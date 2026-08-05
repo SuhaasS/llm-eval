@@ -841,6 +841,8 @@ cd bakeoff && git add src/bakeoff/costs.py tests/test_costs.py && git commit -m 
 
 Claude Code writes a JSONL transcript per session. Verified field layout: `assistant` records carry `message.model`, `message.usage`, `timestamp`, `uuid`, `parentUuid`, `requestId`; tool results arrive as separate records carrying `toolUseResult`. `usage` splits `input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`.
 
+> **Timing correction, 2026-08-05.** As originally drafted, `inference_ms` was the gap between *consecutive assistant records*, which folds tool-execution time into inference and leaves turn 1 at zero; `tool_exec_ms` was hardcoded 0, and Task 10 then derived it as `wall_clock_ms - inference_ms` — a residual, not a measurement. Against the fixture that gave `[0, 7000, 8000, 10000]` inference summing to 25000ms against a 30000ms span, with 5s unaccounted. Spec §6.1 defines the two distinctly ("inference_ms — model generating, the real speed difference"; "tool_exec_ms — test runs, builds") and latency p95 ≤ 2× Sonnet 5 is a stated success criterion (§10), so a split that cannot distinguish a slow model from a slow test run is unusable. Tool-result records carry timestamps, so the real split is already in the transcript; corrected below to `[5000, 6000, 7000, 5000]` inference and `[1000, 1000, 5000, 0]` tool exec, which partition the span exactly. Two tests added to cover it.
+
 **Files:**
 - Create: `bakeoff/src/bakeoff/trajectory.py`
 - Create: `bakeoff/tests/fixtures/trajectory_sample.jsonl`
@@ -852,7 +854,7 @@ Claude Code writes a JSONL transcript per session. Verified field layout: `assis
 
   Task 10 consumes `total_cost_usd` and `first_edit_offset_ms` specifically — do not omit them.
 
-- [ ] **Step 1: Create the fixture**
+- [x] **Step 1: Create the fixture**
 
 `bakeoff/tests/fixtures/trajectory_sample.jsonl` (one JSON object per line, no wrapping):
 
@@ -867,7 +869,7 @@ Claude Code writes a JSONL transcript per session. Verified field layout: `assis
 {"type":"assistant","sessionId":"s1","uuid":"a4","parentUuid":"u4","requestId":"req-4","timestamp":"2026-08-04T00:00:30.000Z","cwd":"/repo","gitBranch":"main","version":"2.1.209","message":{"role":"assistant","model":"claude-sonnet-5","stop_reason":"end_turn","content":[{"type":"text","text":"Fixed."}],"usage":{"input_tokens":5,"output_tokens":10,"cache_read_input_tokens":400,"cache_creation_input_tokens":0}}}
 ```
 
-- [ ] **Step 2: Write the failing test**
+- [x] **Step 2: Write the failing test**
 
 `bakeoff/tests/test_trajectory.py`:
 
@@ -947,14 +949,33 @@ def test_truncated_file_parses_what_exists(tmp_path):
     result = parse_trajectory(broken, model="claude-sonnet-5")
     assert len(result.turns) == 2
     assert result.malformed_lines == 1
+
+
+def test_inference_excludes_tool_execution_time(parsed):
+    """Spec section 6.1 defines inference_ms as model generation time and
+    tool_exec_ms as test runs and builds. Measuring inference as the gap
+    between consecutive assistant records folds tool execution into it and
+    leaves tool_exec_ms permanently zero, which silently corrupts the
+    latency success criterion (section 10)."""
+    assert [t.inference_ms for t in parsed.turns] == [5000, 6000, 7000, 5000]
+    assert [t.tool_exec_ms for t in parsed.turns] == [1000, 1000, 5000, 0]
+
+
+def test_inference_plus_tool_exec_accounts_for_the_whole_session(parsed):
+    """The two must partition the transcript span. If they overlap, one is
+    double-counting; if they undershoot, time is unaccounted for."""
+    span_ms = 30_000  # first record 00:00:00, last 00:00:30
+    inference = sum(t.inference_ms for t in parsed.turns)
+    tool_exec = sum(t.tool_exec_ms for t in parsed.turns)
+    assert inference + tool_exec == span_ms
 ```
 
-- [ ] **Step 3: Run it to confirm it fails**
+- [x] **Step 3: Run it to confirm it fails**
 
 Run: `cd bakeoff && python -m pytest tests/test_trajectory.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'bakeoff.trajectory'`
 
-- [ ] **Step 4: Implement the parser**
+- [x] **Step 4: Implement the parser**
 
 `bakeoff/src/bakeoff/trajectory.py`:
 
@@ -968,12 +989,22 @@ version. Tool results arrive as separate records carrying toolUseResult.
 Parsing is deliberately tolerant: a run killed mid-write leaves a partial
 final line, and losing the whole trajectory over one truncated line would
 violate the spec's "no data loss" requirement (section 6).
+
+Timing follows spec section 6.1, which defines inference_ms as model
+generation time and tool_exec_ms as test runs and builds. Both are read off
+record timestamps: an assistant record's inference is the gap since the
+record that unblocked it (the user prompt, or the preceding tool result),
+and a tool result's gap since its assistant record is that turn's tool
+execution. Measuring inference as the span between consecutive assistant
+records instead would fold tool execution into it and leave tool_exec_ms
+permanently zero -- a silent corruption of the latency success criterion,
+since nothing downstream can distinguish a slow model from a slow test run.
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -1001,6 +1032,12 @@ def _parse_ts(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+def _elapsed_ms(start: datetime | None, end: datetime | None) -> int:
+    if start is None or end is None:
+        return 0
+    return int((end - start).total_seconds() * 1000)
+
+
 def _usage_from(raw: dict) -> TokenUsage:
     return TokenUsage(
         input=raw.get("input_tokens", 0),
@@ -1011,10 +1048,16 @@ def _usage_from(raw: dict) -> TokenUsage:
     )
 
 
+def _is_tool_result(record: dict) -> bool:
+    return "toolUseResult" in record
+
+
 def parse_trajectory(path: Path, model: str) -> ParsedTrajectory:
     result = ParsedTrajectory(model=model)
     by_name: dict[str, int] = {}
     started_at: datetime | None = None
+    # Previous record of any type -- an assistant turn's inference begins
+    # when the record that unblocked it landed, not at the previous turn.
     prev_ts: datetime | None = None
     turn_no = 0
 
@@ -1029,10 +1072,20 @@ def parse_trajectory(path: Path, model: str) -> ParsedTrajectory:
             continue
 
         timestamp = record.get("timestamp")
-        if timestamp and started_at is None:
-            started_at = _parse_ts(timestamp)
+        now = _parse_ts(timestamp) if timestamp else None
+        if now and started_at is None:
+            started_at = now
 
         if record.get("type") != "assistant":
+            # A tool result closes out the tool call the current turn issued.
+            if _is_tool_result(record) and result.turns and now:
+                last = result.turns[-1]
+                result.turns[-1] = replace(
+                    last,
+                    tool_exec_ms=last.tool_exec_ms + _elapsed_ms(prev_ts, now),
+                )
+            if now:
+                prev_ts = now
             continue
 
         message = record.get("message", {})
@@ -1044,10 +1097,7 @@ def parse_trajectory(path: Path, model: str) -> ParsedTrajectory:
         usage = _usage_from(message.get("usage", {}))
         result.total_tokens = result.total_tokens + usage
 
-        now = _parse_ts(timestamp) if timestamp else None
-        inference_ms = 0
-        if now and prev_ts:
-            inference_ms = int((now - prev_ts).total_seconds() * 1000)
+        inference_ms = _elapsed_ms(prev_ts, now)
         if now:
             prev_ts = now
 
@@ -1059,10 +1109,7 @@ def parse_trajectory(path: Path, model: str) -> ParsedTrajectory:
 
             if name in EDIT_TOOLS and result.first_edit_turn is None:
                 result.first_edit_turn = turn_no
-                if now and started_at:
-                    result.first_edit_offset_ms = int(
-                        (now - started_at).total_seconds() * 1000
-                    )
+                result.first_edit_offset_ms = _elapsed_ms(started_at, now)
             if name == "Bash":
                 command = (block.get("input") or {}).get("command", "")
                 if command:
@@ -1086,12 +1133,12 @@ def parse_trajectory(path: Path, model: str) -> ParsedTrajectory:
     return result
 ```
 
-- [ ] **Step 5: Run — expect pass**
+- [x] **Step 5: Run — expect pass**
 
 Run: `cd bakeoff && python -m pytest tests/test_trajectory.py -v`
-Expected: 10 passed
+Expected: 12 passed
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 cd bakeoff && git add src/bakeoff/trajectory.py tests/test_trajectory.py tests/fixtures/trajectory_sample.jsonl && git commit -m "feat: tolerant Claude Code trajectory parser with per-turn cost"

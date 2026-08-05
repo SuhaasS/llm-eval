@@ -4,7 +4,7 @@ Source plan: [docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md](../d
 
 - [x] **Task 1** — Schema and event log
 - [x] **Task 2** — Cost calculation
-- [ ] Task 3 — Trajectory parser (`trajectory.py`)
+- [x] **Task 3** — Trajectory parser
 - [ ] Task 4 — Destructive-command and secret scanners (`scanners.py`)
 - [ ] Task 5 — Container lifecycle and git pinning (`container.py`)
 - [ ] Task 6 — Checkpoint capture (`checkpoints.py`)
@@ -14,6 +14,32 @@ Source plan: [docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md](../d
 - [ ] Task 10 — Run orchestrator (`runner.py`)
 - [ ] Task 11 — Fault-injection gate
 - [ ] Task 12 — End-to-end smoke test
+
+---
+
+## Review — Task 3 (2026-08-05)
+
+**Delivered:** `trajectory.py` — `ParsedTrajectory`, `parse_trajectory()`, `EDIT_TOOLS`. 12 tests (10 from the plan doc + 2 new), 30 passing suite-wide. TDD order held.
+
+**Timing correction — the substantive deviation.** As drafted, `inference_ms` was the gap between *consecutive assistant records*, folding tool-execution time into inference and leaving turn 1 at zero; `tool_exec_ms` was hardcoded 0, and Task 10 derived it as `wall_clock_ms - inference_ms` — a residual, not a measurement.
+
+Spec §6.1 defines the two distinctly ("inference_ms — model generating, the real speed difference"; "tool_exec_ms — test runs, builds") and latency p95 ≤ 2× Sonnet 5 is a stated success criterion (§10). A split that can't distinguish a slow model from a slow test run can't support that criterion.
+
+Tool-result records carry timestamps, so the real split was already in the transcript. Now: an assistant turn's inference is the gap since the record that unblocked it; a tool result's gap since its assistant record is that turn's tool execution.
+
+| against the fixture | inference | tool_exec | sum vs 30000ms span |
+|---|---|---|---|
+| as drafted | `[0, 7000, 8000, 10000]` | `[0, 0, 0, 0]` | 25000 — 5s unaccounted |
+| corrected | `[5000, 6000, 7000, 5000]` | `[1000, 1000, 5000, 0]` | 30000 exactly |
+
+Verified by reproducing the original logic against the fixture and confirming both new tests fail on it. Plan doc's Task 3 code block and test block corrected in the same commit; both now diff clean against the implementation.
+
+**Follow-ups found while tracing downstream — not fixed here:**
+
+1. **Task 10 — a candidate returning cache tokens loses the whole run.** `assemble_record` calls `parse_trajectory` unguarded, and `cost_usd` raises on cache tokens from a model whose cache support is unconfirmed (Task 2's guard). The exception propagates and no run record is written, against the "complete event log of every run" primary deliverable. Fail-fast is defensible during Phase 0b — which exists precisely to resolve candidate cache support before the full run — but the real run needs a defensive call site. Belongs to Task 10.
+2. **Task 7 — true inference latency is captured and discarded.** `BakeoffCallback.log_success_event` receives `start_time`/`end_time` from LiteLLM and uses neither. That's wire-level ground truth for generation time and would cross-check the trajectory-derived numbers. Belongs to Task 7.
+
+**Known, by design:** `ToolCallStats.malformed` stays 0 — the plan's self-review notes it comes from the wire log, since Claude Code's transcript doesn't record parse failures.
 
 ---
 
