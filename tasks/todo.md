@@ -7,13 +7,39 @@ Source plan: [docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md](../d
 - [x] **Task 3** — Trajectory parser
 - [x] **Task 4** — Destructive-command and secret scanners
 - [x] **Task 5** — Container lifecycle and git pinning
-- [ ] Task 6 — Checkpoint capture (`checkpoints.py`)
+- [x] **Task 6** — Checkpoint capture
 - [ ] Task 7 — Wire-level logging (`wire.py`)
 - [ ] Task 8 — Failure and exclusion classification (`classify.py`)
 - [ ] Task 9 — Claude Code runner (`claude_runner.py`)
 - [ ] Task 10 — Run orchestrator (`runner.py`)
 - [ ] Task 11 — Fault-injection gate
 - [ ] Task 12 — End-to-end smoke test
+
+---
+
+## Review — Task 6 (2026-08-05)
+
+**Delivered:** `checkpoints.py` — `CheckpointRecorder`, `SupportsSnapshot`. 5 tests, implemented verbatim (traced by hand first, all pass as specified). Plus the deferred `snapshot_diff` root-cause fix and 1 integration test. **47 unit + 9 integration passing.**
+
+`CheckpointRecorder` depends only on a Protocol, so its tests use a fake and need no Docker.
+
+**Root cause closed.** `snapshot_diff` ignored exit codes and returned stdout only, so any stderr-routed git failure yielded `("", [])` — indistinguishable from a clean tree. In Task 5 that was test hygiene; in Task 6 it becomes data integrity, because `_capture` writes that empty result into a `Checkpoint` as *"the agent had changed nothing by turn K"* — a fabricated measurement feeding the cost-at-budget-K curve.
+
+Every git call now routes through `_checked_exec`, raising `ContainerError` with stderr attached. Safe because `git diff` runs without `--exit-code`, so it returns 0 regardless of whether differences exist; a non-zero code is unambiguously a failure.
+
+Verified end to end:
+
+- New test observed failing with `DID NOT RAISE ContainerError` before the fix — the silent path, live
+- Re-ran the unmounted-repo scenario afterward: `test_snapshot_diff_returns_empty_for_clean_tree`, which **passed vacuously last turn**, now fails with `git add -A failed (exit 128): fatal: not a git repository`
+- Confirmed the fix does not turn "no changes" into an error — the clean-tree test still passes normally when the repo *is* mounted
+
+**Three defects found in Task 10's call site while tracing the consumer:**
+
+1. **Checkpoints are captured after the run ends, so every one snapshots the same final state.** The loop runs post-hoc over `parsed.turns` once `ClaudeCodeRunner.run` has returned, meaning the working tree is at its end state for all of them. The per-turn progression would be fabricated — identical diffs relabeled with different turn numbers — making the cost-at-budget-K curve meaningless. Capture must be interleaved with the agent's execution. **Highest-priority item on this list.**
+2. `force_capture(turn=len(recorder.captured) + 1, ...)` numbers the final checkpoint by *count*, not turn — 20 turns at K=5 emits `turn=5`, colliding with the real checkpoint at turn 5; at K=1 it emits `turn=21`, a turn that never happened.
+3. Every intermediate `maybe_capture` passes `elapsed_ms=0`, so `Checkpoint.elapsed_ms` is meaningless except on the final capture.
+
+`CheckpointRecorder` is correct in isolation — it snapshots when called, and the caller owns interleaving. Noted in the module docstring, since the recorder cannot detect the misuse itself.
 
 ---
 

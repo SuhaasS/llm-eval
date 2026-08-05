@@ -1395,7 +1395,7 @@ cd bakeoff && git add src/bakeoff/scanners.py tests/test_scanners.py && git comm
 >
 > **macOS bind-mount hazard (new test).** The Docker VM mounts `$HOME` but not `/var/folders`, where pytest's `tmp_path` lives — so the repo mounts as an **empty directory with no error**. Reproduced: without `--basetemp` under `$HOME`, `test_snapshot_diff_returns_empty_for_clean_tree` still passes, because git's "not a git repository" goes to *stderr* and `snapshot_diff` returns stdout only — an empty mount is indistinguishable from a clean tree. `test_repo_is_actually_mounted` and `test_git_is_available_in_container` were added to assert both preconditions directly. Run integration tests with `--basetemp="$HOME/.cache/bakeoff-pytest"`.
 >
-> **Root cause left open for Task 6.** `snapshot_diff` ignores exit codes and stderr, so it cannot tell "clean tree" from "git command failed." The guard tests cover the two known paths; any new stderr-routed git failure would reproduce the same silent-empty result. Checking `ExecResult.exit_code` inside `snapshot_diff` closes it at the source.
+> **Root cause — closed in Task 6, 2026-08-05.** `snapshot_diff` ignored exit codes and stderr, so it could not tell "clean tree" from "git command failed," and any new stderr-routed git failure would have reproduced the same silent-empty result. It now routes every git call through `_checked_exec` and raises `ContainerError` with stderr attached. Safe because `git diff` runs without `--exit-code`, so it returns 0 whether or not differences exist and a non-zero code is unambiguously a failure. Verified by re-running the unmounted-repo scenario: `test_snapshot_diff_returns_empty_for_clean_tree`, which previously passed vacuously, now fails with `git add -A failed (exit 128): fatal: not a git repository`. `test_snapshot_diff_raises_when_git_fails` pins it.
 
 **Files:**
 - Create: `bakeoff/src/bakeoff/container.py`
@@ -1494,6 +1494,20 @@ def test_restore_paths_reverts_agent_edits_to_test_files(git_container):
     git_container.restore_paths(git_container.base_sha, ["tests/test_a.py"])
     result = git_container.exec(["cat", "/repo/tests/test_a.py"])
     assert "tampered" not in result.stdout
+
+
+@integration
+def test_snapshot_diff_raises_when_git_fails(alpine_container):
+    """A failed snapshot must not be indistinguishable from a clean tree.
+
+    git reports "not a git repository" on stderr, and snapshot_diff returns
+    stdout, so without an exit-code check this call returns ("", []) -- which
+    a Checkpoint stores as "the agent had changed nothing by this turn."
+    That is a fabricated measurement feeding the cost-at-budget-K curve, not
+    a visible error. Fail instead.
+    """
+    with pytest.raises(ContainerError, match="git"):
+        alpine_container.snapshot_diff("abc123")
 
 
 @integration
@@ -1706,13 +1720,38 @@ class RunContainer:
             duration_ms=duration_ms,
         )
 
+    def _checked_exec(self, cmd: list[str]) -> ExecResult:
+        """Run a command that must succeed, or say so.
+
+        git writes failures ("not a git repository", a bad base_sha, an
+        unreadable object) to stderr and exits non-zero, while this class
+        returns stdout -- so an unchecked failure yields empty output that is
+        byte-identical to a clean tree. Downstream that becomes a Checkpoint
+        claiming the agent changed nothing, which is a fabricated measurement
+        rather than a visible error.
+        """
+        result = self.exec(cmd)
+        if result.exit_code != 0:
+            raise ContainerError(
+                f"{' '.join(cmd)} failed (exit {result.exit_code}): "
+                f"{(result.stderr or result.stdout).strip()}"
+            )
+        return result
+
     def snapshot_diff(self, base_sha: str) -> tuple[str, list[str]]:
         """Stage everything, then diff against base. Staging first captures
         untracked files and normalizes over whether the agent committed
-        (spec section 5.6)."""
-        self.exec(["git", "add", "-A"])
-        diff = self.exec(["git", "diff", "--cached", base_sha])
-        names = self.exec(["git", "diff", "--cached", "--name-only", base_sha])
+        (spec section 5.6).
+
+        `git diff` is run without --exit-code, so it returns 0 whether or not
+        differences exist; a non-zero code is unambiguously a failure and
+        never means "there were changes".
+        """
+        self._checked_exec(["git", "add", "-A"])
+        diff = self._checked_exec(["git", "diff", "--cached", base_sha])
+        names = self._checked_exec(
+            ["git", "diff", "--cached", "--name-only", base_sha]
+        )
         files = [line for line in names.stdout.splitlines() if line.strip()]
         return diff.stdout, files
 
@@ -1737,8 +1776,8 @@ class RunContainer:
 - [x] **Step 4: Run — expect pass**
 
 Run: `cd bakeoff && python -m pytest tests/test_container.py -v -m integration --basetemp="$HOME/.cache/bakeoff-pytest"`
-Expected: 8 passed (requires a running Docker daemon). The default suite
-(`python -m pytest tests/`) is 42 with the 8 integration tests deselected.
+Expected: 9 passed (requires a running Docker daemon). The default suite
+(`python -m pytest tests/`) is 47 with the 9 integration tests deselected.
 
 - [x] **Step 5: Commit**
 
@@ -1758,7 +1797,7 @@ cd bakeoff && git add src/bakeoff/container.py tests/test_container.py tests/con
 - Consumes: `RunContainer` from `bakeoff.container`; `Checkpoint` from `bakeoff.schema`
 - Produces: `CheckpointRecorder(container, base_sha, every_k_turns: int)` with `.maybe_capture(turn: int, elapsed_ms: int) -> Checkpoint | None` and `.captured: list[Checkpoint]`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `bakeoff/tests/test_checkpoints.py`:
 
@@ -1819,12 +1858,12 @@ def test_final_capture_forces_a_snapshot_regardless_of_k():
     assert container.calls == 1
 ```
 
-- [ ] **Step 2: Run to confirm it fails**
+- [x] **Step 2: Run to confirm it fails**
 
 Run: `cd bakeoff && python -m pytest tests/test_checkpoints.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'bakeoff.checkpoints'`
 
-- [ ] **Step 3: Implement the recorder**
+- [x] **Step 3: Implement the recorder**
 
 `bakeoff/src/bakeoff/checkpoints.py`:
 
@@ -1835,6 +1874,12 @@ The agent run stores diffs only. Running the oracle inline would cost
 roughly 96,000 test-suite executions across the full eval, so grading is a
 separate offline batch job over these stored diffs. That also makes
 checkpoint grading re-runnable if the oracle changes.
+
+A checkpoint is only meaningful if it is taken while the agent is working:
+snapshotting after the run has finished yields the same end state for every
+turn number, which reads as a per-turn progression that never happened.
+The recorder cannot detect that -- it snapshots whenever it is called, so
+the caller owns interleaving capture with execution.
 """
 
 from __future__ import annotations
@@ -1881,12 +1926,12 @@ class CheckpointRecorder:
         return checkpoint
 ```
 
-- [ ] **Step 4: Run — expect pass**
+- [x] **Step 4: Run — expect pass**
 
 Run: `cd bakeoff && python -m pytest tests/test_checkpoints.py -v`
 Expected: 5 passed
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd bakeoff && git add src/bakeoff/checkpoints.py tests/test_checkpoints.py && git commit -m "feat: per-turn checkpoint capture, grading deferred offline"

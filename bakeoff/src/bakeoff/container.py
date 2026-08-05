@@ -102,13 +102,38 @@ class RunContainer:
             duration_ms=duration_ms,
         )
 
+    def _checked_exec(self, cmd: list[str]) -> ExecResult:
+        """Run a command that must succeed, or say so.
+
+        git writes failures ("not a git repository", a bad base_sha, an
+        unreadable object) to stderr and exits non-zero, while this class
+        returns stdout -- so an unchecked failure yields empty output that is
+        byte-identical to a clean tree. Downstream that becomes a Checkpoint
+        claiming the agent changed nothing, which is a fabricated measurement
+        rather than a visible error.
+        """
+        result = self.exec(cmd)
+        if result.exit_code != 0:
+            raise ContainerError(
+                f"{' '.join(cmd)} failed (exit {result.exit_code}): "
+                f"{(result.stderr or result.stdout).strip()}"
+            )
+        return result
+
     def snapshot_diff(self, base_sha: str) -> tuple[str, list[str]]:
         """Stage everything, then diff against base. Staging first captures
         untracked files and normalizes over whether the agent committed
-        (spec section 5.6)."""
-        self.exec(["git", "add", "-A"])
-        diff = self.exec(["git", "diff", "--cached", base_sha])
-        names = self.exec(["git", "diff", "--cached", "--name-only", base_sha])
+        (spec section 5.6).
+
+        `git diff` is run without --exit-code, so it returns 0 whether or not
+        differences exist; a non-zero code is unambiguously a failure and
+        never means "there were changes".
+        """
+        self._checked_exec(["git", "add", "-A"])
+        diff = self._checked_exec(["git", "diff", "--cached", base_sha])
+        names = self._checked_exec(
+            ["git", "diff", "--cached", "--name-only", base_sha]
+        )
         files = [line for line in names.stdout.splitlines() if line.strip()]
         return diff.stdout, files
 

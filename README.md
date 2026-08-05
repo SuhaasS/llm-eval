@@ -48,4 +48,4 @@ Integration tests are opt-in — they need a Docker daemon, and on macOS they ne
 cd bakeoff && .venv/bin/python -m pytest -v -m integration --basetemp="$HOME/.cache/bakeoff-pytest"
 ```
 
-Status: Tasks 1–5 complete (schema, event log, pricing, trajectory parser, scanners, container). 42 unit + 8 integration tests passing.
+Status: Tasks 1–6 complete (schema, event log, pricing, trajectory parser, scanners, container, checkpoints). 47 unit + 9 integration tests passing.

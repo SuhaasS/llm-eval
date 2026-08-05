@@ -85,6 +85,20 @@ def test_restore_paths_reverts_agent_edits_to_test_files(git_container):
 
 
 @integration
+def test_snapshot_diff_raises_when_git_fails(alpine_container):
+    """A failed snapshot must not be indistinguishable from a clean tree.
+
+    git reports "not a git repository" on stderr, and snapshot_diff returns
+    stdout, so without an exit-code check this call returns ("", []) -- which
+    a Checkpoint stores as "the agent had changed nothing by this turn."
+    That is a fabricated measurement feeding the cost-at-budget-K curve, not
+    a visible error. Fail instead.
+    """
+    with pytest.raises(ContainerError, match="git"):
+        alpine_container.snapshot_diff("abc123")
+
+
+@integration
 def test_network_is_disabled(alpine_container):
     result = alpine_container.exec(
         ["sh", "-c", "wget -q -T 2 -O- http://example.com || echo BLOCKED"]
