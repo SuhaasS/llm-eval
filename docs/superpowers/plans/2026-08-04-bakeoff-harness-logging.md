@@ -21,7 +21,7 @@
 - **No model-specific calibration anywhere.** Any parameter needing a value takes it from config, never from an incumbent model's observed behavior. (§1 Model-neutrality rule)
 - **All timestamps UTC, ISO-8601, `Z`-suffixed.**
 - **Secret-scan before any log leaves the machine.** Wire logs and trajectories contain repository source. (§3.6, §6.2)
-- **Model pricing, standard tier:** Sonnet 5 `$3.00/$15.00`; Gemma 4 31B `$0.14/$0.40`; Nemotron 3 Super 120B `$0.15/$0.65`; Kimi K2.5 `$0.60/$2.50` per 1M in/out. (§8)
+- **Model pricing, standard tier, US regions:** Sonnet 5 `$3.00/$15.00`; Gemma 4 31B `$0.14/$0.40`; Nemotron 3 Super 120B `$0.15/$0.65`; Kimi K2.5 `$0.60/$3.00` per 1M in/out. (§8; re-verified against AWS 2026-08-05 — see the Task 2 correction note)
 
 ---
 
@@ -666,6 +666,8 @@ cd bakeoff && git add pyproject.toml src/bakeoff/__init__.py src/bakeoff/schema.
 
 ## Task 2: Cost Calculation
 
+> **Price correction, 2026-08-05.** All four models re-verified against the AWS Bedrock pricing page. Sonnet 5 ($3.00/$15.00 standard), Gemma 4 31B ($0.14/$0.40), and Nemotron 3 Super 120B ($0.15/$0.65) were correct as written. **Kimi K2.5 output was wrong: $3.00, not $2.50** — the plan doc had taken the optimistic end of the `Model_Bakeoff_Plan.md` "$2.50–3.00" range. Corrected below, along with the `3.10` → `3.60` test expectation. Cache multipliers 0.10× read / 1.25× write confirmed; AWS publishes no cache pricing for any of the three candidates, which independently supports the `None` multipliers.
+
 **Files:**
 - Create: `bakeoff/src/bakeoff/costs.py`
 - Test: `bakeoff/tests/test_costs.py`
@@ -674,7 +676,7 @@ cd bakeoff && git add pyproject.toml src/bakeoff/__init__.py src/bakeoff/schema.
 - Consumes: `TokenUsage` from `bakeoff.schema`
 - Produces: `ModelPricing` dataclass; `PRICE_BOOK: dict[str, ModelPricing]`; `cost_usd(model: str, usage: TokenUsage) -> float`; `UnknownModelError`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `bakeoff/tests/test_costs.py`:
 
@@ -709,7 +711,7 @@ def test_candidate_pricing_matches_spec():
     usage = TokenUsage(input=1_000_000, output=1_000_000)
     assert cost_usd("gemma-4-31b", usage) == pytest.approx(0.54)
     assert cost_usd("nemotron-3-super-120b", usage) == pytest.approx(0.80)
-    assert cost_usd("kimi-k2-5", usage) == pytest.approx(3.10)
+    assert cost_usd("kimi-k2-5", usage) == pytest.approx(3.60)
 
 
 def test_candidates_have_cache_support_unconfirmed():
@@ -733,22 +735,27 @@ def test_zero_usage_is_zero_cost():
     assert cost_usd("claude-sonnet-5", TokenUsage()) == 0.0
 ```
 
-- [ ] **Step 2: Run it to confirm it fails**
+- [x] **Step 2: Run it to confirm it fails**
 
 Run: `cd bakeoff && python -m pytest tests/test_costs.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'bakeoff.costs'`
 
-- [ ] **Step 3: Implement pricing**
+- [x] **Step 3: Implement pricing**
 
 `bakeoff/src/bakeoff/costs.py`:
 
 ```python
 """Token usage to USD. Standard-tier Bedrock pricing (spec section 8).
 
+Prices are US regions (us-east-1, us-east-2, us-west-2), verified against the
+AWS Bedrock pricing page on 2026-08-05. Other regions run 15-20% higher; if the
+eval ever runs outside the US, this book needs a region axis.
+
 Candidate cache multipliers are None on purpose: spec section 8 records
-that Bedrock prompt-cache support for the three candidates is unconfirmed.
-Guessing here would silently corrupt the headline cost metric, so any cache
-tokens observed on those models raise instead.
+that Bedrock prompt-cache support for the three candidates is unconfirmed,
+and AWS publishes no cache pricing for any of them. Guessing here would
+silently corrupt the headline cost metric, so any cache tokens observed on
+those models raise instead.
 """
 
 from __future__ import annotations
@@ -779,7 +786,7 @@ PRICE_BOOK: dict[str, ModelPricing] = {
     ),
     "gemma-4-31b": ModelPricing(input_per_1m=0.14, output_per_1m=0.40),
     "nemotron-3-super-120b": ModelPricing(input_per_1m=0.15, output_per_1m=0.65),
-    "kimi-k2-5": ModelPricing(input_per_1m=0.60, output_per_1m=2.50),
+    "kimi-k2-5": ModelPricing(input_per_1m=0.60, output_per_1m=3.00),
 }
 
 _PER_MILLION = 1_000_000
@@ -817,12 +824,12 @@ def cost_usd(model: str, usage: TokenUsage) -> float:
     return total
 ```
 
-- [ ] **Step 4: Run — expect pass**
+- [x] **Step 4: Run — expect pass**
 
 Run: `cd bakeoff && python -m pytest tests/test_costs.py -v`
 Expected: 9 passed
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd bakeoff && git add src/bakeoff/costs.py tests/test_costs.py && git commit -m "feat: standard-tier Bedrock pricing with explicit unconfirmed-cache guard"
