@@ -36,4 +36,16 @@ bakeoff/
 └── tests/
 ```
 
-Status: docs only. Harness implementation starts at Task 1 (schema + event log).
+## Running the tests
+
+```bash
+cd bakeoff && .venv/bin/python -m pytest tests/ -v
+```
+
+Integration tests are opt-in — they need a Docker daemon, and on macOS they need `--basetemp` under `$HOME`, because the Docker VM mounts `$HOME` but not `/var/folders` and a repo mounted from there appears inside the container as a silently empty directory:
+
+```bash
+cd bakeoff && .venv/bin/python -m pytest -v -m integration --basetemp="$HOME/.cache/bakeoff-pytest"
+```
+
+Status: Tasks 1–5 complete (schema, event log, pricing, trajectory parser, scanners, container). 42 unit + 8 integration tests passing.

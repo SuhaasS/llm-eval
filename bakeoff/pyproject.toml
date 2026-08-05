@@ -14,3 +14,7 @@ build-backend = "setuptools.build_meta"
 [tool.pytest.ini_options]
 markers = ["integration: requires Docker or network"]
 testpaths = ["tests"]
+# Integration tests are opt-in: they need a Docker daemon, so running them by
+# default would turn "no daemon here" into a suite-wide collection error.
+# Override with `-m integration` on the command line.
+addopts = "-m 'not integration'"

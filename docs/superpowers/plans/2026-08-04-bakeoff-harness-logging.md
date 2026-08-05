@@ -1386,6 +1386,17 @@ cd bakeoff && git add src/bakeoff/scanners.py tests/test_scanners.py && git comm
 
 ## Task 5: Container Lifecycle and Git Pinning
 
+> **Corrections, 2026-08-05.** Four defects, all confirmed empirically against a real daemon (Colima 0.10.3 / Docker 29.5.2) rather than by reading:
+>
+> 1. **The conftest broke the whole suite.** It imported `bakeoff.container` at module level, and conftest loads for *every* test — with no `addopts` filter, integration tests ran by default, so 41 passing tests became a collection error wherever the `docker` SDK was absent. Fixed with `addopts = "-m 'not integration'"` in `pyproject.toml` plus fixture-local imports.
+> 2. **`install_git` cannot work.** `apk add` needs network; containers are created `network_mode="none"` per §5.1. Alpine ships no git, so all three `git_container` tests were broken. They break loudly, not silently — an absent binary is an OCI exec failure whose message lands in *stdout*, so `snapshot_diff` returns non-empty and the assertions fail. The fixture now uses a digest-pinned `alpine/git` image (git 2.54.0, and Alpine-based so busybox `wget` remains available for the network test). `install_git` stays in the interface but can only short-circuit, never install.
+> 3. **Image entrypoints defeat `sleep infinity`.** Verified: `alpine/git` declares `ENTRYPOINT ["git"]`, so the container would have run `git sleep infinity` and exited. `RunContainer` now passes `entrypoint=["sleep"], command=["infinity"]`, which also protects against production task images that carry their own entrypoints.
+> 4. **The digest test was needlessly gated.** It validates `__init__` and needs no daemon, so the §5.1 pinning guarantee now runs on every machine. File-level `pytestmark` replaced with per-test marks.
+>
+> **macOS bind-mount hazard (new test).** The Docker VM mounts `$HOME` but not `/var/folders`, where pytest's `tmp_path` lives — so the repo mounts as an **empty directory with no error**. Reproduced: without `--basetemp` under `$HOME`, `test_snapshot_diff_returns_empty_for_clean_tree` still passes, because git's "not a git repository" goes to *stderr* and `snapshot_diff` returns stdout only — an empty mount is indistinguishable from a clean tree. `test_repo_is_actually_mounted` and `test_git_is_available_in_container` were added to assert both preconditions directly. Run integration tests with `--basetemp="$HOME/.cache/bakeoff-pytest"`.
+>
+> **Root cause left open for Task 6.** `snapshot_diff` ignores exit codes and stderr, so it cannot tell "clean tree" from "git command failed." The guard tests cover the two known paths; any new stderr-routed git failure would reproduce the same silent-empty result. Checking `ExecResult.exit_code` inside `snapshot_diff` closes it at the source.
+
 **Files:**
 - Create: `bakeoff/src/bakeoff/container.py`
 - Test: `bakeoff/tests/test_container.py`
@@ -1394,7 +1405,7 @@ cd bakeoff && git add src/bakeoff/scanners.py tests/test_scanners.py && git comm
 - Consumes: nothing from earlier tasks
 - Produces: `RunContainer(image: str, repo_path: str, base_sha: str, install_git: bool = False, mem_limit: str = "4g")` context manager with `.exec(cmd: list[str]) -> ExecResult`, `.snapshot_diff(base_sha: str) -> tuple[str, list[str]]`, `.restore_paths(base_sha: str, paths: list[str]) -> None`, `.stats() -> HostMetrics`; `ExecResult(exit_code: int, stdout: str, stderr: str, duration_ms: int)`; `ContainerError`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `bakeoff/tests/test_container.py`:
 
@@ -1403,15 +1414,21 @@ import pytest
 
 from bakeoff.container import ContainerError, RunContainer
 
-pytestmark = pytest.mark.integration
+integration = pytest.mark.integration
 
 
 def test_rejects_tag_instead_of_digest():
-    """Spec section 5.1: images pin by digest, never by tag."""
+    """Spec section 5.1: images pin by digest, never by tag.
+
+    Not marked integration -- this validates __init__ and needs no daemon,
+    so the pinning guarantee is checked on every machine, not only ones
+    where Docker happens to be running.
+    """
     with pytest.raises(ContainerError, match="digest"):
         RunContainer(image="python:3.11", repo_path="/tmp/x", base_sha="abc")
 
 
+@integration
 def test_exec_returns_exit_code_and_output(alpine_container):
     result = alpine_container.exec(["echo", "hello"])
     assert result.exit_code == 0
@@ -1419,17 +1436,49 @@ def test_exec_returns_exit_code_and_output(alpine_container):
     assert result.duration_ms >= 0
 
 
+@integration
 def test_exec_captures_nonzero_exit(alpine_container):
     result = alpine_container.exec(["sh", "-c", "exit 3"])
     assert result.exit_code == 3
 
 
+@integration
+def test_repo_is_actually_mounted(git_container):
+    """Guards against a silently empty bind mount.
+
+    On macOS the Docker VM mounts $HOME but not /var/folders, so a repo under
+    pytest's default tmp_path appears inside the container as an empty
+    directory with no error raised. Every snapshot assertion below would then
+    pass for the wrong reason -- an empty mount looks exactly like a clean
+    tree. Fail here instead, loudly.
+    """
+    result = git_container.exec(["ls", "/repo/tests/test_a.py"])
+    assert result.exit_code == 0, (
+        "repo did not mount; run with --basetemp under $HOME"
+    )
+
+
+@integration
+def test_git_is_available_in_container(git_container):
+    """Guards against the other source of vacuous passes.
+
+    network_mode="none" means git cannot be installed at runtime, and a
+    missing git makes every snapshot_diff call return empty output -- which
+    reads as a clean tree rather than as a broken container.
+    """
+    result = git_container.exec(["git", "--version"])
+    assert result.exit_code == 0
+    assert "git version" in result.stdout
+
+
+@integration
 def test_snapshot_diff_returns_empty_for_clean_tree(git_container):
     diff, files = git_container.snapshot_diff(git_container.base_sha)
     assert diff == ""
     assert files == []
 
 
+@integration
 def test_snapshot_diff_includes_untracked_files(git_container):
     git_container.exec(["sh", "-c", "echo new > /repo/added.txt"])
     diff, files = git_container.snapshot_diff(git_container.base_sha)
@@ -1437,6 +1486,7 @@ def test_snapshot_diff_includes_untracked_files(git_container):
     assert "new" in diff
 
 
+@integration
 def test_restore_paths_reverts_agent_edits_to_test_files(git_container):
     """Spec section 4.2.1 check 2: the agent must not be able to influence
     its own grader."""
@@ -1446,6 +1496,7 @@ def test_restore_paths_reverts_agent_edits_to_test_files(git_container):
     assert "tampered" not in result.stdout
 
 
+@integration
 def test_network_is_disabled(alpine_container):
     result = alpine_container.exec(
         ["sh", "-c", "wget -q -T 2 -O- http://example.com || echo BLOCKED"]
@@ -1456,11 +1507,32 @@ def test_network_is_disabled(alpine_container):
 Add `bakeoff/tests/conftest.py`:
 
 ```python
+"""Fixtures for container integration tests.
+
+The image ships git rather than installing it at runtime. RunContainer
+creates containers with network_mode="none" (spec section 5.1), so
+`apk add git` inside the container cannot work -- and a missing git makes
+snapshot_diff return empty output, which is indistinguishable from a clean
+tree. That failure mode passes tests while measuring nothing, so git has to
+be baked into the image.
+
+Bind mounts on macOS: the Docker VM mounts $HOME, not /var/folders, so a
+repo under pytest's default tmp_path mounts as an EMPTY directory with no
+error. Run integration tests with --basetemp under $HOME:
+
+    pytest -m integration --basetemp="$HOME/.cache/bakeoff-pytest"
+
+test_repo_is_actually_mounted guards this: if the mount is silently empty,
+it fails loudly instead of letting the snapshot tests pass vacuously.
+"""
+
 import subprocess
 
 import pytest
 
-from bakeoff.container import RunContainer
+# Alpine-based and ships git, so `command -v git` short-circuits install_git
+# and busybox wget is available for the network-isolation test.
+FIXTURE_IMAGE = "alpine/git:latest"
 
 
 def _digest_for(tag: str) -> str:
@@ -1475,48 +1547,57 @@ def _digest_for(tag: str) -> str:
 
 
 @pytest.fixture(scope="session")
-def alpine_digest():
-    return _digest_for("alpine:3.20")
+def image_digest():
+    return _digest_for(FIXTURE_IMAGE)
 
 
 @pytest.fixture
-def alpine_container(alpine_digest, tmp_path):
+def alpine_container(image_digest, tmp_path):
+    from bakeoff.container import RunContainer
+
     (tmp_path / "repo").mkdir()
     with RunContainer(
-        image=alpine_digest, repo_path=str(tmp_path / "repo"), base_sha=""
+        image=image_digest, repo_path=str(tmp_path / "repo"), base_sha=""
     ) as container:
         yield container
 
 
 @pytest.fixture
-def git_container(alpine_digest, tmp_path):
+def git_container(image_digest, tmp_path):
+    from bakeoff.container import RunContainer
+
     repo = tmp_path / "repo"
     (repo / "tests").mkdir(parents=True)
     (repo / "tests" / "test_a.py").write_text("def test_a():\n    assert True\n")
 
-    run = lambda *args: subprocess.run(args, cwd=repo, check=True, capture_output=True)
+    def run(*args):
+        return subprocess.run(args, cwd=repo, check=True, capture_output=True)
+
     run("git", "init", "-q")
     run("git", "config", "user.email", "eval@pindrop.test")
     run("git", "config", "user.name", "eval")
     run("git", "add", "-A")
     run("git", "commit", "-q", "-m", "base")
     sha = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
-        capture_output=True, text=True,
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
 
     with RunContainer(
-        image=alpine_digest, repo_path=str(repo), base_sha=sha, install_git=True
+        image=image_digest, repo_path=str(repo), base_sha=sha, install_git=True
     ) as container:
         yield container
 ```
 
-- [ ] **Step 2: Run to confirm it fails**
+- [x] **Step 2: Run to confirm it fails**
 
-Run: `cd bakeoff && python -m pytest tests/test_container.py -v -m integration`
+Run: `cd bakeoff && python -m pytest tests/test_container.py -v -m integration --basetemp="$HOME/.cache/bakeoff-pytest"`
 Expected: FAIL with `ModuleNotFoundError: No module named 'bakeoff.container'`
 
-- [ ] **Step 3: Implement the container wrapper**
+- [x] **Step 3: Implement the container wrapper**
 
 `bakeoff/src/bakeoff/container.py`:
 
@@ -1525,6 +1606,13 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'bakeoff.container'`
 
 Spec section 5.1: image pinned by digest, repo detached at base_sha,
 network disabled, fresh container per sample.
+
+Note on install_git: with network_mode="none" a package manager cannot
+reach a mirror, so the image must already ship git. The flag survives only
+to short-circuit on `command -v git`; it cannot install anything at run
+time. A container without git makes snapshot_diff return empty output,
+which reads as a clean tree rather than as a broken container -- so the
+image, not this flag, is what guarantees git is present.
 """
 
 from __future__ import annotations
@@ -1578,7 +1666,11 @@ class RunContainer:
         self._client = docker.from_env()
         self._container = self._client.containers.run(
             self.image,
-            command=["sleep", "infinity"],
+            # Override whatever the image declares -- task images carry their
+            # own entrypoints, and an image with ENTRYPOINT ["git"] would run
+            # `git sleep infinity` and exit immediately.
+            entrypoint=["sleep"],
+            command=["infinity"],
             volumes={self.repo_path: {"bind": REPO_MOUNT, "mode": "rw"}},
             working_dir=REPO_MOUNT,
             network_mode="none",  # spec section 5.1
@@ -1642,12 +1734,13 @@ class RunContainer:
         return HostMetrics(mem_peak_mb=self._peak_mem_mb)
 ```
 
-- [ ] **Step 4: Run — expect pass**
+- [x] **Step 4: Run — expect pass**
 
-Run: `cd bakeoff && python -m pytest tests/test_container.py -v -m integration`
-Expected: 7 passed (requires a running Docker daemon)
+Run: `cd bakeoff && python -m pytest tests/test_container.py -v -m integration --basetemp="$HOME/.cache/bakeoff-pytest"`
+Expected: 8 passed (requires a running Docker daemon). The default suite
+(`python -m pytest tests/`) is 42 with the 8 integration tests deselected.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd bakeoff && git add src/bakeoff/container.py tests/test_container.py tests/conftest.py && git commit -m "feat: digest-pinned run container with git state control"

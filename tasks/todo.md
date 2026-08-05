@@ -6,7 +6,7 @@ Source plan: [docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md](../d
 - [x] **Task 2** — Cost calculation
 - [x] **Task 3** — Trajectory parser
 - [x] **Task 4** — Destructive-command and secret scanners
-- [ ] Task 5 — Container lifecycle and git pinning (`container.py`)
+- [x] **Task 5** — Container lifecycle and git pinning
 - [ ] Task 6 — Checkpoint capture (`checkpoints.py`)
 - [ ] Task 7 — Wire-level logging (`wire.py`)
 - [ ] Task 8 — Failure and exclusion classification (`classify.py`)
@@ -14,6 +14,46 @@ Source plan: [docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md](../d
 - [ ] Task 10 — Run orchestrator (`runner.py`)
 - [ ] Task 11 — Fault-injection gate
 - [ ] Task 12 — End-to-end smoke test
+
+---
+
+## Review — Task 5 (2026-08-05)
+
+**Delivered:** `container.py` — `RunContainer`, `ExecResult`, `ContainerError`. 9 tests (7 from the plan doc + 2 guards), verified against a real daemon: **42 default + 8 integration**. TDD order held.
+
+**Environment.** No container runtime existed on this machine. Installed Colima 0.10.3 + Docker CLI 29.7.1 via brew; VM at `--cpu 2 --memory 4 --disk 20` (4GB because `RunContainer` defaults to `mem_limit="4g"`). Installed the `docker` SDK into the venv — it was already a declared dependency, just skipped by Task 1's `--no-deps`.
+
+One unrelated fix needed: `~/.docker/config.json` carried `"credsStore": "desktop"` from a since-removed Docker Desktop, which broke every image pull with `docker-credential-desktop: executable file not found`. Removed that key only; **backup at `~/.docker/config.json.bak-precolima`**.
+
+**Four defects, all confirmed empirically rather than by reading:**
+
+1. **The conftest broke the whole suite.** It imported `bakeoff.container` at module level; conftest loads for every test, and with no `addopts` filter integration tests ran by default — so 41 passing tests became a collection error anywhere the SDK was missing. Fixed with `addopts = "-m 'not integration'"` plus fixture-local imports.
+2. **`install_git` cannot work.** `apk add` needs network; containers are `network_mode="none"` per §5.1. Fixture now uses digest-pinned `alpine/git` (git 2.54.0, Alpine-based so busybox `wget` still serves the network test). The flag stays in the interface but can only short-circuit.
+3. **Image entrypoints defeat `sleep infinity`.** Verified `alpine/git` declares `ENTRYPOINT ["git"]` — the container would have run `git sleep infinity` and exited. `RunContainer` now passes `entrypoint=["sleep"], command=["infinity"]`, which also covers production task images with their own entrypoints.
+4. **The digest test was needlessly gated** behind a file-level `pytestmark`. It validates `__init__`, needs no daemon, and is the §5.1 pinning guarantee — now runs everywhere.
+
+**The vacuous-pass hazard, reproduced — and scoped correctly.** On macOS the Docker VM mounts `$HOME` but not `/var/folders`, so a repo under pytest's default `tmp_path` mounts as an **empty directory with no error raised**. Confirmed by running integration without `--basetemp`: `test_snapshot_diff_returns_empty_for_clean_tree` **still passed** while measuring nothing, and only the new `test_repo_is_actually_mounted` failed, with a message naming the fix.
+
+The two failure paths are not symmetric, and an earlier version of this note wrongly claimed both were vacuous:
+
+| path | git behavior | error stream | clean-tree test |
+|---|---|---|---|
+| repo not mounted | git runs, "not a git repository" | **stderr** | **passes vacuously** |
+| git binary absent | OCI exec failure, never runs | **stdout** | fails loudly |
+
+`snapshot_diff` returns stdout only, which is why stderr-routed failures disappear and stdout-routed ones don't. Missing git is still a real defect — `install_git` can't work under `network_mode="none"` and all three git tests break — it just breaks honestly. `test_git_is_available_in_container` remains worthwhile as a direct assertion rather than an inferred one.
+
+**Root cause still open:** `snapshot_diff` discards exit codes and stderr, so it cannot distinguish "clean tree" from "git command failed." The two guard tests cover the known paths, but any *new* stderr-routed git failure would reproduce the same silent-empty result. Checking `ExecResult.exit_code` in `snapshot_diff` would close it at the source — **candidate fix for Task 6**, which builds directly on this method.
+
+**Run integration tests with:**
+
+```bash
+cd bakeoff && .venv/bin/python -m pytest tests/test_container.py -v -m integration --basetemp="$HOME/.cache/bakeoff-pytest"
+```
+
+`DOCKER_HOST` turned out to be unnecessary — Colima 0.10.3 symlinks `/var/run/docker.sock`, and `docker.from_env()` resolves it. Verified both with and without.
+
+**Known, unchanged:** `HostMetrics.cpu_pct_p95` stays unpopulated — `stats()` returns memory only. Wiring CPU sampling belongs to Task 10.
 
 ---
 
