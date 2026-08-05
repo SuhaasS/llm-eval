@@ -65,7 +65,7 @@ Each module owns one responsibility and is testable without Docker or network ex
 - Consumes: nothing (foundation task)
 - Produces: `SCHEMA_VERSION: str`, `TokenUsage`, `TimingBreakdown`, `ToolCallStats`, `DestructiveEvent`, `Checkpoint`, `TurnRecord`, `Versions`, `Exclusion`, `RunRecord` dataclasses; `EventLog(root: Path)` with `.write_run(record: RunRecord) -> Path` and `.read_run(run_id: str) -> RunRecord`
 
-- [ ] **Step 1: Create the package skeleton**
+- [x] **Step 1: Create the package skeleton**
 
 `bakeoff/pyproject.toml`:
 
@@ -96,7 +96,7 @@ from bakeoff.schema import SCHEMA_VERSION
 __all__ = ["SCHEMA_VERSION"]
 ```
 
-- [ ] **Step 2: Write the failing schema test**
+- [x] **Step 2: Write the failing schema test**
 
 `bakeoff/tests/test_schema.py`:
 
@@ -168,12 +168,12 @@ def test_run_record_stamps_schema_version_automatically():
     assert record.schema_version == SCHEMA_VERSION
 ```
 
-- [ ] **Step 3: Run it to confirm it fails**
+- [x] **Step 3: Run it to confirm it fails**
 
 Run: `cd bakeoff && python -m pytest tests/test_schema.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'bakeoff.schema'`
 
-- [ ] **Step 4: Implement the schema**
+- [x] **Step 4: Implement the schema**
 
 `bakeoff/src/bakeoff/schema.py`:
 
@@ -476,12 +476,12 @@ class RunRecord:
         return cls(**{k: v for k, v in data.items() if k in known})
 ```
 
-- [ ] **Step 5: Run the schema test — expect pass**
+- [x] **Step 5: Run the schema test — expect pass**
 
 Run: `cd bakeoff && python -m pytest tests/test_schema.py -v`
 Expected: 4 passed
 
-- [ ] **Step 6: Write the failing event-log test**
+- [x] **Step 6: Write the failing event-log test**
 
 `bakeoff/tests/test_eventlog.py`:
 
@@ -555,12 +555,12 @@ def test_partial_write_does_not_corrupt_index(tmp_path, monkeypatch):
     assert not index.exists() or "r-bad" not in index.read_text()
 ```
 
-- [ ] **Step 7: Run it to confirm it fails**
+- [x] **Step 7: Run it to confirm it fails**
 
 Run: `cd bakeoff && python -m pytest tests/test_eventlog.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'bakeoff.eventlog'`
 
-- [ ] **Step 8: Implement the event log**
+- [x] **Step 8: Implement the event log**
 
 `bakeoff/src/bakeoff/eventlog.py`:
 
@@ -651,12 +651,12 @@ class EventLog:
         return [p.stem for p in self.runs_dir.glob("*.json")]
 ```
 
-- [ ] **Step 9: Run both test files — expect pass**
+- [x] **Step 9: Run both test files — expect pass**
 
 Run: `cd bakeoff && python -m pytest tests/ -v`
 Expected: 9 passed
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 cd bakeoff && git add pyproject.toml src/bakeoff/__init__.py src/bakeoff/schema.py src/bakeoff/eventlog.py tests/test_schema.py tests/test_eventlog.py && git commit -m "feat: run-record schema and append-only event log"
