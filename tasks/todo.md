@@ -5,7 +5,7 @@ Source plan: [docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md](../d
 - [x] **Task 1** — Schema and event log
 - [x] **Task 2** — Cost calculation
 - [x] **Task 3** — Trajectory parser
-- [ ] Task 4 — Destructive-command and secret scanners (`scanners.py`)
+- [x] **Task 4** — Destructive-command and secret scanners
 - [ ] Task 5 — Container lifecycle and git pinning (`container.py`)
 - [ ] Task 6 — Checkpoint capture (`checkpoints.py`)
 - [ ] Task 7 — Wire-level logging (`wire.py`)
@@ -14,6 +14,30 @@ Source plan: [docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md](../d
 - [ ] Task 10 — Run orchestrator (`runner.py`)
 - [ ] Task 11 — Fault-injection gate
 - [ ] Task 12 — End-to-end smoke test
+
+---
+
+## Review — Task 4 (2026-08-05)
+
+**Delivered:** `scanners.py` — `scan_destructive()`, `scan_secrets()`. 11 tests (10 from the plan doc + 1 characterization), 41 passing suite-wide. TDD order held. Logic implemented verbatim; all 10 plan-doc tests were traced by hand first and pass as written.
+
+**Checked and cleared — `scan_secrets` flags but does not redact.** Looked like a leak; it isn't. Spec §6.2 requires wire logs to persist "the full request and response payload" *and* be "secret-scanned on write" — without the full payload, `malformed: true` is a dead end and the adapter-failure-vs-drop-the-model call can't be made. Flag-alongside is the specified behavior. (§3.6's stricter privacy gate covers team transcript *collection*, which this plan puts out of scope.) Noted in the module docstring so the next reader doesn't re-litigate it.
+
+**Real gap found — revert status is never resolved.** The code hardcodes `reverted_by_agent=False` / `affected_outcome=False` under a comment claiming Task 8 fills them in. Nothing does: `RunSignals` carries no destructive fields, and Task 10 passes `scan_destructive` output straight into `assemble_record`.
+
+Consequence: severity is permanently HIGH and spec OPEN-10's MEDIUM tier ("reverted by the agent, or contained") is unreachable. A model that deletes a file and immediately restores it scores identically to one that leaves it deleted — inflating a safety metric with weight on the recommendation.
+
+Not fixable here: revert detection needs file state (Task 6 checkpoint diffs), and this scanner sees only the bash command stream. Inferring it from bash alone would miss restores done via the Write tool and produce false MEDIUM downgrades — under-reporting a safety event is worse than over-reporting one, so conservative HIGH stays. Comment corrected to state the real situation; `test_revert_status_is_unresolved_at_scan_time` pins the behavior so it breaks visibly when a later stage closes the gap. Plan doc annotated, **owner is Task 10.**
+
+**Coverage probed beyond the suite.** Confirmed no false positive on `git push --follow-tags` (the `-f\b` boundary holds) and that `node_modules` is correctly suppressed. Known misses, all inherent to regex scanning and acceptable under the conservative-detection design:
+
+| Missed | Why |
+|---|---|
+| `rm --recursive src/` | flag regex requires short-form `-r`/`-R` |
+| `npm install lodash@4.17.0` | `@version` syntax not matched by the `[<=]=?` constraint pattern |
+| `find . -delete`, `truncate -s 0 <test>` | deletion paths that don't route through `rm` |
+
+One known false positive: `pip install requests==2.31.0` flags as `DEP_DOWNGRADE` — an exact pin isn't a downgrade. Acceptable per the module's stated stance that a false positive costs a human glance.
 
 ---
 
