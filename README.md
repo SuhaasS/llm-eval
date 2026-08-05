@@ -1,0 +1,39 @@
+# Pindrop LLM Bakeoff Eval
+
+Internal eval harness for scoring agentic-coding models (Nemotron 3 Super 120B, Gemma 4 31B, Kimi K2.5, Claude Sonnet 5) on Pindrop's own repos, routed through a self-hosted LiteLLM proxy against AWS Bedrock.
+
+The eval measures; it does not decide. Sonnet 5 is an arm, not the answer key.
+
+## Docs
+
+| Doc | What it is |
+|---|---|
+| [Model_Bakeoff_Plan.md](docs/Model_Bakeoff_Plan.md) | Candidate comparison, cost analysis, LiteLLM vs. OpenRouter, timeline |
+| [specs/2026-08-03-llm-bakeoff-eval-design.md](docs/superpowers/specs/2026-08-03-llm-bakeoff-eval-design.md) | Eval design spec — data pipeline, scoring, success criteria |
+| [plans/2026-08-04-bakeoff-harness-logging.md](docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md) | Implementation plan, Tasks 1–12 |
+
+## Primary deliverable
+
+A complete, immutable event log of every run. Scores are derived views over that log — re-running 2,000 agentic sessions is expensive, re-scoring a preserved log is free.
+
+## Planned layout
+
+```
+bakeoff/
+├── pyproject.toml
+├── src/bakeoff/
+│   ├── schema.py         # run record dataclasses; SCHEMA_VERSION
+│   ├── eventlog.py       # append-only writer/reader; immutability enforcement
+│   ├── costs.py          # PriceBook: TokenUsage -> USD
+│   ├── trajectory.py     # Claude Code JSONL -> turns, tool calls, usage
+│   ├── container.py      # Docker lifecycle, git pinning, diff extraction
+│   ├── checkpoints.py    # per-turn diff capture
+│   ├── scanners.py       # destructive-command and secret scanning
+│   ├── wire.py           # LiteLLM callback -> wire log
+│   ├── claude_runner.py  # Claude Code subprocess with controlled config
+│   ├── classify.py       # failure_class and exclusion classification
+│   └── runner.py         # orchestrates one run end-to-end
+└── tests/
+```
+
+Status: docs only. Harness implementation starts at Task 1 (schema + event log).
