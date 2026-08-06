@@ -48,6 +48,8 @@ Integration tests are opt-in — they need a Docker daemon, and on macOS they ne
 cd bakeoff && .venv/bin/python -m pytest -v -m integration --basetemp="$HOME/.cache/bakeoff-pytest"
 ```
 
-Status: Tasks 1–8 complete (schema, event log, pricing, trajectory parser, scanners, container, checkpoints, wire logging, classification). 75 unit + 9 integration tests passing.
+Status: Tasks 1–9 complete (schema, event log, pricing, trajectory parser, scanners, container, checkpoints, wire logging, classification, Claude Code runner). 96 unit + 9 integration tests passing.
 
-Bedrock model IDs in [config/litellm_config.yaml](bakeoff/config/litellm_config.yaml) are verified against the AWS model cards; routing and auth are not — Phase 0c's smoke test is the gate.
+Bedrock model IDs and per-arm sampling in [config/litellm_config.yaml](bakeoff/config/litellm_config.yaml) are verified against the AWS model cards and each lab's published guidance. Routing, auth, and whether the proxy actually applies that sampling are not — Phase 0c's smoke test is the gate, and it reads the applied values back from the wire log rather than from the config file.
+
+Eval runs are pinned to `claude 2.1.220` and launched with `CLAUDE_CONFIG_DIR` pointed at an empty per-run directory, so they never load your `~/.claude` settings, hooks, skills, or plugins. Your own Claude Code sessions are unaffected.

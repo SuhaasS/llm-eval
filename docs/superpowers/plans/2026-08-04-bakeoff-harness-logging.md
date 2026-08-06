@@ -2748,7 +2748,17 @@ cd bakeoff && git add src/bakeoff/classify.py tests/test_classify.py && git comm
 - Consumes: nothing from earlier tasks
 - Produces: `ClaudeCodeConfig` dataclass; `build_command(config) -> list[str]`; `build_env(config) -> dict[str, str]`; `config_digest(config) -> str`; `ClaudeCodeRunner(config)` with `.run(prompt: str, cwd: str) -> RunnerResult`; `RunnerResult(exit_code, transcript_path, stdout, stderr, wall_clock_ms, timed_out)`
 
-- [ ] **Step 1: Create the frozen eval settings**
+> **Corrections, 2026-08-06.** Checked against the installed CLI, **claude 2.1.220** — the `versions.claude_code` floor for the eval. `--max-turns` was suspected missing (absent from `--help`) but **is present**: 9 hits in the binary, including the `--max-turns <turns>` option definition. It is simply hidden. All 9 given tests pass as written. Four defects found, three demonstrated by running the plan's own code.
+>
+> **1. `--settings` does not replace user settings, it adds to them.** Help text, verbatim: "Path to a settings JSON file or a JSON string to load **additional** settings from." So `eval_settings.json` merges *on top of* `~/.claude/settings.json`; `--strict-mcp-config` covers MCP servers only, leaving hooks, skills, output styles, plugins and user `CLAUDE.md` in place. Spec §5.2 requires "no user-level settings" and names this operator's environment as the risk ("hooks, ~15 MCP servers, many skills"). Compounding it, the plan **strips** `CLAUDE_CONFIG_DIR`, which makes Claude Code fall back to `~/.claude` — the lever pulled the wrong way. Corrected to **set** it, to an empty per-run directory: one lever relocates user settings, `CLAUDE.md`, skills, plugins, and `projects/`.
+>
+> **2. The environment was a denylist over the full inherited env.** `dict(os.environ)` minus three keys. On the authoring machine 19 `CLAUDE*`/`ANTHROPIC*` variables are set and **none of the three popped keys is among them**. The load-bearing case: `CLAUDE_CODE_USE_BEDROCK` and `CLAUDE_CODE_USE_VERTEX` are both in the 2.1.220 binary, and either makes the CLI ignore `ANTHROPIC_BASE_URL` and call the provider directly — bypassing the proxy and leaving the §6.2-mandatory wire log empty while the run looks normal. Demonstrated: both survive `build_env` as written. Replaced with an allowlist (`PATH`, `HOME`, `LANG`, `LC_ALL`, `TZ`, `TMPDIR`, `SSL_CERT_FILE`), which fails closed.
+>
+> **3. `_find_transcript` could return another run's transcript.** It returned the newest `*.jsonl` in the project dir whether or not this run wrote it; Task 10 reuses one repo path across the N=10 samples and across arms, so a run that crashes before writing inherits the *previous* model's trajectory, tokens and cost. Demonstrated: with this run writing nothing, it returns `prev-run.jsonl`. Separately, the munging rule is wrong — Claude Code hyphenates dots as well as separators (`/Users/x/.claude` → `-Users-x--claude`, confirmed on disk), so any repo path containing a dot resolves to a nonexistent directory, returns `None`, and Task 10 records turns, tokens and cost as zero without complaint. Both close by globbing the per-run config dir from correction 1.
+>
+> **4. `temperature` was a silent no-op, and a uniform value would have broken two arms.** The field reached neither command nor env, and `litellm_config.yaml` set no temperature, so §5.3 was unimplemented while `RunRecord.sampling` stood ready to record a value that was never applied — the Task 8 `FALSE_SUCCESS` failure mode again. Routed to the proxy, the only layer that can apply it. Values verified against each lab on 2026-08-06, and they are **not** interchangeable: **Claude Sonnet 5 returns 400 on any non-default `temperature`/`top_p`/`top_k`**, Moonshot documents **temperature 0 causing multi-minute stalls** on Kimi K2.5, and Gemma 4 31B and Nemotron 3 Super both document 1.0 / top_p 0.95. A single uniform number — temperature 0 being the intuitive "fair" choice — would fail every call on the reference arm and convert Kimi's config error into a latency measurement, which is precisely the §5.4 failure mode. §5.3's "(or lab-recommended)" clause is load-bearing: what is held identical across arms is the policy, not the number. `config_digest` therefore **excludes** temperature, since folding a necessarily-per-model value into a cross-arm identity digest would make the digest assert something false.
+
+- [x] **Step 1: Create the frozen eval settings**
 
 `bakeoff/config/eval_settings.json`:
 
@@ -2765,15 +2775,20 @@ cd bakeoff && git add src/bakeoff/classify.py tests/test_classify.py && git comm
 
 Runs are non-interactive inside a network-isolated container, so permission prompts would deadlock. Isolation comes from the container, not from the permission layer.
 
-- [ ] **Step 2: Write the failing test**
+This file is **additive**, not authoritative — `--settings` merges it on top of whatever is already loaded. `CLAUDE_CONFIG_DIR` is what makes it the only settings file in play.
+
+- [x] **Step 2: Write the failing test**
 
 `bakeoff/tests/test_claude_runner.py`:
 
 ```python
+import json
+
 import pytest
 
 from bakeoff.claude_runner import (
     ClaudeCodeConfig,
+    ClaudeCodeRunner,
     build_command,
     build_env,
     config_digest,
@@ -2786,6 +2801,7 @@ def make_config(**overrides) -> ClaudeCodeConfig:
         base_url="http://127.0.0.1:4000",
         auth_token="test-token",
         settings_path="/cfg/eval_settings.json",
+        config_dir="/run/artifacts/r-001/claude-config",
         max_turns=60,
         wall_clock_timeout_s=1800,
     )
@@ -2848,14 +2864,167 @@ def test_config_digest_ignores_model_so_arms_are_comparable():
     assert config_digest(make_config(model="kimi-k2-5")) == config_digest(
         make_config(model="claude-sonnet-5")
     )
+
+
+# --- configuration isolation (spec section 5.2) ------------------------------
+
+
+def test_env_isolates_config_dir_from_operator_setup():
+    """CLAUDE_CONFIG_DIR must be SET, not stripped.
+
+    `--settings` loads *additional* settings (verified against the claude
+    2.1.220 help text), so it merges on top of ~/.claude/settings.json
+    rather than replacing it. Stripping CLAUDE_CONFIG_DIR makes Claude Code
+    fall back to ~/.claude -- the operator's real hooks, skills, plugins and
+    CLAUDE.md, which section 5.2 names as the highest-risk contamination
+    source. Pointing it at an empty per-run directory is the actual lever.
+    """
+    config = make_config()
+    env = build_env(config)
+    assert env["CLAUDE_CONFIG_DIR"] == config.config_dir
+
+
+def test_env_does_not_leak_ambient_claude_variables(monkeypatch):
+    """The parent environment is not a safe base to start from.
+
+    A harness run is itself often launched from a Claude Code session, so
+    these are set in practice, not hypothetically.
+    """
+    monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.setenv("CLAUDE_EFFORT", "high")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "parent-session")
+    monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "cli")
+
+    env = build_env(make_config())
+
+    for leaked in (
+        "CLAUDECODE",
+        "CLAUDE_EFFORT",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_CODE_ENTRYPOINT",
+    ):
+        assert leaked not in env
+
+
+def test_env_cannot_silently_bypass_the_proxy(monkeypatch):
+    """Spec section 6.2 makes wire logging mandatory, and the wire log only
+    exists because every call goes through the LiteLLM proxy.
+
+    CLAUDE_CODE_USE_BEDROCK and CLAUDE_CODE_USE_VERTEX (both present in the
+    claude 2.1.220 binary) make the CLI ignore ANTHROPIC_BASE_URL and call
+    the provider directly. Inheriting either -- plausible in a shell at a
+    Bedrock shop -- produces a run that looks normal and has an empty wire
+    log. This is the failure that must not be possible.
+    """
+    monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
+    monkeypatch.setenv("CLAUDE_CODE_USE_VERTEX", "1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-operator-key")
+
+    env = build_env(make_config())
+
+    assert "CLAUDE_CODE_USE_BEDROCK" not in env
+    assert "CLAUDE_CODE_USE_VERTEX" not in env
+    assert "ANTHROPIC_API_KEY" not in env
+    assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:4000"
+
+
+def test_env_preserves_what_the_subprocess_needs_to_start():
+    """The allowlist must not be so tight that `claude` cannot be resolved
+    or run. A test that only asserts absence would pass on an empty dict."""
+    env = build_env(make_config())
+    assert env["PATH"]
+    assert env["HOME"]
+
+
+def test_config_digest_covers_environment_not_just_command():
+    """The digest is stored as proof the arms ran identically, but every
+    behavior knob except --max-turns lives in the environment. A digest over
+    the command alone would certify two differently-configured runs as the
+    same."""
+    assert config_digest(make_config()) != config_digest(
+        make_config(max_output_tokens=4096)
+    )
+
+
+def test_config_digest_ignores_per_model_sampling():
+    """Spec section 5.3 freezes sampling at each model's lab-recommended
+    setting, and those differ: Sonnet 5 returns 400 on any non-default
+    sampling parameter, Kimi K2.5 stalls for minutes at 0, Gemma and
+    Nemotron document 1.0. What is identical across arms is the policy, not
+    the number.
+
+    Digesting the number would make config_digest -- the artifact that
+    certifies the arms ran under one configuration -- differ per arm for a
+    reason that is not a configuration difference.
+    """
+    assert config_digest(make_config(temperature=None)) == config_digest(
+        make_config(temperature=1.0)
+    )
+
+
+def test_config_digest_excludes_the_auth_token():
+    """The digest lands in the run record, which is written to disk and
+    shared. A secret must not be derivable from it, and the token does not
+    affect behavior."""
+    assert config_digest(make_config(auth_token="token-a")) == config_digest(
+        make_config(auth_token="token-b")
+    )
+
+
+# --- transcript discovery ----------------------------------------------------
+
+
+def test_transcript_is_never_taken_from_another_run(tmp_path):
+    """A run that produced no transcript must report None.
+
+    Selecting the newest *.jsonl under a shared project directory would hand
+    back the PREVIOUS run's trajectory -- another model's turns, tokens and
+    cost, attributed to this run. Task 10 reuses one repo path across the
+    N=10 samples and across arms, so the neighbouring file is routinely a
+    different model's.
+    """
+    config_dir = tmp_path / "run-002" / "claude-config"
+    (config_dir / "projects" / "-work-repo").mkdir(parents=True)
+
+    stale = tmp_path / "run-001" / "claude-config" / "projects" / "-work-repo"
+    stale.mkdir(parents=True)
+    (stale / "aaaaaaaa-0000-0000-0000-000000000000.jsonl").write_text(
+        json.dumps({"type": "assistant", "sessionId": "previous-run"}) + "\n"
+    )
+
+    assert ClaudeCodeRunner._find_transcript(str(config_dir)) is None
+
+
+def test_transcript_found_regardless_of_path_punctuation(tmp_path):
+    """Claude Code hyphenates dots as well as separators when munging cwd
+    into a project directory name -- /Users/x/.claude becomes
+    -Users-x--claude. Reimplementing that rule with str.replace("/", "-")
+    misses any repo path containing a dot, returns None, and Task 10 then
+    records turns, tokens and cost as zero without complaint.
+
+    Globbing the per-run config dir sidesteps the rule entirely.
+    """
+    config_dir = tmp_path / "claude-config"
+    munged = config_dir / "projects" / "-work-repo-v1-2--hidden"
+    munged.mkdir(parents=True)
+    transcript = munged / "bbbbbbbb-0000-0000-0000-000000000000.jsonl"
+    transcript.write_text(
+        json.dumps({"type": "assistant", "sessionId": "this-run"}) + "\n"
+    )
+
+    assert ClaudeCodeRunner._find_transcript(str(config_dir)) == transcript
+
+
+def test_missing_config_dir_reports_no_transcript(tmp_path):
+    assert ClaudeCodeRunner._find_transcript(str(tmp_path / "never-created")) is None
 ```
 
-- [ ] **Step 3: Run to confirm it fails**
+- [x] **Step 3: Run to confirm it fails**
 
 Run: `cd bakeoff && python -m pytest tests/test_claude_runner.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'bakeoff.claude_runner'`
 
-- [ ] **Step 4: Implement the runner**
+- [x] **Step 4: Implement the runner**
 
 `bakeoff/src/bakeoff/claude_runner.py`:
 
@@ -2866,6 +3035,27 @@ Spec section 5.2: CLAUDE.md, settings, hooks, MCP servers, and skills all
 change agent behavior. Any of them leaking into a run contaminates results,
 and unevenly across models. Everything is pinned explicitly here, and
 config_digest() is stored on every run record as proof.
+
+Two levers do the pinning, and neither is optional:
+
+  CLAUDE_CONFIG_DIR   points at an empty per-run directory. `--settings`
+                      loads *additional* settings, so it merges on top of
+                      the operator's ~/.claude/settings.json rather than
+                      replacing it; relocating the config dir is what
+                      actually detaches user settings, CLAUDE.md, skills
+                      and plugins. It also relocates projects/, which is
+                      why transcript discovery is unambiguous.
+
+  an env allowlist    rather than a denylist. A denylist has to anticipate
+                      every contaminant; the one that matters most is
+                      CLAUDE_CODE_USE_BEDROCK / CLAUDE_CODE_USE_VERTEX,
+                      either of which makes the CLI ignore
+                      ANTHROPIC_BASE_URL and call the provider directly --
+                      bypassing the proxy and leaving the mandatory wire
+                      log (section 6.2) empty, with the run still looking
+                      normal.
+
+Verified against claude 2.1.220.
 """
 
 from __future__ import annotations
@@ -2880,6 +3070,22 @@ from pathlib import Path
 
 EMPTY_MCP_CONFIG = '{"mcpServers":{}}'
 
+# The only ambient variables the subprocess inherits. It reaches Bedrock
+# through the LiteLLM proxy over HTTP with a bearer token, so it needs no
+# AWS credentials and none are passed.
+PASSTHROUGH_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TZ", "TMPDIR", "SSL_CERT_FILE")
+
+# Per-run or per-arm values: they must not move the digest, or the digest
+# stops proving that the arms were configured identically.
+DIGEST_EXCLUDED_ENV = frozenset(
+    {
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_BASE_URL",
+        "CLAUDE_CONFIG_DIR",
+    }
+)
+
 
 @dataclass(frozen=True)
 class ClaudeCodeConfig:
@@ -2887,8 +3093,17 @@ class ClaudeCodeConfig:
     base_url: str
     auth_token: str
     settings_path: str
+    config_dir: str
     max_turns: int
     wall_clock_timeout_s: int
+    # Uniform across arms, but see the tokenizer note in config/README:
+    # Sonnet 5's tokenizer emits ~30% more tokens for the same text, so an
+    # identical numeric cap is not an identical text budget.
+    max_output_tokens: int = 16384
+    # Applied by the LiteLLM proxy, not by this process -- Claude Code has
+    # no temperature flag. Carried here only so the run record can state
+    # what the proxy was configured to send (spec section 5.3); None means
+    # "send no temperature", which is mandatory for Sonnet 5.
     temperature: float | None = None
 
 
@@ -2919,37 +3134,57 @@ def build_command(config: ClaudeCodeConfig) -> list[str]:
     ]
 
 
+def _eval_env(config: ClaudeCodeConfig) -> dict[str, str]:
+    """The variables the harness sets deliberately."""
+    return {
+        "CLAUDE_CONFIG_DIR": config.config_dir,
+        "ANTHROPIC_BASE_URL": config.base_url,
+        "ANTHROPIC_AUTH_TOKEN": config.auth_token,
+        "ANTHROPIC_MODEL": config.model,
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        "DISABLE_AUTOUPDATER": "1",
+        "DISABLE_TELEMETRY": "1",
+        "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(config.max_output_tokens),
+    }
+
+
 def build_env(config: ClaudeCodeConfig) -> dict[str, str]:
-    env = dict(os.environ)
-    env.update(
-        {
-            "ANTHROPIC_BASE_URL": config.base_url,
-            "ANTHROPIC_AUTH_TOKEN": config.auth_token,
-            "ANTHROPIC_MODEL": config.model,
-            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-            "DISABLE_AUTOUPDATER": "1",
-            "DISABLE_TELEMETRY": "1",
-            "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "16384",
-        }
-    )
-    # Strip anything that could pull in personal configuration.
-    for key in ("CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY", "CLAUDE_CODE_SSE_PORT"):
-        env.pop(key, None)
+    env = {key: os.environ[key] for key in PASSTHROUGH_ENV if key in os.environ}
+    env.update(_eval_env(config))
     return env
 
 
 def config_digest(config: ClaudeCodeConfig) -> str:
     """Digest of everything that must be identical across arms.
 
-    Deliberately excludes `model` (that is the independent variable) and
-    `auth_token` (a secret, and not behavior-affecting).
+    Deliberately excludes `model` (that is the independent variable),
+    `auth_token` (a secret, and not behavior-affecting), `base_url` and
+    `config_dir` (per-run paths), and `temperature`.
+
+    Temperature is excluded because it is necessarily per-model: Sonnet 5
+    returns 400 on any non-default sampling parameter, Kimi K2.5 stalls for
+    minutes at 0, and the other arms document 1.0. Spec section 5.3's "or
+    lab-recommended" clause means the thing held identical across arms is
+    the policy -- each model at its documented operating point -- not the
+    number. Folding a per-model number into a cross-arm identity digest
+    would make the digest assert something false. The values themselves are
+    recorded per run in RunRecord.sampling.
+
+    Covers the environment as well as the command, because every knob
+    except --max-turns lives in the environment. The passthrough *keys* are
+    included so that widening the allowlist moves the digest; their values
+    are not, since they are machine paths rather than eval configuration.
     """
     payload = {
         k: v
         for k, v in asdict(config).items()
-        if k not in {"model", "auth_token", "base_url"}
+        if k not in {"model", "auth_token", "base_url", "config_dir", "temperature"}
     }
     payload["command_shape"] = build_command(config)[1:]
+    payload["env_shape"] = {
+        k: v for k, v in _eval_env(config).items() if k not in DIGEST_EXCLUDED_ENV
+    }
+    payload["env_passthrough"] = sorted(PASSTHROUGH_ENV)
     blob = json.dumps(payload, sort_keys=True)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
@@ -2961,6 +3196,9 @@ class ClaudeCodeRunner:
     def run(self, prompt: str, cwd: str) -> RunnerResult:
         command = build_command(self.config)
         env = build_env(self.config)
+        # The caller owns freshness: this directory must be empty at the
+        # start of each run, or transcript discovery loses its guarantee.
+        Path(self.config.config_dir).mkdir(parents=True, exist_ok=True)
         started = time.monotonic()
         timed_out = False
 
@@ -2985,7 +3223,7 @@ class ClaudeCodeRunner:
         wall_clock_ms = int((time.monotonic() - started) * 1000)
         return RunnerResult(
             exit_code=exit_code,
-            transcript_path=self._find_transcript(cwd),
+            transcript_path=self._find_transcript(self.config.config_dir),
             stdout=stdout,
             stderr=stderr,
             wall_clock_ms=wall_clock_ms,
@@ -2993,36 +3231,48 @@ class ClaudeCodeRunner:
         )
 
     @staticmethod
-    def _find_transcript(cwd: str) -> Path | None:
-        """Claude Code writes transcripts to
-        ~/.claude/projects/<munged-cwd>/<session-uuid>.jsonl, where the
-        munged directory replaces path separators with hyphens."""
-        munged = str(Path(cwd).resolve()).replace("/", "-")
-        project_dir = Path.home() / ".claude" / "projects" / munged
-        if not project_dir.is_dir():
+    def _find_transcript(config_dir: str) -> Path | None:
+        """Locate this run's transcript under <config_dir>/projects/.
+
+        Globbing rather than reconstructing the project directory name:
+        Claude Code hyphenates dots as well as separators when munging cwd
+        (/Users/x/.claude becomes -Users-x--claude), so a replace("/", "-")
+        rule silently misses any repo path containing a dot.
+
+        The directory is fresh per run, so anything found belongs to this
+        run and an empty result is an honest "no transcript" rather than a
+        neighbouring run's. Sub-sessions write their own files; the most
+        recently written one is the main session, which ends last.
+        """
+        projects = Path(config_dir) / "projects"
+        if not projects.is_dir():
             return None
         transcripts = sorted(
-            project_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True
+            projects.glob("**/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True
         )
         return transcripts[0] if transcripts else None
 ```
 
-- [ ] **Step 5: Run — expect pass**
+- [x] **Step 5: Run — expect pass**
 
 Run: `cd bakeoff && python -m pytest tests/test_claude_runner.py -v`
-Expected: 9 passed
+Expected: 19 passed (9 as given, plus 10 covering the four corrections)
 
-- [ ] **Step 6: Verify the CLI flags actually exist in the installed version**
+- [x] **Step 6: Verify the CLI flags actually exist in the installed version**
 
 Run: `claude --help`
-Expected: `-p`, `--output-format`, `--strict-mcp-config`, `--mcp-config`, `--settings`, `--max-turns` all present.
+Expected: `-p`, `--output-format`, `--strict-mcp-config`, `--mcp-config`, `--settings` all present.
+
+**`--max-turns` is not in `--help` and is still valid.** Confirmed present in the claude 2.1.220 binary (`strings` shows the `--max-turns <turns>` option definition). Absence from help output is not evidence a flag is gone — check the binary before changing `build_command`, since dropping the turn cap would silently remove the §5.4 budget the whole eval is measured against.
+
+Also read `--settings` closely: it loads *additional* settings. It is not a replacement, and on its own it does not satisfy §5.2.
 
 If any flag differs in your installed version, fix `build_command` and its test together. Record the observed `claude --version` in the commit message — it becomes the `versions.claude_code` floor for the whole eval.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
-cd bakeoff && git add src/bakeoff/claude_runner.py config/eval_settings.json tests/test_claude_runner.py && git commit -m "feat: Claude Code runner with pinned, model-independent config digest"
+git add bakeoff/src/bakeoff/claude_runner.py bakeoff/config/eval_settings.json bakeoff/config/litellm_config.yaml bakeoff/tests/test_claude_runner.py bakeoff/tests/test_config.py && git commit -m "feat: Claude Code runner with isolated config and model-independent digest"
 ```
 
 ---
@@ -3036,6 +3286,22 @@ cd bakeoff && git add src/bakeoff/claude_runner.py config/eval_settings.json tes
 **Interfaces:**
 - Consumes: everything from Tasks 1-9
 - Produces: `TaskSpec` dataclass; `execute_run(task: TaskSpec, model: str, sample_index: int, config: ClaudeCodeConfig, event_log: EventLog, ...) -> RunRecord`
+
+> **Defects carried forward from Tasks 3–9, to close here. Accumulated 2026-08-05/06 — read before implementing.**
+>
+> Each was found while implementing an earlier task and could not be fixed there. Ordered by how badly the recorded data is wrong if it ships as written.
+>
+> 1. **The agent does not run in the container.** `execute_run` calls `ClaudeCodeRunner(config).run(prompt, cwd=repo_path)` — a **host** subprocess, while the pinned container merely runs alongside it. The agent therefore gets host network (the container's `network_mode="none"` does not apply to it), the host toolchain rather than the digest-pinned image, and filesystem reach beyond the repo. Every isolation guarantee in §5.1 is void for the process actually under test, while the run record asserts a pinned image digest. **Decide before implementing: exec inside the container, or stop making the §5.1 claims.**
+> 2. **Checkpoints are captured after the run ends**, so every one snapshots the same final state — the per-turn progression §5.5 is built on is fabricated (Task 6).
+> 3. `force_capture(turn=len(captured) + 1)` numbers the final checkpoint by count rather than turn, so turn numbers are wrong whenever any capture was skipped (Task 6).
+> 4. Intermediate `maybe_capture` calls pass `elapsed_ms=0` (Task 6).
+> 5. `reverted_by_agent` / `affected_outcome` are never populated, so destructive severity is permanently HIGH and OPEN-10's MEDIUM tier is unreachable (Task 4).
+> 6. `assemble_record` calls `parse_trajectory` unguarded: a candidate returning cache tokens trips Task 2's pricing guard and **the run record is never written at all** (Task 3).
+> 7. `WireLogger` is constructed outside the `try`, so with mode `"xt"` a pre-existing wire log raises before any record can be written (Task 7).
+> 8. Pass `tests_passed=None`, not `False` — `False` labelled every clean run `FALSE_SUCCESS` (Task 8). Register the callback per run as `litellm.callbacks = [BakeoffCallback(wire_logger, run_id)]`; the config file cannot do it (Task 7).
+> 9. `tool_calls_malformed` is always 0, leaving `TOOL_MALFORMATION` and `ADAPTER_FAILURE` unreachable (Tasks 7, 8).
+> 10. `execute_run` must create a fresh, **empty** per-run `config_dir` and pass it on `ClaudeCodeConfig`, then clean it up after copying the transcript into artifacts. Transcript discovery's correctness depends on that directory starting empty — a reused one reintroduces the stale-transcript bug Task 9 closed (Task 9).
+> 11. Populate `RunRecord.sampling` from the **wire log**, not from `ClaudeCodeConfig.temperature` — the config records what was requested, the wire log what was sent (Task 9).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -3834,6 +4100,12 @@ cd bakeoff && git add scripts/smoke_test.py fixtures/smoke_task && git commit -m
 **Known deferrals inside this plan.** `ToolCallStats.malformed` is populated by the wire log rather than the trajectory (Claude Code's transcript does not record parse failures), so wiring it through `assemble_record` lands in the scoring plan alongside wire-log analysis. `Checkpoint.tests_pass` stays `None` by design — §5.5 requires offline grading. `RunSignals.tests_passed` is likewise unknown at harness time; it is now `None` rather than `False` (see the Task 8 correction — hardcoding `False` labelled every clean run `FALSE_SUCCESS`), and the offline grader re-derives `outcome` and `failure_class` from the stored record.
 
 Because `ToolCallStats.malformed` is never populated during a run, note the knock-on: `TOOL_MALFORMATION` and `ADAPTER_FAILURE` are both unreachable at harness time, so the adapter-vs-model distinction §6.4 calls the eval's most consequential call cannot fire until the wire-log analysis lands.
+
+**§5.2 is only half-implemented, and the missing half is the verification half.** The section requires "dumping and diffing the effective config at session start of every run" with the dump stored in the run record. Task 9 pins the config and digests the *intent*; it does not read back what the session actually loaded. Those are different claims — if `--settings` silently fails to load, the digest is unchanged and identical across arms while the runs are contaminated. The `-p --output-format stream-json` init event carries the effective model, tools and MCP servers, so the dump is capturable, but only from a live run. **Task 12 gate**, not fakeable offline.
+
+**Sampling is configured but not confirmed applied.** `litellm_config.yaml` now sets each arm's lab-recommended temperature (Sonnet 5: none, by API constraint). LiteLLM merges `litellm_params` as defaults, and a temperature in Claude Code's own request body may win. Only the wire log shows what was sent, so **Task 12 reads the applied sampling back from `wire.jsonl`** rather than trusting the config file, and `RunRecord.sampling` should be populated from the wire log for the same reason.
+
+**Two token-budget asymmetries that §5.4 should weigh before the caps are frozen.** Sonnet 5 ships a new tokenizer producing ~30% more tokens for the same text (Anthropic's own migration guidance). So (a) a uniform `CLAUDE_CODE_MAX_OUTPUT_TOKENS` and a uniform token cap give Sonnet ~30% less *text* budget than the other arms — the §5.4 failure mode, a config choice scored as a capability difference; and (b) cost-per-task is not directly comparable across arms at equal text, since Sonnet bills more tokens for the same output. Neither is fixed here: §5.4 derives caps from the calibration pilot, which is where this belongs. Separately, `PRICE_BOOK` carries Sonnet 5 at standard $3/$15 while Anthropic lists introductory $2/$10 through 2026-08-31 — **whether Bedrock mirrors that introductory rate is unverified**, and worth checking against the AWS pricing page before any cost figure is published.
 
 ---
 

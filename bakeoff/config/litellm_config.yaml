@@ -25,13 +25,42 @@
 #   Gemma      /openai/v1     (OpenAI Chat Completions)
 #   Nemotron   /v1            (OpenAI Chat Completions)
 #   Kimi       /v1            (OpenAI Chat Completions)
+#
+# SAMPLING (spec section 5.3). Claude Code has no temperature flag, so this
+# file is the only layer that can set it. Values verified against each
+# lab's published guidance on 2026-08-06:
+#
+#   claude-sonnet-5   OMITTED. Setting temperature, top_p or top_k to a
+#                     non-default value returns 400. Configuring one here
+#                     would fail every call on the reference arm.
+#   gemma-4-31b       temperature 1.0, top_p 0.95
+#   nemotron-3-...    temperature 1.0, top_p 0.95 (all tasks, per NVIDIA)
+#   kimi-k2-5         temperature 1.0, top_p 0.95 (thinking mode). Moonshot
+#                     documents temperature 0 causing multi-minute stalls.
+#
+# Section 5.3 says "0.6 (or lab-recommended)". Lab-recommended is what is
+# used: a single uniform number would 400 one arm and stall another, which
+# is the section 5.4 failure mode -- a config choice scored as a model
+# difference. The constant across arms is the policy, not the value, so
+# config_digest deliberately excludes temperature (see claude_runner).
+#
+# NOT VERIFIED HERE: that the proxy actually sends these. LiteLLM merges
+# litellm_params as defaults and a temperature in Claude Code's own request
+# body may win. Only the wire log shows what was sent -- Phase 0c (Task 12)
+# reads it back from wire.jsonl rather than trusting this file.
 
 model_list:
   # ---- bedrock-mantle (primary) ----
   - model_name: claude-sonnet-5
+    # api_base deliberately omits the /v1 the endpoint actually serves:
+    # LiteLLM's anthropic provider appends "/v1/messages" itself, so the
+    # documented .../anthropic/v1 base produces .../anthropic/v1/v1/messages
+    # and 404s with an empty error body. Verified 2026-08-05 -- raw POST to
+    # .../anthropic/v1/messages returns 200 with this same model id, so the
+    # fault was URL construction, not the endpoint or the model name.
     litellm_params:
       model: anthropic/anthropic.claude-sonnet-5
-      api_base: https://bedrock-mantle.us-east-1.api.aws/anthropic/v1
+      api_base: https://bedrock-mantle.us-east-1.api.aws/anthropic
       api_key: os.environ/AWS_BEARER_TOKEN_BEDROCK
 
   - model_name: gemma-4-31b
@@ -45,24 +74,31 @@ model_list:
       model: openai/google.gemma-4-31b
       api_base: https://bedrock-mantle.us-east-1.api.aws/openai/v1
       api_key: os.environ/AWS_BEARER_TOKEN_BEDROCK
+      temperature: 1.0
+      top_p: 0.95
 
   - model_name: nemotron-3-super-120b
     litellm_params:
       model: openai/nvidia.nemotron-super-3-120b
       api_base: https://bedrock-mantle.us-east-1.api.aws/v1
       api_key: os.environ/AWS_BEARER_TOKEN_BEDROCK
+      temperature: 1.0
+      top_p: 0.95
 
   - model_name: kimi-k2-5
     litellm_params:
       model: openai/moonshotai.kimi-k2.5
       api_base: https://bedrock-mantle.us-east-1.api.aws/v1
       api_key: os.environ/AWS_BEARER_TOKEN_BEDROCK
+      temperature: 1.0
+      top_p: 0.95
 
   # ---- bedrock-runtime (alternate; no Gemma entry) ----
   - model_name: claude-sonnet-5-runtime
     # Must use the us. geo inference profile: the model card lists the
     # In-Region runtime URL as N/A, so the bare ID cannot be invoked.
     # US geo also matches the data-residency posture behind choosing Bedrock.
+    # No temperature/top_p here either -- same 400 as the mantle arm.
     litellm_params:
       model: bedrock/us.anthropic.claude-sonnet-5
       aws_region_name: us-east-1
@@ -71,11 +107,15 @@ model_list:
     litellm_params:
       model: bedrock/nvidia.nemotron-super-3-120b
       aws_region_name: us-east-1
+      temperature: 1.0
+      top_p: 0.95
 
   - model_name: kimi-k2-5-runtime
     litellm_params:
       model: bedrock/moonshotai.kimi-k2.5
       aws_region_name: us-east-1
+      temperature: 1.0
+      top_p: 0.95
 
 litellm_settings:
   # NO `callbacks:` entry here, deliberately. Verified against litellm

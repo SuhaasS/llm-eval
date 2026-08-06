@@ -10,10 +10,68 @@ Source plan: [docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md](../d
 - [x] **Task 6** — Checkpoint capture
 - [x] **Task 7** — Wire-level logging
 - [x] **Task 8** — Failure and exclusion classification
-- [ ] Task 9 — Claude Code runner (`claude_runner.py`)
+- [x] **Task 9** — Claude Code runner
 - [ ] Task 10 — Run orchestrator (`runner.py`)
 - [ ] Task 11 — Fault-injection gate
 - [ ] Task 12 — End-to-end smoke test
+
+---
+
+## Review — Task 9 (2026-08-06)
+
+**Delivered:** `claude_runner.py` — `ClaudeCodeConfig`, `RunnerResult`, `build_command`, `build_env`, `config_digest`, `ClaudeCodeRunner`; `config/eval_settings.json`; per-arm sampling in `config/litellm_config.yaml`. 19 new tests (9 plan-doc + 10), **96 unit + 9 integration passing.**
+
+Everything checked against the installed CLI, **claude 2.1.220** — the `versions.claude_code` floor.
+
+**Verified sound before changing anything.** `--max-turns` is absent from `--help`, which looked like a missing flag and would have meant the §5.4 turn budget silently doing nothing. It is present in the binary (`--max-turns <turns>`), just hidden. No change made — the flag was fine, and removing it on the strength of help output would have deleted the cap the eval is measured against.
+
+**1. `--settings` adds settings, it does not replace them.** Help text: "load **additional** settings from." So `eval_settings.json` merges on top of `~/.claude/settings.json` — hooks, skills, output styles, plugins, user `CLAUDE.md` all still load. `--strict-mcp-config` covers only MCP servers. §5.2 requires "no user-level settings" and names this machine as the risk. The plan also **stripped** `CLAUDE_CONFIG_DIR`, which forces the fallback to `~/.claude` — the lever pulled backwards. Now **set**, to an empty per-run directory; one lever moves user settings, `CLAUDE.md`, skills, plugins and `projects/` at once. Harness subprocesses only — `~/.claude` is never read or modified.
+
+**2. The environment was a denylist over `dict(os.environ)`.** Three keys popped; 19 `CLAUDE*`/`ANTHROPIC*` variables set on this machine, **none of them among the three**. The one that matters:
+
+```
+USE_BEDROCK survives: True
+USE_VERTEX  survives: True
+CLAUDE_CONFIG_DIR set: False
+```
+
+`CLAUDE_CODE_USE_BEDROCK` / `USE_VERTEX` (both in the 2.1.220 binary) make the CLI ignore `ANTHROPIC_BASE_URL` and call the provider directly — proxy bypassed, §6.2-mandatory wire log empty, run looks normal. Replaced with an allowlist, which fails closed.
+
+**3. `_find_transcript` could return another run's transcript.** Two problems, both demonstrated against the plan's own code:
+
+```
+=== stale transcript ===
+this run wrote nothing; returned: prev-run.jsonl
+
+=== dot in path ===
+real dir on disk : repo-v1
+plan looks for   : repo.v1
+transcript found : None
+```
+
+Newest-by-mtime in a shared project dir hands back the *previous* model's trajectory, tokens and cost when this run crashes early — and Task 10 reuses one repo path across the N=10 and across arms. Separately the munging rule is wrong: Claude Code hyphenates dots as well as separators (`/Users/x/.claude` → `-Users-x--claude`, confirmed on disk), so a dotted repo path yields `None` and Task 10 records zeros without complaint. Both close by globbing the per-run config dir.
+
+**4. `temperature` was a no-op, and the intuitive fix would have broken two arms.** The field reached neither command nor env, and the proxy config set nothing — so §5.3 was unimplemented while `RunRecord.sampling` stood ready to record a value never applied. Same shape as the Task 8 `FALSE_SUCCESS` bug: the record asserting something untrue.
+
+Routed to the proxy, the only layer that can apply it. Values verified per lab, and they are **not** interchangeable:
+
+| Arm | Setting | Why |
+|---|---|---|
+| Claude Sonnet 5 | **omit entirely** | non-default `temperature`/`top_p`/`top_k` returns **400** |
+| Kimi K2.5 | 1.0, top_p 0.95 | Moonshot documents **multi-minute stalls at 0** |
+| Nemotron 3 Super 120B | 1.0, top_p 0.95 | NVIDIA, all tasks |
+| Gemma 4 31B | 1.0, top_p 0.95 | Google |
+
+Temperature 0 uniformly — the obvious "fair" choice — would 400 every call on the reference arm and turn Kimi's config error into a latency measurement. That is the §5.4 failure mode exactly: a config choice scored as a model difference. §5.3's "(or lab-recommended)" is load-bearing; what is identical across arms is the policy, not the number. `config_digest` therefore excludes temperature, since a per-model value inside a cross-arm identity digest would make the digest assert something false. `test_sonnet_5_arms_send_no_sampling_parameters` pins it, because "make sampling uniform" is the natural later edit and is wrong.
+
+**Recorded, not fixed** — outside this task, added to the plan's self-review:
+
+- §5.2's other half is unimplemented: it requires **dumping and diffing the effective config at session start** and storing the dump. Task 9 digests *intent*. If `--settings` silently fails to load, the digest is unchanged and identical across arms while the runs are contaminated. Needs a live run → Task 12.
+- Sampling is configured but not confirmed applied — LiteLLM merges `litellm_params` as defaults and Claude Code's own request body may win. Only the wire log shows what was sent → Task 12 reads it back from `wire.jsonl`.
+- Sonnet 5's new tokenizer emits **~30% more tokens for the same text**, so a uniform token cap is not a uniform text budget, and cost-per-task is not comparable at equal output. §5.4 caps come from the calibration pilot; flagged there.
+- `PRICE_BOOK` has Sonnet 5 at standard $3/$15; Anthropic lists introductory $2/$10 through 2026-08-31. **Whether Bedrock mirrors it is unverified** — worth checking before any cost figure is published.
+
+Task 10's carried-forward defect list is now 11 items and lives in the plan doc at the head of Task 10, not just in session notes. The top item is new and structural: **the agent runs as a host subprocess, so §5.1's container isolation does not apply to the process under test** while the run record asserts a pinned image digest.
 
 ---
 
