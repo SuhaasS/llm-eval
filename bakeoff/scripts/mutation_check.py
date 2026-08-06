@@ -142,6 +142,38 @@ MUTATIONS = [
         "tests/test_verify_logger.py -k docker",
         "not integration",
     ),
+    (
+        "digest: stop excluding the per-run run_id header (config field)",
+        "src/bakeoff/claude_runner.py",
+        '            "temperature",\n            "custom_headers",',
+        '            "temperature",',
+        "tests/test_claude_runner.py -k run_id_header",
+        "not integration",
+    ),
+    (
+        "digest: stop excluding the run_id header env var",
+        "src/bakeoff/claude_runner.py",
+        '        # Carries the run_id, so it differs by construction on every run.\n        "ANTHROPIC_CUSTOM_HEADERS",\n',
+        '',
+        "tests/test_claude_runner.py -k run_id_header",
+        "not integration",
+    ),
+    (
+        "attribution: never send the run_id header to the agent",
+        "src/bakeoff/claude_runner.py",
+        '        {"ANTHROPIC_CUSTOM_HEADERS": config.custom_headers}\n        if config.custom_headers\n        else {}',
+        '        {}',
+        "tests/test_claude_runner.py -k run_id_header",
+        "not integration",
+    ),
+    (
+        "in-process callback: drop the failure status code",
+        "src/bakeoff/wire.py",
+        '"status_code": self._status_code(kwargs) if failed else None,',
+        '"status_code": None,',
+        "tests/test_wire.py -k status",
+        "not integration",
+    ),
 ]
 
 

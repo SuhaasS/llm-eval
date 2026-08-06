@@ -127,6 +127,46 @@ def test_callback_records_measured_latency(tmp_path):
     assert logger.entries()[0]["metadata"]["latency_ms"] == 2500
 
 
+def test_callback_captures_the_http_status_of_a_failed_call(tmp_path):
+    """The only place the harness ever sees an HTTP status.
+
+    LiteLLM puts the exception on the failure kwargs, and its exceptions
+    carry the provider status -- 429 throttle, 408 timeout, 503 unavailable
+    -- which are exactly the codes classify_exclusion maps to pre-registered
+    infra reasons. Without it a Bedrock throttle is indistinguishable from
+    the model giving up, and gets scored against the model.
+    """
+    logger = WireLogger(tmp_path / "wire.jsonl.gz")
+    callback = BakeoffCallback(logger, run_id="r-1")
+    now = datetime(2026, 8, 4, tzinfo=UTC)
+
+    class Throttled(Exception):
+        status_code = 429
+
+    callback.log_failure_event(
+        {"model": "gemma-4-31b", "exception": Throttled()}, {}, now, now
+    )
+    assert logger.entries()[0]["metadata"]["status_code"] == 429
+
+
+def test_callback_does_not_invent_a_status_for_a_local_failure(tmp_path):
+    """A connection reset or a client-side bug has no HTTP status.
+    Defaulting to 500 would manufacture an api_5xx exclusion -- dropping a
+    run from the results on the strength of a status nobody reported."""
+    logger = WireLogger(tmp_path / "wire.jsonl.gz")
+    callback = BakeoffCallback(logger, run_id="r-1")
+    now = datetime(2026, 8, 4, tzinfo=UTC)
+
+    callback.log_failure_event(
+        {"model": "gemma-4-31b", "exception": RuntimeError("connection reset")},
+        {}, now, now,
+    )
+    callback.log_success_event({"model": "gemma-4-31b"}, {"id": "x"}, now, now)
+
+    assert logger.entries()[0]["metadata"]["status_code"] is None
+    assert logger.entries()[1]["metadata"]["status_code"] is None
+
+
 def test_callback_counts_calls_not_turns(tmp_path):
     """LiteLLM fires once per API call, not per agent turn, and the proxy
     is configured with num_retries. Two failed attempts and a success are

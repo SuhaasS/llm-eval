@@ -198,6 +198,39 @@ def test_config_digest_ignores_per_model_sampling():
     )
 
 
+def test_config_digest_ignores_the_per_run_run_id_header():
+    """`custom_headers` carries the run_id, so it differs BY CONSTRUCTION on
+    every single run.
+
+    config_digest exists to certify that every arm ran under one
+    configuration. Folding in a value that is unique per run would make
+    every digest unique, which does not merely weaken that certificate --
+    it makes two runs of the same arm look differently configured, so
+    nothing in 2,400 records could ever be compared on it. The header is
+    excluded in two places, the config field and the env var, and both are
+    load-bearing.
+    """
+    assert config_digest(make_config(custom_headers="X-Bakeoff-Run-Id: aaa")) == (
+        config_digest(make_config(custom_headers="X-Bakeoff-Run-Id: bbb"))
+    )
+    # And a run with the header configured must match one without, so the
+    # dry run and the proxy path stay comparable.
+    assert config_digest(make_config(custom_headers="")) == config_digest(
+        make_config(custom_headers="X-Bakeoff-Run-Id: aaa")
+    )
+
+
+def test_the_run_id_header_still_reaches_the_agent():
+    """The other half: excluded from the digest, but present in the
+    environment. Dropping it would leave the proxy unable to attribute any
+    call to a run, and every wire entry would land in unattributed.jsonl."""
+    env = container_env(make_config(custom_headers="X-Bakeoff-Run-Id: r-42"))
+    assert env["ANTHROPIC_CUSTOM_HEADERS"] == "X-Bakeoff-Run-Id: r-42"
+    # Absent, not empty, when unset: an empty header value is a header the
+    # agent would still send.
+    assert "ANTHROPIC_CUSTOM_HEADERS" not in container_env(make_config())
+
+
 def test_config_digest_excludes_the_auth_token():
     """The digest lands in the run record, which is written to disk and
     shared. A secret must not be derivable from it, and the token does not
