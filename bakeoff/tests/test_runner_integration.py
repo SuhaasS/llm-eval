@@ -250,3 +250,102 @@ def test_reference_image_ships_the_pinned_agent_and_its_dependencies(tmp_path):
         for binary in ("rg", "git", "timeout"):
             found = container.exec(["sh", "-c", f"command -v {binary}"])
             assert found.exit_code == 0, f"{binary} missing from the eval image"
+
+
+@integration
+def test_full_chain_runs_from_transcript_to_record(agent_image, tmp_path):
+    """Everything downstream of the orchestrator, on real data.
+
+    The fake agent writes a session transcript where Claude Code writes
+    one, so this exercises in-container transcript discovery,
+    parse_trajectory, cost_usd, scan_destructive and the per-turn records
+    -- none of which run end to end when trajectory_path is None.
+    """
+    import subprocess
+
+    from bakeoff.eventlog import EventLog
+    from bakeoff.runner import TaskSpec, execute_run
+
+    repo = tmp_path / "repo"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "tests" / "test_a.py").write_text("def test_a():\n    assert True\n")
+    for args in (
+        ["init", "-q"], ["config", "user.email", "e@x"], ["config", "user.name", "e"],
+        ["add", "-A"], ["commit", "-q", "-m", "base"],
+    ):
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+    ).stdout.strip()
+
+    record = execute_run(
+        task=TaskSpec(
+            task_id="t-chain", task_version=1, repo="r", base_sha=sha,
+            container_image_digest=agent_image, prompt="go",
+            test_paths=["tests/test_a.py"],
+        ),
+        model="gemma-4-31b",
+        sample_index=0,
+        config=_config("/eval/claude-config"),
+        event_log=EventLog(tmp_path / "log"),
+        repo_path=str(repo),
+        artifacts_root=tmp_path / "artifacts",
+    )
+
+    assert not record.trajectory_parse_error, record.trajectory_parse_error
+    assert record.turns_used == 2
+    assert record.versions.claude_code == "2.1.220"
+
+    # Real token accounting through the price book, not a hand-built stub.
+    assert record.tokens.input == 2700
+    assert record.tokens.output == 720
+    assert record.cost_usd == pytest.approx(2700 * 0.14 / 1e6 + 720 * 0.40 / 1e6)
+
+    # The transcript's Bash turn deletes a declared test path.
+    assert [e.category.value for e in record.destructive_events] == ["test_deletion"]
+
+    # Timing is split, not lumped: the parser reads tool execution off the
+    # tool-result timestamps rather than leaving it at zero.
+    assert record.time.inference_ms > 0
+    assert record.time.tool_exec_ms > 0
+
+
+@integration
+def test_a_broken_container_still_writes_a_record(agent_image, tmp_path):
+    """Spec section 6.6. A base_sha that does not exist makes the checkout
+    fail inside the container; the run is lost but the record must not be.
+    """
+    import subprocess
+
+    from bakeoff.eventlog import EventLog
+    from bakeoff.runner import TaskSpec, execute_run
+    from bakeoff.schema import Outcome, TerminationReason
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "seed.txt").write_text("seed\n")
+    for args in (
+        ["init", "-q"], ["config", "user.email", "e@x"], ["config", "user.name", "e"],
+        ["add", "-A"], ["commit", "-q", "-m", "base"],
+    ):
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+
+    log = EventLog(tmp_path / "log")
+    record = execute_run(
+        task=TaskSpec(
+            task_id="t-crash", task_version=1, repo="r",
+            base_sha="0" * 40,  # no such commit
+            container_image_digest=agent_image, prompt="go", test_paths=[],
+        ),
+        model="gemma-4-31b",
+        sample_index=0,
+        config=_config("/eval/claude-config"),
+        event_log=log,
+        repo_path=str(repo),
+        artifacts_root=tmp_path / "artifacts",
+    )
+
+    assert record.outcome == Outcome.CRASHED
+    assert record.terminated_by == TerminationReason.CRASH
+    assert record.exclusion.reason_code == "container_crashed"
+    assert log.read_run(record.run_id) == record

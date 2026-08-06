@@ -106,16 +106,32 @@ def git_container(image_digest, tmp_path):
 # window without pausing the agent, which the harness cannot do -- so the
 # checkpoint boundary is approximate by a few hundred milliseconds, and the
 # fake keeps that from turning into a flaky test about something else.
+# It also writes a session transcript where Claude Code would, so the whole
+# downstream chain runs for real: transcript discovery inside the
+# container, parse_trajectory, cost_usd, scan_destructive, and the per-turn
+# records. Without it trajectory_path is None and everything after the
+# orchestrator is exercised only by unit tests with hand-built fixtures.
 FAKE_AGENT = """#!/bin/sh
+SESSION="${CLAUDE_CONFIG_DIR:-/tmp/cfg}/projects/-repo"
+mkdir -p "$SESSION"
+T="$SESSION/fake-session.jsonl"
+
 echo '{"type":"system","subtype":"init","session_id":"fake"}'
+
 echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Write"}]}}'
+echo '{"type":"assistant","timestamp":"2026-08-06T00:00:00.000Z","version":"2.1.220","requestId":"req-1","message":{"model":"gemma-4-31b","stop_reason":"tool_use","usage":{"input_tokens":1200,"output_tokens":300},"content":[{"type":"tool_use","name":"Write","input":{}}]}}' >> "$T"
 sleep 2
 echo turn-one > /repo/first.txt
+echo '{"type":"user","timestamp":"2026-08-06T00:00:02.000Z","toolUseResult":{"ok":true},"message":{"content":[{"type":"tool_result"}]}}' >> "$T"
 echo '{"type":"user","message":{"content":[{"type":"tool_result"}]}}'
-echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Write"}]}}'
+
+echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]}}'
+echo '{"type":"assistant","timestamp":"2026-08-06T00:00:02.100Z","version":"2.1.220","requestId":"req-2","message":{"model":"gemma-4-31b","stop_reason":"end_turn","usage":{"input_tokens":1500,"output_tokens":420},"content":[{"type":"tool_use","name":"Bash","input":{"command":"rm -rf tests/test_a.py"}}]}}' >> "$T"
 sleep 2
 echo turn-two > /repo/second.txt
+echo '{"type":"user","timestamp":"2026-08-06T00:00:04.100Z","toolUseResult":{"ok":true},"message":{"content":[{"type":"tool_result"}]}}' >> "$T"
 echo '{"type":"user","message":{"content":[{"type":"tool_result"}]}}'
+
 echo '{"type":"result","subtype":"success"}'
 """
 
