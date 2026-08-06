@@ -526,6 +526,100 @@ def test_version_block_is_populated_for_every_component(task, tmp_path):
     assert record.schema_version
 
 
+def test_harness_commit_marks_an_uncommitted_tree_as_dirty(tmp_path, monkeypatch):
+    """A bare SHA on a modified tree asserts a provenance that does not
+    exist.
+
+    2,400 runs are collected over weeks while this code keeps changing, and
+    a record is only re-derivable if it names the harness that produced it.
+    A run made from a working tree with uncommitted edits did not run the
+    code at that SHA, and the record has to say so -- there is no way to
+    recover the distinction afterwards.
+    """
+    import subprocess as sp
+
+    from bakeoff.runner import harness_commit
+
+    calls = {"status": "M src/bakeoff/runner.py\n"}
+
+    def fake_run(cmd, **kwargs):
+        out = "abc123def456" if cmd[1] == "rev-parse" else calls["status"]
+        return sp.CompletedProcess(cmd, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(sp, "run", fake_run)
+
+    harness_commit.cache_clear()
+    assert harness_commit() == "abc123def456-dirty"
+
+    calls["status"] = ""
+    harness_commit.cache_clear()
+    assert harness_commit() == "abc123def456"
+    harness_commit.cache_clear()
+
+
+def test_version_lookups_never_cost_the_record(monkeypatch):
+    """Both version probes shell out or hit package metadata, and neither is
+    worth a run for. A machine with no git, or a litellm installed outside
+    package metadata, must degrade to an empty string -- the tokens are
+    already paid for by the time this runs."""
+    import subprocess as sp
+    from importlib.metadata import PackageNotFoundError
+
+    import bakeoff.runner as runner_module
+    from bakeoff.runner import harness_commit, litellm_version
+
+    def no_git(*_a, **_k):
+        raise FileNotFoundError("git not found")
+
+    monkeypatch.setattr(sp, "run", no_git)
+    harness_commit.cache_clear()
+    assert harness_commit() == ""
+    harness_commit.cache_clear()
+
+    def missing(*_a, **_k):
+        raise PackageNotFoundError("litellm")
+
+    monkeypatch.setattr(runner_module, "package_version", missing)
+    litellm_version.cache_clear()
+    assert litellm_version() == ""
+    litellm_version.cache_clear()
+
+
+def test_a_5xx_is_excluded_as_infra_under_its_own_reason_code(task, tmp_path):
+    """429 and 5xx are separate pre-registered reasons. Collapsing them
+    would hide whether Bedrock was throttling the eval or failing outright,
+    which are different operational problems with different fixes."""
+    record = assemble_record(
+        task=task, model="gemma-4-31b", sample_index=0,
+        started_at="2026-08-04T00:00:00Z", finished_at="2026-08-04T00:00:30Z",
+        trajectory_path=None, runner_result=None, checkpoints=[],
+        destructive_events=[], artifacts_root=tmp_path,
+        wire_entries=[
+            {"request": {"model": "gemma-4-31b"},
+             "metadata": {"failed": True, "status_code": 503}},
+        ],
+    )
+    assert record.exclusion is not None
+    assert record.exclusion.reason_code == "api_5xx"
+
+
+def test_a_client_error_is_not_an_infra_failure(task, tmp_path):
+    """A 400 is the adapter or the request, not the platform. Excluding it
+    as infra would quietly drop the runs that reveal a broken tool
+    translation -- exactly the section 6.4 evidence the eval needs."""
+    record = assemble_record(
+        task=task, model="gemma-4-31b", sample_index=0,
+        started_at="2026-08-04T00:00:00Z", finished_at="2026-08-04T00:00:30Z",
+        trajectory_path=None, runner_result=None, checkpoints=[],
+        destructive_events=[], artifacts_root=tmp_path,
+        wire_entries=[
+            {"request": {"model": "gemma-4-31b"},
+             "metadata": {"failed": True, "status_code": 400}},
+        ],
+    )
+    assert record.exclusion is None
+
+
 def test_task_set_commit_is_deliberately_empty_until_the_dataset_exists(task, tmp_path):
     """The one version field with nothing to populate it. Asserted as empty
     on purpose: inventing a value would be worse than an honest blank, and

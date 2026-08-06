@@ -70,6 +70,11 @@ def _headers(kwargs: dict) -> dict[str, str]:
         params.get("litellm_metadata"),
         kwargs.get("metadata"),
         kwargs.get("litellm_metadata"),
+        # Last resort, and the most durable: the proxy records the raw
+        # request here regardless of how metadata is keyed. Note it sits
+        # under litellm_params, NOT at the top level -- verified against a
+        # live proxy. Reading only the top level makes this branch dead.
+        params.get("proxy_server_request"),
         kwargs.get("proxy_server_request"),
     ):
         headers = (source or {}).get("headers")

@@ -49,6 +49,20 @@ Source plan: [docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md](../d
 cd bakeoff && .venv/bin/python scripts/verify_logger.py
 ```
 
+### Verification pass (same day)
+
+"All tests pass" is not evidence a suite would catch a regression — a test can assert something that was always true. So every guarantee was removed one at a time to see whether a test went red. `scripts/mutation_check.py`, **16/16 caught**. Test count 136 → **166 unit + 25 integration**; coverage 84% → **89%**, with `proxy_callback.py` 34% → 93%.
+
+Three real gaps surfaced, and two false alarms in the harness itself:
+
+- **The `-dirty` suffix had no test at all.** The mutation harness first reported it CAUGHT because pytest exits non-zero on "no tests collected" — an empty selector scored as a catch. Fixed the harness to treat exit 5 as a miss, then wrote the test.
+- **`proxy_callback.py` was only ever tested end to end**, and cannot be otherwise covered from the harness process — it executes inside the proxy container, so coverage numbers are blind to it by construction. Now exercised directly against kwargs shaped like the real ones (dumped from a live proxy), which turned up a **dead fallback**: `_headers` looked for `proxy_server_request` at the top level, but it lives under `litellm_params`, so the last-resort attribution path was unreachable.
+- **`unattributed_count == 0` was a vacuous assertion** — the count is 0 when nothing was written at all. Added the positive case: a header-less call is kept and flagged.
+- **The concurrency test did not test the lock.** It passed with the lock deleted: the GIL and `O_APPEND` make the race not materialise by luck. Rewritten to force a thread switch between the counter's read and its write, which does catch removal. The volume test stays, relabelled for what it actually shows.
+- **`verify_logger.py` had no tests**, including for its most important behaviour — refusing to report success when it could not run the checks that see the capture path.
+
+One earlier "MISSED" was a false negative: the phantom-index mutation is caught by `test_writing_same_run_id_twice_raises` and by the dry run (`FAIL: re-write was accepted`); my `-k` filter simply did not select them.
+
 ---
 
 ## Review — Task 10 (2026-08-06)

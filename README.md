@@ -48,7 +48,7 @@ Integration tests are opt-in — they need a Docker daemon, and on macOS they ne
 cd bakeoff && .venv/bin/python -m pytest -v -m integration --basetemp="$HOME/.cache/bakeoff-pytest"
 ```
 
-Status: Tasks 1–11 complete (schema, event log, pricing, trajectory parser, scanners, container, checkpoints, wire logging, classification, Claude Code runner, run orchestrator, fault-injection gate). 136 unit + 25 integration tests passing.
+Status: Tasks 1–11 complete (schema, event log, pricing, trajectory parser, scanners, container, checkpoints, wire logging, classification, Claude Code runner, run orchestrator, fault-injection gate). 166 unit + 25 integration tests passing, 89% coverage.
 
 ### The gate
 
@@ -59,6 +59,14 @@ cd bakeoff && .venv/bin/python scripts/verify_logger.py
 ```
 
 All twelve §6.6 cases are injected offline — no credentials, no spend. Throttles come from a real LiteLLM proxy whose `mock_response` raises a genuine `RateLimitError`. Without a Docker daemon the gate reports `GATE INCOMPLETE` and exits 1 rather than passing: the mid-run kill, the proxy-side wire log, and live checkpoint capture are only observable against a real daemon.
+
+A passing suite is not by itself evidence the suite would notice a regression, so each guarantee is checked by removing it and confirming a test goes red:
+
+```bash
+cd bakeoff && .venv/bin/python scripts/mutation_check.py
+```
+
+Sixteen mutations, all caught. It fails loudly on a stale anchor — a mutation harness that quietly stops mutating reports a clean sweep while testing nothing.
 
 ## Running a run
 
