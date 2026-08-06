@@ -11,9 +11,61 @@ Source plan: [docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md](../d
 - [x] **Task 7** — Wire-level logging
 - [x] **Task 8** — Failure and exclusion classification
 - [x] **Task 9** — Claude Code runner
-- [ ] Task 10 — Run orchestrator (`runner.py`)
+- [x] **Task 10** — Run orchestrator
 - [ ] Task 11 — Fault-injection gate
 - [ ] Task 12 — End-to-end smoke test
+
+---
+
+## Review — Task 10 (2026-08-06)
+
+**Delivered:** `runner.py` — `TaskSpec`, `make_run_id`, `resolve_reverts`, `assemble_record`, `execute_run`. Plus `docker/eval-agent.Dockerfile`, and changes to `container.py`, `claude_runner.py`, `schema.py`. **115 unit + 19 integration passing.**
+
+All 11 carried-forward defects closed. Two of them changed the architecture rather than the orchestrator.
+
+### The agent now runs inside the container
+
+This is what defect 1 actually cost. `network_mode="none"` and "agent in the container" are mutually exclusive — an isolated container cannot reach the LiteLLM proxy. §5.1's second branch resolves it: "network off during the run, **or through a recording proxy**", and the proxy *is* the recording proxy. `RunContainer` gained a `network` parameter for an `internal=True` network carrying only the proxy.
+
+**This changes how you run the proxy: it must be a container on that network.** An internal network has no host route, so `127.0.0.1:4000` is unreachable by design; the agent reaches `http://litellm:4000` through Docker's embedded DNS. `scripts/smoke_bedrock.py` is unaffected — it drives the Router in-process and tests routing, not isolation.
+
+`execute_run` defaults `network=None` and records `isolated=False` when it is absent. Such a run still executes, but §5.1 did not hold for the process under test, and the record says so rather than letting `container_image_digest` imply otherwise. New field, so `SCHEMA_VERSION` moved to 1.1.0 — a reader that could not tell the versions apart would read an absent `isolated` as a positive claim that the run was *not* isolated.
+
+### Checkpoints are captured live
+
+Demonstrated against the plan's own capture order with a fake stream-json agent:
+
+```
+post-hoc (as planned)          live capture (now)
+  turn=1 elapsed=0               turn=1 elapsed=2043
+    files=[first, second]          files=[first]
+  turn=2 elapsed=0               turn=2 elapsed=4102
+    files=[first, second]          files=[first, second]
+  distinct diffs: 1              distinct diffs: 2
+```
+
+Because capture is now concurrent with the agent, `snapshot_diff` can no longer touch `.git/index` — staging under a live agent means the agent's next `git commit` sweeps in files it never staged, and its `git status` disagrees with reality. Staging moved to a throwaway `GIT_INDEX_FILE`. The guard failed against the old code with `['loose.txt', 'staged.txt'] == ['staged.txt']`.
+
+**Off-by-one found while reviewing my own fix.** An assistant message announces the tool calls a turn is *about* to make, so at message k the tree holds k−1 turns of work. Firing `on_turn(k)` there files turn k−1's work under turn k — understating every checkpoint by one turn, on the exact axis the cost-at-budget-K curve is plotted against. The callback now reports turns *completed*; `force_capture` supplies the final turn, whose tools run after the stream's last message. That also removed a duplicate — the old `force_capture(turn=len(captured) + 1)` collided with the last `maybe_capture`.
+
+**Limitation I did not paper over:** the boundary is approximate by however long a snapshot takes. A tool writing faster than `git add -A` completes can put part of turn k+1 into turn k's checkpoint. Closing that window means pausing the agent, which no external observer can do. The alternative isn't more precise, it's wrong — post-hoc capture gives every checkpoint the same end state.
+
+### Two defects found during implementation, neither on the list
+
+- `build_env` forwarded the host `PATH` and `HOME` into the container, where Docker merges them over the image's own environment. `claude` would have stopped resolving, and any host path that happened to exist in the image would have resolved to something never installed. Split into `build_env` (host) and `container_env` (eval keys only).
+- `DISABLE_UPDATES=1` set *before* the install step makes the Claude Code installer print "Updates are disabled by your administrator" and leave no binary — while exiting 0, so the failure surfaces several steps later as `claude: not found`. Caught by building the image.
+
+### Reference image
+
+`docker/eval-agent.Dockerfile` pins claude 2.1.220 and **fails the build** if the installed version differs, so drift cannot ship silently into `versions.claude_code`. Carries `git`, `ripgrep` (a Claude Code runtime dependency), and `coreutils` for `timeout` — which enforces the wall-clock budget from inside the container, because Docker offers no way to kill a running exec from outside.
+
+```bash
+cd bakeoff && docker build -f docker/eval-agent.Dockerfile -t bakeoff-eval-agent .
+```
+
+### Still open, deliberately
+
+`tool_calls_malformed` stays 0: deciding a call was malformed means inspecting raw completions, which is the scoring plan's wire-log analysis. `TOOL_MALFORMATION` and `ADAPTER_FAILURE` remain unreachable at harness time — now by design rather than oversight. `errored` is populated from wire failures. `affected_outcome` needs the test oracle.
 
 ---
 

@@ -10,7 +10,11 @@ from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from typing import Any
 
-SCHEMA_VERSION = "1.0.0"
+# 1.1.0 adds `isolated` and `trajectory_parse_error`. Both are additive with
+# defaults, so 1.0.0 records still load; the version moves anyway, because a
+# reader that cannot tell the two apart would read a 1.0.0 record's absent
+# `isolated` as a positive claim that the run was NOT isolated.
+SCHEMA_VERSION = "1.1.0"
 
 
 class Outcome(str, Enum):
@@ -227,6 +231,18 @@ class RunRecord:
     tool_calls: ToolCallStats = field(default_factory=ToolCallStats)
     truncation_events: list[dict[str, Any]] = field(default_factory=list)
     destructive_events: list[DestructiveEvent] = field(default_factory=list)
+
+    # True only when the agent ran inside the pinned container with no route
+    # off the host except the recording proxy (spec section 5.1). A run with
+    # this False is still a run, but container_image_digest above did not
+    # constrain the process under test, and comparisons across arms should
+    # say so rather than let the digest imply isolation.
+    isolated: bool = False
+    # Non-empty when the transcript could not be parsed. The record is still
+    # written -- the tokens were already spent, and the raw transcript is on
+    # disk -- but every derived field below is empty and must not be read as
+    # "the agent did nothing".
+    trajectory_parse_error: str = ""
 
     diff_stats: dict[str, int] = field(default_factory=dict)
     p2p_regressions: list[str] = field(default_factory=list)

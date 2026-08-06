@@ -81,3 +81,123 @@ def git_container(image_digest, tmp_path):
         image=image_digest, repo_path=str(repo), base_sha=sha, install_git=True
     ) as container:
         yield container
+
+
+# A stand-in for `claude` that speaks the same stream-json protocol on
+# stdout. It exists to prove the checkpoint progression is real: against
+# the post-hoc capture this replaces, every checkpoint held identical
+# content, and a test that only counted checkpoints would have passed just
+# as happily.
+#
+# The event order mirrors Claude Code's and that ordering is the point. An
+# assistant message announces the tool calls a turn is ABOUT to make, so
+# the file write comes after it, and the working tree at assistant message
+# k still holds only k-1 turns of work. A fake that wrote before
+# announcing would hide an off-by-one in turn numbering instead of
+# catching it.
+#
+# The sleep between an assistant message and its file write stands in for
+# real tool latency, and it is what makes this test deterministic.
+#
+# It also marks a real limitation rather than papering over one: a snapshot
+# triggered by assistant message k+1 races with turn k+1's first tool call.
+# A tool that writes faster than `git add -A` completes can land part of
+# turn k+1 in turn k's checkpoint. Nothing outside the agent can close that
+# window without pausing the agent, which the harness cannot do -- so the
+# checkpoint boundary is approximate by a few hundred milliseconds, and the
+# fake keeps that from turning into a flaky test about something else.
+FAKE_AGENT = """#!/bin/sh
+echo '{"type":"system","subtype":"init","session_id":"fake"}'
+echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Write"}]}}'
+sleep 2
+echo turn-one > /repo/first.txt
+echo '{"type":"user","message":{"content":[{"type":"tool_result"}]}}'
+echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Write"}]}}'
+sleep 2
+echo turn-two > /repo/second.txt
+echo '{"type":"user","message":{"content":[{"type":"tool_result"}]}}'
+echo '{"type":"result","subtype":"success"}'
+"""
+
+
+@pytest.fixture
+def agent_container(git_container):
+    """git_container with a fake `claude` on the container's PATH."""
+    git_container.exec(
+        [
+            "sh",
+            "-c",
+            f"cat > /usr/local/bin/claude <<'EOF'\n{FAKE_AGENT}EOF\n"
+            "chmod +x /usr/local/bin/claude",
+        ]
+    )
+    check = git_container.exec(["sh", "-c", "command -v claude"])
+    assert check.exit_code == 0, "fake agent did not land on PATH"
+    return git_container
+
+
+@pytest.fixture(scope="session")
+def agent_image(tmp_path_factory):
+    """Build an image that ships the fake agent.
+
+    execute_run creates its own container, so the agent has to be in the
+    image rather than installed afterwards. Building it here keeps the
+    production path free of a test-only injection hook -- the orchestrator
+    runs exactly the code it will run in the eval.
+
+    Referenced by image ID: a locally built image has no registry digest,
+    and the ID pins the config and every layer.
+    """
+    context = tmp_path_factory.mktemp("agent-image")
+    (context / "claude").write_text(FAKE_AGENT)
+    (context / "Dockerfile").write_text(
+        f"FROM {FIXTURE_IMAGE}\n"
+        "COPY claude /usr/local/bin/claude\n"
+        "RUN chmod +x /usr/local/bin/claude\n"
+        "ENTRYPOINT []\n"
+    )
+    subprocess.run(
+        ["docker", "build", "-q", "-t", "bakeoff-fake-agent:test", str(context)],
+        check=True,
+        capture_output=True,
+    )
+    out = subprocess.run(
+        ["docker", "inspect", "--format", "{{.Id}}", "bakeoff-fake-agent:test"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return out.stdout.strip()
+
+
+@pytest.fixture
+def internal_network(image_digest):
+    """An internal Docker network with a stand-in proxy on it.
+
+    Spec section 5.1 allows the run to reach a recording proxy and nothing
+    else. `internal=True` removes the route off the host, so the proxy --
+    resolvable by container name through Docker's embedded DNS -- is the
+    only endpoint that answers.
+    """
+    import docker
+
+    client = docker.from_env()
+    network = client.networks.create("bakeoff-test-net", driver="bridge", internal=True)
+    proxy = client.containers.run(
+        image_digest,
+        entrypoint=["sh"],
+        # busybox nc, not httpd -- alpine/git ships no httpd. -lk -e gives a
+        # persistent listener that answers every connection.
+        command=[
+            "-c",
+            "while true; do printf 'HTTP/1.0 200 OK\\r\\n\\r\\nPROXY-OK\\n' | nc -l -p 4000; done",
+        ],
+        name="litellm",
+        network=network.name,
+        detach=True,
+    )
+    try:
+        yield network.name
+    finally:
+        proxy.remove(force=True)
+        network.remove()

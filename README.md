@@ -48,7 +48,19 @@ Integration tests are opt-in — they need a Docker daemon, and on macOS they ne
 cd bakeoff && .venv/bin/python -m pytest -v -m integration --basetemp="$HOME/.cache/bakeoff-pytest"
 ```
 
-Status: Tasks 1–9 complete (schema, event log, pricing, trajectory parser, scanners, container, checkpoints, wire logging, classification, Claude Code runner). 96 unit + 9 integration tests passing.
+Status: Tasks 1–10 complete (schema, event log, pricing, trajectory parser, scanners, container, checkpoints, wire logging, classification, Claude Code runner, run orchestrator). 115 unit + 19 integration tests passing.
+
+## Running a run
+
+The agent executes **inside** the pinned container, on an internal Docker network whose only reachable endpoint is the LiteLLM proxy — spec §5.1's "network off, or through a recording proxy". That has one operational consequence: **the proxy must run as a container on that network**, not as a host process. An internal network has no host route, so `127.0.0.1:4000` is unreachable by design; the agent reaches `http://litellm:4000` through Docker's embedded DNS.
+
+Build the reference agent image first (it pins `claude` by version and fails the build on drift):
+
+```bash
+cd bakeoff && docker build -f docker/eval-agent.Dockerfile -t bakeoff-eval-agent .
+```
+
+`execute_run` without a `network` still runs, but records `isolated=False` — §5.1 did not hold for the process under test, and the record says so rather than letting the pinned image digest imply otherwise.
 
 Bedrock model IDs and per-arm sampling in [config/litellm_config.yaml](bakeoff/config/litellm_config.yaml) are verified against the AWS model cards and each lab's published guidance. Routing, auth, and whether the proxy actually applies that sampling are not — Phase 0c's smoke test is the gate, and it reads the applied values back from the wire log rather than from the config file.
 

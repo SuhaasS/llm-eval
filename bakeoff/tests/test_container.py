@@ -14,6 +14,18 @@ def test_rejects_tag_instead_of_digest():
     """
     with pytest.raises(ContainerError, match="digest"):
         RunContainer(image="python:3.11", repo_path="/tmp/x", base_sha="abc")
+    with pytest.raises(ContainerError, match="digest"):
+        RunContainer(image="python@latest", repo_path="/tmp/x", base_sha="abc")
+
+
+def test_accepts_either_form_of_content_pin():
+    """A registry digest travels between machines; a bare image ID pins the
+    image config, and so every layer, for an image built locally and never
+    pushed. Both are content pins; a tag is not."""
+    RunContainer(
+        image="python@sha256:" + "0" * 64, repo_path="/tmp/x", base_sha="abc"
+    )
+    RunContainer(image="sha256:" + "0" * 64, repo_path="/tmp/x", base_sha="abc")
 
 
 @integration
@@ -85,6 +97,28 @@ def test_restore_paths_reverts_agent_edits_to_test_files(git_container):
 
 
 @integration
+def test_snapshot_does_not_disturb_the_agents_own_index(git_container):
+    """Checkpoints are now taken WHILE the agent works, so staging must not
+    touch the index the agent is using.
+
+    `git add -A` against the real index would silently stage the agent's
+    in-progress work under it -- a later `git commit` by the agent would
+    then sweep in files it never staged, and `git status` would lie. The
+    snapshot stages into a throwaway GIT_INDEX_FILE instead.
+    """
+    git_container.exec(["sh", "-c", "echo agent-staged > /repo/staged.txt"])
+    git_container.exec(["git", "add", "staged.txt"])
+    git_container.exec(["sh", "-c", "echo agent-unstaged > /repo/loose.txt"])
+
+    git_container.snapshot_diff(git_container.base_sha)
+
+    staged = git_container.exec(["git", "diff", "--cached", "--name-only"])
+    assert staged.stdout.split() == ["staged.txt"], (
+        "snapshot leaked into the agent's index"
+    )
+
+
+@integration
 def test_snapshot_diff_raises_when_git_fails(alpine_container):
     """A failed snapshot must not be indistinguishable from a clean tree.
 
@@ -104,3 +138,34 @@ def test_network_is_disabled(alpine_container):
         ["sh", "-c", "wget -q -T 2 -O- http://example.com || echo BLOCKED"]
     )
     assert "BLOCKED" in result.stdout
+
+
+@integration
+def test_isolated_network_reaches_the_proxy_and_nothing_else(
+    internal_network, image_digest, tmp_path
+):
+    """Spec section 5.1's second branch: network off, OR through a recording
+    proxy. The agent runs in this container and must reach the LiteLLM proxy
+    to call a model at all -- so "no network" is not an option, and "some
+    network" has to mean exactly one endpoint.
+
+    Both halves are asserted. Checking only that the internet is blocked
+    would pass on a container with no network at all, which is the config
+    the agent cannot work under.
+    """
+    (tmp_path / "repo").mkdir()
+    with RunContainer(
+        image=image_digest,
+        repo_path=str(tmp_path / "repo"),
+        base_sha="",
+        network=internal_network,
+    ) as container:
+        reachable = container.exec(
+            ["sh", "-c", "wget -q -T 5 -O- http://litellm:4000/ping || echo UNREACHABLE"]
+        )
+        assert "PROXY-OK" in reachable.stdout, reachable.stdout
+
+        blocked = container.exec(
+            ["sh", "-c", "wget -q -T 5 -O- http://example.com || echo BLOCKED"]
+        )
+        assert "BLOCKED" in blocked.stdout

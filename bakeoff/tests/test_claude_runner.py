@@ -1,12 +1,16 @@
 import json
+import os
 
 import pytest
 
 from bakeoff.claude_runner import (
+    BackendResult,
     ClaudeCodeConfig,
     ClaudeCodeRunner,
+    HostBackend,
     build_command,
     build_env,
+    container_env,
     config_digest,
 )
 
@@ -152,6 +156,22 @@ def test_env_preserves_what_the_subprocess_needs_to_start():
     assert env["HOME"]
 
 
+def test_container_env_does_not_forward_host_paths():
+    """Docker merges this with the image's own environment.
+
+    Forwarding the host PATH would replace a working container PATH with
+    directories that do not exist in the image, so `claude` would stop
+    resolving -- and any path that did happen to exist would resolve to
+    something the image never installed. HOME decides where the agent
+    writes state, with the same problem.
+    """
+    env = container_env(make_config())
+    assert "PATH" not in env
+    assert "HOME" not in env
+    assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:4000"
+    assert env["CLAUDE_CONFIG_DIR"] == "/run/artifacts/r-001/claude-config"
+
+
 def test_config_digest_covers_environment_not_just_command():
     """The digest is stored as proof the arms ran identically, but every
     behavior knob except --max-turns lives in the environment. A digest over
@@ -233,3 +253,98 @@ def test_transcript_found_regardless_of_path_punctuation(tmp_path):
 
 def test_missing_config_dir_reports_no_transcript(tmp_path):
     assert ClaudeCodeRunner._find_transcript(str(tmp_path / "never-created")) is None
+
+
+# --- live turn boundaries ----------------------------------------------------
+
+
+class ReplayBackend:
+    """Feeds canned stdout lines through the runner's streaming path."""
+
+    def __init__(self, lines):
+        self.lines = lines
+        self.command = None
+
+    def transcript_root(self, config):
+        return config.config_dir
+
+    def env_for(self, config):
+        return build_env(config)
+
+    def execute(self, command, env, cwd, timeout_s, on_stdout_line):
+        self.command = command
+        for line in self.lines:
+            on_stdout_line(line)
+        return BackendResult(
+            exit_code=0, stdout="\n".join(self.lines), stderr="", timed_out=False
+        )
+
+
+STREAM = [
+    '{"type":"system","subtype":"init","session_id":"s1"}',
+    '{"type":"assistant","message":{"content":[]}}',
+    '{"type":"user","message":{"content":[]}}',
+    '{"type":"assistant","message":{"content":[]}}',
+    "",
+    "not json at all",
+    '{"type":"result","subtype":"success"}',
+]
+
+
+def test_on_turn_reports_turns_completed_not_events_seen(tmp_path):
+    """An assistant message announces the tool calls a turn is ABOUT to
+    make, so at message k the working tree holds k-1 turns of work.
+
+    Reporting k would file turn k-1's work under turn k and understate
+    every checkpoint by one turn -- on the exact axis the cost-at-budget-K
+    curve is plotted against. Nothing fires for the first message: no turn
+    has finished and the tree is still the base commit.
+    """
+    seen = []
+    runner = ClaudeCodeRunner(
+        make_config(config_dir=str(tmp_path / "cfg")), backend=ReplayBackend(STREAM)
+    )
+    result = runner.run("fix the bug", cwd=str(tmp_path), on_turn=lambda t, ms: seen.append(t))
+
+    assert seen == [1]
+    assert result.turns_streamed == 2
+
+
+def test_non_assistant_events_are_not_counted_as_turns(tmp_path):
+    """stdout carries system, user and result events, blank lines, and a
+    possibly-partial final line. Counting any of them as a turn would
+    fabricate checkpoints for turns that never happened."""
+    runner = ClaudeCodeRunner(
+        make_config(config_dir=str(tmp_path / "cfg")), backend=ReplayBackend(STREAM)
+    )
+    result = runner.run("p", cwd=str(tmp_path))
+    assert result.turns_streamed == 2  # not 7
+
+
+def test_prompt_reaches_the_command_but_not_the_digest(tmp_path):
+    """Two arms run different tasks under one configuration. A digest that
+    moved with the prompt could never show that."""
+    backend = ReplayBackend([])
+    config = make_config(config_dir=str(tmp_path / "cfg"))
+    ClaudeCodeRunner(config, backend=backend).run("fix the bug", cwd=str(tmp_path))
+
+    assert backend.command[-1] == "fix the bug"
+    assert "fix the bug" not in json.dumps(build_command(config))
+
+
+def test_host_backend_streams_real_subprocess_output(tmp_path):
+    """Exercises the actual streaming machinery, not just the replay stub."""
+    seen = []
+    result = HostBackend().execute(
+        command=[
+            "sh",
+            "-c",
+            'printf \'{"type":"assistant"}\\n{"type":"result"}\\n\'',
+        ],
+        env=dict(os.environ),
+        cwd=str(tmp_path),
+        timeout_s=30,
+        on_stdout_line=seen.append,
+    )
+    assert result.exit_code == 0
+    assert seen == ['{"type":"assistant"}', '{"type":"result"}']

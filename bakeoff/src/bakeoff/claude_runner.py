@@ -36,8 +36,24 @@ import subprocess
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any, Callable
 
 EMPTY_MCP_CONFIG = '{"mcpServers":{}}'
+
+
+def _is_assistant_event(line: str) -> bool:
+    """True for a stream-json assistant turn.
+
+    Tolerant on purpose: stdout carries system, user and result events too,
+    and a partial line during shutdown must not take the run down.
+    """
+    line = line.strip()
+    if not line.startswith("{"):
+        return False
+    try:
+        return json.loads(line).get("type") == "assistant"
+    except json.JSONDecodeError:
+        return False
 
 # The only ambient variables the subprocess inherits. It reaches Bedrock
 # through the LiteLLM proxy over HTTP with a bearer token, so it needs no
@@ -84,6 +100,9 @@ class RunnerResult:
     stderr: str
     wall_clock_ms: int
     timed_out: bool
+    # Turns seen live on stdout. May exceed the transcript's turn count if
+    # the run was killed before the last record was flushed to disk.
+    turns_streamed: int = 0
 
 
 def build_command(config: ClaudeCodeConfig) -> list[str]:
@@ -111,16 +130,35 @@ def _eval_env(config: ClaudeCodeConfig) -> dict[str, str]:
         "ANTHROPIC_AUTH_TOKEN": config.auth_token,
         "ANTHROPIC_MODEL": config.model,
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        # DISABLE_AUTOUPDATER only stops the background check; DISABLE_UPDATES
+        # blocks every update path. An agent that upgraded itself mid-eval
+        # would change versions.claude_code between runs without the record
+        # ever saying so.
         "DISABLE_AUTOUPDATER": "1",
+        "DISABLE_UPDATES": "1",
         "DISABLE_TELEMETRY": "1",
         "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(config.max_output_tokens),
     }
 
 
 def build_env(config: ClaudeCodeConfig) -> dict[str, str]:
+    """Environment for a host subprocess: allowlist plus the eval's own keys."""
     env = {key: os.environ[key] for key in PASSTHROUGH_ENV if key in os.environ}
     env.update(_eval_env(config))
     return env
+
+
+def container_env(config: ClaudeCodeConfig) -> dict[str, str]:
+    """Environment for an in-container exec: the eval's own keys only.
+
+    The host allowlist must NOT be forwarded here. Docker merges this with
+    the image's environment, so passing the host's PATH would replace a
+    valid container PATH with directories that do not exist in the image --
+    `claude` would stop resolving, and any path that happened to exist would
+    resolve to something the image never installed. The same applies to HOME,
+    which decides where the agent writes state.
+    """
+    return _eval_env(config)
 
 
 def config_digest(config: ClaudeCodeConfig) -> str:
@@ -158,45 +196,191 @@ def config_digest(config: ClaudeCodeConfig) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
-class ClaudeCodeRunner:
-    def __init__(self, config: ClaudeCodeConfig) -> None:
-        self.config = config
+@dataclass(frozen=True)
+class BackendResult:
+    exit_code: int
+    stdout: str
+    stderr: str
+    timed_out: bool
 
-    def run(self, prompt: str, cwd: str) -> RunnerResult:
-        command = build_command(self.config)
-        env = build_env(self.config)
-        # The caller owns freshness: this directory must be empty at the
-        # start of each run, or transcript discovery loses its guarantee.
-        Path(self.config.config_dir).mkdir(parents=True, exist_ok=True)
-        started = time.monotonic()
+
+class HostBackend:
+    """Run the agent as a subprocess of the harness.
+
+    Retained for tests and for machines without a Docker daemon. It gives
+    the agent the host's network, toolchain and filesystem, so a run made
+    this way satisfies none of spec section 5.1 -- execute_run records that
+    rather than letting the pinned image digest imply otherwise.
+    """
+
+    def transcript_root(self, config: ClaudeCodeConfig) -> str:
+        return config.config_dir
+
+    def env_for(self, config: ClaudeCodeConfig) -> dict[str, str]:
+        return build_env(config)
+
+    def execute(
+        self,
+        command: list[str],
+        env: dict[str, str],
+        cwd: str,
+        timeout_s: int,
+        on_stdout_line: Callable[[str], None],
+    ) -> BackendResult:
+        proc = subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.monotonic() + timeout_s
+        stdout_lines: list[str] = []
         timed_out = False
 
-        try:
-            completed = subprocess.run(
-                command,
-                input=prompt,
-                cwd=cwd,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=self.config.wall_clock_timeout_s,
-            )
-            exit_code = completed.returncode
-            stdout, stderr = completed.stdout, completed.stderr
-        except subprocess.TimeoutExpired as exc:
-            timed_out = True
-            exit_code = -1
-            stdout = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-            stderr = exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            stdout_lines.append(line)
+            on_stdout_line(line.rstrip("\n"))
+            if time.monotonic() > deadline:
+                timed_out = True
+                proc.kill()
+                break
 
-        wall_clock_ms = int((time.monotonic() - started) * 1000)
-        return RunnerResult(
-            exit_code=exit_code,
-            transcript_path=self._find_transcript(self.config.config_dir),
-            stdout=stdout,
+        stderr = proc.stderr.read() if proc.stderr else ""
+        proc.wait()
+        return BackendResult(
+            exit_code=proc.returncode,
+            stdout="".join(stdout_lines),
             stderr=stderr,
-            wall_clock_ms=wall_clock_ms,
             timed_out=timed_out,
+        )
+
+
+class ContainerBackend:
+    """Run the agent inside the pinned container (spec section 5.1).
+
+    The container's working directory is the mounted repo, so `cwd` is
+    ignored. The config directory is bind-mounted separately: it must not
+    sit under the repo, or `git add -A` would sweep the whole config tree
+    and every transcript into each checkpoint diff.
+
+    Timeouts are enforced by `timeout` inside the container, not by
+    abandoning the read loop. Docker exposes no way to kill a running exec,
+    so a harness that merely stopped reading would leave the agent running.
+    `timeout` reports 124 on expiry, which is how timed_out is detected.
+    """
+
+    TIMEOUT_EXIT_CODE = 124
+
+    def __init__(self, container: Any, host_config_dir: str) -> None:
+        self.container = container
+        self.host_config_dir = host_config_dir
+
+    def transcript_root(self, config: ClaudeCodeConfig) -> str:
+        return self.host_config_dir
+
+    def env_for(self, config: ClaudeCodeConfig) -> dict[str, str]:
+        return container_env(config)
+
+    def execute(
+        self,
+        command: list[str],
+        env: dict[str, str],
+        cwd: str,
+        timeout_s: int,
+        on_stdout_line: Callable[[str], None],
+    ) -> BackendResult:
+        result = self.container.exec_stream(
+            ["timeout", "-s", "TERM", str(timeout_s), *command],
+            on_stdout_line=on_stdout_line,
+            env=env,
+        )
+        return BackendResult(
+            exit_code=result.exit_code,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            timed_out=result.exit_code == self.TIMEOUT_EXIT_CODE,
+        )
+
+
+class ClaudeCodeRunner:
+    def __init__(
+        self, config: ClaudeCodeConfig, backend: HostBackend | ContainerBackend | None = None
+    ) -> None:
+        self.config = config
+        self.backend = backend or HostBackend()
+
+    def run(
+        self,
+        prompt: str,
+        cwd: str,
+        on_turn: Callable[[int, int], None] | None = None,
+    ) -> RunnerResult:
+        """Execute one agent run.
+
+        on_turn(completed_turns, elapsed_ms) fires at each turn boundary,
+        which is the only moment a checkpoint can observe work in progress.
+
+        The argument is how many turns have FINISHED, not the index of the
+        event that just arrived. An assistant message announces the tool
+        calls a turn is about to make, so when assistant message k lands the
+        working tree still holds the result of k-1 turns. Passing k would
+        file turn k-1's work under turn k and understate progress at every
+        checkpoint by exactly one turn -- which is the axis the
+        cost-at-budget-K curve is plotted against.
+
+        Nothing fires for the first assistant message: no turn has completed
+        yet, and the tree is still the base commit. The caller is
+        responsible for the final turn, whose tools run after the last
+        message on the stream (see execute_run's force_capture).
+
+        The boundary is approximate by however long a snapshot takes. The
+        callback runs while the agent is live, so a tool call that writes
+        faster than the snapshot completes can put part of turn k+1 into
+        turn k's checkpoint. Closing that window would mean pausing the
+        agent, which no external observer can do -- the alternative,
+        snapshotting after the run, is not approximate but simply wrong:
+        every checkpoint then holds the same end state.
+        """
+        # The prompt is appended here rather than inside build_command so
+        # that config_digest stays a property of the configuration and does
+        # not change with the task under test.
+        command = [*build_command(self.config), prompt]
+        env = self.backend.env_for(self.config)
+        # The caller owns freshness: this directory must be empty at the
+        # start of each run, or transcript discovery loses its guarantee.
+        Path(self.backend.transcript_root(self.config)).mkdir(parents=True, exist_ok=True)
+        started = time.monotonic()
+        turns = 0
+
+        def handle_line(line: str) -> None:
+            nonlocal turns
+            if not _is_assistant_event(line):
+                return
+            turns += 1
+            if on_turn is not None and turns > 1:
+                on_turn(turns - 1, int((time.monotonic() - started) * 1000))
+
+        result = self.backend.execute(
+            command=command,
+            env=env,
+            cwd=cwd,
+            timeout_s=self.config.wall_clock_timeout_s,
+            on_stdout_line=handle_line,
+        )
+
+        return RunnerResult(
+            exit_code=result.exit_code,
+            transcript_path=self._find_transcript(
+                self.backend.transcript_root(self.config)
+            ),
+            stdout=result.stdout,
+            stderr=result.stderr,
+            wall_clock_ms=int((time.monotonic() - started) * 1000),
+            timed_out=result.timed_out,
+            turns_streamed=turns,
         )
 
     @staticmethod
