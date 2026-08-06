@@ -12,8 +12,42 @@ Source plan: [docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md](../d
 - [x] **Task 8** — Failure and exclusion classification
 - [x] **Task 9** — Claude Code runner
 - [x] **Task 10** — Run orchestrator
-- [ ] Task 11 — Fault-injection gate
+- [x] **Task 11** — Fault-injection gate
 - [ ] Task 12 — End-to-end smoke test
+
+---
+
+## Review — Task 11 (2026-08-06)
+
+**Delivered:** `tests/test_fault_injection.py` (all twelve spec §6.6 cases), `scripts/verify_logger.py`, `src/bakeoff/proxy_callback.py`, `config/litellm_fault_injection.yaml`, `docker/litellm-proxy.Dockerfile`. **136 unit + 25 integration passing.** Gate exits 0.
+
+**Four defects found, all closed.** None would have been caught by the seven tests the plan drafted for this task — every one of them passes against the code as it stood.
+
+1. **A Bedrock throttle was scored against the model.** `execute_run` never populated `api_error_status`, so `classify_exclusion`'s 429/408/5xx branch was unreachable in production. The drafted test called the classifier directly and passed green over the dead path. Now derived from the wire log, with the rule that **only the final call counts, and only if it failed** — `num_retries: 3` means a recovered throttle produced a complete run, and excluding it would discard good data.
+
+2. **Four of six version fields were empty on every record** — `litellm`, `bedrock_model_id`, `harness_commit`, `task_set_commit`. §6.6 asks for "correct for every component". `harness_commit` carries a `-dirty` suffix on an uncommitted tree, so a record can never claim a provenance it does not have. `task_set_commit` stays empty and is asserted empty until the dataset plan exists.
+
+3. **Checkpoints were discarded whenever a run failed part way through.** `checkpoints = recorder.captured` sat inside the `try` after the agent call, so a snapshot hitting a full disk — or the container being killed — threw away every checkpoint already captured. The record still looked well-formed with an empty list, which is indistinguishable from a quiet run.
+
+4. **Wire capture was dead in the real topology.** `litellm.callbacks` registers in the harness process, which makes no model calls; the agent calls the proxy, a third process. Every real run would have produced an empty wire log — empty `sampling`, empty prompt and tool hashes, zero errored calls — silently, while §6.2 makes wire logging mandatory. Capture now runs inside the proxy (`proxy_callback.py`), attributed per run by an `X-Bakeoff-Run-Id` header, replayed through the existing `WireLogger` so there is still exactly one canonical artifact.
+
+**Verified rather than assumed:**
+- Pointed claude 2.1.220 at a local listener: `ANTHROPIC_CUSTOM_HEADERS="X-Bakeoff-Run-Id: <id>"` lands verbatim on every `POST /v1/messages?beta=true`. It probes `HEAD /api/hello` first.
+- `mock_response: "litellm.RateLimitError"` raises a **real** `RateLimitError` inside the proxy, so §6.6's throttle case is injected end to end with no credentials and no spend.
+- On `/v1/messages`, sampling fields are **not** top-level callback kwargs and `optional_params` is `{}`; the payload lives in `litellm_params.proxy_server_request.body`. Reading the obvious place would have recorded `None` for every sampling field — indistinguishable from a caller that sent none.
+- `litellm[proxy]==1.95.0` does not cap fastapi, and 0.141.0 removed `get_flat_dependant`, which the proxy imports at startup. An unpinned build dies before serving a request, on whatever day that release shipped, with nothing in this repo changed. Pinned to 0.140.0.
+
+**Deliberately not closed:** `tool_calls.malformed` stays 0 on every harness-written record — deciding a call was malformed means inspecting raw completions, which is the wire-log analysis in the scoring plan. A test pins that 0 so it is never misread as "the harness looked and found none".
+
+**Carried to Task 12:** a temperature configured on a deployment is invisible to the proxy-side callback on the Anthropic Messages route. Observed against a `mock_response` deployment, which short-circuits before provider param transformation, so it is not proof the value is dropped on a real call — but §5.3 puts sampling entirely in proxy config, so if it is dropped, three arms run at unspecified sampling. Must be read back from the wire log after the first real call.
+
+**One behaviour worth stating:** with no Docker daemon the gate reports `GATE INCOMPLETE` and exits 1 rather than passing. The mid-run kill, the proxy-side wire log, and live checkpoint capture are only observable against a real daemon; certifying the capture path on the strength of checks that cannot see it is the failure the gate exists to prevent.
+
+**Verify:**
+
+```bash
+cd bakeoff && .venv/bin/python scripts/verify_logger.py
+```
 
 ---
 

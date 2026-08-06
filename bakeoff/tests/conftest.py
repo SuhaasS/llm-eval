@@ -18,6 +18,8 @@ it fails loudly instead of letting the snapshot tests pass vacuously.
 """
 
 import subprocess
+import time
+from pathlib import Path
 
 import pytest
 
@@ -111,10 +113,26 @@ def git_container(image_digest, tmp_path):
 # container, parse_trajectory, cost_usd, scan_destructive, and the per-turn
 # records. Without it trajectory_path is None and everything after the
 # orchestrator is exercised only by unit tests with hand-built fixtures.
+# When ANTHROPIC_BASE_URL is set it also makes a REAL HTTP call to the proxy,
+# carrying ANTHROPIC_CUSTOM_HEADERS exactly as Claude Code does. Verified
+# against claude 2.1.220 by pointing it at a local listener: the value lands
+# on the wire verbatim as `X-Bakeoff-Run-Id: <id>` on every POST /v1/messages.
+# Without a real request the proxy-side callback never fires, and the wire
+# capture path would be tested only in the harness process -- which is the
+# defect this exists to catch.
 FAKE_AGENT = """#!/bin/sh
 SESSION="${CLAUDE_CONFIG_DIR:-/tmp/cfg}/projects/-repo"
 mkdir -p "$SESSION"
 T="$SESSION/fake-session.jsonl"
+
+if [ -n "$ANTHROPIC_BASE_URL" ]; then
+  curl -s -o /dev/null -X POST "$ANTHROPIC_BASE_URL/v1/messages" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer ${ANTHROPIC_AUTH_TOKEN:-none}" \
+    -H "${ANTHROPIC_CUSTOM_HEADERS:-X-Unused: 1}" \
+    -d "{\\"model\\":\\"${ANTHROPIC_MODEL:-mock-ok}\\",\\"max_tokens\\":64,\\"messages\\":[{\\"role\\":\\"user\\",\\"content\\":\\"hi\\"}]}" \
+    || true
+fi
 
 echo '{"type":"system","subtype":"init","session_id":"fake"}'
 
@@ -168,6 +186,10 @@ def agent_image(tmp_path_factory):
     (context / "claude").write_text(FAKE_AGENT)
     (context / "Dockerfile").write_text(
         f"FROM {FIXTURE_IMAGE}\n"
+        # curl is how the fake agent reaches the proxy. Installed at BUILD
+        # time deliberately: during a run the container is on an internal
+        # network with no route to a mirror, which is the point.
+        "RUN apk add --no-cache curl\n"
         "COPY claude /usr/local/bin/claude\n"
         "RUN chmod +x /usr/local/bin/claude\n"
         "ENTRYPOINT []\n"
@@ -184,6 +206,93 @@ def agent_image(tmp_path_factory):
         text=True,
     )
     return out.stdout.strip()
+
+
+PROXY_TAG = "bakeoff-litellm-proxy:test"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+@pytest.fixture(scope="session")
+def proxy_image():
+    """Build the LiteLLM proxy image once per session.
+
+    Real image, real litellm, real callback dispatch. A mocked proxy would
+    prove nothing here: the defect being covered is that LiteLLM's callback
+    dispatch happens in the PROXY process, and only a real proxy process can
+    demonstrate that the callback fires there.
+    """
+    subprocess.run(
+        [
+            "docker", "build", "-q",
+            "-f", str(REPO_ROOT / "docker" / "litellm-proxy.Dockerfile"),
+            "-t", PROXY_TAG, str(REPO_ROOT),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return PROXY_TAG
+
+
+@pytest.fixture
+def fault_proxy(proxy_image, tmp_path):
+    """An internal network carrying a real LiteLLM proxy that answers from
+    mock_response.
+
+    Yields (network_name, host_wire_dir). Every deployment is mocked, so
+    this costs nothing and needs no credentials -- a gate that costs money
+    is a gate that stops being run.
+    """
+    import docker
+
+    client = docker.from_env()
+    wire_dir = tmp_path / "wire"
+    wire_dir.mkdir()
+
+    network = client.networks.create(
+        "bakeoff-fault-net", driver="bridge", internal=True
+    )
+    proxy = client.containers.run(
+        proxy_image,
+        command=[
+            "--config", "/app/config/litellm_fault_injection.yaml",
+            "--port", "4000", "--host", "0.0.0.0",
+        ],
+        name="litellm",
+        network=network.name,
+        volumes={
+            str(REPO_ROOT / "src"): {"bind": "/app/src", "mode": "ro"},
+            str(REPO_ROOT / "config"): {"bind": "/app/config", "mode": "ro"},
+            str(wire_dir): {"bind": "/eval/wire", "mode": "rw"},
+        },
+        detach=True,
+    )
+    try:
+        _wait_for_proxy(proxy)
+        yield network.name, wire_dir
+    finally:
+        proxy.remove(force=True)
+        network.remove()
+
+
+def _wait_for_proxy(proxy, timeout_s: int = 90) -> None:
+    """Block until the proxy answers.
+
+    Probed from INSIDE the container: the network is internal, so there is
+    no host route to poll. A fixed sleep would either flake or waste time on
+    every run.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        result = proxy.exec_run(
+            ["python", "-c",
+             "import urllib.request;"
+             "urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness', timeout=2)"]
+        )
+        if result.exit_code == 0:
+            return
+        time.sleep(2)
+    logs = proxy.logs(tail=40).decode("utf-8", errors="replace")
+    raise RuntimeError(f"litellm proxy did not become ready:\n{logs}")
 
 
 @pytest.fixture

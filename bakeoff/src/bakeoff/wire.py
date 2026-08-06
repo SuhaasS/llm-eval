@@ -104,6 +104,21 @@ class BakeoffCallback(CustomLogger):
         except (TypeError, AttributeError):
             return None
 
+    @staticmethod
+    def _status_code(kwargs: dict) -> int | None:
+        """HTTP status of a failed call.
+
+        This is the only place the harness ever sees one. LiteLLM puts the
+        exception object on the failure kwargs, and its exceptions carry the
+        provider status (RateLimitError 429, Timeout 408,
+        ServiceUnavailableError 503) -- exactly the codes classify_exclusion
+        maps to pre-registered infra reasons. Without it a Bedrock throttle
+        is indistinguishable from the model giving up, and gets scored
+        against the model.
+        """
+        status = getattr(kwargs.get("exception"), "status_code", None)
+        return status if isinstance(status, int) else None
+
     def _record(
         self,
         kwargs: dict,
@@ -133,6 +148,7 @@ class BakeoffCallback(CustomLogger):
                 "run_id": self.run_id,
                 "call_index": self._call_index,
                 "failed": failed,
+                "status_code": self._status_code(kwargs) if failed else None,
                 # Measured generation time, as opposed to the trajectory
                 # parser's estimate from transcript timestamps.
                 "latency_ms": self._latency_ms(start_time, end_time),

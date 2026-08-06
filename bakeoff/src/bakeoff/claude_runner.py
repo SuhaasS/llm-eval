@@ -68,6 +68,8 @@ DIGEST_EXCLUDED_ENV = frozenset(
         "ANTHROPIC_MODEL",
         "ANTHROPIC_BASE_URL",
         "CLAUDE_CONFIG_DIR",
+        # Carries the run_id, so it differs by construction on every run.
+        "ANTHROPIC_CUSTOM_HEADERS",
     }
 )
 
@@ -90,6 +92,11 @@ class ClaudeCodeConfig:
     # what the proxy was configured to send (spec section 5.3); None means
     # "send no temperature", which is mandatory for Sonnet 5.
     temperature: float | None = None
+    # Extra request headers, "Name: Value" per line. Verified against claude
+    # 2.1.220: ANTHROPIC_CUSTOM_HEADERS in that format appears on every
+    # POST /v1/messages. The harness stamps the run_id here so the proxy-side
+    # wire log can attribute each call to a run (see proxy_callback).
+    custom_headers: str = ""
 
 
 @dataclass(frozen=True)
@@ -124,7 +131,13 @@ def build_command(config: ClaudeCodeConfig) -> list[str]:
 
 def _eval_env(config: ClaudeCodeConfig) -> dict[str, str]:
     """The variables the harness sets deliberately."""
+    extra = (
+        {"ANTHROPIC_CUSTOM_HEADERS": config.custom_headers}
+        if config.custom_headers
+        else {}
+    )
     return {
+        **extra,
         "CLAUDE_CONFIG_DIR": config.config_dir,
         "ANTHROPIC_BASE_URL": config.base_url,
         "ANTHROPIC_AUTH_TOKEN": config.auth_token,
@@ -185,7 +198,15 @@ def config_digest(config: ClaudeCodeConfig) -> str:
     payload = {
         k: v
         for k, v in asdict(config).items()
-        if k not in {"model", "auth_token", "base_url", "config_dir", "temperature"}
+        if k
+        not in {
+            "model",
+            "auth_token",
+            "base_url",
+            "config_dir",
+            "temperature",
+            "custom_headers",
+        }
     }
     payload["command_shape"] = build_command(config)[1:]
     payload["env_shape"] = {

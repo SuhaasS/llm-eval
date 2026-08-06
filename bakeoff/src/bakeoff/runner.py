@@ -23,8 +23,11 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import subprocess
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from functools import lru_cache
+from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +41,7 @@ from bakeoff.claude_runner import (
 from bakeoff.classify import RunSignals, classify_exclusion, classify_failure
 from bakeoff.container import RunContainer
 from bakeoff.eventlog import EventLog
+from bakeoff.proxy_callback import read_run_entries
 from bakeoff.scanners import scan_destructive
 from bakeoff.schema import (
     Artifacts,
@@ -80,6 +84,63 @@ def _sha256(value: Any) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()
+
+
+@lru_cache(maxsize=1)
+def litellm_version() -> str:
+    """Installed LiteLLM version.
+
+    From package metadata, not `litellm.__version__` -- that attribute does
+    not exist in 1.95.0 and raises AttributeError through the module's
+    __getattr__, which would have cost the record for a version string.
+    """
+    try:
+        return package_version("litellm")
+    except PackageNotFoundError:
+        return ""
+
+
+@lru_cache(maxsize=1)
+def harness_commit() -> str:
+    """Commit of the harness that produced a record, `-dirty` when the tree
+    has uncommitted changes.
+
+    2,400 runs are collected over weeks while this code keeps changing. A
+    record that cannot be attributed to a specific harness version cannot be
+    re-derived or trusted after the fact, and a clean SHA on a dirty tree
+    would assert a provenance that does not exist.
+    """
+    try:
+        root = Path(__file__).resolve().parent
+        sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=root, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        return f"{sha}-dirty" if dirty else sha
+    except (subprocess.CalledProcessError, OSError):
+        return ""
+
+
+def final_api_error_status(entries: list[dict[str, Any]]) -> int | None:
+    """The HTTP status a run ENDED on, or None.
+
+    Only the last call counts. `general_settings.num_retries: 3` means a
+    transient 429 followed by a successful retry produced a complete run, and
+    excluding it would discard good data over an error that cost nothing.
+    Exclusion is the one mechanism by which results can be massaged (section
+    6.4), so the bar is deliberately high: the run has to have died on it.
+    """
+    if not entries:
+        return None
+    metadata = entries[-1].get("metadata") or {}
+    if not metadata.get("failed"):
+        return None
+    status = metadata.get("status_code")
+    return status if isinstance(status, int) else None
 
 
 def resolve_reverts(
@@ -197,6 +258,8 @@ def assemble_record(
 
     entries = wire_entries or []
     first_request = entries[0].get("request", {}) if entries else {}
+    if api_error_status is None:
+        api_error_status = final_api_error_status(entries)
     failed_calls = sum(
         1 for e in entries if (e.get("metadata") or {}).get("failed")
     )
@@ -256,6 +319,15 @@ def assemble_record(
         versions=versions or Versions(
             claude_code=parsed.claude_code_version,
             container_image_digest=task.container_image_digest,
+            litellm=litellm_version(),
+            harness_commit=harness_commit(),
+            # The model the proxy actually resolved the alias to, read off
+            # the wire rather than from config: the alias is what was asked
+            # for, this is what answered.
+            bedrock_model_id=first_request.get("model", "") if entries else "",
+            # Deliberately blank until the dataset plan exists. Inventing a
+            # value would be worse than an honest gap.
+            task_set_commit="",
         ),
         config_digest=cfg_digest,
         system_prompt_sha=_sha256(first_request.get("system")) if entries else "",
@@ -301,6 +373,7 @@ def execute_run(
     every_k_turns: int = 1,
     attempt_number: int = 1,
     parent_run_id: str | None = None,
+    proxy_wire_dir: Path | None = None,
 ) -> RunRecord:
     """Run one sample and write exactly one record.
 
@@ -309,6 +382,13 @@ def execute_run(
     reach a model, so the run is executed but marked `isolated=False` --
     the record says plainly that section 5.1's guarantees did not hold,
     rather than letting the pinned image digest imply they did.
+
+    `proxy_wire_dir` is the host side of the directory the proxy writes its
+    wire log into. When set, the record's wire evidence comes from there:
+    the agent's calls are made by the proxy process, so the in-process
+    callback never sees them. The two sources are never merged -- one call
+    would be counted twice and the retry-aware error status would read the
+    wrong last entry.
     """
     import litellm  # slow to import; and only needed when a run executes
 
@@ -330,6 +410,12 @@ def execute_run(
     crashed = False
     previous_callbacks = list(litellm.callbacks)
     wire: WireLogger | None = None
+    # Held outside the try so a failure part way through the run keeps the
+    # checkpoints already captured. They are the only evidence of what the
+    # agent had built by then, and discarding them yields a well-formed
+    # record with an empty checkpoint list -- data loss that looks like a
+    # quiet run.
+    recorder: CheckpointRecorder | None = None
 
     try:
         # Inside the try: a name collision on the wire log must cost the wire
@@ -353,7 +439,13 @@ def execute_run(
             recorder = CheckpointRecorder(container, task.base_sha, every_k_turns)
             backend = ContainerBackend(container, str(host_config_dir))
             runner = ClaudeCodeRunner(
-                replace(config, config_dir=CONTAINER_CONFIG_DIR), backend=backend
+                replace(
+                    config,
+                    config_dir=CONTAINER_CONFIG_DIR,
+                    # Stamped per run so the proxy can attribute each call.
+                    custom_headers=f"X-Bakeoff-Run-Id: {run_id}",
+                ),
+                backend=backend,
             )
 
             # Capture as each turn lands, not afterwards. Snapshotting after
@@ -368,7 +460,6 @@ def execute_run(
                 turn=runner_result.turns_streamed,
                 elapsed_ms=runner_result.wall_clock_ms,
             )
-            checkpoints = recorder.captured
 
             if trajectory_path and trajectory_path.exists():
                 try:
@@ -384,7 +475,19 @@ def execute_run(
         # Global state: leaving this set would let one run's logger capture
         # the next run's calls, silently cross-contaminating wire logs.
         litellm.callbacks = previous_callbacks
+        if recorder is not None:
+            checkpoints = recorder.captured
         if wire is not None:
+            if proxy_wire_dir is not None:
+                # The agent's calls were made by the proxy process; replay
+                # them through WireLogger so there is still exactly one
+                # canonical artifact, secret-scanned in one place.
+                for entry in read_run_entries(proxy_wire_dir, run_id):
+                    wire.log_call(
+                        request=entry.get("request", {}),
+                        response=entry.get("response", {}),
+                        metadata=entry.get("metadata", {}),
+                    )
             wire_entries = wire.entries()
             wire.close()
 

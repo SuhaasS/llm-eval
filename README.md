@@ -48,7 +48,17 @@ Integration tests are opt-in — they need a Docker daemon, and on macOS they ne
 cd bakeoff && .venv/bin/python -m pytest -v -m integration --basetemp="$HOME/.cache/bakeoff-pytest"
 ```
 
-Status: Tasks 1–10 complete (schema, event log, pricing, trajectory parser, scanners, container, checkpoints, wire logging, classification, Claude Code runner, run orchestrator). 115 unit + 19 integration tests passing.
+Status: Tasks 1–11 complete (schema, event log, pricing, trajectory parser, scanners, container, checkpoints, wire logging, classification, Claude Code runner, run orchestrator, fault-injection gate). 136 unit + 25 integration tests passing.
+
+### The gate
+
+Spec §6.6 requires the logging layer to be fault-injected before it is trusted with 2,400 runs. Run this before collecting any data:
+
+```bash
+cd bakeoff && .venv/bin/python scripts/verify_logger.py
+```
+
+All twelve §6.6 cases are injected offline — no credentials, no spend. Throttles come from a real LiteLLM proxy whose `mock_response` raises a genuine `RateLimitError`. Without a Docker daemon the gate reports `GATE INCOMPLETE` and exits 1 rather than passing: the mid-run kill, the proxy-side wire log, and live checkpoint capture are only observable against a real daemon.
 
 ## Running a run
 
@@ -61,6 +71,14 @@ cd bakeoff && docker build -f docker/eval-agent.Dockerfile -t bakeoff-eval-agent
 ```
 
 `execute_run` without a `network` still runs, but records `isolated=False` — §5.1 did not hold for the process under test, and the record says so rather than letting the pinned image digest imply otherwise.
+
+**Wire logging happens inside the proxy, not in the harness.** The harness process makes no model calls — the agent does, through the proxy — so a callback registered on `litellm.callbacks` here observes nothing. Build the proxy image, mount `src/` and a wire directory into it, and pass that directory to `execute_run` as `proxy_wire_dir`; without it `sampling`, `system_prompt_sha`, `tool_schema_sha` and the API error status come back empty:
+
+```bash
+cd bakeoff && docker build -f docker/litellm-proxy.Dockerfile -t bakeoff-litellm .
+```
+
+Each request carries `X-Bakeoff-Run-Id` via `ANTHROPIC_CUSTOM_HEADERS`, which is how the proxy attributes a call to a run. A call that arrives without it is written to `unattributed.jsonl` rather than guessed at, and the gate fails on any such line.
 
 Bedrock model IDs and per-arm sampling in [config/litellm_config.yaml](bakeoff/config/litellm_config.yaml) are verified against the AWS model cards and each lab's published guidance. Routing, auth, and whether the proxy actually applies that sampling are not — Phase 0c's smoke test is the gate, and it reads the applied values back from the wire log rather than from the config file.
 

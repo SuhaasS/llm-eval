@@ -523,20 +523,26 @@ Private repo or bucket with a documented access list, per §3.6. Secret-scanned 
 
 Fault-injection pass. Confirm each of these produces a complete, correctly-classified record with nothing lost:
 
-- [ ] Container killed mid-run
-- [ ] Bedrock throttle / 5xx during generation
-- [ ] Deliberately malformed tool call
-- [ ] Token budget exhausted mid-edit
-- [ ] Turn budget exhausted
-- [ ] Agent issues a destructive command
-- [ ] Test harness itself crashes
-- [ ] Disk full during checkpoint write
-- [ ] Wire log captures a malformed completion in full, pre-parse
-- [ ] Per-turn token and cost records reconstruct the run-level totals exactly
-- [ ] Version block populated and correct for every component
-- [ ] Interrupted run leaves a partial-but-valid record, not a corrupt one
+- [x] Container killed mid-run
+- [x] Bedrock throttle / 5xx during generation
+- [x] Deliberately malformed tool call
+- [x] Token budget exhausted mid-edit
+- [x] Turn budget exhausted
+- [x] Agent issues a destructive command
+- [x] Test harness itself crashes
+- [x] Disk full during checkpoint write
+- [x] Wire log captures a malformed completion in full, pre-parse
+- [x] Per-turn token and cost records reconstruct the run-level totals exactly
+- [x] Version block populated and correct for every component
+- [x] Interrupted run leaves a partial-but-valid record, not a corrupt one
 
 The logger is trusted with 2,400 runs. Test it before, not after.
+
+**Closed 2026-08-06** by `bakeoff/tests/test_fault_injection.py`, gated by `bakeoff/scripts/verify_logger.py` (exit non-zero, and `GATE INCOMPLETE` rather than a pass when Docker is unavailable). Every case is injected offline: no credentials, no spend. Throttles use a proxy deployment whose `mock_response` raises a real `RateLimitError`.
+
+Four defects were found by working this list rather than by the tests originally drafted for it — a Bedrock throttle was being scored against the model because nothing populated `api_error_status`; four of six version fields were empty on every record; checkpoints captured before a mid-run failure were being discarded; and wire capture was registered in the harness process, which makes no model calls, so **every real run would have produced an empty wire log**. All four are closed; see Task 11 in the harness plan.
+
+Two items remain open at Phase 0c and are recorded against Task 12: whether the proxy actually applies §5.3 sampling on the Anthropic Messages route, and whether Claude Code completes a loop through the proxy on an internal network.
 
 ---
 

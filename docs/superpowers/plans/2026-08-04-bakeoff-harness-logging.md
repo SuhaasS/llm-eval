@@ -4098,231 +4098,101 @@ git add bakeoff/src/bakeoff/runner.py bakeoff/src/bakeoff/container.py bakeoff/s
 
 ---
 
-## Task 11: Fault-Injection Gate
+## Task 11: Fault-Injection Gate — DONE (2026-08-06)
 
 This implements the spec section 6.6 checklist. **The harness is not trusted with 2,400 runs until every case here passes.**
 
 **Files:**
-- Create: `bakeoff/tests/test_fault_injection.py`
-- Create: `bakeoff/scripts/verify_logger.py`
-- Test: itself
+- Created: `bakeoff/tests/test_fault_injection.py` (22 cases: 18 unit, 4 integration)
+- Created: `bakeoff/scripts/verify_logger.py`
+- Created: `bakeoff/src/bakeoff/proxy_callback.py`
+- Created: `bakeoff/config/litellm_fault_injection.yaml`
+- Created: `bakeoff/docker/litellm-proxy.Dockerfile`
+- Changed: `runner.py`, `wire.py`, `claude_runner.py`, `tests/conftest.py`
 
 **Interfaces:**
 - Consumes: everything from Tasks 1-10
 - Produces: `scripts/verify_logger.py` — a runnable gate that exits non-zero if any capture case fails
 
-- [ ] **Step 1: Write the fault-injection tests**
+### What the original plan for this task would have missed
 
-`bakeoff/tests/test_fault_injection.py`:
+The seven tests as drafted all pass against the code as it stood. Four defects were found by writing the section 6.6 checklist out in full and asserting each case as close to production as it could be asserted.
 
-```python
-"""Spec section 6.6 gate. Each case must produce a complete, correctly
-classified record with nothing lost."""
+**Defect 12 — `api_error_status` was never populated (CLOSED).** `execute_run` never passed it to `assemble_record`, so `classify_exclusion`'s throttle/timeout/5xx branch was unreachable on a real run and every Bedrock 429 was scored against the model. The drafted test called `classify_exclusion` directly and passed green over the dead path. Now derived from the wire log — the only place the harness ever sees an HTTP status — with a deliberate rule: **only the LAST call counts, and only if it failed.** `num_retries: 3` means a transient 429 followed by a successful retry produced a complete run, and exclusion is the one mechanism by which results can be massaged.
 
-import gzip
-import json
+**Defect 13 — the version block was 4/6 empty on every record (CLOSED).** `litellm`, `bedrock_model_id`, `harness_commit` and `task_set_commit` were `""` on every record ever written, while section 6.6 asks for "populated and correct for every component". Now populated from `importlib.metadata` (note `litellm.__version__` does **not** exist in 1.95.0 — it raises `AttributeError`), `git rev-parse HEAD` with a `-dirty` suffix, and the resolved model read off the wire. `task_set_commit` stays empty until the dataset plan exists and is asserted empty on purpose.
 
-import pytest
+**Defect 14 — checkpoints were discarded when a run failed part way through (CLOSED).** `checkpoints = recorder.captured` sat after the agent call inside the `try`, so any mid-run failure — a snapshot hitting a full disk, the container being killed — threw away every checkpoint already captured. The record still looked well-formed, with an empty checkpoint list, which is indistinguishable from a quiet run. The recorder is now held outside the `try` and read in the `finally`.
 
-from bakeoff.classify import RunSignals, classify_exclusion
-from bakeoff.eventlog import EventLog
-from bakeoff.runner import TaskSpec, assemble_record
-from bakeoff.schema import ExclusionClass, Outcome, TerminationReason
-from bakeoff.trajectory import parse_trajectory
-from bakeoff.wire import WireLogger
+**Defect 15 — wire capture was dead in the Task 10 topology (CLOSED).** `litellm.callbacks = [BakeoffCallback(...)]` registers in the *harness* process, which makes no LLM calls: the agent runs in its own container and the model call is made by the proxy, a third process. Every real run would have produced an empty wire log, and with it empty `sampling`, empty `system_prompt_sha` and `tool_schema_sha`, `errored: 0`, and (after defect 12) no error status — silently. Section 6.2 makes wire logging mandatory.
 
+Closed by moving capture to where the calls are: `bakeoff/src/bakeoff/proxy_callback.py` runs inside the proxy, registered as `callbacks: bakeoff.proxy_callback.instance`. The harness reads those lines back and replays them through the existing `WireLogger`, so there is still exactly one canonical artifact.
 
-@pytest.fixture
-def task():
-    return TaskSpec(
-        task_id="t-fault",
-        task_version=1,
-        repo="pindrop/example",
-        base_sha="abc123",
-        container_image_digest="python@sha256:" + "0" * 64,
-        prompt="Fix it",
-        test_paths=["tests/test_a.py"],
-    )
+### Verified against the real thing, not assumed
 
+| Claim | How it was checked |
+|---|---|
+| A dotted path to a module-level **instance** works as a proxy callback | `get_instance_fn` returns the resolved attribute as-is; only a *class* fails the `isinstance(CustomLogger)` check. Confirmed by a live proxy writing a wire log |
+| Claude Code stamps custom headers | Pointed claude 2.1.220 at a local listener: `ANTHROPIC_CUSTOM_HEADERS="X-Bakeoff-Run-Id: <id>"` appears verbatim on every `POST /v1/messages?beta=true`. It also probes `HEAD /api/hello` first |
+| Faults can be injected with no credentials | `mock_response: "litellm.RateLimitError"` raises a **real** `RateLimitError` (429) inside the proxy. Also `litellm.InternalServerError` (500), `litellm.ContextWindowExceededError` (400). No sentinel exists for 408 |
+| Sampling fields are not top-level callback kwargs on `/v1/messages` | Dumped the live callback kwargs: `max_tokens`, `temperature`, `system`, `tools` are all `None` and `optional_params` is `{}`. The payload is in `litellm_params.proxy_server_request.body` |
+| `litellm[proxy]==1.95.0` does not cap fastapi | fastapi 0.141.0 removed `get_flat_dependant`, which the proxy imports at startup; an unpinned build dies before serving a request. Pinned to 0.140.0, which has the symbol |
 
-def test_container_killed_midrun_yields_valid_record(task, tmp_path):
-    log = EventLog(tmp_path / "log")
-    record = assemble_record(
-        task=task, model="gemma-4-31b", sample_index=0,
-        started_at="2026-08-04T00:00:00Z", finished_at="2026-08-04T00:00:10Z",
-        trajectory_path=None, runner_result=None, checkpoints=[],
-        destructive_events=[], artifacts_root=tmp_path, container_crashed=True,
-    )
-    log.write_run(record)
-    assert log.read_run(record.run_id).outcome == Outcome.CRASHED
+### Carried to Task 12
 
+**The proxy's configured sampling is not visible to the callback on the Anthropic Messages route.** A `temperature` set on the deployment appears in neither `optional_params`, `litellm_params`, nor `standard_logging_object.model_parameters`. That was observed against a `mock_response` deployment, which short-circuits before provider param transformation, so it does **not** prove the value is dropped on a real call. It does mean the wire log cannot yet confirm section 5.3 sampling was applied — and section 5.3 puts sampling entirely in proxy config because Claude Code has no temperature flag. If the value really is dropped, two arms run at unspecified sampling with nothing in the record saying so. **Task 12 must check this against a real endpoint.**
 
-def test_bedrock_throttle_classified_as_infra_not_model():
-    exclusion = classify_exclusion(
-        RunSignals(
-            outcome=Outcome.FAILED, terminated_by=TerminationReason.CRASH,
-            tool_calls_total=0, tool_calls_malformed=0, truncation_events=0,
-            distinct_turn_hashes=0, turns_used=0, agent_claimed_success=False,
-            tests_passed=False, api_error_status=429,
-        )
-    )
-    assert exclusion.cls == ExclusionClass.INFRA_FAILURE
+### The twelve section 6.6 cases
 
+| # | Spec case | Where |
+|---|---|---|
+| 1 | Container killed mid-run | `test_container_killed_mid_run_still_writes_a_record` (integration; kills the real container mid-stream) |
+| 2 | Bedrock throttle / 5xx | `test_proxy_throttle_is_excluded_as_infra_not_scored_against_the_model` (integration, real 429 through a real proxy) + two derivation unit tests |
+| 3 | Deliberately malformed tool call | `test_malformed_tool_call_does_not_lose_the_turn`, plus `test_malformed_count_is_deliberately_deferred_not_measured` |
+| 4 | Token budget exhausted mid-edit | `test_token_budget_exhausted_mid_edit_keeps_the_partial_work` |
+| 5 | Turn budget exhausted | `test_turn_budget_exhausted_is_distinct_from_token_exhaustion` |
+| 6 | Agent issues a destructive command | `test_destructive_command_survives_parse_scan_and_record` |
+| 7 | Test harness itself crashes | `test_harness_crash_before_the_agent_starts_still_writes_a_record` |
+| 8 | Disk full during checkpoint write | `test_checkpoint_write_failure_keeps_the_checkpoints_already_captured` |
+| 8b | Disk full during the record write | `test_failed_record_write_leaves_no_phantom_index_entry` |
+| 9 | Malformed completion in the wire log, pre-parse | `test_malformed_completion_survives_in_wire_log`, `test_truncated_trajectory_parses_partially` |
+| 10 | Per-turn tokens and cost reconstruct run totals | `test_per_turn_tokens_reconstruct_run_totals`, `test_run_record_totals_match_its_own_per_turn_records` |
+| 11 | Version block populated and correct | `test_version_block_is_populated_for_every_component`, `test_task_set_commit_is_deliberately_empty_until_the_dataset_exists` |
+| 12 | Interrupted run leaves a partial-but-valid record | `test_agent_killed_mid_stream_leaves_a_partial_but_valid_record` |
 
-def test_malformed_completion_survives_in_wire_log(tmp_path):
-    path = tmp_path / "wire.jsonl.gz"
-    logger = WireLogger(path)
-    raw = '{"name":"Edit","input":{"file_path":'  # truncated mid-object
-    logger.log_call(
-        request={"model": "kimi-k2-5"},
-        response={"raw_completion": raw, "parse_error": "unexpected EOF"},
-        metadata={"run_id": "r-1", "turn": 3},
-    )
-    logger.close()
+Plus the defect-15 guard, `test_proxy_side_capture_records_the_call_the_agent_made`, and its **negative control** `test_without_a_proxy_wire_dir_the_harness_captures_nothing` — the same run against the same proxy, sourcing entries in-process, capturing nothing. Without the control the positive test could be passing on in-process capture and nobody would know.
 
-    with gzip.open(path, "rt", encoding="utf-8") as handle:
-        entry = json.loads(handle.readline())
-    assert entry["response"]["raw_completion"] == raw
+- [x] **Step 1: Write the fault-injection tests** — `tests/test_fault_injection.py`, all twelve cases
+- [x] **Step 2: Run to confirm the suite fails or passes honestly** — 4 of 18 failed on first run, one per defect above
+- [x] **Step 3: Fix the defects** — `wire.py` status capture, `runner.py` derivation + version block + checkpoint survival, `proxy_callback.py`
+- [x] **Step 4: Write the runnable gate script** — `scripts/verify_logger.py`
+- [x] **Step 5: Run the gate** — `GATE PASSED`, exit 0
 
+### The gate script, as built
 
-def test_truncated_trajectory_parses_partially(tmp_path):
-    src = (
-        '{"type":"assistant","timestamp":"2026-08-04T00:00:01.000Z","version":"2.1.209",'
-        '"message":{"model":"gemma-4-31b","stop_reason":"end_turn","content":[],'
-        '"usage":{"input_tokens":1,"output_tokens":2}}}\n'
-        '{"type":"assis'
-    )
-    path = tmp_path / "t.jsonl"
-    path.write_text(src)
+The version drafted in this plan had four defects, all fixed:
 
-    parsed = parse_trajectory(path, model="gemma-4-31b")
-    assert len(parsed.turns) == 1
-    assert parsed.malformed_lines == 1
+- it invoked bare `python`, which resolves to whatever is first on PATH rather than the venv holding the dependencies — now `sys.executable`
+- it set no `cwd`, so it only worked when run from `bakeoff/`
+- it listed `tests/test_fault_injection.py` separately as well as inside `tests/`, running every case twice
+- it omitted `--basetemp` under `$HOME`, which `tests/conftest.py` documents as required on macOS: the Docker VM mounts `$HOME` only, and a repo bind-mounted from `/var/folders` appears inside the container as a silently **empty** directory, so the snapshot tests compare nothing against nothing and pass
 
+It also skipped `test_runner_integration.py` and `scripts/dry_run.py`, the only end-to-end checks that exist. Both are in the gate now.
 
-def test_per_turn_tokens_reconstruct_run_totals(tmp_path):
-    """The arithmetic check that catches a silently lossy logger."""
-    lines = []
-    for i in range(5):
-        lines.append(
-            json.dumps(
-                {
-                    "type": "assistant",
-                    "timestamp": f"2026-08-04T00:00:0{i}.000Z",
-                    "version": "2.1.209",
-                    "message": {
-                        "model": "gemma-4-31b",
-                        "stop_reason": "tool_use",
-                        "content": [],
-                        "usage": {"input_tokens": i, "output_tokens": i * 2},
-                    },
-                }
-            )
-        )
-    path = tmp_path / "t.jsonl"
-    path.write_text("\n".join(lines))
+One behaviour worth stating: **with no Docker daemon the gate returns `GATE INCOMPLETE` and exit 1, not a pass.** Half of section 6.6 — the mid-run kill, the proxy-side wire log, live checkpoint capture — is only observable against a real daemon. Reporting "passed" on the strength of the checks that cannot see those is the exact failure this gate exists to prevent.
 
-    parsed = parse_trajectory(path, model="gemma-4-31b")
-    assert sum(t.tokens.input for t in parsed.turns) == parsed.total_tokens.input
-    assert sum(t.tokens.output for t in parsed.turns) == parsed.total_tokens.output
-    assert sum(t.cost_usd for t in parsed.turns) == pytest.approx(
-        parsed.total_cost_usd
-    )
-
-
-def test_version_block_populated_on_every_record(task, tmp_path):
-    record = assemble_record(
-        task=task, model="gemma-4-31b", sample_index=0,
-        started_at="2026-08-04T00:00:00Z", finished_at="2026-08-04T00:01:00Z",
-        trajectory_path=None, runner_result=None, checkpoints=[],
-        destructive_events=[], artifacts_root=tmp_path,
-    )
-    assert record.versions.container_image_digest == task.container_image_digest
-    assert record.schema_version
-
-
-def test_disk_full_during_write_leaves_no_phantom_index_entry(tmp_path, monkeypatch):
-    log = EventLog(tmp_path / "log")
-
-    def boom(*_a, **_k):
-        raise OSError("No space left on device")
-
-    monkeypatch.setattr("bakeoff.eventlog.json.dump", boom)
-    with pytest.raises(OSError):
-        log.write_run(
-            assemble_record(
-                task=TaskSpec(
-                    task_id="t-x", task_version=1, repo="r", base_sha="s",
-                    container_image_digest="python@sha256:" + "0" * 64, prompt="p",
-                ),
-                model="gemma-4-31b", sample_index=0,
-                started_at="2026-08-04T00:00:00Z",
-                finished_at="2026-08-04T00:01:00Z",
-                trajectory_path=None, runner_result=None, checkpoints=[],
-                destructive_events=[], artifacts_root=tmp_path,
-            )
-        )
-    index = tmp_path / "log" / "index.jsonl"
-    assert not index.exists() or index.read_text().strip() == ""
-```
-
-- [ ] **Step 2: Run to confirm the suite fails or passes honestly**
-
-Run: `cd bakeoff && python -m pytest tests/test_fault_injection.py -v`
-Expected: 7 passed. Any failure here is a real logging defect — fix the module, not the test.
-
-- [ ] **Step 3: Write the runnable gate script**
-
-`bakeoff/scripts/verify_logger.py`:
-
-```python
-#!/usr/bin/env python3
-"""Spec section 6.6 gate. Run before any real eval batch.
-
-Exits non-zero if the logging layer cannot be trusted with a full run.
-"""
-
-from __future__ import annotations
-
-import subprocess
-import sys
-
-CHECKS = [
-    ("unit suite", ["python", "-m", "pytest", "tests/", "-q", "-m", "not integration"]),
-    ("fault injection", ["python", "-m", "pytest", "tests/test_fault_injection.py", "-q"]),
-    ("container integration", ["python", "-m", "pytest", "tests/test_container.py", "-q", "-m", "integration"]),
-]
-
-
-def main() -> int:
-    failures: list[str] = []
-    for name, command in CHECKS:
-        print(f"\n=== {name} ===", flush=True)
-        if subprocess.run(command).returncode != 0:
-            failures.append(name)
-
-    if failures:
-        print(f"\nGATE FAILED: {', '.join(failures)}")
-        print("Do not start an eval batch until these pass.")
-        return 1
-
-    print("\nGATE PASSED: logging layer verified.")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-```
-
-- [ ] **Step 4: Run the gate**
-
-Run: `cd bakeoff && python scripts/verify_logger.py`
-Expected: `GATE PASSED: logging layer verified.` and exit code 0
-
-- [ ] **Step 5: Commit**
+### Verify
 
 ```bash
-cd bakeoff && git add tests/test_fault_injection.py scripts/verify_logger.py && git commit -m "feat: fault-injection gate verifying the logger loses nothing"
+cd bakeoff && .venv/bin/python scripts/verify_logger.py
+```
+
+Expected: `GATE PASSED: logging layer verified.` and exit code 0. 136 unit + 25 integration tests, no credentials, no spend.
+
+- [x] **Step 6: Commit**
+
+```bash
+cd bakeoff && git commit -m "feat: fault-injection gate verifying the logger loses nothing"
 ```
 
 ---
@@ -4338,6 +4208,24 @@ cd bakeoff && git add tests/test_fault_injection.py scripts/verify_logger.py && 
 **Interfaces:**
 - Consumes: `execute_run`, `TaskSpec` from `bakeoff.runner`; `ClaudeCodeConfig` from `bakeoff.claude_runner`; `EventLog`
 - Produces: `scripts/smoke_test.py`, printing a per-model table and exiting non-zero if any model produced no diff
+
+### Gates inherited from Task 11 (2026-08-06)
+
+Three things can only be checked here, against a real endpoint and real credentials. Each is cheap to check once the smoke run exists, and expensive to discover afterwards.
+
+- [ ] **Does the proxy actually apply section 5.3 sampling?** A `temperature` configured on a deployment is invisible to the proxy-side callback on the Anthropic Messages route — absent from `optional_params`, `litellm_params`, and `standard_logging_object.model_parameters`. That was observed against a `mock_response` deployment, which short-circuits before provider param transformation, so it is not proof the value is dropped on a real call. **Read the wire log after the smoke run and confirm the configured temperature is present on the arms that set one and absent on both Sonnet 5 arms.** If it is genuinely dropped, sampling is unspecified on three arms and `config/litellm_config.yaml`'s per-arm values are decorative.
+
+- [ ] **Does the LiteLLM proxy tolerate the internal network?** Verified only that the *agent* container can reach it. The proxy itself resolves nothing else on an `internal=True` network, and startup may attempt lookups that now fail rather than resolve.
+
+- [ ] **Does Claude Code complete a loop through the proxy?** Header stamping is verified (`X-Bakeoff-Run-Id` lands on every `POST /v1/messages?beta=true`), and so is capture of a real HTTP call by the proxy-side callback. What is not verified is Claude Code driving a real model through this path — the fake agent speaks stream-json but calls nothing.
+
+**Run the fault-injection gate first**, since a smoke run that spends money on a broken logger wastes both:
+
+```bash
+cd bakeoff && .venv/bin/python scripts/verify_logger.py
+```
+
+**The proxy runs as a container**, built from `docker/litellm-proxy.Dockerfile` and joined to the same internal network. `scripts/smoke_bedrock.py` drives the Router in-process, which is a different arrangement and captures no wire log. Use `config/litellm_config.yaml` (real Bedrock) rather than `config/litellm_fault_injection.yaml` (mocks), and pass `proxy_wire_dir` to `execute_run` or the record's wire-derived fields come back empty.
 
 - [ ] **Step 1: Build the smoke fixture**
 

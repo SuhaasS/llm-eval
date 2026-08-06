@@ -1,0 +1,59 @@
+# Fault-injection proxy config (spec section 6.6). NOT for real runs.
+#
+# Every deployment here answers from mock_response, so the whole capture path
+# -- agent -> proxy -> callback -> wire log -> run record -- can be exercised
+# with no credentials and no spend. That matters more than convenience: a
+# gate that costs money to run is a gate that stops being run.
+#
+# The error deployments raise REAL exceptions, not canned error bodies.
+# Verified in litellm 1.95.0 (llms/anthropic/experimental_pass_through/
+# messages/utils.py): these three sentinel strings are recognised on the
+# /v1/messages route and raise the corresponding litellm exception, which
+# carries the status code classify_exclusion maps to a pre-registered
+# reason:
+#
+#   litellm.RateLimitError             429 -> api_throttle
+#   litellm.InternalServerError        500 -> api_5xx
+#   litellm.ContextWindowExceededError 400 -> not an infra failure, by design
+#
+# There is no sentinel for Timeout (408), so that branch stays unit-tested.
+# Stated rather than left as an apparent gap.
+
+model_list:
+  - model_name: mock-ok
+    litellm_params:
+      model: anthropic/claude-sonnet-5
+      api_key: not-used-by-mock
+      mock_response: "the mock model replies"
+
+  - model_name: mock-throttle
+    litellm_params:
+      model: anthropic/claude-sonnet-5
+      api_key: not-used-by-mock
+      mock_response: "litellm.RateLimitError"
+
+  - model_name: mock-5xx
+    litellm_params:
+      model: anthropic/claude-sonnet-5
+      api_key: not-used-by-mock
+      mock_response: "litellm.InternalServerError"
+
+litellm_settings:
+  # Points at the module-level INSTANCE, never the class. get_instance_fn
+  # resolves a dotted path with getattr and returns it as-is; LiteLLM then
+  # dispatches on isinstance(callback, CustomLogger), so a class object is
+  # skipped in silence -- no wire log, no error. This is exactly why the
+  # production config carries no callbacks entry and the harness registered
+  # an instance in-process instead. That in-process registration is what
+  # this file replaces: the harness process makes no model calls.
+  callbacks: bakeoff.proxy_callback.instance
+  drop_params: false
+  set_verbose: false
+
+general_settings:
+  # No retries here, unlike production. A retry would turn one injected 429
+  # into four wire entries and make the test assert on retry behaviour
+  # instead of on capture. The retry-versus-final-error rule is covered by
+  # its own unit test.
+  num_retries: 0
+  request_timeout: 60
