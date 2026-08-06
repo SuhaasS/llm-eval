@@ -542,7 +542,14 @@ The logger is trusted with 2,400 runs. Test it before, not after.
 
 Four defects were found by working this list rather than by the tests originally drafted for it — a Bedrock throttle was being scored against the model because nothing populated `api_error_status`; four of six version fields were empty on every record; checkpoints captured before a mid-run failure were being discarded; and wire capture was registered in the harness process, which makes no model calls, so **every real run would have produced an empty wire log**. All four are closed; see Task 11 in the harness plan.
 
-Two items remain open at Phase 0c and are recorded against Task 12: whether the proxy actually applies §5.3 sampling on the Anthropic Messages route, and whether Claude Code completes a loop through the proxy on an internal network.
+Both items previously left open here are now **closed offline** (2026-08-06), by `bakeoff/scripts/smoke_test.py --mode offline`, which is part of the gate:
+
+- **§5.3 sampling does reach the wire.** A deployment-level `temperature: 1.0` appears on the wire log and in `RunRecord.sampling`; the Sonnet arm, which configures none, shows none. Its earlier absence was an artifact of the `mock_response` path, which short-circuits before provider parameter transformation. The candidate arms route through `openai/` on mantle rather than `anthropic/`, so that variant is still confirmed only at the live run.
+- **Claude Code does complete a loop through the proxy on an internal network** — three turns, two tool calls, a real staged diff, every call attributed.
+
+Getting there closed four more defects, all of which would have made the paid run produce nothing usable. See Task 12 in the harness plan.
+
+Still open, and only the live run can close it: whether a real model completes a real task, and whether Bedrock routing and credentials work at all.
 
 ---
 

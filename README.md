@@ -48,7 +48,15 @@ Integration tests are opt-in — they need a Docker daemon, and on macOS they ne
 cd bakeoff && .venv/bin/python -m pytest -v -m integration --basetemp="$HOME/.cache/bakeoff-pytest"
 ```
 
-Status: Tasks 1–11 complete (schema, event log, pricing, trajectory parser, scanners, container, checkpoints, wire logging, classification, Claude Code runner, run orchestrator, fault-injection gate). 166 unit + 25 integration tests passing, 89% coverage.
+Status: Tasks 1–11 complete (schema, event log, pricing, trajectory parser, scanners, container, checkpoints, wire logging, classification, Claude Code runner, run orchestrator, fault-injection gate). Task 12's offline half is done: the real Claude Code binary completes a loop through a real LiteLLM proxy on an internal network, emits tool calls, lands a diff, and every call is captured and attributed. **193 unit + 25 integration tests passing.**
+
+The live half — a real model, real Bedrock — is blocked on credentials, not on code:
+
+```bash
+aws sso login --profile pindrop-bakeoff
+cd bakeoff && .venv/bin/python scripts/smoke_bedrock.py --derive-mantle-token
+cd bakeoff && .venv/bin/python scripts/smoke_test.py --mode live
+```
 
 ### The gate
 
@@ -59,6 +67,8 @@ cd bakeoff && .venv/bin/python scripts/verify_logger.py
 ```
 
 All twelve §6.6 cases are injected offline — no credentials, no spend. Throttles come from a real LiteLLM proxy whose `mock_response` raises a genuine `RateLimitError`. Without a Docker daemon the gate reports `GATE INCOMPLETE` and exits 1 rather than passing: the mid-run kill, the proxy-side wire log, and live checkpoint capture are only observable against a real daemon.
+
+The gate also runs the offline smoke test — the real Claude Code binary, streaming, through a real proxy. That is there because mock deployments short-circuit before LiteLLM's streaming wrapper, so the success callback never fires and capture silently misses the call; every real call is streaming, so nothing else in the gate could see it.
 
 A passing suite is not by itself evidence the suite would notice a regression, so each guarantee is checked by removing it and confirming a test goes red:
 

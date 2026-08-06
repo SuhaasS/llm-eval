@@ -4209,15 +4209,35 @@ cd bakeoff && git commit -m "feat: fault-injection gate verifying the logger los
 - Consumes: `execute_run`, `TaskSpec` from `bakeoff.runner`; `ClaudeCodeConfig` from `bakeoff.claude_runner`; `EventLog`
 - Produces: `scripts/smoke_test.py`, printing a per-model table and exiting non-zero if any model produced no diff
 
+### Offline half — DONE (2026-08-06)
+
+`scripts/smoke_test.py --mode offline`, now part of `verify_logger.py`. Real Claude Code binary, pinned container, real LiteLLM proxy on an internal Docker network, real streaming SSE from `fixtures/anthropic_stub.py`. Result: **3 turns, 2 tool calls, 3 wire entries, a 157-byte staged diff, zero unattributed calls, effective config identical across arms.**
+
+The plan drafted below could not have run: seven blocking and silent defects in the drafted script, listed in the session plan. Building it turned up four more in code and config, none visible to any existing test:
+
+**Defect 16 — the production proxy config registered no wire callback.** Every real run would have read an empty wire directory. Task 11's defect 15 in a second place; the config comment argued correctly about a dotted path to a *class*, and the fix is a path to a module-level *instance*.
+
+**Defect 17 — `config/eval_settings.json` was mounted nowhere.** `--settings` named a path no image had, and Claude Code does not fail on a missing settings file.
+
+**Defect 18 — the image ran as root, and Claude Code refuses `bypassPermissions` under root.** Visible only after 17 was fixed. `--allow-dangerously-skip-permissions` does not lift the guard. Together 17 and 18 would have landed no diff on any arm, reading as four models failing the task.
+
+**Defect 19 — mock deployments never exercise the streaming path.** `mock_response` short-circuits inside `anthropic_messages` before litellm's streaming wrapper, so the success callback never fires for a streaming request, and every real Claude Code call is streaming. Measured: two calls served, one captured. The gate now cross-checks its own capture against the proxy's access log.
+
+**§5.3 answered.** A deployment-level `temperature: 1.0` does reach the wire and `RunRecord.sampling`; its earlier absence was a mock artifact. The candidate arms route through `openai/` rather than `anthropic/`, so that variant stays live-only.
+
+**Also:** the agent's stdout is kept as an artifact — the §5.2 init event is emitted there and nowhere else, so the effective config could not otherwise be read back.
+
+**Honest limit:** the stub replies instantly, so all three checkpoints hold the same diff. Checkpoint progression is covered by `dry_run.py`, whose stand-in agent sleeps between turns.
+
 ### Gates inherited from Task 11 (2026-08-06)
 
 Three things can only be checked here, against a real endpoint and real credentials. Each is cheap to check once the smoke run exists, and expensive to discover afterwards.
 
-- [ ] **Does the proxy actually apply section 5.3 sampling?** A `temperature` configured on a deployment is invisible to the proxy-side callback on the Anthropic Messages route — absent from `optional_params`, `litellm_params`, and `standard_logging_object.model_parameters`. That was observed against a `mock_response` deployment, which short-circuits before provider param transformation, so it is not proof the value is dropped on a real call. **Read the wire log after the smoke run and confirm the configured temperature is present on the arms that set one and absent on both Sonnet 5 arms.** If it is genuinely dropped, sampling is unspecified on three arms and `config/litellm_config.yaml`'s per-arm values are decorative.
+- [x] **Does the proxy actually apply section 5.3 sampling?** YES on the streaming Anthropic path, confirmed offline. A `temperature` configured on a deployment is invisible to the proxy-side callback on the Anthropic Messages route — absent from `optional_params`, `litellm_params`, and `standard_logging_object.model_parameters`. That was observed against a `mock_response` deployment, which short-circuits before provider param transformation, so it is not proof the value is dropped on a real call. **Read the wire log after the smoke run and confirm the configured temperature is present on the arms that set one and absent on both Sonnet 5 arms.** If it is genuinely dropped, sampling is unspecified on three arms and `config/litellm_config.yaml`'s per-arm values are decorative.
 
-- [ ] **Does the LiteLLM proxy tolerate the internal network?** Verified only that the *agent* container can reach it. The proxy itself resolves nothing else on an `internal=True` network, and startup may attempt lookups that now fail rather than resolve.
+- [x] **Does the LiteLLM proxy tolerate the internal network?** Wrong question, and answered: `internal=True` removes the external route by definition, so the proxy joins TWO networks -- internal with the agent, bridge for egress. Verified only that the *agent* container can reach it. The proxy itself resolves nothing else on an `internal=True` network, and startup may attempt lookups that now fail rather than resolve.
 
-- [ ] **Does Claude Code complete a loop through the proxy?** Header stamping is verified (`X-Bakeoff-Run-Id` lands on every `POST /v1/messages?beta=true`), and so is capture of a real HTTP call by the proxy-side callback. What is not verified is Claude Code driving a real model through this path — the fake agent speaks stream-json but calls nothing.
+- [x] **Does Claude Code complete a loop through the proxy?** YES -- 3 turns, 2 tool calls, a real diff. Header stamping is verified (`X-Bakeoff-Run-Id` lands on every `POST /v1/messages?beta=true`), and so is capture of a real HTTP call by the proxy-side callback. What is not verified is Claude Code driving a real model through this path — the fake agent speaks stream-json but calls nothing.
 
 **Run the fault-injection gate first**, since a smoke run that spends money on a broken logger wastes both:
 

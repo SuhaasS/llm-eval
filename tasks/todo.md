@@ -13,7 +13,7 @@ Source plan: [docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md](../d
 - [x] **Task 9** — Claude Code runner
 - [x] **Task 10** — Run orchestrator
 - [x] **Task 11** — Fault-injection gate
-- [ ] Task 12 — End-to-end smoke test
+- [~] **Task 12** — End-to-end smoke test — offline half DONE, live half blocked on credentials
 
 ---
 
@@ -423,3 +423,72 @@ Sources: [AWS Bedrock pricing](https://aws.amazon.com/bedrock/pricing/) · [Kimi
 ```bash
 cd bakeoff && .venv/bin/python -m pytest tests/ -v
 ```
+
+---
+
+## Review — Task 12, offline half (2026-08-06)
+
+`scripts/smoke_test.py --mode offline` runs the real Claude Code binary in the
+pinned container against a real LiteLLM proxy on an internal Docker network.
+It is now part of `verify_logger.py`. Result: 3 turns, 2 tool calls, 3 wire
+entries, a 157-byte staged diff, every call attributed, effective config
+identical across arms.
+
+**Four defects found by building it.** Each would have made the paid run
+produce nothing usable, and none was visible to any existing test.
+
+1. **The production proxy config registered no wire callback.** Every real run
+   would have read an empty wire directory — empty sampling, empty prompt and
+   tool hashes, no resolved model id, no API error status — on a record that
+   otherwise looked complete. Task 11's defect 15, in a second place. The
+   config's own comment argued correctly about a dotted path to a *class*; the
+   fix is a dotted path to a module-level *instance*.
+
+2. **`config/eval_settings.json` was mounted nowhere.** Every call site passed
+   `--settings /eval/eval_settings.json`, a path no image had. Claude Code does
+   not fail on a missing settings file — it starts with none of the pinned
+   settings loaded.
+
+3. **The image ran as root, and Claude Code refuses `bypassPermissions` under
+   root.** Only visible once defect 2 was fixed and the settings actually
+   loaded: the agent then exited before emitting a single event.
+   `--allow-dangerously-skip-permissions` does not lift the guard; a non-root
+   uid does. Together, 2 and 3 would have landed no diff on any arm — a harness
+   bug that reads as four models failing the task.
+
+4. **Mock deployments never exercise the streaming path.** `mock_response`
+   short-circuits inside `anthropic_messages` before litellm's streaming
+   wrapper, so the success callback never fires for a streaming request — and
+   every real Claude Code call is streaming. Measured: two calls served, one
+   captured. `fixtures/anthropic_stub.py` speaks real SSE so the gate now
+   exercises the path a live run uses, and the gate cross-checks its own
+   capture against the proxy's access log rather than only counting what it
+   managed to record.
+
+**Task 11's carried §5.3 question is answered.** A deployment-level
+`temperature: 1.0` does reach the wire and `RunRecord.sampling`. Its absence
+before was a mock artifact. The candidate arms route through `openai/` rather
+than `anthropic/`, so that variant is still live-only.
+
+**Also fixed:** the agent's stdout is kept as an artifact. The §5.2 init event
+is emitted there and nowhere else — a completed session's transcript carries
+queue-operation, user, attachment, assistant and last-prompt records and no
+init — so the effective config could not otherwise be read back at all.
+
+**Honest limits of the offline gate.** The stub replies instantly, so all
+three checkpoints hold the same diff: the checkpoint boundary race documented
+in `tests/conftest.py` is degenerate at zero turn latency. `scripts/dry_run.py`
+covers checkpoint progression, with a stand-in agent that sleeps between turns.
+And nothing here says anything about a model.
+
+**Blocked on credentials, not on code.** `bakeoff/.env`'s
+`AWS_BEARER_TOKEN_BEDROCK` is still an unfilled `<placeholder>`, and the SSO
+session expired 2026-08-06T03:21Z. The live half needs:
+
+```bash
+aws sso login --profile pindrop-bakeoff
+cd bakeoff && .venv/bin/python scripts/smoke_bedrock.py --derive-mantle-token
+```
+
+then `scripts/smoke_bedrock.py --live` as the cheap routing check, then
+`scripts/smoke_test.py --mode live`.
