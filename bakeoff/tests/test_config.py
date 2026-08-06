@@ -65,6 +65,43 @@ def test_every_other_arm_pins_its_lab_recommended_sampling():
         assert params["top_p"] == 0.95, entry["model_name"]
 
 
+def test_the_production_config_registers_the_proxy_side_wire_callback():
+    """Spec section 6.2 makes wire logging mandatory, and the proxy is the
+    only process that makes the calls.
+
+    Without this entry a real run reads an empty wire directory and comes
+    back with empty sampling, empty prompt and tool hashes, no resolved
+    model id, zero errored calls and no API error status -- silently, on a
+    record that otherwise looks complete. That shipped once already
+    (Task 11, defect 15); the fault-injection config carries the callback
+    and the production config did not.
+    """
+    settings = yaml.safe_load(CONFIG.read_text())["litellm_settings"]
+    assert settings.get("callbacks") == "bakeoff.proxy_callback.instance"
+
+
+def test_the_registered_callback_path_resolves_to_a_dispatchable_instance():
+    """The trap this config comment has always warned about, asserted.
+
+    get_instance_fn resolves a dotted path with getattr and returns it
+    as-is. LiteLLM's success_handler then dispatches on
+    isinstance(callback, CustomLogger); a CLASS fails that check and is
+    skipped in silence -- no wire log, no error. Pointing at a module-level
+    INSTANCE is what makes the config form work at all, so the distinction
+    is load-bearing rather than stylistic.
+    """
+    import importlib
+
+    from litellm.integrations.custom_logger import CustomLogger
+
+    path = yaml.safe_load(CONFIG.read_text())["litellm_settings"]["callbacks"]
+    module_name, _, attribute = path.rpartition(".")
+    resolved = getattr(importlib.import_module(module_name), attribute)
+
+    assert not isinstance(resolved, type), f"{path} is a class; it would be skipped"
+    assert isinstance(resolved, CustomLogger)
+
+
 def test_gemma_has_no_bedrock_runtime_entry():
     """Gemma 4 31B is served only on bedrock-mantle -- it supports neither
     Converse nor Invoke. A bedrock/ route for it could never resolve, and

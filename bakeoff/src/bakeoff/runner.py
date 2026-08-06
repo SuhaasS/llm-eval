@@ -60,6 +60,7 @@ from bakeoff.trajectory import ParsedTrajectory, parse_trajectory
 from bakeoff.wire import BakeoffCallback, WireLogger
 
 CONTAINER_CONFIG_DIR = "/eval/claude-config"
+STDOUT_NAME = "agent_stdout.jsonl"
 
 
 @dataclass(frozen=True)
@@ -357,6 +358,17 @@ def assemble_record(
             trajectory_jsonl_gz=str(trajectory_path) if trajectory_path else None,
             wire_log_gz=str(artifacts_root / "wire.jsonl.gz"),
             final_diff=checkpoints[-1].diff_vs_base if checkpoints else None,
+            # The agent's stream-json stdout, which is NOT the session
+            # transcript: the transcript records messages, while the init
+            # event carrying the effective config (spec section 5.2) is
+            # emitted only on stdout and appears nowhere on disk otherwise.
+            # It is also the only record of what the agent printed when a
+            # run failed before writing a transcript at all.
+            container_stdout=(
+                str(artifacts_root / STDOUT_NAME)
+                if (artifacts_root / STDOUT_NAME).exists()
+                else None
+            ),
         ),
     )
 
@@ -374,6 +386,7 @@ def execute_run(
     attempt_number: int = 1,
     parent_run_id: str | None = None,
     proxy_wire_dir: Path | None = None,
+    settings_host_path: Path | None = None,
 ) -> RunRecord:
     """Run one sample and write exactly one record.
 
@@ -389,6 +402,14 @@ def execute_run(
     callback never sees them. The two sources are never merged -- one call
     would be counted twice and the retry-aware error status would read the
     wrong last entry.
+
+    `settings_host_path` is the host file mounted at `config.settings_path`,
+    the container path `--settings` names. Claude Code does not fail on a
+    settings file that is not there: it starts with none of the pinned
+    settings loaded and the run looks entirely normal. Section 5.2 calls
+    configuration the highest-risk contamination source, and the pinned
+    settings are what let the agent edit anything at all, so an unmounted
+    file is the most expensive silent failure available.
     """
     import litellm  # slow to import; and only needed when a run executes
 
@@ -417,6 +438,13 @@ def execute_run(
     # quiet run.
     recorder: CheckpointRecorder | None = None
 
+    # Added to, never replacing: the config dir is how the transcript is
+    # found afterwards, and a run with no transcript parses to zero turns,
+    # zero tokens and zero cost -- which reads as a quiet run, not as loss.
+    mounts = {str(host_config_dir): CONTAINER_CONFIG_DIR}
+    if settings_host_path is not None:
+        mounts[str(settings_host_path)] = config.settings_path
+
     try:
         # Inside the try: a name collision on the wire log must cost the wire
         # log, not the run record.
@@ -431,7 +459,7 @@ def execute_run(
             repo_path=repo_path,
             base_sha=task.base_sha,
             network=network,
-            extra_mounts={str(host_config_dir): CONTAINER_CONFIG_DIR},
+            extra_mounts=mounts,
         ) as container:
             container.exec(["git", "checkout", "--detach", task.base_sha])
             container.exec(["git", "clean", "-xfd"])
@@ -475,6 +503,11 @@ def execute_run(
         # Global state: leaving this set would let one run's logger capture
         # the next run's calls, silently cross-contaminating wire logs.
         litellm.callbacks = previous_callbacks
+        # In the finally: a run that crashed part way through is exactly the
+        # one whose stdout is worth having.
+        stdout = getattr(runner_result, "stdout", "") or ""
+        if stdout:
+            (artifacts_root / STDOUT_NAME).write_text(stdout)
         if recorder is not None:
             checkpoints = recorder.captured
         if wire is not None:

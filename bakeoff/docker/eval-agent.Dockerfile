@@ -37,8 +37,28 @@ RUN apt-get update \
 # the new digest makes the change visible in every record.
 ARG CLAUDE_CODE_VERSION=2.1.220
 
-ENV PATH=/root/.local/bin:$PATH
+# NOT root, and this is load-bearing rather than hygiene. Claude Code
+# refuses bypassPermissions under root -- "cannot be used with root/sudo
+# privileges for security reasons" -- and exits before emitting a single
+# stream-json event. `--allow-dangerously-skip-permissions` does not lift
+# the guard either; only a non-root uid does. Spec section 5.2 pins
+# bypassPermissions because a `-p` session that has to ask for permission
+# auto-denies, so the agent would make no edits at all and every arm would
+# be scored as having failed the task.
+#
+# Mount points are created and chowned here: the bind-mounted repo appears
+# as 0:0 through the macOS VM's virtiofs, which ignores ownership, but a
+# Linux host honours it and the agent must be able to write to /repo.
+RUN useradd --create-home --uid 1000 eval \
+    && mkdir -p /repo /eval/claude-config \
+    && chown -R eval:eval /repo /eval
 
+USER eval
+ENV HOME=/home/eval \
+    PATH=/home/eval/.local/bin:$PATH
+
+# Installed as the user that will run it: the installer writes into $HOME,
+# and a binary under /root is unreadable at mode 700 by anyone else.
 RUN curl -fsSL https://claude.ai/install.sh | bash -s "${CLAUDE_CODE_VERSION}"
 
 # Set AFTER the install, not before. The installer goes through the same
@@ -62,10 +82,10 @@ RUN installed="$(claude --version)" \
          *) echo "expected ${CLAUDE_CODE_VERSION}, got ${installed}" >&2; exit 1 ;; \
        esac
 
-# Mount points. claude-config is mounted from the host per run and must NOT
-# live under /repo -- `git add -A` would sweep the whole config tree, and
-# every transcript in it, into each checkpoint diff.
-RUN mkdir -p /repo /eval/claude-config
+# /repo and /eval/claude-config are created above, before the USER switch,
+# so they can be chowned. claude-config is mounted from the host per run and
+# must NOT live under /repo -- `git add -A` would sweep the whole config
+# tree, and every transcript in it, into each checkpoint diff.
 WORKDIR /repo
 
 # RunContainer overrides this with `sleep infinity` and drives the container

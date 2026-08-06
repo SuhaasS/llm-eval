@@ -16,6 +16,10 @@ build-backend = "setuptools.build_meta"
 [tool.pytest.ini_options]
 markers = ["integration: requires Docker or network"]
 testpaths = ["tests"]
+# The repo root, so tests can import scripts/ the way an operator runs it.
+# scripts/smoke_test.py holds the Phase 0c go/no-go criteria, and criteria
+# that are only exercised by the paid run they gate are not gated at all.
+pythonpath = ["."]
 # Integration tests are opt-in: they need a Docker daemon, so running them by
 # default would turn "no daemon here" into a suite-wide collection error.
 # Override with `-m integration` on the command line.

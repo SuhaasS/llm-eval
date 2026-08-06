@@ -1,0 +1,64 @@
+# Offline half of the Phase 0c smoke test. No credentials, no spend.
+#
+# The topology this exercises is the real one: the pinned container runs the
+# real Claude Code binary, which talks to this proxy in another container
+# over an internal Docker network, and the proxy-side callback records the
+# call. Only the model is fake.
+#
+# api_base points at fixtures/anthropic_stub.py, a real streaming Anthropic
+# endpoint, NOT at a `mock_response` deployment. That distinction is the
+# whole reason this file exists. LiteLLM's mock short-circuits inside
+# anthropic_messages before the provider call, so a STREAMING request never
+# reaches the streaming wrapper that fires the success callback on stream
+# completion. Measured against litellm 1.95.0 with claude 2.1.220: two
+# calls made, only the non-streaming one captured. Every real Claude Code
+# call is streaming, so a gate built on mocks would certify capture that
+# does not happen -- the same class of defect as Task 11's defect 15.
+#
+# `/v1/messages` is appended by LiteLLM's anthropic provider, so api_base
+# carries neither it nor a trailing /v1, exactly as the mantle Sonnet arm
+# in litellm_config.yaml does.
+#
+# The deployment is named `claude-sonnet-5`, a REAL arm name, on purpose:
+# model_name doubles as the PRICE_BOOK key, so a name like `mock-ok` raises
+# UnknownModelError inside cost_usd. assemble_record catches that, leaving a
+# record whose turns, tokens and cost are all zero with only
+# trajectory_parse_error set -- the offline gate would be measuring the
+# price book rather than the topology.
+
+model_list:
+  - model_name: claude-sonnet-5
+    litellm_params:
+      model: anthropic/claude-sonnet-5
+      api_base: http://stub:8080
+      api_key: not-checked-by-the-stub
+
+  # Carries sampling, and that is the point of having a second arm here.
+  # Section 5.3 puts sampling entirely in proxy config because Claude Code
+  # has no temperature flag, and Task 11 could not tell whether a
+  # deployment-level temperature survives to the wire: it was absent from
+  # optional_params, litellm_params and standard_logging_object on the mock
+  # path, which short-circuits before provider param transformation. A real
+  # provider call answers the question, and this arm asks it for free.
+  #
+  # Values match the production gemma-4-31b arm so the answer transfers.
+  - model_name: gemma-4-31b
+    litellm_params:
+      model: anthropic/claude-sonnet-5
+      api_base: http://stub:8080
+      api_key: not-checked-by-the-stub
+      temperature: 1.0
+      top_p: 0.95
+
+litellm_settings:
+  # The same registration the production config now uses, so the offline
+  # gate exercises the real capture path rather than a test-only one.
+  callbacks: bakeoff.proxy_callback.instance
+  drop_params: false
+  set_verbose: false
+
+general_settings:
+  # Matches production, unlike the fault-injection config: this run is about
+  # whether the ordinary path works, and production retries.
+  num_retries: 3
+  request_timeout: 900

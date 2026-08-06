@@ -60,6 +60,18 @@ CHECKS: list[tuple[str, list[str], bool]] = [
         [sys.executable, "scripts/dry_run.py"],
         True,
     ),
+    # The real Claude Code binary, streaming, through a real proxy. Here
+    # rather than left to the paid run because the streaming path is the
+    # only one a live call uses, and it was NOT covered before: a
+    # mock_response deployment short-circuits before litellm's streaming
+    # wrapper, so the success callback never fires and capture silently
+    # misses the call. That is the same class of defect as Task 11's
+    # defect 15, and it is invisible to every other check here.
+    (
+        "offline smoke (real agent, streaming proxy, tool call, diff)",
+        [sys.executable, "scripts/smoke_test.py", "--mode", "offline"],
+        True,
+    ),
 ]
 
 
@@ -116,8 +128,10 @@ def main() -> int:
 
     print("\nGATE PASSED: logging layer verified.")
     print("Verified offline: no model was called and nothing was spent.")
-    print("NOT verified here: that a real model completes a real task, and")
-    print("that the proxy applies section 5.3 sampling on a real endpoint.")
+    print("NOT verified here: that a real model completes a real task, or")
+    print("that Bedrock routing and credentials work. Sampling now reaches")
+    print("the wire on the streaming Anthropic path (offline smoke), but the")
+    print("candidate arms route through openai/ on mantle -- confirm live.")
     print("Both are Phase 0c (Task 12).")
     return 0
 

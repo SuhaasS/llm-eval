@@ -42,10 +42,9 @@ litellm_settings:
   # Points at the module-level INSTANCE, never the class. get_instance_fn
   # resolves a dotted path with getattr and returns it as-is; LiteLLM then
   # dispatches on isinstance(callback, CustomLogger), so a class object is
-  # skipped in silence -- no wire log, no error. This is exactly why the
-  # production config carries no callbacks entry and the harness registered
-  # an instance in-process instead. That in-process registration is what
-  # this file replaces: the harness process makes no model calls.
+  # skipped in silence -- no wire log, no error. The production config now
+  # carries the same line, for the same reason: the harness process makes no
+  # model calls, so registering a callback there observes nothing.
   callbacks: bakeoff.proxy_callback.instance
   drop_params: false
   set_verbose: false

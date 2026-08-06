@@ -118,18 +118,28 @@ model_list:
       top_p: 0.95
 
 litellm_settings:
-  # NO `callbacks:` entry here, deliberately. Verified against litellm
-  # 1.95.0: get_instance_fn resolves a dotted path with getattr and returns
-  # it as-is, so `callbacks: bakeoff.wire.BakeoffCallback` puts the CLASS in
-  # the callback list. success_handler dispatches on
-  # isinstance(callback, CustomLogger), a class fails that check, and the
-  # callback is skipped in silence -- no wire log, no error, and spec
-  # section 6.2 makes wire logging mandatory.
+  # Wire capture, registered where the calls are actually made (spec
+  # section 6.2). The agent runs in its own container and this proxy is a
+  # third process, so a callback registered in the harness process observes
+  # nothing -- that was Task 11's defect 15, and it produced records with
+  # empty sampling, empty prompt and tool hashes and no error status while
+  # looking complete.
   #
-  # BakeoffCallback also needs a per-run WireLogger and run_id, which no
-  # config string can supply. Register an instance per run instead:
+  # The dotted path must resolve to a module-level INSTANCE, and this is
+  # the whole trap. Verified against litellm 1.95.0: get_instance_fn
+  # resolves the path with getattr and returns it as-is, then
+  # success_handler dispatches on isinstance(callback, CustomLogger). A
+  # class -- `bakeoff.wire.BakeoffCallback` -- fails that check and is
+  # skipped in SILENCE: no wire log, no error. `proxy_callback.instance`
+  # exists precisely so this line can point at an object rather than a type.
   #
-  #     litellm.callbacks = [BakeoffCallback(wire_logger, run_id)]
+  # bakeoff.wire.BakeoffCallback still cannot be named here for a second
+  # reason: it needs a per-run WireLogger and run_id, which no config
+  # string can supply. The proxy-side callback instead attributes each call
+  # by the X-Bakeoff-Run-Id header the harness stamps per run, and the
+  # harness replays those lines through WireLogger afterwards so there is
+  # still exactly one canonical artifact.
+  callbacks: bakeoff.proxy_callback.instance
   drop_params: false          # surface unsupported params instead of hiding them
   set_verbose: false
 
