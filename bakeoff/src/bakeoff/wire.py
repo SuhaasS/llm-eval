@@ -21,6 +21,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from litellm.integrations.custom_logger import CustomLogger
+
 from bakeoff.scanners import scan_secrets
 
 
@@ -62,15 +64,31 @@ class WireLogger:
             self._closed = True
 
 
-class BakeoffCallback:
-    """LiteLLM CustomLogger hook. Registered via litellm.callbacks.
+class BakeoffCallback(CustomLogger):
+    """LiteLLM callback hook. Registered via litellm.callbacks.
 
     LiteLLM invokes log_success_event / log_failure_event with the full
     kwargs (the outbound request), response_obj, and the real start/end
     timestamps of the call.
+
+    Subclassing CustomLogger is load-bearing, not decorative. LiteLLM's
+    success_handler dispatches on `isinstance(callback, CustomLogger)`, with
+    the only other branch being plain callables. A duck-typed object with
+    matching method names is skipped in silence — no wire log, no error —
+    and spec section 6.2 makes wire logging mandatory.
+
+    Register an INSTANCE, per run:
+
+        litellm.callbacks = [BakeoffCallback(wire_logger, run_id)]
+
+    The proxy's `litellm_settings.callbacks: dotted.path` form cannot work
+    here: get_instance_fn resolves the dotted path with getattr and returns
+    it as-is, so the class object lands in the callback list, fails the
+    isinstance check, and logs nothing.
     """
 
     def __init__(self, logger: WireLogger, run_id: str) -> None:
+        super().__init__()
         self.logger = logger
         self.run_id = run_id
         # Deliberately NOT a turn counter. LiteLLM fires once per API call,

@@ -98,6 +98,19 @@ def test_refuses_to_overwrite_an_existing_log(tmp_path):
         WireLogger(path)
 
 
+def test_callback_is_dispatchable_by_litellm(tmp_path):
+    """LiteLLM's success_handler dispatches on isinstance(callback,
+    CustomLogger); its only other branch is plain callables. A duck-typed
+    object with the right method names is skipped without an error, so the
+    run would produce no wire log at all -- and spec section 6.2 makes wire
+    logging mandatory. Verified against litellm 1.95.0.
+    """
+    from litellm.integrations.custom_logger import CustomLogger
+
+    callback = BakeoffCallback(WireLogger(tmp_path / "wire.jsonl.gz"), run_id="r-1")
+    assert isinstance(callback, CustomLogger)
+
+
 def test_callback_records_measured_latency(tmp_path):
     """LiteLLM hands the callback real start/end timestamps. That is
     wire-level ground truth for generation time, where the trajectory

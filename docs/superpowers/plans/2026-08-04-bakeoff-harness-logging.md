@@ -1950,7 +1950,9 @@ cd bakeoff && git add src/bakeoff/checkpoints.py tests/test_checkpoints.py && gi
 >
 > **Both transports are now configured.** Mantle is primary (AWS-recommended, and Gemma's only option); `bedrock-runtime` entries sit alongside for the three models that support it, so Phase 0 picks per arm from evidence and can A/B the adapter question directly. Each route takes a distinct `model_name` — LiteLLM round-robins across repeated names, which would randomize transport per call and confound latency and tool-translation results. `PRICE_BOOK` gains matching `-runtime` aliases (same token prices; transport does not change cost), and Gemma deliberately gets none.
 >
-> **Still unverified:** routing, auth, endpoint reachability, and callback registration. No AWS credentials and no `litellm` in the authoring environment — YAML parsing plus the `PRICE_BOOK` cross-check is the ceiling. Task 12 remains the gate. Known Gemma asymmetries recorded for §9: no parallel tool calls, and reasoning content absent on the Chat Completions path (so its `TokenUsage.reasoning` reads zero while Sonnet's does not, understating Gemma's cost).
+> **Fifth correction, after installing litellm 1.95.0 — the callback would have logged nothing.** `BakeoffCallback` was a plain class. LiteLLM's `success_handler` dispatches on `isinstance(callback, CustomLogger)`, its only other branch being plain callables, so a duck-typed object is skipped *in silence* — no wire log, no error, against a §6.2 mandatory requirement. Worse, the `litellm_settings.callbacks: bakeoff.wire.BakeoffCallback` line made it unreachable twice over: `get_instance_fn` resolves a dotted path with `getattr` and returns it **as-is**, so the class object itself lands in the callback list and fails the same check. Now `BakeoffCallback(CustomLogger)`, the config's `callbacks:` line is removed with an explanation, and `test_callback_is_dispatchable_by_litellm` pins the isinstance contract. Verified: the string form resolves to a class and is not dispatchable; a programmatic instance is.
+>
+> **Still unverified:** routing, auth, and endpoint reachability. No AWS credentials in the authoring environment — Task 12 remains the gate for those. Known Gemma asymmetries recorded for §9: no parallel tool calls, and reasoning content absent on the Chat Completions path (so its `TokenUsage.reasoning` reads zero while Sonnet's does not, understating Gemma's cost).
 
 **Files:**
 - Create: `bakeoff/src/bakeoff/wire.py`
@@ -2066,6 +2068,19 @@ def test_refuses_to_overwrite_an_existing_log(tmp_path):
         WireLogger(path)
 
 
+def test_callback_is_dispatchable_by_litellm(tmp_path):
+    """LiteLLM's success_handler dispatches on isinstance(callback,
+    CustomLogger); its only other branch is plain callables. A duck-typed
+    object with the right method names is skipped without an error, so the
+    run would produce no wire log at all -- and spec section 6.2 makes wire
+    logging mandatory. Verified against litellm 1.95.0.
+    """
+    from litellm.integrations.custom_logger import CustomLogger
+
+    callback = BakeoffCallback(WireLogger(tmp_path / "wire.jsonl.gz"), run_id="r-1")
+    assert isinstance(callback, CustomLogger)
+
+
 def test_callback_records_measured_latency(tmp_path):
     """LiteLLM hands the callback real start/end timestamps. That is
     wire-level ground truth for generation time, where the trajectory
@@ -2135,6 +2150,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from litellm.integrations.custom_logger import CustomLogger
+
 from bakeoff.scanners import scan_secrets
 
 
@@ -2176,15 +2193,31 @@ class WireLogger:
             self._closed = True
 
 
-class BakeoffCallback:
-    """LiteLLM CustomLogger hook. Registered via litellm.callbacks.
+class BakeoffCallback(CustomLogger):
+    """LiteLLM callback hook. Registered via litellm.callbacks.
 
     LiteLLM invokes log_success_event / log_failure_event with the full
     kwargs (the outbound request), response_obj, and the real start/end
     timestamps of the call.
+
+    Subclassing CustomLogger is load-bearing, not decorative. LiteLLM's
+    success_handler dispatches on `isinstance(callback, CustomLogger)`, with
+    the only other branch being plain callables. A duck-typed object with
+    matching method names is skipped in silence — no wire log, no error —
+    and spec section 6.2 makes wire logging mandatory.
+
+    Register an INSTANCE, per run:
+
+        litellm.callbacks = [BakeoffCallback(wire_logger, run_id)]
+
+    The proxy's `litellm_settings.callbacks: dotted.path` form cannot work
+    here: get_instance_fn resolves the dotted path with getattr and returns
+    it as-is, so the class object lands in the callback list, fails the
+    isinstance check, and logs nothing.
     """
 
     def __init__(self, logger: WireLogger, run_id: str) -> None:
+        super().__init__()
         self.logger = logger
         self.run_id = run_id
         # Deliberately NOT a turn counter. LiteLLM fires once per API call,
@@ -2330,10 +2363,18 @@ model_list:
       aws_region_name: us-east-1
 
 litellm_settings:
-  # BakeoffCallback requires constructor arguments, so it cannot be
-  # registered by this string form -- pass an instance via litellm.callbacks
-  # instead. Task 12 confirms the wiring.
-  callbacks: bakeoff.wire.BakeoffCallback
+  # NO `callbacks:` entry here, deliberately. Verified against litellm
+  # 1.95.0: get_instance_fn resolves a dotted path with getattr and returns
+  # it as-is, so `callbacks: bakeoff.wire.BakeoffCallback` puts the CLASS in
+  # the callback list. success_handler dispatches on
+  # isinstance(callback, CustomLogger), a class fails that check, and the
+  # callback is skipped in silence -- no wire log, no error, and spec
+  # section 6.2 makes wire logging mandatory.
+  #
+  # BakeoffCallback also needs a per-run WireLogger and run_id, which no
+  # config string can supply. Register an instance per run instead:
+  #
+  #     litellm.callbacks = [BakeoffCallback(wire_logger, run_id)]
   drop_params: false          # surface unsupported params instead of hiding them
   set_verbose: false
 
@@ -2355,7 +2396,7 @@ offline checks that need no credentials: the YAML parses, every `model_name` pri
 - [x] **Step 5: Run — expect pass**
 
 Run: `cd bakeoff && python -m pytest tests/test_wire.py -v`
-Expected: 9 passed, plus 3 in `tests/test_config.py`. Default suite is 59.
+Expected: 10 passed, plus 3 in `tests/test_config.py`. Default suite is 60.
 
 - [x] **Step 6: Commit**
 

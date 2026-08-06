@@ -78,10 +78,18 @@ model_list:
       aws_region_name: us-east-1
 
 litellm_settings:
-  # BakeoffCallback requires constructor arguments, so it cannot be
-  # registered by this string form -- pass an instance via litellm.callbacks
-  # instead. Task 12 confirms the wiring.
-  callbacks: bakeoff.wire.BakeoffCallback
+  # NO `callbacks:` entry here, deliberately. Verified against litellm
+  # 1.95.0: get_instance_fn resolves a dotted path with getattr and returns
+  # it as-is, so `callbacks: bakeoff.wire.BakeoffCallback` puts the CLASS in
+  # the callback list. success_handler dispatches on
+  # isinstance(callback, CustomLogger), a class fails that check, and the
+  # callback is skipped in silence -- no wire log, no error, and spec
+  # section 6.2 makes wire logging mandatory.
+  #
+  # BakeoffCallback also needs a per-run WireLogger and run_id, which no
+  # config string can supply. Register an instance per run instead:
+  #
+  #     litellm.callbacks = [BakeoffCallback(wire_logger, run_id)]
   drop_params: false          # surface unsupported params instead of hiding them
   set_verbose: false
 
