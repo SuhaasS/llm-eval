@@ -436,13 +436,27 @@ class Proxy:
             (self.wire_dir.parent / "proxy.log").write_text(self.logs(tail=10000))
         except Exception:  # noqa: BLE001
             pass
-        for resource in (self.container, self.stub, self.internal, self.egress):
-            if resource is None:
+        # Containers first, and networks only after. A network with an
+        # attached container refuses to go, and Network.remove() takes no
+        # `force` -- passing one raises TypeError, which a bare except then
+        # swallows, leaking a network per invocation until the daemon runs
+        # out of address space.
+        for container in (self.container, self.stub):
+            if container is None:
                 continue
             try:
-                resource.remove(force=True)
+                container.remove(force=True)
             except Exception:  # noqa: BLE001 - teardown must not mask a failure
                 pass
+        for network in (self.internal, self.egress):
+            if network is None:
+                continue
+            for _ in range(10):
+                try:
+                    network.remove()
+                    break
+                except Exception:  # noqa: BLE001 - container removal is async
+                    time.sleep(1)
         return False
 
 
