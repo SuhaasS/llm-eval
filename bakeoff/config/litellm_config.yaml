@@ -1,0 +1,93 @@
+# Self-hosted LiteLLM proxy calling Bedrock directly (spec section 2).
+# No third-party hop: this runs inside the Pindrop AWS account.
+#
+# Model IDs verified against the AWS Bedrock model cards on 2026-08-05.
+# Routing itself is NOT verified here -- no credentials in the authoring
+# environment. Phase 0c's smoke test (Task 12) is the gate.
+#
+# Both transports are configured so Phase 0 can pick per arm from evidence
+# rather than assumption, and so an adapter failure can be told apart from
+# model weakness (spec section 6.4):
+#
+#   bedrock-mantle   AWS-recommended; the ONLY route Gemma 4 31B supports
+#   bedrock-runtime  Converse/Invoke; unavailable for Gemma
+#
+# Every model_name is distinct on purpose. LiteLLM treats repeated
+# model_name values as one load-balanced deployment group and round-robins
+# between them, which would randomize transport per call and confound both
+# latency and tool-translation results.
+#
+# model_name doubles as the PRICE_BOOK key in bakeoff.costs -- a name here
+# that the price book does not know raises UnknownModelError mid-run.
+#
+# Paths differ per model family and are not interchangeable:
+#   Sonnet 5   /anthropic/v1  (Anthropic Messages)
+#   Gemma      /openai/v1     (OpenAI Chat Completions)
+#   Nemotron   /v1            (OpenAI Chat Completions)
+#   Kimi       /v1            (OpenAI Chat Completions)
+
+model_list:
+  # ---- bedrock-mantle (primary) ----
+  - model_name: claude-sonnet-5
+    litellm_params:
+      model: anthropic/anthropic.claude-sonnet-5
+      api_base: https://bedrock-mantle.us-east-1.api.aws/anthropic/v1
+      api_key: os.environ/AWS_BEARER_TOKEN_BEDROCK
+
+  - model_name: gemma-4-31b
+    # Mantle only. Gemma supports neither Converse nor Invoke, and its path
+    # is /openai/v1 rather than the /v1 the other OpenAI-compatible arms use.
+    # Known constraints (spec section 6.4 adapter class, not model weakness):
+    #   - no parallel tool calls; one tool call per turn
+    #   - reasoning content is returned only by the Responses API, so
+    #     TokenUsage.reasoning reads zero on this path
+    litellm_params:
+      model: openai/google.gemma-4-31b
+      api_base: https://bedrock-mantle.us-east-1.api.aws/openai/v1
+      api_key: os.environ/AWS_BEARER_TOKEN_BEDROCK
+
+  - model_name: nemotron-3-super-120b
+    litellm_params:
+      model: openai/nvidia.nemotron-super-3-120b
+      api_base: https://bedrock-mantle.us-east-1.api.aws/v1
+      api_key: os.environ/AWS_BEARER_TOKEN_BEDROCK
+
+  - model_name: kimi-k2-5
+    litellm_params:
+      model: openai/moonshotai.kimi-k2.5
+      api_base: https://bedrock-mantle.us-east-1.api.aws/v1
+      api_key: os.environ/AWS_BEARER_TOKEN_BEDROCK
+
+  # ---- bedrock-runtime (alternate; no Gemma entry) ----
+  - model_name: claude-sonnet-5-runtime
+    # Must use the us. geo inference profile: the model card lists the
+    # In-Region runtime URL as N/A, so the bare ID cannot be invoked.
+    # US geo also matches the data-residency posture behind choosing Bedrock.
+    litellm_params:
+      model: bedrock/us.anthropic.claude-sonnet-5
+      aws_region_name: us-east-1
+
+  - model_name: nemotron-3-super-120b-runtime
+    litellm_params:
+      model: bedrock/nvidia.nemotron-super-3-120b
+      aws_region_name: us-east-1
+
+  - model_name: kimi-k2-5-runtime
+    litellm_params:
+      model: bedrock/moonshotai.kimi-k2.5
+      aws_region_name: us-east-1
+
+litellm_settings:
+  # BakeoffCallback requires constructor arguments, so it cannot be
+  # registered by this string form -- pass an instance via litellm.callbacks
+  # instead. Task 12 confirms the wiring.
+  callbacks: bakeoff.wire.BakeoffCallback
+  drop_params: false          # surface unsupported params instead of hiding them
+  set_verbose: false
+
+general_settings:
+  # Retries are logged as infra events, never silently absorbed. Each retry
+  # is its own callback invocation, which is why the wire log counts calls
+  # rather than turns.
+  num_retries: 3
+  request_timeout: 900

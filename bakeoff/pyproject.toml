@@ -5,7 +5,7 @@ requires-python = ">=3.11"
 dependencies = ["docker>=7.0", "litellm>=1.40"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-cov"]
+dev = ["pytest>=8.0", "pytest-cov", "pyyaml"]
 
 [build-system]
 requires = ["setuptools>=68"]

@@ -1941,6 +1941,17 @@ cd bakeoff && git add src/bakeoff/checkpoints.py tests/test_checkpoints.py && gi
 
 ## Task 7: Wire-Level Logging
 
+> **Corrections, 2026-08-05.** Four, of which the config one is the most consequential.
+>
+> 1. **`start_time` / `end_time` were discarded.** Both callbacks received them from LiteLLM and `_record` never saw them. That is measured generation latency, where Task 3 can only infer it from transcript gaps — and latency p95 ≤ 2× Sonnet 5 is a stated success criterion (§10). Now captured as `metadata.latency_ms`.
+> 2. **The callback's `turn` counter was not a turn.** LiteLLM fires per API call and the proxy sets `num_retries: 3`, so one agent turn can produce several calls. Anything joining wire entries to trajectory turns — which the scoring plan must do, since `ToolCallStats.malformed` comes from the wire log — would silently mis-join. Renamed to `call_index`; `failed` already distinguishes retries.
+> 3. **`gzip.open(path, "wt")` truncated.** The global constraint says files open with mode `x`; `EventLog` already honors it. A wire log is the one artifact that cannot be reconstructed, so a name collision must fail rather than silently destroy the prior run's log. Now `"xt"`.
+> 4. **Every model ID was wrong**, verified against the AWS model cards: `anthropic.claude-sonnet-5`, `google.gemma-4-31b`, `nvidia.nemotron-super-3-120b`, `moonshotai.kimi-k2.5`. All four carried a spurious `-v1:0` and two had their name segments transposed. **Gemma is structural, not cosmetic: it does not support `bedrock-runtime` at all**, so `bedrock/google.gemma-4-31b-v1:0` could never resolve — and per §6.4 that failure would present as adapter failure indistinguishable from model weakness. The requirement was known upstream and lost here ([Model_Bakeoff_Plan.md:59](../../Model_Bakeoff_Plan.md), spec §11 Phase 0a) — `grep -i mantle` over this plan returned zero hits.
+>
+> **Both transports are now configured.** Mantle is primary (AWS-recommended, and Gemma's only option); `bedrock-runtime` entries sit alongside for the three models that support it, so Phase 0 picks per arm from evidence and can A/B the adapter question directly. Each route takes a distinct `model_name` — LiteLLM round-robins across repeated names, which would randomize transport per call and confound latency and tool-translation results. `PRICE_BOOK` gains matching `-runtime` aliases (same token prices; transport does not change cost), and Gemma deliberately gets none.
+>
+> **Still unverified:** routing, auth, endpoint reachability, and callback registration. No AWS credentials and no `litellm` in the authoring environment — YAML parsing plus the `PRICE_BOOK` cross-check is the ceiling. Task 12 remains the gate. Known Gemma asymmetries recorded for §9: no parallel tool calls, and reasoning content absent on the Chat Completions path (so its `TokenUsage.reasoning` reads zero while Sonnet's does not, understating Gemma's cost).
+
 **Files:**
 - Create: `bakeoff/src/bakeoff/wire.py`
 - Create: `bakeoff/config/litellm_config.yaml`
@@ -1950,15 +1961,18 @@ cd bakeoff && git add src/bakeoff/checkpoints.py tests/test_checkpoints.py && gi
 - Consumes: `scan_secrets` from `bakeoff.scanners`
 - Produces: `WireLogger(path: Path)` with `.log_call(request: dict, response: dict, metadata: dict) -> None`, `.close() -> None`, `.entries() -> list[dict]`; `BakeoffCallback` (LiteLLM `CustomLogger` subclass)
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `bakeoff/tests/test_wire.py`:
 
 ```python
 import gzip
 import json
+from datetime import UTC, datetime
 
-from bakeoff.wire import WireLogger
+import pytest
+
+from bakeoff.wire import BakeoffCallback, WireLogger
 
 
 def test_writes_gzipped_jsonl(tmp_path):
@@ -2040,14 +2054,60 @@ def test_close_is_idempotent(tmp_path):
     logger = WireLogger(tmp_path / "wire.jsonl.gz")
     logger.close()
     logger.close()
+
+
+def test_refuses_to_overwrite_an_existing_log(tmp_path):
+    """Global constraint: the event log is append-only and immutable, and
+    files open with mode "x". Opening "wt" would silently destroy a prior
+    run's wire log -- the one artifact that cannot be reconstructed."""
+    path = tmp_path / "wire.jsonl.gz"
+    WireLogger(path).close()
+    with pytest.raises(FileExistsError):
+        WireLogger(path)
+
+
+def test_callback_records_measured_latency(tmp_path):
+    """LiteLLM hands the callback real start/end timestamps. That is
+    wire-level ground truth for generation time, where the trajectory
+    parser can only infer it from transcript gaps -- and latency p95 is a
+    stated success criterion (spec section 10)."""
+    logger = WireLogger(tmp_path / "wire.jsonl.gz")
+    callback = BakeoffCallback(logger, run_id="r-1")
+
+    start = datetime(2026, 8, 4, 0, 0, 0, tzinfo=UTC)
+    end = datetime(2026, 8, 4, 0, 0, 2, 500000, tzinfo=UTC)
+    callback.log_success_event({"model": "gemma-4-31b"}, {"id": "x"}, start, end)
+    logger.close()
+
+    assert logger.entries()[0]["metadata"]["latency_ms"] == 2500
+
+
+def test_callback_counts_calls_not_turns(tmp_path):
+    """LiteLLM fires once per API call, not per agent turn, and the proxy
+    is configured with num_retries. Two failed attempts and a success are
+    one turn but three calls, so labelling the counter "turn" would
+    silently mis-join wire entries against trajectory turns."""
+    logger = WireLogger(tmp_path / "wire.jsonl.gz")
+    callback = BakeoffCallback(logger, run_id="r-1")
+
+    now = datetime(2026, 8, 4, tzinfo=UTC)
+    callback.log_failure_event({"model": "kimi-k2-5"}, {}, now, now)
+    callback.log_failure_event({"model": "kimi-k2-5"}, {}, now, now)
+    callback.log_success_event({"model": "kimi-k2-5"}, {}, now, now)
+    logger.close()
+
+    entries = logger.entries()
+    assert [e["metadata"]["call_index"] for e in entries] == [1, 2, 3]
+    assert [e["metadata"]["failed"] for e in entries] == [True, True, False]
+    assert not any("turn" in e["metadata"] for e in entries)
 ```
 
-- [ ] **Step 2: Run to confirm it fails**
+- [x] **Step 2: Run to confirm it fails**
 
 Run: `cd bakeoff && python -m pytest tests/test_wire.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'bakeoff.wire'`
 
-- [ ] **Step 3: Implement the wire logger**
+- [x] **Step 3: Implement the wire logger**
 
 `bakeoff/src/bakeoff/wire.py`:
 
@@ -2061,6 +2121,10 @@ the adapter or drop the candidate (spec section 6.4).
 
 Secrets are FLAGGED, never redacted: the eval needs the true payload, and
 flags drive the pre-share scrub (spec section 3.6).
+
+Logs open with mode "x" like the event log (global constraints): a wire log
+is the one artifact that cannot be reconstructed after the fact, so a
+name collision must fail rather than silently truncate.
 """
 
 from __future__ import annotations
@@ -2078,7 +2142,7 @@ class WireLogger:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._handle = gzip.open(self.path, "wt", encoding="utf-8")
+        self._handle = gzip.open(self.path, "xt", encoding="utf-8")
         self._closed = False
         self._entries: list[dict[str, Any]] = []
 
@@ -2116,16 +2180,35 @@ class BakeoffCallback:
     """LiteLLM CustomLogger hook. Registered via litellm.callbacks.
 
     LiteLLM invokes log_success_event / log_failure_event with the full
-    kwargs (the outbound request) and response_obj.
+    kwargs (the outbound request), response_obj, and the real start/end
+    timestamps of the call.
     """
 
     def __init__(self, logger: WireLogger, run_id: str) -> None:
         self.logger = logger
         self.run_id = run_id
-        self._turn = 0
+        # Deliberately NOT a turn counter. LiteLLM fires once per API call,
+        # and the proxy retries, so one agent turn can produce several
+        # calls. Naming this "turn" would invite a silent mis-join against
+        # trajectory turn numbers.
+        self._call_index = 0
 
-    def _record(self, kwargs: dict, response_obj: Any, failed: bool) -> None:
-        self._turn += 1
+    @staticmethod
+    def _latency_ms(start: Any, end: Any) -> int | None:
+        try:
+            return int((end - start).total_seconds() * 1000)
+        except (TypeError, AttributeError):
+            return None
+
+    def _record(
+        self,
+        kwargs: dict,
+        response_obj: Any,
+        failed: bool,
+        start_time: Any = None,
+        end_time: Any = None,
+    ) -> None:
+        self._call_index += 1
         raw = response_obj
         if hasattr(response_obj, "model_dump"):
             raw = response_obj.model_dump()
@@ -2144,8 +2227,11 @@ class BakeoffCallback:
             response=raw if isinstance(raw, dict) else {"raw_completion": str(raw)},
             metadata={
                 "run_id": self.run_id,
-                "turn": self._turn,
+                "call_index": self._call_index,
                 "failed": failed,
+                # Measured generation time, as opposed to the trajectory
+                # parser's estimate from transcript timestamps.
+                "latency_ms": self._latency_ms(start_time, end_time),
                 "bedrock_request_id": (kwargs.get("litellm_params") or {}).get(
                     "request_id"
                 ),
@@ -2153,56 +2239,125 @@ class BakeoffCallback:
         )
 
     def log_success_event(self, kwargs, response_obj, start_time, end_time) -> None:
-        self._record(kwargs, response_obj, failed=False)
+        self._record(kwargs, response_obj, False, start_time, end_time)
 
     def log_failure_event(self, kwargs, response_obj, start_time, end_time) -> None:
-        self._record(kwargs, response_obj, failed=True)
+        self._record(kwargs, response_obj, True, start_time, end_time)
 ```
 
-- [ ] **Step 4: Create the LiteLLM proxy config**
+- [x] **Step 4: Create the LiteLLM proxy config**
 
 `bakeoff/config/litellm_config.yaml`:
 
 ```yaml
 # Self-hosted LiteLLM proxy calling Bedrock directly (spec section 2).
 # No third-party hop: this runs inside the Pindrop AWS account.
+#
+# Model IDs verified against the AWS Bedrock model cards on 2026-08-05.
+# Routing itself is NOT verified here -- no credentials in the authoring
+# environment. Phase 0c's smoke test (Task 12) is the gate.
+#
+# Both transports are configured so Phase 0 can pick per arm from evidence
+# rather than assumption, and so an adapter failure can be told apart from
+# model weakness (spec section 6.4):
+#
+#   bedrock-mantle   AWS-recommended; the ONLY route Gemma 4 31B supports
+#   bedrock-runtime  Converse/Invoke; unavailable for Gemma
+#
+# Every model_name is distinct on purpose. LiteLLM treats repeated
+# model_name values as one load-balanced deployment group and round-robins
+# between them, which would randomize transport per call and confound both
+# latency and tool-translation results.
+#
+# model_name doubles as the PRICE_BOOK key in bakeoff.costs -- a name here
+# that the price book does not know raises UnknownModelError mid-run.
+#
+# Paths differ per model family and are not interchangeable:
+#   Sonnet 5   /anthropic/v1  (Anthropic Messages)
+#   Gemma      /openai/v1     (OpenAI Chat Completions)
+#   Nemotron   /v1            (OpenAI Chat Completions)
+#   Kimi       /v1            (OpenAI Chat Completions)
+
 model_list:
+  # ---- bedrock-mantle (primary) ----
   - model_name: claude-sonnet-5
     litellm_params:
-      model: bedrock/anthropic.claude-sonnet-5-v1:0
-      aws_region_name: us-east-1
+      model: anthropic/anthropic.claude-sonnet-5
+      api_base: https://bedrock-mantle.us-east-1.api.aws/anthropic/v1
+      api_key: os.environ/AWS_BEARER_TOKEN_BEDROCK
+
   - model_name: gemma-4-31b
+    # Mantle only. Gemma supports neither Converse nor Invoke, and its path
+    # is /openai/v1 rather than the /v1 the other OpenAI-compatible arms use.
+    # Known constraints (spec section 6.4 adapter class, not model weakness):
+    #   - no parallel tool calls; one tool call per turn
+    #   - reasoning content is returned only by the Responses API, so
+    #     TokenUsage.reasoning reads zero on this path
     litellm_params:
-      model: bedrock/google.gemma-4-31b-v1:0
-      aws_region_name: us-east-1
+      model: openai/google.gemma-4-31b
+      api_base: https://bedrock-mantle.us-east-1.api.aws/openai/v1
+      api_key: os.environ/AWS_BEARER_TOKEN_BEDROCK
+
   - model_name: nemotron-3-super-120b
     litellm_params:
-      model: bedrock/nvidia.nemotron-3-super-120b-v1:0
-      aws_region_name: us-east-1
+      model: openai/nvidia.nemotron-super-3-120b
+      api_base: https://bedrock-mantle.us-east-1.api.aws/v1
+      api_key: os.environ/AWS_BEARER_TOKEN_BEDROCK
+
   - model_name: kimi-k2-5
     litellm_params:
-      model: bedrock/moonshotai.kimi-k2-5-v1:0
+      model: openai/moonshotai.kimi-k2.5
+      api_base: https://bedrock-mantle.us-east-1.api.aws/v1
+      api_key: os.environ/AWS_BEARER_TOKEN_BEDROCK
+
+  # ---- bedrock-runtime (alternate; no Gemma entry) ----
+  - model_name: claude-sonnet-5-runtime
+    # Must use the us. geo inference profile: the model card lists the
+    # In-Region runtime URL as N/A, so the bare ID cannot be invoked.
+    # US geo also matches the data-residency posture behind choosing Bedrock.
+    litellm_params:
+      model: bedrock/us.anthropic.claude-sonnet-5
+      aws_region_name: us-east-1
+
+  - model_name: nemotron-3-super-120b-runtime
+    litellm_params:
+      model: bedrock/nvidia.nemotron-super-3-120b
+      aws_region_name: us-east-1
+
+  - model_name: kimi-k2-5-runtime
+    litellm_params:
+      model: bedrock/moonshotai.kimi-k2.5
       aws_region_name: us-east-1
 
 litellm_settings:
+  # BakeoffCallback requires constructor arguments, so it cannot be
+  # registered by this string form -- pass an instance via litellm.callbacks
+  # instead. Task 12 confirms the wiring.
   callbacks: bakeoff.wire.BakeoffCallback
   drop_params: false          # surface unsupported params instead of hiding them
   set_verbose: false
 
 general_settings:
-  # Retries are logged as infra events, never silently absorbed.
+  # Retries are logged as infra events, never silently absorbed. Each retry
+  # is its own callback invocation, which is why the wire log counts calls
+  # rather than turns.
   num_retries: 3
   request_timeout: 900
 ```
 
-Model IDs above are placeholders pending Phase 0 confirmation — Task 10's smoke test verifies each one resolves.
+Model IDs verified against the AWS Bedrock model cards on 2026-08-05. Routing, auth,
+and endpoint reachability remain unverified — Task 12's smoke test is the gate, and it
+must also confirm Claude Code's tool protocol survives translation to OpenAI Chat
+Completions on the three candidate arms. `bakeoff/tests/test_config.py` adds the three
+offline checks that need no credentials: the YAML parses, every `model_name` prices via
+`PRICE_BOOK`, and Gemma carries no `bedrock/` route.
 
-- [ ] **Step 5: Run — expect pass**
+- [x] **Step 5: Run — expect pass**
 
 Run: `cd bakeoff && python -m pytest tests/test_wire.py -v`
-Expected: 6 passed
+Expected: 9 passed, plus 3 in `tests/test_config.py`. Default suite is 59.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 cd bakeoff && git add src/bakeoff/wire.py config/litellm_config.yaml tests/test_wire.py && git commit -m "feat: wire-level request/response capture via LiteLLM callback"

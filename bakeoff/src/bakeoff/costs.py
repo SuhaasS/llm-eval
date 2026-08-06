@@ -42,6 +42,19 @@ PRICE_BOOK: dict[str, ModelPricing] = {
     "kimi-k2-5": ModelPricing(input_per_1m=0.60, output_per_1m=3.00),
 }
 
+# The proxy exposes the bedrock-runtime route under a "-runtime" suffix so the
+# two transports stay distinguishable in the record (LiteLLM would otherwise
+# load-balance across same-named entries). Transport does not change token
+# pricing, so these alias the same ModelPricing. Gemma has no runtime route --
+# it is served only on bedrock-mantle -- so it gets no alias.
+PRICE_BOOK.update(
+    {
+        f"{name}-runtime": pricing
+        for name, pricing in PRICE_BOOK.items()
+        if name != "gemma-4-31b"
+    }
+)
+
 _PER_MILLION = 1_000_000
 
 
