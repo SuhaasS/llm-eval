@@ -2408,6 +2408,12 @@ cd bakeoff && git add src/bakeoff/wire.py config/litellm_config.yaml tests/test_
 
 ## Task 8: Failure and Exclusion Classification
 
+> **Correction, 2026-08-05 — every clean run would have been labelled a false success.** Task 10 builds `RunSignals` with `agent_claimed_success = (terminated_by == AGENT_FINISH)` and `tests_passed=False` hardcoded, and assigns `outcome = FAILED` to any self-terminating agent. On the normal healthy path — agent finishes, no malformation, no truncation, no loop — `classify_failure` therefore reached `agent_claimed_success and not tests_passed` and returned `FALSE_SUCCESS`. Demonstrated against Task 10's exact signal shape: plan-doc version returns `FALSE_SUCCESS`, corrected version returns `None`.
+>
+> That matters because `FALSE_SUCCESS` asserts the model claimed a success it did not achieve — an accusation of dishonesty, applied to essentially every well-behaved run, written into a log with no update API. `Outcome.RESOLVED` is never assigned at harness time either, so the `RESOLVED` guard never fires to prevent it. The self-review below flags the hardcoded `False` as a known deferral with the offline grader re-deriving later, but a derived view cannot un-write a bad value from an immutable record, and the global constraints state that the logger records raw observations while every score is derived later.
+>
+> Root cause: treating "not graded yet" as "the tests failed" — absence of evidence recorded as evidence of failure. `tests_passed` is now tri-state (`bool | None`, default `None`). Classes readable from the transcript alone (`P2P_REGRESSION`, `TOOL_MALFORMATION`, `TRUNCATION`, `LOOP_REPETITION`, `GAVE_UP`) classify unchanged; the two that need the oracle (`FALSE_SUCCESS`, and the `WRONG_BUT_CONFIDENT` catch-all) require an explicit result. All 13 original tests still pass — the fixture supplies `tests_passed=False` explicitly. Two tests added, one of which reproduces Task 10's construction so the regression cannot be reintroduced silently. **Task 10 must pass `tests_passed=None`.**
+
 **Files:**
 - Create: `bakeoff/src/bakeoff/classify.py`
 - Test: `bakeoff/tests/test_classify.py`
@@ -2416,7 +2422,7 @@ cd bakeoff && git add src/bakeoff/wire.py config/litellm_config.yaml tests/test_
 - Consumes: `Outcome`, `TerminationReason`, `FailureClass`, `ExclusionClass`, `Exclusion`, `ToolCallStats` from `bakeoff.schema`
 - Produces: `RunSignals` dataclass; `classify_failure(signals: RunSignals) -> FailureClass | None`; `classify_exclusion(signals: RunSignals) -> Exclusion | None`; `PRE_REGISTERED_REASONS: frozenset[str]`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `bakeoff/tests/test_classify.py`:
 
@@ -2529,14 +2535,49 @@ def test_every_reason_code_is_pre_registered():
     for case in cases:
         exclusion = classify_exclusion(case)
         assert exclusion.reason_code in PRE_REGISTERED_REASONS
+
+
+def test_ungraded_run_is_not_accused_of_false_success():
+    """tests_passed=None means "not graded yet", not "the tests failed".
+
+    FALSE_SUCCESS asserts the model claimed a success it did not achieve.
+    Deriving that from an absent grade would convict every run the oracle
+    has not reached, permanently, in a log with no update API.
+    """
+    result = classify_failure(signals(agent_claimed_success=True, tests_passed=None))
+    assert result != FailureClass.FALSE_SUCCESS
+    assert result is None
+
+
+def test_harness_time_signals_leave_the_failure_class_undetermined():
+    """Reproduces the orchestrator's own signal construction for a clean run.
+
+    The harness cannot know whether tests passed -- grading is offline by
+    design (spec section 5.5) -- and it marks any self-terminating agent as
+    having claimed success. Classifying from that alone would label every
+    well-behaved run. Structural failures still classify; this one has none,
+    so the class stays open for the offline grader.
+    """
+    clean = signals(
+        outcome=Outcome.FAILED,
+        terminated_by=TerminationReason.AGENT_FINISH,
+        agent_claimed_success=True,
+        tests_passed=None,
+        tool_calls_malformed=0,
+        truncation_events=0,
+        turns_used=12,
+        distinct_turn_hashes=12,
+    )
+    assert classify_failure(clean) is None
+    assert classify_exclusion(clean) is None
 ```
 
-- [ ] **Step 2: Run to confirm it fails**
+- [x] **Step 2: Run to confirm it fails**
 
 Run: `cd bakeoff && python -m pytest tests/test_classify.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'bakeoff.classify'`
 
-- [ ] **Step 3: Implement classification**
+- [x] **Step 3: Implement classification**
 
 `bakeoff/src/bakeoff/classify.py`:
 
@@ -2548,6 +2589,16 @@ reason code is pre-registered here — in code, before any run executes.
 Adding a code later is a visible diff, not a judgement call at analysis time.
 
 Model failures are NEVER excluded. They are the measurement.
+
+Grading is offline by design (spec section 5.5), so at harness time the test
+outcome is genuinely unknown rather than negative. `tests_passed` is
+tri-state for that reason: the classes that need the oracle (FALSE_SUCCESS,
+and the WRONG_BUT_CONFIDENT catch-all) only fire on an explicit result,
+while the classes readable from the transcript alone — malformation,
+truncation, loops, repetition, giving up early — classify immediately.
+Treating "not graded yet" as "the tests failed" would stamp FALSE_SUCCESS,
+an accusation of dishonesty, onto every well-behaved run, permanently,
+since the event log has no update API.
 """
 
 from __future__ import annotations
@@ -2591,7 +2642,9 @@ class RunSignals:
     distinct_turn_hashes: int
     turns_used: int
     agent_claimed_success: bool
-    tests_passed: bool
+    # None means "not graded yet", which is the harness's normal state --
+    # not a failing test result.
+    tests_passed: bool | None = None
     p2p_regressions: list[str] = field(default_factory=list)
     container_crashed: bool = False
     api_error_status: int | None = None
@@ -2607,14 +2660,18 @@ def classify_failure(signals: RunSignals) -> FailureClass | None:
     if signals.outcome == Outcome.RESOLVED:
         return None
 
+    # Observable from the transcript alone; no oracle needed.
     if signals.p2p_regressions:
         return FailureClass.P2P_REGRESSION
     if signals.malformation_rate >= MALFORMATION_FAILURE_THRESHOLD:
         return FailureClass.TOOL_MALFORMATION
     if signals.truncation_events > 0:
         return FailureClass.TRUNCATION
-    if signals.agent_claimed_success and not signals.tests_passed:
+
+    # Needs the test oracle: only an explicit failure supports the claim.
+    if signals.agent_claimed_success and signals.tests_passed is False:
         return FailureClass.FALSE_SUCCESS
+
     if (
         signals.turns_used >= LOOP_MIN_TURNS
         and signals.distinct_turn_hashes / signals.turns_used < LOOP_DISTINCT_RATIO
@@ -2622,6 +2679,12 @@ def classify_failure(signals: RunSignals) -> FailureClass | None:
         return FailureClass.LOOP_REPETITION
     if signals.turns_used <= GAVE_UP_MAX_TURNS:
         return FailureClass.GAVE_UP
+
+    if signals.tests_passed is None:
+        # Nothing structural went wrong and the oracle has not run. Saying
+        # anything here would be a guess written into an immutable record;
+        # the offline grader re-derives this from the stored run.
+        return None
 
     return FailureClass.WRONG_BUT_CONFIDENT
 
@@ -2661,12 +2724,12 @@ def classify_exclusion(signals: RunSignals) -> Exclusion | None:
     return None
 ```
 
-- [ ] **Step 4: Run — expect pass**
+- [x] **Step 4: Run — expect pass**
 
 Run: `cd bakeoff && python -m pytest tests/test_classify.py -v`
-Expected: 13 passed
+Expected: 15 passed. Default suite is 75.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd bakeoff && git add src/bakeoff/classify.py tests/test_classify.py && git commit -m "feat: pre-registered failure and exclusion classification"
@@ -3768,7 +3831,9 @@ cd bakeoff && git add scripts/smoke_test.py fixtures/smoke_task && git commit -m
 2. **Scoring** — deterministic checks, offline checkpoint grading, judge protocol, κ calibration (§4)
 3. **Analysis and reporting** — paired cluster bootstrap, pass@1/pass^k, Elo, scorecard (§10)
 
-**Known deferrals inside this plan.** `ToolCallStats.malformed` is populated by the wire log rather than the trajectory (Claude Code's transcript does not record parse failures), so wiring it through `assemble_record` lands in the scoring plan alongside wire-log analysis. `Checkpoint.tests_pass` stays `None` by design — §5.5 requires offline grading. `RunSignals.tests_passed` is likewise hardcoded `False` in the harness; the offline grader re-derives `outcome` and `failure_class` from the stored record.
+**Known deferrals inside this plan.** `ToolCallStats.malformed` is populated by the wire log rather than the trajectory (Claude Code's transcript does not record parse failures), so wiring it through `assemble_record` lands in the scoring plan alongside wire-log analysis. `Checkpoint.tests_pass` stays `None` by design — §5.5 requires offline grading. `RunSignals.tests_passed` is likewise unknown at harness time; it is now `None` rather than `False` (see the Task 8 correction — hardcoding `False` labelled every clean run `FALSE_SUCCESS`), and the offline grader re-derives `outcome` and `failure_class` from the stored record.
+
+Because `ToolCallStats.malformed` is never populated during a run, note the knock-on: `TOOL_MALFORMATION` and `ADAPTER_FAILURE` are both unreachable at harness time, so the adapter-vs-model distinction §6.4 calls the eval's most consequential call cannot fire until the wire-log analysis lands.
 
 ---
 

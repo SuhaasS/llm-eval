@@ -9,11 +9,46 @@ Source plan: [docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md](../d
 - [x] **Task 5** — Container lifecycle and git pinning
 - [x] **Task 6** — Checkpoint capture
 - [x] **Task 7** — Wire-level logging
-- [ ] Task 8 — Failure and exclusion classification (`classify.py`)
+- [x] **Task 8** — Failure and exclusion classification
 - [ ] Task 9 — Claude Code runner (`claude_runner.py`)
 - [ ] Task 10 — Run orchestrator (`runner.py`)
 - [ ] Task 11 — Fault-injection gate
 - [ ] Task 12 — End-to-end smoke test
+
+---
+
+## Review — Task 8 (2026-08-05)
+
+**Delivered:** `classify.py` — `RunSignals`, `classify_failure`, `classify_exclusion`, `PRE_REGISTERED_REASONS`. 15 tests (13 plan-doc + 2), **75 unit + 9 integration passing.** Pure logic, stdlib only.
+
+**The correction — every clean run would have been labelled a false success.**
+
+Task 10 builds `RunSignals` with `agent_claimed_success = (terminated_by == AGENT_FINISH)` and `tests_passed=False` hardcoded, and assigns `outcome = FAILED` to any self-terminating agent. So on the normal path — agent finishes, no malformation, no truncation, no loop — `classify_failure` reached `agent_claimed_success and not tests_passed` and returned `FALSE_SUCCESS`.
+
+Demonstrated against Task 10's exact signal construction:
+
+```
+plan doc  (tests_passed=False): FailureClass.FALSE_SUCCESS
+corrected (tests_passed=None) : None
+```
+
+`FALSE_SUCCESS` asserts the model claimed a success it did not achieve. Applying that to essentially every well-behaved run is an accusation of dishonesty written into a log with no update API — permanent. `Outcome.RESOLVED` is never assigned at harness time either, so the `RESOLVED` guard never fires to prevent it.
+
+The plan's self-review did flag the hardcoded `False` as a known deferral with the offline grader re-deriving later. But a derived view cannot un-write a bad value from an immutable record, and the global constraints say the logger records raw observations while every score is derived later.
+
+Root cause: treating "not graded yet" as "the tests failed" — absence of evidence recorded as evidence of failure. `tests_passed` is now tri-state (`bool | None`, default `None`), splitting the classes by what each needs:
+
+| class | needs | harness time |
+|---|---|---|
+| `P2P_REGRESSION`, `TOOL_MALFORMATION`, `TRUNCATION`, `LOOP_REPETITION`, `GAVE_UP` | transcript only | classifies as before |
+| `FALSE_SUCCESS` | test oracle | requires explicit `False` |
+| `WRONG_BUT_CONFIDENT` (catch-all) | test oracle | requires a result at all |
+
+Verified structural failures still classify without the oracle — malformation, truncation, loop, and gave-up all fire with `tests_passed=None`. All 13 original tests unaffected (the fixture supplies `False` explicitly). `test_harness_time_signals_leave_the_failure_class_undetermined` reproduces Task 10's construction, so the regression can't return silently.
+
+**Found while tracing:** `tool_calls_malformed` is always 0, because `ToolCallStats.malformed` comes from the wire log and isn't wired through `assemble_record`. So `TOOL_MALFORMATION` and `ADAPTER_FAILURE` are **both unreachable at harness time** — the adapter-vs-model distinction §6.4 calls the eval's most consequential call cannot currently fire. Recorded in the plan doc's self-review alongside the existing deferral.
+
+**Correct as specified:** `task_defect_flaky_test` and `task_defect_bad_base_sha` are pre-registered but never emitted by `classify_exclusion`. That's the point — they're applied by a human during analysis, and pre-registering them before any run is what stops exclusion criteria being invented after seeing results.
 
 ---
 

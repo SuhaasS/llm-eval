@@ -48,6 +48,6 @@ Integration tests are opt-in — they need a Docker daemon, and on macOS they ne
 cd bakeoff && .venv/bin/python -m pytest -v -m integration --basetemp="$HOME/.cache/bakeoff-pytest"
 ```
 
-Status: Tasks 1–7 complete (schema, event log, pricing, trajectory parser, scanners, container, checkpoints, wire logging). 60 unit + 9 integration tests passing.
+Status: Tasks 1–8 complete (schema, event log, pricing, trajectory parser, scanners, container, checkpoints, wire logging, classification). 75 unit + 9 integration tests passing.
 
 Bedrock model IDs in [config/litellm_config.yaml](bakeoff/config/litellm_config.yaml) are verified against the AWS model cards; routing and auth are not — Phase 0c's smoke test is the gate.
