@@ -45,16 +45,38 @@ sys.path.insert(0, str(REPO))
 AGENT_TAG = "bakeoff-eval-agent:smoke"
 PROXY_TAG = "bakeoff-litellm-proxy:smoke"
 
-# The four arms of the eval, all on bedrock-mantle. The -runtime variants
-# exist in the config to tell an adapter failure from a model failure
-# (spec section 6.4) and are opt-in via --models: doubling the arms doubles
-# the spend for a question Phase 0c does not have to answer.
-MANTLE_ARMS = [
-    "claude-sonnet-5",
+# The four arms of the eval. NOT one transport: Sonnet 5 runs on
+# bedrock-runtime and the three candidates on bedrock-mantle.
+#
+# That split is not a preference. The mantle passthrough derives
+# `anthropic-beta` HTTP headers from Claude Code's context_management and
+# output_config and mantle rejects them, so the mantle Sonnet arm 400s on
+# every call with "invalid beta flag" -- measured twice on 2026-08-07, and
+# additional_drop_params cannot reach a header. bedrock-runtime carries beta
+# values as a request-body field instead and completes the task.
+#
+# The cost is a section 6.4 confound on the reference arm, tracked in
+# TASKS.md: Sonnet is not transport-identical to the arms it is the reference
+# for. `claude-sonnet-5` stays reachable through --models as the control that
+# demonstrates the difference, but it does not earn a slot in the default set.
+EVAL_ARMS = [
+    "claude-sonnet-5-runtime",
     "gemma-4-31b",
     "nemotron-3-super-120b",
     "kimi-k2-5",
 ]
+
+# Phase 0c's exit criterion. One run per arm structurally cannot see a failure
+# RATE, only a failure -- and the two 2026-08-07 runs proved the point: Kimi
+# failed both times and in two different ways, so either run alone would have
+# read as one deterministic bug. GO requires every repeat of every arm to pass;
+# the per-arm rates are reported either way, because "which arm, how often, in
+# what way" is the output Phase 3 sizing actually needs.
+LIVE_REPEATS = 3
+
+# The offline gate stays at one. The stub replies from a fixed script, so
+# repeats are byte-identical and would only triple verify_logger's runtime.
+OFFLINE_REPEATS = 1
 
 PROMPT = (
     "The test in tests/test_calc.py fails. Fix the bug in calc.py so that it "
@@ -576,12 +598,27 @@ def run_arm(
     network: str,
     max_turns: int,
     timeout_s: int,
+    repeat: int = 0,
 ) -> tuple[Any, dict, int]:
+    """One run of one arm. `repeat` indexes runs of the same arm.
+
+    It has to reach two places, and both are load-bearing:
+
+      the workdir     each repeat builds its own repo. Sharing one would let
+                      repeat 2 start from repeat 1's dirty tree and report a
+                      diff its own agent never made.
+
+      sample_index    run_id is a hash of (task, model, sample, attempt) and
+                      write_run opens mode "x", so a second repeat at
+                      sample_index=0 raises ImmutabilityError out of
+                      execute_run rather than overwriting -- correct, and
+                      fatal to the matrix if the index does not move.
+    """
     from bakeoff.claude_runner import ClaudeCodeConfig
     from bakeoff.proxy_callback import unattributed_count
     from bakeoff.runner import TaskSpec, execute_run
 
-    arm_dir = workdir / arm
+    arm_dir = workdir / f"{arm}-{repeat}"
     repo, base_sha = build_smoke_repo(arm_dir)
 
     task = TaskSpec(
@@ -610,7 +647,7 @@ def run_arm(
     record = execute_run(
         task=task,
         model=arm,
-        sample_index=0,
+        sample_index=repeat,
         config=config,
         event_log=event_log,
         repo_path=str(repo),
@@ -648,18 +685,71 @@ def wire_entry_count(record) -> int:
 
 def print_table(rows: list[dict]) -> None:
     header = (
-        f"{'arm':26} {'outcome':18} {'turns':>5} {'tools':>6} {'wire':>5} "
-        f"{'out_tok':>8} {'cost$':>9} {'wall_s':>7} {'diff_b':>7}  verdict"
+        f"{'run':30} {'outcome':18} {'turns':>5} {'tools':>6} {'wire':>5} "
+        f"{'out_tok':>8} {'cache_r':>8} {'cache_w':>8} {'cost$':>9} "
+        f"{'wall_s':>7} {'diff_b':>7}  verdict"
     )
     print("\n" + header)
     print("-" * len(header))
     for row in rows:
         print(
-            f"{row['arm']:26} {row['outcome']:18} {row['turns']:>5} "
+            f"{row['label']:30} {row['outcome']:18} {row['turns']:>5} "
             f"{row['tools']:>6} {row['wire']:>5} {row['out_tok']:>8} "
+            f"{row['cache_read']:>8} {row['cache_write']:>8} "
             f"{row['cost']:>9.5f} {row['wall_s']:>7.1f} {row['diff_b']:>7}  "
             f"{row['verdict']}"
         )
+
+
+def print_rates(rows: list[dict], repeats: int) -> None:
+    """Per-arm pass rate and the distinct ways each arm failed.
+
+    The reason N=3 exists. A summed failure count would have reported Kimi's
+    two 2026-08-07 runs as "2 failures" when they were two *different*
+    failures -- one mid-stream death, one clean exit that never called the
+    edit tool -- and those need different fixes. Grouping by run_problems'
+    returned reasons keeps them apart without inventing a second taxonomy.
+    """
+    if repeats <= 1:
+        return
+    print(f"\nper-arm rates over {repeats} run(s)")
+    for arm in dict.fromkeys(row["arm"] for row in rows):
+        arm_rows = [row for row in rows if row["arm"] == arm]
+        passed = sum(1 for row in arm_rows if not row["problems"])
+        print(f"  {arm:26} passed {passed}/{len(arm_rows)}")
+        modes: dict[str, int] = {}
+        for row in arm_rows:
+            if row["problems"]:
+                modes["; ".join(row["problems"])] = (
+                    modes.get("; ".join(row["problems"]), 0) + 1
+                )
+        for mode, count in sorted(modes.items(), key=lambda item: -item[1]):
+            print(f"    {count}x  {mode}")
+
+
+def print_cache_tokens(rows: list[dict]) -> None:
+    """Whether an arm returns cache tokens at all, stated rather than assumed.
+
+    costs.py prices cache tokens for Sonnet and raises for the three
+    candidates, whose Bedrock cache support is unconfirmed. assemble_record
+    catches that, so a candidate that ever returns one yields a record with
+    turns, tokens and cost all ZERO -- which is byte-identical to an arm that
+    legitimately failed on its first call. Measured on 2026-08-07: the cache
+    warms on turn 2 of a single run (not at N=10, as TASKS.md assumed), and
+    the candidates returned no cache fields at all on the mantle route. This
+    line is what keeps that an observation instead of an inference.
+    """
+    print("\ncache tokens (costs.py raises for any candidate that returns one)")
+    for arm in dict.fromkeys(row["arm"] for row in rows):
+        arm_rows = [row for row in rows if row["arm"] == arm]
+        reads = sum(row["cache_read"] for row in arm_rows)
+        writes = sum(row["cache_write"] for row in arm_rows)
+        priced = arm.startswith("claude-sonnet-5")
+        if reads or writes:
+            note = "priced" if priced else "UNPRICED -- record would zero"
+        else:
+            note = "none returned"
+        print(f"  {arm:26} read={reads:<9} write={writes:<9} {note}")
 
 
 def print_sampling(rows: list[dict]) -> None:
@@ -673,7 +763,13 @@ def print_sampling(rows: list[dict]) -> None:
     not a reason to call the run invalid.
     """
     print("\nsampling as it appears on the wire (spec section 5.3)")
+    # One line per ARM, not per run: sampling comes from proxy config, which
+    # does not vary between repeats of the same arm.
+    seen: set[str] = set()
     for row in rows:
+        if row["arm"] in seen:
+            continue
+        seen.add(row["arm"])
         sampling = row["sampling"] or {}
         temperature = sampling.get("temperature")
         shown = "absent" if temperature is None else repr(temperature)
@@ -698,6 +794,13 @@ def main() -> int:
     )
     parser.add_argument("--max-turns", type=int, default=30)
     parser.add_argument("--timeout-s", type=int, default=900)
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=None,
+        help=f"runs per arm (default {LIVE_REPEATS} live, {OFFLINE_REPEATS} offline). "
+        "GO requires every repeat of every arm to pass.",
+    )
     parser.add_argument("--keep", action="store_true", help="keep artifacts on disk")
     args = parser.parse_args()
 
@@ -706,7 +809,7 @@ def main() -> int:
     expectations = LIVE if args.mode == "live" else OFFLINE
     if args.mode == "live":
         config_name = "litellm_config.yaml"
-        arms = args.models.split(",") if args.models else list(MANTLE_ARMS)
+        arms = args.models.split(",") if args.models else list(EVAL_ARMS)
     else:
         config_name = "litellm_smoke_offline.yaml"
         # Two arms, not one. The second configures a temperature, which is
@@ -728,8 +831,15 @@ def main() -> int:
     workdir.mkdir(parents=True)
     wire_dir = workdir / "wire"
 
+    repeats = args.repeats
+    if repeats is None:
+        repeats = LIVE_REPEATS if args.mode == "live" else OFFLINE_REPEATS
+    if repeats < 1:
+        raise SystemExit("--repeats must be at least 1")
+
     print(f"mode      {args.mode}  ({config_name})")
     print(f"arms      {', '.join(arms)}")
+    print(f"repeats   {repeats} per arm ({len(arms) * repeats} runs)")
     print(f"workdir   {workdir}")
     if expectations.not_applicable:
         print(
@@ -755,46 +865,60 @@ def main() -> int:
     with Proxy(
         config_name, wire_dir, environment, stamp, with_stub=args.mode == "offline"
     ) as proxy:
+        # Arm-major: all repeats of one arm before moving on. Keeps a NO-GO
+        # arm's runs adjacent in the output, and keeps the repeats of one arm
+        # close together in time so a rate is not confounded by drift in
+        # Bedrock-side load across the whole matrix.
         for arm in arms:
-            print(f"\nrunning {arm} ...")
-            record, config_dump, unattributed = run_arm(
-                arm,
-                image,
-                workdir,
-                wire_dir,
-                event_log,
-                proxy.internal_name,
-                args.max_turns,
-                args.timeout_s,
-            )
-            entries = wire_entry_count(record)
-            problems = run_problems(
-                record,
-                wire_entries=entries,
-                unattributed=unattributed,
-                config=config_dump,
-                expectations=expectations,
-            )
-            if problems:
-                failures[arm] = problems
-            configs[arm] = config_dump
-            rows.append(
-                {
-                    "arm": arm,
-                    "outcome": record.outcome.value,
-                    "turns": record.turns_used,
-                    "tools": record.tool_calls.total,
-                    "wire": entries,
-                    "out_tok": record.tokens.output,
-                    "cost": record.cost_usd,
-                    "wall_s": record.time.wall_clock_total_ms / 1000,
-                    "diff_b": len(record.artifacts.final_diff or ""),
-                    "unattributed": unattributed,
-                    "sampling": record.sampling,
-                    "verdict": "NO-GO" if problems else "go",
-                    "wire_log": record.artifacts.wire_log_gz,
-                }
-            )
+            for repeat in range(repeats):
+                label = arm if repeats == 1 else f"{arm}/{repeat + 1}"
+                print(f"\nrunning {label} ...")
+                record, config_dump, unattributed = run_arm(
+                    arm,
+                    image,
+                    workdir,
+                    wire_dir,
+                    event_log,
+                    proxy.internal_name,
+                    args.max_turns,
+                    args.timeout_s,
+                    repeat=repeat,
+                )
+                entries = wire_entry_count(record)
+                problems = run_problems(
+                    record,
+                    wire_entries=entries,
+                    unattributed=unattributed,
+                    config=config_dump,
+                    expectations=expectations,
+                )
+                if problems:
+                    failures[label] = problems
+                # One representative per arm: section 5.2 compares arms
+                # against each other, and repeats of one arm are configured
+                # identically by construction.
+                configs.setdefault(arm, config_dump)
+                rows.append(
+                    {
+                        "arm": arm,
+                        "label": label,
+                        "outcome": record.outcome.value,
+                        "turns": record.turns_used,
+                        "tools": record.tool_calls.total,
+                        "wire": entries,
+                        "out_tok": record.tokens.output,
+                        "cache_read": record.tokens.cache_read,
+                        "cache_write": record.tokens.cache_write,
+                        "cost": record.cost_usd,
+                        "wall_s": record.time.wall_clock_total_ms / 1000,
+                        "diff_b": len(record.artifacts.final_diff or ""),
+                        "unattributed": unattributed,
+                        "sampling": record.sampling,
+                        "problems": problems,
+                        "verdict": "NO-GO" if problems else "go",
+                        "wire_log": record.artifacts.wire_log_gz,
+                    }
+                )
 
         if not rows:
             print("\nno arms ran")
@@ -815,6 +939,8 @@ def main() -> int:
             )
 
         print_table(rows)
+        print_rates(rows, repeats)
+        print_cache_tokens(rows)
         print_sampling(rows)
 
         differences = config_differences(configs) if len(configs) > 1 else []
@@ -827,12 +953,12 @@ def main() -> int:
 
         if failures or differences:
             print("\nNO-GO")
-            for arm, problems in failures.items():
-                print(f"  {arm}")
+            for label, problems in failures.items():
+                print(f"  {label}")
                 for problem in problems:
                     print(f"    - {problem}")
                 wire = next(
-                    (r["wire_log"] for r in rows if r["arm"] == arm), None
+                    (r["wire_log"] for r in rows if r.get("label") == label), None
                 )
                 if wire:
                     print(f"    wire log: {wire}")
@@ -848,7 +974,19 @@ def main() -> int:
             print(proxy.logs())
             return 1
 
-    print(f"\nGO ({expectations.name} criteria): every arm completed a loop.")
+    print(
+        f"\nGO ({expectations.name} criteria): every arm completed a loop "
+        f"on all {repeats} of {repeats} run(s)."
+    )
+    if repeats < LIVE_REPEATS and args.mode == "live":
+        # Said out loud, because a GO at N=1 reads exactly like a GO at N=3
+        # to anyone scanning the output -- and the whole reason this knob
+        # exists is that N=1 cannot see a rate.
+        print(
+            f"WEAKER THAN THE PHASE 0c CRITERION: {repeats} run(s) per arm, "
+            f"not {LIVE_REPEATS}. A failure rate below roughly "
+            f"1-in-{repeats + 1} is invisible at this N."
+        )
     if expectations.not_applicable:
         print(
             f"NOT checked in this mode: {', '.join(sorted(expectations.not_applicable))}"

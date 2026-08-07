@@ -567,3 +567,64 @@ sandbox.
 **Still NO-GO, for unrelated reasons.** Gemma failed 3/3 with the same
 Bedrock-side `Generation failed`; Kimi failed a second time and in a *different*
 way than the first. Both carried forward in `TASKS.md`.
+
+---
+
+## Phase 0c raised to N=3 per arm — 2026-08-07
+
+`smoke_test.py --repeats` (default 3 live, 1 offline). GO now requires every
+repeat of every arm; a run below N=3 prints an explicit weaker-than-criterion
+warning, because a GO at N=1 otherwise reads identically to a GO at N=3.
+
+Two things had to reach through `run_arm`, and missing either is fatal rather
+than degrading: a per-repeat **workdir** (repeat 2 would otherwise start from
+repeat 1's dirty tree and report a diff its own agent never made) and a
+per-repeat **`sample_index`** (`run_id` hashes `(task, model, sample, attempt)`
+and `write_run` opens `"x"`, so a second repeat at index 0 raises
+`ImmutabilityError` out of `execute_run`).
+
+Reporting is per-run rows plus per-arm pass rates, with failure modes **grouped
+by `run_problems`' returned reasons rather than summed** — the earlier two Kimi
+failures were two different faults and a count of 2 would have hidden that.
+Arms run arm-major so repeats of one arm stay close in time and a rate is not
+confounded by drift in Bedrock-side load across the matrix.
+
+**Result: NO-GO, 2 of 4 arms, 3/3 each.** Sonnet 5 (8 turns, correct diff every
+run) and Nemotron (15–21 turns, correct diff every run). Gemma 0/3, Kimi 0/3.
+Verified: 12 records, 12 distinct `run_id`s, `unattributed.jsonl` empty, all
+six proxy-side errors attributing to `gemma-4-31b` and to no other arm.
+
+**Three findings that only N>1 could produce.** None of them is about a model,
+and all three would have been invisible at N=1:
+
+1. **Sonnet's cost varies 2.9× on byte-identical work** — $0.548 / $0.231 /
+   $0.192 for the same 8 turns and the same 157-byte diff. The Bedrock prompt
+   cache persists *across runs*, so run 1 pays `cache_write` at 1.25×
+   (125,995 tokens) and later runs read at 0.10× (312,652 by run 3). §5.7
+   interleaves execution order, so at N=10 per task each sample's cost depends
+   on where the scheduler put it. Sonnet is the only arm with caching, so
+   Sonnet-vs-candidate cost is confounded twice: by order, and by the presence
+   of caching at all.
+
+2. **Nemotron's wall clock varies 4.7×** — 201.9s / 42.6s / 54.2s at 19/15/21
+   turns. OPEN-3 sizing was drawn from a single 311s sample; sizing off 311s
+   versus off 42s differs by an order of magnitude across 2,400 runs.
+
+3. **Kimi's failure is deterministic, not a rate.** 3/3 identical: both calls
+   return 200, the agent says *"Let me fix it:"* and exits
+   `subtype: success, is_error: false` at 3 turns with no edit tool call. The
+   earlier `MidStreamFallbackError` did not reproduce. This is the most
+   dangerous open failure in the eval — the run is well-formed, terminates
+   successfully, and its record is indistinguishable from a model that chose
+   not to do the work. Every other failure announces itself with a non-200.
+
+**A recorded premise was wrong and is now corrected.** `TASKS.md` held that the
+cache-token cost guard would first fire "at N=10, when the cache warms". The
+cache warms on **turn 2 of a single run** (Sonnet call 0 writes 41,723, call 1
+reads it back). The guard has never fired for a different reason entirely: the
+three candidates return no cache fields at all on the OpenAI-compatible mantle
+route, across 9 candidate runs. `smoke_test.py` now reports cache tokens per
+arm so this stays measured rather than inferred. The guard is still worth
+making loud, on a better argument than the original: a zeroed record reads as
+`turns=0, cost=0` with an empty `trajectory_parse_error`, which is exactly what
+Gemma legitimately produced three times in this same run.
