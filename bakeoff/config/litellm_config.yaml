@@ -60,6 +60,7 @@ model_list:
     # fault was URL construction, not the endpoint or the model name.
     litellm_params:
       model: anthropic/anthropic.claude-sonnet-5
+      additional_drop_params: ["context_management", "output_config"]
       api_base: https://bedrock-mantle.us-east-1.api.aws/anthropic
       api_key: os.environ/AWS_BEARER_TOKEN_BEDROCK
 
@@ -72,6 +73,7 @@ model_list:
     #     TokenUsage.reasoning reads zero on this path
     litellm_params:
       model: openai/google.gemma-4-31b
+      additional_drop_params: ["reasoning_effort"]
       api_base: https://bedrock-mantle.us-east-1.api.aws/openai/v1
       api_key: os.environ/AWS_BEARER_TOKEN_BEDROCK
       temperature: 1.0
@@ -80,6 +82,7 @@ model_list:
   - model_name: nemotron-3-super-120b
     litellm_params:
       model: openai/nvidia.nemotron-super-3-120b
+      additional_drop_params: ["reasoning_effort"]
       api_base: https://bedrock-mantle.us-east-1.api.aws/v1
       api_key: os.environ/AWS_BEARER_TOKEN_BEDROCK
       temperature: 1.0
@@ -88,6 +91,7 @@ model_list:
   - model_name: kimi-k2-5
     litellm_params:
       model: openai/moonshotai.kimi-k2.5
+      additional_drop_params: ["reasoning_effort"]
       api_base: https://bedrock-mantle.us-east-1.api.aws/v1
       api_key: os.environ/AWS_BEARER_TOKEN_BEDROCK
       temperature: 1.0
@@ -140,6 +144,36 @@ litellm_settings:
   # harness replays those lines through WireLogger afterwards so there is
   # still exactly one canonical artifact.
   callbacks: bakeoff.proxy_callback.instance
+
+  # Route the three OpenAI-compatible arms through /v1/chat/completions
+  # rather than /v1/responses. Without this LiteLLM sends any `openai/`
+  # deployment's Anthropic Messages traffic to the Responses API, and
+  # Bedrock answers 400: "The model 'nvidia.nemotron-super-3-120b' does not
+  # support the '/v1/responses' API". Measured on the Phase 0c live run,
+  # 2026-08-07, for both Nemotron and Kimi.
+  #
+  # This is a section 6.4 adapter setting, not a model finding. The failure
+  # it fixes was identical on every candidate arm and would have read as
+  # three models unable to drive Claude Code.
+  use_chat_completions_url_for_anthropic_messages: true
+
+  # Named one at a time, never a blanket `drop_params: true`. A blanket drop
+  # would also silently discard temperature or max_tokens if a provider ever
+  # rejected one, and section 5.3 sampling would then be unapplied with
+  # nothing in the record saying so. Each entry below is a measured Bedrock
+  # rejection from the Phase 0c live run, 2026-08-07:
+  #
+  #   reasoning_effort   the chat-completions bridge derives it from Claude
+  #                      Code's `thinking` block; Bedrock's OpenAI-compatible
+  #                      route rejects it for all three candidate models
+  #   context_management  Claude Code sends it; LiteLLM turns it into an
+  #   output_config       anthropic-beta header, and mantle answers
+  #                       "invalid beta flag"
+  additional_drop_params:
+    - reasoning_effort
+    - context_management
+    - output_config
+
   drop_params: false          # surface unsupported params instead of hiding them
   set_verbose: false
 

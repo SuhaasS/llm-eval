@@ -472,15 +472,31 @@ def proxy_environment(mode: str) -> dict[str, str]:
 
     import os
 
-    from scripts.smoke_bedrock import ENV_FILE, load_env_file
+    from scripts.smoke_bedrock import (
+        ENV_FILE,
+        derive_mantle_token,
+        load_env_file,
+        resolve_aws_paths,
+        scrub_placeholders,
+    )
 
     load_env_file(ENV_FILE)
+    scrub_placeholders()
+    resolve_aws_paths()
+
     token = os.environ.get("AWS_BEARER_TOKEN_BEDROCK", "")
     if not token:
+        # Minted from the current SSO session, in memory, never written to
+        # disk. A long-lived key in .env would outlive the run that needed
+        # it and sit there with no expiry anyone tracks.
+        token = derive_mantle_token(os.environ.get("AWS_REGION_NAME") or "us-east-1")
+        if token:
+            print(f"mantle    derived short-term bearer token (len {len(token)})")
+    if not token:
         raise SystemExit(
-            "AWS_BEARER_TOKEN_BEDROCK is not set and bakeoff/.env does not "
-            "supply it. Run `aws sso login --profile pindrop-bakeoff`, then "
-            "`python scripts/smoke_bedrock.py --derive-mantle-token`."
+            "No mantle credential. Run:\n"
+            "  AWS_CONFIG_FILE=bakeoff/.aws/config aws sso login "
+            "--profile pindrop-bakeoff"
         )
     return {"AWS_BEARER_TOKEN_BEDROCK": token}
 

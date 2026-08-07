@@ -1,0 +1,10 @@
+# Spec section 5.6 stages everything (`git add -A`) so untracked files the
+# agent created land in the submission diff. That is deliberate, and it also
+# sweeps in anything the test run compiles: the first live smoke produced a
+# diff whose first hunk was a binary __pycache__/calc.cpython-312.pyc.
+#
+# Every task repo in the dataset needs this, or diff size and file counts
+# measure the interpreter rather than the agent.
+__pycache__/
+*.py[cod]
+.pytest_cache/
