@@ -460,12 +460,59 @@ class Proxy:
         return False
 
 
+SSO_LOGIN_HINT = (
+    "  AWS_CONFIG_FILE=bakeoff/.aws/config aws sso login --profile pindrop-bakeoff"
+)
+
+
+def freeze_sigv4_credentials(region: str) -> dict[str, str]:
+    """Resolve the ambient AWS session into literal keys for the container.
+
+    The bedrock-runtime arms sign SigV4, and the proxy container cannot
+    resolve an SSO profile itself: it has no ~/.aws, no SSO cache and no
+    browser to re-authenticate with. Freezing on the host and passing the
+    triple in is the only way those arms reach Bedrock at all.
+
+    These are temporary STS credentials and inherit the SSO session's expiry,
+    the same hours-not-days horizon as the mantle token -- the unattended
+    multi-day run in TASKS.md P1 needs a refresh path that does not exist yet,
+    for both transports rather than just one.
+    """
+    import boto3
+
+    session = boto3.Session(region_name=region)
+    credentials = session.get_credentials()
+    if credentials is None:
+        return {}
+    frozen = credentials.get_frozen_credentials()
+    env = {
+        "AWS_ACCESS_KEY_ID": frozen.access_key,
+        "AWS_SECRET_ACCESS_KEY": frozen.secret_key,
+        # Region twice on purpose: LiteLLM reads AWS_REGION_NAME, botocore
+        # reads AWS_DEFAULT_REGION, and a deployment without aws_region_name
+        # would otherwise sign against a region it guessed.
+        "AWS_REGION_NAME": region,
+        "AWS_DEFAULT_REGION": region,
+    }
+    if frozen.token:
+        env["AWS_SESSION_TOKEN"] = frozen.token
+    return env
+
+
 def proxy_environment(mode: str) -> dict[str, str]:
     """Credentials for the proxy container. Live mode only.
 
     The agent is passed none of these and never sees them: it reaches
-    Bedrock through the proxy over HTTP, which is what makes the bearer
-    token a single-hop secret.
+    Bedrock through the proxy over HTTP, which is what makes both credentials
+    single-hop secrets.
+
+    Both transports are provisioned, because Sonnet 5 is served over
+    bedrock-runtime while the three candidates are served over
+    bedrock-mantle (see config/litellm_config.yaml). The mantle token is
+    passed as BAKEOFF_MANTLE_TOKEN and NOT as AWS_BEARER_TOKEN_BEDROCK:
+    LiteLLM's bedrock/ handler falls back to the AWS-named variable when a
+    deployment has no api_key, so setting it here would bearer-authenticate
+    every runtime arm and fail them with `bedrock:CallWithBearerToken`.
     """
     if mode != "live":
         return {}
@@ -474,8 +521,11 @@ def proxy_environment(mode: str) -> dict[str, str]:
 
     from scripts.smoke_bedrock import (
         ENV_FILE,
+        LITELLM_BEARER_ENV,
+        MANTLE_ENV,
         derive_mantle_token,
         load_env_file,
+        normalize_mantle_token,
         resolve_aws_paths,
         scrub_placeholders,
     )
@@ -483,22 +533,35 @@ def proxy_environment(mode: str) -> dict[str, str]:
     load_env_file(ENV_FILE)
     scrub_placeholders()
     resolve_aws_paths()
+    normalize_mantle_token()
 
-    token = os.environ.get("AWS_BEARER_TOKEN_BEDROCK", "")
+    region = os.environ.get("AWS_REGION_NAME") or "us-east-1"
+
+    token = os.environ.get(MANTLE_ENV, "")
     if not token:
         # Minted from the current SSO session, in memory, never written to
         # disk. A long-lived key in .env would outlive the run that needed
         # it and sit there with no expiry anyone tracks.
-        token = derive_mantle_token(os.environ.get("AWS_REGION_NAME") or "us-east-1")
+        token = derive_mantle_token(region)
         if token:
             print(f"mantle    derived short-term bearer token (len {len(token)})")
     if not token:
+        raise SystemExit("No mantle credential. Run:\n" + SSO_LOGIN_HINT)
+
+    sigv4 = freeze_sigv4_credentials(region)
+    if not sigv4:
         raise SystemExit(
-            "No mantle credential. Run:\n"
-            "  AWS_CONFIG_FILE=bakeoff/.aws/config aws sso login "
-            "--profile pindrop-bakeoff"
+            "No SigV4 credentials -- every bedrock-runtime arm would fail.\n"
+            + SSO_LOGIN_HINT
         )
-    return {"AWS_BEARER_TOKEN_BEDROCK": token}
+    print(f"sigv4     froze session credentials for the proxy ({region})")
+
+    environment = {MANTLE_ENV: token, **sigv4}
+    # Belt and braces: the container inherits nothing from this process, but
+    # an image or compose layer that ever sets the AWS-named variable would
+    # silently move the runtime arms onto bearer auth.
+    assert LITELLM_BEARER_ENV not in environment
+    return environment
 
 
 # --- the run -----------------------------------------------------------------

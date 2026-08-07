@@ -102,6 +102,36 @@ def test_the_registered_callback_path_resolves_to_a_dispatchable_instance():
     assert isinstance(resolved, CustomLogger)
 
 
+def test_no_mantle_arm_reads_the_bearer_variable_litellm_falls_back_to():
+    """One proxy serves both transports, and the env var name is what keeps
+    them apart.
+
+    LiteLLM's bedrock/ handler (base_aws_llm.get_request_headers, verified
+    1.95.0) uses the deployment's api_key when set and otherwise falls back
+    to AWS_BEARER_TOKEN_BEDROCK, signing SigV4 only when both are absent. The
+    runtime deployments carry no api_key on purpose, so a proxy process
+    holding AWS_BEARER_TOKEN_BEDROCK bearer-authenticates all three of them
+    and they fail with `bedrock:CallWithBearerToken` -- while the mantle arms
+    stay green, which makes it read as a bedrock-runtime problem.
+
+    Renaming the reference back is a one-character-looking edit with no local
+    symptom, which is why it is pinned here rather than left to the comment.
+    """
+    for entry in _model_list():
+        api_key = entry["litellm_params"].get("api_key", "")
+        assert "AWS_BEARER_TOKEN_BEDROCK" not in api_key, entry["model_name"]
+
+
+def test_bedrock_runtime_arms_carry_no_api_key():
+    """SigV4 is the whole point of these deployments. An api_key on one takes
+    the bearer branch above and never signs -- the same failure as the
+    ambient variable, but per-arm and even easier to miss."""
+    for entry in _model_list():
+        params = entry["litellm_params"]
+        if params["model"].startswith("bedrock/"):
+            assert "api_key" not in params, entry["model_name"]
+
+
 def test_gemma_has_no_bedrock_runtime_entry():
     """Gemma 4 31B is served only on bedrock-mantle -- it supports neither
     Converse nor Invoke. A bedrock/ route for it could never resolve, and

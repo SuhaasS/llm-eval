@@ -109,8 +109,37 @@ def load_env_file(path: Path) -> list[str]:
 
 # ---------------------------------------------------------------- credentials
 
-MANTLE_ENV = "AWS_BEARER_TOKEN_BEDROCK"
+# The name the harness carries the mantle bearer token under. Deliberately
+# NOT AWS_BEARER_TOKEN_BEDROCK: LiteLLM's bedrock/ (SigV4) handler falls back
+# to that variable when a deployment has no api_key, so a process holding it
+# bearer-authenticates every bedrock-runtime arm and fails them with
+#   not authorized to perform: bedrock:CallWithBearerToken
+# unless the role carries that permission. config/litellm_config.yaml names
+# BAKEOFF_MANTLE_TOKEN explicitly on the mantle deployments, which takes the
+# api_key branch; the runtime deployments find nothing and sign. That is what
+# lets one proxy serve both transports at once.
+MANTLE_ENV = "BAKEOFF_MANTLE_TOKEN"
+
+# The variable LiteLLM itself consults. Never set by the harness; scrubbed
+# where an operator's shell or .env may have set it.
+LITELLM_BEARER_ENV = "AWS_BEARER_TOKEN_BEDROCK"
+
 SIGV4_ENV = ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")
+
+
+def normalize_mantle_token() -> bool:
+    """Move an operator-supplied bearer token onto the name the config reads.
+
+    A token exported or written to .env under the AWS name is a working
+    credential, and the rename would otherwise report the mantle arms as
+    MISSING while it sits right there. Adopt it, then let the post-construction
+    scrub remove the AWS-named copy so the runtime arms still sign.
+    """
+    legacy = os.environ.get(LITELLM_BEARER_ENV)
+    if legacy and not os.environ.get(MANTLE_ENV):
+        os.environ[MANTLE_ENV] = legacy
+        return True
+    return False
 
 
 def derive_mantle_token(region: str) -> str | None:
@@ -206,17 +235,15 @@ def preflight() -> tuple[Any, list[dict[str, Any]], int]:
     try:
         router = Router(model_list=entries, num_retries=0)
         print("\nrouter      constructed ok")
-        # The mantle deployments captured the bearer token into their api_key
-        # during construction. Drop it from the environment now: LiteLLM's
-        # bedrock/ (SigV4) handler also consults AWS_BEARER_TOKEN_BEDROCK and
-        # prefers it when set, which routes the runtime arms through bearer
-        # auth and fails them with
-        #   not authorized to perform: bedrock:CallWithBearerToken
-        # unless the role carries that permission. Without this, enabling the
-        # mantle arms silently breaks every runtime arm -- and the whole point
-        # of configuring both transports is comparing them in one run.
-        if os.environ.pop(MANTLE_ENV, None):
-            print("            bearer token unset post-construction "
+        # The harness carries the token as MANTLE_ENV, which LiteLLM never
+        # reads, so nothing here poisons the runtime arms. An operator's shell
+        # or .env can still hold LITELLM_BEARER_ENV, and that one LiteLLM does
+        # consult -- it would route every bedrock-runtime arm through bearer
+        # auth instead of SigV4 and fail them all, while the mantle arms stay
+        # green. Scrub it after construction, when the mantle deployments have
+        # already captured their api_key.
+        if os.environ.pop(LITELLM_BEARER_ENV, None):
+            print(f"            ambient {LITELLM_BEARER_ENV} unset "
                   "(keeps bedrock-runtime arms on SigV4)")
     except Exception as exc:  # noqa: BLE001 -- report, do not mask
         print(f"\nrouter      FAILED to construct: {type(exc).__name__}: {exc}")
@@ -394,7 +421,7 @@ def main() -> int:
         "--derive-mantle-token",
         action="store_true",
         help="mint a short-term bearer token from the current AWS session "
-        "(in memory only) instead of reading AWS_BEARER_TOKEN_BEDROCK",
+        f"(in memory only) instead of reading {MANTLE_ENV}",
     )
     args = parser.parse_args()
 
@@ -408,6 +435,8 @@ def main() -> int:
     if scrubbed:
         print(f"env         ignored unfilled placeholders: {', '.join(sorted(scrubbed))}")
     resolve_aws_paths()
+    if normalize_mantle_token():
+        print(f"env         adopted {LITELLM_BEARER_ENV} as {MANTLE_ENV}")
     if loaded:
         print(f"env         {ENV_FILE.name}: {', '.join(loaded)}")
     elif ENV_FILE.exists():
@@ -421,7 +450,7 @@ def main() -> int:
         if token:
             # Set before preflight so the mantle arms report their real
             # credential state, and before Router construction so the config's
-            # os.environ/AWS_BEARER_TOKEN_BEDROCK references resolve.
+            # os.environ/BAKEOFF_MANTLE_TOKEN references resolve.
             os.environ[MANTLE_ENV] = token
             print(f"mantle      derived short-term bearer token (len {len(token)})")
 

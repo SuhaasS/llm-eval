@@ -4,7 +4,7 @@ Single list of open work for the LLM bakeoff eval. **This file is the backlog.**
 `tasks/todo.md` is the opposite — a completed-work review log, one section per
 finished task. Nothing here is done; move it there when it is.
 
-Last updated 2026-08-07, after the Phase 0c live smoke run.
+Last updated 2026-08-07, after the second Phase 0c live smoke run.
 
 Spec: [docs/superpowers/specs/2026-08-03-llm-bakeoff-eval-design.md](docs/superpowers/specs/2026-08-03-llm-bakeoff-eval-design.md)
 Harness plan: [docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md](docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md)
@@ -13,36 +13,50 @@ Harness plan: [docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md](doc
 
 ## P0 — Blocking Phase 0c go/no-go
 
-The 2026-08-07 live run: **1 of 4 arms passed.** Nemotron completed the task
-(16 turns, 8 tool calls, 578-byte diff, $0.047, 311s). The other three failed
-for adapter reasons, not model capability — all three are deterministic, so at
-scale they are 600 dead runs each rather than a sampling problem.
+The second 2026-08-07 live run: **2 of 4 arms passed.** Sonnet 5 is fixed and
+is no longer the blocker — it now completes the task over bedrock-runtime
+(7 turns, 4 tool calls, correct one-line diff, $0.388, 13.6s), alongside
+Nemotron (19 turns, 9 tool calls, $0.057). See `tasks/todo.md` for how.
 
-- [ ] **Sonnet 5 — `"invalid beta flag"` on every call.** LiteLLM auto-injects
-  `anthropic-beta` headers derived from Claude Code's `context_management` and
-  `output_config`; bedrock-mantle rejects them. Per-deployment
-  `additional_drop_params` did not stop the header injection.
-  **Blocking: this is the reference arm — without it there is no comparison.**
-  Next: try `claude-sonnet-5-runtime`, already in `config/litellm_config.yaml`.
-  It uses `bedrock/` SigV4 Converse, a different code path that never touches
-  the passthrough doing the injection. If that works, record the transport
-  asymmetry vs the candidates as a §6.4 confound.
+Gemma and Kimi remain. Both are adapter-class, not model capability.
 
 - [ ] **Gemma 4 31B — `JSON-RPC error -32602: Job registration failed ...
-  Generation failed`.** Bedrock-side, not a parameter rejection. Observed 2/2.
-  Next: 3–5 runs to establish deterministic vs intermittent. Those need
-  different fixes and one sample cannot tell them apart.
+  Generation failed`.** Bedrock-side, not a parameter rejection. **Observed
+  3/3**, so deterministic is now the better bet than intermittent.
+  The 2026-08-07 second run also showed the same error arriving *mid-stream*,
+  wrapped as `MidStreamFallbackError` — one fault with two surface forms
+  depending on whether it lands before or during the stream. Do not count
+  those as two bugs.
+  Next: this arm has produced no tool call in any run. Decide whether it is
+  fixable at the adapter layer at all, or whether Gemma leaves the eval — that
+  decision blocks the dataset sizing, so make it before Phase 3.
 
-- [ ] **Kimi K2.5 — dies mid-stream (`MidStreamFallbackError`)** after 4 turns
-  and 2 real tool calls. Unlike the other two this is a *rate*, not a binary,
-  and a rate is invisible at N=1. At scale it forks badly: scored as model
-  failure it penalizes Kimi for adapter reasons; excluded, its effective N
-  shrinks and the surviving sample skews toward short runs.
-  Next: 3–5 runs to measure the rate.
+- [ ] **Kimi K2.5 — two distinct failure modes in two runs, zero diffs.**
+  Run 1: died mid-stream (`MidStreamFallbackError`) after 4 turns and 2 real
+  tool calls. Run 2: both calls returned 200 and the agent exited
+  `subtype: success, is_error: false` after announcing *"Let me fix it:"* and
+  never calling the edit tool.
+  These are *rates*, not binaries, and now plausibly two independent ones.
+  A rate is invisible at N=1. At scale it forks badly: scored as model failure
+  it penalizes Kimi for adapter reasons; excluded, its effective N shrinks and
+  the surviving sample skews toward short runs.
+  Next: 3–5 runs to measure both rates separately. Run 2's mode is the more
+  dangerous of the two — it is indistinguishable from a model that simply did
+  not do the work, and nothing in the record flags it.
+
+- [ ] **Record the Sonnet transport asymmetry as a §6.4 confound.** Sonnet 5
+  now signs SigV4 against bedrock-runtime while all three candidates go through
+  the mantle passthrough. Different code path, different request shape: on
+  runtime, beta features ride as an `additionalModelRequestFields.anthropic_beta`
+  *body* field rather than an `anthropic-beta` header. The reference arm is
+  therefore not transport-identical to the arms it is the reference for, and
+  any Sonnet-vs-candidate delta carries that. It needs to be stated wherever
+  the comparison is published, not just known here.
 
 - [ ] **Re-run the four-arm smoke to a real GO**, then raise the Phase 0c exit
   criterion to **N=3 per arm, not N=1.** One run per arm structurally cannot
-  see a failure rate.
+  see a failure rate — and Kimi has now demonstrated that exact point by
+  failing differently the second time.
 
 ---
 
@@ -61,10 +75,15 @@ None of these can appear at N=1. All will appear at N=10.
   Next: measure whether candidates return cache tokens, then either price them
   or keep the guard and make it a loud failure rather than a silent zeroing.
 
-- [ ] **The mantle bearer token expires mid-run.** Minted in memory by
-  `smoke_bedrock.derive_mantle_token`, inheriting the SSO session's expiry —
-  hours, not days. Phase 4 is 3–4 days mostly unattended, so every mantle arm
-  starts returning 401 partway through. No refresh path exists.
+- [ ] **Both credentials expire mid-run, and now every arm is exposed.** The
+  mantle bearer token is minted in memory by
+  `smoke_bedrock.derive_mantle_token`; the SigV4 keys are frozen out of the SSO
+  session by `smoke_test.freeze_sigv4_credentials`. Both inherit the SSO
+  session's expiry — hours, not days. Phase 4 is 3–4 days mostly unattended, so
+  the mantle arms start returning 401 and the runtime arms start failing
+  signature validation partway through. No refresh path exists for either.
+  Widened 2026-08-07: before Sonnet moved to bedrock-runtime this touched the
+  candidates only, and the reference arm would have survived it.
 
 - [ ] **Throttling makes the exclusion rate load-dependent.** No 429s at N=1. At
   scale they are routine, and the exclusion rate then correlates with when and
@@ -93,6 +112,10 @@ None of these can appear at N=1. All will appear at N=10.
   2026-08-07 had to come from the proxy's own logs instead — and in the full
   run the proxy log is not an artifact of the record. §6.2 exists so a failure
   can be diagnosed after the fact; right now it cannot be.
+  Confirmed again on the second run: the failing mantle Sonnet arm recorded
+  exactly `{"status_code": 400, "raw_completion": "None"}`, and `invalid beta
+  flag` was recoverable only by grepping `proxy.log`. Two runs, two diagnoses
+  that the event log could not support on its own.
 
 - [ ] **Every dataset task repo needs a `.gitignore`.** §5.6 stages everything
   (`git add -A`), so the first live run's diff led with a binary

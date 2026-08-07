@@ -16,7 +16,7 @@ review log — one section per finished task, kept for what each one turned up.
 - [x] **Task 9** — Claude Code runner
 - [x] **Task 10** — Run orchestrator
 - [x] **Task 11** — Fault-injection gate
-- [~] **Task 12** — End-to-end smoke test — offline half DONE, live half blocked on credentials
+- [~] **Task 12** — End-to-end smoke test — offline half DONE; live half 2 of 4 arms passing
 
 ---
 
@@ -495,3 +495,75 @@ cd bakeoff && .venv/bin/python scripts/smoke_bedrock.py --derive-mantle-token
 
 then `scripts/smoke_bedrock.py --live` as the cheap routing check, then
 `scripts/smoke_test.py --mode live`.
+
+---
+
+## Sonnet 5 moved to bedrock-runtime — 2026-08-07
+
+**The P0 blocker is gone.** The reference arm now completes the smoke task:
+7 turns, 4 tool calls, 5 wire calls, the correct one-line fix, $0.388, 13.6s.
+Nemotron still passes alongside it (19 turns, 9 tool calls, $0.057), so the
+change did not cost the mantle arms anything.
+
+**What was actually wrong.** Not what the error said. `"invalid beta flag"`
+comes from LiteLLM's `anthropic/` passthrough deriving `anthropic-beta` HTTP
+headers from Claude Code's `context_management` and `output_config`, which
+bedrock-mantle rejects. `additional_drop_params` removes the *parameters* and
+never touches the *header*, which is why per-deployment drops did nothing.
+`bedrock/us.anthropic.claude-sonnet-5` leaves that passthrough entirely: on the
+Converse path beta values ride as an `additionalModelRequestFields.anthropic_beta`
+*body* field (`converse_transformation.py:1474`, litellm 1.95.0), and
+`_filter_context_management_for_bedrock_converse` reduces `context_management`
+to compact-edits-only or drops it. Different mechanism, not just a different
+endpoint.
+
+**The real blocker was credentials, and it was invisible.** The runtime arm
+could never have worked through the proxy no matter what the config said:
+
+1. `smoke_test.proxy_environment` passed the container **only** the mantle
+   bearer token. `bedrock/` deployments sign SigV4 and need real AWS keys,
+   which nothing supplied. The container cannot resolve an SSO profile itself —
+   no `~/.aws`, no SSO cache, no browser — so `freeze_sigv4_credentials` now
+   resolves the session on the host and passes the frozen triple in.
+
+2. Worse, the two transports **could not coexist in one proxy**. LiteLLM's
+   `base_aws_llm.get_request_headers` (verified 1.95.0) uses a deployment's
+   `api_key` when set and otherwise falls back to `AWS_BEARER_TOKEN_BEDROCK`,
+   signing SigV4 only when both are absent. The runtime deployments carry no
+   `api_key` on purpose, so a proxy holding that variable bearer-authenticates
+   all three of them. `smoke_bedrock.py` had been working around this in-process
+   by popping the variable after Router construction; a container cannot.
+   The fix is a rename — the harness now carries the token as
+   `BAKEOFF_MANTLE_TOKEN`, a name LiteLLM never looks up, so mantle deployments
+   take the explicit-`api_key` branch and runtime deployments fall through
+   to SigV4.
+
+**Proven before spending anything.** Two proxy containers, dummy credentials,
+same request to `claude-sonnet-5-runtime`:
+
+| proxy env | error | branch |
+|---|---|---|
+| `BAKEOFF_MANTLE_TOKEN` only | `The security token included in the request is invalid` | SigV4 |
+| `+ AWS_BEARER_TOKEN_BEDROCK` | `Invalid API Key format: Must start with pre-defined prefix` | bearer |
+
+That second message is the one `smoke_bedrock.check_sigv4` already warns about:
+a bearer-token error on a route that does not use bearer tokens, which reads as
+a config fault and is not one. Pinned by two tests in `tests/test_config.py` —
+no arm may reference `AWS_BEARER_TOKEN_BEDROCK`, and no `bedrock/` arm may
+carry an `api_key`. Both failures are silent and neither has a local symptom.
+
+**The live run carried its own control.** `claude-sonnet-5` on mantle ran in
+the same proxy, same run, and still 400d with `invalid beta flag` — so the
+difference is attributable to transport and to nothing else that changed.
+
+**What this cost.** The reference arm is no longer transport-identical to the
+arms it is the reference for. Recorded as an open §6.4 confound in `TASKS.md`
+rather than treated as free. The alternative — pointing Claude Code straight at
+Bedrock with `CLAUDE_CODE_USE_BEDROCK` — was rejected: it empties the wire log
+on the reference arm, needs the agent container to have real network egress on
+a pinned task repo, and puts AWS credentials inside a `bypassPermissions`
+sandbox.
+
+**Still NO-GO, for unrelated reasons.** Gemma failed 3/3 with the same
+Bedrock-side `Generation failed`; Kimi failed a second time and in a *different*
+way than the first. Both carried forward in `TASKS.md`.

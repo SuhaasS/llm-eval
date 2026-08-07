@@ -26,6 +26,24 @@
 #   Nemotron   /v1            (OpenAI Chat Completions)
 #   Kimi       /v1            (OpenAI Chat Completions)
 #
+# CREDENTIALS. The two transports authenticate differently and the ENV VAR
+# NAME carrying the mantle token is load-bearing. LiteLLM's bedrock/ handler
+# resolves auth as (base_aws_llm.get_request_headers, verified 1.95.0):
+#
+#     if api_key is not None:      bearer = api_key
+#     else:                        bearer = os.environ["AWS_BEARER_TOKEN_BEDROCK"]
+#     if bearer:  Authorization: Bearer ...     else:  SigV4Auth(...)
+#
+# The runtime deployments below carry no api_key -- SigV4 is the whole point
+# of them -- so a proxy process with AWS_BEARER_TOKEN_BEDROCK set sends
+# bearer auth to bedrock-runtime and every runtime arm fails with
+#   not authorized to perform: bedrock:CallWithBearerToken
+# The mantle token is therefore passed as BAKEOFF_MANTLE_TOKEN, a name
+# LiteLLM does not look up. The mantle deployments name it explicitly, which
+# takes the api_key branch; the runtime deployments find nothing and sign.
+# Renaming this back to AWS_BEARER_TOKEN_BEDROCK breaks all three runtime
+# arms at once, and only when both transports are served by one proxy.
+#
 # SAMPLING (spec section 5.3). Claude Code has no temperature flag, so this
 # file is the only layer that can set it. Values verified against each
 # lab's published guidance on 2026-08-06:
@@ -62,7 +80,7 @@ model_list:
       model: anthropic/anthropic.claude-sonnet-5
       additional_drop_params: ["context_management", "output_config"]
       api_base: https://bedrock-mantle.us-east-1.api.aws/anthropic
-      api_key: os.environ/AWS_BEARER_TOKEN_BEDROCK
+      api_key: os.environ/BAKEOFF_MANTLE_TOKEN
 
   - model_name: gemma-4-31b
     # Mantle only. Gemma supports neither Converse nor Invoke, and its path
@@ -75,7 +93,7 @@ model_list:
       model: openai/google.gemma-4-31b
       additional_drop_params: ["reasoning_effort"]
       api_base: https://bedrock-mantle.us-east-1.api.aws/openai/v1
-      api_key: os.environ/AWS_BEARER_TOKEN_BEDROCK
+      api_key: os.environ/BAKEOFF_MANTLE_TOKEN
       temperature: 1.0
       top_p: 0.95
 
@@ -84,7 +102,7 @@ model_list:
       model: openai/nvidia.nemotron-super-3-120b
       additional_drop_params: ["reasoning_effort"]
       api_base: https://bedrock-mantle.us-east-1.api.aws/v1
-      api_key: os.environ/AWS_BEARER_TOKEN_BEDROCK
+      api_key: os.environ/BAKEOFF_MANTLE_TOKEN
       temperature: 1.0
       top_p: 0.95
 
@@ -93,7 +111,7 @@ model_list:
       model: openai/moonshotai.kimi-k2.5
       additional_drop_params: ["reasoning_effort"]
       api_base: https://bedrock-mantle.us-east-1.api.aws/v1
-      api_key: os.environ/AWS_BEARER_TOKEN_BEDROCK
+      api_key: os.environ/BAKEOFF_MANTLE_TOKEN
       temperature: 1.0
       top_p: 0.95
 
