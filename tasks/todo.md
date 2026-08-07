@@ -2,6 +2,9 @@
 
 Source plan: [docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md](../docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md)
 
+Open work lives in [TASKS.md](../TASKS.md). This file is the completed-work
+review log — one section per finished task, kept for what each one turned up.
+
 - [x] **Task 1** — Schema and event log
 - [x] **Task 2** — Cost calculation
 - [x] **Task 3** — Trajectory parser
