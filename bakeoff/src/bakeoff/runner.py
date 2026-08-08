@@ -41,7 +41,7 @@ from bakeoff.claude_runner import (
 from bakeoff.classify import RunSignals, classify_exclusion, classify_failure
 from bakeoff.container import RunContainer
 from bakeoff.eventlog import EventLog
-from bakeoff.proxy_callback import read_run_entries
+from bakeoff.proxy_callback import read_manifest, read_run_entries
 from bakeoff.scanners import scan_destructive
 from bakeoff.schema import (
     Artifacts,
@@ -223,9 +223,12 @@ def assemble_record(
     cache_state: CacheState | None = None,
     wire_entries: list[dict[str, Any]] | None = None,
     isolated: bool = False,
+    adapter_patches: list[str] | None = None,
+    proxy_litellm: str = "",
 ) -> RunRecord:
     parsed = ParsedTrajectory(model=model)
     parse_error = ""
+    adapter_patches = list(adapter_patches or [])
     if trajectory_path is not None and Path(trajectory_path).exists():
         try:
             parsed = parse_trajectory(Path(trajectory_path), model=model)
@@ -336,6 +339,13 @@ def assemble_record(
             # Deliberately blank until the dataset plan exists. Inventing a
             # value would be worse than an honest gap.
             task_set_commit="",
+            # What the PROXY reported patching in its own litellm, read from
+            # the manifest it wrote. Not derived from our config: section 6.1's
+            # rule is that configuration is never reported as observation, and
+            # `litellm` above is this process's version, which says nothing
+            # about the container -- it pins its own copy.
+            litellm_patches=adapter_patches,
+            litellm_proxy_version=proxy_litellm,
         ),
         config_digest=cfg_digest,
         system_prompt_sha=_sha256(first_request.get("system")) if entries else "",
@@ -537,6 +547,16 @@ def execute_run(
             wire_entries = wire.entries()
             wire.close()
 
+    # What the proxy reported doing to its own litellm. Read from the manifest
+    # the proxy wrote into the shared wire directory rather than asserted from
+    # our config: a record must not claim a patch was active because a config
+    # file asked for one. An absent manifest yields empty values, which honestly
+    # says the proxy made no claim.
+    adapter_patches: list[str] = []
+    proxy_litellm = ""
+    if proxy_wire_dir is not None:
+        adapter_patches, proxy_litellm = read_manifest(proxy_wire_dir)
+
     finished_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
     record = assemble_record(
@@ -556,6 +576,8 @@ def execute_run(
         cfg_digest=config_digest(config),
         wire_entries=wire_entries,
         isolated=bool(network),
+        adapter_patches=adapter_patches,
+        proxy_litellm=proxy_litellm,
     )
     event_log.write_run(record)
     return record

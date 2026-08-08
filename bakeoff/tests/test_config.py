@@ -77,7 +77,36 @@ def test_the_production_config_registers_the_proxy_side_wire_callback():
     and the production config did not.
     """
     settings = yaml.safe_load(CONFIG.read_text())["litellm_settings"]
-    assert settings.get("callbacks") == "bakeoff.proxy_callback.instance"
+    assert "bakeoff.proxy_callback.instance" in settings.get("callbacks", [])
+
+
+def test_every_proxy_config_registers_both_callbacks():
+    """Three configs start a proxy, and a patch missing from one of them means
+    the offline gate and the fault-injection suite certify an UNPATCHED
+    topology under the same name as the patched one -- the weaker check
+    wearing the stronger check's label.
+
+    Applies to the wire callback too: that one shipped absent from the
+    production config once already (Task 11, defect 15).
+    """
+    for path in sorted(CONFIG.parent.glob("litellm*.yaml")):
+        callbacks = yaml.safe_load(path.read_text())["litellm_settings"]["callbacks"]
+        assert "bakeoff.proxy_callback.instance" in callbacks, path.name
+        assert "bakeoff.litellm_patches.instance" in callbacks, path.name
+
+
+def test_no_deployment_targets_the_real_anthropic_api():
+    """The assumption that makes the tool-id patch safe, written down.
+
+    `^[a-zA-Z0-9_-]+$` on tool_use ids is enforced by Anthropic's own API.
+    Disabling the sanitizer is only sound because nothing here calls it --
+    every arm goes to Bedrock. Point an arm at api.anthropic.com and the patch
+    stops being a bug fix and starts being a bug.
+    """
+    for path in sorted(CONFIG.parent.glob("litellm*.yaml")):
+        for entry in yaml.safe_load(path.read_text())["model_list"]:
+            base = str(entry["litellm_params"].get("api_base", ""))
+            assert "api.anthropic.com" not in base, f"{path.name}: {entry['model_name']}"
 
 
 def test_the_registered_callback_path_resolves_to_a_dispatchable_instance():
@@ -94,12 +123,13 @@ def test_the_registered_callback_path_resolves_to_a_dispatchable_instance():
 
     from litellm.integrations.custom_logger import CustomLogger
 
-    path = yaml.safe_load(CONFIG.read_text())["litellm_settings"]["callbacks"]
-    module_name, _, attribute = path.rpartition(".")
-    resolved = getattr(importlib.import_module(module_name), attribute)
+    paths = yaml.safe_load(CONFIG.read_text())["litellm_settings"]["callbacks"]
+    for path in paths:
+        module_name, _, attribute = path.rpartition(".")
+        resolved = getattr(importlib.import_module(module_name), attribute)
 
-    assert not isinstance(resolved, type), f"{path} is a class; it would be skipped"
-    assert isinstance(resolved, CustomLogger)
+        assert not isinstance(resolved, type), f"{path} is a class; it would be skipped"
+        assert isinstance(resolved, CustomLogger), path
 
 
 def test_no_mantle_arm_reads_the_bearer_variable_litellm_falls_back_to():

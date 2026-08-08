@@ -28,6 +28,19 @@ MUTATIONS = [
         "not integration",
     ),
     (
+        # Patching only common_utils is the half-fix that looks complete:
+        # adapters.transformation bound the symbol with `from ... import`, so
+        # it keeps its own reference and the RESPONSE path -- where the
+        # mangling happens -- stays broken. Dropping it from the target list
+        # reproduces exactly that.
+        "adapter: patch only common_utils, leaving the response path mangling",
+        "src/bakeoff/litellm_patches.py",
+        "    return [common_utils, transformation]",
+        "    return [common_utils]",
+        "tests/test_litellm_patches.py -k from_import",
+        "not integration",
+    ),
+    (
         "defect 1: stop deriving api_error_status from the wire",
         "src/bakeoff/runner.py",
         "    if api_error_status is None:\n        api_error_status = final_api_error_status(entries)",

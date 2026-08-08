@@ -212,6 +212,60 @@ class BakeoffProxyCallback(CustomLogger):
 instance = BakeoffProxyCallback()
 
 
+# --- the adapter-patch manifest ---------------------------------------------
+#
+# Lives here rather than in bakeoff.litellm_patches because the harness must be
+# able to READ it, and importing that module applies its patches -- which would
+# patch litellm in the harness process and in every pytest run. This module is
+# already the proxy/harness file-handoff contract (see read_run_entries below),
+# so the manifest belongs with it.
+
+MANIFEST_NAME = "adapter_patches.json"
+
+
+def write_manifest(
+    patches: list[str], litellm_version: str, wire_dir: Path
+) -> Path | None:
+    """Proxy side: record what this process did to its own litellm.
+
+    Written by the proxy about itself, deliberately. Section 6.1's rule is that
+    configuration is never reported as observation -- a record must not claim a
+    patch was active because a config file asked for one -- and the harness's
+    own litellm version says nothing about the container, which pins its own.
+    """
+    try:
+        wire_dir.mkdir(parents=True, exist_ok=True)
+        path = wire_dir / MANIFEST_NAME
+        path.write_text(
+            json.dumps(
+                {"patches": sorted(patches), "litellm": litellm_version},
+                sort_keys=True,
+            )
+        )
+        return path
+    except OSError:
+        # A manifest that cannot be written must not take the proxy down; the
+        # absence is itself readable as "no claim made".
+        return None
+
+
+def read_manifest(wire_dir: Path) -> tuple[list[str], str]:
+    """Harness side: what the proxy reported, or nothing if it reported nothing.
+
+    An absent manifest returns empty values. That is distinguishable from a
+    proxy reporting an empty patch set only by the litellm version also being
+    blank, and both readings are honest: neither invents a claim.
+    """
+    path = Path(wire_dir) / MANIFEST_NAME
+    if not path.exists():
+        return [], ""
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return [], ""
+    return [str(p) for p in (data.get("patches") or [])], str(data.get("litellm") or "")
+
+
 def read_run_entries(wire_dir: Path, run_id: str) -> list[dict[str, Any]]:
     """Entries the proxy recorded for one run, in call order.
 

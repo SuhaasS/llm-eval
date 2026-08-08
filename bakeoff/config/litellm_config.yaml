@@ -161,7 +161,17 @@ litellm_settings:
   # by the X-Bakeoff-Run-Id header the harness stamps per run, and the
   # harness replays those lines through WireLogger afterwards so there is
   # still exactly one canonical artifact.
-  callbacks: bakeoff.proxy_callback.instance
+  # Two entries, and the second is not optional in any config. The
+  # tool-id patch must be present wherever a proxy is started, or the
+  # offline gate and the fault-injection suite certify an UNPATCHED
+  # topology under the same name as the patched one.
+  #
+  # bakeoff.litellm_patches applies on construction and is imported by
+  # nothing in the harness -- that separation is what keeps the harness
+  # process's litellm unpatched. See that module for the defect.
+  callbacks:
+    - bakeoff.proxy_callback.instance
+    - bakeoff.litellm_patches.instance
 
   # Route the three OpenAI-compatible arms through /v1/chat/completions
   # rather than /v1/responses. Without this LiteLLM sends any `openai/`
