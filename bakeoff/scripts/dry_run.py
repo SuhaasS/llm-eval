@@ -143,13 +143,22 @@ def main() -> int:
         print(f"turns_used      {record.turns_used}")
         print(f"claude_code     {record.versions.claude_code or '(none)'}")
         print(f"tokens          in={record.tokens.input} out={record.tokens.output}")
-        print(f"cost_usd        ${record.cost_usd:.6f}")
+        # None is "price unknown", not zero, and formatting it with a float
+        # spec raises TypeError -- which would take the section 6.6 gate down,
+        # since this script is one of its four legs.
+        cost = (
+            "unknown (tokens above are complete; repriceable offline)"
+            if record.cost_usd is None
+            else f"${record.cost_usd:.6f}"
+        )
+        print(f"cost_usd        {cost}")
         print(
             f"timing          inference={record.time.inference_ms}ms "
             f"tool_exec={record.time.tool_exec_ms}ms "
             f"wall={record.time.wall_clock_total_ms}ms"
         )
         print(f"parse_error     {record.trajectory_parse_error or '(none)'}")
+        print(f"pricing_error   {record.pricing_error or '(none)'}")
 
         print("\ncheckpoints (this is the part that used to be fabricated)")
         for cp in record.checkpoints:

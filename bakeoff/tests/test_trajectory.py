@@ -34,10 +34,72 @@ def test_per_turn_tokens_reconstruct_the_total(parsed):
 
 
 def test_per_turn_cost_is_populated(parsed):
+    """Every turn is priced here because claude-sonnet-5 has confirmed cache
+    pricing. The sum is asserted strictly, not defensively: if a turn ever
+    comes back None on this fixture, the reconstruction guarantee has broken
+    and the test should say so loudly rather than skip the None."""
     assert all(t.cost_usd > 0 for t in parsed.turns)
     assert sum(t.cost_usd for t in parsed.turns) == pytest.approx(
         parsed.total_cost_usd
     )
+
+
+# --- pricing is not parsing --------------------------------------------------
+#
+# The same fixture, read as a model whose cache pricing is unconfirmed. It
+# carries cache_read=1000, so cost_usd raises on every turn. That used to
+# abort the parse and cost the whole trajectory.
+
+
+@pytest.fixture
+def unpriced():
+    return parse_trajectory(FIXTURE, model="kimi-k2-5")
+
+
+def test_an_unpriceable_model_keeps_every_turn(unpriced):
+    """The transcript parsed. Only the price is missing.
+
+    Before this split, cost_usd raising took parse_trajectory down with it and
+    assemble_record replaced the result with an empty ParsedTrajectory -- so a
+    run that had worked was recorded with turns, tokens and tool calls all
+    zero. Measured live 2026-08-07 on a kimi-k2-5 run that produced the
+    correct diff.
+    """
+    assert len(unpriced.turns) == 4
+    assert [t.turn for t in unpriced.turns] == [1, 2, 3, 4]
+
+
+def test_an_unpriceable_model_keeps_its_tokens_so_the_run_can_be_repriced(unpriced):
+    """The tokens are the whole reason an unknown price is survivable: AWS may
+    publish cache rates later, and the run is recoverable only if its usage
+    was recorded at the time."""
+    assert unpriced.total_tokens.input == 25
+    assert unpriced.total_tokens.output == 75
+    assert unpriced.total_tokens.cache_read == 1000
+    assert unpriced.tool_calls.total == 3
+    assert unpriced.bash_commands
+
+
+def test_an_unpriceable_model_reports_cost_unknown_not_zero(unpriced):
+    """None, never 0.0. Zero is a positive claim that the run was free, and
+    it is indistinguishable from an arm that died before spending anything --
+    a shape this very run produced three times for Gemma."""
+    assert unpriced.total_cost_usd is None
+    assert all(t.cost_usd is None for t in unpriced.turns)
+
+
+def test_the_reason_names_the_model_and_the_cause(unpriced):
+    assert "kimi-k2-5" in unpriced.pricing_error
+    assert "cache support unconfirmed" in unpriced.pricing_error
+
+
+@pytest.mark.parametrize("model", ["claude-sonnet-5", "kimi-k2-5", "not-in-price-book"])
+def test_cost_is_none_exactly_when_a_pricing_error_is_recorded(model):
+    """The invariant. A None cost with no stated reason is the silent absence
+    the event log exists to prevent, and a reason with a number beside it
+    would make the number a lie."""
+    result = parse_trajectory(FIXTURE, model=model)
+    assert (result.total_cost_usd is None) == bool(result.pricing_error)
 
 
 def test_tool_calls_counted_by_name(parsed):

@@ -126,13 +126,29 @@ def run_problems(
     """Every reason this run is not evidence. Empty means GO."""
     problems: list[str] = []
 
-    # First, because it silently zeroes everything downstream. The three
-    # candidate models raise on any observed cache token (their Bedrock
-    # cache support is unconfirmed), assemble_record catches it so the
-    # record survives -- with turns, tokens and cost all zero. Those are
-    # precisely the numbers Phase 0c exists to produce.
+    # First, because it zeroes everything downstream: the derived fields are
+    # empty and must not be read as "the agent did nothing".
     if record.trajectory_parse_error:
         problems.append(f"trajectory did not parse: {record.trajectory_parse_error}")
+
+    # An unpriced run is NOT a failure. The three candidates raise on any
+    # observed cache token (their Bedrock cache pricing is unconfirmed), and
+    # the loop, the tool calls and the diff are all still evidence -- only the
+    # price is missing. This used to arrive as trajectory_parse_error, which
+    # zeroed the record; now the tokens survive and the run is repriceable
+    # offline, so it is reported rather than gated.
+    #
+    # It becomes a real problem only when the tokens are ALSO empty, because
+    # then nothing can reprice it and the cost is lost permanently.
+    if record.cost_usd is None:
+        repriceable = record.tokens.input or record.tokens.output or (
+            record.tokens.cache_read or record.tokens.cache_write
+        )
+        if not repriceable:
+            problems.append(
+                f"cost unknown AND no tokens recorded: {record.pricing_error} "
+                "-- this run can never be repriced"
+            )
 
     if record.turns_used <= 0:
         problems.append("no turns: the agent never completed a loop")
@@ -692,11 +708,16 @@ def print_table(rows: list[dict]) -> None:
     print("\n" + header)
     print("-" * len(header))
     for row in rows:
+        # cost is None when the arm's tokens could not be priced. A float
+        # format spec raises TypeError on that, and this table prints AFTER
+        # the whole matrix has been paid for -- the arm that triggers it would
+        # take the entire report down with it.
+        cost = "  unpriced" if row["cost"] is None else f"{row['cost']:>9.5f}"
         print(
             f"{row['label']:30} {row['outcome']:18} {row['turns']:>5} "
             f"{row['tools']:>6} {row['wire']:>5} {row['out_tok']:>8} "
             f"{row['cache_read']:>8} {row['cache_write']:>8} "
-            f"{row['cost']:>9.5f} {row['wall_s']:>7.1f} {row['diff_b']:>7}  "
+            f"{cost} {row['wall_s']:>7.1f} {row['diff_b']:>7}  "
             f"{row['verdict']}"
         )
 
@@ -731,22 +752,29 @@ def print_cache_tokens(rows: list[dict]) -> None:
     """Whether an arm returns cache tokens at all, stated rather than assumed.
 
     costs.py prices cache tokens for Sonnet and raises for the three
-    candidates, whose Bedrock cache support is unconfirmed. assemble_record
-    catches that, so a candidate that ever returns one yields a record with
-    turns, tokens and cost all ZERO -- which is byte-identical to an arm that
-    legitimately failed on its first call. Measured on 2026-08-07: the cache
-    warms on turn 2 of a single run (not at N=10, as TASKS.md assumed), and
-    the candidates returned no cache fields at all on the mantle route. This
-    line is what keeps that an observation instead of an inference.
+    candidates, whose Bedrock cache pricing is unconfirmed. That trip used to
+    zero the whole record; parse_trajectory now keeps the turns and tokens and
+    records the cost as unknown, so the remaining job of this line is to say
+    which arms are affected -- and therefore which arms need a rate before any
+    cost figure is published.
+
+    Measured on 2026-08-07: the cache warms on turn 2 of a single run (not at
+    N=10, as TASKS.md assumed), and Kimi does return cache tokens once it runs
+    a real multi-turn loop. The earlier reading that the candidates returned
+    none came from runs that died at turn 2.
     """
-    print("\ncache tokens (costs.py raises for any candidate that returns one)")
+    print("\ncache tokens (costs.py has no confirmed rate for any candidate)")
     for arm in dict.fromkeys(row["arm"] for row in rows):
         arm_rows = [row for row in rows if row["arm"] == arm]
         reads = sum(row["cache_read"] for row in arm_rows)
         writes = sum(row["cache_write"] for row in arm_rows)
         priced = arm.startswith("claude-sonnet-5")
         if reads or writes:
-            note = "priced" if priced else "UNPRICED -- record would zero"
+            note = (
+                "priced"
+                if priced
+                else "UNPRICED -- cost recorded as null, tokens intact"
+            )
         else:
             note = "none returned"
         print(f"  {arm:26} read={reads:<9} write={writes:<9} {note}")

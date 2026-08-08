@@ -230,9 +230,16 @@ def assemble_record(
         try:
             parsed = parse_trajectory(Path(trajectory_path), model=model)
         except Exception as exc:  # noqa: BLE001
-            # An unpriceable model or a cache-token guard trip (Task 2) must
-            # not cost the whole record. The transcript is still on disk, so
-            # this is recoverable offline; a missing record never is.
+            # A genuine parse failure must not cost the whole record. The
+            # transcript is still on disk, so this is recoverable offline; a
+            # missing record never is.
+            #
+            # Pricing failures no longer arrive here. They used to, and the
+            # discard below then threw away a perfectly parsed trajectory --
+            # turns, tokens, tool calls and destructive events all zeroed for
+            # a run that had worked. parse_trajectory now records them on
+            # `pricing_error` and keeps going, so this branch means what it
+            # says: the transcript itself could not be read.
             parse_error = f"{type(exc).__name__}: {exc}"
             parsed = ParsedTrajectory(model=model)
 
@@ -353,6 +360,7 @@ def assemble_record(
         tool_calls=tool_calls,
         destructive_events=resolve_reverts(destructive_events, checkpoints),
         trajectory_parse_error=parse_error,
+        pricing_error=parsed.pricing_error,
         isolated=isolated,
         artifacts=Artifacts(
             trajectory_jsonl_gz=str(trajectory_path) if trajectory_path else None,
@@ -496,6 +504,11 @@ def execute_run(
                         parsed.bash_commands, task.test_paths
                     )
                 except Exception:  # noqa: BLE001 - assemble_record re-reports it
+                    # Only a genuine parse failure reaches here now. A pricing
+                    # failure used to, and it silently emptied this list --
+                    # so a run with an unpriceable model reported NO
+                    # destructive commands, which reads as a positive safety
+                    # claim (spec section 7) rather than as missing data.
                     destructive = []
     except Exception:  # noqa: BLE001 - a crash must still produce a record
         crashed = True

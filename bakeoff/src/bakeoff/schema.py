@@ -14,7 +14,20 @@ from typing import Any
 # defaults, so 1.0.0 records still load; the version moves anyway, because a
 # reader that cannot tell the two apart would read a 1.0.0 record's absent
 # `isolated` as a positive claim that the run was NOT isolated.
-SCHEMA_VERSION = "1.1.0"
+#
+# 2.0.0 is a MAJOR bump, and the only one so far that is not additive.
+# `cost_usd` changes type from `float` to `float | None` on both RunRecord and
+# TurnRecord: `None` now means "the tokens are known and the price is not",
+# and `0.0` keeps its old meaning of a genuine zero. `pricing_error` says why.
+#
+# Minor would have been a lie in both directions. A 1.x reader handed a 2.0.0
+# record sees `null` where it expects a number and `sum(r.cost_usd for r in
+# records)` raises TypeError -- the read contract genuinely broke. And a 2.x
+# reader handed a 1.1.0 record sees `0.0` with no way to tell a free run from
+# an unpriceable one, which is the confusion this field exists to end.
+#
+# Also adds `Versions.litellm_patches`, which is additive and rides along.
+SCHEMA_VERSION = "2.0.0"
 
 
 class Outcome(str, Enum):
@@ -115,6 +128,15 @@ class Versions:
     container_image_digest: str = ""
     harness_commit: str = ""
     task_set_commit: str = ""
+    # Adapter patches the PROXY reported applying to its own litellm, read
+    # back from the manifest it writes -- an observation, not this process's
+    # configuration. `litellm` above is the harness's version and says nothing
+    # about the proxy container, which pins its own; litellm_proxy_version is
+    # what the patched process reported about itself.
+    # list, not tuple: the record is JSON, and a tuple decodes back as a list,
+    # so a tuple here would make a record unequal to its own round trip.
+    litellm_patches: list[str] = field(default_factory=list)
+    litellm_proxy_version: str = ""
 
 
 @dataclass(frozen=True)
@@ -150,7 +172,9 @@ class Checkpoint:
 class TurnRecord:
     turn: int
     tokens: TokenUsage
-    cost_usd: float
+    # None when this turn's tokens could not be priced. `tokens` above stays
+    # complete either way, so the turn is repriceable offline.
+    cost_usd: float | None
     inference_ms: int
     tool_exec_ms: int
     stop_reason: str | None = None
@@ -223,7 +247,11 @@ class RunRecord:
 
     time: TimingBreakdown = field(default_factory=TimingBreakdown)
     tokens: TokenUsage = field(default_factory=TokenUsage)
-    cost_usd: float = 0.0
+    # None means the price is unknown, NOT that the run was free. See
+    # pricing_error for the reason, and `tokens` above for what it cost in
+    # tokens -- that stays complete, so the run can be repriced offline the
+    # moment rates are published. 0.0 still means a genuine zero.
+    cost_usd: float | None = 0.0
     cache_state: CacheState = field(default_factory=CacheState)
 
     per_turn: list[TurnRecord] = field(default_factory=list)
@@ -243,6 +271,12 @@ class RunRecord:
     # disk -- but every derived field below is empty and must not be read as
     # "the agent did nothing".
     trajectory_parse_error: str = ""
+    # Non-empty exactly when cost_usd is None: the transcript parsed fine and
+    # the tokens are complete, but at least one turn could not be priced.
+    # Distinct from trajectory_parse_error on purpose -- that one means the
+    # derived fields are empty, this one means only the price is missing, and
+    # collapsing them is what made a working run look like a dead one.
+    pricing_error: str = ""
 
     diff_stats: dict[str, int] = field(default_factory=dict)
     p2p_regressions: list[str] = field(default_factory=list)

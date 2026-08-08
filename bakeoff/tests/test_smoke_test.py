@@ -293,10 +293,22 @@ class _Record:
 
     def __init__(self, **kwargs):
         self.trajectory_parse_error = kwargs.get("parse_error", "")
+        self.pricing_error = kwargs.get("pricing_error", "")
+        self.cost_usd = kwargs.get("cost_usd", 0.012)
         self.turns_used = kwargs.get("turns", 3)
         self.isolated = kwargs.get("isolated", True)
         self.exclusion = kwargs.get("exclusion")
         self.tool_calls = type("T", (), {"total": kwargs.get("tools", 5)})()
+        self.tokens = type(
+            "U",
+            (),
+            {
+                "input": kwargs.get("input_tokens", 1000),
+                "output": kwargs.get("output_tokens", 200),
+                "cache_read": kwargs.get("cache_read", 0),
+                "cache_write": kwargs.get("cache_write", 0),
+            },
+        )()
         self.artifacts = type(
             "A", (), {"final_diff": kwargs.get("diff", "diff --git a/calc.py")}
         )()
@@ -321,15 +333,44 @@ def test_a_healthy_live_run_passes_every_criterion():
     assert _live_problems(_Record()) == []
 
 
-def test_a_zeroed_cost_guard_trip_is_not_read_as_a_quiet_run():
-    """The three candidate models raise on any observed cache token, since
-    their Bedrock cache support is unconfirmed. assemble_record catches it,
-    so the record survives -- with turns, tokens and cost all zero and only
-    trajectory_parse_error set. Those are the exact numbers Phase 0c exists
-    to produce, so an unchecked parse error yields a confident table of
-    zeroes."""
+def test_a_trajectory_that_failed_to_parse_is_not_read_as_a_quiet_run():
+    """A record whose transcript could not be parsed has every derived field
+    empty. Those zeroes are the exact numbers Phase 0c exists to produce, so
+    an unchecked parse error yields a confident table of zeroes."""
+    assert _live_problems(_Record(parse_error="JSONDecodeError: line 4"))
+
+
+def test_an_unpriced_run_is_reported_but_does_not_fail_the_gate():
+    """A cache-token guard trip means the price is unknown, not that the run
+    failed. The loop, the tool calls and the diff are all still evidence, and
+    the tokens are recorded in full -- so the run is repriceable offline the
+    moment AWS publishes rates, and gating on it would discard good data.
+
+    This is the case that used to arrive as trajectory_parse_error with the
+    whole trajectory zeroed."""
+    assert (
+        _live_problems(
+            _Record(
+                cost_usd=None,
+                pricing_error="ValueError: kimi-k2-5: cache support unconfirmed",
+                cache_read=15168,
+            )
+        )
+        == []
+    )
+
+
+def test_an_unpriced_run_with_no_tokens_fails_because_it_can_never_be_repriced():
+    """The one case where an unknown price IS fatal. Tokens are what make a
+    run repriceable; without them the cost is lost permanently and no later
+    rate table can recover it."""
     assert _live_problems(
-        _Record(parse_error="ValueError: kimi-k2-5: cache support unconfirmed")
+        _Record(
+            cost_usd=None,
+            pricing_error="UnknownModelError: mystery-model",
+            input_tokens=0,
+            output_tokens=0,
+        )
     )
 
 

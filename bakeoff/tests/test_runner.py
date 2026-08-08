@@ -173,11 +173,20 @@ def test_clean_run_is_not_labelled_a_false_success(task, tmp_path):
     assert record.failure_class is None
 
 
-def test_unparseable_trajectory_still_writes_a_record(task, tmp_path):
-    """Spec section 6.6. parse_trajectory raises on an unknown model (and on
-    cache tokens from a model whose cache pricing is unconfirmed -- Task 2's
-    guard). Letting that propagate would cost the entire run record for a
-    pricing-table gap, after the tokens were already paid for.
+def test_an_unpriceable_model_keeps_its_trajectory_and_reports_cost_unknown(
+    task, tmp_path
+):
+    """Spec section 6.6. A price-book gap must cost the PRICE, not the run.
+
+    This used to zero the record: cost_usd raised, parse_trajectory aborted,
+    and assemble_record replaced the whole ParsedTrajectory with an empty one
+    -- so turns, tokens and tool calls all read zero for a transcript that had
+    parsed perfectly. Observed live on 2026-08-07, where a kimi-k2-5 run that
+    produced the correct diff was written as a row of zeroes indistinguishable
+    from an arm that died on its first call.
+
+    The tokens are what make the run repriceable offline once rates exist, so
+    they must survive; only the dollar figure is unknown.
     """
     record = assemble_record(
         task=task,
@@ -192,8 +201,13 @@ def test_unparseable_trajectory_still_writes_a_record(task, tmp_path):
         artifacts_root=tmp_path,
     )
     assert record.run_id
-    assert record.turns_used == 0
-    assert record.trajectory_parse_error
+    assert record.turns_used == 5
+    assert record.tokens.input > 0
+    # The transcript parsed fine. Only the price is missing, and the record
+    # says which of the two it is.
+    assert record.trajectory_parse_error == ""
+    assert record.pricing_error
+    assert record.cost_usd is None
 
 
 # --- what actually went over the wire ----------------------------------------

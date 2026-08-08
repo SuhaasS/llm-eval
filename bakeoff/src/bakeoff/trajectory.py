@@ -26,7 +26,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 
-from bakeoff.costs import cost_usd
+from bakeoff.costs import UnknownModelError, cost_usd
 from bakeoff.schema import TokenUsage, ToolCallStats, TurnRecord
 
 EDIT_TOOLS = frozenset({"Edit", "Write", "NotebookEdit", "MultiEdit"})
@@ -37,13 +37,18 @@ class ParsedTrajectory:
     turns: list[TurnRecord] = field(default_factory=list)
     tool_calls: ToolCallStats = field(default_factory=ToolCallStats)
     total_tokens: TokenUsage = field(default_factory=TokenUsage)
-    total_cost_usd: float = 0.0
+    # None means "at least one turn could not be priced", never "free". The
+    # default stays 0.0 because a trajectory with no turns is an honest empty
+    # sum; only the guard below may turn it into None. See pricing_error.
+    total_cost_usd: float | None = 0.0
     model: str = ""
     claude_code_version: str = ""
     first_edit_turn: int | None = None
     first_edit_offset_ms: int | None = None
     bash_commands: list[tuple[int, str]] = field(default_factory=list)
     malformed_lines: int = 0
+    # Why the cost is unknown. Non-empty exactly when total_cost_usd is None.
+    pricing_error: str = ""
 
 
 def _parse_ts(value: str) -> datetime:
@@ -133,8 +138,28 @@ def parse_trajectory(path: Path, model: str) -> ParsedTrajectory:
                 if command:
                     result.bash_commands.append((turn_no, command))
 
-        turn_cost = cost_usd(model, usage)
-        result.total_cost_usd += turn_cost
+        # Pricing is not parsing, and conflating them destroyed data. cost_usd
+        # raises for the three candidates on any cache token (their Bedrock
+        # cache pricing is unconfirmed) and for a model absent from the price
+        # book. Letting that escape aborts the loop, and assemble_record then
+        # replaces the whole ParsedTrajectory with an empty one -- so a run
+        # whose transcript parsed perfectly is recorded with turns, tokens and
+        # tool calls all zero. Observed live on 2026-08-07: a kimi-k2-5 run
+        # that produced the correct diff was written as a row of zeroes, a
+        # shape indistinguishable from an arm that died on its first call.
+        #
+        # UnknownModelError subclasses KeyError, not ValueError, so both are
+        # named. Both mean the same thing -- the tokens are known and the
+        # price is not -- and the tokens are what make the run repriceable
+        # offline once rates are published.
+        try:
+            turn_cost: float | None = cost_usd(model, usage)
+        except (ValueError, UnknownModelError) as exc:
+            turn_cost = None
+            result.pricing_error = result.pricing_error or f"{type(exc).__name__}: {exc}"
+        else:
+            if result.total_cost_usd is not None:
+                result.total_cost_usd += turn_cost
         result.turns.append(
             TurnRecord(
                 turn=turn_no,
@@ -148,4 +173,10 @@ def parse_trajectory(path: Path, model: str) -> ParsedTrajectory:
         )
 
     result.tool_calls = ToolCallStats(total=sum(by_name.values()), by_name=by_name)
+    if result.pricing_error:
+        # All-or-nothing, deliberately. Summing only the priceable turns would
+        # understate the run's cost while looking like a precise figure, which
+        # is worse than saying nothing -- section 8's cost metric would be
+        # quietly biased low for exactly the arms whose pricing is in doubt.
+        result.total_cost_usd = None
     return result

@@ -9,6 +9,18 @@ that Bedrock prompt-cache support for the three candidates is unconfirmed,
 and AWS publishes no cache pricing for any of them. Guessing here would
 silently corrupt the headline cost metric, so any cache tokens observed on
 those models raise instead.
+
+CALLER CONTRACT. Raising is right, but only the price may be lost by it.
+`trajectory.parse_trajectory` catches per turn and records the reason on
+`ParsedTrajectory.pricing_error`, so the turn count, the tokens and the tool
+calls all survive and the run stays repriceable offline the moment AWS
+publishes rates. Calling this where an exception aborts a parse is the
+2026-08-07 defect: a kimi-k2-5 run that produced the correct diff was written
+to the log as turns=0, tokens=0, cost=0.
+
+Bedrock returns no dollar figure on any call -- every cost anywhere in this
+harness is tokens times a published rate -- so this table is the only pricing
+authority and a gap in it must be reported, never estimated.
 """
 
 from __future__ import annotations

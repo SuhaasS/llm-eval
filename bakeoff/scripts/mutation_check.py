@@ -15,6 +15,19 @@ PY = str(REPO / ".venv" / "bin" / "python")
 # (label, file, find, replace, test selector, marker)
 MUTATIONS = [
     (
+        # The 2026-08-07 defect: cost_usd raising took parse_trajectory down
+        # with it, and assemble_record then discarded the whole trajectory.
+        # A run that produced the correct diff was recorded as turns=0,
+        # tokens=0, cost=0 -- indistinguishable from an arm that died on its
+        # first call. Reverting to the bare call restores exactly that.
+        "pricing: let a cache-token guard trip take the whole trajectory down",
+        "src/bakeoff/trajectory.py",
+        "        try:\n            turn_cost: float | None = cost_usd(model, usage)",
+        "        if True:\n            turn_cost: float | None = cost_usd(model, usage)",
+        "tests/test_trajectory.py -k unpriceable",
+        "not integration",
+    ),
+    (
         "defect 1: stop deriving api_error_status from the wire",
         "src/bakeoff/runner.py",
         "    if api_error_status is None:\n        api_error_status = final_api_error_status(entries)",

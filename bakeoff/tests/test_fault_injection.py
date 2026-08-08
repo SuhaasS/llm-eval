@@ -60,10 +60,14 @@ def _assistant(
     tool: str | None = None,
     tool_input: dict | None = None,
     model: str = "gemma-4-31b",
+    cache_read: int = 0,
 ) -> str:
     content = []
     if tool:
         content.append({"type": "tool_use", "name": tool, "input": tool_input or {}})
+    usage = {"input_tokens": 100, "output_tokens": 50}
+    if cache_read:
+        usage["cache_read_input_tokens"] = cache_read
     return json.dumps(
         {
             "type": "assistant",
@@ -73,7 +77,7 @@ def _assistant(
             "message": {
                 "model": model,
                 "stop_reason": stop_reason,
-                "usage": {"input_tokens": 100, "output_tokens": 50},
+                "usage": usage,
                 "content": content,
             },
         }
@@ -343,6 +347,49 @@ def test_destructive_command_survives_parse_scan_and_record(task, tmp_path):
     assert event.turn == 2
     assert event.severity is Severity.HIGH  # still gone at the end
     assert event.reverted_by_agent is False
+
+
+def test_a_destructive_command_survives_an_unpriceable_model(task, tmp_path):
+    """Section 7's safety record must not depend on the price book.
+
+    execute_run scans destructive commands off the parsed trajectory and
+    empties the list on any parse exception. A cache-token pricing failure
+    used to be such an exception, so an unpriceable arm reported NO
+    destructive commands -- which reads as a positive safety claim rather
+    than as missing data. The scan runs on gemma-4-31b usage carrying
+    cache_read, which is exactly what used to raise.
+    """
+    path = _write(
+        tmp_path,
+        [
+            _assistant(1, stop_reason="tool_use", tool="Edit", cache_read=4096),
+            _assistant(
+                2, stop_reason="tool_use", tool="Bash",
+                tool_input={"command": "rm -rf tests/test_a.py"},
+                cache_read=4096,
+            ),
+        ],
+    )
+    parsed = parse_trajectory(path, model="gemma-4-31b")
+
+    # The pricing failed and the parse did not.
+    assert parsed.total_cost_usd is None
+    assert "cache support unconfirmed" in parsed.pricing_error
+
+    events = scan_destructive(parsed.bash_commands, task.test_paths)
+    assert events and events[0].turn == 2
+
+    record = assemble_record(
+        task=task, model="gemma-4-31b", sample_index=0,
+        started_at="2026-08-04T00:00:00Z", finished_at="2026-08-04T00:05:00Z",
+        trajectory_path=path, runner_result=None, checkpoints=[],
+        destructive_events=events, artifacts_root=tmp_path,
+    )
+    assert record.destructive_events[0].turn == 2
+    assert record.turns_used == 2
+    assert record.tokens.cache_read == 8192
+    assert record.cost_usd is None
+    assert record.trajectory_parse_error == ""
 
 
 # --- case 7: the test harness itself crashes ---------------------------------
