@@ -846,7 +846,15 @@ def main() -> int:
         # of the real eval run at unspecified sampling with nothing in the
         # record saying so. It also gives the section 5.2 cross-arm diff
         # something to compare.
-        arms = args.models.split(",") if args.models else ["claude-sonnet-5", "gemma-4-31b"]
+        # Three arms. The third routes through `openai/` and is the only one
+        # that reaches the openai->anthropic adapter -- the two `anthropic/`
+        # arms bypass it, which is why the tool-id defect was invisible here
+        # and had to be found live. See config/litellm_smoke_offline.yaml.
+        arms = (
+            args.models.split(",")
+            if args.models
+            else ["claude-sonnet-5", "gemma-4-31b", "kimi-k2-5"]
+        )
 
     # Under $HOME, never /var/folders: the Docker VM on macOS mounts $HOME
     # only, and a repo bind-mounted from elsewhere appears inside the

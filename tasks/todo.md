@@ -733,3 +733,48 @@ its own character class. No arm in `EVAL_ARMS` is affected.
 offline deployment uses the `anthropic/` provider, which bypasses the
 openai→anthropic adapter entirely. The fix has unit coverage and a mutation
 anchor, but the gate would stay green if the patch died.
+
+---
+
+## The offline gate can now catch a dead adapter patch — 2026-08-08
+
+Closes the gap left by the tool-id fix. Every offline deployment used the
+`anthropic/` provider, which bypasses the openai→anthropic adapter entirely, so
+the §6.6 gate could not reach the tool-id defect **or** its fix — the patch had
+unit coverage and a mutation anchor, but the gate would have stayed green if it
+died. That is what made the original defect cost a live run to find.
+
+`fixtures/anthropic_stub.py` now serves `/v1/chat/completions` alongside
+`/v1/messages` from the same process, so no container plumbing changed. The
+offline config gains a third arm on `openai/`, and the stub does two things
+that make the check real:
+
+- it issues **Kimi-shaped** tool-call ids (`functions.Read:0`,
+  `functions.Write:1`). An id already inside Anthropic's character class would
+  make the check vacuous.
+- it **rejects a `tool_call_id` it never issued**, with a 400. Without that the
+  round trip is unchecked: a mangled id comes back, the stub answers anyway,
+  and the gate passes while the adapter corrupts every tool call.
+
+Verified by disabling the patch and re-running: the arm goes NO-GO with
+`tool_call_id 'functions_Read_0' was never issued by this stub -- the adapter
+rewrote it`. That is the 2026-08-07 defect, caught offline, for free.
+
+**Three divergences between the offline and production configs surfaced while
+wiring it up**, each of which would have made the gate certify different
+behaviour than it was meant to prove:
+
+1. `use_chat_completions_url_for_anthropic_messages` was missing offline, so
+   LiteLLM routed the `openai/` arm to `/v1/responses` — the exact production
+   defect measured on 2026-08-07, live in the gate itself.
+2. `additional_drop_params: [reasoning_effort]` has to be **per deployment**.
+   The global `litellm_settings` entry does not reach an `openai/`
+   deployment's param validation; measured here, the arm still 400s with only
+   the global entry.
+3. The stub answered unknown paths by falling through to its Anthropic
+   handler, so a wrong-endpoint bug surfaced as an unhelpful parse error two
+   layers away. Unknown paths now 404 with the path in the message.
+
+A config setting that differs between these two files is a §5.2 divergence in
+the gate itself, and all three were invisible until an arm actually exercised
+the adapter.

@@ -198,29 +198,98 @@ def script(body: dict) -> list[bytes]:
     return text_stream()
 
 
+# --- the OpenAI-compatible half --------------------------------------------
+#
+# Served from the same process, on /v1/chat/completions, so the offline gate
+# can reach the openai->anthropic adapter. The Anthropic half above cannot:
+# an `anthropic/` deployment bypasses that adapter entirely, which is why the
+# 2026-08-07 tool-id defect was invisible offline and cost a live run to find.
+#
+# The id below is Kimi-shaped ON PURPOSE. LiteLLM's
+# normalize_anthropic_tool_use_id rewrites every character outside
+# [a-zA-Z0-9_-] to an underscore, so without bakeoff.litellm_patches this id
+# comes back as `functions_Write_0` and validate_tool_call_ids rejects it.
+# That is the whole point: the gate must go red if the patch dies, and an id
+# that already satisfies Anthropic's pattern would make the check vacuous.
+KIMI_SHAPED_IDS = {"functions.Read:0", "functions.Write:1"}
+
+
+def validate_tool_call_ids(body: dict) -> str | None:
+    """Reject a tool_call_id this stub never issued.
+
+    Without this the round trip is unchecked: a mangled id would come back,
+    the stub would answer anyway, and the gate would pass while the adapter
+    silently corrupted every tool call. Returns an error string, or None.
+    """
+    for message in body.get("messages", []):
+        if message.get("role") != "tool":
+            continue
+        seen = message.get("tool_call_id")
+        if seen not in KIMI_SHAPED_IDS:
+            return (
+                f"tool_call_id {seen!r} was never issued by this stub "
+                f"(issued {sorted(KIMI_SHAPED_IDS)}) -- the adapter rewrote it"
+            )
+    return None
+
+
+def _openai_tool_call(call_id: str, name: str, arguments: dict) -> list[bytes]:
+    call = {
+        "index": 0,
+        "id": call_id,
+        "type": "function",
+        "function": {"name": name, "arguments": json.dumps(arguments)},
+    }
+    first = {
+        "choices": [{"index": 0, "delta": {"tool_calls": [call]}, "finish_reason": None}]
+    }
+    last = {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}
+    return [
+        b"data: " + json.dumps(first).encode() + b"\n\n",
+        b"data: " + json.dumps(last).encode() + b"\n\n",
+        b"data: [DONE]\n\n",
+    ]
+
+
+def openai_chunks(body: dict) -> list[bytes]:
+    """Read, then Write, then stop -- the same shape as the Anthropic script.
+
+    The Read is not decoration here either: Claude Code refuses to write a
+    file it has not read, so a stub that goes straight to Write lands no diff
+    and the gate reports a failure that belongs to the stub.
+    """
+    done = sum(1 for m in body.get("messages", []) if m.get("role") == "tool")
+    if done == 0:
+        return _openai_tool_call(
+            "functions.Read:0", "Read", {"file_path": "/repo/calc.py"}
+        )
+    if done == 1:
+        return _openai_tool_call(
+            "functions.Write:1",
+            "Write",
+            {"file_path": "/repo/calc.py", "content": FIXED},
+        )
+    payload = {
+        "choices": [{"index": 0, "delta": {"content": "done"}, "finish_reason": "stop"}]
+    }
+    return [b"data: " + json.dumps(payload).encode() + b"\n\n", b"data: [DONE]\n\n"]
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, *_args):  # noqa: A003 - quieter than the default
         pass
 
-    def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler's naming
-        length = int(self.headers.get("content-length", 0))
-        try:
-            body = json.loads(self.rfile.read(length) or b"{}")
-        except json.JSONDecodeError:
-            body = {}
+    def _json(self, status: int, payload: dict) -> None:
+        blob = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(blob)))
+        self.end_headers()
+        self.wfile.write(blob)
 
-        if not body.get("stream"):
-            payload = json.dumps(non_streaming(body)).encode()
-            self.send_response(200)
-            self.send_header("content-type", "application/json")
-            self.send_header("content-length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-            return
-
-        chunks = script(body)
+    def _sse(self, chunks: list[bytes]) -> None:
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.send_header("cache-control", "no-cache")
@@ -229,6 +298,47 @@ class Handler(BaseHTTPRequestHandler):
         for chunk in chunks:
             self.wfile.write(f"{len(chunk):X}\r\n".encode() + chunk + b"\r\n")
         self.wfile.write(b"0\r\n\r\n")
+
+    def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler's naming
+        length = int(self.headers.get("content-length", 0))
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except json.JSONDecodeError:
+            body = {}
+
+        # Anything that is neither route is a routing regression, and it must
+        # be loud. Answering /v1/responses with an Anthropic-shaped body -- the
+        # old behaviour, by falling through -- turned a wrong-endpoint bug into
+        # an unhelpful parse error two layers away. Measured while adding the
+        # openai arm: without use_chat_completions_url_for_anthropic_messages
+        # LiteLLM routes here, and the fall-through hid why.
+        if not ("chat/completions" in self.path or self.path.endswith("/messages")):
+            self._json(
+                404,
+                {
+                    "error": {
+                        "message": f"stub serves /v1/messages and "
+                        f"/v1/chat/completions, not {self.path}",
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
+            return
+
+        if "chat/completions" in self.path:
+            problem = validate_tool_call_ids(body)
+            if problem:
+                # 400 rather than a silent retry: the gate has to SEE this.
+                self._json(400, {"error": {"message": problem, "type": "invalid_request_error"}})
+                return
+            self._sse(openai_chunks(body))
+            return
+
+        if not body.get("stream"):
+            self._json(200, non_streaming(body))
+            return
+
+        self._sse(script(body))
 
     def do_GET(self):  # noqa: N802
         self.send_response(200)

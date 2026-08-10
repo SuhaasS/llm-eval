@@ -50,6 +50,32 @@ model_list:
       temperature: 1.0
       top_p: 0.95
 
+  # The only offline arm that reaches the openai->anthropic adapter, and the
+  # reason it exists. The two arms above use the `anthropic/` provider, which
+  # bypasses that adapter entirely -- so the 2026-08-07 tool-id defect, where
+  # LiteLLM rewrote Kimi's `functions.Read:0` to `functions_Read_0` and broke
+  # its tool loop, was structurally invisible to this gate and cost a live run
+  # to find.
+  #
+  # The stub answers /v1/chat/completions with a Kimi-shaped tool_call id and
+  # REJECTS a tool_call_id it never issued. So if bakeoff.litellm_patches ever
+  # stops applying, the id comes back mangled, the stub 400s, and this arm goes
+  # red -- which is the only way the gate can tell a live patch from a dead one.
+  #
+  # Named kimi-k2-5 because model_name doubles as the PRICE_BOOK key.
+  - model_name: kimi-k2-5
+    litellm_params:
+      model: openai/kimi-k2-5-stub
+      # Per-deployment, exactly as the production kimi arm carries it. The
+      # global litellm_settings.additional_drop_params below does NOT reach an
+      # openai/ deployment's param validation -- measured here: with only the
+      # global entry the arm still 400s on reasoning_effort.
+      additional_drop_params: ["reasoning_effort"]
+      api_base: http://stub:8080/v1
+      api_key: not-checked-by-the-stub
+      temperature: 1.0
+      top_p: 0.95
+
 litellm_settings:
   # The same registration the production config now uses, so the offline
   # gate exercises the real capture path rather than a test-only one.
@@ -64,6 +90,25 @@ litellm_settings:
   callbacks:
     - bakeoff.proxy_callback.instance
     - bakeoff.litellm_patches.instance
+  # Must match litellm_config.yaml. Without it LiteLLM sends an `openai/`
+  # deployment's Anthropic Messages traffic to the /v1/responses API instead
+  # of /v1/chat/completions -- which is the production defect measured on
+  # 2026-08-07, and it also means the offline gate would exercise different
+  # routing than the run it is meant to certify. A setting that differs
+  # between these two files is a section 5.2 divergence in the gate itself.
+  use_chat_completions_url_for_anthropic_messages: true
+
+  # Also mirrored from litellm_config.yaml, and for the same reason: the
+  # chat-completions bridge derives reasoning_effort from Claude Code's
+  # `thinking` block, and an openai/ deployment that has not dropped it 400s
+  # before reaching the provider. Named one at a time, never a blanket
+  # `drop_params: true`, so a future unsupported param surfaces instead of
+  # being silently discarded.
+  additional_drop_params:
+    - reasoning_effort
+    - context_management
+    - output_config
+
   drop_params: false
   set_verbose: false
 
