@@ -16,7 +16,7 @@ review log — one section per finished task, kept for what each one turned up.
 - [x] **Task 9** — Claude Code runner
 - [x] **Task 10** — Run orchestrator
 - [x] **Task 11** — Fault-injection gate
-- [~] **Task 12** — End-to-end smoke test — offline half DONE; live half 2 of 4 arms passing
+- [~] **Task 12** — End-to-end smoke test — offline half DONE; live half 3 of 4 arms passing
 
 ---
 
@@ -628,3 +628,108 @@ arm so this stays measured rather than inferred. The guard is still worth
 making loud, on a better argument than the original: a zeroed record reads as
 `turns=0, cost=0` with an empty `trajectory_parse_error`, which is exactly what
 Gemma legitimately produced three times in this same run.
+
+---
+
+## Two adapter defects that were being measured as model failure — 2026-08-08
+
+Kimi K2.5 went **0/3 to 3/3** with no model change. Both fixes were needed, and
+in this order: the second alone would have converted a visible failure into an
+invisible one.
+
+### 1. A pricing failure destroyed the whole trajectory
+
+`cost_usd` raises for the three candidates on any cache token and for a model
+absent from the price book. It was called inside `parse_trajectory`'s per-turn
+loop, so the raise aborted the parse — and `assemble_record` then replaced the
+whole `ParsedTrajectory` with an empty one. Turns, tokens, tool calls **and
+destructive events** all zeroed for a transcript that had parsed perfectly.
+
+Caught live: a Kimi run that produced the correct 157-byte diff was recorded as
+`turns=0 tools=0 tokens=0 cost=0` — byte-identical to Gemma legitimately dying
+on its first call, which the same run produced three times. The signature was
+already occupied, so the corruption was unnoticeable.
+
+`TASKS.md` had this as a latent N=10 risk. Both halves were wrong. The cache
+warms on **turn 2 of a single run** (Sonnet call 0 writes 41,723; call 1 reads
+it back), and Kimi **does** return cache tokens once it runs a real multi-turn
+loop. The earlier reading that the candidates returned none came from runs that
+died at turn 2 — contaminated by defect 2 below.
+
+`cost_usd` still raises: it is the right primitive, and the guard is what stops
+a guessed multiplier corrupting the headline metric. The call site now catches
+per turn. `SCHEMA_VERSION` 1.1.0 → **2.0.0**, the first non-additive change —
+`cost_usd` becomes `float | None`, where `None` is "price unknown" and `0.0`
+keeps meaning a genuine zero.
+
+### 2. LiteLLM mangled Kimi's tool-call ids
+
+Kimi emits `functions.Read:0`. `normalize_anthropic_tool_use_id` rewrote every
+character outside `[a-zA-Z0-9_-]` to `_`, so Claude Code received
+`functions_Read_0`, stored it, and echoed it back — and Kimi stopped driving
+the tool loop, announcing the fix in prose and exiting `subtype: success` with
+no edit.
+
+The function's own docstring names this pairing. It was added for the *reverse*
+case — a Kimi-format id reaching a native Anthropic deployment — and is
+destructive applied on the Kimi path itself.
+
+**Diagnosis was by controlled experiment, not inspection.** The wire log could
+not answer it: `proxy_callback._request` prefers `optional_params` over the
+inbound body, so it records Anthropic-shaped messages and OpenAI-shaped tools,
+and never the outbound messages. Reconstructing the bridge's actual output
+(verified against the real transformation, no network) and replaying it:
+
+| tool_call_id | tool calls emitted |
+|---|---|
+| `functions.Read:0` (native) | 42/42 |
+| `functions_Read:0`, `zz:0` (colon kept) | included above |
+| `functions_Read_0` (what the bridge sent) | **0/22** |
+| `call_abc0` (foreign, no colon) | 4/6 |
+
+Function name in the id is irrelevant (`functions.Edit:0` works 4/4). A simple
+"colon required" reading is wrong — `call_abc0` mostly works without one — so
+the honest statement is narrower: **the exact string the bridge produced is in
+the always-fails class, and preserving the colon is deterministically safe.**
+
+End-to-end confirmation came before any fix was written: disabling the
+sanitizer made Kimi run `Read ×2 → Edit → Bash → Bash` and produce the correct
+diff, 3/3. That same run is what fired the cache guard for the first time — and
+produced exactly the predicted catastrophe, a **successful** run recorded as a
+row of zeroes.
+
+**Not a thumb on the scale.** Verified post-patch: Sonnet still emits
+`toolu_bdrk_…` and Nemotron `call_3a20…`, both already inside the allowed class,
+so the sanitizer was a no-op for them and remains one. The patch is
+unconditional and process-wide precisely so it cannot become a per-arm
+difference.
+
+**Design points that came out of adversarial review, each verified before
+adoption:**
+
+- The patch must **not** hang off `proxy_callback.py`: `runner.py` imports that
+  module at harness level, so it would patch litellm in every harness process
+  and every pytest run. It lives in its own module, registered separately in
+  all three proxy configs — patching only the production config would let the
+  §6.6 gate certify an unpatched topology under the same name.
+- Patching `common_utils` alone is a **no-op on the response path**:
+  `adapters.transformation` bound the symbol with `from … import` and holds its
+  own reference. A mutation anchor now reproduces exactly that half-fix.
+- Provenance is **observed, not configured**. The proxy writes a manifest with
+  its own patch set and its own litellm version; the harness reads it back.
+  `Versions.litellm` is the harness's version and says nothing about the
+  container, which pins its own — recording "patch active" from our config
+  would be configuration reported as observation.
+
+**Result: 3 of 4 arms at 3/3.** Gemma alone still fails, now 9/9 identically.
+Two of the three original "model failures" have turned out to be adapter
+defects with one-line causes.
+
+**Known exposure, recorded in `TASKS.md`:** removing the sanitizer process-wide
+makes `kimi-k2-5-runtime` unsafe, since Bedrock's Converse `toolUseId` enforces
+its own character class. No arm in `EVAL_ARMS` is affected.
+
+**Gap left open:** the §6.6 offline gate cannot reach either defect — every
+offline deployment uses the `anthropic/` provider, which bypasses the
+openai→anthropic adapter entirely. The fix has unit coverage and a mutation
+anchor, but the gate would stay green if the patch died.

@@ -97,6 +97,8 @@ These are enforced in code and asserted by tests. Breaking one is usually silent
 - **The config dir must not live under `/repo`** — `git add -A` would sweep the whole config tree and every transcript into each checkpoint diff.
 - **The agent image runs as non-root.** Claude Code refuses `bypassPermissions` under root and exits before emitting a single event.
 - **LiteLLM callbacks must be registered as an instance of `CustomLogger`.** LiteLLM dispatches on `isinstance`; a dotted path resolving to a class, or a duck-typed object, is skipped in silence.
+- **`litellm_patches` must never be imported from `bakeoff/`.** Importing it applies its patches — `instance` is built at module scope because `get_instance_fn` resolves the configured dotted path with `getattr`. The proxy imports it via `litellm_settings.callbacks`; the harness must not, or every harness process and every pytest run gets a patched litellm. `runner.py` imports `proxy_callback` at module level, which is why the manifest read/write lives there and not in the patch module.
+- **A pricing failure must not reach `parse_trajectory`'s caller.** `cost_usd` raises by design, but the call site catches per turn and records `pricing_error`. Letting it escape aborts the parse, and `assemble_record` then discards the whole trajectory — turns, tokens, tool calls and destructive events all zero for a run that worked. `cost_usd` is `float | None`: `None` is "price unknown", `0.0` is a genuine zero, and the two are not interchangeable.
 - **`mock_response` deployments short-circuit before the streaming wrapper**, so the success callback never fires and capture silently misses the call. Every real call is streaming — hence `fixtures/anthropic_stub.py`, a real streaming endpoint, for the offline smoke test.
 
 ## Conventions
@@ -114,4 +116,4 @@ These are enforced in code and asserted by tests. Breaking one is usually silent
 | [specs/2026-08-03-llm-bakeoff-eval-design.md](docs/superpowers/specs/2026-08-03-llm-bakeoff-eval-design.md) | The spec every `section N.N` reference in the code points at. |
 | [plans/2026-08-04-bakeoff-harness-logging.md](docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md) | Implementation plan, Tasks 1–12. |
 
-Current state: Tasks 1–11 complete, Task 12's offline half done. The live half ran twice on 2026-08-07, ending at **2 of 4 arms passing** — Sonnet 5 (on bedrock-runtime) and Nemotron. The two remaining failures are adapter issues, not model capability, and are the P0 items in `TASKS.md`.
+Current state: Tasks 1–11 complete, Task 12's offline half done. The live half now runs at N=3 per arm, with **3 of 4 arms passing 3/3** — Sonnet 5 (on bedrock-runtime), Nemotron and Kimi K2.5. Gemma alone still fails, 9/9 identically, and is the P0 item in `TASKS.md`. Two of the three original "model failures" turned out to be adapter defects with one-line causes; weigh that before reading Gemma's as capability.
