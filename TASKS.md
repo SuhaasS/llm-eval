@@ -24,7 +24,7 @@ which is worth weighing when reading Gemma below.
 
 - [ ] **Gemma 4 31B — `JSON-RPC error -32602: Job registration failed ...
   Generation failed`.** Bedrock-side, not a parameter rejection. **Observed
-  6/6**, identically: 1 turn, 0 tool calls, 2 wire calls, no diff. Deterministic.
+  9/9**, identically: 1 turn, 0 tool calls, 2 wire calls, no diff. Deterministic.
   The error has two surface forms — a plain `BadRequestError` when it lands
   before the stream and a `MidStreamFallbackError` when it lands during it.
   One fault, not two. At N=3 every proxy-side error in the run attributed to
@@ -191,8 +191,14 @@ None of these can appear at N=1. All will appear at N=10.
 - [ ] **`ToolCallStats.malformed` is never populated at harness time**, so
   `TOOL_MALFORMATION` and `ADAPTER_FAILURE` are both unreachable — and §6.4
   calls the adapter-vs-model distinction the eval's most consequential call.
-  Deferred to the wire-log analysis in the scoring plan; nothing can fire it
-  until that lands.
+  Keep `malformed` at 0 at harness time (deciding a call was malformed means
+  reading raw completions, which §6.4 puts offline). The Kimi tool-id defect
+  made the cost of this concrete: it was an adapter failure the harness could
+  never have flagged, and it took a live run to find.
+  Next, for the scoring plan: a pass over `wire.jsonl.gz` where the set of
+  `tool_use` ids in a response must equal the set of `tool_result` ids in the
+  next request. That single check would have caught the id mangling directly,
+  offline and for free.
 
 - [ ] **§5.2's config dump is an artifact, not a record field.** Written to
   `artifacts_root/<arm>/effective_config.json` and diffed across arms by the
@@ -217,14 +223,6 @@ None of these can appear at N=1. All will appear at N=10.
   forwards raw `input_json_delta` and does no repair, so this bites the
   occasional non-streaming call rather than every turn. Detect offline by
   comparing the wire log's raw arguments against the transcript.
-
-- [ ] **`ToolCallStats.malformed` is hard-zero, so `ADAPTER_FAILURE` is
-  unreachable** — and the Kimi tool-id bug was precisely an adapter failure the
-  harness could never have flagged. Keep `malformed` at 0 at harness time (§6.4
-  puts the adapter-vs-model call offline) and write the detector as a pass over
-  `wire.jsonl.gz`: the set of `tool_use` ids in a response must equal the set
-  of `tool_result` ids in the next request. That check would have caught the
-  id-mangling defect directly, without a live run.
 
 - [ ] **`TokenUsage.reasoning` is structurally 0 on all three candidates.** The
   adapter's usage translation emits input/output/cache fields and has no
@@ -258,7 +256,7 @@ None of these can appear at N=1. All will appear at N=10.
 
 ## Housekeeping
 
-- [ ] **20 commits unpushed.** Pushed manually.
+- [ ] **27 commits unpushed.** Pushed manually.
 
 - [ ] **`bakeoff/.env` holds three commented-out static AWS credential lines
   with plaintext values**, annotated in-file as an expired STS session
