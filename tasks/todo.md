@@ -16,7 +16,94 @@ review log — one section per finished task, kept for what each one turned up.
 - [x] **Task 9** — Claude Code runner
 - [x] **Task 10** — Run orchestrator
 - [x] **Task 11** — Fault-injection gate
-- [~] **Task 12** — End-to-end smoke test — offline half DONE; live half 3 of 4 arms passing
+- [x] **Task 12** — End-to-end smoke test — offline DONE; live **GO, 4 arms 3/3**
+
+---
+
+## Gemma's second adapter defect, and Phase 0c goes GO — 2026-08-11
+
+With `propertyNames` fixed Gemma finally emitted tool calls — 30 of them, every
+run — and still did nothing: all `Bash`, 4 distinct commands, no `Edit`, no
+diff, `terminated_by: turns`. That read like a model looping. It was not.
+
+**Gemma returns the same tool-call id on every response.**
+
+```
+tool-call ids Gemma returned across all 30 responses: {'call_0': 30}
+```
+
+Its ids are indexed *within* a response and it emits one call per response
+(`supports_parallel_function_calling: false`), so the index is always 0. Every
+other arm is unique — Sonnet `toolu_bdrk_…` 5/5, Nemotron `call_4196d6e0…` 8/8,
+Kimi `functions.Read:0` 5/5.
+
+Claude Code executed all 30 locally (`tool_use {'call_0': 30}`,
+`tool_result {'call_0': 30}`) but could not pair duplicates when re-serializing,
+so the conversation Gemma actually saw carried **1 tool_use, 1 tool_result and
+28 `(no content)` turns**. It never observed anything after its first `ls`, so
+it re-issued the same plan to the turn cap. Every symptom followed from that.
+
+**The fix** rewrites a response-path id only when it collides with one already
+in the conversation — a strict no-op for the three arms whose ids never repeat,
+which is what keeps it from becoming a per-arm difference and what stops it
+rewriting Kimi's `functions.Read:0`, the exact shape the previous patch exists
+to preserve.
+
+**Two mistakes, both caught by measuring rather than reasoning.** They are worth
+recording because the second is the failure mode this file keeps describing.
+
+1. **The ContextVar carrier did not work.** The plan was to set the
+   conversation's id set in the pre-request hook and read it on the per-chunk
+   translation. Probing the running proxy:
+
+   ```
+   [probe] HOOK          set={'functions.Read:0'}
+   [probe] RESPONSE      seen=None      <- every chunk, every time
+   [probe] WRAPPER_INIT  seen={'functions.Read:0'}
+   ```
+
+   The SSE response is iterated by the server's own task, whose context was
+   copied before the hook ran. `AnthropicStreamWrapper.__init__` still sees it —
+   it runs in the handler coroutine — so the set is snapshotted there, onto the
+   stream, and read back in `_should_start_new_content_block`.
+
+2. **A mutable ContextVar default hid that entirely.** `default=set()` is one
+   object shared by every context that never called `set()`, so the broken
+   version still produced unique-looking ids by accumulating them process-wide
+   across every run and arm, and the gate passed. The default is now `None`,
+   which the code refuses to guess from.
+
+**The gate needed a third check, and finding that out took reverting the fix.**
+The stub now issues the same Kimi-shaped id twice, reproducing Gemma's failure
+offline byte-for-byte — with the patch off, `{'functions.Read:0': 29}` and 28
+`(no content)` turns. But the obvious signals stayed green: the arm ran **60
+turns and 30 tool calls and still landed the 157-byte diff**, so `diff_b` and
+the verdict passed, and `validate_tool_call_ids` never fired because Claude Code
+drops the unpairable call rather than echoing a bad one. `validate_loop_progress`
+closes it — the openai script is exactly 3 calls, so a 4th means the loop is not
+advancing. Carrier working: kimi 5 turns, GO. Carrier broken: crashed, NO-GO.
+
+**Result: GO. Four arms, 3/3 each**, correct 157-byte diff on all 12 runs.
+Gemma 17/19/23 turns and 8/9/11 tool calls; the mechanism verified directly
+rather than inferred from the outcome:
+
+```
+gemma-4-31b-0: model returned 8 calls / 1 distinct raw id {'call_0': 8}
+   after uniquify: ['call_0', 'call_0_1', ... 'call_0_7']
+   tool_results=8   '(no content)' turns=0
+```
+
+**Four for four.** Every "model failure" this eval has produced has been a
+harness-layer defect: Sonnet's beta header, Kimi's tool-id mangling, Gemma's
+`propertyNames`, Gemma's colliding ids. Each was deterministic, each was total,
+each had a small cause. No capability claim about any arm is supported by
+anything in the log yet, and that is the base rate the next total failure should
+be read against.
+
+**Left open, deliberately:** the request carries `system` both as a top-level
+field and as 6 inline `system`-role messages, the first landing *after* the user
+message. Filed in `TASKS.md` rather than bundled here, so this run stays
+attributable to the id fix alone.
 
 ---
 

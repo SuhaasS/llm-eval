@@ -4,8 +4,8 @@ Single list of open work for the LLM bakeoff eval. **This file is the backlog.**
 `tasks/todo.md` is the opposite — a completed-work review log, one section per
 finished task. Nothing here is done; move it there when it is.
 
-Last updated 2026-08-11, after the N=3 live run that took Gemma from 0 tool
-calls to 30 and moved its failure out of the adapter and into the model.
+Last updated 2026-08-11. **Phase 0c is GO**: four arms, 3/3 each, after two
+Gemma adapter defects were found and fixed in one day.
 
 Spec: [docs/superpowers/specs/2026-08-03-llm-bakeoff-eval-design.md](docs/superpowers/specs/2026-08-03-llm-bakeoff-eval-design.md)
 Harness plan: [docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md](docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md)
@@ -14,34 +14,29 @@ Harness plan: [docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md](doc
 
 ## P0 — Blocking Phase 0c go/no-go
 
-Latest N=3 live run, 12 runs across 4 arms: **3 of 4 arms pass, 3/3 each.**
-Sonnet 5 (bedrock-runtime), Nemotron and Kimi K2.5 all produce the correct diff
-on every run. **Gemma is the only arm still failing** — but its failure moved.
+Latest N=3 live run, 2026-08-11, 12 runs across 4 arms: **GO — all four arms
+3/3**, every run producing the correct 157-byte diff. Sonnet 5 7–8 turns,
+Gemma 17–23, Nemotron 21–27, Kimi 10–12.
 
-Gemma's `-32602` is fixed and was an adapter defect: two of Claude Code's tool
-schemas carry `propertyNames`, which Gemma's Bedrock engine rejects, and the
-proxy now strips it. See `tasks/todo.md`. Gemma went from **0 tool calls in any
-run** to **30 in every run**. That makes it **three of three** original "model
-failures" that were harness-layer defects with one-line causes — Sonnet's beta
-header, Kimi's tool-id mangling, and this. Weigh that base rate before reading
-what is left below as capability.
+Gemma took two fixes to get there, both adapter defects, neither about the
+model: its Bedrock engine rejects `propertyNames` in a tool schema, and it
+returns the tool-call id `call_0` on every response so Claude Code could not
+pair anything after the first call. See `tasks/todo.md`.
 
-- [ ] **Gemma 4 31B loops on Bash and never edits.** 3/3, identically:
-  30 tool calls, **all of them `Bash`**, only **4 distinct commands** among the
-  30, mostly `python3 tests/test_calc.py` repeated. No `Read`, no `Edit`, no
-  assistant text, no diff, `terminated_by: turns` — it exhausts the turn cap.
-  ~100s wall per run, `errored: 0`, `malformed: 0`; every call is well-formed
-  and answers 200.
-  This is the first behavioural evidence about Gemma the eval has ever had, and
-  unlike the `-32602` it is not obviously a transport fault. But it is not yet
-  clean evidence of capability either: **30/30 calls landing on a single tool**
-  is itself a suspicious distribution, and the price-map entry records
-  `supports_parallel_function_calling: false` for this model. Rule out a
-  tool-selection or tool-presentation artifact before concluding the model
-  cannot do the task.
-  Next: read the wire log for what Gemma was actually offered and what it
-  returned, then decide whether Gemma stays in the eval. That decision sets the
-  arm count, which sizes the dataset, so make it before Phase 3.
+**Four for four.** Every "model failure" this eval has produced — Sonnet's beta
+header, Kimi's tool-id mangling, Gemma's `propertyNames`, Gemma's colliding ids
+— has been a harness-layer defect. Each looked deterministic and total
+beforehand. Nothing in the record yet supports a capability claim about any arm,
+and that base rate is the thing to weigh the next total failure against.
+
+- [ ] **The request carries `system` twice, and the first copy lands after the
+  user message.** Seen in every Gemma wire log from 2026-08-11: the request has
+  a top-level `system` field *and* 6 inline `system`-role messages, with
+  `messages[1]` being the first of them — so the role sequence opens
+  `['user', 'system', ...]`. Not implicated in any measured failure, and
+  deliberately not bundled into the tool-call id fix so that run stays
+  attributable. Worth a look before Phase 3: it is not the shape any provider
+  documents, and an arm that handles it badly would look like a weak model.
 
 - [ ] **`kimi-k2-5-runtime` is newly unsafe** and must not be run without a
   fix. The tool-id patch removes the sanitizer process-wide; on the `bedrock/`
@@ -61,14 +56,12 @@ what is left below as capability.
   any Sonnet-vs-candidate delta carries that. It needs to be stated wherever
   the comparison is published, not just known here.
 
-- [ ] **Re-run the four-arm smoke to a real GO.** The N=3 criterion is
-  implemented and enforced (`smoke_test.py --repeats`, default 3 live, GO
-  requires every repeat of every arm; a run below N=3 prints an explicit
-  weaker-than-criterion warning). Latest run, 2026-08-11: **NO-GO at 3 of 4
-  arms** — Sonnet 5 3/3, Nemotron 3/3, Kimi 3/3, Gemma 0/3.
-  Blocked on Gemma alone, not on the gate. Unchanged as a count, but the
-  blocker is now the loop-on-Bash behaviour above rather than a transport
-  rejection, and that is a different decision.
+- [x] **Re-run the four-arm smoke to a real GO.** Done 2026-08-11: **GO, all
+  four arms 3/3** at the default `--repeats 3`. Moved to `tasks/todo.md`.
+  What this does and does not license: the loop, the transport, the capture and
+  the §5.2 config dump are now demonstrated on every arm, so Phase 0c's
+  go/no-go is answered. It says nothing about relative model quality — one
+  fixture task, N=3, and the harness does not grade.
 
 ---
 
