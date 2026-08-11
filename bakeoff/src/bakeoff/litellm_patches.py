@@ -1,10 +1,16 @@
-"""Adapter patches applied to LiteLLM inside the PROXY process only.
+"""Adapter interventions applied to LiteLLM inside the PROXY process only.
 
 Spec section 6.4 exists to tell an adapter failure apart from a model failure.
-This module removes one adapter failure that was being measured as model
-weakness.
+This module removes two adapter failures that were being measured as model
+weakness. Both were total, both were deterministic, and both had one-line
+causes -- which is the base rate to weigh before reading the next arm's failure
+as capability.
 
-THE DEFECT. Kimi K2.5 emits tool-call ids of the form ``functions.Read:0``.
+  anthropic_tool_use_id_passthrough        Kimi K2.5, below
+  anthropic_tool_schema_property_names_strip   Gemma 4 31B, in the hook on
+                                           BakeoffAdapterPatches
+
+THE FIRST DEFECT. Kimi K2.5 emits tool-call ids of the form ``functions.Read:0``.
 LiteLLM's ``normalize_anthropic_tool_use_id`` rewrites every character outside
 ``[a-zA-Z0-9_-]`` to an underscore, so the id becomes ``functions_Read_0`` on
 the way back to Claude Code. Claude Code stores it and echoes it in the next
@@ -60,9 +66,16 @@ from typing import Any
 
 from litellm.integrations.custom_logger import CustomLogger
 
-# Stable identifier recorded on every run record. Changing it changes what the
-# log claims was done to the adapter, so it is a name, not a description.
+# Stable identifiers recorded on every run record. Changing one changes what
+# the log claims was done to the adapter, so these are names, not descriptions.
 TOOL_USE_ID_PASSTHROUGH = "anthropic_tool_use_id_passthrough"
+TOOL_SCHEMA_PROPERTY_NAMES_STRIP = "anthropic_tool_schema_property_names_strip"
+
+# The one JSON-Schema keyword Gemma's Bedrock engine will not accept. Measured,
+# not guessed: see the second defect in the module docstring. Deliberately a
+# single name rather than a denylist -- every other exotic keyword in Claude
+# Code's schemas was probed individually and passed.
+_REJECTED_SCHEMA_KEYWORD = "propertyNames"
 
 # Anthropic's own separator for Gemini thought signatures. The function being
 # patched has a second, unrelated job -- stripping this suffix -- and that job
@@ -84,6 +97,29 @@ def _passthrough_tool_use_id(raw_id: str) -> str:
         else raw_id
     )
     return base_id or "tool_use_id"
+
+
+def _strip_property_names(obj: Any) -> Any:
+    """Return ``obj`` with every ``propertyNames`` key removed, at any depth.
+
+    A copy, never in-place. The object handed to the hook is Claude Code's own
+    request, and mutating it would make the wire log's ``tool_schema_sha``
+    depend on whether capture ran before or after the hook -- configuration
+    leaking into observation, which section 6.2 exists to prevent.
+
+    Recursion is over the whole schema rather than the top level because Gemma
+    rejected the nested form too, and nested is where both real occurrences
+    live (``properties.metadata.propertyNames`` on TaskCreate and TaskUpdate).
+    """
+    if isinstance(obj, dict):
+        return {
+            key: _strip_property_names(value)
+            for key, value in obj.items()
+            if key != _REJECTED_SCHEMA_KEYWORD
+        }
+    if isinstance(obj, list):
+        return [_strip_property_names(item) for item in obj]
+    return obj
 
 
 def _targets() -> list[Any]:
@@ -109,11 +145,22 @@ def _targets() -> list[Any]:
 
 
 def apply() -> list[str]:
-    """Install the patches and verify they took. Idempotent.
+    """Install the interventions and verify they took. Idempotent.
 
-    Returns the applied patch ids. Raises if a target module no longer holds
-    the symbol -- a litellm upgrade that renames or moves it must fail loudly
-    here rather than leave the proxy quietly mangling ids again.
+    Returns their ids, in the order they are applied. Raises if a target module
+    no longer holds the symbol -- a litellm upgrade that renames or moves it
+    must fail loudly here rather than leave the proxy quietly mangling ids
+    again.
+
+    The two interventions are verified differently because they work
+    differently. The tool-id passthrough is a monkeypatch, so the check calls
+    the patched function and reads the result. The propertyNames strip is a
+    pre-request HOOK, and nothing here can prove litellm will call it -- that
+    depends on this class being registered in ``litellm_settings.callbacks``
+    and on ``anthropic_messages`` still dispatching pre-request hooks. What is
+    checked here is only that the strip itself works and the hook exists to
+    carry it. The claim that litellm actually calls it is made by the offline
+    gate, where a surviving ``propertyNames`` makes the stub answer 400.
     """
     applied: list[str] = []
     for module in _targets():
@@ -135,6 +182,20 @@ def apply() -> list[str]:
                 f"got {probe!r}"
             )
     applied.append(TOOL_USE_ID_PASSTHROUGH)
+
+    probe = _strip_property_names(
+        {"properties": {"metadata": {_REJECTED_SCHEMA_KEYWORD: {"type": "string"}}}}
+    )
+    if probe != {"properties": {"metadata": {}}}:
+        raise RuntimeError(
+            f"{TOOL_SCHEMA_PROPERTY_NAMES_STRIP} did not take: got {probe!r}"
+        )
+    if not hasattr(BakeoffAdapterPatches, "async_pre_request_hook"):
+        raise RuntimeError(
+            f"{TOOL_SCHEMA_PROPERTY_NAMES_STRIP} has no hook to run in: "
+            "BakeoffAdapterPatches lost async_pre_request_hook"
+        )
+    applied.append(TOOL_SCHEMA_PROPERTY_NAMES_STRIP)
     return applied
 
 
@@ -157,14 +218,60 @@ def _report(patches: list[str]) -> Path | None:
 
 
 class BakeoffAdapterPatches(CustomLogger):
-    """Applies the patches on construction.
+    """Applies the patches on construction, and carries the propertyNames strip.
 
-    A CustomLogger subclass on purpose. LiteLLM's ``initialize_callbacks_on_proxy``
-    resolves each entry in ``litellm_settings.callbacks`` and its success
-    handler dispatches on ``isinstance(cb, CustomLogger)`` -- a duck-typed
-    object is skipped in silence. Registering properly means the entry cannot
-    rot into a no-op that still looks configured.
+    A CustomLogger subclass on purpose, now for two reasons. LiteLLM's
+    ``initialize_callbacks_on_proxy`` resolves each entry in
+    ``litellm_settings.callbacks`` and its success handler dispatches on
+    ``isinstance(cb, CustomLogger)`` -- a duck-typed object is skipped in
+    silence. Registering properly means the entry cannot rot into a no-op that
+    still looks configured. And ``async_pre_request_hook`` below is only
+    reached because this is a real CustomLogger: ``_execute_pre_request_hooks``
+    iterates ``litellm.callbacks`` and skips anything that fails the same
+    isinstance check.
     """
+
+    async def async_pre_request_hook(
+        self, model: str, messages: list, kwargs: dict
+    ) -> dict:
+        """Remove ``propertyNames`` from every tool schema, on every arm.
+
+        THE DEFECT. Gemma 4 31B failed 9/9 live runs with ``JSON-RPC error
+        -32602: Job registration failed: Engine bad request: Task submission
+        failed with status 400 Bad Request: Generation failed``. Measured
+        against live bedrock-mantle on 2026-08-10 by a 15-rung request ladder:
+        the fault is one JSON-Schema keyword. ``exclusiveMinimum``,
+        ``maxItems``, ``anyOf``, ``const``, ``format`` and ``pattern`` each
+        pass; ``propertyNames`` fails, object-level and nested alike. Exactly
+        two of the 24 tools Claude Code 2.1.220 declares carry it -- TaskCreate
+        and TaskUpdate, both on ``properties.metadata`` -- and each fails alone
+        against Gemma while passing against Nemotron. 74 bytes, one whole arm.
+
+        WHY THIS IS NOT A THUMB ON THE SCALE. ``propertyNames: {"type":
+        "string"}`` is vacuous: JSON object keys are strings by definition, so
+        removing it constrains nothing that was constrained before. No arm's
+        tool contract changes meaning. The strip is unconditional and applies
+        to all four arms for the same section 6.4 reason the tool-id patch is
+        process-wide: a per-arm intervention would make the arms non-identical
+        in transport, which is the confound this harness works to avoid.
+
+        WHY A HOOK RATHER THAN A PATCH. ``anthropic_messages`` calls
+        ``_execute_pre_request_hooks`` before it branches on provider, and
+        keeps the ``tools`` this returns. So one hook covers the ``anthropic/``
+        Sonnet arm and the three ``openai/`` candidate arms identically.
+        Patching the openai->anthropic adapter instead would reach the
+        candidates only, and reintroduce the asymmetry.
+
+        Returning ``kwargs`` rather than ``None`` matters: the caller keeps the
+        return value, so ``None`` on a request with no tools would discard
+        every other parameter.
+
+        Verified against litellm 1.95.0 and claude 2.1.220.
+        """
+        tools = kwargs.get("tools")
+        if tools:
+            kwargs["tools"] = _strip_property_names(tools)
+        return kwargs
 
     def __init__(self) -> None:
         super().__init__()
