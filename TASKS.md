@@ -4,8 +4,10 @@ Single list of open work for the LLM bakeoff eval. **This file is the backlog.**
 `tasks/todo.md` is the opposite — a completed-work review log, one section per
 finished task. Nothing here is done; move it there when it is.
 
-Last updated 2026-08-11. **Phase 0c is GO**: four arms, 3/3 each, after two
-Gemma adapter defects were found and fixed in one day.
+Last updated 2026-08-11. Two Gemma adapter defects fixed; Gemma is now 6/6
+across two independent N=3 runs. **Phase 0c is not GO** — a repeat run put
+Nemotron at 2/3 on a model-behaviour flake, so the criterion is unmet and the
+arm's flake rate is the new P0.
 
 Spec: [docs/superpowers/specs/2026-08-03-llm-bakeoff-eval-design.md](docs/superpowers/specs/2026-08-03-llm-bakeoff-eval-design.md)
 Harness plan: [docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md](docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md)
@@ -14,9 +16,35 @@ Harness plan: [docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md](doc
 
 ## P0 — Blocking Phase 0c go/no-go
 
-Latest N=3 live run, 2026-08-11, 12 runs across 4 arms: **GO — all four arms
-3/3**, every run producing the correct 157-byte diff. Sonnet 5 7–8 turns,
-Gemma 17–23, Nemotron 21–27, Kimi 10–12.
+Two independent N=3 runs on 2026-08-11, 24 runs across 4 arms:
+
+| arm | run A | run B |
+|---|---|---|
+| claude-sonnet-5-runtime | 3/3 | 3/3 |
+| gemma-4-31b | 3/3 | 3/3 |
+| nemotron-3-super-120b | 3/3 | **2/3** |
+| kimi-k2-5 | 3/3 | 3/3 |
+
+Run A was GO. Run B was NO-GO on Nemotron alone. **The GO does not reproduce**,
+and one observation of it was not a rate — the same mistake §5.7 and the N=3
+criterion exist to prevent, made here in the space of one afternoon.
+
+- [ ] **Nemotron 3 Super drops the loop mid-task, ~1 run in 6.** Measured on
+  the run B failure: `terminated_by: agent_finish`, 3 turns, **1 tool call**
+  (`Read`), no diff. It wrote *"Now let me check the test file to see what the
+  expected behavior should be:"* and then ended its turn without emitting the
+  call. No API error, no retry, `errored: 0`, `malformed: 0`, ids unique, zero
+  `(no content)` turns — so nothing in the adapter is implicated, and the
+  proxy-side interventions provably never fired on this arm.
+  This is the eval's **first failure that survives an adapter explanation**,
+  which makes it the first thing in the log that might be about a model. Treat
+  it as a rate, not an event: 1/6 today, and a single further observation will
+  not settle it either. It also lands directly on §5.7 — an arm that silently
+  quits ~17% of the time makes pass@1 a measurement of the flake as much as of
+  the model.
+  Next: repeat N≥10 on this arm alone before Phase 3 sizing, and decide whether
+  a quit-without-tool-call is an exclusion or a legitimate failure. The harness
+  does not grade, so that decision belongs in the scoring plan.
 
 Gemma took two fixes to get there, both adapter defects, neither about the
 model: its Bedrock engine rejects `propertyNames` in a tool schema, and it
@@ -56,12 +84,17 @@ and that base rate is the thing to weigh the next total failure against.
   any Sonnet-vs-candidate delta carries that. It needs to be stated wherever
   the comparison is published, not just known here.
 
-- [x] **Re-run the four-arm smoke to a real GO.** Done 2026-08-11: **GO, all
-  four arms 3/3** at the default `--repeats 3`. Moved to `tasks/todo.md`.
-  What this does and does not license: the loop, the transport, the capture and
-  the §5.2 config dump are now demonstrated on every arm, so Phase 0c's
-  go/no-go is answered. It says nothing about relative model quality — one
-  fixture task, N=3, and the harness does not grade.
+- [ ] **Re-run the four-arm smoke to a real GO.** Run A on 2026-08-11 was GO,
+  all four arms 3/3; run B immediately after was NO-GO at Nemotron 2/3. Still
+  open, and now blocked on the Nemotron flake rather than on Gemma.
+  What the two runs *do* establish, independent of the verdict: the loop, the
+  transport, the capture and the §5.2 config dump work on every arm, and Gemma
+  is 6/6. What they do not: any statement about relative model quality — one
+  fixture task, and the harness does not grade.
+  **The N=3 criterion is itself now suspect.** It was chosen so a single run
+  could not be read as a rate, and two consecutive N=3 runs just disagreed on
+  the verdict. Whatever N Phase 3 uses has to be sized off the measured flake
+  rate above, not picked in advance.
 
 ---
 

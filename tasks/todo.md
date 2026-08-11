@@ -16,7 +16,7 @@ review log — one section per finished task, kept for what each one turned up.
 - [x] **Task 9** — Claude Code runner
 - [x] **Task 10** — Run orchestrator
 - [x] **Task 11** — Fault-injection gate
-- [x] **Task 12** — End-to-end smoke test — offline DONE; live **GO, 4 arms 3/3**
+- [~] **Task 12** — End-to-end smoke test — offline DONE; live Gemma 6/6, but the GO does not reproduce (Nemotron flake)
 
 ---
 
@@ -83,8 +83,8 @@ drops the unpairable call rather than echoing a bad one. `validate_loop_progress
 closes it — the openai script is exactly 3 calls, so a 4th means the loop is not
 advancing. Carrier working: kimi 5 turns, GO. Carrier broken: crashed, NO-GO.
 
-**Result: GO. Four arms, 3/3 each**, correct 157-byte diff on all 12 runs.
-Gemma 17/19/23 turns and 8/9/11 tool calls; the mechanism verified directly
+**Result: Gemma 6/6 across two independent N=3 runs**, 17–23 turns and 8–11
+tool calls, correct 157-byte diff every time. The mechanism verified directly
 rather than inferred from the outcome:
 
 ```
@@ -99,6 +99,19 @@ harness-layer defect: Sonnet's beta header, Kimi's tool-id mangling, Gemma's
 each had a small cause. No capability claim about any arm is supported by
 anything in the log yet, and that is the base rate the next total failure should
 be read against.
+
+**And the first GO did not reproduce.** Run A was GO at four arms 3/3; run B,
+immediately after, was NO-GO at Nemotron 2/3 — `agent_finish` at 3 turns after a
+single `Read`, having written *"Now let me check the test file"* and then not
+emitted the call. Unique ids, zero `(no content)`, `errored: 0`, no API error;
+the proxy-side interventions provably never fired on that arm, so unlike the
+four above this one survives an adapter explanation.
+
+That is worth more than the GO was. Two consecutive N=3 runs disagreed on the
+verdict, which is the same "one observation is not a rate" error the N=3
+criterion was introduced to prevent — committed here in the docs an hour before
+the repeat run falsified them. The GO claim has been withdrawn from `TASKS.md`
+and the Nemotron flake rate is the new P0.
 
 **Left open, deliberately:** the request carries `system` both as a top-level
 field and as 6 inline `system`-role messages, the first landing *after* the user
