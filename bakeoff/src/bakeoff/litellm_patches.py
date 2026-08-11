@@ -61,6 +61,7 @@ Verified against litellm 1.95.0.
 from __future__ import annotations
 
 import os
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +71,26 @@ from litellm.integrations.custom_logger import CustomLogger
 # the log claims was done to the adapter, so these are names, not descriptions.
 TOOL_USE_ID_PASSTHROUGH = "anthropic_tool_use_id_passthrough"
 TOOL_SCHEMA_PROPERTY_NAMES_STRIP = "anthropic_tool_schema_property_names_strip"
+TOOL_USE_ID_COLLISION_UNIQUIFY = "anthropic_tool_use_id_collision_uniquify"
+
+# The tool_use ids already present in the conversation being answered, set by
+# the pre-request hook and read on the response path.
+#
+# A ContextVar and not an attribute, because there is nowhere to hang an
+# attribute: `LiteLLMAnthropicMessagesAdapter()` is constructed fresh at each
+# call site (transformation.py, streaming_iterator.py), so `self` never
+# outlives one translation. The hook is awaited rather than run as a Task, so
+# what it sets lands in the enclosing request's context and is visible to the
+# provider call and the streaming iterator beneath it.
+# The default is None, never a set(). A mutable default on a ContextVar is a
+# single object shared by every context that never called set() -- so a missed
+# propagation would not fail, it would quietly accumulate ids across every run
+# and every arm in the process and still produce unique-looking output. That
+# reads as a working patch. None means "no request context reached here", which
+# is a state the code can detect and refuse to guess at.
+_SEEN_TOOL_USE_IDS: ContextVar[set[str] | None] = ContextVar(
+    "bakeoff_seen_tool_use_ids", default=None
+)
 
 # The one JSON-Schema keyword Gemma's Bedrock engine will not accept. Measured,
 # not guessed: see the second defect in the module docstring. Deliberately a
@@ -120,6 +141,76 @@ def _strip_property_names(obj: Any) -> Any:
     if isinstance(obj, list):
         return [_strip_property_names(item) for item in obj]
     return obj
+
+
+def _uniquify_tool_use_id(raw_id: str, seen: set[str]) -> str:
+    """Return an id not already used in this conversation, and claim it.
+
+    A no-op unless ``raw_id`` collides -- which is what keeps this from being a
+    per-arm difference. Sonnet, Nemotron and Kimi never repeat an id, so this
+    never fires on them, and in particular it never touches Kimi's
+    ``functions.Read:0``, the exact shape the passthrough patch above exists to
+    preserve. Uniquifying unconditionally would rewrite all three.
+
+    The suffix stays inside ``[a-zA-Z0-9_-]`` on purpose: Claude Code echoes
+    the rewritten id back in ``tool_result.tool_use_id`` and the inbound
+    ``sanitize_tool_use_ids_in_anthropic_messages`` runs over it, so a suffix
+    outside that class would be rewritten there and break the pairing this
+    restores.
+    """
+    if raw_id not in seen:
+        seen.add(raw_id)
+        return raw_id
+    suffix = 1
+    while f"{raw_id}_{suffix}" in seen:
+        suffix += 1
+    unique = f"{raw_id}_{suffix}"
+    seen.add(unique)
+    return unique
+
+
+def _tool_use_ids_in(messages: Any) -> set[str]:
+    """Every tool_use id already present in an anthropic-format conversation.
+
+    Only ``tool_use`` ids, not ``tool_result.tool_use_id``: a result always
+    echoes a use, so collecting both would add nothing and would make the set
+    depend on whether a turn had been answered yet.
+    """
+    seen: set[str] = set()
+    for message in messages or []:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "tool_use"
+                and isinstance(block.get("id"), str)
+            ):
+                seen.add(block["id"])
+    return seen
+
+
+def _uniquify_in_place(block: Any, seen: set[str] | None) -> None:
+    """Rewrite a ``tool_use`` block's id if it collides with ``seen``.
+
+    ``seen is None`` means the conversation's ids never reached this stream.
+    Do nothing then, rather than invent a suffix: without them there is no way
+    to know whether this id collides, and a guess would rewrite the three arms
+    whose ids are already unique. The offline gate is what proves this branch
+    is not the one being taken -- it carries a real collision, so if the set
+    goes missing the arm loops and lands no diff.
+    """
+    if seen is None or not isinstance(block, dict):
+        return
+    if block.get("type") != "tool_use":
+        return
+    raw_id = block.get("id")
+    if not isinstance(raw_id, str) or not raw_id:
+        return
+    unique = _uniquify_tool_use_id(raw_id, seen)
+    if unique != raw_id:
+        block["id"] = unique
 
 
 def _targets() -> list[Any]:
@@ -196,7 +287,91 @@ def apply() -> list[str]:
             "BakeoffAdapterPatches lost async_pre_request_hook"
         )
     applied.append(TOOL_SCHEMA_PROPERTY_NAMES_STRIP)
+
+    applied.append(_apply_collision_uniquify())
     return applied
+
+
+_WRAPPED_MARKER = "_bakeoff_collision_uniquify"
+
+# Where the conversation's id set is captured, and why it is not captured on
+# the per-chunk translation itself.
+#
+# MEASURED 2026-08-11, by probing the offline gate rather than reasoning about
+# it. The pre-request hook sets the ContextVar correctly
+# (``HOOK set={'functions.Read:0'}``), and the per-chunk translation reads
+# ``None`` on every single chunk: the SSE response is iterated by the server's
+# own task, whose context was copied before the hook ran. A ContextVar read
+# from there is always empty.
+#
+# ``AnthropicStreamWrapper.__init__`` still sees it
+# (``WRAPPER_INIT seen={'functions.Read:0'}``) -- it runs in the handler
+# coroutine, right after the provider call. So the set is snapshotted there,
+# onto the stream object, and travels with it into the chunks.
+#
+# This is also why the ContextVar's default is None rather than ``set()``: with
+# a shared mutable default the broken version still produced unique-looking
+# ids, by accumulating them process-wide across every run and arm, and the gate
+# passed. The failure has to be visible to be fixed.
+_SEEN_IDS_ATTR = "_bakeoff_seen_tool_use_ids"
+
+
+def _apply_collision_uniquify() -> str:
+    """Patch the streaming response path. Idempotent."""
+    import functools
+
+    from litellm.llms.anthropic.experimental_pass_through.adapters.streaming_iterator import (  # noqa: E501
+        AnthropicStreamWrapper,
+    )
+
+    for name in ("__init__", "_should_start_new_content_block"):
+        if not hasattr(AnthropicStreamWrapper, name):
+            raise RuntimeError(
+                f"AnthropicStreamWrapper no longer defines {name}: the litellm "
+                f"pin moved and {TOOL_USE_ID_COLLISION_UNIQUIFY} would silently "
+                "stop applying"
+            )
+
+    original_init = AnthropicStreamWrapper.__init__
+    if not getattr(original_init, _WRAPPED_MARKER, False):
+
+        @functools.wraps(original_init)
+        def patched_init(self, *args, **kwargs):
+            # A copy: the stream mutates its own set as it issues ids, and two
+            # concurrent streams must not share one.
+            seen = _SEEN_TOOL_USE_IDS.get()
+            setattr(self, _SEEN_IDS_ATTR, set(seen) if seen is not None else None)
+            return original_init(self, *args, **kwargs)
+
+        setattr(patched_init, _WRAPPED_MARKER, True)
+        AnthropicStreamWrapper.__init__ = patched_init
+
+    original_should_start = AnthropicStreamWrapper._should_start_new_content_block
+    if not getattr(original_should_start, _WRAPPED_MARKER, False):
+
+        @functools.wraps(original_should_start)
+        def patched_should_start(self, *args, **kwargs):
+            started = original_should_start(self, *args, **kwargs)
+            # Only when a NEW block opens: that is the one moment the id is
+            # minted, and rewriting it on later deltas would change an id the
+            # client has already seen.
+            if started:
+                _uniquify_in_place(
+                    getattr(self, "current_content_block_start", None),
+                    getattr(self, _SEEN_IDS_ATTR, None),
+                )
+            return started
+
+        setattr(patched_should_start, _WRAPPED_MARKER, True)
+        AnthropicStreamWrapper._should_start_new_content_block = patched_should_start
+
+    probe: set[str] = {"call_0"}
+    if _uniquify_tool_use_id("call_0", probe) != "call_0_1":
+        raise RuntimeError(
+            f"{TOOL_USE_ID_COLLISION_UNIQUIFY} did not take: a colliding id was "
+            "returned unchanged"
+        )
+    return TOOL_USE_ID_COLLISION_UNIQUIFY
 
 
 def _report(patches: list[str]) -> Path | None:
@@ -271,6 +446,21 @@ class BakeoffAdapterPatches(CustomLogger):
         tools = kwargs.get("tools")
         if tools:
             kwargs["tools"] = _strip_property_names(tools)
+
+        # THE SECOND DEFECT, and the only place the response path can learn
+        # about it. Gemma 4 31B returned the tool-call id `call_0` on all 30
+        # responses of every run -- its ids are indexed WITHIN a response, and
+        # it emits one call per response. Claude Code executed all 30 locally
+        # but could not pair duplicates on the way back, so the conversation
+        # Gemma saw carried 1 tool_use, 1 tool_result and 28 "(no content)"
+        # turns: it never observed anything after its first command, and
+        # repeated the same plan until the turn cap. Measured 2026-08-11;
+        # Sonnet 5/5, Nemotron 8/8 and Kimi 5/5 ids were all distinct.
+        #
+        # A fresh set per request, never carried over: the ids are read off
+        # THIS conversation, so nothing is remembered between calls and a
+        # first turn correctly starts empty.
+        _SEEN_TOOL_USE_IDS.set(_tool_use_ids_in(messages))
         return kwargs
 
     def __init__(self) -> None:
