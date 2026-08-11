@@ -1,12 +1,20 @@
-"""The tool-id passthrough patch, and the containment that keeps it proxy-only.
+"""The proxy-side adapter interventions, and the containment that keeps them there.
 
-The defect it removes was measured, not theorised: Kimi K2.5 emits
-``functions.Read:0``, LiteLLM rewrote it to ``functions_Read_0`` on the
-response path, Claude Code echoed the mangled form back, and Kimi stopped
-driving the tool loop -- 0/22 tool calls mangled versus 42/42 with the colon
-intact.
+Neither defect was theorised; both were measured on live runs, and both were
+being scored as model weakness until they were found.
+
+Kimi K2.5 emits ``functions.Read:0``, LiteLLM rewrote it to
+``functions_Read_0`` on the response path, Claude Code echoed the mangled form
+back, and Kimi stopped driving the tool loop -- 0/22 tool calls mangled versus
+42/42 with the colon intact.
+
+Gemma 4 31B failed 9/9 with ``JSON-RPC error -32602: Job registration failed``
+because two of Claude Code's tool schemas carry ``propertyNames``, which its
+Bedrock serving engine rejects.
 """
 
+import asyncio
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -92,7 +100,121 @@ def test_the_gemini_thought_signature_split_is_preserved():
 def test_apply_is_idempotent():
     first = litellm_patches.apply()
     second = litellm_patches.apply()
-    assert first == second == [litellm_patches.TOOL_USE_ID_PASSTHROUGH]
+    assert first == second == [
+        litellm_patches.TOOL_USE_ID_PASSTHROUGH,
+        litellm_patches.TOOL_SCHEMA_PROPERTY_NAMES_STRIP,
+    ]
+
+
+# --- propertyNames strip (the 2026-08-10 Gemma defect) -----------------------
+#
+# Gemma 4 31B failed 9/9 live runs with `JSON-RPC error -32602: Job
+# registration failed`. A 15-rung request ladder against live mantle isolated
+# it to one JSON-Schema keyword: `propertyNames`, carried by exactly two of the
+# 24 tools Claude Code 2.1.220 declares. Stripping it took the arm from FAIL to
+# PASS with Nemotron and Kimi unchanged.
+
+# The real shape, from TaskCreate's `metadata` property.
+TASK_CREATE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "metadata": {
+            "type": "object",
+            "propertyNames": {"type": "string"},
+            "additionalProperties": {"type": "string"},
+        },
+        "prompt": {"type": "string"},
+    },
+    "required": ["prompt"],
+}
+
+
+def test_property_names_is_stripped_at_every_depth():
+    """Object-level, nested under a property, and inside a list.
+
+    Gemma rejected both the object-level and the nested form, so a strip that
+    only reached the top level would leave TaskCreate and TaskUpdate failing --
+    which is every real occurrence.
+    """
+    payload = {
+        "propertyNames": {"type": "string"},
+        "properties": {"metadata": {"propertyNames": {"type": "string"}}},
+        "anyOf": [{"propertyNames": {"type": "string"}}],
+    }
+    stripped = litellm_patches._strip_property_names(payload)
+
+    assert stripped == {"properties": {"metadata": {}}, "anyOf": [{}]}
+
+
+def test_property_names_strip_leaves_the_keywords_gemma_accepts():
+    """Only the measured keyword goes.
+
+    exclusiveMinimum, maxItems, anyOf, const, format and pattern were each
+    probed individually against live Gemma on 2026-08-10 and each PASSED.
+    Stripping more than was measured would silently change every arm's tool
+    contract to work around a fault that does not exist.
+    """
+    schema = {
+        "type": "object",
+        "properties": {
+            "n": {"type": "number", "exclusiveMinimum": 0},
+            "xs": {"type": "array", "items": {"type": "string"}, "maxItems": 32},
+            "status": {"anyOf": [{"type": "string", "const": "deleted"}]},
+            "url": {"type": "string", "format": "uri"},
+            "id": {"type": "string", "pattern": "^wf_[a-z0-9-]{6,}$"},
+        },
+        "additionalProperties": False,
+        "$schema": "http://json-schema.org/draft-07/schema#",
+    }
+
+    assert litellm_patches._strip_property_names(schema) == schema
+
+
+def test_the_strip_does_not_mutate_the_caller_s_schema():
+    """The hook hands its result to litellm, but the caller's list is Claude
+    Code's own request object -- mutating it in place would make the wire log's
+    tool_schema_sha depend on whether capture ran before or after the hook."""
+    original = {"properties": {"metadata": {"propertyNames": {"type": "string"}}}}
+    snapshot = json.loads(json.dumps(original))
+
+    litellm_patches._strip_property_names(original)
+
+    assert original == snapshot
+
+
+def test_the_hook_strips_property_names_from_a_real_tool():
+    hook = litellm_patches.BakeoffAdapterPatches.async_pre_request_hook
+    kwargs = {
+        "tools": [
+            {
+                "name": "TaskCreate",
+                "description": "Create a task.",
+                "input_schema": TASK_CREATE_SCHEMA,
+            }
+        ],
+        "stream": True,
+    }
+
+    out = asyncio.run(hook(litellm_patches.instance, "gemma-4-31b", [], kwargs))
+
+    schema = out["tools"][0]["input_schema"]
+    assert "propertyNames" not in schema["properties"]["metadata"]
+    assert schema["properties"]["metadata"]["additionalProperties"] == {
+        "type": "string"
+    }
+    # Everything else the hook was handed comes back untouched.
+    assert out["stream"] is True
+
+
+def test_the_hook_is_a_noop_without_tools():
+    """`anthropic_messages` calls the hook on every request, including the ones
+    Claude Code makes with no tool block. Returning None there would drop the
+    whole kwargs dict, since handler.py keeps the hook's return value."""
+    hook = litellm_patches.BakeoffAdapterPatches.async_pre_request_hook
+
+    for kwargs in ({"stream": True}, {"tools": None, "stream": True}):
+        out = asyncio.run(hook(litellm_patches.instance, "gemma-4-31b", [], kwargs))
+        assert out == kwargs
 
 
 def test_the_manifest_records_what_the_proxy_did_to_itself(tmp_path):

@@ -41,6 +41,18 @@ MUTATIONS = [
         "not integration",
     ),
     (
+        # The 2026-08-10 defect: two of Claude Code's 24 tool schemas carry
+        # `propertyNames`, and Gemma's Bedrock engine rejects it with
+        # -32602. 9/9 live runs lost to 74 bytes. Reverting the strip to
+        # identity puts the keyword back on the wire for every arm.
+        "adapter: stop stripping propertyNames, restoring Gemma's -32602",
+        "src/bakeoff/litellm_patches.py",
+        "    if isinstance(obj, dict):\n        return {\n            key: _strip_property_names(value)",
+        "    if True:\n        return obj\n    if isinstance(obj, dict):\n        return {\n            key: _strip_property_names(value)",
+        "tests/test_litellm_patches.py -k property_names",
+        "not integration",
+    ),
+    (
         "defect 1: stop deriving api_error_status from the wire",
         "src/bakeoff/runner.py",
         "    if api_error_status is None:\n        api_error_status = final_api_error_status(entries)",

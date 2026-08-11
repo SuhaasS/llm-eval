@@ -233,6 +233,50 @@ def validate_tool_call_ids(body: dict) -> str | None:
     return None
 
 
+def validate_no_property_names(body: dict) -> str | None:
+    """Reject a request whose tool schemas still carry ``propertyNames``.
+
+    The 2026-08-10 defect: Gemma 4 31B failed 9/9 live runs with `JSON-RPC
+    error -32602`, and the cause was this one JSON-Schema keyword on two of
+    Claude Code's 24 tools (TaskCreate and TaskUpdate, both on
+    `properties.metadata`). `bakeoff.litellm_patches` strips it in a
+    pre-request hook.
+
+    That hook is the half of the fix nothing else can verify. `apply()` can
+    check that the strip function works, but not that litellm ever calls it --
+    that depends on the class being registered AND on `anthropic_messages`
+    still dispatching pre-request hooks, either of which a litellm bump could
+    take away in silence. This check is the only thing standing between that
+    and a green gate over a dead hook.
+
+    No fixture arm is needed to reach it: the gate runs the real pinned Claude
+    Code, which DECLARES all 24 tools on every request whether or not it calls
+    them. Both routes are checked, because the hook runs before litellm
+    branches on provider and so must clean the `anthropic/` arms too.
+
+    Returns an error string, or None.
+    """
+    def offenders(obj, path: str = "") -> list[str]:
+        if isinstance(obj, dict):
+            found = [path] if "propertyNames" in obj else []
+            for key, value in obj.items():
+                found += offenders(value, f"{path}.{key}" if path else key)
+            return found
+        if isinstance(obj, list):
+            return [f for i, v in enumerate(obj) for f in offenders(v, f"{path}[{i}]")]
+        return []
+
+    for field in ("tools", "messages", "system"):
+        hits = offenders(body.get(field), field)
+        if hits:
+            return (
+                f"propertyNames survived in {hits[0]!r} -- the "
+                "anthropic_tool_schema_property_names_strip hook did not run. "
+                "Gemma's Bedrock engine answers -32602 to this."
+            )
+    return None
+
+
 def _openai_tool_call(call_id: str, name: str, arguments: dict) -> list[bytes]:
     call = {
         "index": 0,
@@ -323,6 +367,15 @@ class Handler(BaseHTTPRequestHandler):
                     }
                 },
             )
+            return
+
+        # Checked on BOTH routes: the propertyNames strip is a pre-request hook
+        # that runs before litellm branches on provider, so the `anthropic/`
+        # arms must come through clean too. A check on the openai route alone
+        # would leave three of the four offline arms unguarded.
+        problem = validate_no_property_names(body)
+        if problem:
+            self._json(400, {"error": {"message": problem, "type": "invalid_request_error"}})
             return
 
         if "chat/completions" in self.path:
