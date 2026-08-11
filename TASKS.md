@@ -4,10 +4,11 @@ Single list of open work for the LLM bakeoff eval. **This file is the backlog.**
 `tasks/todo.md` is the opposite — a completed-work review log, one section per
 finished task. Nothing here is done; move it there when it is.
 
-Last updated 2026-08-11. Two Gemma adapter defects fixed; Gemma is now 6/6
-across two independent N=3 runs. **Phase 0c is not GO** — a repeat run put
-Nemotron at 2/3 on a model-behaviour flake, so the criterion is unmet and the
-arm's flake rate is the new P0.
+Last updated 2026-08-11. Two Gemma adapter defects fixed; Gemma is 6/6 across
+two independent N=3 runs. **Phase 0c is not GO** — one Nemotron run quit
+mid-plan, and a follow-up N=10 on that arm came back 10/10, leaving a rare
+model-behaviour flake at 1/16 with an interval too wide to act on. That
+measurement, not the verdict, is the P0.
 
 Spec: [docs/superpowers/specs/2026-08-03-llm-bakeoff-eval-design.md](docs/superpowers/specs/2026-08-03-llm-bakeoff-eval-design.md)
 Harness plan: [docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md](docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md)
@@ -29,22 +30,48 @@ Run A was GO. Run B was NO-GO on Nemotron alone. **The GO does not reproduce**,
 and one observation of it was not a rate — the same mistake §5.7 and the N=3
 criterion exist to prevent, made here in the space of one afternoon.
 
-- [ ] **Nemotron 3 Super drops the loop mid-task, ~1 run in 6.** Measured on
-  the run B failure: `terminated_by: agent_finish`, 3 turns, **1 tool call**
-  (`Read`), no diff. It wrote *"Now let me check the test file to see what the
-  expected behavior should be:"* and then ended its turn without emitting the
-  call. No API error, no retry, `errored: 0`, `malformed: 0`, ids unique, zero
-  `(no content)` turns — so nothing in the adapter is implicated, and the
-  proxy-side interventions provably never fired on this arm.
-  This is the eval's **first failure that survives an adapter explanation**,
-  which makes it the first thing in the log that might be about a model. Treat
-  it as a rate, not an event: 1/6 today, and a single further observation will
-  not settle it either. It also lands directly on §5.7 — an arm that silently
-  quits ~17% of the time makes pass@1 a measurement of the flake as much as of
-  the model.
-  Next: repeat N≥10 on this arm alone before Phase 3 sizing, and decide whether
-  a quit-without-tool-call is an exclusion or a legitimate failure. The harness
-  does not grade, so that decision belongs in the scoring plan.
+- [ ] **Nemotron 3 Super quits mid-plan, 1 run in 16.** Investigated
+  2026-08-11 and confirmed to be the model, not the bridge. The failing
+  response, read raw off the wire:
+
+  ```
+  finish_reason: 'stop'   tool_calls: None   function_call: None
+  content: 'Now let me check the test file to see what the expected
+            behavior should be:\n'         completion_tokens: 46
+  ```
+
+  It narrated its next action and ended the turn without emitting the call.
+  Claude Code takes `end_turn` at face value and stops, so the run records
+  `terminated_by: agent_finish` with 1 tool call and no diff.
+
+  **Adapter ruled out, on evidence rather than absence.** `finish_reason` is
+  literally `stop`, not an unrecognised value coerced to `end_turn` by the
+  translation (the §P2 trap below); the content holds no tool call emitted as
+  text, which is the Nemotron-family failure worth suspecting; `stop` not
+  `length`, and 46 completion tokens, so nothing was truncated; ids unique and
+  zero `(no content)` turns, so the collision uniquifier provably never fired
+  on this arm. A successful run says almost the same sentence — *"Now let me
+  check the test file to see what's expected:"* — with `finish_reason:
+  tool_calls` beside it. Same intent, one sampled with the call and one
+  without.
+
+  **Rate, measured rather than assumed.** N=10 on this arm alone came back
+  **10/10**. Pooled over every post-fix run: **1/16, 6.2%, 95% CI 1.1–28.3%.**
+  The interval is the finding — 16 runs cannot separate a 2% flake from a 25%
+  one, and it would take ~47 runs to be 95% sure of seeing a 6% event at all.
+  Do not quote 6% as the rate.
+
+  Sampling is a plausible contributor and is not free to change: this arm runs
+  `temperature 1.0, top_p 0.95` on NVIDIA's own guidance, and §5.3 keeps the
+  policy identical across arms rather than the number, so lowering it for
+  Nemotron alone would trade a model property for a config confound.
+
+  Next: this is the eval's **first failure that survives an adapter
+  explanation** — everything before it was harness. It needs a ruling in the
+  scoring plan, not here: a quit-without-tool-call is either a legitimate
+  failure or an exclusion, and §5.7 sizing has to carry whichever it is. The
+  offline grader can identify the class cheaply — final turn `stop`, no diff,
+  and prose promising an action it never took.
 
 Gemma took two fixes to get there, both adapter defects, neither about the
 model: its Bedrock engine rejects `propertyNames` in a tool schema, and it
