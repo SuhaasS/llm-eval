@@ -4,7 +4,8 @@ Single list of open work for the LLM bakeoff eval. **This file is the backlog.**
 `tasks/todo.md` is the opposite — a completed-work review log, one section per
 finished task. Nothing here is done; move it there when it is.
 
-Last updated 2026-08-08, after the N=3 live run that took Kimi to 3/3.
+Last updated 2026-08-11, after the N=3 live run that took Gemma from 0 tool
+calls to 30 and moved its failure out of the adapter and into the model.
 
 Spec: [docs/superpowers/specs/2026-08-03-llm-bakeoff-eval-design.md](docs/superpowers/specs/2026-08-03-llm-bakeoff-eval-design.md)
 Harness plan: [docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md](docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md)
@@ -15,31 +16,32 @@ Harness plan: [docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md](doc
 
 Latest N=3 live run, 12 runs across 4 arms: **3 of 4 arms pass, 3/3 each.**
 Sonnet 5 (bedrock-runtime), Nemotron and Kimi K2.5 all produce the correct diff
-on every run. **Gemma is the only arm still failing** — 9/9 now, identically.
+on every run. **Gemma is the only arm still failing** — but its failure moved.
 
-Kimi went 0/3 → 3/3 with no model change. Its failure was LiteLLM rewriting
-`functions.Read:0` to `functions_Read_0`; see `tasks/todo.md`. That is the
-second of two arms whose "model failure" turned out to be an adapter defect,
-which is worth weighing when reading Gemma below.
+Gemma's `-32602` is fixed and was an adapter defect: two of Claude Code's tool
+schemas carry `propertyNames`, which Gemma's Bedrock engine rejects, and the
+proxy now strips it. See `tasks/todo.md`. Gemma went from **0 tool calls in any
+run** to **30 in every run**. That makes it **three of three** original "model
+failures" that were harness-layer defects with one-line causes — Sonnet's beta
+header, Kimi's tool-id mangling, and this. Weigh that base rate before reading
+what is left below as capability.
 
-- [ ] **Gemma 4 31B — `JSON-RPC error -32602: Job registration failed ...
-  Generation failed`.** Bedrock-side, not a parameter rejection. **Observed
-  9/9**, identically: 1 turn, 0 tool calls, 2 wire calls, no diff. Deterministic.
-  The error has two surface forms — a plain `BadRequestError` when it lands
-  before the stream and a `MidStreamFallbackError` when it lands during it.
-  One fault, not two. At N=3 every proxy-side error in the run attributed to
-  this arm and to no other.
-  Next: this arm has produced no tool call in any run, so nothing is known
-  about whether Gemma can drive Claude Code at all. Decide whether it is
-  fixable at the adapter layer, or whether Gemma leaves the eval — that
-  decision sets the arm count, which sizes the dataset, so make it before
-  Phase 3.
-  **Weigh the base rate before concluding capability.** Two of the three
-  original "model failures" — Sonnet's and Kimi's — turned out to be adapter
-  defects with one-line causes, and both looked equally deterministic and
-  equally total beforehand. Gemma's error is Bedrock-side rather than in the
-  bridge, which is a genuine difference, but it is not yet evidence about the
-  model.
+- [ ] **Gemma 4 31B loops on Bash and never edits.** 3/3, identically:
+  30 tool calls, **all of them `Bash`**, only **4 distinct commands** among the
+  30, mostly `python3 tests/test_calc.py` repeated. No `Read`, no `Edit`, no
+  assistant text, no diff, `terminated_by: turns` — it exhausts the turn cap.
+  ~100s wall per run, `errored: 0`, `malformed: 0`; every call is well-formed
+  and answers 200.
+  This is the first behavioural evidence about Gemma the eval has ever had, and
+  unlike the `-32602` it is not obviously a transport fault. But it is not yet
+  clean evidence of capability either: **30/30 calls landing on a single tool**
+  is itself a suspicious distribution, and the price-map entry records
+  `supports_parallel_function_calling: false` for this model. Rule out a
+  tool-selection or tool-presentation artifact before concluding the model
+  cannot do the task.
+  Next: read the wire log for what Gemma was actually offered and what it
+  returned, then decide whether Gemma stays in the eval. That decision sets the
+  arm count, which sizes the dataset, so make it before Phase 3.
 
 - [ ] **`kimi-k2-5-runtime` is newly unsafe** and must not be run without a
   fix. The tool-id patch removes the sanitizer process-wide; on the `bedrock/`
@@ -62,9 +64,11 @@ which is worth weighing when reading Gemma below.
 - [ ] **Re-run the four-arm smoke to a real GO.** The N=3 criterion is
   implemented and enforced (`smoke_test.py --repeats`, default 3 live, GO
   requires every repeat of every arm; a run below N=3 prints an explicit
-  weaker-than-criterion warning). Latest run: **NO-GO at 3 of 4 arms** —
-  Sonnet 5 3/3, Nemotron 3/3, Kimi 3/3, Gemma 0/3.
-  Blocked on Gemma alone, not on the gate.
+  weaker-than-criterion warning). Latest run, 2026-08-11: **NO-GO at 3 of 4
+  arms** — Sonnet 5 3/3, Nemotron 3/3, Kimi 3/3, Gemma 0/3.
+  Blocked on Gemma alone, not on the gate. Unchanged as a count, but the
+  blocker is now the loop-on-Bash behaviour above rather than a transport
+  rejection, and that is a different decision.
 
 ---
 

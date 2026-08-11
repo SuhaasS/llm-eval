@@ -20,6 +20,85 @@ review log — one section per finished task, kept for what each one turned up.
 
 ---
 
+## The third "model failure" was also an adapter defect — 2026-08-11
+
+Gemma 4 31B had failed **9/9** with `JSON-RPC error -32602: Job registration
+failed: Engine bad request: Task submission failed with status 400 Bad Request:
+Generation failed`, 1 turn and 0 tool calls every time. `TASKS.md` recorded it
+as "Bedrock-side, not a parameter rejection". **`-32602` is JSON-RPC's `Invalid
+params`**, and the invalid param was in the tool schema the whole time.
+
+**The cause is one JSON-Schema keyword: `propertyNames`.** Found with a 15-rung
+request ladder against live mantle, each rung adding one thing to the one above,
+with Nemotron re-run as a control on every failing rung:
+
+| probe | gemma |
+|---|---|
+| bare / stream / plain system / system blocks with `cache_control` / temperature | PASS |
+| one tool, `$schema`, `additionalProperties: false` | PASS |
+| `exclusiveMinimum`, `maxItems`, `anyOf`, `const`, `format: uri`, `pattern` | PASS |
+| **`propertyNames`**, object-level and nested alike | **FAIL** |
+| two tools, `max_tokens` 16384, first 12 real tools | PASS |
+| all 24 real tools | **FAIL** |
+
+Exactly two of the 24 tools Claude Code 2.1.220 declares carry it — `TaskCreate`
+and `TaskUpdate`, both on `properties.metadata`. Each fails alone against Gemma
+and passes against Nemotron. Confirmed against the eval's own pinned image
+rather than a laptop's claude: `bakeoff-eval-agent` emits the same 24 tools with
+the keyword on the same two. **74 bytes**, and it cost an arm.
+
+**What was ruled out first, offline.** Capturing what LiteLLM actually POSTs for
+each mantle arm — the real Claude Code body replayed through the real config,
+against a local capture server — showed all three candidate arms emitting the
+same top-level keys, the same translation and the same `stream_options`,
+differing only in `model` and in the `/openai/v1` vs `/v1` base. So the bridge
+was not treating Gemma differently; Gemma's engine was rejecting a shared
+payload. Routing through litellm's first-class `bedrock_mantle/` provider
+instead of the config's generic `openai/` produced a byte-identical body, so
+that was not it either.
+
+**The fix is a pre-request hook, not a monkeypatch.** `anthropic_messages` calls
+`_execute_pre_request_hooks` before it branches on provider and keeps the
+`tools` the hook returns, so one hook on `BakeoffAdapterPatches` — already a
+registered `CustomLogger` — covers the `anthropic/` Sonnet arm and the three
+`openai/` candidates identically. Patching the openai→anthropic adapter would
+have reached the candidates only and reintroduced exactly the §6.4 asymmetry the
+harness works to avoid.
+
+**Why stripping it is not a thumb on the scale.** `propertyNames: {"type":
+"string"}` is vacuous — JSON object keys are strings by definition — so removing
+it constrains nothing that was constrained before, and no arm's tool contract
+changes meaning. Only the measured keyword is stripped: the other six were each
+probed individually and each passed, and widening the strip to a denylist would
+be working around faults that do not exist.
+
+**Two guards, because they fail differently.** `apply()` proves the strip
+function works and the hook exists, and the proxy refuses to start otherwise —
+verified by reverting the strip, which killed startup rather than degrading.
+But nothing in-process can prove litellm *calls* the hook, so the offline stub
+now 400s on a surviving `propertyNames`, on **both** routes since the hook runs
+before provider branching. Verified by neutering the hook while leaving the
+strip intact: the gate went red with
+`propertyNames survived in 'tools[14].function.parameters.properties.metadata'`.
+A gate that cannot fail is not evidence, and these two mutations fail it in the
+two different ways it can actually break.
+
+**Result: Gemma goes from 0 tool calls in any run to 30 in every run.** 3/3.
+It is still 0/3 on the task, and the reason is now a model observation rather
+than a transport one: all 30 calls are `Bash`, only 4 distinct commands among
+them, mostly `python3 tests/test_calc.py` repeated; no `Read`, no `Edit`, no
+diff, `terminated_by: turns`. `errored: 0`, `malformed: 0` — every call is
+well-formed and answers 200. Carried to `TASKS.md` with the caveat that 30/30
+calls on a single tool is itself a suspicious distribution and deserves a wire-
+log read before it is called capability.
+
+**The base rate is now three for three.** Sonnet's beta header, Kimi's tool-id
+mangling, and Gemma's `propertyNames` — every "model failure" this eval has
+produced has been a harness-layer defect with a one-line cause, and each looked
+deterministic and total beforehand.
+
+---
+
 ## Review — Task 11 (2026-08-06)
 
 **Delivered:** `tests/test_fault_injection.py` (all twelve spec §6.6 cases), `scripts/verify_logger.py`, `src/bakeoff/proxy_callback.py`, `config/litellm_fault_injection.yaml`, `docker/litellm-proxy.Dockerfile`. **136 unit + 25 integration passing.** Gate exits 0.
