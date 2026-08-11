@@ -28,6 +28,41 @@ REPO = Path(__file__).resolve().parents[1]
 from bakeoff import litellm_patches  # noqa: E402
 
 
+def _streaming_chunk(tool_call_id: str, tool_name: str = "Bash"):
+    """One openai streaming chunk opening a tool call.
+
+    Built from litellm's own types rather than a stub object: the patched code
+    reads `chunk.choices[0].delta.tool_calls[0].function`, and a duck-typed
+    stand-in would pass a test that the real chunk shape fails.
+    """
+    from litellm.types.utils import (
+        ChatCompletionDeltaToolCall,
+        Delta,
+        Function,
+        ModelResponseStream,
+        StreamingChoices,
+    )
+
+    return ModelResponseStream(
+        choices=[
+            StreamingChoices(
+                index=0,
+                finish_reason=None,
+                delta=Delta(
+                    tool_calls=[
+                        ChatCompletionDeltaToolCall(
+                            id=tool_call_id,
+                            type="function",
+                            index=0,
+                            function=Function(name=tool_name, arguments="{}"),
+                        )
+                    ]
+                ),
+            )
+        ]
+    )
+
+
 def test_a_kimi_id_survives_the_patch_unchanged():
     litellm_patches.apply()
     from litellm.llms.anthropic import common_utils
@@ -103,7 +138,129 @@ def test_apply_is_idempotent():
     assert first == second == [
         litellm_patches.TOOL_USE_ID_PASSTHROUGH,
         litellm_patches.TOOL_SCHEMA_PROPERTY_NAMES_STRIP,
+        litellm_patches.TOOL_USE_ID_COLLISION_UNIQUIFY,
     ]
+
+
+# --- colliding tool-call ids (the 2026-08-11 Gemma defect) -------------------
+#
+# Gemma returned the id `call_0` on all 30 responses of every run: its ids are
+# indexed WITHIN a response, and it emits one call per response. Claude Code
+# executed all 30 locally but could not pair duplicates on the way back, so the
+# conversation Gemma saw carried 1 tool_use, 1 tool_result and 28 "(no
+# content)" turns -- it never observed anything after its first command and
+# repeated the same plan to the turn cap.
+
+
+def test_an_id_seen_for_the_first_time_is_returned_unchanged():
+    """The no-op that keeps this from being a per-arm difference. Sonnet,
+    Nemotron and Kimi never repeat an id, so the uniquifier must never fire on
+    them -- including on Kimi's `functions.Read:0`, whose exact shape the
+    passthrough patch above exists to preserve."""
+    for raw in ("toolu_bdrk_01ERnhUz5E3Tug8XwDf9RDcG",
+                "call_4196d6e081be491194548c6d",
+                "functions.Read:0"):
+        seen: set[str] = set()
+        assert litellm_patches._uniquify_tool_use_id(raw, seen) == raw
+
+
+def test_a_colliding_id_gets_the_smallest_free_suffix():
+    seen = {"call_0"}
+    assert litellm_patches._uniquify_tool_use_id("call_0", seen) == "call_0_1"
+    assert litellm_patches._uniquify_tool_use_id("call_0", seen) == "call_0_2"
+    assert litellm_patches._uniquify_tool_use_id("call_0", seen) == "call_0_3"
+
+
+def test_the_uniquified_id_survives_the_request_path_sanitizer():
+    """Claude Code echoes the rewritten id back in `tool_result.tool_use_id`,
+    and `sanitize_tool_use_ids_in_anthropic_messages` runs on every inbound
+    request. A suffix outside [a-zA-Z0-9_-] would be rewritten there and the
+    pairing this fix restores would break again one layer down."""
+    litellm_patches.apply()
+    from litellm.llms.anthropic import common_utils
+
+    out = litellm_patches._uniquify_tool_use_id("call_0", {"call_0"})
+    assert common_utils.normalize_anthropic_tool_use_id(out) == out
+
+
+def test_the_streaming_wrapper_rewrites_only_a_collision():
+    """The patch has to bite on the streaming path: every real Claude Code call
+    streams. It hangs off the stream wrapper rather than the per-chunk
+    translation because the per-chunk call runs in the server's own response
+    task, where the request ContextVar reads None -- measured, see the module
+    docstring."""
+    litellm_patches.apply()
+    from litellm.llms.anthropic.experimental_pass_through.adapters.streaming_iterator import (  # noqa: E501
+        AnthropicStreamWrapper,
+    )
+
+    token = litellm_patches._SEEN_TOOL_USE_IDS.set({"call_0"})
+    try:
+        wrapper = AnthropicStreamWrapper(completion_stream=iter([]), model="gemma")
+    finally:
+        litellm_patches._SEEN_TOOL_USE_IDS.reset(token)
+
+    # Captured at construction, in the request's own context.
+    assert getattr(wrapper, litellm_patches._SEEN_IDS_ATTR) == {"call_0"}
+
+    collided = wrapper._should_start_new_content_block(
+        _streaming_chunk("call_0")
+    ), wrapper.current_content_block_start["id"]
+    untouched = wrapper._should_start_new_content_block(
+        _streaming_chunk("functions.Read:0")
+    ), wrapper.current_content_block_start["id"]
+
+    assert collided[1] == "call_0_1"
+    assert untouched[1] == "functions.Read:0"
+
+
+def test_a_stream_that_never_saw_the_request_leaves_ids_alone():
+    """Fail closed, not open. If the id set does not reach the stream the patch
+    must do nothing rather than invent a suffix -- a guess would rewrite the
+    three arms whose ids are already unique."""
+    litellm_patches.apply()
+    from litellm.llms.anthropic.experimental_pass_through.adapters.streaming_iterator import (  # noqa: E501
+        AnthropicStreamWrapper,
+    )
+
+    wrapper = AnthropicStreamWrapper(completion_stream=iter([]), model="gemma")
+    assert getattr(wrapper, litellm_patches._SEEN_IDS_ATTR) is None
+
+    wrapper._should_start_new_content_block(_streaming_chunk("call_0"))
+    wrapper._should_start_new_content_block(_streaming_chunk("call_0"))
+    assert wrapper.current_content_block_start["id"] == "call_0"
+
+
+def test_the_hook_collects_the_ids_already_in_the_conversation():
+    hook = litellm_patches.BakeoffAdapterPatches.async_pre_request_hook
+    messages = [
+        {"role": "user", "content": "fix it"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": ""},
+                {"type": "tool_use", "id": "call_0", "name": "Bash", "input": {}},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "call_0", "content": "ok"}
+            ],
+        },
+    ]
+
+    async def seen_after(msgs):
+        # Read inside the same coroutine. `asyncio.run` starts a fresh context,
+        # so a ContextVar set within it is not visible to the caller -- which
+        # is a property of the test harness, not of the request path, where the
+        # hook is awaited inside the request's own context.
+        await hook(litellm_patches.instance, "gemma-4-31b", msgs, {})
+        return litellm_patches._SEEN_TOOL_USE_IDS.get()
+
+    assert asyncio.run(seen_after(messages)) == {"call_0"}
+    # A first turn carries none, and must not inherit a previous request's.
+    assert asyncio.run(seen_after([])) == set()
 
 
 # --- propertyNames strip (the 2026-08-10 Gemma defect) -----------------------

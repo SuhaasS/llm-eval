@@ -53,6 +53,18 @@ MUTATIONS = [
         "not integration",
     ),
     (
+        # The 2026-08-11 defect: Gemma returns the same tool-call id on every
+        # response, Claude Code cannot pair the duplicates, and the model never
+        # sees any tool result after its first. Returning the id unchanged puts
+        # the collision back.
+        "adapter: stop uniquifying colliding tool-call ids",
+        "src/bakeoff/litellm_patches.py",
+        "    if raw_id not in seen:\n        seen.add(raw_id)\n        return raw_id",
+        "    if True:\n        return raw_id",
+        "tests/test_litellm_patches.py -k collision",
+        "not integration",
+    ),
+    (
         "defect 1: stop deriving api_error_status from the wire",
         "src/bakeoff/runner.py",
         "    if api_error_status is None:\n        api_error_status = final_api_error_status(entries)",

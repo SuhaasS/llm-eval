@@ -205,31 +205,60 @@ def script(body: dict) -> list[bytes]:
 # an `anthropic/` deployment bypasses that adapter entirely, which is why the
 # 2026-08-07 tool-id defect was invisible offline and cost a live run to find.
 #
-# The id below is Kimi-shaped ON PURPOSE. LiteLLM's
-# normalize_anthropic_tool_use_id rewrites every character outside
-# [a-zA-Z0-9_-] to an underscore, so without bakeoff.litellm_patches this id
-# comes back as `functions_Write_0` and validate_tool_call_ids rejects it.
-# That is the whole point: the gate must go red if the patch dies, and an id
-# that already satisfies Anthropic's pattern would make the check vacuous.
-KIMI_SHAPED_IDS = {"functions.Read:0", "functions.Write:1"}
+# This one id carries BOTH live adapter defects, which is why it is shaped the
+# way it is and why it is issued twice.
+#
+# Kimi-shaped, because litellm's normalize_anthropic_tool_use_id rewrites every
+# character outside [a-zA-Z0-9_-] to an underscore: without the passthrough
+# patch it comes back as `functions_Read_0`. An id already inside Anthropic's
+# pattern would make that half of the check vacuous.
+#
+# Issued TWICE, because Gemma's ids are indexed within a response and it emits
+# one call per response, so every response came back as the same `call_0`.
+# Without the uniquify patch Claude Code cannot pair the duplicate, drops the
+# second call, and this arm lands no diff.
+COLLIDING_ID = "functions.Read:0"
+
+# What the round trip may legitimately come back as. The bare id on the first
+# result; the uniquified form on the second, since the patch rewrites the
+# duplicate before Claude Code ever sees it.
+ISSUED_IDS = {COLLIDING_ID, f"{COLLIDING_ID}_1"}
 
 
 def validate_tool_call_ids(body: dict) -> str | None:
     """Reject a tool_call_id this stub never issued.
 
-    Without this the round trip is unchecked: a mangled id would come back,
-    the stub would answer anyway, and the gate would pass while the adapter
-    silently corrupted every tool call. Returns an error string, or None.
+    Without this the round trip is unchecked: a mangled id would come back, the
+    stub would answer anyway, and the gate would pass while the adapter
+    silently corrupted every tool call.
+
+    Two different defects land here now, so the message says which. A
+    `functions_Read_0` means the passthrough patch died and the character class
+    was rewritten. A second bare `functions.Read:0` means the uniquify patch
+    died -- though that one usually shows up as a missing Write and an empty
+    diff rather than reaching this check at all, because Claude Code drops the
+    unpairable call before it is ever echoed back.
+
+    Returns an error string, or None.
     """
-    for message in body.get("messages", []):
-        if message.get("role") != "tool":
-            continue
-        seen = message.get("tool_call_id")
-        if seen not in KIMI_SHAPED_IDS:
+    echoed = [
+        m.get("tool_call_id")
+        for m in body.get("messages", [])
+        if m.get("role") == "tool"
+    ]
+    for seen in echoed:
+        if seen not in ISSUED_IDS:
             return (
                 f"tool_call_id {seen!r} was never issued by this stub "
-                f"(issued {sorted(KIMI_SHAPED_IDS)}) -- the adapter rewrote it"
+                f"(issued {sorted(ISSUED_IDS)}) -- the adapter rewrote it, so "
+                "anthropic_tool_use_id_passthrough is not applying"
             )
+    if len(echoed) != len(set(echoed)):
+        return (
+            f"tool_call_id echoed twice: {echoed} -- the duplicate the stub "
+            "issued was never uniquified, so "
+            "anthropic_tool_use_id_collision_uniquify is not applying"
+        )
     return None
 
 
@@ -277,6 +306,37 @@ def validate_no_property_names(body: dict) -> str | None:
     return None
 
 
+def validate_loop_progress(body: dict) -> str | None:
+    """Reject a conversation that is not advancing through the script.
+
+    The openai script is exactly three calls -- Read, Write, done -- so the
+    stub is never legitimately asked a fourth time. More than that means the
+    tool loop is spinning: the client could not pair a tool call, so no result
+    came back, so the stub reissues the same step forever.
+
+    This check exists because the obvious signals do not fire. Measured
+    2026-08-11 with the uniquify patch disabled: the arm ran 60 turns and 30
+    tool calls, and STILL landed the 157-byte diff, so `diff_b` and the run
+    verdict both stayed green. `validate_tool_call_ids` did not fire either --
+    Claude Code drops the unpairable call rather than echoing a duplicate, so
+    nothing wrong ever comes back over the wire. Without this the gate reports
+    GO over Gemma's exact failure.
+
+    Returns an error string, or None.
+    """
+    assistant_turns = sum(
+        1 for m in body.get("messages", []) if m.get("role") == "assistant"
+    )
+    if assistant_turns > 2:
+        return (
+            f"the openai script is 3 calls but the conversation already has "
+            f"{assistant_turns} assistant turns -- the tool loop is not "
+            "advancing, so a tool call went unpaired and "
+            "anthropic_tool_use_id_collision_uniquify is not applying"
+        )
+    return None
+
+
 def _openai_tool_call(call_id: str, name: str, arguments: dict) -> list[bytes]:
     call = {
         "index": 0,
@@ -305,11 +365,18 @@ def openai_chunks(body: dict) -> list[bytes]:
     done = sum(1 for m in body.get("messages", []) if m.get("role") == "tool")
     if done == 0:
         return _openai_tool_call(
-            "functions.Read:0", "Read", {"file_path": "/repo/calc.py"}
+            COLLIDING_ID, "Read", {"file_path": "/repo/calc.py"}
         )
     if done == 1:
+        # The SAME id again, deliberately -- this is Gemma's defect reproduced.
+        # Its ids are indexed within a response and it emits one call per
+        # response, so every response came back as `call_0`; Claude Code could
+        # not pair the duplicate, the second call was dropped, and the arm made
+        # no diff. Without the uniquify patch this Write never runs and this
+        # arm goes red, which is the only offline evidence that the patch is
+        # not just present but actually reached on the streaming path.
         return _openai_tool_call(
-            "functions.Write:1",
+            COLLIDING_ID,
             "Write",
             {"file_path": "/repo/calc.py", "content": FIXED},
         )
@@ -379,7 +446,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if "chat/completions" in self.path:
-            problem = validate_tool_call_ids(body)
+            problem = validate_tool_call_ids(body) or validate_loop_progress(body)
             if problem:
                 # 400 rather than a silent retry: the gate has to SEE this.
                 self._json(400, {"error": {"message": problem, "type": "invalid_request_error"}})
