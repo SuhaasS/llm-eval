@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,182 @@ def parsed():
 def test_one_turn_per_assistant_record(parsed):
     assert len(parsed.turns) == 4
     assert [t.turn for t in parsed.turns] == [1, 2, 3, 4]
+
+
+# --- one API call is one turn ------------------------------------------------
+
+
+def _write(tmp_path, records) -> Path:
+    path = tmp_path / "split.jsonl"
+    path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+    return path
+
+
+def _assistant(message_id, blocks, *, usage=None, stop_reason=None, minute=0):
+    message = {"model": "claude-sonnet-5", "content": blocks}
+    if message_id is not None:
+        message["id"] = message_id
+    if usage is not None:
+        message["usage"] = usage
+    if stop_reason is not None:
+        message["stop_reason"] = stop_reason
+    return {
+        "type": "assistant",
+        "timestamp": f"2026-08-11T00:0{minute}:00.000Z",
+        "version": "2.1.220",
+        "message": message,
+    }
+
+
+def test_one_api_call_is_one_turn_even_when_split_across_content_blocks(tmp_path):
+    """Claude Code writes one transcript record per CONTENT BLOCK, and every
+    one repeats the whole `usage`. Measured on a real Kimi transcript: 10
+    assistant records, 5 distinct `message.id`s, shaped ['text'], ['tool_use'],
+    ['tool_use'] for a single reply.
+
+    Counting records instead of calls doubled every token total in the log --
+    stored Sonnet run 7be2933b recorded cache_write 83,867 against a true
+    42,171, and $0.3726 against $0.2148.
+    """
+    usage = {"input_tokens": 2, "output_tokens": 93, "cache_creation_input_tokens": 41695}
+    path = _write(
+        tmp_path,
+        [
+            _assistant("msg_a", [{"type": "text", "text": "hi"}], usage=usage),
+            _assistant(
+                "msg_a",
+                [{"type": "tool_use", "name": "Read", "input": {}}],
+                usage=usage,
+            ),
+            _assistant(
+                "msg_a",
+                [{"type": "tool_use", "name": "Bash", "input": {"command": "ls"}}],
+                usage=usage,
+                stop_reason="tool_use",
+            ),
+        ],
+    )
+    parsed = parse_trajectory(path, model="claude-sonnet-5")
+
+    assert len(parsed.turns) == 1, "three records, one API call"
+    assert parsed.assistant_records == 3, "the collapse stays visible"
+    assert parsed.total_tokens.cache_write == 41695, "counted once, not three times"
+    assert parsed.total_tokens.output == 93
+    assert parsed.tool_calls.total == 2, "both tool calls belong to that turn"
+    assert parsed.bash_commands == [(1, "ls")]
+    assert parsed.turns[0].api_message_id == "msg_a"
+    assert parsed.turns[0].stop_reason == "tool_use", "the last block carries it"
+
+
+def test_records_without_a_message_id_are_not_merged(tmp_path):
+    """Merging on absence is the same error in the expensive direction: it
+    would collapse genuinely distinct calls and understate a run's cost."""
+    usage = {"input_tokens": 10, "output_tokens": 5}
+    path = _write(
+        tmp_path,
+        [
+            _assistant(None, [{"type": "text", "text": "a"}], usage=usage, minute=0),
+            _assistant(None, [{"type": "text", "text": "b"}], usage=usage, minute=1),
+        ],
+    )
+    parsed = parse_trajectory(path, model="claude-sonnet-5")
+
+    assert len(parsed.turns) == 2
+    assert parsed.total_tokens.output == 10
+    assert [t.api_message_id for t in parsed.turns] == [None, None]
+
+
+def test_a_malformed_usage_block_costs_the_field_not_the_record(tmp_path):
+    """`_usage_from` runs outside the pricing guard, so anything it raises
+    aborts the parse and assemble_record discards the whole trajectory -- the
+    2026-08-07 row-of-zeroes defect. `usage` comes from a proxy translation
+    layer this repo documents as shape-shifting, so a `cache_creation` arriving
+    as a list, or a tier arriving as null, must cost that field and nothing
+    else. The null is the quieter one: it stores None and raises a TypeError
+    inside TokenUsage.__add__ on the NEXT turn.
+    """
+    path = _write(
+        tmp_path,
+        [
+            _assistant(
+                "msg_a",
+                [],
+                usage={"input_tokens": 10, "output_tokens": 5, "cache_creation": [1, 2]},
+                minute=0,
+            ),
+            _assistant(
+                "msg_b",
+                [],
+                usage={
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "cache_creation_input_tokens": 700,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": None,
+                        "ephemeral_1h_input_tokens": 200,
+                    },
+                },
+                minute=1,
+            ),
+        ],
+    )
+    parsed = parse_trajectory(path, model="claude-sonnet-5")
+
+    assert len(parsed.turns) == 2, "neither record cost the parse"
+    assert parsed.total_tokens.input == 20
+    assert parsed.total_tokens.cache_write == 700
+    assert parsed.total_tokens.cache_write_5m == 0, "unreadable, not invented"
+    assert parsed.total_tokens.cache_write_1h == 200
+
+
+def test_a_total_smaller_than_its_own_tiers_is_raised_to_them(tmp_path):
+    """cost_usd charges cache_write once and reads the 1h tier out of it, so a
+    total below the tier sum would bill more tokens than were written."""
+    path = _write(
+        tmp_path,
+        [
+            _assistant(
+                "msg_a",
+                [],
+                usage={
+                    "cache_creation_input_tokens": 100,
+                    "cache_creation": {"ephemeral_1h_input_tokens": 500},
+                },
+            )
+        ],
+    )
+    parsed = parse_trajectory(path, model="claude-sonnet-5")
+
+    assert parsed.total_tokens.cache_write == 500
+    assert parsed.total_tokens.cache_write_1h == 500
+
+
+def test_a_reply_split_around_a_tool_result_is_still_one_turn(tmp_path):
+    """Keyed on message.id globally, not on the previous record, so anything
+    interleaved between two blocks of one reply cannot split it."""
+    usage = {"input_tokens": 4, "output_tokens": 20}
+    path = _write(
+        tmp_path,
+        [
+            _assistant("msg_a", [{"type": "text", "text": "x"}], usage=usage, minute=0),
+            {
+                "type": "user",
+                "timestamp": "2026-08-11T00:01:00.000Z",
+                "toolUseResult": {"stdout": ""},
+                "message": {"content": []},
+            },
+            _assistant(
+                "msg_a",
+                [{"type": "tool_use", "name": "Read", "input": {}}],
+                usage=usage,
+                minute=2,
+            ),
+        ],
+    )
+    parsed = parse_trajectory(path, model="claude-sonnet-5")
+
+    assert len(parsed.turns) == 1
+    assert parsed.total_tokens.output == 20
 
 
 def test_tokens_summed_across_turns(parsed):

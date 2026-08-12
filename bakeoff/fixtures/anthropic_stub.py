@@ -39,13 +39,21 @@ def sse(event: str, data: dict) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
 
 
-def tool_use_stream(name: str, arguments: dict) -> list[bytes]:
+def tool_use_stream(name: str, arguments: dict, message_id: str) -> list[bytes]:
     """One tool_use block, streamed the way Anthropic streams one.
 
     input_json_delta rather than a whole input object: partial JSON is how
     tool arguments actually arrive, and reassembling them is exactly where
     an adapter breaks (spec section 6.4). A stub that skipped it would test
     a shape no provider sends.
+
+    `message_id` is a parameter, and it has to be, because `parse_trajectory`
+    uses `message.id` to tell one API call from the several transcript records
+    Claude Code splits it into. A stub that answered two distinct calls with
+    one hardcoded id made the parser merge them -- so the offline gate
+    undercounted turns and tokens against its own wire log, while every live
+    run stayed correct. A stub that reuses ids is not a stand-in for an API
+    that does not.
     """
     payload = json.dumps(arguments)
     return [
@@ -54,7 +62,7 @@ def tool_use_stream(name: str, arguments: dict) -> list[bytes]:
             {
                 "type": "message_start",
                 "message": {
-                    "id": "msg_stub_1",
+                    "id": message_id,
                     "type": "message",
                     "role": "assistant",
                     "model": "claude-sonnet-5",
@@ -190,10 +198,14 @@ def script(body: dict) -> list[bytes]:
     """
     done = tool_results(body)
     if done == 0:
-        return tool_use_stream("Read", {"file_path": "/repo/calc.py"})
+        return tool_use_stream(
+            "Read", {"file_path": "/repo/calc.py"}, "msg_stub_read"
+        )
     if done == 1:
         return tool_use_stream(
-            "Write", {"file_path": "/repo/calc.py", "content": FIXED}
+            "Write",
+            {"file_path": "/repo/calc.py", "content": FIXED},
+            "msg_stub_write",
         )
     return text_stream()
 
@@ -258,6 +270,91 @@ def validate_tool_call_ids(body: dict) -> str | None:
             f"tool_call_id echoed twice: {echoed} -- the duplicate the stub "
             "issued was never uniquified, so "
             "anthropic_tool_use_id_collision_uniquify is not applying"
+        )
+    return None
+
+
+def validate_max_completion_tokens(body: dict) -> str | None:
+    """Reject an openai-route request that still spells the cap ``max_tokens``.
+
+    Stands in for what Bedrock's `/openai/v1` route started doing on
+    2026-08-12, which took Gemma 4 31B to 0/3 with every call 400ing before the
+    model saw anything: `Unsupported parameter: 'max_tokens' is not supported
+    with this model`. `bakeoff.litellm_patches` renames it to
+    `max_completion_tokens` for every `openai/` deployment.
+
+    Checked on the openai route ONLY. The `anthropic/` arms send a native
+    Anthropic body where `max_tokens` is correct and required, so a check on
+    both routes would fail Sonnet for being right.
+
+    Same reasoning as `validate_no_property_names`: `apply()` can prove the
+    rename function works, not that litellm still routes through the entry it
+    wraps. `OpenAIConfig.map_openai_params` branches on o-series, gpt-5 and
+    audio models before delegating, so a litellm bump that reclassifies a
+    candidate would leave the wrapper installed and never called. This is the
+    only thing standing between that and a green gate over a dead patch.
+
+    Returns an error string, or None.
+    """
+    if "max_tokens" in body:
+        return (
+            f"max_tokens={body['max_tokens']!r} reached the openai route -- "
+            "the openai_max_completion_tokens_rename patch did not apply. "
+            "Bedrock's /openai/v1 route answers 400 to this, which is what "
+            "took Gemma to 0/3 on 2026-08-12."
+        )
+    if "max_completion_tokens" not in body:
+        return (
+            "neither max_tokens nor max_completion_tokens reached the openai "
+            "route -- the cap was dropped rather than renamed, so this arm "
+            "would run uncapped while every other arm runs at 16384"
+        )
+    return None
+
+
+def validate_reasoning_effort_none(body: dict) -> str | None:
+    """Reject an openai-route request carrying tools without an explicit 'none'.
+
+    Stands in for gemma's third wall, measured live 2026-08-12:
+
+        Function tools with reasoning_effort are not supported for
+        google.gemma-4-31b in /v1/chat/completions. To use function tools, use
+        /v1/responses or set reasoning_effort to 'none'.
+
+    The route applies a non-none default when the parameter is ABSENT, which is
+    why this refuses absence rather than only refusing a wrong value -- an
+    absent reasoning_effort is exactly what `additional_drop_params` produced,
+    and it is what took the arm to 0/3 with the escape sitting in the error
+    message.
+
+    Also refuses a non-'none' value, because that is the shape a half-applied
+    patch produces: Claude Code sends `thinking: {"type": "adaptive"}` on every
+    arm and litellm derives "medium" from it, so a pin that fails to override
+    the derived value looks configured and sends the one thing the route
+    refuses.
+
+    Checked on the openai route only and only when tools are present -- that is
+    the whole scope of the real constraint, and widening it would fail requests
+    Bedrock accepts.
+
+    Returns an error string, or None.
+    """
+    if not body.get("tools"):
+        return None
+    effort = body.get("reasoning_effort")
+    if effort is None:
+        return (
+            "tools were sent with no reasoning_effort -- the "
+            "openai_reasoning_effort_pinned_none patch did not apply. Gemma's "
+            "route applies a non-none default and then refuses the tools, "
+            "which is what took it to 0/3 on 2026-08-12."
+        )
+    if effort != "none":
+        return (
+            f"tools were sent with reasoning_effort={effort!r} -- the pin did "
+            "not override the value litellm derives from Claude Code's "
+            "`thinking` block, so the arm would run thinking-on against "
+            "thinking-off arms (spec section 5.4) even where the route allows it."
         )
     return None
 
@@ -446,7 +543,12 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if "chat/completions" in self.path:
-            problem = validate_tool_call_ids(body) or validate_loop_progress(body)
+            problem = (
+                validate_max_completion_tokens(body)
+                or validate_reasoning_effort_none(body)
+                or validate_tool_call_ids(body)
+                or validate_loop_progress(body)
+            )
             if problem:
                 # 400 rather than a silent retry: the gate has to SEE this.
                 self._json(400, {"error": {"message": problem, "type": "invalid_request_error"}})

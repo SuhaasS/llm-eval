@@ -78,6 +78,13 @@ LIVE_REPEATS = 3
 # repeats are byte-identical and would only triple verify_logger's runtime.
 OFFLINE_REPEATS = 1
 
+# Bedrock's prompt-cache TTL for the arms that have one, in seconds. Claude
+# Code requests no `ttl` on its cache_control blocks, so the default applies;
+# every write observed on the wire came back as `ephemeral_5m_input_tokens`.
+# Used only to say whether the harness's own run spacing sits inside it -- the
+# answer, measured across six matrices, is 3-5 seconds against 300.
+CACHE_TTL_S = 300.0
+
 PROMPT = (
     "The test in tests/test_calc.py fails. Fix the bug in calc.py so that it "
     "passes. Do not modify the test."
@@ -322,7 +329,37 @@ def build_images() -> str:
         capture_output=True,
         text=True,
     )
-    return out.stdout.strip()
+    image = out.stdout.strip()
+    assert_agent_can_verify_its_work(image)
+    return image
+
+
+def assert_agent_can_verify_its_work(image: str) -> None:
+    """Refuse to spend money on a matrix the agent cannot check itself in.
+
+    Spec section 3.3 measures a loop that ends in "runs tests, sees failures,
+    self-corrects". Through all of Phase 0c the image shipped no pytest, so
+    the loop ended at "edits" and every arm was scored on one unverified
+    guess -- Gemma burned 30 of 30 turns re-running a command that raised
+    ModuleNotFoundError with the bug fixed and with it unfixed alike, and the
+    9/9 was read as capability.
+
+    A precondition rather than a run criterion, deliberately: by the time a
+    record exists the tokens are paid for, and nothing in the record can
+    distinguish "the model never verified" from "the model could not".
+    """
+    probe = subprocess.run(
+        ["docker", "run", "--rm", "--entrypoint", "sh", image,
+         "-c", "command -v pytest && python -m pytest --version"],
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode != 0:
+        raise RuntimeError(
+            "the eval image ships no test runner, so the agent cannot verify "
+            "its own work and no arm's failure would be attributable to the "
+            f"model:\n{probe.stdout}{probe.stderr}"
+        )
 
 
 # --- the proxy ---------------------------------------------------------------
@@ -457,15 +494,24 @@ class Proxy:
         return self.container.logs(tail=tail).decode("utf-8", "replace")
 
     def request_count(self) -> int:
-        """POSTs the proxy actually served, counted from its own log.
+        """Client requests the proxy served, counted from its own log.
 
         The independent check on capture: every call the proxy answered must
         appear in the wire log or in unattributed.jsonl. A call that lands in
         neither is silently missing evidence, and section 6.2 makes the wire
         log the record of what went over the wire -- an incomplete one is
         worse than an absent one, because it looks complete.
+
+        This counts INBOUND requests, which is not the same quantity as the
+        wire log's entries: `num_retries: 3` means one request can produce
+        several provider attempts, each its own callback invocation. The
+        reconciliation in main() is what reads the two against each other.
+
+        Untruncated on purpose. `tail=10000` silently capped the numerator on
+        a long run, so a matrix big enough to matter would under-report served
+        and the check would pass by losing evidence of losing evidence.
         """
-        return self.logs(tail=10000).count("POST /v1/messages")
+        return self.logs(tail="all").count("POST /v1/messages")
 
     def __exit__(self, *_exc):
         # Kept unconditionally: on a teardown after a failure this is the
@@ -689,11 +735,44 @@ def run_arm(
 def wire_entry_count(record) -> int:
     import gzip
 
+    # None since 3.1.0, when the artifact does not exist -- the record no
+    # longer publishes a path to a file that was never opened.
+    if not record.artifacts.wire_log_gz:
+        return 0
     path = Path(record.artifacts.wire_log_gz)
     if not path.exists():
         return 0
     with gzip.open(path, "rt", encoding="utf-8") as handle:
         return sum(1 for line in handle if line.strip())
+
+
+def wire_failed_count(record) -> int:
+    """Entries recording a provider attempt that failed.
+
+    This is what licenses a captured count larger than a served one. LiteLLM
+    retries a failed call up to `num_retries` times and each attempt fires the
+    callback separately, so surplus attempts must each follow a failure -- a
+    surplus larger than the failure count is unexplained and worth a gate.
+    """
+    import gzip
+
+    if not record.artifacts.wire_log_gz:
+        return 0
+    path = Path(record.artifacts.wire_log_gz)
+    if not path.exists():
+        return 0
+    failed = 0
+    with gzip.open(path, "rt", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if (entry.get("metadata") or {}).get("failed"):
+                failed += 1
+    return failed
 
 
 # --- output ------------------------------------------------------------------
@@ -762,6 +841,11 @@ def print_cache_tokens(rows: list[dict]) -> None:
     N=10, as TASKS.md assumed), and Kimi does return cache tokens once it runs
     a real multi-turn loop. The earlier reading that the candidates returned
     none came from runs that died at turn 2.
+
+    `warm` is therefore printed PER REPEAT rather than summed. The totals here
+    say whether an arm caches at all; only the per-repeat column says which
+    repeat paid the cache write, and on the 2026-08-11 N=3 runs that column
+    alone separated the $0.547 run from the $0.176 one.
     """
     print("\ncache tokens (costs.py has no confirmed rate for any candidate)")
     for arm in dict.fromkeys(row["arm"] for row in rows):
@@ -777,7 +861,154 @@ def print_cache_tokens(rows: list[dict]) -> None:
             )
         else:
             note = "none returned"
-        print(f"  {arm:26} read={reads:<9} write={writes:<9} {note}")
+        # None is undetermined, not cold -- do not collapse it into "cold".
+        warm = ",".join(
+            {True: "warm", False: "cold", None: "?"}[row["cache_warm"]]
+            for row in arm_rows
+        )
+        print(f"  {arm:26} read={reads:<9} write={writes:<9} at_start={warm:<14} {note}")
+
+
+def run_order(arms: list[str], repeats: int, interleave: bool) -> list[tuple[str, int]]:
+    """The (arm, repeat) sequence to execute, in order.
+
+    ARM-MAJOR IS THE DEFAULT, and it is the ordering every cost figure in
+    TASKS.md was measured under. It keeps a NO-GO arm's runs adjacent in the
+    output and keeps one arm's repeats close in time, so a pass rate is not
+    confounded by drift in Bedrock-side load across the whole matrix.
+
+    It also walks straight into section 5.8's confound: back-to-back repeats of
+    the same arm warm that arm's prompt cache, and the second and third repeats
+    then read at 0.1x what the first paid to write. On the 2026-08-11 set the
+    three Sonnet runs started 15 and 14 seconds apart and the first cost 2.9x
+    the others. That is a fact about the ordering, not about the model.
+
+    Interleaving is the section 5.8 control, and it is worth being precise
+    about what it does not do. Measured: one interleaved round of the full
+    matrix takes 1.4-3.9 minutes, inside the 5-minute TTL, so every arm after
+    round 1 still finds its own prefix warm. Interleaving REDISTRIBUTES the
+    write cost across repeats; it does not produce cold runs. Nothing short of
+    idling past the TTL does, and the gap that decides it is now recorded per
+    run as `cache_state.seconds_since_prior_run`.
+    """
+    if interleave:
+        return [(arm, repeat) for repeat in range(repeats) for arm in arms]
+    return [(arm, repeat) for arm in arms for repeat in range(repeats)]
+
+
+def adjacent_repeats(order: list[tuple[str, int]]) -> list[str]:
+    """Arms that appear in two consecutive positions of the run order."""
+    return [a for (a, _), (b, _) in zip(order, order[1:]) if a == b]
+
+
+def print_run_order(order: list[tuple[str, int]], rows: list[dict], repeats: int) -> None:
+    """Spec section 5.8: the interleaving "must be verified, not assumed".
+
+    Reports the ORDERING and the GAP, because only the second one decides
+    anything. Interleaving a matrix that completes a round in under 5 minutes
+    reorders which repeat pays the cache write; it does not make any repeat
+    cold. The gaps are read from the records rather than from the schedule --
+    what the harness intended is not evidence of what the cache did.
+    """
+    if repeats <= 1:
+        return
+    print("\nrun ordering (spec section 5.8)")
+
+    arms = {arm for arm, _ in order}
+    adjacent = adjacent_repeats(order)
+    if len(arms) == 1:
+        print("  one arm: interleaving cannot separate its repeats from each other")
+    elif not adjacent:
+        print("  interleaved: no arm ran twice in a row")
+    else:
+        counts: dict[str, int] = {}
+        for arm in adjacent:
+            counts[arm] = counts.get(arm, 0) + 1
+        print(
+            "  NOT INTERLEAVED: an arm ran back-to-back, so its later repeats "
+            "read a cache its own earlier repeat paid to write."
+        )
+        for arm, count in sorted(counts.items(), key=lambda item: -item[1]):
+            print(f"    {arm:26} {count} back-to-back transition(s)")
+        print("  Re-run with --interleave to redistribute that write cost.")
+
+    gaps = [
+        row["gap_s"]
+        for row in rows
+        if isinstance(row.get("gap_s"), (int, float))
+    ]
+    if not gaps:
+        print("  no run followed an earlier run of its own arm")
+        return
+    print(
+        f"  gap to the prior run of the same arm: "
+        f"{min(gaps):.1f}s to {max(gaps):.1f}s over {len(gaps)} run(s)"
+    )
+    if max(gaps) < CACHE_TTL_S:
+        print(
+            f"  ALL INSIDE the {CACHE_TTL_S:.0f}s prompt-cache TTL. Every warm "
+            "run below was warmed by this harness, not by a deployment pattern."
+        )
+
+
+def print_cost(rows: list[dict], repeats: int) -> None:
+    """Spec section 5.8: cost per run, by cache scenario, naming both.
+
+    NEITHER COLUMN IS A CORRECTION OF THE OTHER, which is why neither is called
+    normalized. They are two real deployment situations:
+
+      first_task     turn 1 found the cache cold. A developer opening a fresh
+                     task pays the tool-schema write, ~42k tokens at 1.25x.
+      warm_followup  turn 1 read a prefix someone else wrote. A developer
+                     starting another task inside the TTL.
+
+    Calling the warm number "normalized" asserted it was the corrected one. It
+    is not. In this harness the warm runs exist because the scheduler ran
+    repeats 3-5 seconds apart inside a 300-second TTL -- see print_run_order --
+    and what carries over is 30,506 tokens of task-independent tool schemas, not
+    any part of the work. Averaging the two would price a scenario nobody is in.
+
+    Runs whose cost is None are excluded and counted, because a mean over "the
+    runs that happened to miss the cache" is not a price of anything -- and for
+    the candidate arms that is not a coincidence: `warm is True` requires cache
+    tokens, cache tokens raise on a model with no confirmed rate, so their
+    warm_followup column is unreachable by construction rather than unobserved.
+    """
+    if repeats <= 1:
+        return
+    print("\ncost per run by cache scenario (spec section 5.8)")
+    for arm in dict.fromkeys(row["arm"] for row in rows):
+        arm_rows = [row for row in rows if row["arm"] == arm]
+        priced = [row for row in arm_rows if row["cost"] is not None]
+        if not priced:
+            print(f"  {arm:26} unpriced on all {len(arm_rows)} run(s)")
+            continue
+
+        def mean(subset: list[dict]) -> str:
+            if not subset:
+                return "     --      "
+            return f"{sum(row['cost'] for row in subset) / len(subset):<9.5f} n={len(subset)}"
+
+        if all(row["cache_warm"] is None for row in arm_rows):
+            # Neither scenario applies: nothing reported cache accounting, so
+            # every run is undetermined rather than cold. Printing two empty
+            # columns would read as "measured, and both were zero".
+            total = sum(row["cost"] for row in priced) / len(priced)
+            print(
+                f"  {arm:26} cost={total:<9.5f} n={len(priced)}   "
+                "cache state undetermined on every run -- no scenario applies"
+            )
+            continue
+
+        cold = mean([row for row in priced if row["cache_warm"] is False])
+        warm = mean([row for row in priced if row["cache_warm"] is True])
+        unpriced = len(arm_rows) - len(priced)
+        note = ""
+        if unpriced and any(row["cache_warm"] is True for row in arm_rows):
+            note = f"  [{unpriced} unpriced, incl. every warm run -- no cache rate]"
+        elif unpriced:
+            note = f"  [{unpriced} unpriced]"
+        print(f"  {arm:26} first_task={cold}   warm_followup={warm}{note}")
 
 
 def print_sampling(rows: list[dict]) -> None:
@@ -829,6 +1060,13 @@ def main() -> int:
         help=f"runs per arm (default {LIVE_REPEATS} live, {OFFLINE_REPEATS} offline). "
         "GO requires every repeat of every arm to pass.",
     )
+    parser.add_argument(
+        "--interleave",
+        action="store_true",
+        help="round-robin the arms so repeats of one arm never run back-to-back "
+        "(spec section 5.8). Off by default; the ordering actually used is "
+        "reported either way.",
+    )
     parser.add_argument("--keep", action="store_true", help="keep artifacts on disk")
     args = parser.parse_args()
 
@@ -876,6 +1114,8 @@ def main() -> int:
     print(f"mode      {args.mode}  ({config_name})")
     print(f"arms      {', '.join(arms)}")
     print(f"repeats   {repeats} per arm ({len(arms) * repeats} runs)")
+    order = run_order(arms, repeats, args.interleave)
+    print(f"order     {'interleaved' if args.interleave else 'arm-major'}")
     print(f"workdir   {workdir}")
     if expectations.not_applicable:
         print(
@@ -901,60 +1141,61 @@ def main() -> int:
     with Proxy(
         config_name, wire_dir, environment, stamp, with_stub=args.mode == "offline"
     ) as proxy:
-        # Arm-major: all repeats of one arm before moving on. Keeps a NO-GO
-        # arm's runs adjacent in the output, and keeps the repeats of one arm
-        # close together in time so a rate is not confounded by drift in
-        # Bedrock-side load across the whole matrix.
-        for arm in arms:
-            for repeat in range(repeats):
-                label = arm if repeats == 1 else f"{arm}/{repeat + 1}"
-                print(f"\nrunning {label} ...")
-                record, config_dump, unattributed = run_arm(
-                    arm,
-                    image,
-                    workdir,
-                    wire_dir,
-                    event_log,
-                    proxy.internal_name,
-                    args.max_turns,
-                    args.timeout_s,
-                    repeat=repeat,
-                )
-                entries = wire_entry_count(record)
-                problems = run_problems(
-                    record,
-                    wire_entries=entries,
-                    unattributed=unattributed,
-                    config=config_dump,
-                    expectations=expectations,
-                )
-                if problems:
-                    failures[label] = problems
-                # One representative per arm: section 5.2 compares arms
-                # against each other, and repeats of one arm are configured
-                # identically by construction.
-                configs.setdefault(arm, config_dump)
-                rows.append(
-                    {
-                        "arm": arm,
-                        "label": label,
-                        "outcome": record.outcome.value,
-                        "turns": record.turns_used,
-                        "tools": record.tool_calls.total,
-                        "wire": entries,
-                        "out_tok": record.tokens.output,
-                        "cache_read": record.tokens.cache_read,
-                        "cache_write": record.tokens.cache_write,
-                        "cost": record.cost_usd,
-                        "wall_s": record.time.wall_clock_total_ms / 1000,
-                        "diff_b": len(record.artifacts.final_diff or ""),
-                        "unattributed": unattributed,
-                        "sampling": record.sampling,
-                        "problems": problems,
-                        "verdict": "NO-GO" if problems else "go",
-                        "wire_log": record.artifacts.wire_log_gz,
-                    }
-                )
+        # See run_order: arm-major by default, round-robin under --interleave.
+        # Either way the ordering used is reported rather than assumed, which
+        # is what section 5.8 asks for.
+        for arm, repeat in order:
+            label = arm if repeats == 1 else f"{arm}/{repeat + 1}"
+            print(f"\nrunning {label} ...")
+            record, config_dump, unattributed = run_arm(
+                arm,
+                image,
+                workdir,
+                wire_dir,
+                event_log,
+                proxy.internal_name,
+                args.max_turns,
+                args.timeout_s,
+                repeat=repeat,
+            )
+            entries = wire_entry_count(record)
+            problems = run_problems(
+                record,
+                wire_entries=entries,
+                unattributed=unattributed,
+                config=config_dump,
+                expectations=expectations,
+            )
+            if problems:
+                failures[label] = problems
+            # One representative per arm: section 5.2 compares arms
+            # against each other, and repeats of one arm are configured
+            # identically by construction.
+            configs.setdefault(arm, config_dump)
+            rows.append(
+                {
+                    "arm": arm,
+                    "label": label,
+                    "outcome": record.outcome.value,
+                    "turns": record.turns_used,
+                    "tools": record.tool_calls.total,
+                    "wire": entries,
+                    "wire_failed": wire_failed_count(record),
+                    "out_tok": record.tokens.output,
+                    "cache_read": record.tokens.cache_read,
+                    "cache_write": record.tokens.cache_write,
+                    "cache_warm": record.cache_state.warm,
+                    "gap_s": record.cache_state.seconds_since_prior_run,
+                    "cost": record.cost_usd,
+                    "wall_s": record.time.wall_clock_total_ms / 1000,
+                    "diff_b": len(record.artifacts.final_diff or ""),
+                    "unattributed": unattributed,
+                    "sampling": record.sampling,
+                    "problems": problems,
+                    "verdict": "NO-GO" if problems else "go",
+                    "wire_log": record.artifacts.wire_log_gz,
+                }
+            )
 
         if not rows:
             print("\nno arms ran")
@@ -964,19 +1205,48 @@ def main() -> int:
         # only the entries we captured cannot detect a call we failed to
         # capture -- the wire log would simply be short, and short is
         # indistinguishable from quiet.
+        #
+        # The two counts are DIFFERENT QUANTITIES and equality was the wrong
+        # test. `served` is inbound client requests; `captured` is provider
+        # attempts, and `num_retries: 3` means one request can produce several.
+        # Measured 2026-08-12: served=39, captured=42, the delta exactly the
+        # three retries of gemma's failing call -- reported as "some calls were
+        # captured nowhere", which describes captured < served, the opposite of
+        # what happened. A gate that cries loss on every retry is a gate that
+        # gets ignored, and it would then miss a real loss.
         served = proxy.request_count()
         captured = sum(row["wire"] for row in rows) + sum(
             row["unattributed"] for row in rows
         )
-        if served != captured:
+        failed = sum(row["wire_failed"] for row in rows)
+        if captured < served:
             failures.setdefault("wire capture", []).append(
-                f"the proxy served {served} POST /v1/messages but {captured} "
-                "were recorded: some calls were captured nowhere"
+                f"the proxy served {served} POST /v1/messages but only "
+                f"{captured} provider attempt(s) were recorded: "
+                f"{served - captured} call(s) were captured nowhere"
+            )
+        elif captured - served > failed:
+            # Surplus attempts are retries, and a retry only follows a
+            # failure. More surplus than failures means the surplus is
+            # something else, and nothing in the record would say what.
+            failures.setdefault("wire capture", []).append(
+                f"the proxy served {served} POST /v1/messages and recorded "
+                f"{captured} provider attempt(s), a surplus of "
+                f"{captured - served}, but only {failed} attempt(s) failed: "
+                "retries cannot account for the difference"
+            )
+        elif captured > served:
+            print(
+                f"\nwire capture  {served} request(s) -> {captured} provider "
+                f"attempt(s); {captured - served} retry/retries after "
+                f"{failed} failure(s)"
             )
 
         print_table(rows)
         print_rates(rows, repeats)
         print_cache_tokens(rows)
+        print_run_order(order, rows, repeats)
+        print_cost(rows, repeats)
         print_sampling(rows)
 
         differences = config_differences(configs) if len(configs) > 1 else []

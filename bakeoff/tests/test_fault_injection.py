@@ -131,9 +131,15 @@ class FakeRunner:
     """Stands in for ClaudeCodeRunner. Fires `turns` boundaries, then either
     returns or raises -- an agent killed mid-stream."""
 
-    def __init__(self, turns: int = 2, raise_after: int | None = None) -> None:
+    def __init__(
+        self,
+        turns: int = 2,
+        raise_after: int | None = None,
+        transcript_path: Path | None = None,
+    ) -> None:
         self.turns = turns
         self.raise_after = raise_after
+        self.transcript_path = transcript_path
 
     def run(self, prompt, cwd, on_turn=None):
         for turn in range(1, self.turns + 1):
@@ -143,7 +149,7 @@ class FakeRunner:
                 on_turn(turn, turn * 1000)
         return RunnerResult(
             exit_code=0,
-            transcript_path=None,
+            transcript_path=self.transcript_path,
             stdout="",
             stderr="",
             wall_clock_ms=self.turns * 1000,
@@ -159,6 +165,9 @@ def _fake_run(
     container=None,
     runner=None,
     container_raises=False,
+    event_log=None,
+    sample_index=0,
+    artifacts_name="artifacts",
 ):
     import bakeoff.runner as runner_module
 
@@ -187,12 +196,72 @@ def _fake_run(
     return execute_run(
         task=task,
         model="gemma-4-31b",
-        sample_index=0,
+        sample_index=sample_index,
         config=config,
-        event_log=EventLog(tmp_path / "log"),
+        event_log=event_log or EventLog(tmp_path / "log"),
         repo_path=str(tmp_path / "repo"),
-        artifacts_root=tmp_path / "artifacts",
+        artifacts_root=tmp_path / artifacts_name,
     )
+
+
+# --- the wiring, not a fault: cache_state must survive the whole orchestrator -
+
+
+def test_execute_run_records_cache_state_and_the_run_that_warmed_it(
+    task, tmp_path, monkeypatch
+):
+    """The assertion this file's FIRST rule exists for.
+
+    Through schema 2.0.0 `cache_state` was a parameter nobody passed, so every
+    record asserted `warm: false` -- a false claim, not an empty field, on the
+    axis Sonnet's 2.9x cost spread turns on. A unit test on assemble_record
+    would have passed the whole time, exactly as it did for api_error_status.
+    So this goes through execute_run, and it checks the lookup as well as the
+    measurement: the second run of a task must point at the first.
+
+    The transcripts are the two real shapes. Run one reads 0 on turn 1 and
+    30506 on turn 2 -- the cache warming WITHIN the run, which is why `warm`
+    cannot be taken from the run total. Run two reads on turn 1, which it
+    could only have got from run one.
+    """
+    log = EventLog(tmp_path / "log")
+
+    cold = _write(
+        tmp_path,
+        [_assistant(1, cache_read=0), _assistant(2, "end_turn", cache_read=30506)],
+        name="cold.jsonl",
+    )
+    warm = _write(
+        tmp_path,
+        [_assistant(1, cache_read=30506), _assistant(2, "end_turn", cache_read=41693)],
+        name="warm.jsonl",
+    )
+
+    first = _fake_run(
+        monkeypatch,
+        task,
+        tmp_path,
+        runner=FakeRunner(transcript_path=cold),
+        event_log=log,
+        sample_index=0,
+        artifacts_name="a0",
+    )
+    second = _fake_run(
+        monkeypatch,
+        task,
+        tmp_path,
+        runner=FakeRunner(transcript_path=warm),
+        event_log=log,
+        sample_index=1,
+        artifacts_name="a1",
+    )
+
+    assert first.cache_state.warm is False
+    assert first.tokens.cache_read > 0, "the run total would have said warm"
+    assert first.cache_state.prior_same_task_run_id is None
+
+    assert second.cache_state.warm is True
+    assert second.cache_state.prior_same_task_run_id == first.run_id
 
 
 # --- case 3: deliberately malformed tool call --------------------------------
@@ -392,6 +461,49 @@ def test_a_destructive_command_survives_an_unpriceable_model(task, tmp_path):
     assert record.trajectory_parse_error == ""
 
 
+def test_per_turn_costs_carry_their_price_basis_when_the_run_total_cannot(
+    task, tmp_path
+):
+    """A partial pricing failure leaves real dollars in `per_turn` while
+    `cost_usd` goes None. Keying the basis on the run total blanked it there,
+    so those figures sat in the record with no book attached -- and they are
+    exactly what an offline repricer sums.
+
+    Turn 1 carries no cache token and prices; turn 2 carries one and raises.
+    """
+    path = _write(
+        tmp_path,
+        [
+            _assistant(1, stop_reason="tool_use", tool="Read"),
+            _assistant(2, stop_reason="end_turn", cache_read=4096),
+        ],
+    )
+    record = assemble_record(
+        task=task, model="gemma-4-31b", sample_index=0,
+        started_at="2026-08-04T00:00:00Z", finished_at="2026-08-04T00:05:00Z",
+        trajectory_path=path, runner_result=None, checkpoints=[],
+        destructive_events=[], artifacts_root=tmp_path,
+    )
+
+    assert record.cost_usd is None, "one turn could not be priced"
+    assert record.per_turn[0].cost_usd is not None, "the other one could"
+    assert record.versions.pricing_basis != ""
+
+
+def test_a_record_that_priced_nothing_claims_no_price_basis(task, tmp_path):
+    """The mirror. A crashed run with no transcript has cost 0.0 by default,
+    and stamping a basis on it would dress an absent measurement as a priced
+    one."""
+    record = assemble_record(
+        task=task, model="gemma-4-31b", sample_index=0,
+        started_at="2026-08-04T00:00:00Z", finished_at="2026-08-04T00:05:00Z",
+        trajectory_path=None, runner_result=None, checkpoints=[],
+        destructive_events=[], artifacts_root=tmp_path, container_crashed=True,
+    )
+    assert record.turns_used == 0
+    assert record.versions.pricing_basis == ""
+
+
 # --- case 7: the test harness itself crashes ---------------------------------
 
 
@@ -478,6 +590,222 @@ def test_failed_record_write_leaves_no_phantom_index_entry(task, tmp_path, monke
         run_id = json.loads(line)["run_id"]
         assert (tmp_path / "log" / "runs" / f"{run_id}.json").exists()
     assert not list((tmp_path / "log" / "runs").glob("*.partial"))
+
+
+# --- case 8b: the log refuses the record, and the record survives anyway -----
+
+
+def test_a_refused_write_strands_the_record_beside_its_own_artifacts(
+    task, tmp_path, monkeypatch
+):
+    """The last statement of a run used to be unguarded.
+
+    By the time `write_run` is called the tokens are spent, and the write has
+    real ways to fail that say nothing about the run: a `<run_id>.json.partial`
+    left by a process killed mid-write raises ImmutabilityError forever after
+    -- and `run_id` is deterministic, so the retry raises too -- while a full
+    disk raises OSError. Either way the record was gone, which is the one loss
+    the module docstring says cannot be re-derived at any price.
+
+    Both halves are asserted. The strand file has to be there AND the
+    exception has to escape: a caller that believed the log was complete would
+    go on to compute means over a matrix with a hole in it.
+    """
+    from bakeoff.runner import UNWRITTEN_NAME
+
+    def boom(*_a, **_k):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr("bakeoff.eventlog.json.dump", boom)
+
+    with pytest.raises(OSError):
+        _fake_run(monkeypatch, task, tmp_path)
+
+    stranded = tmp_path / "artifacts" / UNWRITTEN_NAME
+    assert stranded.exists(), "the record was lost with the write"
+
+    # A whole record, not a stub: it has to be appendable offline as-is.
+    recovered = json.loads(stranded.read_text())
+    assert recovered["task_id"] == task.task_id
+    assert recovered["schema_version"]
+    assert recovered["run_id"]
+
+
+def test_a_stale_partial_does_not_silently_swallow_the_rerun(task, tmp_path, monkeypatch):
+    """The concrete way A-2's guard gets exercised in production.
+
+    A process killed between `open(tmp, "x")` and the rename leaves the
+    .partial behind, and nothing cleans it up. Because run_id is derived from
+    (task, model, sample, attempt), the natural fix -- run it again -- hits
+    the same file and raises again.
+    """
+    from bakeoff.runner import UNWRITTEN_NAME, make_run_id
+
+    log = EventLog(tmp_path / "log")
+    run_id = make_run_id(task.task_id, "gemma-4-31b", 0, 1)
+    runs = tmp_path / "log" / "runs"
+    runs.mkdir(parents=True, exist_ok=True)
+    (runs / f"{run_id}.json.partial").write_text("{}")
+
+    with pytest.raises(Exception):
+        _fake_run(monkeypatch, task, tmp_path, event_log=log)
+
+    assert (tmp_path / "artifacts" / UNWRITTEN_NAME).exists()
+
+
+# --- case 8c: no transcript is loss, and must not read as a quiet run --------
+
+
+def test_a_missing_transcript_is_recorded_as_loss_not_as_silence(
+    task, tmp_path, monkeypatch
+):
+    """Zeroes are only readable as observation when the error field is empty.
+
+    A run whose transcript never appeared sends turns_used, every token count,
+    tool_calls, destructive_events and cost_usd to zero together. Until this
+    branch existed `trajectory_parse_error` stayed "" through all of that, so
+    the row was byte-identical to a genuinely quiet run -- the exact ambiguity
+    the rest of the schema's vocabulary is built to eliminate.
+    """
+    record = _fake_run(
+        monkeypatch, task, tmp_path, runner=FakeRunner(turns=2, transcript_path=None)
+    )
+
+    assert record.turns_used == 0
+    assert record.tokens.input == 0
+    assert record.cost_usd == 0.0
+    assert "absent" in record.trajectory_parse_error, (
+        "a zero row with an empty error field claims the agent was quiet"
+    )
+
+
+def test_a_transcript_that_parsed_says_nothing_about_absence(task, tmp_path):
+    """The other side of it: a real transcript must leave the field empty, or
+    the signal means nothing."""
+    transcript = _write(tmp_path, [_assistant(1, stop_reason="end_turn")])
+
+    record = assemble_record(
+        task=task, model="gemma-4-31b", sample_index=0,
+        started_at="2026-08-04T00:00:00Z", finished_at="2026-08-04T00:01:00Z",
+        trajectory_path=transcript, runner_result=None, checkpoints=[],
+        destructive_events=[], artifacts_root=tmp_path,
+    )
+
+    assert record.trajectory_parse_error == ""
+    assert record.turns_used == 1
+
+
+# --- case 8d: attribution loss must be visible in the record -----------------
+
+
+def test_calls_the_proxy_could_not_attribute_are_counted_in_the_record(task, tmp_path):
+    """A run whose header stamping broke writes a well-formed record.
+
+    Every wire-derived field -- sampling, both hashes, bedrock_model_id --
+    comes back empty, and before 3.1.0 nothing in the record said why. The
+    gate for this existed only in scripts/smoke_test.py, which does not run
+    during an eval.
+    """
+    record = assemble_record(
+        task=task, model="gemma-4-31b", sample_index=0,
+        started_at="2026-08-04T00:00:00Z", finished_at="2026-08-04T00:01:00Z",
+        trajectory_path=None, runner_result=None, checkpoints=[],
+        destructive_events=[], artifacts_root=tmp_path,
+        wire_entries=[], wire_unattributed=3,
+    )
+
+    assert record.wire_entries_seen == 0
+    assert record.wire_unattributed == 3
+    assert record.sampling == {}
+
+
+def test_unmeasured_attribution_is_none_not_zero(task, tmp_path):
+    """None and 0 are different claims, and only 0 licenses trusting the
+    wire-derived fields. A run with no proxy wire directory never had an
+    unattributed.jsonl to count."""
+    record = assemble_record(
+        task=task, model="gemma-4-31b", sample_index=0,
+        started_at="2026-08-04T00:00:00Z", finished_at="2026-08-04T00:01:00Z",
+        trajectory_path=None, runner_result=None, checkpoints=[],
+        destructive_events=[], artifacts_root=tmp_path,
+    )
+
+    assert record.wire_unattributed is None
+
+
+def test_execute_run_counts_only_this_runs_lost_calls(task, tmp_path, monkeypatch):
+    """A DELTA, not an absolute.
+
+    unattributed.jsonl is shared by every run against one proxy. An absolute
+    count would charge each run with every earlier run's losses, so every run
+    after the first would be unreadable and the field would be worse than
+    absent.
+    """
+    wire_dir = tmp_path / "wire"
+    wire_dir.mkdir()
+    # Two calls an EARLIER run lost. This run must not be blamed for them.
+    (wire_dir / "unattributed.jsonl").write_text('{"a":1}\n{"a":2}\n')
+
+    import bakeoff.runner as runner_module
+
+    box = FakeContainer()
+    monkeypatch.setattr(runner_module, "RunContainer", lambda **_k: box)
+    monkeypatch.setattr(runner_module, "ContainerBackend", lambda *a, **k: None)
+    monkeypatch.setattr(
+        runner_module, "ClaudeCodeRunner", lambda *a, **k: FakeRunner(turns=1)
+    )
+
+    config = ClaudeCodeConfig(
+        model="gemma-4-31b", base_url="http://litellm:4000", auth_token="unused",
+        settings_path="/eval/eval_settings.json", config_dir="/eval/claude-config",
+        max_turns=60, wall_clock_timeout_s=300,
+    )
+    record = execute_run(
+        task=task, model="gemma-4-31b", sample_index=0, config=config,
+        event_log=EventLog(tmp_path / "log"), repo_path=str(tmp_path / "repo"),
+        artifacts_root=tmp_path / "artifacts", proxy_wire_dir=wire_dir,
+    )
+
+    assert record.wire_unattributed == 0, "inherited an earlier run's losses"
+
+
+def test_an_absent_system_prompt_hashes_to_empty_not_to_a_digest_of_null(
+    task, tmp_path
+):
+    """`_sha256(None)` used to return the sha256 of the four bytes "null".
+
+    That is an ordinary-looking 64-hex digest, so a record that observed no
+    system prompt could not be told from one that observed a real prompt --
+    and two arms that both sent nothing would agree on a hash and read as
+    having sent the same thing.
+    """
+    record = assemble_record(
+        task=task, model="gemma-4-31b", sample_index=0,
+        started_at="2026-08-04T00:00:00Z", finished_at="2026-08-04T00:01:00Z",
+        trajectory_path=None, runner_result=None, checkpoints=[],
+        destructive_events=[], artifacts_root=tmp_path,
+        wire_entries=[{"request": {"model": "gemma-4-31b"}, "metadata": {}}],
+    )
+
+    assert record.system_prompt_sha == ""
+    assert record.tool_schema_sha == ""
+    assert record.wire_entries_seen == 1
+
+
+def test_a_wire_log_that_was_never_opened_is_not_advertised_as_an_artifact(
+    task, tmp_path
+):
+    """Unlike container_stdout, this path used to be asserted unconditionally,
+    so a consumer following it got a FileNotFoundError instead of a null it
+    could have handled."""
+    record = assemble_record(
+        task=task, model="gemma-4-31b", sample_index=0,
+        started_at="2026-08-04T00:00:00Z", finished_at="2026-08-04T00:01:00Z",
+        trajectory_path=None, runner_result=None, checkpoints=[],
+        destructive_events=[], artifacts_root=tmp_path,
+    )
+
+    assert record.artifacts.wire_log_gz is None
 
 
 # --- case 9: wire log captures a malformed completion in full, pre-parse -----
@@ -854,11 +1182,26 @@ def test_proxy_side_capture_records_the_call_the_agent_made(
     # merely presence: max_tokens is what the caller actually sent, so an
     # empty dict or a config-sourced default both fail here.
     assert record.sampling["max_output_tokens"] == 64
-    assert len(record.system_prompt_sha) == 64
+    # Pinned against the request the fake agent actually sent, not merely
+    # asserted to be 64 hex. Length alone passed for as long as _sha256(None)
+    # returned the digest of the four bytes "null" -- a request carrying no
+    # system prompt produced a perfectly ordinary-looking hash, and this test
+    # certified it.
+    import hashlib as _hashlib
+
+    assert record.system_prompt_sha == _hashlib.sha256(
+        json.dumps("You are Claude Code.", sort_keys=True).encode()
+    ).hexdigest()
     assert len(record.tool_schema_sha) == 64
     # Read off the wire, not from config: the alias is what was asked for,
     # this is what answered.
     assert record.versions.bedrock_model_id
+
+    # Attribution accounted for in the record itself, not only in the
+    # artifact. Zero is a measurement here, which is what licenses reading
+    # the sampling and hashes above as real observations.
+    assert record.wire_entries_seen == len(logged)
+    assert record.wire_unattributed == 0
 
 
 @integration

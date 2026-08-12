@@ -47,6 +47,11 @@ class ParsedTrajectory:
     first_edit_offset_ms: int | None = None
     bash_commands: list[tuple[int, str]] = field(default_factory=list)
     malformed_lines: int = 0
+    # Raw `type: "assistant"` records. `len(turns)` counts API calls, and the
+    # difference between them is how many content blocks the calls were split
+    # across -- the quantity that silently doubled every token total until
+    # 3.0.0. Kept so the collapse is visible without the transcript.
+    assistant_records: int = 0
     # Why the cost is unknown. Non-empty exactly when total_cost_usd is None.
     pricing_error: str = ""
 
@@ -62,13 +67,64 @@ def _elapsed_ms(start: datetime | None, end: datetime | None) -> int:
 
 
 def _usage_from(raw: dict) -> TokenUsage:
+    """Project `message.usage`. Absent fields are 0 -- see the caller's guard.
+
+    Zero here is ambiguous by construction: a provider that reports no cache
+    accounting at all and one that reports a genuine 0 project identically.
+    `runner._cache_warm` is what resolves it, using the whole run rather than
+    one field, so nothing downstream may read a 0 in this struct as an
+    observation on its own.
+
+    The ephemeral split (spec section 3.1) is nested under `cache_creation`
+    when the provider sends it; the flat `cache_creation_input_tokens` is the
+    total either way. Only Sonnet's native-Anthropic route carries the nested
+    object -- LiteLLM's Converse bridge emits the flat field alone -- so the
+    tiers routinely sum to less than the total, and that gap is an untiered
+    write, not a 5m one.
+
+    THIS FUNCTION MUST NOT RAISE. It runs outside `parse_trajectory`'s pricing
+    guard, so anything escaping it aborts the parse and `assemble_record`
+    discards the whole trajectory -- turns, tokens, tool calls and destructive
+    events all zeroed for a run that worked. `usage` comes from a proxy
+    translation layer this repo documents as lossy and shape-shifting, so every
+    field is coerced rather than trusted: a `cache_creation` that arrives as a
+    list, or a tier that arrives as `null`, would otherwise cost the record.
+    The `null` case is the quieter one -- it stores `None` here and raises a
+    TypeError in `TokenUsage.__add__` on the NEXT turn, one call away from
+    anything that could name the cause.
+    """
+    tiers = raw.get("cache_creation")
+    if not isinstance(tiers, dict):
+        tiers = {}
+    write_5m = _int(tiers.get("ephemeral_5m_input_tokens"))
+    write_1h = _int(tiers.get("ephemeral_1h_input_tokens"))
     return TokenUsage(
-        input=raw.get("input_tokens", 0),
-        output=raw.get("output_tokens", 0),
-        reasoning=raw.get("reasoning_tokens", 0),
-        cache_read=raw.get("cache_read_input_tokens", 0),
-        cache_write=raw.get("cache_creation_input_tokens", 0),
+        input=_int(raw.get("input_tokens")),
+        output=_int(raw.get("output_tokens")),
+        reasoning=_int(raw.get("reasoning_tokens")),
+        cache_read=_int(raw.get("cache_read_input_tokens")),
+        # The nested sum is the fallback, not the source: a response carrying
+        # only the tiers must not report a zero total and price as free. `max`
+        # rather than `or`, so the invariant `cache_write >= 5m + 1h` holds for
+        # anything this function returns -- `cost_usd` charges the total once
+        # and reads the 1h tier out of it, and a total smaller than its own
+        # tiers makes that arithmetic bill more tokens than were written.
+        cache_write=max(
+            _int(raw.get("cache_creation_input_tokens")), write_5m + write_1h
+        ),
+        cache_write_5m=write_5m,
+        cache_write_1h=write_1h,
     )
+
+
+def _int(value: object) -> int:
+    """A token count, or 0 for anything that is not one.
+
+    `null` is the case that matters: JSON nulls reach here as `None`, store as
+    `None`, and raise a TypeError inside `TokenUsage.__add__` on a later turn --
+    far from the field that caused it, and costing the whole record.
+    """
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
 def _is_tool_result(record: dict) -> bool:
@@ -78,6 +134,8 @@ def _is_tool_result(record: dict) -> bool:
 def parse_trajectory(path: Path, model: str) -> ParsedTrajectory:
     result = ParsedTrajectory(model=model)
     by_name: dict[str, int] = {}
+    # message.id -> index into result.turns. See the dedupe below.
+    by_message_id: dict[str, int] = {}
     started_at: datetime | None = None
     # Previous record of any type -- an assistant turn's inference begins
     # when the record that unblocked it landed, not at the previous turn.
@@ -112,13 +170,34 @@ def parse_trajectory(path: Path, model: str) -> ParsedTrajectory:
             continue
 
         message = record.get("message", {})
-        turn_no += 1
+        result.assistant_records += 1
 
         if not result.claude_code_version:
             result.claude_code_version = record.get("version", "")
 
+        # ONE API CALL IS ONE TURN, and Claude Code does not write it that way.
+        # It emits one transcript record per CONTENT BLOCK -- a reply with text
+        # and two tool calls is three records -- and every one of them repeats
+        # the whole `usage`. Counting records therefore inflated both the turn
+        # count and the token total: measured on stored records 2026-08-11, a
+        # five-call Sonnet run recorded 6 turns and `cache_write` 83,867 against
+        # a true 42,171, doubling its cost.
+        #
+        # Keyed on `message.id` globally rather than on the previous record, so
+        # a tool_result landing between two blocks of the same reply cannot
+        # split it. A record with NO id gets a key nothing else can match, so
+        # it stays its own turn: merging on absence would collapse genuinely
+        # distinct calls, the same error in the expensive direction.
+        message_id = message.get("id")
+        key = message_id or f"\0record-{result.assistant_records}"
+        seen = by_message_id.get(key)
+
+        if seen is None:
+            turn_no += 1
         usage = _usage_from(message.get("usage", {}))
-        result.total_tokens = result.total_tokens + usage
+
+        if seen is None:
+            result.total_tokens = result.total_tokens + usage
 
         inference_ms = _elapsed_ms(prev_ts, now)
         if now:
@@ -152,6 +231,19 @@ def parse_trajectory(path: Path, model: str) -> ParsedTrajectory:
         # named. Both mean the same thing -- the tokens are known and the
         # price is not -- and the tokens are what make the run repriceable
         # offline once rates are published.
+        if seen is not None:
+            # A later block of a call already counted. Its tool calls are on
+            # the turn above; its usage is a repeat, and its `stop_reason` is
+            # the real one -- the first block of a reply carries None while the
+            # last carries `tool_use` or `end_turn`, which is what
+            # assemble_record reads to decide the outcome.
+            existing = result.turns[seen]
+            if message.get("stop_reason") is not None:
+                result.turns[seen] = replace(
+                    existing, stop_reason=message.get("stop_reason")
+                )
+            continue
+
         try:
             turn_cost: float | None = cost_usd(model, usage)
         except (ValueError, UnknownModelError) as exc:
@@ -160,6 +252,7 @@ def parse_trajectory(path: Path, model: str) -> ParsedTrajectory:
         else:
             if result.total_cost_usd is not None:
                 result.total_cost_usd += turn_cost
+        by_message_id[key] = len(result.turns)
         result.turns.append(
             TurnRecord(
                 turn=turn_no,
@@ -169,6 +262,7 @@ def parse_trajectory(path: Path, model: str) -> ParsedTrajectory:
                 tool_exec_ms=0,
                 stop_reason=message.get("stop_reason"),
                 bedrock_request_id=record.get("requestId"),
+                api_message_id=message_id,
             )
         )
 

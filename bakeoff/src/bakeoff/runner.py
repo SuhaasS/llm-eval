@@ -6,6 +6,12 @@ crash mid-run still yields a valid partial record rather than nothing
 allowed to raise past this module -- the tokens are already paid for by
 then, and a lost record cannot be re-derived at any price.
 
+The write itself is the exception, and it is a deliberate one. It CAN
+raise -- a caller that thought the log was complete would go on to compute
+means over a matrix with a hole in it -- but it may not lose the record on
+the way out. `_write_or_strand` puts the record next to its own artifacts
+first and re-raises second, so the failure is loud and the data survives it.
+
 Two things this module is careful NOT to do:
 
   It does not decide whether the agent succeeded. Grading is offline
@@ -40,8 +46,9 @@ from bakeoff.claude_runner import (
 )
 from bakeoff.classify import RunSignals, classify_exclusion, classify_failure
 from bakeoff.container import RunContainer
+from bakeoff.costs import PRICING_BASIS
 from bakeoff.eventlog import EventLog
-from bakeoff.proxy_callback import read_manifest, read_run_entries
+from bakeoff.proxy_callback import read_manifest, read_run_entries, unattributed_count
 from bakeoff.scanners import scan_destructive
 from bakeoff.schema import (
     Artifacts,
@@ -53,6 +60,7 @@ from bakeoff.schema import (
     Severity,
     TerminationReason,
     TimingBreakdown,
+    TokenUsage,
     ToolCallStats,
     Versions,
 )
@@ -61,6 +69,11 @@ from bakeoff.wire import BakeoffCallback, WireLogger
 
 CONTAINER_CONFIG_DIR = "/eval/claude-config"
 STDOUT_NAME = "agent_stdout.jsonl"
+WIRE_NAME = "wire.jsonl.gz"
+# Where a record goes when the event log refuses it. Named so a directory
+# listing says what it is: this file existing means the log is INCOMPLETE and
+# an offline pass has to append it.
+UNWRITTEN_NAME = "record.unwritten.json"
 
 
 @dataclass(frozen=True)
@@ -81,7 +94,35 @@ def make_run_id(
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
 
 
+def _unattributed(wire_dir: Path | None) -> int | None:
+    """Calls the proxy could not attribute, or None if nobody could count.
+
+    Total by construction, like the prior-run lookup: it runs on the path
+    that must always reach a record, and an unreadable unattributed.jsonl is
+    not worth losing a run over. A read failure yields None -- "not
+    measured" -- rather than 0, because 0 is the value that licenses trusting
+    the wire-derived fields.
+    """
+    if wire_dir is None:
+        return None
+    try:
+        return unattributed_count(Path(wire_dir))
+    except Exception:  # noqa: BLE001 - a record must not be lost to a count
+        return None
+
+
 def _sha256(value: Any) -> str:
+    """Digest of a request field, or "" when the field was not there.
+
+    The None guard is the whole point. Without it an absent `system` block
+    hashes the four bytes "null" and yields a perfectly ordinary-looking
+    64-hex digest -- so a record that observed no system prompt is
+    indistinguishable from one that observed a real prompt, and two arms that
+    both sent nothing would agree on a hash and read as having sent the same
+    thing. "" is what every other unobserved string field in the record uses.
+    """
+    if value is None:
+        return ""
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()
@@ -203,6 +244,61 @@ def resolve_reverts(
     return resolved
 
 
+def _elapsed_seconds(earlier: str, later: str) -> float | None:
+    """Seconds between two ISO timestamps, or None if either cannot be read.
+
+    None on an unparseable input rather than 0.0, which would read as "these
+    runs started at the same instant" -- the strongest possible claim about
+    cache carryover, made from missing data.
+    """
+    if not earlier or not later:
+        return None
+    try:
+        start = datetime.fromisoformat(earlier.replace("Z", "+00:00"))
+        end = datetime.fromisoformat(later.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (end - start).total_seconds()
+
+
+def _cache_warm(parsed: ParsedTrajectory) -> bool | None:
+    """Did this run start against a cache an earlier run had warmed?
+
+    FIRST TURN, never the run total. Bedrock's cache warms on turn 2 of a
+    single run, so a run-total `cache_read > 0` is true of nearly every Sonnet
+    run and separates nothing; turn 1 cannot read what this run itself wrote.
+
+    The three None cases are the point of this being a function. `False` is a
+    claim -- the provider accounted for cache and reported no read on the first
+    call -- and every path that cannot support that claim must say nothing
+    instead. Schema 2.1.0 fixed the first; 2.2.0 fixes the other two, which
+    between them covered three of the four arms:
+
+    - No turn parsed. Nothing was observed.
+    - Turn 1 carried no `usage` block. `_usage_from` projects that to all-zero
+      tokens, byte-identical to a genuine zero, so the projection alone cannot
+      be read; an API-error or replayed assistant record lands here.
+    - The run reported no cache accounting ANYWHERE, read or write, on any
+      turn. Gemma and Nemotron do this on every run -- 9 for 9 -- and `false`
+      would assert a cold cache on models whose cache support is unconfirmed
+      (`costs.PRICE_BOOK` carries None multipliers for exactly that reason).
+
+    Checked against the measured Sonnet runs in tasks/todo.md: the cold run's
+    turn 1 is (0, 41695), so the run-total guard sees writes and leaves it
+    False, and the warm runs (30506, 11187) stay True. This narrows what
+    `false` means without moving any value that was already a measurement.
+    """
+    if not parsed.turns:
+        return None
+    first = parsed.turns[0].tokens
+    if first == TokenUsage():
+        return None
+    total = parsed.total_tokens
+    if total.cache_read == 0 and total.cache_write == 0:
+        return None
+    return first.cache_read > 0
+
+
 def assemble_record(
     task: TaskSpec,
     model: str,
@@ -220,8 +316,21 @@ def assemble_record(
     api_error_status: int | None = None,
     versions: Versions | None = None,
     cfg_digest: str = "",
-    cache_state: CacheState | None = None,
+    # Not a CacheState. `warm` is derived here from the parsed trajectory so it
+    # cannot be forgotten by a caller -- a cache_state parameter nobody passed
+    # is what made every record through schema 2.0.0 claim `warm: false`.
+    prior_same_task_run_id: str | None = None,
+    # The prior run's `started_at`, for CacheState.seconds_since_prior_run.
+    # Passed in rather than looked up here: execute_run reads the index once,
+    # before the container starts, and a second lookup after the run would
+    # measure the gap to a different run.
+    prior_started_at: str = "",
     wire_entries: list[dict[str, Any]] | None = None,
+    # None, not 0: "no proxy wire directory was configured, so nobody
+    # counted" is a different claim from "counted, and it was zero", and only
+    # the second one licenses reading an empty `sampling` as a real
+    # observation rather than as lost attribution.
+    wire_unattributed: int | None = None,
     isolated: bool = False,
     adapter_patches: list[str] | None = None,
     proxy_litellm: str = "",
@@ -245,6 +354,24 @@ def assemble_record(
             # says: the transcript itself could not be read.
             parse_error = f"{type(exc).__name__}: {exc}"
             parsed = ParsedTrajectory(model=model)
+    else:
+        # No transcript at all, which is NOT the same as a transcript that
+        # parsed to nothing -- and until this branch existed the record could
+        # not tell you which. turns_used, every token count, tool_calls,
+        # destructive_events and cost_usd all go to zero together here, and
+        # `parse_error` stayed empty, so the row read as a quiet, well-behaved
+        # run. It is total loss of the run's derived evidence.
+        #
+        # It goes on trajectory_parse_error rather than a new field because
+        # the contract that field already carries -- "non-empty exactly when
+        # the derived fields are zero because the transcript could not be
+        # read" -- is the same claim to a reader. A separate field would let
+        # a consumer check one and not the other.
+        parse_error = (
+            f"transcript absent: {trajectory_path}"
+            if trajectory_path is not None
+            else "transcript absent: the runner reported no transcript path"
+        )
 
     timed_out = bool(getattr(runner_result, "timed_out", False))
     wall_clock_ms = int(getattr(runner_result, "wall_clock_ms", 0) or 0)
@@ -325,6 +452,11 @@ def assemble_record(
         outcome=outcome,
         terminated_by=terminated_by,
         turns_used=len(parsed.turns),
+        # Three counts of the same run, from three places, stored because they
+        # disagree informatively: API calls, transcript records, and what the
+        # CLI itself streamed. A single number hid a 2x token inflation.
+        assistant_records=parsed.assistant_records,
+        turns_streamed=int(getattr(runner_result, "turns_streamed", 0) or 0),
         parent_run_id=parent_run_id,
         attempt_number=attempt_number,
         versions=versions or Versions(
@@ -346,14 +478,40 @@ def assemble_record(
             # about the container -- it pins its own copy.
             litellm_patches=adapter_patches,
             litellm_proxy_version=proxy_litellm,
+            # Which price book produced the dollars in this record. Keyed on
+            # ANY priced turn, not on the run total: a run where one turn hit
+            # the cache guard has `cost_usd: null` while `per_turn[i].cost_usd`
+            # keeps real figures, and those are exactly what an offline
+            # repricer sums. Blanking the basis there left dollars in the
+            # record with no book attached.
+            pricing_basis=(
+                PRICING_BASIS
+                if any(turn.cost_usd is not None for turn in parsed.turns)
+                else ""
+            ),
         ),
         config_digest=cfg_digest,
         system_prompt_sha=_sha256(first_request.get("system")) if entries else "",
         tool_schema_sha=_sha256(first_request.get("tools")) if entries else "",
         sampling={
             "temperature": first_request.get("temperature"),
-            "max_output_tokens": first_request.get("max_tokens"),
+            # Whichever spelling the wire carried. The three candidate arms
+            # send max_completion_tokens (openai_max_completion_tokens_rename);
+            # Sonnet sends max_tokens on its native Anthropic body. Reading
+            # max_tokens alone would fall through to Claude Code's raw request
+            # on a renamed arm and report the config rather than the wire.
+            "max_output_tokens": (
+                first_request.get("max_completion_tokens")
+                if first_request.get("max_completion_tokens") is not None
+                else first_request.get("max_tokens")
+            ),
         } if entries else {},
+        # What the wire could and could not account for. Recorded next to the
+        # fields derived from it, because those fields are empty for both
+        # "the proxy saw nothing" and "the proxy saw everything and could not
+        # attribute any of it", and the two are different failures.
+        wire_entries_seen=len(entries),
+        wire_unattributed=wire_unattributed,
         exclusion=classify_exclusion(signals),
         failure_class=classify_failure(signals),
         time=TimingBreakdown(
@@ -364,7 +522,11 @@ def assemble_record(
         ),
         tokens=parsed.total_tokens,
         cost_usd=parsed.total_cost_usd,
-        cache_state=cache_state or CacheState(),
+        cache_state=CacheState(
+            warm=_cache_warm(parsed),
+            prior_same_task_run_id=prior_same_task_run_id,
+            seconds_since_prior_run=_elapsed_seconds(prior_started_at, started_at),
+        ),
         per_turn=parsed.turns,
         checkpoints=checkpoints,
         tool_calls=tool_calls,
@@ -374,7 +536,17 @@ def assemble_record(
         isolated=isolated,
         artifacts=Artifacts(
             trajectory_jsonl_gz=str(trajectory_path) if trajectory_path else None,
-            wire_log_gz=str(artifacts_root / "wire.jsonl.gz"),
+            # Existence-checked, like container_stdout below. This used to be
+            # asserted unconditionally, so a run whose WireLogger never opened
+            # -- a name collision, an unwritable artifacts dir -- still
+            # published a path to a file that was not there, and a consumer
+            # following it got a FileNotFoundError instead of a null it could
+            # have handled.
+            wire_log_gz=(
+                str(artifacts_root / WIRE_NAME)
+                if (artifacts_root / WIRE_NAME).exists()
+                else None
+            ),
             final_diff=checkpoints[-1].diff_vs_base if checkpoints else None,
             # The agent's stream-json stdout, which is NOT the session
             # transcript: the transcript records messages, while the init
@@ -435,6 +607,21 @@ def execute_run(
     run_id = make_run_id(task.task_id, model, sample_index, attempt_number)
     started_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
+    # Read BEFORE the container starts, so "prior" means prior to this run
+    # rather than merely prior to the write. Never raises (see EventLog), which
+    # is why it sits out here rather than inside the try below -- an exception
+    # there would be recorded as a container crash.
+    prior_run = event_log.last_run_for(task.task_id, model)
+    prior_run_id = prior_run[0] if prior_run else None
+    prior_started_at = prior_run[1] if prior_run else ""
+
+    # A DELTA, not an absolute. unattributed.jsonl is shared by every run
+    # against a proxy, so an absolute count would charge this run with every
+    # earlier run's lost calls and every run after the first would be
+    # unreadable. Read before the container starts, for the same reason the
+    # prior-run lookup is.
+    unattributed_before = _unattributed(proxy_wire_dir)
+
     # Fresh and empty per run: transcript discovery globs this directory and
     # trusts that whatever it finds belongs to this run.
     host_config_dir = artifacts_root / "claude-config"
@@ -466,7 +653,7 @@ def execute_run(
     try:
         # Inside the try: a name collision on the wire log must cost the wire
         # log, not the run record.
-        wire = WireLogger(artifacts_root / "wire.jsonl.gz")
+        wire = WireLogger(artifacts_root / WIRE_NAME)
         # The proxy's config file cannot register this -- the callback needs
         # a per-run logger and run_id, and a dotted path resolves to the
         # class rather than an instance (see wire.BakeoffCallback).
@@ -557,6 +744,13 @@ def execute_run(
     if proxy_wire_dir is not None:
         adapter_patches, proxy_litellm = read_manifest(proxy_wire_dir)
 
+    unattributed_after = _unattributed(proxy_wire_dir)
+    wire_unattributed = (
+        unattributed_after - unattributed_before
+        if unattributed_before is not None and unattributed_after is not None
+        else None
+    )
+
     finished_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
     record = assemble_record(
@@ -574,10 +768,52 @@ def execute_run(
         parent_run_id=parent_run_id,
         container_crashed=crashed,
         cfg_digest=config_digest(config),
+        prior_same_task_run_id=prior_run_id,
+        prior_started_at=prior_started_at,
         wire_entries=wire_entries,
+        wire_unattributed=wire_unattributed,
         isolated=bool(network),
         adapter_patches=adapter_patches,
         proxy_litellm=proxy_litellm,
     )
-    event_log.write_run(record)
+    _write_or_strand(record, event_log, artifacts_root)
     return record
+
+
+def _write_or_strand(
+    record: RunRecord, event_log: EventLog, artifacts_root: Path
+) -> None:
+    """Append the record, and if that fails leave it on disk instead of losing it.
+
+    This is the last statement of a run and it used to be unguarded, which
+    made it the one place the module docstring's promise did not hold: the
+    tokens are spent by the time we get here, and `write_run` has real ways
+    to fail that have nothing to do with the run. A stale `<run_id>.json.partial`
+    from a process killed mid-write raises ImmutabilityError forever after,
+    and the run_id is deterministic, so the retry raises too. A full or
+    read-only disk raises OSError. Either way the record was gone.
+
+    The strand file is written next to the run's own artifacts, so a reader
+    who finds a transcript, a wire log and a final diff also finds the record
+    that describes them, and an offline pass can append it later.
+
+    The exception is re-raised. The goal is that the DATA survives, not that
+    the failure is hidden -- a caller that believed the log was complete
+    would go on to compute means over a matrix with a hole in it. Excluded
+    and crashed runs are stranded too: the log keeps their records (spec
+    section 6.6), so losing one is the same loss.
+    """
+    try:
+        event_log.write_run(record)
+    except BaseException:
+        # Best effort, and it must not mask the original failure -- a
+        # traceback naming the strand-write is a traceback that does not name
+        # the reason the log write failed.
+        try:
+            artifacts_root.mkdir(parents=True, exist_ok=True)
+            (artifacts_root / UNWRITTEN_NAME).write_text(
+                json.dumps(record.to_dict(), indent=2, sort_keys=True)
+            )
+        except Exception:  # noqa: BLE001 - the raise below is the real signal
+            pass
+        raise

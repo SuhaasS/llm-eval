@@ -3,8 +3,19 @@
 # Real task images are the dataset plan's job -- each one pins a repo, its
 # lockfile dependencies, and its toolchain. This file exists so the harness
 # is testable end to end and so those builds have a worked example of the
-# one part that is the same for every task: getting a pinned Claude Code
-# into the image.
+# TWO parts that are the same for every task: getting a pinned Claude Code
+# into the image, and giving the agent a way to run the task's tests.
+#
+# THE SECOND ONE IS NOT OPTIONAL. Spec section 3.3 measures a loop -- the
+# agent reads, edits, runs tests, sees failures, and self-corrects without
+# human input. An image with no test runner truncates that loop after
+# "edits", and every arm is then scored on a single unverified guess. This
+# is not hypothetical: the image shipped without pytest through all of
+# Phase 0c, and Gemma spent 30 of its 30 turns re-running
+# `python3 tests/test_calc.py`, which under this image raised
+# ModuleNotFoundError whether or not the bug had been fixed. Its 9/9 failure
+# was read as capability. A task image that cannot turn its own fixture
+# green is measuring the image.
 #
 # Build:
 #   docker build -f docker/eval-agent.Dockerfile -t bakeoff-eval-agent .
@@ -30,6 +41,20 @@ RUN apt-get update \
         git \
         ripgrep \
     && rm -rf /var/lib/apt/lists/*
+
+# The test runner, pinned for the same reason CLAUDE_CODE_VERSION is: it is
+# part of the environment every arm is compared in, so a floating version
+# would be an unrecorded difference between two runs the log swears were
+# identical. Installed system-wide, before the USER switch, so `pytest` and
+# `python -m pytest` both resolve for the eval user without a per-run
+# install -- which could not reach a mirror anyway (see above).
+ARG PYTEST_VERSION=9.1.1
+RUN pip install --no-cache-dir "pytest==${PYTEST_VERSION}" \
+    && installed="$(pytest --version)" \
+    && case "$installed" in \
+         *"${PYTEST_VERSION}"*) echo "pytest ${PYTEST_VERSION} pinned" ;; \
+         *) echo "expected pytest ${PYTEST_VERSION}, got ${installed}" >&2; exit 1 ;; \
+       esac
 
 # Pinned deliberately. This value becomes versions.claude_code for every run
 # built from this image, and the harness compares arms on the assumption

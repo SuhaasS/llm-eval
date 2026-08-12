@@ -113,6 +113,12 @@ def git_container(image_digest, tmp_path):
 # container, parse_trajectory, cost_usd, scan_destructive, and the per-turn
 # records. Without it trajectory_path is None and everything after the
 # orchestrator is exercised only by unit tests with hand-built fixtures.
+# The body carries `system` and `tools` because Claude Code's does, and
+# because system_prompt_sha/tool_schema_sha are computed from them. Omitting
+# them used to be harmless-looking: _sha256(None) returned the sha256 of the
+# four bytes "null", an ordinary 64-hex digest, so a test asserting "the hash
+# is 64 characters" passed against a request that carried no prompt at all.
+# _sha256 now returns "" for an absent field, which is what made that visible.
 # When ANTHROPIC_BASE_URL is set it also makes a REAL HTTP call to the proxy,
 # carrying ANTHROPIC_CUSTOM_HEADERS exactly as Claude Code does. Verified
 # against claude 2.1.220 by pointing it at a local listener: the value lands
@@ -130,7 +136,7 @@ if [ -n "$ANTHROPIC_BASE_URL" ]; then
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer ${ANTHROPIC_AUTH_TOKEN:-none}" \
     -H "${ANTHROPIC_CUSTOM_HEADERS:-X-Unused: 1}" \
-    -d "{\\"model\\":\\"${ANTHROPIC_MODEL:-mock-ok}\\",\\"max_tokens\\":64,\\"messages\\":[{\\"role\\":\\"user\\",\\"content\\":\\"hi\\"}]}" \
+    -d "{\\"model\\":\\"${ANTHROPIC_MODEL:-mock-ok}\\",\\"max_tokens\\":64,\\"system\\":\\"You are Claude Code.\\",\\"tools\\":[{\\"name\\":\\"Bash\\",\\"input_schema\\":{\\"type\\":\\"object\\"}}],\\"messages\\":[{\\"role\\":\\"user\\",\\"content\\":\\"hi\\"}]}" \
     || true
 fi
 

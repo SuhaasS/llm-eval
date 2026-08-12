@@ -135,6 +135,10 @@ class BakeoffCallback(CustomLogger):
             raw = dict(response_obj.__dict__)
 
         self.logger.log_call(
+            # Same key set as proxy_callback._request, and it has to stay that
+            # way: a run's canonical artifact is written from whichever path
+            # was live, so a field present in one projection and absent from
+            # the other would read as "not sent on this arm".
             request={
                 "model": kwargs.get("model"),
                 "messages": kwargs.get("messages"),
@@ -142,6 +146,13 @@ class BakeoffCallback(CustomLogger):
                 "system": kwargs.get("system"),
                 "temperature": kwargs.get("temperature"),
                 "max_tokens": kwargs.get("max_tokens"),
+                "max_completion_tokens": kwargs.get("max_completion_tokens"),
+                "thinking": kwargs.get("thinking"),
+                "reasoning_effort": kwargs.get("reasoning_effort"),
+                "context_management": kwargs.get("context_management"),
+                "output_config": kwargs.get("output_config"),
+                "anthropic_beta": kwargs.get("anthropic_beta"),
+                "stream": kwargs.get("stream"),
             },
             response=raw if isinstance(raw, dict) else {"raw_completion": str(raw)},
             metadata={

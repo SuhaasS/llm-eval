@@ -1,14 +1,28 @@
 """Adapter interventions applied to LiteLLM inside the PROXY process only.
 
 Spec section 6.4 exists to tell an adapter failure apart from a model failure.
-This module removes two adapter failures that were being measured as model
-weakness. Both were total, both were deterministic, and both had one-line
-causes -- which is the base rate to weigh before reading the next arm's failure
-as capability.
+This module removes five adapter failures that were being measured as model
+weakness. All were total, all were deterministic, and all had one-line causes
+-- which is the base rate to weigh before reading the next arm's failure as
+capability.
 
   anthropic_tool_use_id_passthrough        Kimi K2.5, below
   anthropic_tool_schema_property_names_strip   Gemma 4 31B, in the hook on
                                            BakeoffAdapterPatches
+  anthropic_tool_use_id_collision_uniquify Gemma 4 31B again, at the streaming
+                                           wrapper: it returns the id `call_0`
+                                           on every response, so Claude Code
+                                           could pair nothing after the first
+                                           call
+  openai_max_completion_tokens_rename      Gemma 4 31B a third time, at the
+                                           openai provider's param mapping:
+                                           its route stopped accepting the
+                                           deprecated `max_tokens` spelling
+  openai_reasoning_effort_pinned_none      Gemma 4 31B a fourth time, same
+                                           seam: its route refuses `tools`
+                                           unless reasoning_effort is
+                                           explicitly "none", and absent is
+                                           not "none"
 
 THE FIRST DEFECT. Kimi K2.5 emits tool-call ids of the form ``functions.Read:0``.
 LiteLLM's ``normalize_anthropic_tool_use_id`` rewrites every character outside
@@ -37,11 +51,104 @@ Anthropic API, which nothing in this eval calls -- every deployment targets
 Bedrock. tests/test_config.py pins that assumption so it fails loudly if an
 arm is ever pointed at api.anthropic.com.
 
-KNOWN EXPOSURE, recorded rather than fixed: on the ``bedrock/`` Converse route
-the id becomes Bedrock's ``toolUseId``, which carries its own character
-constraint. Harmless for the arms actually run (``claude-sonnet-5-runtime``
-emits compliant ids), but it makes ``kimi-k2-5-runtime`` -- configured, and not
-in EVAL_ARMS -- newly unsafe. See TASKS.md.
+WHERE THE CONSTRAINT LIVES INSTEAD. Anthropic's API is not the only enforcer
+of that character class, so removing the sanitizer moves the constraint rather
+than retiring it. Below /v1/messages the ``bedrock/`` route splits by model,
+not by config: Claude models resolve to ``AmazonAnthropicClaudeMessagesConfig``
+and go to the Invoke endpoint carrying a native Anthropic body, never
+constructing a ``toolUseId`` -- so ``claude-sonnet-5-runtime`` is exempt
+STRUCTURALLY, not because its ids happen to be clean. Every other model falls
+through to the openai -> Converse bridge, where
+``prompt_templates/factory.py`` copies the tool id verbatim into
+``BedrockToolUseBlock(toolUseId=)`` / ``BedrockToolResultBlock(toolUseId=)``,
+and Bedrock constrains that to ``[a-zA-Z0-9_-]{1,64}``.
+
+Two claims, kept apart because only one of them is measured: that the id
+reaches ``toolUseId`` unsanitized is CONFIRMED (litellm 1.95.0, offline, by
+tests/test_litellm_patches.py); that Bedrock rejects it is NOT -- it is
+inferred from AWS's published pattern, and settling it costs money on an arm
+outside EVAL_ARMS.
+
+So the constraint is now a property of WHICH DEPLOYMENTS ARE CONFIGURED, and
+tests/test_config.py's
+``test_no_bedrock_arm_reaches_converse_with_ids_it_would_reject`` is what
+enforces it -- resolving each ``bedrock/`` arm's route through litellm's own
+routing and requiring any Converse-bound model to be on an allowlist whose
+entries carry measured id shapes. ``kimi-k2-5-runtime`` is commented out of
+litellm_config.yaml for exactly this reason; scoping THIS patch by provider
+instead was rejected, because re-enabling the sanitizer for bedrock reinstates
+the very defect described above and turns a loud 400 into a silent zero-diff
+run.
+
+THE FOURTH DEFECT. Gemma 4 31B failed 0/3 live on 2026-08-12 with every call
+400ing before the model saw anything: ``Unsupported parameter: 'max_tokens' is
+not supported with this model``. Bracketed to a ~14 hour window in which
+nothing on this side moved -- same litellm 1.95.0, same claude 2.1.220, same
+patches -- and narrowed to the parameter by probing each arm outside Claude
+Code: ``max_tokens`` fails on Gemma alone, ``max_completion_tokens`` and
+neither both pass, and Nemotron and Kimi accept either.
+
+The discriminator is the ROUTE, not the model, and litellm says so itself.
+``bedrock_mantle.common_utils.mantle_base_segment`` selects ``/openai/v1`` for
+any model whose price-map entry carries ``use_openai_responses_path`` -- the
+gemma-4-* family, gpt-5.x and grok-4.3 -- and ``/v1`` for everything else.
+``/openai/v1`` tracks OpenAI's own contract, where ``max_tokens`` is deprecated
+in favour of ``max_completion_tokens`` and reasoning models reject it outright.
+
+WHY IT IS APPLIED HERE AND NOT PER ARM. ``max_completion_tokens`` is accepted
+on all three candidate arms, so the rename goes in across the board rather than
+scoped to Gemma. Section 5.4 requires the arms be identical in everything but
+the model; a Gemma-only rename would have made transport a per-arm difference
+and scored it as capability. The two names cap the same quantity -- reasoning
+tokens are a detail OF ``completion_tokens``, not additional to it -- so this
+is a spelling change on the arms that already worked.
+
+``additional_drop_params: ["max_tokens"]`` is the tempting one-liner and is
+wrong: measured, it leaves the body with NO cap at all while every other arm
+runs at 16384, which is a config choice scored as a capability difference.
+
+THE FIFTH DEFECT, and it was hiding behind the fourth. ``max_tokens`` was the
+first of three walls on the same route; the 400 fired before the others could
+be seen. Measured by request ladder on 2026-08-12: a non-default ``top_p`` is
+rejected outright (handled in litellm_config.yaml, not here, because it is a
+sampling decision), ``temperature`` must be 1, and ``tools`` are refused unless
+``reasoning_effort`` is explicitly ``"none"``. The route applies a non-none
+default when the parameter is absent, so dropping it -- which is what
+``additional_drop_params: ["reasoning_effort"]`` did -- is what kept the escape
+out of reach. A workaround for one defect was blocking the fix for the next.
+
+AND THE CONFIG COMMENT THAT SENT US THERE WAS WRONG. litellm_config.yaml
+recorded the 2026-08-07 ``reasoning_effort`` rejection as Bedrock's. Probed
+2026-08-12 with raw httpx, bypassing litellm entirely: Bedrock accepts it on
+all three candidate arms, and ``"high"`` measurably changes output (gemma
+240 -> 580 completion tokens, kimi 171 -> 717). The rejection is litellm's own
+``_check_valid_arg``, because ``OpenAIGPTConfig.get_supported_openai_params``
+omits ``reasoning_effort`` for a non-o-series model. A client-side guard was
+recorded as a provider constraint, and the drop rested on that for five days.
+
+WHY OpenAIConfig AND NOT OpenAIGPTConfig. ``get_optional_params`` dispatches
+``custom_llm_provider == "openai"`` to ``litellm.OpenAIConfig()``, which is NOT
+an ``OpenAIGPTConfig`` subclass -- it branches on o-series, gpt-5 and audio
+models first and only then delegates to the module-level ``openAIGPTConfig``
+instance. Patching the inner one covers today's fall-through and is bypassed
+the moment litellm classifies a candidate into one of those branches. This
+patch wraps the outer entry and post-processes its result, so it holds whatever
+litellm does internally and is a no-op wherever litellm already renamed.
+
+WHAT IT DOES NOT REACH, deliberately recorded because the failure would be
+silent. ``OpenAILikeChatConfig`` overrides ``map_openai_params``, and
+``BedrockMantleChatConfig`` inherits from it, so a deployment moved to the
+``bedrock_mantle/`` provider -- which litellm 1.95.0 ships, and which would
+derive the /openai/v1 vs /v1 path by itself -- would not be renamed by this.
+tests/test_config.py pins that every candidate deployment uses ``openai/``, so
+the constraint is a property of which deployments are configured rather than a
+comment nobody reads.
+
+Sonnet 5 is untouched on both transports and is exempt STRUCTURALLY, not
+because its parameters happen to be clean: ``anthropic/`` resolves to
+``AnthropicConfig`` and ``bedrock/`` to ``AmazonConverseConfig``, neither of
+which is reachable from the openai provider branch. On a native Anthropic body
+``max_tokens`` is correct and required.
 
 WHY THIS MODULE IS SEPARATE FROM proxy_callback. The harness imports
 ``bakeoff.proxy_callback`` at module level (``runner.py`` uses
@@ -72,6 +179,15 @@ from litellm.integrations.custom_logger import CustomLogger
 TOOL_USE_ID_PASSTHROUGH = "anthropic_tool_use_id_passthrough"
 TOOL_SCHEMA_PROPERTY_NAMES_STRIP = "anthropic_tool_schema_property_names_strip"
 TOOL_USE_ID_COLLISION_UNIQUIFY = "anthropic_tool_use_id_collision_uniquify"
+MAX_COMPLETION_TOKENS_RENAME = "openai_max_completion_tokens_rename"
+REASONING_EFFORT_PINNED_NONE = "openai_reasoning_effort_pinned_none"
+
+# The parameter, and the one value section 5.4 allows it to take. A constant
+# rather than a literal because the value IS the eval decision: every arm runs
+# thinking-off, so no arm's reasoning is a config artefact. Changing it here
+# changes what the eval measures, which is why it does not live inline.
+_REASONING_EFFORT = "reasoning_effort"
+_REASONING_EFFORT_VALUE = "none"
 
 # The tool_use ids already present in the conversation being answered, set by
 # the pre-request hook and read on the response path.
@@ -289,6 +405,7 @@ def apply() -> list[str]:
     applied.append(TOOL_SCHEMA_PROPERTY_NAMES_STRIP)
 
     applied.append(_apply_collision_uniquify())
+    applied.extend(_apply_openai_param_pins())
     return applied
 
 
@@ -372,6 +489,132 @@ def _apply_collision_uniquify() -> str:
             "returned unchanged"
         )
     return TOOL_USE_ID_COLLISION_UNIQUIFY
+
+
+def _apply_openai_param_pins() -> list[str]:
+    """Make the openai provider's outgoing params the ones the route accepts.
+
+    Two interventions, one wrapper, because they hang off the same seam:
+    ``litellm.OpenAIConfig.map_openai_params``, the entry
+    ``get_optional_params`` dispatches ``custom_llm_provider == "openai"`` to.
+    They are reported as two ids because they are two guarantees and a reader
+    of ``Versions.litellm_patches`` needs to know which one a record was
+    written under.
+
+      MAX_COMPLETION_TOKENS_RENAME  the cap, under the spelling that still works
+      REASONING_EFFORT_PINNED_NONE  thinking off, uniformly and explicitly
+
+    POST-PROCESSING, not pre. Three separate things depend on it:
+
+      * The same function routes o-series, gpt-5 and audio models to configs
+        that already rename, so a check on the RETURNED dict is a no-op there
+        rather than a double rename.
+      * ``_check_valid_arg`` runs over ``non_default_params`` BEFORE this and
+        rejects ``reasoning_effort`` outright for a non-o-series openai model
+        (``OpenAIGPTConfig.get_supported_openai_params`` omits it). Injecting
+        into the result is what gets past a guard that is litellm's, not AWS's.
+      * ``additional_drop_params`` has already run, so the injected value is
+        not the one that gets dropped.
+
+    WHY reasoning_effort IS PINNED AND NOT LEFT ALONE. Gemma's route refuses
+    ``tools`` unless ``reasoning_effort`` is explicitly ``"none"`` -- absent is
+    not good enough, because the route applies a non-none default. Measured
+    2026-08-12: ``Function tools with reasoning_effort are not supported for
+    google.gemma-4-31b in /v1/chat/completions. To use function tools, use
+    /v1/responses or set reasoning_effort to 'none'.``
+
+    WHY CONFIG CANNOT DO IT. Claude Code sends ``thinking: {"type":
+    "adaptive"}`` on every arm and litellm's
+    ``translate_anthropic_thinking_to_reasoning_effort`` derives a value from
+    it. Measured: a deployment carrying ``allowed_openai_params:
+    ["reasoning_effort"]`` and ``reasoning_effort: "none"`` still sends
+    ``"medium"`` -- the derived value wins over the deployment default. Only
+    something downstream of the mapping can pin it.
+
+    WHY none AND NOT A REAL EFFORT. Section 5.4: every arm identical but the
+    model. Sonnet returned zero reasoning tokens across 856 stored calls and
+    all three candidates had ``reasoning_effort`` dropped, so the whole Phase
+    0c corpus is thinking-off. Pinning ``"none"`` makes explicit on all three
+    candidates what every arm was already doing implicitly, rather than turning
+    thinking on for one arm and calling the difference capability. Turning it
+    ON is a defensible eval and a different one -- it needs Gemma on
+    ``/v1/responses`` (tools and reasoning are mutually exclusive on
+    chat/completions), and it invalidates rather than re-measures the corpus.
+
+    Idempotent. Only ``openai/`` deployments reach it, so Sonnet's two arms are
+    untouched. See the module docstring for what this deliberately does not
+    reach.
+    """
+    import functools
+
+    import litellm
+
+    # `in __dict__`, not `hasattr`. OpenAIConfig inherits from BaseConfig,
+    # which declares map_openai_params abstractly -- so hasattr stays True
+    # after the override is gone, and the wrapper would wrap an abstract stub
+    # that returns None. The guard has to ask whether THIS class still defines
+    # the method, which is the thing a litellm refactor would move.
+    if "map_openai_params" not in vars(litellm.OpenAIConfig):
+        raise RuntimeError(
+            "litellm.OpenAIConfig no longer defines map_openai_params: the "
+            f"litellm pin moved and {MAX_COMPLETION_TOKENS_RENAME} / "
+            f"{REASONING_EFFORT_PINNED_NONE} would silently stop applying"
+        )
+
+    original = litellm.OpenAIConfig.map_openai_params
+    if not getattr(original, _WRAPPED_MARKER, False):
+
+        @functools.wraps(original)
+        def patched(
+            self,
+            non_default_params: dict,
+            optional_params: dict,
+            model: str,
+            drop_params: bool,
+        ) -> dict:
+            # Forwarded BY KEYWORD, and the parameter names are load-bearing:
+            # litellm calls this with keywords, so a wrapper whose signature
+            # renames them raises TypeError inside the provider call and
+            # litellm re-wraps that as APIConnectionError -- a signature bug
+            # wearing a provider failure's clothes.
+            mapped = original(
+                self,
+                non_default_params=non_default_params,
+                optional_params=optional_params,
+                model=model,
+                drop_params=drop_params,
+            )
+            if isinstance(mapped, dict):
+                if "max_tokens" in mapped:
+                    mapped["max_completion_tokens"] = mapped.pop("max_tokens")
+                # Assigned unconditionally, never set-if-absent: the value that
+                # would otherwise be here is the one derived from Claude Code's
+                # `thinking` block, and it is exactly what has to lose.
+                mapped[_REASONING_EFFORT] = _REASONING_EFFORT_VALUE
+            return mapped
+
+        setattr(patched, _WRAPPED_MARKER, True)
+        litellm.OpenAIConfig.map_openai_params = patched
+
+    # The observable behaviour, not the assignment: this is the check that
+    # would catch litellm moving either intervention somewhere this wrapper
+    # cannot see. A derived reasoning_effort goes in, so the probe also proves
+    # the pin BEATS one rather than merely filling a gap.
+    probe = litellm.OpenAIConfig().map_openai_params(
+        non_default_params={"max_tokens": 16, _REASONING_EFFORT: "medium"},
+        optional_params={},
+        model="google.gemma-4-31b",
+        drop_params=False,
+    )
+    if probe.get("max_completion_tokens") != 16 or "max_tokens" in probe:
+        raise RuntimeError(
+            f"{MAX_COMPLETION_TOKENS_RENAME} did not take: got {probe!r}"
+        )
+    if probe.get(_REASONING_EFFORT) != _REASONING_EFFORT_VALUE:
+        raise RuntimeError(
+            f"{REASONING_EFFORT_PINNED_NONE} did not take: got {probe!r}"
+        )
+    return [MAX_COMPLETION_TOKENS_RENAME, REASONING_EFFORT_PINNED_NONE]
 
 
 def _report(patches: list[str]) -> Path | None:

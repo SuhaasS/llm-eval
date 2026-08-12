@@ -12,6 +12,13 @@
 #   bedrock-mantle   AWS-recommended; the ONLY route Gemma 4 31B supports
 #   bedrock-runtime  Converse/Invoke; unavailable for Gemma
 #
+# bedrock-runtime is two routes wearing one prefix, and which one a deployment
+# gets is decided by the model id rather than by anything in this file. Claude
+# models take Invoke with a native Anthropic body; everything else takes the
+# openai -> Converse bridge, which puts the model's own tool-call ids into
+# toolUseId under a character class Bedrock enforces server-side. See the
+# commented-out kimi-k2-5-runtime block for what that costs.
+#
 # Every model_name is distinct on purpose. LiteLLM treats repeated
 # model_name values as one load-balanced deployment group and round-robins
 # between them, which would randomize transport per call and confound both
@@ -89,13 +96,33 @@ model_list:
     #   - no parallel tool calls; one tool call per turn
     #   - reasoning content is returned only by the Responses API, so
     #     TokenUsage.reasoning reads zero on this path
+    #
+    # NO top_p, AND THAT IS FORCED. On 2026-08-12 the /openai/v1 route began
+    # validating this model under OpenAI's reasoning-model contract, which
+    # rejects any non-default top_p outright:
+    #   Unsupported parameter: 'top_p' is not supported with this model.
+    # Measured by request ladder the same day -- temperature 1.0 passes and
+    # 0.6 does not ("Unsupported value: 'temperature' does not support 0.6"),
+    # so the lab-recommended temperature survives and the lab-recommended
+    # top_p cannot.
+    #
+    # This is the position claude-sonnet-5 has always been in and it is handled
+    # the same way: omit rather than fight, and record it. Section 5.3's
+    # constant across arms is the POLICY -- lab-recommended unless the route
+    # refuses it -- not the number, which is why nemotron and kimi keep
+    # top_p 0.95 rather than being levelled down to match. It is a real
+    # section 5.3 divergence and belongs in whatever publishes the comparison.
+    #
+    # The other two walls this route put up are in bakeoff.litellm_patches,
+    # because neither can be expressed here: max_tokens has to become
+    # max_completion_tokens, and reasoning_effort has to be pinned to "none"
+    # or the route refuses `tools` entirely.
     litellm_params:
       model: openai/google.gemma-4-31b
       additional_drop_params: ["reasoning_effort"]
       api_base: https://bedrock-mantle.us-east-1.api.aws/openai/v1
       api_key: os.environ/BAKEOFF_MANTLE_TOKEN
       temperature: 1.0
-      top_p: 0.95
 
   - model_name: nemotron-3-super-120b
     litellm_params:
@@ -132,12 +159,37 @@ model_list:
       temperature: 1.0
       top_p: 0.95
 
-  - model_name: kimi-k2-5-runtime
-    litellm_params:
-      model: bedrock/moonshotai.kimi-k2.5
-      aws_region_name: us-east-1
-      temperature: 1.0
-      top_p: 0.95
+  # kimi-k2-5-runtime is COMMENTED OUT, not deleted: it is the fallback
+  # transport if mantle ever breaks for Kimi the way it broke for Sonnet, and
+  # what it would take to restore it is worth keeping next to it.
+  #
+  # It cannot be served as written. Below /v1/messages the bedrock/ route
+  # splits by model, not by config (verified against litellm 1.95.0):
+  # Claude models resolve to AmazonAnthropicClaudeMessagesConfig and go to the
+  # Invoke endpoint with a native Anthropic body, never constructing a
+  # toolUseId; everything else falls through to the openai -> Converse bridge,
+  # where prompt_templates/factory.py copies the tool id verbatim into
+  # BedrockToolUseBlock(toolUseId=) and BedrockToolResultBlock(toolUseId=).
+  # Bedrock constrains that to [a-zA-Z0-9_-]{1,64} SERVER-side -- litellm
+  # sanitizes tool NAMES on this path and never ids, so nothing fails locally.
+  #
+  # Kimi's ids are `functions.Read:0`, and the sanitizer that used to rewrite
+  # them is deliberately gone (bakeoff.litellm_patches -- removing it is what
+  # let Kimi drive the tool loop at all). So this deployment would send a colon
+  # to Converse. Leaving it live left it one `--models kimi-k2-5-runtime` away
+  # from a paid run, which is the only reason it was reachable.
+  #
+  # TO RESTORE: uncomment, then add bedrock/moonshotai.kimi-k2.5 to
+  # CONVERSE_SAFE_TOOL_ID_MODELS in tests/test_config.py with the id shape it
+  # actually returns as the evidence -- the allowlist entry is the measurement,
+  # not the paperwork -- and smoke-test the arm before trusting it.
+  #
+  # - model_name: kimi-k2-5-runtime
+  #   litellm_params:
+  #     model: bedrock/moonshotai.kimi-k2.5
+  #     aws_region_name: us-east-1
+  #     temperature: 1.0
+  #     top_p: 0.95
 
 litellm_settings:
   # Wire capture, registered where the calls are actually made (spec
@@ -192,11 +244,30 @@ litellm_settings:
   # rejection from the Phase 0c live run, 2026-08-07:
   #
   #   reasoning_effort   the chat-completions bridge derives it from Claude
-  #                      Code's `thinking` block; Bedrock's OpenAI-compatible
-  #                      route rejects it for all three candidate models
+  #                      Code's `thinking` block, and LITELLM rejects it --
+  #                      see the correction below; this entry is retained as
+  #                      a backstop, not as the mechanism
   #   context_management  Claude Code sends it; LiteLLM turns it into an
   #   output_config       anthropic-beta header, and mantle answers
   #                       "invalid beta flag"
+  #
+  # CORRECTION, 2026-08-12. Until today this block said Bedrock rejected
+  # reasoning_effort "for all three candidate models". That was wrong, and it
+  # cost the gemma arm. Probed with raw httpx, bypassing litellm entirely:
+  # Bedrock ACCEPTS reasoning_effort on all three, and "high" measurably
+  # changes output (gemma 240 -> 580 completion tokens, kimi 171 -> 717). The
+  # rejection is litellm's own _check_valid_arg, because
+  # OpenAIGPTConfig.get_supported_openai_params omits the parameter for a
+  # non-o-series model. A client-side guard was recorded as a provider
+  # constraint, and the drop below rested on that misattribution.
+  #
+  # The per-deployment entries are KEPT, but they are no longer the mechanism.
+  # bakeoff.litellm_patches pins reasoning_effort to "none" downstream of the
+  # param mapping -- it has to, because gemma's route refuses `tools` unless
+  # the value is explicitly "none", and a drop cannot express a value. The
+  # entries stay so that a patch which fails to apply produces a loud
+  # UnsupportedParamsError rather than silently forwarding the "medium" that
+  # litellm derives from Claude Code's `thinking: {"type": "adaptive"}`.
   additional_drop_params:
     - reasoning_effort
     - context_management

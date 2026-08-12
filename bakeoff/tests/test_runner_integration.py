@@ -7,6 +7,8 @@ under different turn numbers, a progression that never happened. A test
 asserting only that N checkpoints exist passes on both.
 """
 
+from pathlib import Path
+
 import pytest
 
 from bakeoff.checkpoints import CheckpointRecorder
@@ -247,9 +249,60 @@ def test_reference_image_ships_the_pinned_agent_and_its_dependencies(tmp_path):
             f"image ships {version.stdout!r}; versions.claude_code would be wrong"
         )
 
-        for binary in ("rg", "git", "timeout"):
+        # pytest belongs on this list for the same reason the others do, and
+        # its absence was not caught for the whole of Phase 0c: a missing
+        # test runner does not fail the run, it just removes the agent's
+        # only way to check its own work. Every arm then gets scored on one
+        # unverified guess. Both spellings, because a model reaches for
+        # either and only one of them is a console script.
+        for binary in ("rg", "git", "timeout", "pytest"):
             found = container.exec(["sh", "-c", f"command -v {binary}"])
             assert found.exit_code == 0, f"{binary} missing from the eval image"
+
+        module = container.exec(["python", "-m", "pytest", "--version"])
+        assert module.exit_code == 0, module.stderr
+
+
+@integration
+def test_the_smoke_fixture_goes_red_then_green_inside_the_reference_image(tmp_path):
+    """The offline half of this lives in test_smoke_fixture.py; this is the
+    half only a real image can answer -- that the runner and the fixture's
+    pytest.ini actually meet inside the container the eval runs in.
+
+    `python3 tests/test_calc.py`, the command the image used to leave as the
+    only option, raised ModuleNotFoundError both before and after a correct
+    fix. That is what Gemma's 30 identical turns were.
+    """
+    import shutil
+    import subprocess
+
+    from bakeoff.container import RunContainer
+
+    probe = subprocess.run(
+        ["docker", "inspect", "--format", "{{.Id}}", "bakeoff-eval-agent"],
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode != 0:
+        pytest.skip("bakeoff-eval-agent not built; see docker/eval-agent.Dockerfile")
+
+    fixture = Path(__file__).resolve().parent.parent / "fixtures" / "smoke_task"
+    repo = tmp_path / "repo"
+    shutil.copytree(fixture, repo)
+
+    with RunContainer(
+        image=probe.stdout.strip(), repo_path=str(repo), base_sha=""
+    ) as container:
+        red = container.exec(["python", "-m", "pytest", "-q"])
+        assert red.exit_code != 0, "fixture passes with the bug still in it"
+        assert "assert -1 == 5" in red.stdout, red.stdout + red.stderr
+        assert "ModuleNotFoundError" not in red.stdout + red.stderr
+
+        (repo / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+
+        green = container.exec(["python", "-m", "pytest", "-q"])
+        assert green.exit_code == 0, green.stdout + green.stderr
+        assert "1 passed" in green.stdout, green.stdout
 
 
 @integration

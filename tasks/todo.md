@@ -20,6 +20,569 @@ review log — one section per finished task, kept for what each one turned up.
 
 ---
 
+## Reviewing the turns fix found the environment, not the code — 2026-08-12
+
+Same two questions as the previous review — does this promote observability,
+does it simulate practical use — asked of the whole logging change (~2,700
+insertions, schema 3.0.0). The observability answer was mostly yes with
+unevenly applied discipline. The practical-use answer was no, for a reason
+that is not in any of the changed files.
+
+### The agent could not run tests, and had not been able to for all of Phase 0c
+
+`docker/eval-agent.Dockerfile` installed `ca-certificates coreutils curl git
+ripgrep`. No pytest, and `apt`/`pip` cannot reach a mirror during a run by
+design. Separately, `fixtures/smoke_task/tests/test_calc.py` does `from calc
+import add` while `calc.py` sits at the repo root, so the one verification
+command available — `python3 tests/test_calc.py` — put `tests/` on
+`sys.path[0]` and raised `ModuleNotFoundError`. **Before the fix and after
+it.** There was no command in that image that turned the fixture green.
+
+Spec §3.3 measures a loop: *reads, edits, runs tests, sees failures,
+self-corrects*. It terminated after "edits" on every arm. And the symptom was
+already sitting in this file, read as model behaviour — Gemma's 30 calls were
+"mostly `python3 tests/test_calc.py` repeated". That is a model doing the
+correct thing against an environment that could not answer it. An arm that
+tried to verify was penalised; an arm that did not try looked equally good.
+
+Four of the "model failures" found so far have now turned out to be adapter or
+environment defects. That is the base rate to weigh the next one against.
+
+Fixed: pinned `pytest==9.1.1` in the image (with a build-time version assert,
+same argument as `CLAUDE_CODE_VERSION`), `pytest.ini` with `pythonpath = .` in
+the fixture, and `smoke_test.assert_agent_can_verify_its_work` as a
+**precondition** rather than a run criterion — by the time a record exists the
+tokens are spent, and no field can distinguish "the model never verified" from
+"the model could not". Red-before/green-after is asserted twice: offline in
+`test_smoke_fixture.py`, and inside the built image in
+`test_runner_integration.py`, because only the second can show the runner and
+the fixture's ini actually meeting.
+
+**The measurement is not redone.** Every N=3 set, the Nemotron 1/16 flake and
+both GO/NO-GO calls predate this. P0 in `TASKS.md`.
+
+### Three ways a total loss wrote a clean-looking record
+
+Each is the same shape: something the log exists to make impossible, made
+possible by a field that stayed empty.
+
+**The final write was unguarded.** `event_log.write_run(record)` was the last
+statement of `execute_run`, outside every `try`, against a module docstring
+promising nothing may raise past it. A stale `<run_id>.json.partial` raises
+`ImmutabilityError` forever — and `run_id` is deterministic, so the retry
+raises too — while a full disk raises `OSError`. Either way the record was
+gone after the tokens were spent. `_write_or_strand` now writes
+`artifacts/record.unwritten.json` **before** re-raising: loud failure, surviving
+data. The re-raise is deliberate; a caller that believed the log was complete
+would compute means over a matrix with a hole in it.
+
+**A missing transcript read as a quiet run.** `assemble_record` only parsed
+when the path existed, so `trajectory_path=None` sent turns, every token count,
+tool calls, destructive events and cost to zero together with
+`trajectory_parse_error` still `""` — the single ambiguity the schema's whole
+vocabulary was built to eliminate, sitting in the middle of it. The field now
+covers "could not be read" rather than "failed to parse", and says `absent`.
+
+**Attribution loss was invisible.** `unattributed_count` had no caller in
+`execute_run` and no record field — the gate for it lived only in
+`smoke_test.py`, which does not run during an eval. A run whose header stamping
+broke wrote a well-formed record with `sampling={}` and empty hashes, verbatim
+the failure `proxy_callback`'s docstring was written against. `wire_entries_seen`
+and `wire_unattributed` now sit beside the fields derived from the wire.
+`wire_unattributed` is `int | None`, and it is a **delta**: `unattributed.jsonl`
+is shared across runs, so an absolute count would charge each run with every
+earlier run's losses.
+
+Two smaller fabrications went with it. `_sha256(None)` returned the sha256 of
+the four bytes `"null"` — an ordinary-looking 64-hex digest, so a record that
+observed no system prompt could not be told from one that observed a real
+prompt, and two arms that both sent nothing agreed on a hash. It returns `""`
+now. And `artifacts.wire_log_gz` was asserted unconditionally, publishing a
+path to a file that was never opened.
+
+That last one had a consequence worth recording: the integration test asserting
+`len(system_prompt_sha) == 64` had been **passing on the fabricated digest**.
+The fake agent sent no `system` block. Both were fixed — the fake agent now
+sends what Claude Code sends, and the assertion pins the actual hash rather
+than its length.
+
+### The wire log dropped exactly the fields the open §6.4 question turns on
+
+The request projection was six keys: `model, messages, tools, system,
+temperature, max_tokens`. `thinking`, `reasoning_effort`, `context_management`,
+`output_config`, `anthropic_beta` and `stream` were discarded before write — by
+the log designated as the authority on *what was actually sent*, and those are
+precisely the params `additional_drop_params` removes **per arm**
+(`reasoning_effort` on each candidate deployment, on neither Sonnet one).
+
+So the question "is thinking live on the reference arm and off on the
+candidates" had no answer in 856 stored calls. The only evidence available was
+an outcome proxy: zero reasoning tokens and zero thinking content on all five
+arms, Sonnet included — which says no arm was thinking in the Phase 0c data,
+but says nothing about what any arm was asked to do.
+
+Widened, in both projections, as an explicit allowlist rather than `**body`
+(the secret scan depends on a known shape). The offline smoke immediately
+showed Claude Code sending `thinking: {"type": "adaptive"}` and
+`output_config: {"effort": "high"}` **identically on every arm**. What settles
+the drop is a live run: `pick()` prefers `optional_params` over the raw body,
+so on an `openai/` deployment the field shows post-drop state. Filed P3.
+
+### The setup document contradicted the invariant it was written for
+
+Found while trying to run the live half. `.env.example` — the file an operator
+copies to `bakeoff/.env` — told them to paste the mantle key into
+`AWS_BEARER_TOKEN_BEDROCK`. That is the one variable `CLAUDE.md` says never to
+use: `base_aws_llm.get_request_headers` falls back to it when a deployment has
+no `api_key`, so a proxy holding it bearer-authenticates all three `bedrock/`
+arms and fails them with `bedrock:CallWithBearerToken`, while the mantle arms
+stay green and it reads as a bedrock-runtime problem. Following the setup
+document verbatim produced exactly that, on arms other than the one being
+configured.
+
+`test_no_mantle_arm_reads_the_bearer_variable_litellm_falls_back_to` pinned the
+config and nothing pinned the instructions. Template now names
+`BAKEOFF_MANTLE_TOKEN`, keeps the wrong variable as a commented warning so a
+reader cannot conclude it was merely forgotten, and
+`test_the_env_template_names_the_variable_the_config_actually_reads` plus a
+mutation anchor hold it there.
+
+### Verification
+
+288 unit tests, 26 integration tests, `verify_logger.py` **GATE PASSED**, and
+`mutation_check.py` **44/44** — seven new anchors, one per guarantee above,
+each confirmed to turn a test red when reverted. The fixture anchor deletes
+`pythonpath` from `pytest.ini`, which reproduces the Phase 0c environment
+exactly.
+
+**The live half did not run: no credentials in this environment.**
+`BAKEOFF_MANTLE_TOKEN` unset (all three candidate arms) and the SSO session
+expired with `TokenRetrievalError` (the `claude-sonnet-5-runtime` reference
+arm). `smoke_bedrock.py` names both correctly and exits 0 with
+`preflight 1 problem(s)` rather than pretending. This is the credential
+expiry `TASKS.md` already flags as having "a refresh path that does not exist
+yet", hit in practice.
+
+Schema 3.1.0. Minor, not major: no stored value changes meaning and a 3.0.0
+reader ignores the new fields safely — but the version is load-bearing anyway,
+because in 3.0.0 the *absence* of these signals was not evidence of anything.
+
+### Not fixed, filed instead
+
+Roughly twenty findings across P2 and P3 in `TASKS.md`. The ones most likely to
+bite: a crashed run's cause exists nowhere in the log (no exception message,
+stderr captured and then discarded); `ToolCallStats.errored` holds failed *API*
+calls under a tool-shaped name and is the only place retries surface; nine
+fields are permanently zero and read as measurements; `TurnRecord` has no
+absolute timestamp, so per-turn, checkpoint and wire time bases never join.
+
+---
+
+## Reviewing the cache feature found a bigger one under it — 2026-08-11
+
+A review of the cache work against two questions: does it promote
+observability, and does it simulate practical use. It did neither, for one
+reason each, and neither reason was in the cache code.
+
+### Every token and every dollar in the log was roughly doubled
+
+`parse_trajectory` counted `type: "assistant"` records as turns. **Claude Code
+writes one record per CONTENT BLOCK, and repeats the whole `usage` block in
+each.** A reply with text and two tool calls is three records carrying the same
+tokens three times.
+
+Measured on stored records rather than argued:
+
+```
+run 7be2933b  turns_used=6  assistant records=6  distinct message.id=5
+  recorded  cache_write 83,867   cost $0.3726
+  deduped   cache_write 42,171   cost $0.2148
+run 0a39ee8e  turns_used=7  distinct message.id=5
+  recorded  read 270,549  write 22,937   deduped  read 198,063  write 11,652
+```
+
+A Kimi transcript shows the mechanism bare: 10 assistant records, 5 ids, shaped
+`['text'], ['tool_use'], ['tool_use']` for one reply.
+
+**One API call is one turn**, keyed on `message.id` globally so a tool result
+landing between two blocks cannot split a reply. A record with no id gets a key
+nothing can match, because merging on absence is the same error in the
+expensive direction. `SCHEMA_VERSION` 3.0.0, MAJOR: `turns_used`, `tokens` and
+`cost_usd` all change value for the same underlying run.
+
+Re-derived across the archive: **16/16 live runs now match the wire log** on
+both call count and `cache_write`, where the stored records matched on neither.
+185 of 219 runs had records collapse. `cache_state.warm` moved on **0** records,
+which is the check that the dedupe did not reorder turns.
+
+The stub was reusing one `message.id` across distinct calls, so the offline gate
+undercounted against its own wire log while every live run stayed correct. Fixed
+in the fixture, not worked around in the parser: a stub that reuses ids is not a
+stand-in for an API that does not.
+
+Three counts are now stored where one was: `turns_used` (API calls),
+`assistant_records` (transcript records), `turns_streamed` (what the CLI itself
+counted). Their differences are the collapse. A single number is what let this
+sit unnoticed.
+
+### The warm-run cost was the artifact, not the correction
+
+`print_cost` labelled the warm number `cache_normalized`, which asserts it is
+the corrected one. The evidence says otherwise.
+
+Every run is a fresh container, a wiped `CLAUDE_CONFIG_DIR`, a fresh repo and a
+one-shot `claude -p`. **Nothing crosses runs but Bedrock's server-side cache**,
+and the repeats are scheduled 3–5 seconds apart inside a 300-second TTL. 6/6
+matrices: run 1 cold at `(0, ~41.7k)`. 10/10 later repeats: warm at exactly
+30,506.
+
+And 30,506 is not the work. Hashing the request components across repeats: the
+`tools` block is byte-identical (84,627 chars), only the `system` tail differs
+by the git SHA, and `30506 + 11187 = 41693 = 41695 − 2`. **The carried prefix is
+the tool schemas — task-independent boilerplate.** That closes the open
+`TASKS.md` question in the direction it suspected.
+
+So the two numbers are two deployment situations, not a number and its
+correction: `first_task` (a developer opening a fresh task, who pays that write)
+and `warm_followup` (another task inside the TTL). Both reported, neither
+headlined. `--interleave` stays, with the measured fact recorded that a round
+takes 1.4–3.9 minutes and therefore **cannot produce a cold run**.
+
+`cache_state.seconds_since_prior_run` puts the deciding fact in the record, so
+a reader sees "warm, and the previous run started 3.4 s ago" without the wire
+log. The smoke output now says it outright: *ALL INSIDE the 300s prompt-cache
+TTL. Every warm run below was warmed by this harness.*
+
+### Six correctness defects, two of them mine
+
+- `_usage_from` could raise `AttributeError` on a `cache_creation` that arrives
+  as a list, and store `None` on a null tier that then raised `TypeError` in
+  `TokenUsage.__add__` a turn later. Both escape the parse and zero the whole
+  record — the 2026-08-07 defect class, reintroduced by yesterday's fix. Every
+  field is coerced now, and the function may not raise.
+- `last_run_id_for` claimed to be total by construction and was not: a `null`
+  index line is valid JSON and raises on `.get`, and a truncation splitting a
+  multi-byte character raises `UnicodeDecodeError` from the iterator. It runs
+  **outside** `execute_run`'s try, so either one cost the record — and the bad
+  line stays in the index, so it cost every later run too.
+- The CRASHED filter added yesterday dropped real warmers. `container_crashed`
+  comes from an `except Exception` around the whole body, so a run that made
+  twenty calls and failed in checkpoint capture is CRASHED. Filters on
+  `turns_used` now, which is what "did it warm the cache" actually means.
+- `cost_usd` charged nothing for tier tokens with a zero total, and overcharged
+  3× when the 1h tier exceeded the total, behind a `max(..., 0)` clamp. Both
+  raise now; this module reports gaps and does not estimate them.
+- `pricing_basis` was blanked whenever the run total was `None`, while surviving
+  per-turn dollars stayed in the record with no book attached. Keyed on any
+  priced turn now.
+- `from_dict` filtered unknown top-level keys but built nested classes with a
+  bare `klass(**data)`, so a 2.2.0 record raised `TypeError` in 2.1.0 code. The
+  reader still sees `schema_version` and can decide; raising decided for it, in
+  the direction of losing the record.
+
+### Gate
+
+272 unit tests, 25 integration, **37/37 mutations caught** including six new
+ones on this path, dry run and the §6.6 gate green.
+
+---
+
+## Cache-handling review — 2026-08-11
+
+A review of the whole cache path, one day after `cache_state` was populated.
+The headline: **that fix was right and it covered one arm of four.**
+
+### The same lie, three arms over
+
+`warm` was `parsed.turns[0].tokens.cache_read > 0`, and `_usage_from` defaults
+every cache field to `0` when the provider sends none. Gemma and Nemotron
+return no cache fields at all — 9 runs each — so every one of their records
+claimed it had started against a **cold cache**, an assertion about a cache
+whose existence is unconfirmed. `costs.PRICE_BOOK` carries `None` multipliers
+for those models for exactly that reason, and the record contradicted it.
+
+Kimi is the worse case: it returns cache tokens on some runs and not others, so
+its `false` could not be told from a genuine cold start.
+
+`runner._cache_warm` now returns `None` on three paths instead of one. The
+added condition is observational, not a lookup against the price book:
+
+    total.cache_read == 0 and total.cache_write == 0  ->  nothing was accounted
+
+Checked against the measured Sonnet runs before committing to it: the cold run's
+turn 1 is `(0, 41695)`, so the run total sees writes and it stays `false`. **No
+value that was already a measurement moves.** A test pins that specific shape,
+because a guard keyed on `cache_read` alone would have called the most expensive
+run in the log undetermined and dropped it from every cost comparison.
+
+Third path: a turn-1 record carrying no `usage` block at all projects to
+all-zero tokens, byte-identical to a genuine zero. API-error and replayed
+assistant records land there, and turn 1 is where the measurement is taken.
+
+### The tier the log was throwing away
+
+Spec §3.1 asks for cache-creation tokens split by 5m/1h ephemeral tier. Nothing
+read it. Verified against the AWS Bedrock prompt-caching page: a **1h write
+bills at 2.00×** against the 5m tier's 1.25×, so `cache_write_multiplier=1.25`
+was a 5m rate applied with no tier check — and with the tier discarded, a run
+priced wrong could not be repriced from the log afterwards.
+
+Exposure today is zero: Claude Code's Bedrock TTL is hardcoded to 5m
+(claude-code#32671, the 1h path behind an undocumented
+`ENABLE_PROMPT_CACHING_1H_BEDROCK` the env allowlist does not pass). The defect
+was that **nothing would notice if that changed.** `TokenUsage` now carries
+`cache_write_5m` / `cache_write_1h` as parts of `cache_write`, never additions
+to it, so an untiered write is charged once at the 5m rate rather than falling
+through to free.
+
+### Sonnet moves to list pricing
+
+$2.00 / $10.00 per 1M, not the Bedrock page's $3.00 / $15.00 — the eval asks
+whether a candidate beats buying Sonnet, not whether one AWS SKU beats another.
+The log is append-only, so records written before today keep figures from the
+old book. `Versions.pricing_basis` now says which book produced a cost, because
+a reader summing across the change gets a number that is not a price of
+anything and, until now, could not tell.
+
+### One open question closed, in the harness's favour
+
+`TASKS.md` asked whether `cost_usd`'s additive charging matches Bedrock's
+accounting. It does. What the check turned up is that the candidate arms reach
+that through a round trip that nearly loses it: LiteLLM's Converse transform
+folds cache tokens **into** `prompt_tokens` (OpenAI usage is inclusive,
+Anthropic's is not) and the anthropic adapter subtracts them back out. Nothing
+pinned it, so an upgrade dropping the subtraction would have double-counted the
+cached prefix — on a warm Sonnet turn, ~30k of a ~34k prompt — with no
+exception and no zero, just a wrong number. `tests/test_usage_accounting.py`
+now pins it against the installed litellm.
+
+### §5.8's other controls
+
+Of the spec's three cache-confound controls, only "log warm and the prior run
+id" existed. `smoke_test` is arm-major and ran repeats 15 seconds apart, which
+is precisely the confound — and every cost figure in `TASKS.md` came from it.
+`--interleave` is the control; `print_run_order` reports whether the ordering
+actually used separated the repeats, because §5.8 says that must be verified
+rather than assumed, and it reports honestly under the default too.
+`print_cost` gives raw and warm-only side by side. No normalization formula was
+invented: on two independent N=3 sets a different repeat was the expensive one,
+so there is no fixed warm-up to subtract — only a run that paid the write.
+
+### Left open, deliberately
+
+`prior_same_task_run_id` skips CRASHED runs now (a run that died before its
+first call warmed nothing, and the index already carried `outcome`). Two limits
+are recorded rather than fixed: the cached prefix is plausibly
+task-*independent*, which a measurement settles and a wider key would only
+paper over; and the lookup is unsafe under §5.7 parallelism. Both are in
+`TASKS.md`.
+
+### Gate
+
+251 unit tests green, **32/32 mutations caught** including six on this path, dry
+run and the §6.6 gate both pass. The offline smoke now prints `at_start=?` for
+all three arms where it used to print `cold` — the stub returns no cache tokens,
+so undetermined is the true answer.
+
+---
+
+## `cache_state` stops lying — 2026-08-11
+
+`execute_run` never passed `cache_state`, so `assemble_record` fell back to
+`CacheState()` and **every record ever written asserted `{"warm": false,
+"prior_same_task_run_id": null}`**. Not an empty field a reader could see — a
+false positive claim, on the axis Sonnet's 2.9× cost spread turns on.
+
+Same shape as the defect `test_fault_injection.py` already warns about in its
+opening paragraph: *"a 429 asserted directly at classify_exclusion passes today
+while the path that would carry it in a real run does not exist."* A parameter
+nobody passes is invisible to any unit test of the function that takes it.
+
+**What `warm` had to mean, decided from the provider docs and then from the
+data.** Verified against the AWS Bedrock prompt-caching docs, 2026-08-11:
+`cacheReadInputTokens` reports "how many tokens were read from the cache…
+because of your previous request"; the TTL "resets with each successful cache
+hit"; **Sonnet 5 is absent from the doc's TTL table**, so the exact window is
+unverified. Cross-region inference — which `claude-sonnet-5-runtime` uses via
+the `us.` geo profile — "may lead to increased cache writes" under load. Two
+consequences: warmth must be *read*, never inferred from elapsed time, and a
+cold turn 1 does not imply the TTL expired.
+
+Then the archived records settled the definition. Per-turn `(cache_read,
+cache_write)` for both 2026-08-11 Sonnet N=3 runs:
+
+| started | turn 1 | cost |
+|---|---|---|
+| 08:40:40 | **(0, 41695)** | **$0.547** |
+| 08:40:56 | (30506, 11187) | $0.216 |
+| 08:41:10 | (30506, 11187) | $0.176 |
+| 17:41:51 | **(0, 41696)** | **$0.373** |
+| 17:42:07 | (30506, 11187) | $0.176 |
+| 17:42:22 | (30506, 11188) | $0.216 |
+
+Turn-1 `cache_read > 0` separates the expensive run from the cheap ones **2/2**,
+and it is the first-started run each time. That is the entire 2.9×/2.5× spread.
+
+Two readings this kills:
+
+- **The run total measures nothing.** The cache warms on turn 2 *within* a
+  single run — the cold run above is reading 41695 by turn 4 — so summed over
+  the run, every Sonnet run looks warm. `smoke_test.print_cache_tokens` had
+  already recorded this on 2026-08-07; it just had not been connected to the
+  field.
+- **Warm ≠ no writes.** A warm turn 1 still writes 11187 tokens, a partial
+  prefix match. Anything keyed on `cache_write == 0` would misclassify all of
+  them.
+
+**Implemented.** `warm` is `per_turn[0].tokens.cache_read > 0`, derived inside
+`assemble_record` from the parsed trajectory so no caller can forget it — the
+old `cache_state` parameter is gone, replaced by `prior_same_task_run_id`, which
+is the only half a caller supplies. `EventLog.last_run_id_for(task_id, model)`
+reads `index.jsonl`, which already carries both keys.
+
+Three decisions worth their reasoning:
+
+- **`warm: bool | None`, schema 2.1.0.** `None` is undetermined, not cold: with
+  no turn parsed nothing was observed, and a reader filtering for cold runs must
+  not silently collect parse failures. The bump follows the 1.1.0 `isolated`
+  precedent rather than the 2.0.0 `cost_usd` one — `None` is falsy so nothing
+  raises, but a reader still has to tell a 2.0.0 `false` (a default, meaningless)
+  from a 2.1.0 `false` (a measurement).
+- **Keyed on model as well as task**, despite the field's name. Bedrock's cache
+  is per-model; a Sonnet run cannot warm Nemotron's. Keyed on task alone, the
+  stored id would routinely fail to explain the `warm` beside it.
+- **Last index line, not max `started_at`.** The index is appended after the
+  record is durable, so line order is *completion* order — and the run that
+  finished most recently is the one that most recently touched the cache. The
+  two coincide under today's sequential runner and diverge under §5.7's
+  interleaving, where completion order stays the causally right one.
+  `last_run_id_for` is total by construction (missing file, unreadable file,
+  torn trailing line all yield `None`), which is what lets `execute_run` call it
+  before the container starts without endangering "a run always produces a
+  record".
+
+**Tested at the level the defect lived at.** Every unit test here would have
+passed while the field was unreachable, so the load-bearing one goes through
+`execute_run`: `test_execute_run_records_cache_state_and_the_run_that_warmed_it`
+runs two fake runs against one event log and asserts the first is cold with no
+prior run, the second warm and pointing at the first.
+
+Both undetermined paths are pinned, and the second matters more than it looks:
+a run with no transcript is obviously unmeasured, but a run whose transcript
+*failed to parse* still produces a record that looks complete, and `warm: false`
+there would refile a parse failure as a measurement. That test asserts
+`trajectory_parse_error != ""` and `warm is None` together so neither can drift.
+`warm=None` is also pinned across the JSON boundary, and a stored 2.0.0 record
+is pinned to keep its own version string — that string is how a reader knows its
+`warm: false` was a default rather than an observation.
+
+Three mutation anchors, all CAUGHT: run total instead of turn 1, `False` instead
+of `None` for an unmeasured run, and dropping the lookup argument. 28/28 overall,
+241 unit tests, gate PASSED.
+
+Applied to the archived records, the new rule labels exactly one run per N=3 set
+cold, and it is the expensive one both times. Note what that check is and is
+not: it re-applies the *rule* to `per_turn[0].tokens.cache_read` on records the
+old code assembled. It confirms the definition against real data; it does not
+exercise the new code path, which only a live run would.
+
+**Found in passing, not fixed:** the docs state `inputTokens` excludes cached
+tokens on Bedrock. Whether `costs.py` accounts for that is now a P1 item.
+
+---
+
+## The tool-id patch's exposure, moved into the config — 2026-08-11
+
+`TASKS.md` offered two fixes for `kimi-k2-5-runtime`: scope the patch by
+resolved provider, or drop the deployment. The first turns out to be the wrong
+one, and for a reason worth writing down.
+
+**The mechanism is real, and it is not Kimi's.** Traced offline against litellm
+1.95.0. Below `/v1/messages` the `bedrock/` route splits **by model id, not by
+config**, and the two halves behave differently:
+
+```
+bedrock/us.anthropic.claude-sonnet-5  -> AmazonAnthropicClaudeMessagesConfig  (Invoke)
+bedrock/nvidia.nemotron-super-3-120b  -> None                                 (Converse bridge)
+bedrock/moonshotai.kimi-k2.5          -> None                                 (Converse bridge)
+```
+
+Claude models take Invoke with a native Anthropic body and never construct a
+`toolUseId`. Everything else goes openai → Converse, where
+`prompt_templates/factory.py:3717,3886` copies the tool id verbatim into
+`BedrockToolUseBlock(toolUseId=)` and `BedrockToolResultBlock(toolUseId=)`.
+Reproduced end to end through litellm's own functions:
+
+```
+PATCHED   -> toolUseId ['functions.Read:0',  'functions.Read:0']
+UNPATCHED -> toolUseId ['functions_Read_0',  'functions_Read_0']
+```
+
+**Two corrections to what was written down.** `claude-sonnet-5-runtime` is
+exempt *structurally* — it never builds a `toolUseId` at all — not because its
+ids happen to be inside the character class, which is what the old note
+implied and is a claim that does not generalize.  And the exposure was never
+Kimi-specific: `nemotron-3-super-120b-runtime` takes the same bridge and is
+safe only because `call_4196d6e081be491194548c6d` already satisfies the class.
+The invariant is about the route, not the model.
+
+**Why provider-scoping was rejected**, in the order that mattered:
+
+1. It reinstates the defect it would be fixing. Sanitize for bedrock and
+   `functions.Read:0` becomes `functions_Read_0`, which Converse *accepts* and
+   Kimi cannot pair — verbatim the 2026-08-07 failure: 0/22 tool calls, prose
+   answer, `subtype: success`, no diff. It trades a loud 400 for a
+   plausible-looking zero.
+2. There is no frame to scope from. `sanitize_tool_use_ids_in_anthropic_messages`
+   runs at `handler.py:234`; `_execute_pre_request_hooks` runs at `:250`. A
+   ContextVar set in `async_pre_request_hook` is one request too late.
+3. Asymmetry hazard, the same class this eval keeps rediscovering:
+   `_SEEN_TOOL_USE_IDS` would fill from already-sanitized messages while the
+   stream wrapper mints raw ids, so `_uniquify_tool_use_id` would silently stop
+   matching and the Gemma collision fix would die on that route.
+4. `Versions.litellm_patches` is per-proxy-process. A conditional patch makes
+   every record claim a patch that was off for some calls — §5.2 inverted, the
+   record asserting a false positive. That would have forced a `SCHEMA_VERSION`
+   move; this change does not, because it removes a possible *value* of
+   `RunRecord.model` and no field's meaning changes.
+
+**So the patch did not change; the configuration did.** Removing the sanitizer
+process-wide moved the character-class constraint out of the library, and the
+config is where it now lives. `kimi-k2-5-runtime` is **commented out, not
+deleted** — it is the fallback transport if mantle breaks for Kimi the way it
+broke for Sonnet, and the restore procedure is kept beside it: uncomment, add
+the model to `CONVERSE_SAFE_TOOL_ID_MODELS` with the id shape it actually
+returns as the evidence, smoke-test.
+
+`test_no_bedrock_arm_reaches_converse_with_ids_it_would_reject` enforces it
+across every `config/litellm*.yaml`, resolving each arm's route through
+litellm's own routing rather than a hardcoded list — so a litellm upgrade that
+moves Sonnet onto the Converse bridge fails here too. Against the unmodified
+config it failed exactly as intended:
+
+```
+AssertionError: litellm_config.yaml: kimi-k2-5-runtime routes through the
+Converse bridge, where its tool-call ids become toolUseId unsanitized.
+assert 'bedrock/moonshotai.kimi-k2.5' in {'bedrock/nvidia.nemotron-super-3-120b'}
+```
+
+Mutation anchor `config: put the kimi runtime deployment back on the converse
+route` reports CAUGHT. The companion characterization test in
+`test_litellm_patches.py` deliberately gets **no** anchor: reverting the
+passthrough would make it fail, and an anchor there would reward removing a fix.
+
+**One claim left open on purpose.** That the id reaches `toolUseId` unsanitized
+is confirmed offline. That Bedrock *rejects* it is inferred from AWS's
+published pattern and is not verified — settling it costs money on an arm
+outside `EVAL_ARMS`, and the fix is sound whichever way it falls. Kept as two
+separate sentences everywhere it is written down.
+
+`PRICE_BOOK` keeps the `kimi-k2-5-runtime` alias. A price for a route nobody
+serves costs nothing; a missing one turns the day the deployment returns into
+an `UnknownModelError` raised mid-parse, after the tokens are spent.
+
+---
+
 ## Gemma's second adapter defect, and Phase 0c goes GO — 2026-08-11
 
 With `propertyNames` fixed Gemma finally emitted tool calls — 30 of them, every

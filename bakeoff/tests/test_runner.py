@@ -151,6 +151,271 @@ def _trajectory(tmp_path, stop_reason="end_turn"):
     return path
 
 
+def _cache_trajectory(tmp_path, reads: list[int]):
+    """A transcript whose per-turn cache_read is exactly `reads`.
+
+    Shaped like the real Sonnet transcripts: a cold run reads 0 on turn 1 and
+    a large number from turn 2 on, because the cache warms WITHIN the run.
+    """
+    path = tmp_path / "cache.jsonl"
+    lines = []
+    for i, read in enumerate(reads):
+        usage = {"input_tokens": 100, "output_tokens": 50}
+        if read:
+            usage["cache_read_input_tokens"] = read
+        lines.append(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "timestamp": f"2026-08-04T00:0{i}:00.000Z",
+                    "version": "2.1.220",
+                    "message": {
+                        "model": "claude-sonnet-5",
+                        "usage": usage,
+                        "stop_reason": "end_turn" if i == len(reads) - 1 else None,
+                        "content": [],
+                    },
+                }
+            )
+        )
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def _cache_record(task, tmp_path, reads: list[int] | None, **kwargs):
+    return assemble_record(
+        task=task,
+        model="claude-sonnet-5",
+        sample_index=0,
+        started_at="2026-08-04T00:00:00Z",
+        finished_at="2026-08-04T00:05:00Z",
+        trajectory_path=(
+            _cache_trajectory(tmp_path, reads) if reads is not None else None
+        ),
+        runner_result=None,
+        checkpoints=[],
+        destructive_events=[],
+        artifacts_root=tmp_path,
+        **kwargs,
+    )
+
+
+def test_a_first_turn_cache_hit_is_recorded_as_warm(task, tmp_path):
+    """Turn 1 cannot read what this run wrote, so a hit there is carryover
+    from an earlier run -- the cross-run cache state that moves cost."""
+    record = _cache_record(task, tmp_path, [30506, 41693, 41919])
+    assert record.cache_state.warm is True
+
+
+def test_warm_is_measured_from_the_first_turn_not_the_run_total(task, tmp_path):
+    """The distinction the field exists for, and the one that is easy to get
+    wrong in the direction that measures nothing.
+
+    Bedrock's cache warms on turn 2 of a SINGLE run, so a run-total
+    `cache_read > 0` is true of essentially every Sonnet run. Measured on the
+    two 2026-08-11 N=3 runs, turn-1 cache_read separates the expensive run
+    from the cheap ones 2/2 -- while the run total does not separate anything:
+
+        turn 1 (0, 41695)      -> $0.547   cold, and it reads 41695 by turn 4
+        turn 1 (30506, 11187)  -> $0.216
+        turn 1 (30506, 11187)  -> $0.176
+
+    This transcript is the cold run's shape. Summing would call it warm.
+    """
+    record = _cache_record(task, tmp_path, [0, 0, 41695, 41921])
+    assert record.cache_state.warm is False
+    assert record.tokens.cache_read > 0, "the run total would say warm"
+
+
+def test_a_genuinely_cold_run_stays_cold_when_its_only_cache_activity_is_writes(
+    task, tmp_path
+):
+    """The regression guard on the test above it: narrowing `false` must not
+    swallow the runs the field exists to find.
+
+    The real cold Sonnet run reads 0 on turn 1 and WRITES 41,695 -- so a guard
+    keyed on cache_read alone would call the most expensive run in the log
+    undetermined and drop it from every cost comparison. Both directions of
+    the cache total are what make a run measurable.
+    """
+    path = tmp_path / "cold.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "timestamp": "2026-08-04T00:00:00.000Z",
+                "version": "2.1.220",
+                "message": {
+                    "model": "claude-sonnet-5",
+                    "usage": {
+                        "input_tokens": 4,
+                        "output_tokens": 50,
+                        "cache_creation_input_tokens": 41695,
+                    },
+                    "stop_reason": "end_turn",
+                    "content": [],
+                },
+            }
+        )
+        + "\n"
+    )
+    record = assemble_record(
+        task=task,
+        model="claude-sonnet-5",
+        sample_index=0,
+        started_at="2026-08-04T00:00:00Z",
+        finished_at="2026-08-04T00:05:00Z",
+        trajectory_path=path,
+        runner_result=None,
+        checkpoints=[],
+        destructive_events=[],
+        artifacts_root=tmp_path,
+    )
+    assert record.tokens.cache_read == 0, "the shape a read-only guard misses"
+    assert record.cache_state.warm is False
+
+
+def test_warm_is_undetermined_when_the_model_reported_no_cache_at_all(task, tmp_path):
+    """The 2.1.0 defect, one level down, on three of the four arms.
+
+    Gemma and Nemotron returned no cache fields in 9 runs. `_usage_from`
+    defaults every cache field to 0, so turn-1 `cache_read > 0` was False and
+    every one of their records claimed it had started against a COLD cache --
+    an assertion about a cache whose existence is unconfirmed, which is why
+    costs.PRICE_BOOK carries None multipliers for them.
+
+    No read and no write anywhere in the run means nothing was accounted for.
+    """
+    record = _cache_record(task, tmp_path, [0, 0, 0])
+    assert record.tokens.cache_read == 0 and record.tokens.cache_write == 0
+    assert record.cache_state.warm is None
+
+
+def test_warm_is_undetermined_when_the_first_turn_carried_no_usage(task, tmp_path):
+    """An assistant record with no `usage` block projects to all-zero tokens,
+    byte-identical to a genuine zero -- so turn-1 cache_read alone cannot tell
+    "reported 0" from "reported nothing". API-error and replayed assistant
+    records land here, and they land on turn 1, where the measurement is."""
+    path = tmp_path / "no_usage.jsonl"
+    path.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "timestamp": f"2026-08-04T00:0{i}:00.000Z",
+                    "version": "2.1.220",
+                    "message": (
+                        {"model": "claude-sonnet-5", "content": []}
+                        if i == 0
+                        else {
+                            "model": "claude-sonnet-5",
+                            "usage": {
+                                "input_tokens": 100,
+                                "output_tokens": 50,
+                                "cache_read_input_tokens": 30506,
+                            },
+                            "content": [],
+                        }
+                    ),
+                }
+            )
+            for i in range(2)
+        )
+        + "\n"
+    )
+    record = assemble_record(
+        task=task,
+        model="claude-sonnet-5",
+        sample_index=0,
+        started_at="2026-08-04T00:00:00Z",
+        finished_at="2026-08-04T00:05:00Z",
+        trajectory_path=path,
+        runner_result=None,
+        checkpoints=[],
+        destructive_events=[],
+        artifacts_root=tmp_path,
+    )
+    assert record.trajectory_parse_error == "", "the transcript parsed fine"
+    assert record.cache_state.warm is None
+
+
+def test_warm_is_undetermined_rather_than_cold_when_no_turn_parsed(task, tmp_path):
+    """`False` would mean the provider reported no cache read. Nothing was
+    reported at all, and a reader filtering for cold runs must not collect
+    runs that produced no transcript as if they were measurements."""
+    record = _cache_record(task, tmp_path, None)
+    assert record.cache_state.warm is None
+
+
+def test_warm_is_undetermined_when_the_trajectory_failed_to_parse(task, tmp_path):
+    """The path that matters more than the one above, because here a record IS
+    produced and looks complete.
+
+    A trajectory that cannot be read leaves every derived field empty, and
+    `warm: false` would be the same class of false claim this field was
+    populated to end -- a parse failure silently filed under "the cache was
+    cold". Pinned together with trajectory_parse_error so neither can drift
+    into looking like a measurement on its own.
+    """
+    bad = tmp_path / "bad.jsonl"
+    bad.write_bytes(b"\xff\xfe not utf-8 at all\n")
+    record = assemble_record(
+        task=task,
+        model="claude-sonnet-5",
+        sample_index=0,
+        started_at="2026-08-04T00:00:00Z",
+        finished_at="2026-08-04T00:05:00Z",
+        trajectory_path=bad,
+        runner_result=None,
+        checkpoints=[],
+        destructive_events=[],
+        artifacts_root=tmp_path,
+    )
+    assert record.trajectory_parse_error != ""
+    assert record.cache_state.warm is None
+
+
+def test_the_gap_to_the_prior_run_is_recorded_beside_the_measurement(task, tmp_path):
+    """`warm` alone cannot distinguish a cache a developer would find warm from
+    one the scheduler warmed three seconds earlier. Measured across six
+    matrices, consecutive repeats start 3-5 seconds apart against a 300 second
+    TTL -- so the gap is what turns the flag into a fact about deployment
+    rather than about the harness."""
+    record = _cache_record(
+        task,
+        tmp_path,
+        [30506],
+        prior_same_task_run_id="abc123",
+        prior_started_at="2026-08-04T00:00:00Z",
+    )
+    assert record.cache_state.warm is True
+    assert record.cache_state.seconds_since_prior_run == 0.0
+
+    later = _cache_record(
+        task, tmp_path, [30506], prior_started_at="2026-08-03T23:55:30Z"
+    )
+    assert later.cache_state.seconds_since_prior_run == 270.0
+
+
+def test_the_gap_is_undetermined_rather_than_zero_with_no_prior_run(task, tmp_path):
+    """0.0 would read as "these runs started at the same instant" -- the
+    strongest possible claim about carryover, made from missing data."""
+    record = _cache_record(task, tmp_path, [0, 41695])
+    assert record.cache_state.prior_same_task_run_id is None
+    assert record.cache_state.seconds_since_prior_run is None
+
+
+def test_the_prior_run_id_is_recorded_beside_the_measurement(task, tmp_path):
+    """Corroborating evidence, not the measurement. A warm run with no prior
+    run, or a cold run with one, are both real and both informative -- the
+    second is a TTL expiry or a cross-region cache write."""
+    record = _cache_record(
+        task, tmp_path, [0, 41695], prior_same_task_run_id="abc123"
+    )
+    assert record.cache_state.prior_same_task_run_id == "abc123"
+    assert record.cache_state.warm is False
+
+
 def test_clean_run_is_not_labelled_a_false_success(task, tmp_path):
     """The harness cannot know whether tests passed -- grading is offline
     (spec section 5.5). Passing tests_passed=False would make every

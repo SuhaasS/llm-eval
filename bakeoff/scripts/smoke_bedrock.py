@@ -363,12 +363,56 @@ def live(router, arms, selected: set[str] | None, with_tools: bool) -> int:
             failures += 1
             continue
 
-        kwargs: dict[str, Any] = {"model": name, "messages": PROBE, "max_tokens": 32}
+        # The cap goes out under the spelling the PROXY would send, and this
+        # script has to reproduce that by hand. `bakeoff.litellm_patches`
+        # renames max_tokens -> max_completion_tokens on every openai/
+        # deployment, but it is applied by importing it -- and the harness may
+        # never import it (that separation is what keeps the harness process's
+        # litellm unpatched), so this in-process Router is unpatched by design.
+        #
+        # Without this branch the probe would keep sending max_tokens to
+        # Bedrock's /openai/v1 route and keep getting the 400 that took Gemma
+        # to 0/3 on 2026-08-12 -- after the proxy was fixed. The tool used to
+        # bracket that defect would have gone on reproducing it, and read as
+        # the fix not taking. See litellm_patches for the measurement; if that
+        # rename changes, this line is the other place it lives.
+        cap = (
+            "max_completion_tokens"
+            if arm["model"].startswith("openai/")
+            else "max_tokens"
+        )
+        kwargs: dict[str, Any] = {"model": name, "messages": PROBE, cap: 32}
         if with_tools:
             kwargs["tools"] = [PROBE_TOOL]
             kwargs["messages"] = [
                 {"role": "user", "content": "Call get_status for the service 'api'."}
             ]
+            if arm["model"].startswith("openai/"):
+                # Gemma's route refuses tools outright unless this is
+                # explicitly "none" -- and absent is not "none", because the
+                # route supplies its own default:
+                #   Function tools with reasoning_effort are not supported for
+                #   google.gemma-4-31b in /v1/chat/completions.
+                #
+                # THREE settings, and all three are required. Measured
+                # 2026-08-12 by removing each in turn:
+                #   reasoning_effort        the value the route demands
+                #   allowed_openai_params   litellm, NOT Bedrock, rejects the
+                #                           parameter on a non-o-series openai
+                #                           model (_check_valid_arg)
+                #   additional_drop_params  the DEPLOYMENT lists
+                #                           ["reasoning_effort"], and that drop
+                #                           strips the value set right here --
+                #                           with the first two alone this arm
+                #                           still 400s
+                #
+                # The proxy needs none of this because bakeoff.litellm_patches
+                # injects downstream of the drop. This script cannot import
+                # that module (it would patch the harness's litellm), so the
+                # pin is reproduced by hand and the two must move together.
+                kwargs["reasoning_effort"] = "none"
+                kwargs["allowed_openai_params"] = ["reasoning_effort"]
+                kwargs["additional_drop_params"] = []
 
         started = time.monotonic()
         try:

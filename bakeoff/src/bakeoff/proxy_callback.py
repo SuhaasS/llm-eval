@@ -137,6 +137,45 @@ def _request(kwargs: dict) -> dict[str, Any]:
         "system": pick("system"),
         "temperature": pick("temperature"),
         "max_tokens": pick("max_tokens"),
+        # Both spellings, because the arms do not agree on one and the record
+        # must say which was sent. openai_max_completion_tokens_rename moves
+        # the cap to max_completion_tokens on the three candidate arms; Sonnet
+        # keeps max_tokens on its native Anthropic body.
+        #
+        # Recording only max_tokens would be worse than losing the field.
+        # `pick` prefers optional_params and falls back to the raw body, and
+        # the raw body is Claude Code's request, which still carries
+        # max_tokens on every arm -- so a renamed call would report a
+        # parameter the wire did not carry, at full plausibility. That is
+        # configuration reported as observation, on the one field the rename
+        # touches.
+        "max_completion_tokens": pick("max_completion_tokens"),
+        # The params `litellm_settings.additional_drop_params` removes, plus
+        # the beta values the two transports carry differently. Recorded
+        # BECAUSE they are dropped, not despite it: the drops are per-arm --
+        # reasoning_effort is listed on each candidate deployment, Sonnet's
+        # runtime deployment lists nothing -- and whether a drop actually
+        # reached a given route is a section 6.4 question about the arms this
+        # eval is comparing.
+        #
+        # Until 3.1.0 this projection was six keys and these were not among
+        # them, so the log designated as the authority on "what was sent"
+        # discarded exactly the fields whose divergence was open. The only
+        # answer available was an outcome proxy: 856 calls across five arms,
+        # zero reasoning tokens on any of them, which says no arm was
+        # thinking but cannot say what any arm was asked to do.
+        #
+        # An explicit allowlist, never **body: the design is that the log
+        # carries a known shape, and the secret scan in wire.py depends on
+        # it. A new field here is a deliberate act.
+        "thinking": pick("thinking"),
+        "reasoning_effort": pick("reasoning_effort"),
+        "context_management": pick("context_management"),
+        "output_config": pick("output_config"),
+        "anthropic_beta": pick("anthropic_beta"),
+        # Every real call streams; a False here means capture is looking at
+        # something other than the agent's traffic.
+        "stream": pick("stream"),
     }
 
 

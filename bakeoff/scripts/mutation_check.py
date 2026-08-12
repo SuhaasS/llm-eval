@@ -65,6 +65,275 @@ MUTATIONS = [
         "not integration",
     ),
     (
+        # The first of the 2026-08-12 defects: Bedrock's /openai/v1 route began
+        # validating Gemma under OpenAI's reasoning-model contract, where
+        # max_tokens is deprecated. Dropping the rename sends the spelling the
+        # route answers 400 to, on all three candidate arms.
+        "adapter: stop renaming max_tokens, restoring Gemma's 0/3",
+        "src/bakeoff/litellm_patches.py",
+        '                if "max_tokens" in mapped:\n'
+        '                    mapped["max_completion_tokens"] = mapped.pop("max_tokens")',
+        '                if False:\n'
+        '                    mapped["max_completion_tokens"] = mapped.pop("max_tokens")',
+        "tests/test_litellm_patches.py -k max_completion",
+        "not integration",
+    ),
+    (
+        # The third 2026-08-12 wall, and the one that survives a green-looking
+        # config: the route refuses `tools` unless reasoning_effort is
+        # explicitly "none", and ABSENT is not "none". Removing the assignment
+        # restores the absence that additional_drop_params produced.
+        "adapter: stop pinning reasoning_effort, so tools go out unpinned",
+        "src/bakeoff/litellm_patches.py",
+        "                mapped[_REASONING_EFFORT] = _REASONING_EFFORT_VALUE",
+        "                pass",
+        "tests/test_litellm_patches.py -k reasoning_effort or pin",
+        "not integration",
+    ),
+    (
+        # Removing the tool-id sanitizer process-wide moved the character-class
+        # constraint out of the library and into this config. Uncommenting the
+        # deployment puts a model whose ids carry a colon back on the Converse
+        # bridge, where they become toolUseId verbatim -- and the failure would
+        # be a 400 from AWS mid-run, not anything visible offline.
+        "config: put the kimi runtime deployment back on the converse route",
+        "config/litellm_config.yaml",
+        "  # - model_name: kimi-k2-5-runtime\n"
+        "  #   litellm_params:\n"
+        "  #     model: bedrock/moonshotai.kimi-k2.5",
+        "  - model_name: kimi-k2-5-runtime\n"
+        "    litellm_params:\n"
+        "      model: bedrock/moonshotai.kimi-k2.5\n"
+        "      aws_region_name: us-east-1\n"
+        "      temperature: 1.0\n"
+        "      top_p: 0.95",
+        "tests/test_config.py -k converse",
+        "not integration",
+    ),
+    (
+        # The measurement that separates Sonnet's $0.547 run from its $0.176
+        # ones. Bedrock's cache warms on turn 2 of a single run, so a run-total
+        # cache_read is true of nearly every Sonnet run and separates nothing.
+        # Taking the total is the plausible-looking mistake, and it is silent.
+        "cache: read warm from the run total instead of the first turn",
+        "src/bakeoff/runner.py",
+        "    return first.cache_read > 0",
+        "    return total.cache_read > 0",
+        "tests/test_runner.py -k warm",
+        "not integration",
+    ),
+    (
+        # The absence half. A run with no parsed turn observed nothing, and
+        # calling that cold refiles a parse failure as a measurement -- the
+        # same false claim, one layer down from the one 2.1.0 fixed.
+        "cache: call an unmeasured run cold instead of undetermined",
+        "src/bakeoff/runner.py",
+        "    if not parsed.turns:\n        return None",
+        "    if not parsed.turns:\n        return False",
+        "tests/test_runner.py -k undetermined",
+        "not integration",
+    ),
+    (
+        # 2.1.0 fixed `warm` for the one arm that has a cache. Gemma and
+        # Nemotron report no cache accounting at all, so turn-1 cache_read is 0
+        # for them on every run and `false` asserted a cold cache on models
+        # whose cache support is unconfirmed -- 3 of the 4 arms still lying
+        # after the fix that was supposed to end it.
+        "cache: call an arm that reports no cache accounting cold",
+        "src/bakeoff/runner.py",
+        "    if total.cache_read == 0 and total.cache_write == 0:\n        return None",
+        "    if False:\n        return None",
+        "tests/test_runner.py -k no_cache_at_all",
+        "not integration",
+    ),
+    (
+        # An assistant record with no usage block projects to all-zero tokens,
+        # byte-identical to a genuine zero. API-error records land on turn 1,
+        # which is exactly where the measurement is taken.
+        "cache: read a first turn that carried no usage as a genuine zero",
+        "src/bakeoff/runner.py",
+        "    if first == TokenUsage():\n        return None",
+        "    if False:\n        return None",
+        "tests/test_runner.py -k first_turn_carried_no_usage",
+        "not integration",
+    ),
+    (
+        # A 1h cache write bills at 2.00x base against the 5m tier's 1.25x
+        # (AWS Bedrock prompt-caching page, 2026-08-11). Charging every write
+        # at the 5m rate understates by 60% and nothing raises -- the tier is
+        # the only field that could ever detect it, and until 2.2.0 the log
+        # did not keep it.
+        "cache: bill a 1h cache write at the 5m rate",
+        "src/bakeoff/costs.py",
+        "                * price.cache_write_1h_multiplier",
+        "                * price.cache_write_multiplier",
+        "tests/test_costs.py -k one_hour",
+        "not integration",
+    ),
+    (
+        # A run that never reached a model call touched no cache. Naming it as
+        # the warmer puts a plausible id beside a `warm` it cannot explain.
+        "cache: name a run that made no model call as the warmer",
+        "src/bakeoff/eventlog.py",
+        '                        if entry.get("turns_used", 1) < 1:\n                            continue',
+        "                        if False:\n                            continue",
+        "tests/test_eventlog.py -k made_no_model_call",
+        "not integration",
+    ),
+    (
+        # The 2026-08-11 review defect. Claude Code writes one transcript
+        # record per CONTENT BLOCK and repeats the whole usage block in each,
+        # so counting records doubled every token total and every cost in the
+        # log -- 83,867 cache_write recorded against a true 42,171.
+        "turns: count transcript records instead of API calls",
+        "src/bakeoff/trajectory.py",
+        "        seen = by_message_id.get(key)",
+        "        seen = None",
+        "tests/test_trajectory.py -k split_across_content_blocks",
+        "not integration",
+    ),
+    (
+        # The other direction, and the more expensive one: merging records that
+        # carry no id at all would collapse genuinely distinct calls into one
+        # turn and understate a run's cost.
+        "turns: merge records that carry no message id",
+        "src/bakeoff/trajectory.py",
+        '        key = message_id or f"\\0record-{result.assistant_records}"',
+        "        key = message_id",
+        "tests/test_trajectory.py -k without_a_message_id",
+        "not integration",
+    ),
+    (
+        # _usage_from runs outside the pricing guard, so anything it raises
+        # aborts the parse and assemble_record discards the whole trajectory --
+        # the 2026-08-07 row-of-zeroes defect, reachable again through a
+        # cache_creation block the proxy layer can reshape.
+        "usage: trust the cache_creation block's shape",
+        "src/bakeoff/trajectory.py",
+        '    tiers = raw.get("cache_creation")\n    if not isinstance(tiers, dict):\n        tiers = {}',
+        '    tiers = raw.get("cache_creation") or {}',
+        "tests/test_trajectory.py -k malformed_usage",
+        "not integration",
+    ),
+    (
+        # A `null` index line is valid JSON and raises AttributeError on .get;
+        # the lookup runs OUTSIDE execute_run's try, so the run produces no
+        # record at all -- and the bad line poisons every later run too.
+        "index: let a corrupt line escape the prior-run lookup",
+        "src/bakeoff/eventlog.py",
+        "                    except Exception:  # noqa: BLE001 - see TOTAL BY CONSTRUCTION\n                        continue",
+        "                    except json.JSONDecodeError:\n                        continue",
+        "tests/test_eventlog.py -k corrupt_index_line",
+        "not integration",
+    ),
+    (
+        # A partial pricing failure nulls the run total while per_turn keeps
+        # real dollars. Keying the basis on the total left those figures with
+        # no price book attached.
+        "pricing: blank the price basis whenever the run total is unknown",
+        "src/bakeoff/runner.py",
+        "                if any(turn.cost_usd is not None for turn in parsed.turns)",
+        "                if parsed.total_cost_usd is not None",
+        "tests/test_fault_injection.py -k price_basis",
+        "not integration",
+    ),
+    (
+        # cache_state was a parameter nobody passed for the whole life of
+        # schema 2.0.0, and every record claimed warm: false because of it.
+        # Dropping the argument reproduces exactly that, and only a test that
+        # goes through execute_run can see it.
+        "cache: stop threading the prior-run lookup through execute_run",
+        "src/bakeoff/runner.py",
+        "        prior_same_task_run_id=prior_run_id,",
+        "        prior_same_task_run_id=None,",
+        "tests/test_fault_injection.py -k cache_state",
+        "not integration",
+    ),
+    (
+        # The last statement of a run was unguarded for the whole life of the
+        # module, against a docstring promising nothing may raise past it. A
+        # stale .partial or a full disk lost the record after the tokens were
+        # spent. Calling write_run bare puts that back.
+        "record: let a refused write lose the record",
+        "src/bakeoff/runner.py",
+        "    _write_or_strand(record, event_log, artifacts_root)",
+        "    event_log.write_run(record)",
+        "tests/test_fault_injection.py -k strands_the_record",
+        "not integration",
+    ),
+    (
+        # The zero-row that reads as a quiet run. No transcript sends turns,
+        # tokens, tool calls, destructive events and cost to zero together
+        # while trajectory_parse_error stays empty -- the one ambiguity the
+        # schema's whole vocabulary exists to eliminate.
+        "trajectory: leave a missing transcript indistinguishable from silence",
+        "src/bakeoff/runner.py",
+        '        parse_error = (\n            f"transcript absent: {trajectory_path}"',
+        '        parse_error = (\n            ""\n            if True\n            else f"transcript absent: {trajectory_path}"',
+        "tests/test_fault_injection.py -k missing_transcript",
+        "not integration",
+    ),
+    (
+        # A run whose header stamping broke writes a well-formed record with
+        # empty sampling and empty hashes. The gate for it lived only in
+        # smoke_test.py, which does not run during an eval.
+        "wire: stop recording the calls the proxy could not attribute",
+        "src/bakeoff/runner.py",
+        "        wire_unattributed=wire_unattributed,\n        isolated=bool(network),",
+        "        wire_unattributed=None,\n        isolated=bool(network),",
+        "tests/test_fault_injection.py -k could_not_attribute or this_runs_lost_calls",
+        "not integration",
+    ),
+    (
+        # sha256(b"null") is an ordinary-looking 64-hex digest, so a record
+        # that observed no system prompt could not be told from one that
+        # observed a real prompt -- and two arms that both sent nothing agreed
+        # on a hash.
+        "wire: hash an absent system prompt into a real-looking digest",
+        "src/bakeoff/runner.py",
+        '    if value is None:\n        return ""\n    return hashlib.sha256(',
+        "    return hashlib.sha256(",
+        "tests/test_fault_injection.py -k digest_of_null",
+        "not integration",
+    ),
+    (
+        # The wire log is the harness's authority on what was SENT, and it
+        # dropped exactly the per-arm params section 6.4 turns on:
+        # reasoning_effort is listed on each candidate deployment and on none
+        # of Sonnet's. 856 stored calls cannot answer the question.
+        "wire: narrow the request projection back to six keys",
+        "src/bakeoff/proxy_callback.py",
+        '        "thinking": pick("thinking"),',
+        '        "_thinking_dropped": None,',
+        "tests/test_proxy_callback.py -k dropped_params",
+        "not integration",
+    ),
+    (
+        # The image shipped no test runner for the whole of Phase 0c, so the
+        # agent could not check its own work and Gemma's 9/9 was read as
+        # capability. Removing pythonpath reproduces the other half: the
+        # fixture is then red before the fix and red after it.
+        "fixture: make the smoke task unverifiable again",
+        "fixtures/smoke_task/pytest.ini",
+        "pythonpath = .",
+        "# pythonpath removed",
+        "tests/test_smoke_fixture.py -k fixture",
+        "not integration",
+    ),
+    (
+        # A config invariant the setup instructions contradict is not pinned.
+        # .env.example told the operator to paste the mantle key into
+        # AWS_BEARER_TOKEN_BEDROCK, which bearer-authenticates every bedrock/
+        # arm -- the failure the config is careful to avoid, produced by
+        # following the document.
+        "env: point the setup template back at the fallback variable",
+        ".env.example",
+        "BAKEOFF_MANTLE_TOKEN=<paste-bedrock-api-key>",
+        "AWS_BEARER_TOKEN_BEDROCK=<paste-bedrock-api-key>",
+        "tests/test_config.py -k env_template",
+        "not integration",
+    ),
+    (
         "defect 1: stop deriving api_error_status from the wire",
         "src/bakeoff/runner.py",
         "    if api_error_status is None:\n        api_error_status = final_api_error_status(entries)",

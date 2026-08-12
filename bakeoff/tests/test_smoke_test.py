@@ -460,6 +460,47 @@ def test_a_waived_criterion_is_actually_waived_when_one_is_declared():
     ), "waiving tool_calls must not also waive the diff"
 
 
+# --- run ordering, spec section 5.8 ------------------------------------------
+
+
+def test_arm_major_ordering_runs_every_arm_back_to_back_with_itself():
+    """The default, and the ordering every cost figure in TASKS.md came from.
+    Named here so the confound is a documented property of the run rather than
+    something a reader has to reconstruct from timestamps."""
+    from scripts.smoke_test import adjacent_repeats, run_order
+
+    order = run_order(["sonnet", "gemma"], repeats=3, interleave=False)
+
+    assert order == [
+        ("sonnet", 0), ("sonnet", 1), ("sonnet", 2),
+        ("gemma", 0), ("gemma", 1), ("gemma", 2),
+    ]
+    assert adjacent_repeats(order) == ["sonnet", "sonnet", "gemma", "gemma"]
+
+
+def test_interleaving_keeps_repeats_of_one_arm_apart():
+    """Section 5.8's control: repeats of the same arm must never run
+    back-to-back, and the spec says that must be verified rather than
+    assumed -- so the check is a function, not a comment."""
+    from scripts.smoke_test import adjacent_repeats, run_order
+
+    order = run_order(["sonnet", "gemma", "kimi"], repeats=3, interleave=True)
+
+    assert adjacent_repeats(order) == []
+    assert [arm for arm, _ in order[:3]] == ["sonnet", "gemma", "kimi"]
+    assert len(order) == 9
+
+
+def test_interleaving_cannot_separate_a_single_arm():
+    """One arm has nothing to interleave with, so the check must report the
+    truth rather than the flag. A green line here would be the assumption
+    section 5.8 exists to forbid."""
+    from scripts.smoke_test import adjacent_repeats, run_order
+
+    order = run_order(["sonnet"], repeats=3, interleave=True)
+    assert adjacent_repeats(order) == ["sonnet", "sonnet"]
+
+
 # --- the fixture -------------------------------------------------------------
 
 

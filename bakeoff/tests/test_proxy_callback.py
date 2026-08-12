@@ -112,6 +112,99 @@ def test_sampling_comes_from_the_request_body_not_the_top_level(wire_dir):
     assert request["model"] == "anthropic/claude-sonnet-5"
 
 
+def test_the_dropped_params_are_recorded_because_they_are_dropped(wire_dir):
+    """The projection has to carry what `additional_drop_params` removes.
+
+    Those drops are PER ARM -- `reasoning_effort` is listed on each of the
+    three candidate deployments and on neither Sonnet deployment -- so
+    whether a drop actually reached a given route is a section 6.4 question
+    about the arms being compared. Through 3.0.0 the projection was six keys
+    and none of these were among them, which left the log designated as the
+    authority on "what was sent" unable to answer it: 856 stored calls across
+    five arms carry no trace of the request side of this at all.
+
+    `stream` is here for a different reason. Every real call streams, so a
+    False would mean capture is looking at something other than the agent's
+    traffic -- the `mock_response` short-circuit that skips the streaming
+    wrapper is the known way to get one.
+    """
+    callback = BakeoffProxyCallback()
+    callback.log_success_event(
+        kwargs_for(
+            body={
+                "model": "mock-ok",
+                "messages": [{"role": "user", "content": "hi"}],
+                "thinking": {"type": "enabled", "budget_tokens": 1024},
+                "reasoning_effort": "medium",
+                "context_management": {"edits": []},
+                "output_config": {"format": "text"},
+                "anthropic_beta": ["context-management-2025-06-27"],
+                "stream": True,
+            }
+        ),
+        {"ok": True},
+        None,
+        None,
+    )
+
+    request = read_run_entries(wire_dir, "run-abc")[0]["request"]
+    assert request["thinking"] == {"type": "enabled", "budget_tokens": 1024}
+    assert request["reasoning_effort"] == "medium"
+    assert request["context_management"] == {"edits": []}
+    assert request["output_config"] == {"format": "text"}
+    assert request["anthropic_beta"] == ["context-management-2025-06-27"]
+    assert request["stream"] is True
+
+
+def test_a_request_that_carried_none_of_them_records_none_not_absence(wire_dir):
+    """The key has to be present with a null, not missing.
+
+    A missing key and a null read the same to `dict.get`, but not to anyone
+    diffing two arms' entries or counting how many calls carried a field: an
+    absent key is also what an OLD log line looks like, and conflating "this
+    arm sent no thinking block" with "this line predates the projection" is
+    the version-confusion the schema notes exist to prevent.
+    """
+    callback = BakeoffProxyCallback()
+    callback.log_success_event(kwargs_for(), {"ok": True}, None, None)
+
+    request = read_run_entries(wire_dir, "run-abc")[0]["request"]
+    for name in (
+        "thinking",
+        "reasoning_effort",
+        "context_management",
+        "output_config",
+        "anthropic_beta",
+        "stream",
+    ):
+        assert name in request, f"{name} missing from the projection entirely"
+        assert request[name] is None
+
+
+def test_the_two_capture_paths_project_the_same_request_shape(wire_dir, tmp_path):
+    """proxy_callback and wire.py must not drift apart.
+
+    A run's canonical artifact is written from whichever path was live -- the
+    proxy one on a real run, the in-process one in tests and the dry run --
+    so a field present in one projection and absent from the other reads as
+    "not sent on this arm" rather than "not captured on this path".
+    """
+    from bakeoff.wire import BakeoffCallback, WireLogger
+
+    callback = BakeoffProxyCallback()
+    callback.log_success_event(kwargs_for(), {"ok": True}, None, None)
+    proxy_keys = set(read_run_entries(wire_dir, "run-abc")[0]["request"])
+
+    logger = WireLogger(tmp_path / "wire.jsonl.gz")
+    BakeoffCallback(logger, "run-abc").log_success_event(
+        {"model": "mock-ok"}, {"ok": True}, None, None
+    )
+    logger.close()
+    in_process_keys = set(logger.entries()[0]["request"])
+
+    assert proxy_keys == in_process_keys
+
+
 def test_resolved_params_win_over_the_raw_body(wire_dir):
     """optional_params is populated on routes that resolve params and is
     closer to what the provider received, so it takes precedence where it
