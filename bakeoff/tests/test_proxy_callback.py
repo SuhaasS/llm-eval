@@ -205,15 +205,88 @@ def test_the_two_capture_paths_project_the_same_request_shape(wire_dir, tmp_path
     assert proxy_keys == in_process_keys
 
 
-def test_resolved_params_win_over_the_raw_body(wire_dir):
-    """optional_params is populated on routes that resolve params and is
-    closer to what the provider received, so it takes precedence where it
-    exists."""
+def test_optional_params_is_not_treated_as_what_the_provider_received(wire_dir):
+    """The rule this replaces was backwards, and measurably so.
+
+    `request` used to prefer `optional_params` and fall back to the client
+    body, on the reasoning that optional_params is "closer to what the provider
+    received". Measured 2026-08-12 against a real streaming provider call: on
+    the anthropic-messages route optional_params belongs to the OUTER call, so
+    it carries `max_tokens: 16384` with no `max_completion_tokens` and no
+    `reasoning_effort` -- the state BEFORE both openai interventions, handed the
+    provenance of a resolved param. Preferring it meant the log reported a
+    parameter the wire did not carry, at full plausibility, on the one field the
+    rename touches.
+
+    `request` is now the client's body and nothing else. What the provider got
+    lives in `resolved`, and comes from the side channel or not at all.
+    """
     callback = BakeoffProxyCallback()
     callback.log_success_event(
         kwargs_for(optional_params={"temperature": 0.2}), {"ok": True}, None, None
     )
-    assert read_run_entries(wire_dir, "run-abc")[0]["request"]["temperature"] == 0.2
+    entry = read_run_entries(wire_dir, "run-abc")[0]
+    assert entry["request"]["temperature"] == 0.7, "the client's value, not the outer call's"
+    assert entry["resolved"] is None, "nothing observed the provider boundary"
+
+
+def test_the_resolved_params_the_side_channel_captured_are_recorded(wire_dir):
+    """What the provider was actually sent, when something could see it.
+
+    The channel exists because nothing on the callback's kwargs can answer
+    this: capture fires on the outer anthropic_messages call and the nested
+    acompletion -- where the cap is renamed and reasoning_effort is pinned --
+    fires no callback of its own.
+    """
+    from bakeoff.proxy_callback import open_resolved_capture, record_resolved_params
+
+    open_resolved_capture("call-1")
+    record_resolved_params(
+        {"max_completion_tokens": 16384, "reasoning_effort": "none", "stream": True}
+    )
+
+    callback = BakeoffProxyCallback()
+    callback.log_success_event(
+        {**kwargs_for(), "litellm_call_id": "call-1"}, {"ok": True}, None, None
+    )
+
+    entry = read_run_entries(wire_dir, "run-abc")[0]
+    assert entry["resolved"]["max_completion_tokens"] == 16384
+    assert entry["resolved"]["reasoning_effort"] == "none"
+    # The cap under the OTHER spelling is what the client asked for, and both
+    # readings have to survive: the whole point is being able to see them
+    # disagree.
+    assert entry["resolved"]["max_tokens"] is None
+    assert entry["request"]["max_tokens"] == 4096
+
+
+def test_a_request_with_no_capture_opened_records_resolved_as_null(wire_dir):
+    """None, never {}. A route that never reached the hook observed nothing,
+    and an empty dict would read as "the provider was sent no parameters"."""
+    callback = BakeoffProxyCallback()
+    callback.log_success_event(kwargs_for(), {"ok": True}, None, None)
+    assert read_run_entries(wire_dir, "run-abc")[0]["resolved"] is None
+
+
+def test_another_calls_resolved_params_are_never_attributed_to_this_one(wire_dir):
+    """The failure this guard exists for is misattribution, not a gap.
+
+    A ContextVar that outlives its request hands the next call the previous
+    one's resolved params -- and on a proxy serving several arms concurrently
+    that is one arm's configuration recorded against another, at full
+    plausibility, with nothing in the record to notice. A gap says "not
+    observed" and can be acted on; this cannot.
+    """
+    from bakeoff.proxy_callback import open_resolved_capture, record_resolved_params
+
+    open_resolved_capture("call-1")
+    record_resolved_params({"max_completion_tokens": 4})
+
+    callback = BakeoffProxyCallback()
+    callback.log_success_event(
+        {**kwargs_for(), "litellm_call_id": "call-2"}, {"ok": True}, None, None
+    )
+    assert read_run_entries(wire_dir, "run-abc")[0]["resolved"] is None
 
 
 def test_proxy_injected_metadata_is_not_reported_as_part_of_the_request(wire_dir):
@@ -438,3 +511,145 @@ def test_a_non_dict_response_is_kept_as_text_rather_than_dropped(wire_dir):
 
     response = read_run_entries(wire_dir, "run-abc")[0]["response"]
     assert response["raw_completion"] == "a bare string completion"
+
+
+# --- what a failure looks like in the log ------------------------------------
+
+
+class _FakeResponse:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+class _ProviderError(Exception):
+    def __init__(self, message: str, status_code: int, body: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.llm_provider = "openai"
+        self.response = _FakeResponse(body)
+
+
+def test_a_failure_records_the_provider_body_not_the_string_none(wire_dir):
+    """`response_obj` is None on a failure, so a 400 landed as
+    `{"raw_completion": "None"}` -- the log said something went wrong and
+    nothing else. Every diagnosis so far (the mantle Sonnet arm's `invalid beta
+    flag`, Gemma's -32602, Gemma's max_tokens rejection) had to come from
+    grepping the proxy's stdout, and in a real run the proxy log is not an
+    artifact of any record. Section 6.2 exists so a failure can be diagnosed
+    after the fact.
+    """
+    exc = _ProviderError(
+        "OpenAIException - Unsupported parameter: 'max_tokens' is not supported",
+        400,
+        '{"error":{"message":"Unsupported parameter: \'max_tokens\'"}}',
+    )
+    callback = BakeoffProxyCallback()
+    callback.log_failure_event(kwargs_for(exception=exc), None, None, None)
+
+    entry = read_run_entries(wire_dir, "run-abc")[0]
+    error = entry["response"]["error"]
+    assert error["type"] == "_ProviderError"
+    assert "max_tokens" in error["message"]
+    assert error["status_code"] == 400
+    assert error["provider"] == "openai"
+    assert "Unsupported parameter" in error["body"]
+    assert "raw_completion" not in entry["response"]
+
+
+def test_a_failure_body_is_reachable_by_the_secret_scan(wire_dir, tmp_path):
+    """The error goes under `response` and not beside it, because WireLogger
+    builds the scan payload from `request` and `response` only. A provider
+    error body is exactly where a request gets echoed back, so an error stored
+    outside the scanned fields is the one place a secret could leave the
+    harness unflagged."""
+    from bakeoff.wire import WireLogger
+
+    logger = WireLogger(tmp_path / "wire.jsonl.gz")
+    logger.log_call(
+        request={"model": "m"},
+        response={"error": {"body": "rejected credentials for AKIA" + "H7QW3ZP2NM4RTX6B"}},
+        metadata={},
+    )
+    logger.close()
+    assert logger.entries()[0]["secret_flags"], "an error body escaped the secret scan"
+
+
+def test_a_successful_call_still_records_the_completion(wire_dir):
+    """The error projection must not displace the ordinary path."""
+    callback = BakeoffProxyCallback()
+    callback.log_success_event(kwargs_for(), {"id": "msg_1", "ok": True}, None, None)
+    assert read_run_entries(wire_dir, "run-abc")[0]["response"]["id"] == "msg_1"
+
+
+def test_the_real_call_boundaries_are_recorded(wire_dir):
+    """`logged_at` is the callback's own clock and is re-stamped again when the
+    harness folds these entries into the canonical artifact. Without the call's
+    own start and end, nothing in the gzipped log says when a call actually
+    happened -- so no per-call latency can ever be attached to the turn that
+    incurred it."""
+    from datetime import UTC, datetime
+
+    start = datetime(2026, 8, 12, 17, 55, 13, tzinfo=UTC)
+    end = datetime(2026, 8, 12, 17, 55, 16, tzinfo=UTC)
+    callback = BakeoffProxyCallback()
+    callback.log_success_event(kwargs_for(), {"ok": True}, start, end)
+
+    metadata = read_run_entries(wire_dir, "run-abc")[0]["metadata"]
+    assert metadata["started_at"] == "2026-08-12T17:55:13Z"
+    assert metadata["ended_at"] == "2026-08-12T17:55:16Z"
+    assert metadata["latency_ms"] == 3000
+
+
+def test_the_call_identity_that_separates_a_retry_from_a_new_call(wire_dir):
+    """Measured 2026-08-12: one failed provider call fires the failure callback
+    TWICE under a single litellm_call_id, and num_retries adds more entries for
+    one client request. Without the id nothing in the log can tell a duplicate
+    from a distinct call -- which is how a 39-served/42-captured surplus was
+    read as three retries when it was three double-logged failures."""
+    callback = BakeoffProxyCallback()
+    callback.log_success_event(
+        {**kwargs_for(), "litellm_call_id": "abc", "litellm_trace_id": "trace-1"},
+        {"ok": True},
+        None,
+        None,
+    )
+    metadata = read_run_entries(wire_dir, "run-abc")[0]["metadata"]
+    assert metadata["litellm_call_id"] == "abc"
+    assert metadata["litellm_trace_id"] == "trace-1"
+
+
+def test_a_null_resolved_says_which_kind_of_null_it_is(wire_dir):
+    """Three unrelated states render as the same missing field and only one is
+    a defect: a route that legitimately resolves no openai params, a callback
+    with no id to join on, and a hand-off that silently broke.
+
+    Not hypothetical. The first mechanism built for this channel passed every
+    unit test and recorded nothing in the real proxy on any arm -- a ContextVar
+    set in the pre-request hook reads back unset in the callback, which runs
+    from a context copied before the hook. `resolved_state` is what said so;
+    without it the null was indistinguishable from an `anthropic/` arm behaving
+    correctly.
+    """
+    from bakeoff.proxy_callback import open_resolved_capture, record_resolved_params
+
+    callback = BakeoffProxyCallback()
+    callback.log_success_event(kwargs_for(), {"ok": True}, None, None)
+    assert read_run_entries(wire_dir, "run-abc")[0]["metadata"][
+        "resolved_state"
+    ] == "no_call_id"
+
+    callback.log_success_event(
+        {**kwargs_for(), "litellm_call_id": "unmapped"}, {"ok": True}, None, None
+    )
+    assert read_run_entries(wire_dir, "run-abc")[1]["metadata"][
+        "resolved_state"
+    ] == "not_recorded"
+
+    open_resolved_capture("mapped")
+    record_resolved_params({"max_completion_tokens": 16})
+    callback.log_success_event(
+        {**kwargs_for(), "litellm_call_id": "mapped"}, {"ok": True}, None, None
+    )
+    assert read_run_entries(wire_dir, "run-abc")[2]["metadata"][
+        "resolved_state"
+    ] == "captured"

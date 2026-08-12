@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import gzip
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -116,6 +117,16 @@ class FakeContainer:
 
     def exec(self, *_args, **_kwargs):
         return None
+
+    def checked_exec(self, *_args, **_kwargs):
+        return None
+
+    def network_isolation(self) -> tuple[bool | None, str]:
+        # None, not True. This double has no Docker network to inspect, so the
+        # honest answer is that nobody measured -- and a double that returned
+        # True would let a record assert section 5.1 held on a run that never
+        # touched a container.
+        return None, "fake container: not measured"
 
     def snapshot_diff(self, base_sha: str) -> tuple[str, list[str]]:
         self.snapshots += 1
@@ -1167,8 +1178,8 @@ def test_proxy_side_capture_records_the_call_the_agent_made(
         agent_image, tmp_path, fault_proxy, "mock-ok", "t-proxy-ok"
     )
 
-    assert record.isolated is True
-    assert record.tool_calls.errored == 0
+    assert record.isolated is True, record.isolation_evidence
+    assert record.tool_calls.api_calls_failed == 0
 
     with gzip.open(tmp_path / "artifacts" / "wire.jsonl.gz", "rt") as handle:
         logged = [json.loads(line) for line in handle if line.strip()]
@@ -1265,7 +1276,11 @@ def test_proxy_throttle_is_excluded_as_infra_not_scored_against_the_model(
     assert record.exclusion.cls is ExclusionClass.INFRA_FAILURE
     assert record.exclusion.reason_code == "api_throttle"
     assert record.exclusion.pre_registered is True
-    assert record.tool_calls.errored == 1
+    # api_calls_failed, not errored. The number is a property of the
+    # transport, and it sat under a name that reads as a property of the
+    # agent's tool use.
+    assert record.tool_calls.api_calls_failed == 1
+    assert record.tool_calls.errored == 0
 
 
 @integration
@@ -1330,3 +1345,236 @@ def test_container_killed_mid_run_still_writes_a_record(agent_image, tmp_path, m
     assert written == record
     assert record.run_id
     assert record.started_at and record.finished_at
+
+
+# --- Gate 0: a record must say what it could not see --------------------------
+#
+# Every assertion below covers an observation that was made and then discarded,
+# so the record showed a well-formed zero instead. None of them is recoverable
+# after the fact: the transcript and the wire log survive a run, a traceback and
+# an exit code do not.
+
+
+def test_a_crashed_run_records_the_cause_not_just_the_fact(task, tmp_path, monkeypatch):
+    """`except Exception: crashed = True` kept no type, no message, no
+    traceback, so a harness defect and a genuine infra failure produced the
+    same record -- and exclusion is, by runner.py's own comment, the one
+    mechanism by which results can be massaged. A CRASHED row nobody can
+    attribute is a row nobody can defend excluding."""
+    record = _fake_run(monkeypatch, task, tmp_path, container_raises=True)
+
+    assert record.outcome is Outcome.CRASHED
+    assert "docker daemon is not reachable" in record.crash_error
+    assert record.crash_error.startswith("RuntimeError:")
+    assert record.artifacts.harness_traceback, "the traceback was not persisted"
+    traceback_text = Path(record.artifacts.harness_traceback).read_text()
+    assert "docker daemon is not reachable" in traceback_text
+    assert "Traceback" in traceback_text
+
+
+def test_a_clean_run_makes_no_crash_claim(task, tmp_path, monkeypatch):
+    """The empty case has to stay empty, or `crash_error` becomes noise that
+    readers learn to skip."""
+    record = _fake_run(monkeypatch, task, tmp_path)
+    assert record.crash_error == ""
+    assert record.artifacts.harness_traceback is None
+
+
+def test_the_agents_stderr_is_persisted(task, tmp_path, monkeypatch):
+    """It was captured all along and thrown away here, so
+    `Artifacts.container_stderr` was a field no code ever set. stderr is where
+    the agent says why it could not start, which is exactly the run whose
+    stdout is empty."""
+    runner = FakeRunner()
+    original = runner.run
+
+    def run_with_stderr(prompt, cwd, on_turn=None):
+        result = original(prompt, cwd, on_turn)
+        return replace(result, stderr="claude: cannot open config dir\n")
+
+    runner.run = run_with_stderr
+    record = _fake_run(monkeypatch, task, tmp_path, runner=runner)
+
+    assert record.artifacts.container_stderr, "stderr was captured and dropped"
+    assert "cannot open config dir" in Path(record.artifacts.container_stderr).read_text()
+
+
+def test_the_agents_exit_code_is_recorded(task, tmp_path, monkeypatch):
+    """A CLI that exited non-zero but still wrote a transcript was
+    byte-identical in the record to a clean finish."""
+    runner = FakeRunner()
+    original = runner.run
+    runner.run = lambda p, cwd, on_turn=None: replace(
+        original(p, cwd, on_turn), exit_code=137
+    )
+
+    record = _fake_run(monkeypatch, task, tmp_path, runner=runner)
+    assert record.agent_exit_code == 137
+
+
+def test_an_exit_code_that_was_never_observed_is_null_not_zero(
+    task, tmp_path, monkeypatch
+):
+    """0 is the code of a clean exit. A run whose agent never ran must not
+    claim one."""
+    record = _fake_run(monkeypatch, task, tmp_path, container_raises=True)
+    assert record.agent_exit_code is None
+
+
+def test_unreadable_stdout_lines_are_counted_not_silently_dropped(
+    task, tmp_path, monkeypatch
+):
+    """The stream-json reader treated "not an assistant event" and "not JSON"
+    alike, so unparseable stdout vanished with no counter -- and it undercounts
+    `turns_streamed`, one of the three counts that exist to cross-check each
+    other. A miscount in the count that catches miscounts cannot be caught."""
+    runner = FakeRunner()
+    original = runner.run
+    runner.run = lambda p, cwd, on_turn=None: replace(
+        original(p, cwd, on_turn), stdout_malformed_lines=4
+    )
+
+    record = _fake_run(monkeypatch, task, tmp_path, runner=runner)
+    assert record.stdout_malformed_lines == 4
+
+
+def test_unreadable_transcript_lines_reach_the_record(task, tmp_path, monkeypatch):
+    """`ParsedTrajectory.malformed_lines` was counted and had no consumer, so a
+    transcript with 40 unreadable lines and a clean one produced identical
+    records."""
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "timestamp": "2026-08-12T00:00:00Z",
+                "message": {"id": "m1", "usage": {"input_tokens": 1, "output_tokens": 1},
+                            "content": [], "stop_reason": "end_turn"},
+            }
+        )
+        + "\n{ truncated\nnot json at all\n"
+    )
+    record = _fake_run(
+        monkeypatch, task, tmp_path, runner=FakeRunner(transcript_path=transcript)
+    )
+    assert record.transcript_malformed_lines == 2
+    # The readable part still parsed: this is a count of damage, not a verdict
+    # on the transcript.
+    assert record.turns_used == 1
+    assert record.trajectory_parse_error == ""
+
+
+def test_a_failing_destructive_scan_does_not_read_as_a_clean_run(
+    task, tmp_path, monkeypatch
+):
+    """The scanner used to share a `try` with the trajectory parse. When the
+    SCANNER raised, assemble_record's independent re-parse still succeeded --
+    so `trajectory_parse_error` stayed empty and `destructive_events` was `[]`,
+    which is a positive safety claim (spec section 7) manufactured by a
+    failure. Exactly what the comment above it said it was preventing."""
+    import bakeoff.runner as runner_module
+
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "timestamp": "2026-08-12T00:00:00Z",
+                "message": {
+                    "id": "m1",
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                    "content": [
+                        {"type": "tool_use", "name": "Bash",
+                         "input": {"command": "rm -rf tests/"}}
+                    ],
+                    "stop_reason": "end_turn",
+                },
+            }
+        )
+        + "\n"
+    )
+
+    def exploding_scan(*_args, **_kwargs):
+        raise ValueError("scanner regex blew up")
+
+    monkeypatch.setattr(runner_module, "scan_destructive", exploding_scan)
+    record = _fake_run(
+        monkeypatch, task, tmp_path, runner=FakeRunner(transcript_path=transcript)
+    )
+
+    assert record.destructive_events == []
+    assert "scanner regex blew up" in record.scanner_error
+    # The parse itself was fine, and the record must not blame it.
+    assert record.trajectory_parse_error == ""
+    assert record.turns_used == 1
+
+
+def test_a_wire_log_collision_costs_the_wire_log_and_not_the_run(
+    task, tmp_path, monkeypatch
+):
+    """What the code claimed and did not do. `gzip.open(path, "xt")` raising
+    inside the run body became `crashed = True`, so the record read CRASHED +
+    container_crashed on a run whose container had not started -- a harness
+    bookkeeping collision recorded as an infrastructure failure, and an
+    excludable one."""
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir(parents=True)
+    (artifacts / "wire.jsonl.gz").write_text("a wire log from an earlier attempt")
+
+    record = _fake_run(monkeypatch, task, tmp_path)
+
+    assert record.outcome is not Outcome.CRASHED
+    assert record.terminated_by is not TerminationReason.CRASH
+    assert record.crash_error == "", "a bookkeeping collision is not a crash"
+    assert "FileExistsError" in record.wire_log_error
+    # No artifact is published for a file this run did not write.
+    assert record.artifacts.wire_log_gz is None
+
+
+@integration
+def test_a_routable_network_is_recorded_as_not_isolated(agent_image, tmp_path):
+    """The one case that separates the measurement from the argument it
+    replaced.
+
+    `isolated = bool(network)` answered True for any network at all, so a
+    container attached to a ROUTABLE one -- with a live path off the host, and
+    therefore to a model the wire log never saw -- would have carried
+    `isolated: true` into every comparison built on it. Section 5.1 is the
+    guarantee that makes `container_image_digest` mean anything about the
+    process under test, and it was the one field runner.py asserted rather than
+    observed.
+
+    Asserted through execute_run and not against RunContainer, because
+    `bool(network)` lives here. A container-level test passes with the argument
+    restored.
+    """
+    import docker
+
+    from bakeoff.runner import TaskSpec, execute_run
+
+    client = docker.from_env()
+    network = client.networks.create("bakeoff-fault-routable", driver="bridge")
+    repo, sha = _git_repo(tmp_path)
+    try:
+        record = execute_run(
+            task=TaskSpec(
+                task_id="t-routable", task_version=1, repo="r", base_sha=sha,
+                container_image_digest=agent_image, prompt="go", test_paths=[],
+            ),
+            model="mock-ok", sample_index=0,
+            config=ClaudeCodeConfig(
+                model="mock-ok", base_url="http://litellm:4000", auth_token="x",
+                settings_path="/eval/eval_settings.json",
+                config_dir="/eval/claude-config", max_turns=2,
+                wall_clock_timeout_s=30,
+            ),
+            event_log=EventLog(tmp_path / "log"), repo_path=str(repo),
+            artifacts_root=tmp_path / "artifacts",
+            network=network.name,
+        )
+    finally:
+        network.remove()
+
+    assert record.isolated is False, record.isolation_evidence
+    assert "ROUTABLE" in record.isolation_evidence
+    assert network.name in record.isolation_evidence

@@ -724,3 +724,57 @@ def test_the_pin_survives_the_drop_that_used_to_be_the_mechanism():
         additional_drop_params=["reasoning_effort"],
     )
     assert resolved["reasoning_effort"] == "none"
+
+
+# --- the resolved-params hand-off --------------------------------------------
+
+
+def test_the_param_mapping_hands_what_it_produced_to_the_wire_capture():
+    """The only place that knows what the provider is being sent.
+
+    Measured 2026-08-12 against a real streaming provider call: the success
+    callback fires on the OUTER anthropic_messages call and the nested
+    acompletion fires nothing of its own, so `optional_params` and
+    `standard_logging_object.model_parameters` both carry the state BEFORE this
+    wrapper -- `max_tokens: 16384`, no `max_completion_tokens`, no
+    `reasoning_effort`. Without the hand-off the wire log reports Claude Code's
+    request as though it were the wire.
+
+    AFTER the rewrites, not before: the point is what goes out.
+    """
+    import litellm
+
+    from bakeoff.proxy_callback import open_resolved_capture, resolved_params
+
+    open_resolved_capture("call-under-test")
+    litellm.OpenAIConfig().map_openai_params(
+        non_default_params={"max_tokens": 16384, "reasoning_effort": "medium"},
+        optional_params={},
+        model="google.gemma-4-31b",
+        drop_params=False,
+    )
+
+    captured = resolved_params("call-under-test")
+    assert captured is not None, "the mapping recorded nothing"
+    assert captured["max_completion_tokens"] == 16384
+    assert captured["reasoning_effort"] == "none"
+    assert "max_tokens" not in captured
+    assert captured["model"] == "google.gemma-4-31b"
+
+
+def test_a_mapping_with_no_capture_open_is_a_no_op():
+    """A route that never reached the pre-request hook records nothing rather
+    than half of something. It must not raise either -- this runs inside the
+    provider call, and an exception here surfaces as an APIConnectionError two
+    layers away."""
+    import litellm
+
+    from bakeoff.proxy_callback import resolved_params
+
+    litellm.OpenAIConfig().map_openai_params(
+        non_default_params={"max_tokens": 8},
+        optional_params={},
+        model="google.gemma-4-31b",
+        drop_params=False,
+    )
+    assert resolved_params("some-other-call") is None

@@ -202,7 +202,7 @@ class RunContainer:
             duration_ms=int((time.monotonic() - started) * 1000),
         )
 
-    def _checked_exec(self, cmd: list[str], env: dict[str, str] | None = None) -> ExecResult:
+    def checked_exec(self, cmd: list[str], env: dict[str, str] | None = None) -> ExecResult:
         """Run a command that must succeed, or say so.
 
         git writes failures ("not a git repository", a bad base_sha, an
@@ -236,9 +236,9 @@ class RunContainer:
         without the agent's own staging area being touched.
         """
         env = {"GIT_INDEX_FILE": SNAPSHOT_INDEX}
-        self._checked_exec(["git", "add", "-A"], env=env)
-        diff = self._checked_exec(["git", "diff", "--cached", base_sha], env=env)
-        names = self._checked_exec(
+        self.checked_exec(["git", "add", "-A"], env=env)
+        diff = self.checked_exec(["git", "diff", "--cached", base_sha], env=env)
+        names = self.checked_exec(
             ["git", "diff", "--cached", "--name-only", base_sha], env=env
         )
         files = [line for line in names.stdout.splitlines() if line.strip()]
@@ -250,6 +250,69 @@ class RunContainer:
         if not paths:
             return
         self.exec(["git", "checkout", base_sha, "--", *paths])
+
+    def network_isolation(self) -> tuple[bool | None, str]:
+        """Whether this container has a route off the host, MEASURED.
+
+        Spec section 5.1's guarantee was previously reported as `bool(network)`
+        -- the argument the caller passed, not a property anything checked. That
+        is the one place runner.py's own rule (configuration is never reported
+        as observation) did not hold, and it would have gone on saying `True`
+        through both of the ways it can actually be false: a `network` naming a
+        non-internal network, and a container that also joined the default
+        bridge.
+
+        Read from Docker rather than probed from inside. `Internal: true` IS
+        the property section 5.1 wants -- Docker's own semantics for a network
+        with no external routing -- so inspecting it observes the real thing at
+        no runtime cost. The alternative, opening a socket to an off-host
+        address and waiting for it to fail, buys nothing and pays for it in
+        timeouts on every run.
+
+        Returns (isolated, evidence). `None` means the inspection failed, so
+        nobody measured -- distinct from `False`, which is a finding.
+        """
+        if self._container is None:
+            return None, "container not started"
+        try:
+            self._container.reload()
+            attached = (
+                (self._container.attrs.get("NetworkSettings") or {}).get("Networks")
+                or {}
+            )
+            if not attached:
+                return False, "no networks attached: no recording proxy"
+
+            verdicts: list[tuple[str, str]] = []
+            for name in sorted(attached):
+                attrs = self._client.networks.get(name).attrs
+                if attrs.get("Driver") == "null":
+                    # network_mode="none". Docker reports this as membership of
+                    # a network literally named `none`, whose Internal flag is
+                    # FALSE -- so reading that flag alone calls the one
+                    # configuration with no connectivity at all "routable". The
+                    # driver is what distinguishes it, and the distinction is
+                    # not cosmetic: the evidence string is the whole point of
+                    # this field, and a plausible wrong reason in it is worse
+                    # than no reason.
+                    verdicts.append((name, "null-driver"))
+                elif attrs.get("Internal", False):
+                    verdicts.append((name, "internal"))
+                else:
+                    verdicts.append((name, "ROUTABLE"))
+
+            evidence = "; ".join(f"{name}: {kind}" for name, kind in verdicts)
+            if all(kind == "null-driver" for _, kind in verdicts):
+                # Trivially unroutable and deliberately NOT isolated: section
+                # 5.1's property is "no route off the host EXCEPT the recording
+                # proxy", and with no network there is no proxy either. The run
+                # happened outside the topology the eval is about -- the same
+                # answer the old `bool(network)` gave, now for the stated reason
+                # rather than by accident.
+                return False, f"{evidence} (no route anywhere, and no recording proxy)"
+            return all(kind == "internal" for _, kind in verdicts), evidence
+        except Exception as exc:  # noqa: BLE001 - never cost a run a record
+            return None, f"isolation check failed: {type(exc).__name__}: {exc}"
 
     def stats(self) -> HostMetrics:
         if self._container is None:

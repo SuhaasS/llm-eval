@@ -41,19 +41,33 @@ from typing import Any, Callable
 EMPTY_MCP_CONFIG = '{"mcpServers":{}}'
 
 
-def _is_assistant_event(line: str) -> bool:
-    """True for a stream-json assistant turn.
+def classify_stdout_line(line: str) -> str:
+    """One of "assistant", "other", "malformed", "blank".
 
     Tolerant on purpose: stdout carries system, user and result events too,
     and a partial line during shutdown must not take the run down.
+
+    It returns a CLASS rather than a bool because the bool it replaced could
+    not tell "a system event" from "a line that did not parse". Both answered
+    False, so unreadable stdout was dropped with no counter -- and dropping it
+    undercounts `turns_streamed`, which exists precisely to cross-check the
+    other two turn counts. A miscount in the count that catches miscounts is
+    the one that cannot be caught.
+
+    Blank is its own class and is not malformed: line-buffered output produces
+    them routinely and counting them as damage would put a permanent non-zero
+    in a field that is supposed to mean something went wrong.
     """
     line = line.strip()
+    if not line:
+        return "blank"
     if not line.startswith("{"):
-        return False
+        return "malformed"
     try:
-        return json.loads(line).get("type") == "assistant"
+        record = json.loads(line)
     except json.JSONDecodeError:
-        return False
+        return "malformed"
+    return "assistant" if record.get("type") == "assistant" else "other"
 
 # The only ambient variables the subprocess inherits. It reaches Bedrock
 # through the LiteLLM proxy over HTTP with a bearer token, so it needs no
@@ -110,6 +124,11 @@ class RunnerResult:
     # Turns seen live on stdout. May exceed the transcript's turn count if
     # the run was killed before the last record was flushed to disk.
     turns_streamed: int = 0
+    # Stdout lines that were not readable as stream-json. Any non-zero value
+    # means `turns_streamed` is a floor rather than a count, so the three-way
+    # turn cross-check has to be read with that in mind instead of silently
+    # reconciling one short.
+    stdout_malformed_lines: int = 0
 
 
 def build_command(config: ClaudeCodeConfig) -> list[str]:
@@ -375,10 +394,15 @@ class ClaudeCodeRunner:
         Path(self.backend.transcript_root(self.config)).mkdir(parents=True, exist_ok=True)
         started = time.monotonic()
         turns = 0
+        malformed = 0
 
         def handle_line(line: str) -> None:
-            nonlocal turns
-            if not _is_assistant_event(line):
+            nonlocal turns, malformed
+            kind = classify_stdout_line(line)
+            if kind == "malformed":
+                malformed += 1
+                return
+            if kind != "assistant":
                 return
             turns += 1
             if on_turn is not None and turns > 1:
@@ -402,6 +426,7 @@ class ClaudeCodeRunner:
             wall_clock_ms=int((time.monotonic() - started) * 1000),
             timed_out=result.timed_out,
             turns_streamed=turns,
+            stdout_malformed_lines=malformed,
         )
 
     @staticmethod

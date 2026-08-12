@@ -525,7 +525,16 @@ def test_prompt_and_tool_hashes_come_from_the_wire(task, tmp_path):
     assert len(record.tool_schema_sha) == 64
 
 
-def test_failed_calls_are_counted_as_tool_call_errors(task, tmp_path):
+def test_failed_api_calls_are_not_reported_as_failed_tool_calls(task, tmp_path):
+    """`errored` sits inside ToolCallStats, so it reads as "tool calls the
+    agent made that failed". It carried the count of failed API calls instead
+    -- the proxy's retries and its double-logged failures -- which is a
+    statement about the transport wearing a statement about the model.
+
+    The number is real and keeps its own field. `errored` stays 0 at harness
+    time for the same reason `malformed` does: deciding a tool call errored
+    means reading tool results, which section 6.4 puts offline.
+    """
     record = assemble_record(
         task=task, model="gemma-4-31b", sample_index=0,
         started_at="2026-08-04T00:00:00Z", finished_at="2026-08-04T00:05:00Z",
@@ -533,7 +542,73 @@ def test_failed_calls_are_counted_as_tool_call_errors(task, tmp_path):
         destructive_events=[], artifacts_root=tmp_path,
         wire_entries=WIRE_ENTRIES,
     )
-    assert record.tool_calls.errored == 1
+    assert record.tool_calls.api_calls_failed == 1
+    assert record.tool_calls.errored == 0
+
+
+def test_sampling_says_whether_it_describes_the_provider_or_the_client(task, tmp_path):
+    """The two are different requests on every candidate arm.
+
+    `openai_max_completion_tokens_rename` and `openai_reasoning_effort_pinned_none`
+    run inside a nested call the capture cannot see, so a record built from the
+    client body describes what Claude Code asked for and not what the provider
+    answered. Both are worth having; a record that cannot say which it holds is
+    not.
+    """
+    client_only = assemble_record(
+        task=task, model="gemma-4-31b", sample_index=0,
+        started_at="2026-08-04T00:00:00Z", finished_at="2026-08-04T00:05:00Z",
+        trajectory_path=None, runner_result=None, checkpoints=[],
+        destructive_events=[], artifacts_root=tmp_path,
+        wire_entries=WIRE_ENTRIES,
+    )
+    assert client_only.sampling_source == "client_request"
+    assert client_only.sampling["max_output_tokens"] == 16384
+
+    resolved = assemble_record(
+        task=task, model="gemma-4-31b", sample_index=0,
+        started_at="2026-08-04T00:00:00Z", finished_at="2026-08-04T00:05:00Z",
+        trajectory_path=None, runner_result=None, checkpoints=[],
+        destructive_events=[], artifacts_root=tmp_path,
+        wire_entries=[
+            {
+                **WIRE_ENTRIES[0],
+                "resolved": {
+                    "model": "gemma-4-31b",
+                    "temperature": 1.0,
+                    "max_completion_tokens": 8192,
+                    "system": "You are a coding agent.",
+                    "tools": [{"name": "Bash"}],
+                },
+            }
+        ],
+    )
+    assert resolved.sampling_source == "resolved"
+    # The cap the WIRE carried, under the spelling the wire used -- not the
+    # 16384 the client asked for under the other one.
+    assert resolved.sampling["max_output_tokens"] == 8192
+
+
+def test_a_double_logged_failure_does_not_inflate_the_call_count(task, tmp_path):
+    """Measured 2026-08-12: one failed provider call fires the failure callback
+    twice under a single litellm_call_id. `wire_entries_seen` counts callback
+    invocations, so it over-counts every failure -- which is how a surplus over
+    the proxy's access log got read as retries. Both counts are kept; neither
+    is corrected into the other."""
+    entries = [
+        {"request": {"model": "m"}, "metadata": {"failed": True, "litellm_call_id": "a"}},
+        {"request": {"model": "m"}, "metadata": {"failed": True, "litellm_call_id": "a"}},
+        {"request": {"model": "m"}, "metadata": {"failed": False, "litellm_call_id": "b"}},
+    ]
+    record = assemble_record(
+        task=task, model="gemma-4-31b", sample_index=0,
+        started_at="2026-08-04T00:00:00Z", finished_at="2026-08-04T00:05:00Z",
+        trajectory_path=None, runner_result=None, checkpoints=[],
+        destructive_events=[], artifacts_root=tmp_path,
+        wire_entries=entries,
+    )
+    assert record.wire_entries_seen == 3
+    assert record.wire_entries_distinct == 2
 
 
 # --- destructive events (spec OPEN-10) ---------------------------------------

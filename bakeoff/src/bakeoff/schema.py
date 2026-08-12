@@ -122,7 +122,67 @@ from typing import Any
 #   ignores the new key safely. But the version has to move, because in 3.1.0
 #   an absent `max_completion_tokens` was not a claim about anything, and from
 #   3.2.0 on it says the arm sent the cap under the older name.
-SCHEMA_VERSION = "3.2.0"
+#
+# 3.3.0 closes the capture gaps -- the observations that were never written and
+# that no offline pass over stored artifacts could ever invent. Every one of
+# them read, in a stored record, as a well-formed zero.
+#
+#   `sampling_source` says whether `sampling` and the two hashes describe the
+#   PROVIDER's request or the CLIENT's. Measured 2026-08-12: the wire callback
+#   fires on the outer anthropic_messages call and the nested acompletion fires
+#   nothing, so both openai param interventions were invisible to it and every
+#   stored `max_tokens` on a candidate arm was a statement about Claude Code.
+#   The channel that carries the real values is new; this field is what says
+#   whether it answered.
+#
+#   `wire_entries_distinct` sits beside `wire_entries_seen` because they are
+#   different numbers: one failed provider call fires the failure callback
+#   TWICE with a single litellm_call_id, and retries add more entries again.
+#   Without both, the wire log cannot be reconciled against the proxy's own
+#   access log -- and the surplus that reconciliation found was misattributed
+#   to retries for exactly that reason.
+#
+#   `crash_error` and `artifacts.harness_traceback` give a CRASHED run a cause.
+#   `runner.py` caught the whole run body and kept no type, no message and no
+#   traceback, so a harness defect and a genuine infra failure were the same
+#   record -- and exclusion is the one mechanism by which results can be
+#   massaged.
+#
+#   `agent_exit_code`: a CLI that exited non-zero but wrote a transcript was
+#   byte-identical to a clean finish.
+#
+#   `transcript_malformed_lines` / `stdout_malformed_lines`: both were counted
+#   or droppable with no consumer, so a transcript with 40 unreadable lines
+#   read exactly like a clean one, and unparseable stdout silently undercounted
+#   `turns_streamed` -- one of the three cross-checks that exist to catch
+#   precisely that.
+#
+#   `scanner_error`: `scan_destructive` shared a `try` with the trajectory
+#   parse, so a scanner failure produced `destructive_events: []` with an empty
+#   `trajectory_parse_error` -- a positive safety claim manufactured by a
+#   failure.
+#
+#   `wire_log_error`: a wire-log name collision was recorded as a container
+#   crash, on a run whose container never started.
+#
+#   `ToolCallStats.api_calls_failed` takes the number that was living in
+#   `errored`, which anyone would read as "tool calls that failed" and which
+#   was in fact the proxy's failed-API-call count.
+#
+# `isolated` widens from `bool` to `bool | None` and starts being MEASURED --
+# from the networks the container actually joined, not from `bool(network)`.
+# It was the one place runner.py's own rule ("configuration is never reported
+# as observation") did not hold. `None` means the inspection failed and nobody
+# measured; `isolation_evidence` says what was seen either way.
+#
+# Minor, not major, on the 2.1.0 precedent. No stored value changes meaning:
+# `sampling.max_output_tokens` carries the same number whichever source
+# answered, and every other field here is new. `isolated` gains a third state
+# that is falsy, so nothing raises the way `sum(cost_usd)` did at 2.0.0. The
+# version still has to move, because in 3.2.0 an absent `crash_error`, a
+# `transcript_malformed_lines` of 0 and an `isolated` of `true` were not claims
+# about anything, and from 3.3.0 on each of them is.
+SCHEMA_VERSION = "3.3.0"
 
 
 class Outcome(str, Enum):
@@ -235,9 +295,20 @@ class TimingBreakdown:
 
 @dataclass(frozen=True)
 class ToolCallStats:
+    """Tool calls the AGENT made. `api_calls_failed` is the one exception."""
+
     total: int = 0
     malformed: int = 0
+    # Tool calls that came back an error. 0 at harness time by design, for the
+    # same reason `malformed` is: deciding it means reading tool results, which
+    # section 6.4 puts offline. Through 3.2.0 this carried the count of failed
+    # API calls instead -- a different quantity under a name nobody would read
+    # that way, and the only place proxy retries surfaced in a record at all.
     errored: int = 0
+    # Provider calls that failed, including retries and the duplicate the
+    # failure path logs. Named for what it is so it cannot be mistaken for a
+    # statement about the agent's tool use.
+    api_calls_failed: int = 0
     by_name: dict[str, int] = field(default_factory=dict)
 
 
@@ -394,6 +465,11 @@ class Artifacts:
     wire_log_gz: str | None = None
     container_stdout: str | None = None
     container_stderr: str | None = None
+    # The harness's own traceback when a run crashed. Kept apart from
+    # container_stderr on purpose: that one is the agent's output, and folding a
+    # harness defect into it would make the agent look like the thing that
+    # failed. `crash_error` carries the one-line summary; this is the rest.
+    harness_traceback: str | None = None
     test_output_gz: str | None = None
     final_diff: str | None = None
 
@@ -462,6 +538,22 @@ class RunRecord:
     tool_schema_sha: str = ""
     sampling: dict[str, Any] = field(default_factory=dict)
 
+    # Which side of the proxy the three fields above describe.
+    #
+    #   "resolved"        the provider boundary was observed, and these are the
+    #                     params that actually went out
+    #   "client_request"  it was not, and these are Claude Code's own body --
+    #                     which on a candidate arm is a DIFFERENT request from
+    #                     the one the provider answered, because the openai
+    #                     interventions rename the cap and pin reasoning_effort
+    #                     inside a nested call the capture cannot see
+    #   ""                no wire entries at all
+    #
+    # Without this the record cannot be read at all on that axis: the two
+    # sources produce identically well-formed values and every stored record
+    # through 3.2.0 reported the second while implying the first.
+    sampling_source: str = ""
+
     # How many model calls this record could actually see, and how many it
     # lost. Everything derived from the wire -- sampling, the two hashes
     # above, bedrock_model_id, the API error status -- is empty when
@@ -480,7 +572,23 @@ class RunRecord:
     # a well-formed record with empty sampling and empty hashes, which is the
     # exact silent shape proxy_callback was written to prevent.
     wire_entries_seen: int = 0
+    # Logical provider calls, as opposed to callback invocations. Measured
+    # 2026-08-12: one FAILED call fires the failure callback twice under a
+    # single litellm_call_id, and `num_retries: 3` produces more entries again
+    # for one client request. So `wire_entries_seen` alone cannot be reconciled
+    # against the proxy's access log, and a surplus there was read as retries
+    # when it was double-logging. Two counts of one thing, stored because they
+    # disagree informatively -- the same reason `assistant_records` sits beside
+    # `turns_used`.
+    wire_entries_distinct: int = 0
     wire_unattributed: int | None = None
+    # Non-empty when the canonical wire artifact could not be opened -- a name
+    # collision, an unwritable directory. The run still happened and its
+    # wire-derived fields still come from the proxy's own files; what is lost is
+    # the gzipped copy, and `artifacts.wire_log_gz` is null to match. Through
+    # 3.2.0 this raised inside the run body instead and was recorded as
+    # `CRASHED` + `container_crashed`, on a run whose container never started.
+    wire_log_error: str = ""
 
     exclusion: Exclusion | None = None
     failure_class: FailureClass | None = None
@@ -505,7 +613,23 @@ class RunRecord:
     # this False is still a run, but container_image_digest above did not
     # constrain the process under test, and comparisons across arms should
     # say so rather than let the digest imply isolation.
-    isolated: bool = False
+    #
+    # MEASURED since 3.3.0, from the networks the container actually joined.
+    # Through 3.2.0 it was `bool(network)` -- an argument, not an observation,
+    # and the one place runner.py's own stated rule did not hold. `True` then
+    # asserted a property nothing had checked, and it would have stayed True if
+    # the named network were not internal or if the container had also joined
+    # the default bridge.
+    #
+    # `None` means the inspection itself failed, so nobody measured. It is not
+    # `False`: an unverified run and a verifiably unisolated one are different
+    # rows, and only one of them is a defect in the network setup.
+    isolated: bool | None = False
+    # What the isolation check saw -- the networks joined and whether each is
+    # internal, or why the check could not run. A bare bool cannot distinguish
+    # "checked, all internal" from "checked, and the container was also on
+    # bridge", which is the failure mode worth naming in the record.
+    isolation_evidence: str = ""
     # Non-empty when the transcript could not be READ -- either it failed to
     # parse, or (since 3.1.0) there was no transcript to parse. Both zero
     # every derived field below, and the reader's question is the same in
@@ -523,6 +647,34 @@ class RunRecord:
     # derived fields are empty, this one means only the price is missing, and
     # collapsing them is what made a working run look like a dead one.
     pricing_error: str = ""
+    # Non-empty when the destructive-command scan did not complete, so
+    # `destructive_events` is missing data rather than empty. It needs its own
+    # field because the scanner used to share a `try` with the trajectory parse:
+    # assemble_record re-parses independently and would succeed, leaving
+    # `trajectory_parse_error` empty and `destructive_events: []` -- a positive
+    # safety claim (spec section 7) manufactured by a failure.
+    scanner_error: str = ""
+    # Why a CRASHED run crashed: the exception type and message from the run
+    # body. Empty on every other outcome. Through 3.2.0 the whole run body was
+    # caught with `except Exception: crashed = True` and nothing was kept, so a
+    # harness defect and a genuine infra failure produced the same record --
+    # and exclusion is, by runner.py's own comment, "the one mechanism by which
+    # results can be massaged". The traceback is in
+    # `artifacts.harness_traceback`.
+    crash_error: str = ""
+    # What the agent process exited with. `None` when it never ran, or ran
+    # without the harness observing an exit. A non-zero exit that still wrote a
+    # transcript was previously byte-identical to a clean finish.
+    agent_exit_code: int | None = None
+    # Input this record could not read, counted rather than skipped in silence.
+    # `transcript_malformed_lines` was already counted by the parser and had no
+    # consumer, so 40 unreadable lines and a clean transcript produced identical
+    # records. `stdout_malformed_lines` was not counted at all: the stream-json
+    # reader treats "not an assistant event" and "not JSON" alike, which
+    # undercounts `turns_streamed` -- one of the three counts that exist to
+    # cross-check each other.
+    transcript_malformed_lines: int = 0
+    stdout_malformed_lines: int = 0
 
     diff_stats: dict[str, int] = field(default_factory=dict)
     p2p_regressions: list[str] = field(default_factory=list)

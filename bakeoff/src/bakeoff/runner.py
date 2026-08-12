@@ -30,6 +30,7 @@ import hashlib
 import json
 import shutil
 import subprocess
+import traceback
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from functools import lru_cache
@@ -69,6 +70,11 @@ from bakeoff.wire import BakeoffCallback, WireLogger
 
 CONTAINER_CONFIG_DIR = "/eval/claude-config"
 STDOUT_NAME = "agent_stdout.jsonl"
+STDERR_NAME = "agent_stderr.txt"
+# The HARNESS's traceback, never the agent's. Named apart from the agent's
+# stderr so a directory listing says whose failure it was: folding a harness
+# defect into the agent's output makes the agent look like the thing that broke.
+HARNESS_TRACEBACK_NAME = "harness_traceback.txt"
 WIRE_NAME = "wire.jsonl.gz"
 # Where a record goes when the event log refuses it. Named so a directory
 # listing says what it is: this file existing means the log is INCOMPLETE and
@@ -183,6 +189,38 @@ def final_api_error_status(entries: list[dict[str, Any]]) -> int | None:
         return None
     status = metadata.get("status_code")
     return status if isinstance(status, int) else None
+
+
+def distinct_wire_calls(entries: list[dict[str, Any]]) -> int:
+    """Logical provider calls, as opposed to callback invocations.
+
+    They are not the same number and the difference is not noise. Measured
+    2026-08-12 against a real streaming provider call: a FAILED call fires the
+    failure callback twice with one `litellm_call_id`, so every failure is
+    double-recorded. `general_settings.num_retries: 3` adds more entries for one
+    client request on top of that.
+
+    So `wire_entries_seen` on its own cannot be reconciled against the proxy's
+    access log, and the 39-served/42-captured surplus recorded in TASKS.md as
+    "exactly the three retries" was three double-logged failures instead -- the
+    same arithmetic, a different cause, and nothing in the log could tell them
+    apart. This sits beside that count for the same reason `assistant_records`
+    sits beside `turns_used`: two counts of one thing, stored because they
+    disagree informatively.
+
+    An entry with no id counts as its own call. Merging on absence would
+    collapse genuinely distinct calls, which is the error in the direction that
+    hides work.
+    """
+    seen: set[str] = set()
+    unkeyed = 0
+    for entry in entries:
+        call_id = (entry.get("metadata") or {}).get("litellm_call_id")
+        if isinstance(call_id, str) and call_id:
+            seen.add(call_id)
+        else:
+            unkeyed += 1
+    return len(seen) + unkeyed
 
 
 def resolve_reverts(
@@ -331,9 +369,15 @@ def assemble_record(
     # the second one licenses reading an empty `sampling` as a real
     # observation rather than as lost attribution.
     wire_unattributed: int | None = None,
-    isolated: bool = False,
+    # None, not False: "the isolation check could not run" is not the finding
+    # "this run was not isolated", and only the second is a defect in the setup.
+    isolated: bool | None = False,
+    isolation_evidence: str = "",
     adapter_patches: list[str] | None = None,
     proxy_litellm: str = "",
+    crash_error: str = "",
+    scanner_error: str = "",
+    wire_log_error: str = "",
 ) -> RunRecord:
     parsed = ParsedTrajectory(model=model)
     parse_error = ""
@@ -395,7 +439,17 @@ def assemble_record(
         terminated_by = TerminationReason.TURNS
 
     entries = wire_entries or []
-    first_request = entries[0].get("request", {}) if entries else {}
+    # What the PROVIDER was sent, falling back to what the client asked for.
+    # The two are different on every candidate arm -- the openai param
+    # interventions rename the cap and pin reasoning_effort inside a nested call
+    # the capture cannot see -- so which one answered has to be recorded beside
+    # the answer. `sampling_source` below is that record.
+    first_resolved = entries[0].get("resolved") if entries else None
+    first_client = entries[0].get("request", {}) if entries else {}
+    first_request = first_resolved if first_resolved else first_client
+    sampling_source = (
+        ("resolved" if first_resolved else "client_request") if entries else ""
+    )
     if api_error_status is None:
         api_error_status = final_api_error_status(entries)
     failed_calls = sum(
@@ -409,7 +463,14 @@ def assemble_record(
         # therefore not reachable at harness time, by design rather than by
         # oversight -- section 6.4's adapter-vs-model call is made offline.
         malformed=parsed.tool_calls.malformed,
-        errored=failed_calls,
+        # 0, not failed_calls. This used to carry the count of failed API
+        # calls, so anyone reading it as "tool calls the agent made that
+        # failed" got the proxy's retry-and-duplicate count instead. That
+        # number is real and is now `api_calls_failed`; deciding a TOOL call
+        # errored means reading tool results, which is offline work for the
+        # same reason `malformed` is.
+        errored=0,
+        api_calls_failed=failed_calls,
         by_name=parsed.tool_calls.by_name,
     )
 
@@ -506,11 +567,17 @@ def assemble_record(
                 else first_request.get("max_tokens")
             ),
         } if entries else {},
+        # Which of the two the two fields above came from. `resolved` means the
+        # provider boundary was observed; `client_request` means it was not and
+        # this is Claude Code's own body, which on a candidate arm is a
+        # different request from the one that went out.
+        sampling_source=sampling_source,
         # What the wire could and could not account for. Recorded next to the
         # fields derived from it, because those fields are empty for both
         # "the proxy saw nothing" and "the proxy saw everything and could not
         # attribute any of it", and the two are different failures.
         wire_entries_seen=len(entries),
+        wire_entries_distinct=distinct_wire_calls(entries),
         wire_unattributed=wire_unattributed,
         exclusion=classify_exclusion(signals),
         failure_class=classify_failure(signals),
@@ -533,18 +600,36 @@ def assemble_record(
         destructive_events=resolve_reverts(destructive_events, checkpoints),
         trajectory_parse_error=parse_error,
         pricing_error=parsed.pricing_error,
+        scanner_error=scanner_error,
+        crash_error=crash_error,
+        wire_log_error=wire_log_error,
+        agent_exit_code=(
+            exit_code if isinstance(exit_code := getattr(
+                runner_result, "exit_code", None
+            ), int) else None
+        ),
+        # How much of its own input this record could not read. Both are 0 on a
+        # clean run and neither was surfaced before, so a transcript with 40
+        # unreadable lines and a clean one produced identical records.
+        transcript_malformed_lines=parsed.malformed_lines,
+        stdout_malformed_lines=int(
+            getattr(runner_result, "stdout_malformed_lines", 0) or 0
+        ),
         isolated=isolated,
+        isolation_evidence=isolation_evidence,
         artifacts=Artifacts(
             trajectory_jsonl_gz=str(trajectory_path) if trajectory_path else None,
-            # Existence-checked, like container_stdout below. This used to be
-            # asserted unconditionally, so a run whose WireLogger never opened
-            # -- a name collision, an unwritable artifacts dir -- still
-            # published a path to a file that was not there, and a consumer
-            # following it got a FileNotFoundError instead of a null it could
-            # have handled.
+            # Existence-checked AND ownership-checked. Existence alone was
+            # asserted unconditionally at first, so a run whose WireLogger never
+            # opened published a path to a file that was not there. But it does
+            # not cover the collision it was written for: on a name collision
+            # the file exists and belongs to an EARLIER attempt, so an existence
+            # check publishes another run's wire log under this run's record --
+            # a worse failure than the null it replaced, because it resolves.
+            # `wire_log_error` is what says this run did not write it.
             wire_log_gz=(
                 str(artifacts_root / WIRE_NAME)
-                if (artifacts_root / WIRE_NAME).exists()
+                if not wire_log_error and (artifacts_root / WIRE_NAME).exists()
                 else None
             ),
             final_diff=checkpoints[-1].diff_vs_base if checkpoints else None,
@@ -557,6 +642,19 @@ def assemble_record(
             container_stdout=(
                 str(artifacts_root / STDOUT_NAME)
                 if (artifacts_root / STDOUT_NAME).exists()
+                else None
+            ),
+            # Where the agent says why it could not start. Existence-checked
+            # like the two above: a path to a file that was never written sends
+            # a consumer to a FileNotFoundError instead of a null it can handle.
+            container_stderr=(
+                str(artifacts_root / STDERR_NAME)
+                if (artifacts_root / STDERR_NAME).exists()
+                else None
+            ),
+            harness_traceback=(
+                str(artifacts_root / HARNESS_TRACEBACK_NAME)
+                if (artifacts_root / HARNESS_TRACEBACK_NAME).exists()
                 else None
             ),
         ),
@@ -634,6 +732,15 @@ def execute_run(
     runner_result = None
     trajectory_path: Path | None = None
     crashed = False
+    crash_error = ""
+    scanner_error = ""
+    wire_log_error = ""
+    # bool(network) until the container is up and the real thing can be read.
+    # Section 5.1's guarantee is not this value; it is what network_isolation()
+    # returns below, and if the container never starts the honest answer is that
+    # nobody measured.
+    isolated: bool | None = None
+    isolation_evidence = "container never started"
     previous_callbacks = list(litellm.callbacks)
     wire: WireLogger | None = None
     # Held outside the try so a failure part way through the run keeps the
@@ -650,14 +757,26 @@ def execute_run(
     if settings_host_path is not None:
         mounts[str(settings_host_path)] = config.settings_path
 
+    # OUTSIDE the try, and guarded. A name collision on the wire log must cost
+    # the wire log and not the run record -- which is what the code here said
+    # and not what it did: `gzip.open(path, "xt")` raising inside the run body
+    # became `crashed=True`, so the record read `CRASHED` + `container_crashed`
+    # on a run whose container had not started. The run still gets its
+    # wire-derived fields from the proxy's own files below; what is lost is the
+    # gzipped copy, and `artifacts.wire_log_gz` is existence-checked so it stays
+    # null to match.
     try:
-        # Inside the try: a name collision on the wire log must cost the wire
-        # log, not the run record.
         wire = WireLogger(artifacts_root / WIRE_NAME)
+    except OSError as exc:
+        wire = None
+        wire_log_error = f"{type(exc).__name__}: {exc}"
+
+    try:
         # The proxy's config file cannot register this -- the callback needs
         # a per-run logger and run_id, and a dotted path resolves to the
         # class rather than an instance (see wire.BakeoffCallback).
-        litellm.callbacks = [BakeoffCallback(wire, run_id)]
+        if wire is not None:
+            litellm.callbacks = [BakeoffCallback(wire, run_id)]
 
         with RunContainer(
             image=task.container_image_digest,
@@ -666,8 +785,18 @@ def execute_run(
             network=network,
             extra_mounts=mounts,
         ) as container:
-            container.exec(["git", "checkout", "--detach", task.base_sha])
-            container.exec(["git", "clean", "-xfd"])
+            # Measured, not assumed -- and measured while the container is up,
+            # which is the only time it can be. See network_isolation().
+            isolated, isolation_evidence = container.network_isolation()
+
+            # checked_exec, not exec. This is the one place the codebase argues
+            # loudest that checking is mandatory and did not do it: git writes
+            # its failures to stderr and exits non-zero while `exec` returns
+            # stdout, so a bad base_sha or an unreadable object yields empty
+            # output byte-identical to a clean checkout -- and every diff after
+            # it is then taken against a tree that was never reset.
+            container.checked_exec(["git", "checkout", "--detach", task.base_sha])
+            container.checked_exec(["git", "clean", "-xfd"])
 
             recorder = CheckpointRecorder(container, task.base_sha, every_k_turns)
             backend = ContainerBackend(container, str(host_config_dir))
@@ -695,11 +824,17 @@ def execute_run(
             )
 
             if trajectory_path and trajectory_path.exists():
+                # TWO try blocks, not one, and the split is the whole point.
+                # They used to share one, so a failure in the SCANNER left
+                # `destructive = []` while assemble_record's independent
+                # re-parse succeeded -- `trajectory_parse_error` empty,
+                # `destructive_events` empty, and nothing anywhere saying the
+                # scan had not run. That is a positive safety claim (spec
+                # section 7) produced by a failure, which is precisely what the
+                # comment below was written to prevent.
+                parsed = None
                 try:
                     parsed = parse_trajectory(trajectory_path, model=model)
-                    destructive = scan_destructive(
-                        parsed.bash_commands, task.test_paths
-                    )
                 except Exception:  # noqa: BLE001 - assemble_record re-reports it
                     # Only a genuine parse failure reaches here now. A pricing
                     # failure used to, and it silently emptied this list --
@@ -707,8 +842,30 @@ def execute_run(
                     # destructive commands, which reads as a positive safety
                     # claim (spec section 7) rather than as missing data.
                     destructive = []
-    except Exception:  # noqa: BLE001 - a crash must still produce a record
+                if parsed is not None:
+                    try:
+                        destructive = scan_destructive(
+                            parsed.bash_commands, task.test_paths
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        destructive = []
+                        scanner_error = f"{type(exc).__name__}: {exc}"
+    except Exception as exc:  # noqa: BLE001 - a crash must still produce a record
         crashed = True
+        # The cause, not just the fact. Without it a harness defect and a
+        # genuine infra failure are the same record -- and exclusion is the one
+        # mechanism by which results can be massaged, so "why" is not optional.
+        crash_error = f"{type(exc).__name__}: {exc}"
+        try:
+            (artifacts_root / HARNESS_TRACEBACK_NAME).write_text(
+                "".join(
+                    traceback.format_exception(type(exc), exc, exc.__traceback__)
+                )
+            )
+        except OSError:
+            # A traceback that cannot be written must not replace the crash it
+            # was describing. crash_error above still names the cause.
+            pass
     finally:
         # Global state: leaving this set would let one run's logger capture
         # the next run's calls, silently cross-contaminating wire logs.
@@ -718,6 +875,13 @@ def execute_run(
         stdout = getattr(runner_result, "stdout", "") or ""
         if stdout:
             (artifacts_root / STDOUT_NAME).write_text(stdout)
+        # And its stderr, for the same reason and with more force: stderr is
+        # where the agent says why it could not start. It was captured all
+        # along (ClaudeRunResult.stderr, ExecResult.stderr) and thrown away
+        # here, so `Artifacts.container_stderr` was a field no code ever set.
+        stderr = getattr(runner_result, "stderr", "") or ""
+        if stderr:
+            (artifacts_root / STDERR_NAME).write_text(stderr)
         if recorder is not None:
             checkpoints = recorder.captured
         if wire is not None:
@@ -728,8 +892,13 @@ def execute_run(
                 for entry in read_run_entries(proxy_wire_dir, run_id):
                     wire.log_call(
                         request=entry.get("request", {}),
+                        resolved=entry.get("resolved"),
                         response=entry.get("response", {}),
                         metadata=entry.get("metadata", {}),
+                        # The proxy's capture time, carried through. Stamping
+                        # now() here instead gave every line in the canonical
+                        # artifact the same post-run reading.
+                        logged_at=entry.get("logged_at"),
                     )
             wire_entries = wire.entries()
             wire.close()
@@ -772,9 +941,14 @@ def execute_run(
         prior_started_at=prior_started_at,
         wire_entries=wire_entries,
         wire_unattributed=wire_unattributed,
-        isolated=bool(network),
+        # The measurement, never `bool(network)`. See RunContainer.
+        isolated=isolated,
+        isolation_evidence=isolation_evidence,
         adapter_patches=adapter_patches,
         proxy_litellm=proxy_litellm,
+        crash_error=crash_error,
+        scanner_error=scanner_error,
+        wire_log_error=wire_log_error,
     )
     _write_or_strand(record, event_log, artifacts_root)
     return record

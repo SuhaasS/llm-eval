@@ -1180,6 +1180,7 @@ def main() -> int:
                     "turns": record.turns_used,
                     "tools": record.tool_calls.total,
                     "wire": entries,
+                    "wire_distinct": record.wire_entries_distinct,
                     "wire_failed": wire_failed_count(record),
                     "out_tok": record.tokens.output,
                     "cache_read": record.tokens.cache_read,
@@ -1207,15 +1208,29 @@ def main() -> int:
         # indistinguishable from quiet.
         #
         # The two counts are DIFFERENT QUANTITIES and equality was the wrong
-        # test. `served` is inbound client requests; `captured` is provider
-        # attempts, and `num_retries: 3` means one request can produce several.
-        # Measured 2026-08-12: served=39, captured=42, the delta exactly the
-        # three retries of gemma's failing call -- reported as "some calls were
-        # captured nowhere", which describes captured < served, the opposite of
-        # what happened. A gate that cries loss on every retry is a gate that
-        # gets ignored, and it would then miss a real loss.
+        # test. `served` is inbound client requests; `captured` is callback
+        # invocations, and one request can produce several.
+        #
+        # TWO mechanisms, and only one of them was known. `num_retries: 3` adds
+        # an invocation per retry -- that is the one this check was written for.
+        # The other was measured 2026-08-12 against a real provider call: a
+        # FAILED call fires the failure callback TWICE under a single
+        # litellm_call_id, so every failure is logged twice whether or not it
+        # was retried. The served=39/captured=42 surplus recorded in TASKS.md as
+        # "exactly the three retries of gemma's failing call" was three
+        # double-logged failures instead: same arithmetic, different cause, and
+        # nothing in the log could tell them apart until `wire_entries_distinct`
+        # existed.
+        #
+        # `distinct` is the number to reconcile against, because it counts
+        # logical calls. It is reported beside the raw count rather than
+        # replacing it -- a gate that silently corrected one number into the
+        # other would hide the day the duplication stops or doubles again.
         served = proxy.request_count()
         captured = sum(row["wire"] for row in rows) + sum(
+            row["unattributed"] for row in rows
+        )
+        distinct = sum(row["wire_distinct"] for row in rows) + sum(
             row["unattributed"] for row in rows
         )
         failed = sum(row["wire_failed"] for row in rows)
@@ -1225,21 +1240,25 @@ def main() -> int:
                 f"{captured} provider attempt(s) were recorded: "
                 f"{served - captured} call(s) were captured nowhere"
             )
-        elif captured - served > failed:
-            # Surplus attempts are retries, and a retry only follows a
-            # failure. More surplus than failures means the surplus is
-            # something else, and nothing in the record would say what.
+        elif captured - served > 2 * failed:
+            # Every surplus invocation traces to a failure: a retry follows one,
+            # and the duplicate IS one. A failure can therefore account for at
+            # most two extra invocations -- its own duplicate and one retry
+            # invocation -- so more surplus than that is something else, and
+            # nothing in the record would say what.
             failures.setdefault("wire capture", []).append(
                 f"the proxy served {served} POST /v1/messages and recorded "
-                f"{captured} provider attempt(s), a surplus of "
-                f"{captured - served}, but only {failed} attempt(s) failed: "
-                "retries cannot account for the difference"
+                f"{captured} callback invocation(s), a surplus of "
+                f"{captured - served}, against {failed} failed attempt(s): "
+                "retries and duplicate failure logging cannot account for the "
+                "difference"
             )
         elif captured > served:
             print(
-                f"\nwire capture  {served} request(s) -> {captured} provider "
-                f"attempt(s); {captured - served} retry/retries after "
-                f"{failed} failure(s)"
+                f"\nwire capture  {served} request(s) -> {distinct} logical "
+                f"call(s) -> {captured} callback invocation(s); "
+                f"{captured - served} surplus after {failed} failure(s) "
+                "(retries and the duplicate the failure path logs)"
             )
 
         print_table(rows)

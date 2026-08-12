@@ -169,3 +169,75 @@ def test_isolated_network_reaches_the_proxy_and_nothing_else(
             ["sh", "-c", "wget -q -T 5 -O- http://example.com || echo BLOCKED"]
         )
         assert "BLOCKED" in blocked.stdout
+
+
+@integration
+def test_isolation_is_measured_from_the_networks_actually_joined(
+    internal_network, image_digest, tmp_path
+):
+    """`isolated` was `bool(network)` -- the argument the caller passed, not a
+    property anything checked. That is the one place runner.py's own rule
+    (configuration is never reported as observation) did not hold, and `True`
+    would have survived both ways it can be wrong: a `network` naming a
+    routable network, and a container that also joined the default bridge.
+
+    Asserted beside the behavioural test above, not instead of it. That one
+    proves the property holds; this one proves the RECORD would have noticed if
+    it did not.
+    """
+    (tmp_path / "repo").mkdir()
+    with RunContainer(
+        image=image_digest,
+        repo_path=str(tmp_path / "repo"),
+        base_sha="",
+        network=internal_network,
+    ) as container:
+        isolated, evidence = container.network_isolation()
+
+    assert isolated is True
+    assert internal_network in evidence
+    assert "internal" in evidence
+
+
+@integration
+def test_a_routable_network_is_reported_as_not_isolated(image_digest, tmp_path):
+    """The finding this exists to make. A non-internal network gives the agent
+    a route off the host, and every arm's `isolated: true` would have gone on
+    saying otherwise."""
+    import docker
+
+    client = docker.from_env()
+    network = client.networks.create("bakeoff-test-routable", driver="bridge")
+    (tmp_path / "repo").mkdir()
+    try:
+        with RunContainer(
+            image=image_digest,
+            repo_path=str(tmp_path / "repo"),
+            base_sha="",
+            network=network.name,
+        ) as container:
+            isolated, evidence = container.network_isolation()
+        assert isolated is False
+        assert "ROUTABLE" in evidence
+    finally:
+        network.remove()
+
+
+@integration
+def test_no_network_at_all_is_not_reported_as_isolated(alpine_container):
+    """network_mode=none is trivially unroutable and deliberately NOT isolated:
+    section 5.1's property is "no route off the host EXCEPT the recording
+    proxy", and with no network there is no proxy either. Same answer the old
+    `bool(network)` gave, now for the stated reason rather than by accident.
+
+    The reason is load-bearing and was measured wrong first. Docker reports
+    network_mode=none as membership of a network literally NAMED `none`, whose
+    `Internal` flag is false -- so reading that flag alone labels the one
+    configuration with no connectivity at all "ROUTABLE". Right verdict, wrong
+    evidence, and the evidence is what this field is for.
+    """
+    isolated, evidence = alpine_container.network_isolation()
+    assert isolated is False
+    assert "null-driver" in evidence
+    assert "ROUTABLE" not in evidence
+    assert "no recording proxy" in evidence

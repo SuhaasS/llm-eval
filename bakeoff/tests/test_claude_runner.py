@@ -1,5 +1,7 @@
 import json
 import os
+import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -381,3 +383,61 @@ def test_host_backend_streams_real_subprocess_output(tmp_path):
     )
     assert result.exit_code == 0
     assert seen == ['{"type":"assistant"}', '{"type":"result"}']
+
+
+# --- stdout that could not be read is damage, and damage gets counted --------
+
+
+def test_unparseable_stdout_is_distinguished_from_a_non_assistant_event():
+    """The predicate this replaced answered False to both, so a truncated line
+    and a system event were the same non-event. Dropping the first undercounts
+    `turns_streamed` -- one of the three turn counts that exist to cross-check
+    each other, which makes it the miscount that cannot be caught by the others.
+    """
+    from bakeoff.claude_runner import classify_stdout_line
+
+    assert classify_stdout_line('{"type": "assistant"}') == "assistant"
+    assert classify_stdout_line('{"type": "system", "subtype": "init"}') == "other"
+    assert classify_stdout_line('{"type": "assis') == "malformed"
+    assert classify_stdout_line("Error: ENOSPC") == "malformed"
+    # Blank is NOT malformed. Line-buffered output produces them routinely, and
+    # counting them as damage puts a permanent non-zero in a field whose whole
+    # job is to be zero on a clean run.
+    assert classify_stdout_line("") == "blank"
+    assert classify_stdout_line("   ") == "blank"
+
+
+def test_the_runner_reports_how_many_stdout_lines_it_could_not_read():
+    """A count, not a log line. `RunnerResult.turns_streamed` is a floor rather
+    than a count whenever this is non-zero, and nothing else in the record says
+    so."""
+    from bakeoff.claude_runner import ClaudeCodeConfig, ClaudeCodeRunner
+
+    class _Backend:
+        def transcript_root(self, config):
+            return str(Path(tempfile.mkdtemp()) / "cfg")
+
+        def env_for(self, config):
+            return {}
+
+        def execute(self, command, env, cwd, timeout_s, on_stdout_line):
+            from bakeoff.claude_runner import BackendResult
+
+            for line in (
+                '{"type": "assistant", "message": {}}',
+                "{ truncated",
+                "npm WARN something",
+                '{"type": "result"}',
+                '{"type": "assistant", "message": {}}',
+            ):
+                on_stdout_line(line)
+            return BackendResult(exit_code=0, stdout="", stderr="", timed_out=False)
+
+    config = ClaudeCodeConfig(
+        model="m", base_url="", auth_token="", settings_path="/s",
+        config_dir="/c", max_turns=5, wall_clock_timeout_s=10,
+    )
+    result = ClaudeCodeRunner(config, backend=_Backend()).run("go", cwd=".")
+
+    assert result.turns_streamed == 2
+    assert result.stdout_malformed_lines == 2

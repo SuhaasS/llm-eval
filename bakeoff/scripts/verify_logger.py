@@ -128,11 +128,13 @@ def main() -> int:
 
     print("\nGATE PASSED: logging layer verified.")
     print("Verified offline: no model was called and nothing was spent.")
+    print("Sampling reaches the wire on both routes now -- the streaming")
+    print("Anthropic path and, via the resolved-params channel, the openai/")
+    print("one, where the record reports the renamed cap and the pinned")
+    print("reasoning_effort rather than Claude Code's request.")
     print("NOT verified here: that a real model completes a real task, or")
-    print("that Bedrock routing and credentials work. Sampling now reaches")
-    print("the wire on the streaming Anthropic path (offline smoke), but the")
-    print("candidate arms route through openai/ on mantle -- confirm live.")
-    print("Both are Phase 0c (Task 12).")
+    print("that Bedrock routing and credentials work. Both are Phase 0c")
+    print("(Task 12).")
     return 0
 
 

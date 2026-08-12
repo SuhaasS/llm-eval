@@ -174,6 +174,12 @@ from typing import Any
 
 from litellm.integrations.custom_logger import CustomLogger
 
+# The resolved-params side channel. bakeoff.proxy_callback owns it because the
+# HARNESS has to read it and importing THIS module applies its patches -- the
+# same reason write_manifest lives over there. The dependency runs in this
+# direction only, and proxy_callback imports nothing from here.
+from bakeoff.proxy_callback import open_resolved_capture, record_resolved_params
+
 # Stable identifiers recorded on every run record. Changing one changes what
 # the log claims was done to the adapter, so these are names, not descriptions.
 TOOL_USE_ID_PASSTHROUGH = "anthropic_tool_use_id_passthrough"
@@ -591,6 +597,18 @@ def _apply_openai_param_pins() -> list[str]:
                 # would otherwise be here is the one derived from Claude Code's
                 # `thinking` block, and it is exactly what has to lose.
                 mapped[_REASONING_EFFORT] = _REASONING_EFFORT_VALUE
+                # Tell the wire log what the provider is actually getting.
+                # This is the ONLY place that knows: measured 2026-08-12, the
+                # success callback fires on the outer anthropic_messages call
+                # and the nested acompletion fires nothing, so every param this
+                # wrapper touches is invisible from where capture runs. Without
+                # this hand-off the log reports Claude Code's `max_tokens` for a
+                # call that carried `max_completion_tokens`, with the provenance
+                # of an observation.
+                #
+                # After the rewrites, never before: the whole point is what goes
+                # out, not what came in.
+                record_resolved_params({"model": model, **mapped})
             return mapped
 
         setattr(patched, _WRAPPED_MARKER, True)
@@ -704,6 +722,20 @@ class BakeoffAdapterPatches(CustomLogger):
         # THIS conversation, so nothing is remembered between calls and a
         # first turn correctly starts empty.
         _SEEN_TOOL_USE_IDS.set(_tool_use_ids_in(messages))
+
+        # Open the wire log's resolved-params capture for this request. Seeded
+        # HERE, in the one place that runs once per request in the request's own
+        # context, so the container is the same object in `map_openai_params`
+        # below it and in the success callback after it -- measured, three
+        # matching identities on one probe. A fresh container per request: two
+        # runs served concurrently must not read each other's params, and a
+        # stale one is how one arm's config gets attributed to another.
+        #
+        # Stamped with litellm's own call id, which this hook and the success
+        # callback both receive and which is measured to hold the same value at
+        # both ends. Without the stamp a capture that outlived its request would
+        # be attributed to the next call rather than refused.
+        open_resolved_capture(kwargs.get("litellm_call_id"))
         return kwargs
 
     def __init__(self) -> None:

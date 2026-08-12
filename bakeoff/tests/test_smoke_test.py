@@ -46,6 +46,12 @@ class _CapturingContainer:
     def exec(self, *_args, **_kwargs):
         return None
 
+    def checked_exec(self, *_args, **_kwargs):
+        return None
+
+    def network_isolation(self) -> tuple[bool | None, str]:
+        return None, "fake container: not measured"
+
     def snapshot_diff(self, base_sha: str) -> tuple[str, list[str]]:
         return ("", [])
 

@@ -185,3 +185,39 @@ def test_callback_counts_calls_not_turns(tmp_path):
     assert [e["metadata"]["call_index"] for e in entries] == [1, 2, 3]
     assert [e["metadata"]["failed"] for e in entries] == [True, True, False]
     assert not any("turn" in e["metadata"] for e in entries)
+
+
+def test_a_replayed_entry_keeps_the_time_it_was_captured(tmp_path):
+    """The proxy makes the calls; the harness folds its entries into the
+    canonical artifact after the run. `log_call` stamped `now()` over every one
+    of them, so each timestamp in the gzipped log was the harness's post-run
+    replay time -- one clock reading spread across the calls it was supposed to
+    order, and the only per-call time the artifact had.
+    """
+    logger = WireLogger(tmp_path / "wire.jsonl.gz")
+    logger.log_call(
+        request={"model": "m"},
+        response={"ok": True},
+        metadata={"call_index": 1},
+        logged_at="2026-08-12T17:55:13Z",
+    )
+    logger.close()
+
+    entry = logger.entries()[0]
+    assert entry["logged_at"] == "2026-08-12T17:55:13Z"
+    # The harness's own stamp is kept BESIDE it, not instead of it: when the
+    # entry was folded in is real information, it is just not when the call
+    # happened.
+    assert entry["replayed_at"] and entry["replayed_at"] != entry["logged_at"]
+
+
+def test_an_entry_captured_in_process_is_not_marked_as_replayed(tmp_path):
+    """`replayed_at` present means the line came from the proxy's file. A
+    non-null on a live capture would make every entry look second-hand."""
+    logger = WireLogger(tmp_path / "wire.jsonl.gz")
+    logger.log_call(request={"model": "m"}, response={"ok": True}, metadata={})
+    logger.close()
+
+    entry = logger.entries()[0]
+    assert entry["replayed_at"] is None
+    assert entry["logged_at"]

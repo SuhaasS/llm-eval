@@ -279,8 +279,8 @@ MUTATIONS = [
         # smoke_test.py, which does not run during an eval.
         "wire: stop recording the calls the proxy could not attribute",
         "src/bakeoff/runner.py",
-        "        wire_unattributed=wire_unattributed,\n        isolated=bool(network),",
-        "        wire_unattributed=None,\n        isolated=bool(network),",
+        "        wire_unattributed=wire_unattributed,\n        # The measurement",
+        "        wire_unattributed=None,\n        # The measurement",
         "tests/test_fault_injection.py -k could_not_attribute or this_runs_lost_calls",
         "not integration",
     ),
@@ -303,8 +303,8 @@ MUTATIONS = [
         # of Sonnet's. 856 stored calls cannot answer the question.
         "wire: narrow the request projection back to six keys",
         "src/bakeoff/proxy_callback.py",
-        '        "thinking": pick("thinking"),',
-        '        "_thinking_dropped": None,',
+        '    "thinking",\n    "reasoning_effort",',
+        '    "_thinking_dropped",\n    "_effort_dropped",',
         "tests/test_proxy_callback.py -k dropped_params",
         "not integration",
     ),
@@ -392,8 +392,8 @@ MUTATIONS = [
     (
         "defect 4c: read sampling from top-level kwargs (the obvious place)",
         "src/bakeoff/proxy_callback.py",
-        "        return resolved.get(name, body.get(name))",
-        "        return resolved.get(name, kwargs.get(name))",
+        "    return project(\n        body,",
+        "    return project(\n        kwargs,",
         "tests/test_fault_injection.py -k proxy_side_capture",
         "integration",
     ),
@@ -492,6 +492,165 @@ MUTATIONS = [
         '"status_code": None,',
         "tests/test_wire.py -k status",
         "not integration",
+    ),
+    # --- Gate 0: the capture gaps -------------------------------------------
+    #
+    # Each of these reverts an observation back to the well-formed zero it used
+    # to be. The zeros are why they are here: none of them looked like a
+    # failure in a stored record.
+    (
+        # The whole reason the side channel exists. Capture fires on the outer
+        # anthropic_messages call and the nested acompletion fires nothing, so
+        # without the hand-off the log reports Claude Code's max_tokens for a
+        # call that carried max_completion_tokens.
+        "wire: stop handing the resolved params to the capture",
+        "src/bakeoff/litellm_patches.py",
+        "                record_resolved_params({\"model\": model, **mapped})",
+        "                pass",
+        "tests/test_litellm_patches.py -k hands_what_it_produced",
+        "not integration",
+    ),
+    (
+        # A capture attributed to whatever call reads it next. On a proxy
+        # serving several arms that is one arm's configuration recorded against
+        # another, at full plausibility.
+        "wire: attribute a resolved capture without checking whose call it was",
+        "src/bakeoff/proxy_callback.py",
+        "        captured = _RESOLVED_BY_CALL.get(call_id)",
+        "        captured = next(iter(_RESOLVED_BY_CALL.values()), None)",
+        "tests/test_proxy_callback.py -k never_attributed",
+        "not integration",
+    ),
+    (
+        # The field that identified the first mechanism as dead. Without it a
+        # broken hand-off and an `anthropic/` arm behaving correctly are the
+        # same null, and the offline gate stays green over both.
+        "wire: stop saying which kind of null a missing resolved is",
+        "src/bakeoff/proxy_callback.py",
+        '        return "captured" if call_id in _RESOLVED_BY_CALL else "not_recorded"',
+        '        return "not_recorded"',
+        "tests/test_proxy_callback.py -k which_kind_of_null",
+        "not integration",
+    ),
+    (
+        # `response_obj` is None on a failure, so this restores
+        # {"raw_completion": "None"} as the entire record of a 400.
+        "wire: drop the provider's error body from a failed call",
+        "src/bakeoff/proxy_callback.py",
+        "    exc = kwargs.get(\"exception\")\n    if exc is None:\n        return None",
+        "    exc = kwargs.get(\"exception\")\n    if True:\n        return None",
+        "tests/test_proxy_callback.py -k provider_body",
+        "not integration",
+    ),
+    (
+        # Restores one post-run clock reading spread across every call in the
+        # canonical artifact.
+        "wire: re-stamp every replayed entry with the harness's own clock",
+        "src/bakeoff/wire.py",
+        '            "logged_at": logged_at or now,',
+        '            "logged_at": now,',
+        "tests/test_wire.py -k replayed",
+        "not integration",
+    ),
+    (
+        # A CRASHED row with no cause. Exclusion is the one mechanism by which
+        # results can be massaged, so an unattributable crash is an
+        # unjustifiable exclusion.
+        "crash: record that a run crashed without recording why",
+        "src/bakeoff/runner.py",
+        '        crash_error = f"{type(exc).__name__}: {exc}"',
+        '        crash_error = ""',
+        "tests/test_fault_injection.py -k crashed_run_records_the_cause",
+        "not integration",
+    ),
+    (
+        # The positive safety claim manufactured by a failure: a scanner that
+        # raised left destructive_events empty with no error anywhere.
+        "safety: let a failing destructive scan read as a clean run",
+        "src/bakeoff/runner.py",
+        '                        scanner_error = f"{type(exc).__name__}: {exc}"',
+        '                        pass',
+        "tests/test_fault_injection.py -k failing_destructive_scan",
+        "not integration",
+    ),
+    (
+        # A wire-log name collision recorded as a container crash, on a run
+        # whose container never started.
+        "wire: put the logger back inside the run body, so a collision is a crash",
+        "src/bakeoff/runner.py",
+        "    except OSError as exc:\n        wire = None\n        wire_log_error = f\"{type(exc).__name__}: {exc}\"",
+        "    except OSError:\n        raise",
+        "tests/test_fault_injection.py -k wire_log_collision",
+        "not integration",
+    ),
+    (
+        # A non-zero exit that still wrote a transcript, byte-identical to a
+        # clean finish.
+        "agent: stop recording the exit code",
+        "src/bakeoff/runner.py",
+        "        agent_exit_code=(\n            exit_code if isinstance(exit_code := getattr(\n                runner_result, \"exit_code\", None\n            ), int) else None\n        ),",
+        "        agent_exit_code=None,",
+        "tests/test_fault_injection.py -k exit_code_is_recorded",
+        "not integration",
+    ),
+    (
+        # Unreadable stdout dropped with no counter, which undercounts
+        # turns_streamed -- the count that exists to catch undercounts.
+        "stdout: treat an unreadable line as an ordinary non-assistant event",
+        "src/bakeoff/claude_runner.py",
+        '    except json.JSONDecodeError:\n        return "malformed"',
+        '    except json.JSONDecodeError:\n        return "other"',
+        "tests/test_claude_runner.py -k unparseable_stdout",
+        "not integration",
+    ),
+    (
+        # 40 unreadable transcript lines, byte-identical in the record to none.
+        "transcript: stop reporting the lines that could not be parsed",
+        "src/bakeoff/runner.py",
+        "        transcript_malformed_lines=parsed.malformed_lines,",
+        "        transcript_malformed_lines=0,",
+        "tests/test_fault_injection.py -k unreadable_transcript",
+        "not integration",
+    ),
+    (
+        # The failed-API-call count back under a name that reads as a statement
+        # about the agent's tool use.
+        "tools: report failed API calls as failed tool calls again",
+        "src/bakeoff/runner.py",
+        "        errored=0,\n        api_calls_failed=failed_calls,",
+        "        errored=failed_calls,\n        api_calls_failed=0,",
+        "tests/test_runner.py -k failed_api_calls",
+        "not integration",
+    ),
+    (
+        # Two counts collapsed into one, which is how a surplus over the
+        # proxy's access log got read as retries when it was double-logging.
+        "wire: count callback invocations as if they were logical calls",
+        "src/bakeoff/runner.py",
+        "    return len(seen) + unkeyed",
+        "    return len(entries)",
+        "tests/test_runner.py -k double_logged",
+        "not integration",
+    ),
+    (
+        # Configuration reported as observation, on the one field runner.py's
+        # own rule was written about.
+        "isolation: assert section 5.1 from the argument instead of measuring it",
+        "src/bakeoff/runner.py",
+        "            isolated, isolation_evidence = container.network_isolation()",
+        "            isolated, isolation_evidence = bool(network), \"\"",
+        "tests/test_fault_injection.py -k routable_network_is_recorded",
+        "integration",
+    ),
+    (
+        # Right verdict, wrong evidence: Docker names the no-connectivity
+        # configuration `none` and reports Internal false for it.
+        "isolation: read the Internal flag alone, calling network_mode=none routable",
+        "src/bakeoff/container.py",
+        '                if attrs.get("Driver") == "null":',
+        '                if False:',
+        "tests/test_container.py -k no_network_at_all",
+        "integration",
     ),
 ]
 

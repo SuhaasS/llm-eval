@@ -23,6 +23,11 @@ from typing import Any
 
 from litellm.integrations.custom_logger import CustomLogger
 
+# The projection contract lives in proxy_callback because that is the module
+# whose docstring owns it. Importing it here is safe and importing
+# bakeoff.litellm_patches would not be -- that one applies its patches on
+# import. proxy_callback holds no patches, only the file-handoff contract.
+from bakeoff.proxy_callback import _error, _iso, project
 from bakeoff.scanners import scan_secrets
 
 
@@ -39,14 +44,36 @@ class WireLogger:
         request: dict[str, Any],
         response: dict[str, Any],
         metadata: dict[str, Any],
+        resolved: dict[str, Any] | None = None,
+        logged_at: str | None = None,
     ) -> None:
+        """Fold one call into the canonical artifact.
+
+        `logged_at` is the ORIGINAL capture time and must be passed through when
+        replaying proxy entries. Without it this method stamped `now()` over
+        every replayed line, so each timestamp in the gzipped artifact was the
+        harness's post-run replay time rather than the call time -- the whole
+        artifact carried one clock reading, spread across the calls it was
+        supposed to order. `replayed_at` keeps the harness's own stamp beside
+        it rather than in place of it.
+
+        `resolved` is what the provider was actually sent, or None when nothing
+        observed it. Kept separate from `request` on purpose: see
+        proxy_callback._request.
+        """
         if self._closed:
             raise RuntimeError("WireLogger is closed")
 
-        payload = json.dumps({"request": request, "response": response}, default=str)
+        now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        payload = json.dumps(
+            {"request": request, "resolved": resolved, "response": response},
+            default=str,
+        )
         entry = {
-            "logged_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "logged_at": logged_at or now,
+            "replayed_at": now if logged_at else None,
             "request": request,
+            "resolved": resolved,
             "response": response,
             "metadata": metadata,
             "secret_flags": scan_secrets(payload),
@@ -134,27 +161,24 @@ class BakeoffCallback(CustomLogger):
         elif hasattr(response_obj, "__dict__"):
             raw = dict(response_obj.__dict__)
 
+        error = _error(kwargs) if failed else None
         self.logger.log_call(
-            # Same key set as proxy_callback._request, and it has to stay that
-            # way: a run's canonical artifact is written from whichever path
-            # was live, so a field present in one projection and absent from
-            # the other would read as "not sent on this arm".
-            request={
-                "model": kwargs.get("model"),
-                "messages": kwargs.get("messages"),
-                "tools": kwargs.get("tools"),
-                "system": kwargs.get("system"),
-                "temperature": kwargs.get("temperature"),
-                "max_tokens": kwargs.get("max_tokens"),
-                "max_completion_tokens": kwargs.get("max_completion_tokens"),
-                "thinking": kwargs.get("thinking"),
-                "reasoning_effort": kwargs.get("reasoning_effort"),
-                "context_management": kwargs.get("context_management"),
-                "output_config": kwargs.get("output_config"),
-                "anthropic_beta": kwargs.get("anthropic_beta"),
-                "stream": kwargs.get("stream"),
-            },
-            response=raw if isinstance(raw, dict) else {"raw_completion": str(raw)},
+            # Projected through the shared allowlist, so this path and the proxy
+            # one cannot drift: a run's canonical artifact is written from
+            # whichever was live, and a field present in one projection and
+            # absent from the other would read as "not sent on this arm".
+            request=project(kwargs),
+            # None, always, on this path. There is no separate resolution to
+            # observe here -- the harness IS the caller, so `kwargs` is both the
+            # request and what goes out. Reporting them as a resolution would
+            # claim an observation of the provider boundary that this path never
+            # makes.
+            resolved=None,
+            response=(
+                {"error": error}
+                if error is not None
+                else raw if isinstance(raw, dict) else {"raw_completion": str(raw)}
+            ),
             metadata={
                 "run_id": self.run_id,
                 "call_index": self._call_index,
@@ -163,6 +187,10 @@ class BakeoffCallback(CustomLogger):
                 # Measured generation time, as opposed to the trajectory
                 # parser's estimate from transcript timestamps.
                 "latency_ms": self._latency_ms(start_time, end_time),
+                "started_at": _iso(start_time),
+                "ended_at": _iso(end_time),
+                "litellm_call_id": kwargs.get("litellm_call_id"),
+                "litellm_trace_id": kwargs.get("litellm_trace_id"),
                 "bedrock_request_id": (kwargs.get("litellm_params") or {}).get(
                     "request_id"
                 ),
