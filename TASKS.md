@@ -26,7 +26,31 @@ with no test runner.
 **New on 2026-08-12, from the GO run itself:** the wire log cannot see either
 new intervention, gemma started returning cache tokens it has no price for,
 and reasoning cannot be enabled uniformly across the three candidates on any
-single route. All three are filed below.
+single route. The first is **closed** — see Gate 0 below; the other two are
+filed further down.
+
+**Gate 0 landed 2026-08-12: every CAPTURE-class gap is closed.** Schema 3.3.0,
+`mutation_check` 61/61, gate PASSED. The distinction that made it urgent is the
+one this file already draws — a capture gap is unrecoverable, so runs collected
+before it lands are permanently harder to diagnose, while a derivation gap can
+be closed at any time including after Phase 4. Details in `tasks/todo.md`;
+three findings from it change claims made elsewhere in this file:
+
+1. **The `served=39 / captured=42` surplus was not three retries.** Measured
+   against a real provider call: a *failed* call fires the failure callback
+   **twice** under one `litellm_call_id`. Three failing gemma requests, three
+   duplicates. Same arithmetic, different cause, and nothing in the log could
+   tell them apart until `wire_entries_distinct` existed.
+2. **`optional_params` was not empty on the wire callback — it was *stale*.**
+   It belongs to the outer `anthropic_messages` call, so it carried the
+   pre-rename `max_tokens: 16384` and the old projection preferred it. The log
+   was not merely failing to see the interventions; it was reporting the state
+   before them with the provenance of a resolved param.
+3. **§5.3 sampling is confirmed applied.** `proxy_callback._request` carried a
+   standing "KNOWN GAP, to verify at Phase 0c" — a deployment-configured
+   temperature appeared nowhere the callback could see. The resolved-params
+   channel shows the `openai/` arm's configured `temperature: 1.0` on the wire.
+   It was being applied all along and was simply not observable.
 
 The `kimi-k2-5-runtime` item closed on 2026-08-11 — the constraint moved into
 the config rather than into the patch. See `tasks/todo.md`.
@@ -48,10 +72,9 @@ file predates that fix.** The remaining order:
 
 1. **`host` / `container.stats()`** — dead code; without it a slow arm cannot
    be told from a loaded host, which is the §5.7 parallel-execution question.
-2. **Error bodies in the wire log** (P2) — the only *capture* gap of the six.
-   Everything else can be back-derived from stored artifacts at any time; this
-   one cannot, so runs collected before it lands are permanently harder to
-   diagnose.
+2. ~~**Error bodies in the wire log**~~ — closed by Gate 0. A failure now
+   carries the provider's own body under `response.error`, inside the fields
+   the secret scan covers.
 
 Everything else found in that audit is a derivation gap and can wait for the
 scoring plan. The distinction is now marked on every P2 item.
@@ -63,8 +86,8 @@ Harness plan: [docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md](doc
 
 ## P0 — Blocking Phase 0c go/no-go
 
-- [ ] **Gemma's mantle route now rejects `max_tokens`. Sixth §6.4 adapter
-  defect, not a model failure.** Live N=3 on 2026-08-12, workdir
+- [x] **FIXED 2026-08-12 (`770fab6`). Gemma's mantle route now rejects `max_tokens`.
+  Sixth §6.4 adapter defect, not a model failure.** Live N=3 on 2026-08-12, workdir
   `20260812T075218Z`: gemma **0/3**, every call 400 before the model saw
   anything, zero tool calls, zero diff.
 
@@ -173,8 +196,8 @@ Harness plan: [docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md](doc
   per-deployment override, so it needs a further patch, and because it would
   diverge gemma's transport from the other two candidates.
 
-- [ ] **The `reasoning_effort` drop was attributed to Bedrock and the
-  attribution was wrong.** `litellm_config.yaml` recorded the 2026-08-07
+- [x] **CORRECTED 2026-08-12. The `reasoning_effort` drop was attributed to Bedrock
+  and the attribution was wrong.** `litellm_config.yaml` recorded the 2026-08-07
   rejection as *"Bedrock's OpenAI-compatible route rejects it for all three
   candidate models"*. Probed 2026-08-12 with raw `httpx`, bypassing litellm
   entirely: **Bedrock accepts it on all three**, and it measurably changes
@@ -198,8 +221,14 @@ Harness plan: [docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md](doc
   three candidates**, and the eval currently runs every arm thinking-off. See
   the §P3 item, which today's measurements close the measurement half of.
 
-- [ ] **Re-measure every arm. No Phase 0c figure was taken in an environment
-  where the agent could run tests.** Found 2026-08-12 in a review of the
+- [x] **DONE 2026-08-12. Re-measure every arm. No Phase 0c figure was taken in an
+  environment where the agent could run tests.** The post-fix four-arm live N=3
+  (`20260812T175513Z`) is that re-measurement: 12/12, every arm 4-5 turns with 4
+  tool calls and a 157-byte diff, in an image where `pytest` exists and the
+  fixture imports. Read it as one observation, not a rate — the N-sizing item
+  below is unchanged by it.
+
+  Original: Found 2026-08-12 in a review of the
   logging change; the environment defect itself is fixed, the re-measurement
   is **partly** done — the 2026-08-12 live N=3 is the first live data with a
   working test runner. Sonnet 3/3, Kimi 3/3, Nemotron 2/3, gemma blocked by
@@ -565,7 +594,7 @@ says which it is.
 
 ### Found by the 2026-08-12 GO run
 
-- [ ] **CAPTURE. The wire log records the request Claude Code sent, not the one
+- [x] **CLOSED by Gate 0. The wire log records the request Claude Code sent, not the one
   the provider answered — so neither openai param intervention is visible in
   it.** Read off `20260812T175513Z`, gemma run 0, a run that demonstrably
   worked:
@@ -606,7 +635,7 @@ says which it is.
 
 ### Found by the 2026-08-12 live run itself
 
-- [ ] **The capture reconciliation compares two different quantities and
+- [x] **CLOSED. The capture reconciliation compares two different quantities and
   reports the wrong direction.** `smoke_test` fails the gate on
   `served != captured`, where `served` counts `POST /v1/messages` in the
   proxy access log (client requests) and `captured` sums wire entries
@@ -645,7 +674,7 @@ says which it is.
 
 Tier A of that review landed (see `tasks/todo.md`). These are what it left.
 
-- [ ] **CAPTURE. A crashed run's cause exists nowhere in the log.**
+- [x] **CLOSED by Gate 0. A crashed run's cause exists nowhere in the log.**
   `runner.py` catches the whole run body with `except Exception: crashed = True`
   and keeps no type, no message, no traceback; `Artifacts.container_stderr` is
   never set even though stderr *is* captured (`claude_runner.py`,
@@ -655,17 +684,17 @@ Tier A of that review landed (see `tasks/todo.md`). These are what it left.
   module's own comment, "the one mechanism by which results can be massaged".
   Wants `crash_error: str` plus persisting stderr.
 
-- [ ] **CAPTURE. `ParsedTrajectory.malformed_lines` is counted and has no
+- [x] **CLOSED by Gate 0. `ParsedTrajectory.malformed_lines` is counted and has no
   consumer.** No `assemble_record` read, no `RunRecord` field. A transcript
   with 40 unreadable lines is byte-identical in the record to a clean one.
   `claude_runner` drops unparseable stdout lines with no counter at all, which
   silently undercounts `turns_streamed` — one of the three cross-check counts.
 
-- [ ] **CAPTURE. The agent's exit code is never recorded.**
+- [x] **CLOSED by Gate 0. The agent's exit code is never recorded.**
   `ClaudeRunResult.exit_code` has no `RunRecord` field, so a CLI that exited
   non-zero but wrote a transcript looks identical to a clean finish.
 
-- [ ] **CAPTURE. Wire log: no success status, no retry identity, no
+- [x] **PARTLY CLOSED by Gate 0. Wire log: no success status, no retry identity, no
   timestamps that survive.** `status_code` is `None` on success, conflating
   200 with unknown. `num_retries: 3` is configured but nothing carries an
   attempt number or a retry-of correlation id, so retries are inferable only
@@ -676,7 +705,7 @@ Tier A of that review landed (see `tasks/todo.md`). These are what it left.
   the canonical artifact is the harness's post-run replay time, not the call
   time.
 
-- [ ] **DERIVATION. `ToolCallStats.errored` holds failed *API* calls, not tool
+- [x] **CLOSED by Gate 0. `ToolCallStats.errored` holds failed *API* calls, not tool
   errors.** `errored=failed_calls` from wire metadata. It is also the only
   place proxy retries surface in a record. Anyone reading it as "tools the
   agent invoked that failed" gets the retry count. Wants a separate
@@ -698,7 +727,7 @@ Tier A of that review landed (see `tasks/todo.md`). These are what it left.
   computed and then dropped, so `sum(per_turn.inference_ms)` systematically
   undercounts the span it purports to cover.
 
-- [ ] **`isolated` is configuration reported as observation.** Set from
+- [x] **CLOSED by Gate 0. `isolated` is configuration reported as observation.** Set from
   `bool(network)`. `False` is honest; `True` asserts a property nothing
   verified — the one place `runner.py`'s own stated rule does not hold. The
   integration suite proves the network has no host route; the record could
@@ -721,20 +750,20 @@ Tier A of that review landed (see `tasks/todo.md`). These are what it left.
   (e) Wire logs are `flush()`ed but never `fsync`ed, and `proxy_callback._write`
   has no `try`, so an unwritable wire dir raises inside LiteLLM's logging path.
 
-- [ ] **`scan_destructive` failing produces a positive safety claim.** The
+- [x] **CLOSED by Gate 0. `scan_destructive` failing produces a positive safety claim.** The
   `try` in `execute_run` spans both `parse_trajectory` and `scan_destructive`.
   If the *scanner* raises, `assemble_record`'s independent re-parse succeeds,
   so `trajectory_parse_error` stays `""` and the record carries
   `destructive_events: []` — precisely what the comment above it says it is
   guarding against. Split the two `try` blocks.
 
-- [ ] **`git checkout --detach` and `git clean` use `exec`, not
-  `_checked_exec`.** At the one place the codebase elsewhere argues checking
+- [x] **CLOSED by Gate 0. `git checkout --detach` and `git clean` use `exec`, not
+  `checked_exec`.** At the one place the codebase elsewhere argues checking
   is mandatory: an unchecked failure yields empty output byte-identical to a
   clean tree. `build_smoke_repo`'s docstring names this exact hazard without
   fixing the call site.
 
-- [ ] **A wire-log name collision is recorded as a container crash.**
+- [x] **CLOSED by Gate 0. A wire-log name collision is recorded as a container crash.**
   `WireLogger` opens `gzip.open(path, "xt")` inside the run `try`, so
   `FileExistsError` becomes `crashed=True` → `CRASHED` + `container_crashed`,
   on a run whose container never started. The comment says the collision "must
@@ -749,7 +778,7 @@ Tier A of that review landed (see `tasks/todo.md`). These are what it left.
   `_build`.** A record written by a later schema still raises `TypeError`
   there, which is the failure `_build` exists to prevent.
 
-- [ ] **CAPTURE. The wire log records a failure's status code but not its error body.**
+- [x] **CLOSED by Gate 0. The wire log records a failure's status code but not its error body.**
   `BakeoffCallback._record` stores `response_obj`, which is `None` on failure,
   so a 400 lands as `{"raw_completion": "None"}`. Every diagnosis on
   2026-08-07 had to come from the proxy's own logs instead — and in the full

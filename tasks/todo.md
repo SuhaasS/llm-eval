@@ -1520,3 +1520,123 @@ behaviour than it was meant to prove:
 A config setting that differs between these two files is a §5.2 divergence in
 the gate itself, and all three were invisible until an arm actually exercised
 the adapter.
+
+---
+
+## Gate 0 — the unrecoverable capture gaps (2026-08-12)
+
+Schema **3.3.0**. Eight observations that were made and then discarded, so each
+one read in a stored record as a well-formed zero. All eight are *capture* gaps:
+unlike a derivation gap, no offline pass over stored artifacts can invent them
+later, so the cost of leaving them grows with every run collected.
+
+Gate: unit 341 green, integration 31 green, `verify_logger.py` PASSED,
+`mutation_check.py` **61/61**.
+
+### What the probe found before any code moved
+
+The largest item turned on one unmeasured fact, and three of the four answers
+were not what the backlog assumed.
+
+| question | answer |
+|---|---|
+| which call fires the wire callback | the **outer** `anthropic_messages` only; the nested `acompletion` fires nothing |
+| `optional_params` / `standard_logging_object.model_parameters` | **populated, and pre-patch** — `max_tokens: 16384`, no `max_completion_tokens`, no `reasoning_effort` |
+| retry identity | `litellm_call_id` and `litellm_trace_id` are both on the kwargs |
+| what a failed call does to the callback | fires it **twice**, same `litellm_call_id` |
+
+The second is worse than the "the resolved params are never in scope" recorded
+in TASKS.md. `optional_params` is not empty — it belongs to the outer call — so
+the old projection preferred it and reported the *pre-rename* `max_tokens` with
+the provenance of a resolved param. Ignoring it entirely would have been safer
+than reading it.
+
+The fourth revises a claim in TASKS.md: the `served=39 / captured=42` surplus
+was recorded as "exactly the three retries of gemma's failing call". It was
+three failures each logged twice. Same arithmetic, different cause, and nothing
+in the log could separate them.
+
+### The two-hop channel, and why the obvious version is dead
+
+`resolved` needed carrying up from `map_openai_params` to the callback.
+
+Hop 1 (hook → mapping) is a ContextVar and works — the route
+`_SEEN_TOOL_USE_IDS` already takes. Hop 2 (mapping → callback) is a **keyed dict
+in one process**, because the ContextVar version *passed every unit test and
+captured nothing in the real proxy*: `resolved_state: no_capture`, 9 for 9. The
+callback runs from a context copied before the hook. A library-level
+reproduction shows the opposite, since there everything is one coroutine — so
+the offline gate, not a unit test, is what settles this class of question.
+
+`resolved_state` is what made that visible in one run rather than by reasoning.
+It was added as a diagnostic and kept: without it a broken hand-off and an
+`anthropic/` arm behaving correctly are the same null.
+
+Measured on the offline gate afterwards, on the `openai/` arm:
+
+```
+sampling_source = resolved
+resolved: max_completion_tokens=16384  reasoning_effort=none  max_tokens=None
+sampling:  {'max_output_tokens': 16384, 'temperature': 1.0}
+```
+
+That `temperature: 1.0` closes a second thing. `proxy_callback._request`
+carried a standing *"KNOWN GAP, to verify at Phase 0c"*: a deployment-configured
+temperature appeared nowhere the callback could see, and §5.3 puts sampling
+entirely in proxy config because Claude Code has no temperature flag — so
+nothing could confirm it was ever applied. It was reaching the provider all
+along and was simply not observable.
+
+### The rest
+
+- **`crash_error` + `artifacts.harness_traceback`.** `except Exception: crashed
+  = True` kept nothing, so a harness defect and an infra failure were the same
+  record — and exclusion is the one mechanism by which results can be massaged.
+- **`artifacts.container_stderr`.** The field existed and no code set it, while
+  stderr was captured and dropped in the `finally` beside stdout.
+- **`agent_exit_code`.** A non-zero exit that still wrote a transcript was
+  byte-identical to a clean finish.
+- **`transcript_malformed_lines` / `stdout_malformed_lines`.** The first was
+  counted with no consumer. The second was not counted at all: the stdout
+  reader treated "not an assistant event" and "not JSON" alike, which
+  undercounts `turns_streamed` — the count that exists to cross-check the other
+  two, and so the miscount the others cannot catch.
+- **`scanner_error`.** `scan_destructive` shared a `try` with the trajectory
+  parse, so a *scanner* failure left `destructive_events: []` with an empty
+  `trajectory_parse_error` — a positive safety claim (§7) manufactured by a
+  failure, which is exactly what the comment above it said it prevented.
+- **`wire_log_error`.** A wire-log name collision raised inside the run body and
+  became `CRASHED` + `container_crashed`, on a run whose container never
+  started. Now the run keeps its wire-derived fields and loses only the gzipped
+  copy. `artifacts.wire_log_gz` had to gain an **ownership** check to match:
+  existence alone publishes the *earlier attempt's* file under this record,
+  which resolves and is therefore worse than the null it replaced.
+- **`checked_exec` for `git checkout --detach` and `git clean`.** Bare `exec` at
+  the one place the codebase argues loudest that checking is mandatory.
+- **`ToolCallStats.api_calls_failed`.** `errored` sits inside `ToolCallStats`
+  and held the count of failed *API* calls, so it read as a statement about the
+  agent while describing the transport.
+- **`wire_entries_distinct`.** Callback invocations and logical calls are
+  different numbers; see the fourth probe finding.
+
+### `isolated` stopped being an argument
+
+Measured from the networks the container actually joined, via Docker rather
+than by probing from inside — `Internal: true` *is* §5.1's property, so
+inspecting it costs nothing and needs no timeouts.
+
+One thing had to be measured twice. Docker reports `network_mode=none` as
+membership of a network literally **named** `none`, whose `Internal` flag is
+**false** — so reading that flag alone labels the one configuration with no
+connectivity at all `ROUTABLE`. Right verdict, wrong evidence, and the evidence
+is the entire point of the field. The driver (`null`) is what distinguishes it.
+
+`isolated` is now `bool | None`; `None` means the inspection failed, which is
+not the finding `False`.
+
+### Not in scope, deliberately
+
+Gate 1 (task manifest, per-task images, a real issue) and Gate 2 (credential
+refresh, run-level retry, parallel-safe prior-run lookup, `container.stats()`).
+`ToolCallStats.malformed` stays 0 at harness time — §6.4 puts the
+adapter-vs-model call offline.
