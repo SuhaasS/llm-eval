@@ -30,7 +30,19 @@ single route. The first is **closed** — see Gate 0 below; the other two are
 filed further down.
 
 **Gate 0 landed 2026-08-12: every CAPTURE-class gap is closed.** Schema 3.3.0,
-`mutation_check` 61/61, gate PASSED. The distinction that made it urgent is the
+`mutation_check` 61/61, gate PASSED, and **confirmed live** on a four-arm N=1
+(`20260812T222630Z`, GO 4/4, every arm landing the 157-byte diff). The live run
+is what proves the channel on the real transport split:
+
+| arm | route | `sampling_source` | what the wire carried |
+|---|---|---|---|
+| gemma-4-31b | `openai/` | `resolved` | `max_completion_tokens=16384`, `reasoning_effort=none`, `temperature=1.0` |
+| nemotron-3-super-120b | `openai/` | `resolved` | same |
+| kimi-k2-5 | `openai/` | `resolved` | same |
+| claude-sonnet-5-runtime | `bedrock/` | `client_request` | `not_recorded` — no openai param mapping on that path, honestly stated |
+
+Claude Code sent `max_tokens=16384` and no `reasoning_effort` on every one of
+them. That divergence is now *in the record* instead of in this file's prose. The distinction that made it urgent is the
 one this file already draws — a capture gap is unrecoverable, so runs collected
 before it lands are permanently harder to diagnose, while a derivation gap can
 be closed at any time including after Phase 4. Details in `tasks/todo.md`;
