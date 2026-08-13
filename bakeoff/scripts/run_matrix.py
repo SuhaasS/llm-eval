@@ -15,16 +15,25 @@ Usage:
     python scripts/run_matrix.py --mode offline
     python scripts/run_matrix.py --mode live --repeats 1
     python scripts/run_matrix.py --mode live --tasks click-3360-... --models gemma-4-31b
+
+Exit codes:
+    0  every cell in the plan has a record
+    1  something is wrong -- preflight refused, cells stranded, or records that
+       cannot be interpreted
+    2  stopped early and cleanly, work remains, re-invoking resumes it
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
+import time
 import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -49,7 +58,15 @@ from bakeoff.matrix import (  # noqa: E402
     write_json,
 )
 from bakeoff.preflight import preflight  # noqa: E402
-from bakeoff.proxy import EVAL_ARMS, Proxy, proxy_environment  # noqa: E402
+from bakeoff.proxy import (  # noqa: E402
+    EVAL_ARMS,
+    SSO_LOGIN_HINT,
+    CredentialWindow,
+    Proxy,
+    credential_stop,
+    credential_window,
+    proxy_environment,
+)
 from bakeoff.session import effective_config  # noqa: E402
 from bakeoff.tasks import TaskError, load_task_set, materialize  # noqa: E402
 
@@ -59,6 +76,18 @@ from bakeoff.tasks import TaskError, load_task_set, materialize  # noqa: E402
 # as the model's failure.
 CACHE = Path.home() / ".cache" / "bakeoff"
 DEFAULT_TASK_SET = REPO / "taskset"
+
+# Everything a cell costs that is NOT inside the agent's wall_clock_timeout_s:
+# materializing a fresh tree, starting the container, the final force_capture,
+# the record write. Added to the timeout when asking whether a cell fits inside
+# the credential window, because a margin of the timeout alone would clear a
+# cell that then dies in its tail with the tokens already spent.
+#
+# NOT measured -- no stored record carries it, since `time.wall_clock_total_ms`
+# covers the agent only. 120 s is a deliberate over-estimate. `cell_wall_s` is
+# now recorded per row precisely so the next version of this number can be a
+# measurement instead of a guess.
+CELL_OVERHEAD_S = 120
 
 
 def base_claude_version(image: str) -> str:
@@ -335,6 +364,39 @@ def main() -> int:
         return 0
 
     environment = proxy_environment(args.mode)
+
+    # AFTER proxy_environment: that is what resolves the project-local AWS
+    # config, so calling this first would read a different session from the one
+    # the proxy is about to be handed.
+    window = (
+        credential_window(os.environ.get("AWS_REGION_NAME") or "us-east-1")
+        if args.mode == "live"
+        else CredentialWindow(None, "offline")
+    )
+    if window.expires_at is not None:
+        print(f"creds     usable until {window.expires_at.isoformat()} ({window.source})")
+        if window.error:
+            print(f"          {window.error}")
+    else:
+        print(f"creds     expiry unreadable ({window.source}): {window.error}")
+        print("          the abort streak is the only backstop on this run")
+
+    # Before the proxy is built, not inside the loop: an already-dead session
+    # must not cost an image build and a container start to discover.
+    longest_cell = max(
+        by_id[cell.task_id].budget.wall_clock_timeout_s + CELL_OVERHEAD_S
+        for cell in resume.todo
+    )
+    blocked = credential_stop(window, datetime.now(timezone.utc), longest_cell)
+    if blocked:
+        print(f"\nNOT STARTING: {blocked}")
+        print(
+            "Nothing was spent and no run_id was touched.\n"
+            f"{SSO_LOGIN_HINT}\n"
+            "then re-invoke this command."
+        )
+        return 2
+
     config_name = (
         "litellm_config.yaml" if args.mode == "live" else "litellm_smoke_offline.yaml"
     )
@@ -348,6 +410,8 @@ def main() -> int:
     tracker = StreakTracker(
         overall=args.abort_streak, per_arm=args.abort_streak_per_arm
     )
+    credentials_expired = False
+    unrun = 0
 
     with Proxy(
         config_name, wire_dir, environment, stamp,
@@ -355,12 +419,37 @@ def main() -> int:
         with_stub=args.mode == "offline",
     ) as proxy:
         for index, cell in enumerate(resume.todo, start=1):
+            task = by_id[cell.task_id]
+            stop = credential_stop(
+                window,
+                now=datetime.now(timezone.utc),
+                # The agent's cap is NOT the whole cell. Materializing a fresh
+                # tree, starting the container, the final force_capture and the
+                # record write all sit outside it -- so a margin of
+                # wall_clock_timeout_s alone would clear a cell that then
+                # outlives the credentials in its tail, spending the tokens and
+                # writing a poisoned record anyway.
+                needed_s=task.budget.wall_clock_timeout_s + CELL_OVERHEAD_S,
+            )
+            if stop:
+                print(f"\nSTOPPING BEFORE {cell.label}: {stop}")
+                print(
+                    "Nothing was spent on this cell and its run_id is untouched.\n"
+                    f"{SSO_LOGIN_HINT}\n"
+                    "then re-invoke this command: plan_resume skips every cell "
+                    "already written."
+                )
+                credentials_expired = True
+                unrun = len(resume.todo) - index + 1
+                break
             print(f"\n[{index}/{len(resume.todo)}] {cell.label}", flush=True)
             try:
+                cell_started = time.monotonic()
                 record, config_dump, unattributed = run_cell(
-                    cell, by_id[cell.task_id], resolved[cell.task_id], args,
+                    cell, task, resolved[cell.task_id], args,
                     event_log, wire_dir, proxy.internal_name, artifacts,
                 )
+                cell_wall_s = time.monotonic() - cell_started
             except Exception as exc:  # noqa: BLE001 - one cell, not the matrix
                 # Loud and counted, never swallowed: a caller that believed the
                 # log was complete would compute means over a matrix with a
@@ -392,6 +481,10 @@ def main() -> int:
                     "wire": record.wire_entries_seen,
                     "cost": record.cost_usd,
                     "wall_s": record.time.wall_clock_total_ms / 1000,
+                    # The whole cell, not just the agent. The two differ by
+                    # exactly CELL_OVERHEAD_S's true value, which is the
+                    # measurement that constant is standing in for.
+                    "cell_wall_s": round(cell_wall_s, 1),
                     "diff_b": len(record.artifacts.final_diff or ""),
                     "problems": problems,
                 }
@@ -442,6 +535,13 @@ def main() -> int:
                 "stranded": stranded,
                 "infra": infra,
                 "proxy_requests": proxy.request_count(),
+                "stopped_early": credentials_expired,
+                "credential_window": {
+                    "expires_at": (
+                        window.expires_at.isoformat() if window.expires_at else None
+                    ),
+                    "source": window.source,
+                },
             },
         )
 
@@ -456,13 +556,19 @@ def main() -> int:
             print(f"  {label}")
             for problem in problems:
                 print(f"    - {problem}")
+    if credentials_expired:
+        print(
+            f"\nSTOPPED EARLY with {unrun} cell(s) unrun. This is not a failure: "
+            "nothing was spent on them and every one keeps its run_id, so "
+            "re-invoking after `aws sso login` resumes exactly here."
+        )
     if stranded or infra:
         print(
             "\nRead the wire log before concluding a model is at fault: "
             "section 6.4 requires telling adapter failure from model failure."
         )
         return 1
-    return 0
+    return 2 if credentials_expired else 0
 
 
 if __name__ == "__main__":
