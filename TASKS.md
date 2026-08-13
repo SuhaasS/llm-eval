@@ -99,8 +99,8 @@ schema 3.3.0. Gate 1's **harness half** closed at schema 3.5.0 — a task is now
 a directory on disk, validated before anything is spent, and scheduled by a
 resumable driver. The credential-expiry blind spot closed at **schema 3.6.0**, and the provider
 finish reason, the `host` block and collection identity at **schema 3.7.0**.
-`verify_logger.py` PASSED on 3 of 3 consecutive runs, unit suite 472,
-integration 37, `mutation_check.py` **90/90**.
+`verify_logger.py` PASSED on 3 of 3 consecutive runs, unit suite 474,
+integration 37, `mutation_check.py` **91/91**.
 
 **That `verify_logger.py` line used to be worth less than it looked.** Until
 2026-08-13 the gate failed on 2 of 3 runs from a stale-`.pyc` defect (see item

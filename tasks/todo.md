@@ -1810,7 +1810,8 @@ designed to do.
 
 ## The two cheap pre-collection items, and the identity defect found under them
 
-**2026-08-13, schema 3.7.0.** 472 unit tests, 37 integration, 90/90 mutations.
+**2026-08-13, schema 3.7.0.** 474 unit tests, 37 integration, 91/91 mutations,
+`verify_logger.py` PASSED.
 Planned across six adversarial review rounds (47 findings, all fixed) before any
 code was written; the rounds are why the last three items below exist at all.
 
@@ -1897,3 +1898,51 @@ merging reader scans. `smoke_test` and `dry_run` pass one too.
 
 **Not repaired, and cannot be:** the log is append-only and those artifacts are
 gone. `TASKS.md` carries the caveats a reader of pre-3.7.0 records needs.
+
+### What the §6.6 gate caught that six review rounds did not
+
+`collection_id` reached `assemble_record` and never `execute_run`. Every real
+caller — `run_matrix`, `smoke_test`, `dry_run` — raised `TypeError`, and **all
+472 unit tests passed**, because every one of them drives `assemble_record`
+directly. The gate failed on the offline smoke, one layer from a paid run.
+
+Same shape as the `cache_state` defect that gave `test_fault_injection.py` its
+first rule: *a parameter nobody passes is invisible to a unit test on the
+function that receives it.* Fixed in three parts — the parameter, an end-to-end
+test through `execute_run`, and a mutation anchored on that call site, since the
+record-level mutation cannot see this half.
+
+### Verification, measured
+
+| check | result |
+|---|---|
+| unit suite | 474 passed |
+| integration | 37, including two new ones against a real container |
+| `mutation_check.py` | **91/91** |
+| `verify_logger.py` (§6.6) | **GATE PASSED** |
+| offline matrix ×2, two event logs | 8 records, all `OK` |
+
+The finish reason, on the offline matrix: `terminated_by: agent_finish` beside
+`terminal_finish_reason: "stop"` — the translated and the raw vocabulary
+agreeing, recorded separately for the first time. The two arms with no stub
+produce `finish_reasons: {}` and `terminal_finish_reason: null` against
+`wire_entries_seen: 2`, which is "nothing returned" and not "nobody counted".
+
+The host block, same run: `samples: 1`, `mem_peak_mb: 136`, `vm_cpus: 2`, a real
+`load_p95`, `contention_flag: false` **measured**, and `cpu_pct_p95: null` —
+correct, not broken. A 0.6 s stub cell yields one frame and the first frame
+yields no percentage by construction. The arm that ended in 0.3 s with zero
+frames reports every field `null` including `contention_flag`, which is the
+tri-state doing its job.
+
+The collision, before and after:
+
+| | records pointing at a file that is not theirs |
+|---|---|
+| pre-3.7.0 | **12 of 24** |
+| post-3.7.0 | **0 of 8** |
+
+The second matrix ran the same four cells under a second event log. All four
+`run_id`s appear in both collections — unchanged and intended — and every record
+keeps its own artifacts, separated by `collection_id`. Before this change the
+second run would have deleted the first's.
