@@ -56,14 +56,26 @@ intervals.
 
 ### Do before collection, cheap, not blocking
 
-- **Record the raw `finish_reason`** beside the translated `stop_reason`. Today
-  the record cannot tell "the model decided it was done" from "the adapter said
-  so" — the 2026-08-13 finish analysis had to be done by hand from
-  `wire.jsonl.gz`. CAPTURE-adjacent and it costs a field. (P2)
-- **Wire up `host` metrics.** `RunContainer.stats()` has zero callers, so
-  `contention_flag: false` ships on every record as a measured-looking claim,
-  and no wall-clock figure can be attributed to the model rather than the
-  machine. (P1)
+Both done at schema 3.7.0, 2026-08-13. See `tasks/todo.md` for what they cost
+and what measuring the first one exposed.
+
+**Read every pre-3.7.0 record with three caveats.** They are permanent — the log
+is append-only.
+
+- `host.contention_flag: false` is a dataclass default, not a measurement. All
+  24 stored records carry it.
+- `artifacts.*` paths resolve to the **last** run of that cell, not necessarily
+  to the record holding them: an unstamped artifacts root plus a per-cell
+  `rmtree` meant a later matrix deleted an earlier run's files. 12 stored
+  records provably disagree with the file they point at.
+- `run_id` names no collection episode, so 6 ids appear in more than one event
+  log — `11ab9cf6527a188f` in **seven**. An offline pass merging logs must key
+  on `(collection_id, run_id)` and treat `collection_id: ""` as unknown rather
+  than as a shared episode.
+
+- [ ] **Artifacts now accumulate per invocation.** The stamped root is the fix
+  for the deletion above, but nothing reclaims the trees, and a 3,200-cell
+  matrix keeps every one. Size it and decide a retention policy. (P3)
 
 ### Blocks the number, not the collection
 
@@ -85,9 +97,10 @@ be used across that boundary.
 offline half done, Gate 0 (every CAPTURE-class observability gap) closed at
 schema 3.3.0. Gate 1's **harness half** closed at schema 3.5.0 — a task is now
 a directory on disk, validated before anything is spent, and scheduled by a
-resumable driver. The credential-expiry blind spot closed at **schema 3.6.0**.
-`verify_logger.py` PASSED on 3 of 3 consecutive runs, unit suite 446,
-integration 35, `mutation_check.py` **80/80**.
+resumable driver. The credential-expiry blind spot closed at **schema 3.6.0**, and the provider
+finish reason, the `host` block and collection identity at **schema 3.7.0**.
+`verify_logger.py` PASSED on 3 of 3 consecutive runs, unit suite 472,
+integration 37, `mutation_check.py` **90/90**.
 
 **That `verify_logger.py` line used to be worth less than it looked.** Until
 2026-08-13 the gate failed on 2 of 3 runs from a stale-`.pyc` defect (see item
@@ -224,7 +237,7 @@ Four gates. Each blocks the next; the section numbering below follows them.
 
 | gate | what it unlocks | state |
 |---|---|---|
-| **0 — capture** | the record can describe a run honestly | **done for the unrecoverable half** (3.3.0, extended 3.6.0); ~7 fields still structurally unpopulated, listed below |
+| **0 — capture** | the record can describe a run honestly | **done for the unrecoverable half** (3.3.0, extended 3.6.0 and 3.7.0); ~6 fields still structurally unpopulated, listed below |
 | **1 — a real task** | one real issue, end to end, on all four arms | **harness half done** (3.5.0, image fixed 2026-08-13); the dataset is the rest |
 | **2 — scale** | a 2,400-run unattended matrix | **P1 below.** Binding constraint measured 2026-08-13: ~20 cells per credential window |
 | **3 — numbers** | a scorecard anyone can defend | **P2 + P3 below**, plus the offline grader |
@@ -238,7 +251,7 @@ empty on every record**, measured across the four live runs of 2026-08-13:
 
 | field | why it is empty | class |
 |---|---|---|
-| `host.cpu_pct_p95`, `host.mem_peak_mb`, `host.contention_flag` | `RunContainer.stats()` has zero callers | **capture**, and `contention_flag: false` reads as measured |
+| ~~`host.cpu_pct_p95`, `host.mem_peak_mb`, `host.contention_flag`~~ | closed 3.7.0 — `HostSampler` samples `docker stats` for the life of the agent; `contention_flag` is `bool \| None` and narrow by design | **was capture** |
 | `time.retry_backoff_ms` | the proxy retries up to 3× and nothing records the backoff, so retry latency hides inside `inference_ms` | **capture** |
 | `tokens.reasoning` | not representable on the candidate adapters, and the provider returns 0 anyway | **capture**, only bites if thinking is turned on |
 | `tokens.cache_write_1h` | LiteLLM's Converse bridge drops Bedrock's `cacheDetails` | **capture**, harmless while the TTL is hardcoded 5m |
@@ -500,17 +513,19 @@ one ends a multi-day run outright.
   neither sees the other. Sequential today, so this is a precondition on
   parallelising the runner, not a live defect.
 
-- [ ] **`host` metrics are dead code: `container.stats()` has zero callers.**
-  `HostMetrics` collects `mem_peak_mb` at
-  [container.py](bakeoff/src/bakeoff/container.py) and nothing ever calls it, so
-  every record carries `{"cpu_pct_p95": null, "mem_peak_mb": null,
-  "contention_flag": false}`. `contention_flag` is the field that tells a slow
-  model from a loaded host, and §5.7 runs arms interleaved and parallel by
-  design. The 22× wall-clock spread in the quota item below is unattributable for
-  exactly this reason — there is no way to ask whether A1's 201.9 s was Nemotron
-  or the machine. `cpu_pct_p95` and `contention_flag` are not collected at all;
-  decide whether they come from `docker stats` sampling or are dropped from the
-  schema, but do not leave a field that reads as measured-and-zero.
+- [x] **`host` metrics are dead code: `container.stats()` has zero callers.**
+  Closed 2026-08-13 at schema 3.7.0. `HostSampler` holds a `stats(stream=True)`
+  generator for the life of the agent and records p95 container CPU, sampled
+  peak memory, host loadavg, the VM's vCPU count and a peer count.
+  `contention_flag` is `bool | None`, `None` on every unsampled run, and claims
+  only that another `bakeoff.eval_agent` container shared the host — it is
+  deliberately not derived from load, because `docker info` NCPU is 2 against
+  `os.cpu_count()` 18, so a loadavg threshold cannot fire and mixing the two
+  puts denominators from different machines behind one boolean. `load_p95` and
+  `vm_cpus` are recorded so an offline view can decide instead.
+
+  The 22× wall-clock spread below is still unattributable for the runs already
+  collected; from 3.7.0 on it is answerable.
 
 - [ ] **Confirm Bedrock service quotas** for the concurrency the plan needs
   (OPEN-3). Wall clock, not cost, is the binding constraint.
@@ -684,8 +699,9 @@ size. Two exceptions are marked CAPTURE and should ride along with Gate 1.
   0.0 and `TOOL_MALFORMATION`/`ADAPTER_FAILURE` can never fire),
   `truncation_events`, `p2p_regressions`, `diff_stats`, `Checkpoint.per_test`,
   `DestructiveEvent.affected_outcome`, `Exclusion.pre_registered` (always
-  `True`), `HostMetrics.contention_flag`. Populate or delete — deleting is
-  honest, leaving them is a claim. The `host` item in P1 is the same defect.
+  `True`). Populate or delete — deleting is honest, leaving them is a claim.
+  `HostMetrics.contention_flag` was on this list and came off it at 3.7.0: it is
+  now measured, or `None`.
 
   Recoverable from, where it matters: `diff_stats` from
   `checkpoints[].diff_vs_base`, `truncation_events` from wire `finish_reason` /

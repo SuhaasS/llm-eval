@@ -865,6 +865,148 @@ MUTATIONS = [
         "tests/test_credentials.py -k rather_than_a_traceback",
         "not integration",
     ),
+    (
+        # The route's own word for why generation stopped. Without it the
+        # record describes the end of a run only in Claude Code's translated
+        # vocabulary, and litellm's mapping is unrecorded.
+        "wire: stop capturing the provider's own finish reason",
+        "src/bakeoff/proxy_callback.py",
+        '    choices = response.get("choices")',
+        "    choices = None",
+        "tests/test_wire.py -k providers_own_finish_reason",
+        "not integration",
+    ),
+    (
+        # A failed entry reached no stopping decision. The fixture gives it a
+        # reason on purpose -- with None the isinstance check alone excludes
+        # it and nothing pins this guard.
+        "wire: count a failed call as a stop the provider reported",
+        "src/bakeoff/runner.py",
+        '        if metadata.get("failed"):\n'
+        "            continue\n"
+        '        reason = metadata.get("finish_reason")\n'
+        "        if isinstance(reason, str) and reason:\n"
+        "            counts[reason] = counts.get(reason, 0) + 1",
+        "        if False:\n"
+        "            continue\n"
+        '        reason = metadata.get("finish_reason")\n'
+        "        if isinstance(reason, str) and reason:\n"
+        "            counts[reason] = counts.get(reason, 0) + 1",
+        "tests/test_runner.py -k counts_only_calls_that_returned",
+        "not integration",
+    ),
+    (
+        # terminal_finish_reason walks BACKWARD past trailing failures -- the
+        # opposite of terminal_error_messages, whose subject is the failure.
+        # Forward yields the first call's reason, not the last.
+        "wire: read the first finish reason instead of the run's last",
+        "src/bakeoff/runner.py",
+        "    for entry in reversed(entries):\n"
+        '        metadata = entry.get("metadata") or {}\n'
+        '        if metadata.get("failed"):\n'
+        "            continue\n"
+        '        reason = metadata.get("finish_reason")',
+        "    for entry in entries:\n"
+        '        metadata = entry.get("metadata") or {}\n'
+        '        if metadata.get("failed"):\n'
+        "            continue\n"
+        '        reason = metadata.get("finish_reason")',
+        "tests/test_runner.py -k last_call_that_returned",
+        "not integration",
+    ),
+    (
+        # Through 3.6.0 every record ever written claimed the run had the host
+        # to itself, from this default, while nothing sampled at all. The
+        # selector must go through assemble_record: HostSampler.metrics()
+        # passes contention_flag explicitly on every path, so the default is
+        # never read there.
+        "host: let an unsampled run claim the machine was quiet",
+        "src/bakeoff/schema.py",
+        "    contention_flag: bool | None = None",
+        "    contention_flag: bool | None = False",
+        "tests/test_fault_injection.py -k does_not_claim_the_host_was_quiet",
+        "not integration",
+    ),
+    (
+        # A CPU reading is worth less than the checkpoint whose raise recorded
+        # CRASHED with zero turns for a working run on 2026-08-12.
+        "host: let a sampler failure escape into the run",
+        "src/bakeoff/container.py",
+        "        except Exception as exc:  # noqa: BLE001 - see the class docstring",
+        "        except KeyboardInterrupt as exc:",
+        "tests/test_container.py -k sampler_that_dies",
+        "not integration",
+    ),
+    (
+        # Measured: a stream's first frame carries precpu_stats with no
+        # system_cpu_usage, so the .get(..., 0) below deltas against the
+        # absolute system total and files a fabricated ~0% reading on every
+        # run. The guard and the .get are a pair -- with a subscript the
+        # KeyError would return None anyway and this mutation would be MISSED.
+        "host: file the first stream frame as a real zero-percent reading",
+        "src/bakeoff/container.py",
+        '            if "system_cpu_usage" not in pre:\n'
+        "                return None\n"
+        "            cpu_delta",
+        "            if False:\n"
+        "                return None\n"
+        "            cpu_delta",
+        "tests/test_container.py -k first_stream_frame",
+        "not integration",
+    ),
+    (
+        # __exit__ force-removes the container under a thread the 3s join may
+        # not have caught, so without this every such run records an error
+        # describing teardown rather than sampling.
+        "host: report teardown as a sampling failure",
+        "src/bakeoff/container.py",
+        "            if not self._stop.is_set():\n"
+        "                self._error =",
+        "            if True:\n"
+        "                self._error =",
+        "tests/test_container.py -k teardown_not_a_sampling_failure",
+        "not integration",
+    ),
+    (
+        # stop() is called from execute_run's OUTER finally, which is not
+        # inside a try -- a raise there escapes execute_run and the run
+        # produces no record at all, not even record.unwritten.json.
+        "host: let stopping the sampler cost the record",
+        "src/bakeoff/container.py",
+        "        except RuntimeError as exc:\n"
+        "            self._error = self._error or",
+        "        except KeyboardInterrupt as exc:\n"
+        "            self._error = self._error or",
+        "tests/test_container.py -k stop_is_total",
+        "not integration",
+    ),
+    (
+        # Unstamped, the path is a pure function of the cell and the next
+        # invocation's rmtree deleted the previous run's artifacts -- 12
+        # stored records point at a file that is not theirs.
+        "collection: let a later matrix delete an earlier record's artifacts",
+        "scripts/run_matrix.py",
+        '    return cache / "artifacts" / stamp',
+        '    return cache / "artifacts"',
+        "tests/test_matrix.py -k share_an_artifacts_path",
+        "not integration",
+    ),
+    (
+        # run_id names no episode, so two collections over the same cells mint
+        # identical ids -- 6 such ids in the stored corpus, one in seven logs.
+        # Three-line anchor: the same kwarg appears in execute_run's
+        # assemble_record call, with parent_run_id and attempt_number reversed.
+        "collection: stop the record naming which collection produced it",
+        "src/bakeoff/runner.py",
+        "        parent_run_id=parent_run_id,\n"
+        "        attempt_number=attempt_number,\n"
+        "        collection_id=collection_id,",
+        "        parent_run_id=parent_run_id,\n"
+        "        attempt_number=attempt_number,\n"
+        '        collection_id="",',
+        "tests/test_fault_injection.py -k which_collection_produced_it",
+        "not integration",
+    ),
 ]
 
 

@@ -1640,3 +1640,260 @@ Gate 1 (task manifest, per-task images, a real issue) and Gate 2 (credential
 refresh, run-level retry, parallel-safe prior-run lookup, `container.stats()`).
 `ToolCallStats.malformed` stays 0 at harness time — §6.4 puts the
 adapter-vs-model call offline.
+
+---
+
+## Gate 1 — the harness half of the real-task path — 2026-08-12
+
+Plan: [docs/superpowers/plans/2026-08-12-gate-1-real-task-path.md](../docs/superpowers/plans/2026-08-12-gate-1-real-task-path.md)
+
+`TASKS.md` framed Gate 1 as five missing pieces. That list was right and it was
+a list of symptoms; two root causes produce all five.
+
+**Root cause A — nothing had ever validated the harness's INPUT.** Every check
+that existed was about the harness (capture, attribution, isolation) or about a
+run's output (turns, tool calls, a diff). Nothing asserted that the thing handed
+to the agent was a task at all. That is the defect that invalidated every Phase
+0c capability figure, and `assert_agent_can_verify_its_work` — added as the fix
+— proves a binary is on `PATH`, which is a weaker claim than the one that
+matters.
+
+**Root cause B — the eval's operational knowledge lived in a script.**
+`smoke_test.py` was the only place that knew the proxy topology, both credential
+paths, the image build and the §5.2 dump. A driver written beside it would
+either duplicate that knowledge, at which point the Phase 0c gate certifies one
+environment and the paid run executes another, or reach into a script from
+library code.
+
+### What the precondition actually has to prove
+
+Not "pytest exists" but "**this task, in this image, at this start state, is red
+before the reference fix and green after it**". The distinction the whole gate
+rests on is one exit code: pytest's `1` means tests ran and failed, while
+`2`/`4`/`5` mean the environment is broken. Both are non-zero, so
+`returncode != 0` — the obvious implementation — accepts the exact Phase 0c
+failure as evidence the bug is present. `tests/test_preflight.py` reproduces
+that case end to end and the mutation check confirms the operator is
+load-bearing.
+
+It paid for itself on the first real task. `pallets/click`'s suite needs `less`
+on `PATH`; without it the pager test closes the borrowed stdout and 189
+unrelated tests error in setup and teardown. Invisible on macOS, invisible to
+any host-side check, and an agent handed that suite is debugging the image
+rather than the bug.
+
+### The start state is not `base_sha`
+
+A real bug-fix PR carries the test that proves the fix, so at `base_sha` the
+oracle does not exist and §3.3's loop has nothing to run — the Phase 0c
+truncation arriving through the dataset instead of the image. The test half is
+therefore applied and **committed**, and that commit is what the container
+detaches to: the submission diff does not carry the test patch, and
+`restore_paths` restores the patched tests rather than deleting them.
+
+Fixed author, committer, date and message make the commit a pure function of
+(base_sha, test half, gitignore_extra), so `start_sha` can be pinned in the
+manifest and a mismatch is a load error. That is what catches a re-cut patch.
+
+One reference diff, split at load rather than two hand-maintained patch files.
+The split is a partition and is checked as one, so nothing can be dropped from
+the thing the offline grader will compare against.
+
+### Three things the design got wrong before it was written down
+
+Recorded because the plan document was iterated twice before any code:
+
+- **Per-test results by report parsing.** Rejected: pytest's JUnit `classname`
+  cannot be mapped back to a node id unambiguously, so the parser becomes a
+  second thing that can be wrong about what happened, inside the check that
+  exists to be right about it. Explicit selection and `--deselect` reduce the
+  whole verdict to exit codes and `FAILED` lines.
+- **Resume against an edited task.** `task_version` is not part of `run_id`, so
+  editing a task leaves every existing cell looking complete and the matrix
+  silently mixes two tasks under one `task_id`. This was the most damaging hole
+  in the first draft and it is the exact class Gate 1 exists to close. Now a
+  hard refusal, per cell.
+- **`.gitignore` as a file to check for.** The property that matters is that
+  running the suite leaves the tree clean; a `.gitignore` that does not cover
+  what *this* suite drops passes the filename check and fails the real one.
+
+### The defect found while verifying, which is the reason to verify
+
+`verify_logger.py` failed once, then passed. The tempting reading is "flake".
+The record said otherwise:
+
+```
+ContainerError: git add -A failed (exit 128): fatal: unable to stat 'calc.py.tmp...'
+```
+
+Checkpoints are captured **while** the agent edits, and Claude Code's Write is
+atomic — it creates `<name>.tmpXXXX` and renames it. A rename landing between
+git's readdir and its stat makes `git add -A` exit 128. And because
+`maybe_capture` is called from inside the agent's stdout loop, the exception did
+not lose a checkpoint: it unwound out of `ClaudeCodeRunner.run`, past the
+container context manager, into `execute_run`'s catch-all, and the run was
+recorded as **CRASHED with zero turns, zero tokens, no diff and no cost** — for
+a run that was working. One offline arm in seven.
+
+Three changes, because any one alone is a worse fix:
+
+- **Retry** the lost race, bounded, and only for that message. `--ignore-errors`
+  would drop the file from the snapshot and report success, which is a wrong
+  diff rather than a missing one.
+- **Contain** the residual failure. Checkpoints are supplementary evidence
+  (§5.5's curve); the trajectory and the final diff are the run's product, and
+  the tokens are spent by the time the recorder is called.
+- **Name the gap** (`checkpoint_error`, schema 3.5.0). Containment alone swaps a
+  loud wrong record for a quiet one: a short `checkpoints` list is
+  byte-identical to an agent that changed nothing for two turns, and the §5.5
+  curve is computed post-hoc over exactly that list.
+
+`force_capture` is deliberately still allowed to raise — it runs after the agent
+exits, has no race left to lose, and its diff *is* the submission.
+
+### Schema moved twice, both times for a field's meaning rather than its shape
+
+3.4.0: `task_set_commit` is populated. An empty string used to say "no dataset
+exists" and now says "this task did not come from a task set" — same bytes,
+different claim.
+
+3.5.0: `checkpoint_error`. Before it, an empty `checkpoints` list meant either
+an idle agent or a crash somewhere else entirely.
+
+### Not in scope, deliberately
+
+The dataset itself (~80 tasks, §3.5) and everything in Gate 2. A hand-written
+task Dockerfile escape hatch is deferred: every escape hatch is a way back to
+the two structural failures the generator makes impossible.
+
+### The result
+
+Four arms, N=1, `pallets/click` #3360, 2026-08-12 (`eventlog-gate1`). Four
+records, exit 0: no stranded cells, no uninterpretable rows, every arm isolated
+with full wire attribution and `sampling_source: resolved` on all three
+candidates.
+
+| arm | turns | tools | wall | cost | diff | terminated_by |
+|---|---|---|---|---|---|---|
+| claude-sonnet-5-runtime | 16 | 15 | 98.9 s | $0.349 | 618 B | agent_finish |
+| kimi-k2-5 | 23 | 22 | 62.3 s | unpriced | 1,485 B | agent_finish |
+| nemotron-3-super-120b | 40 | 40 | 101.3 s | $0.180 | 2,493 B | **turns** |
+| gemma-4-31b | 40 | 38 | 369.5 s | unpriced | 1,215 B | agent_finish |
+
+A hand-run of the oracle over the four stored diffs — not the harness, which
+still never grades — says all four **resolved** it: every submission applied
+cleanly to the start state and both f2p and p2p pass after restoring the test
+files (§4.2.1 check 2). Nemotron's submission rewrites `write_usage` more
+broadly than the reference does and still passes, which is the property the
+task was chosen for: its tests assert rendered output rather than an internal
+name.
+
+Three things that matter more than the pass rate:
+
+- **This task would be dropped by §3.5's own rule.** All four solving it makes
+  it a ceiling task with no discriminating signal. Right task to prove Gate 1,
+  wrong task to keep in a frozen set.
+- **The 40-turn placeholder cap is already binding.** Nemotron terminated on
+  `turns` with a working submission in hand. §5.4 sets caps from the
+  calibration pilot's slowest-converging model; until that runs, no
+  turn-limited result means what it looks like.
+- **Two of three candidate rows were unpriced**, and the two priced rows were
+  Sonnet and Nemotron. On a 20k-line repository the cache is warm nearly every
+  turn, so the pricing hole is the normal state of a candidate row rather than
+  an edge case — much worse than it looked on a 157-byte fixture.
+
+Also confirmed on real data: the submission diff contains only `src/`, never
+the test half, so committing the oracle into the start state does what it was
+designed to do.
+
+---
+
+## The two cheap pre-collection items, and the identity defect found under them
+
+**2026-08-13, schema 3.7.0.** 472 unit tests, 37 integration, 90/90 mutations.
+Planned across six adversarial review rounds (47 findings, all fixed) before any
+code was written; the rounds are why the last three items below exist at all.
+
+### 1. The provider's own finish reason
+
+The record described the end of a run only in Claude Code's translated
+vocabulary — `per_turn[].stop_reason` from the transcript, `terminated_by`
+derived from the last of those. litellm's mapping from the route's own word was
+captured in the wire log and reachable only by decompressing an artifact, which
+is what answering "did nemotron finish or get cut off?" cost by hand.
+
+Both capture paths now stamp `metadata.finish_reason`; the record carries
+`finish_reasons` (a histogram) and `terminal_finish_reason` beside
+`terminated_by`. Measured: all four arms log an OpenAI-shaped response, so
+`choices[0].finish_reason` is uniform — including `claude-sonnet-5-runtime` on
+the bedrock Invoke route.
+
+**Record-level, not per-turn, and that was checked rather than assumed.** No
+join key exists: the transcript keys on `message.id` (`msg_bdrk_…`), the wire
+log's `response.id` is a litellm-generated UUID, `TurnRecord.bedrock_request_id`
+was `None`, and `proxy_callback` never writes one at all. Joining by position is
+wrong on any arm that retried — nemotron's stored run is 44 entries against 40
+successes.
+
+### 2. The host block
+
+`RunContainer.stats()` had zero callers. All 24 stored records carry
+`{"contention_flag": false, "cpu_pct_p95": null, "mem_peak_mb": null}` — two
+honest nulls and one positive claim ("this run had the host to itself") produced
+by a dataclass default.
+
+`HostSampler` holds a `stats(stream=True)` generator for the life of the agent.
+Verified against a real container: `cpu_pct_p95` 99.4 on a one-core busy loop,
+`vm_cpus` 2, `samples` 3, `error` empty.
+
+Three things the review rounds changed about this design:
+
+- **`contention_flag` as first drafted could never fire.** `docker info` NCPU is
+  **2**; `os.cpu_count()` is **18**. A `loadavg/cpu_count` threshold needs host
+  load above 18 while the agent's budget is a 2-vCPU VM, and pairing it with a
+  container percentage scaled by `online_cpus=2` puts two machines' denominators
+  behind one boolean. The flag now claims one narrow thing — another
+  `bakeoff.eval_agent` container shared the host — and `load_p95`, `vm_cpus` and
+  `cpu_pct_p95` are recorded for an offline view to interpret. The harness
+  measures; it does not decide.
+- **It then fabricated `False` a second way.** `any([]) is False`, so gating on
+  frames rather than on peer observations turned "no docker client / every poll
+  failed" into "nobody else was here". Gated on `_peers`, with the poll failure
+  named in `error`.
+- **The first stream frame is a trap.** Measured: it carries `precpu_stats` with
+  `cpu_usage` and **no** `system_cpu_usage`, so `pre.get("system_cpu_usage", 0)`
+  deltas against the absolute system total — enormous, positive, and passing any
+  `sys_delta <= 0` check. A fabricated ~0.000003% reading on every run. Guard on
+  the key; keep the `.get` beside it or the guard is dead code no mutation can
+  catch.
+
+And the containment nearly cost what it was protecting: `stop()` joins a thread
+`start()` may never have started, that raises, and it is called from
+`execute_run`'s **outer `finally`**, which is not inside a `try` — so the
+exception escapes `execute_run` and the run produces **no record at all**, not
+even `record.unwritten.json`. Both `start()` and `stop()` are now total.
+
+### 3. Collection identity — found while measuring item 1
+
+`eventlog-gate1`'s gemma record claims `wire_entries_seen: 40`; the file its
+`artifacts.wire_log_gz` points at holds **23 lines**, written seven hours later.
+
+Root cause is not the path. `run_id = sha256(task|model|sample|attempt)` **names
+no collection episode**, so identity is unique within a matrix and not across
+one. The artifacts path repeated the mistake in path form —
+`CACHE/artifacts/<cell>`, unstamped while `wire_dir` on the next line was
+stamped — and `run_cell` rmtree'd it before every attempt, so the delete landed
+before `execute_run`'s `mkdir` and `WireLogger`'s `"x"` never fired.
+
+Census across all 10 stored event logs: 24 records, **9 distinct `run_id`s, 6 in
+more than one log** (`11ab9cf6527a188f` in seven), and **12 records whose
+`wire_entries_seen` disagrees with the file they point at**. Every matrix
+summary reports `stranded: []`.
+
+Fixed by stamping the root, deleting the rmtree — a delete keyed on a path with
+no `attempt_number` re-arms this the moment run-level retry lands — and adding
+`collection_id` to the record and to the event-log index, which is the surface a
+merging reader scans. `smoke_test` and `dry_run` pass one too.
+
+**Not repaired, and cannot be:** the log is append-only and those artifacts are
+gone. `TASKS.md` carries the caveats a reader of pre-3.7.0 records needs.
