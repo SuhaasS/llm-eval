@@ -638,6 +638,18 @@ class RunRecord:
     schema_version: str = SCHEMA_VERSION
     parent_run_id: str | None = None
     attempt_number: int = 1
+    # Which collection episode produced this run -- run_matrix's invocation
+    # stamp, "" when nothing said.
+    #
+    # `run_id` is sha256(task|model|sample|attempt) and names no episode, so it
+    # is unique WITHIN a collection and not across one: two matrices over the
+    # same cells mint identical ids. Measured across the 10 stored event logs
+    # -- 9 ids, 6 of them in more than one log, one in seven -- and an offline
+    # reader merging logs would treat each group as a single run.
+    #
+    # This does not make ids unique; that would change the identity scheme every
+    # stored record was written under. It makes a collision visible.
+    collection_id: str = ""
 
     # Two independent counts of the same thing, stored because they disagree in
     # informative ways and a single number hid a 2x token inflation for months.

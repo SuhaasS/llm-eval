@@ -171,14 +171,40 @@ def resolve_tasks(tasks, base_image, expected_version, cache, force):
     return resolved, failures
 
 
-def run_cell(cell, task, resolved, args, event_log, wire_dir, network, artifacts):
+def artifacts_root(cache: Path, stamp: str) -> Path:
+    """Per-invocation, like the wire directory beside it.
+
+    `run_cell` rmtree'd a cell's directory before every attempt and the path was
+    a pure function of the cell, so a later invocation deleted an earlier run's
+    artifacts and left that record's `artifacts.*` pointing at the replacement.
+    The record survived intact; what it pointed at did not, and WireLogger's
+    "x" cannot catch it because the delete precedes execute_run's mkdir.
+
+    It also saves `record.unwritten.json`, which `_write_or_strand` writes into
+    artifacts_root -- the one artifact the "a run always produces a record"
+    invariant exists to preserve, and the next attempt on that cell deleted it.
+
+    Records store absolute paths, so a matrix resumed under a new stamp reads
+    back correctly across both.
+    """
+    return cache / "artifacts" / stamp
+
+
+def run_cell(cell, task, resolved, args, event_log, wire_dir, network, artifacts,
+             collection_id):
     from bakeoff.claude_runner import ClaudeCodeConfig
     from bakeoff.proxy_callback import unattributed_count
     from bakeoff.runner import execute_run
 
     run_root = artifacts / f"{cell.task_id}-{cell.model}-{cell.sample_index}"
     repo = run_root / "repo"
-    shutil.rmtree(run_root, ignore_errors=True)
+    # No rmtree. The artifacts root is per-invocation, so this path is new
+    # every time and there is nothing to clear -- and a delete keyed on a path
+    # with no attempt_number in it becomes the artifacts-collision bug the
+    # moment run-level retry lands (TASKS.md P1): two attempts of one cell
+    # would share a stamp AND a directory, and the second would delete the
+    # first's artifacts and its record.unwritten.json while both records live
+    # in the log.
     # A fresh tree per run. Sharing one would let a later sample start from
     # an earlier sample's dirty state and report a diff its own agent never
     # made (spec section 5.1: fresh container per sample, no state bleed).
@@ -210,6 +236,7 @@ def run_cell(cell, task, resolved, args, event_log, wire_dir, network, artifacts
         event_log=event_log,
         repo_path=str(repo),
         artifacts_root=run_root / "artifacts",
+        collection_id=collection_id,
         network=network,
         proxy_wire_dir=wire_dir,
         # Section 5.2's highest-risk contamination source. Claude Code does
@@ -419,7 +446,7 @@ def main() -> int:
         "litellm_config.yaml" if args.mode == "live" else "litellm_smoke_offline.yaml"
     )
     build_proxy_image(REPO)
-    artifacts = CACHE / "artifacts"
+    artifacts = artifacts_root(CACHE, stamp)
     wire_dir = CACHE / "wire" / stamp
 
     rows: list[dict] = []
@@ -466,6 +493,7 @@ def main() -> int:
                 record, config_dump, unattributed = run_cell(
                     cell, task, resolved[cell.task_id], args,
                     event_log, wire_dir, proxy.internal_name, artifacts,
+                    stamp,
                 )
                 cell_wall_s = time.monotonic() - cell_started
             except Exception as exc:  # noqa: BLE001 - one cell, not the matrix

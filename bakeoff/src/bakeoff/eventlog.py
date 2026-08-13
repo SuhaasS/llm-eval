@@ -66,6 +66,11 @@ class EventLog:
                         "outcome": record.outcome.value,
                         "started_at": record.started_at,
                         "schema_version": record.schema_version,
+                        # The index is the surface a reader merging logs
+                        # actually scans, and run_id alone cannot separate two
+                        # collections over the same cells -- 6 ids in the
+                        # stored corpus appear in more than one log.
+                        "collection_id": record.collection_id,
                         # For last_run_for: whether this run made a model call
                         # at all, which is what decides if it warmed the cache.
                         # `outcome` cannot answer that -- see that docstring.

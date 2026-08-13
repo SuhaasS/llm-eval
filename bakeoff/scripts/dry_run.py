@@ -127,6 +127,7 @@ def main() -> int:
             event_log=log,
             repo_path=str(repo),
             artifacts_root=workdir / "artifacts",
+            collection_id=workdir.name,
         )
 
         print()

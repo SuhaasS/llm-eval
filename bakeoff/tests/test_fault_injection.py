@@ -1828,3 +1828,31 @@ def test_an_unsampled_run_does_not_claim_the_host_was_quiet(task, tmp_path):
     )
     assert record.host.contention_flag is None
     assert record.host.samples == 0
+
+
+def test_a_record_says_which_collection_produced_it(task, tmp_path):
+    """run_id is sha256(task|model|sample|attempt) and names no episode, so two
+    collections over the same cells produce identical ids. An offline reader
+    merging event logs would treat different runs as one -- and 6 such ids
+    already exist, one of them in seven logs. Recorded rather than repaired:
+    the log is append-only."""
+    record = assemble_record(
+        task=task, model="kimi-k2-5", sample_index=0,
+        started_at="2026-08-13T00:00:00Z", finished_at="2026-08-13T00:00:30Z",
+        trajectory_path=None, runner_result=None, checkpoints=[],
+        destructive_events=[], artifacts_root=tmp_path,
+        collection_id="20260813T075544Z",
+    )
+    assert record.collection_id == "20260813T075544Z"
+
+
+def test_a_record_with_no_collection_states_that_rather_than_guessing(task, tmp_path):
+    """"" is every record written before 3.7.0 and every non-matrix path --
+    honest, and distinguishable from a named episode."""
+    record = assemble_record(
+        task=task, model="kimi-k2-5", sample_index=0,
+        started_at="2026-08-13T00:00:00Z", finished_at="2026-08-13T00:00:30Z",
+        trajectory_path=None, runner_result=None, checkpoints=[],
+        destructive_events=[], artifacts_root=tmp_path,
+    )
+    assert record.collection_id == ""

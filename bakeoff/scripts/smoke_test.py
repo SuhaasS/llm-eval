@@ -369,6 +369,9 @@ def run_arm(
         event_log=event_log,
         repo_path=str(repo),
         artifacts_root=arm_dir / "artifacts",
+        # The smoke gate mints the same deterministic run_ids the matrix does,
+        # so two invocations are indistinguishable in a merged view without it.
+        collection_id=workdir.name,
         network=network,
         proxy_wire_dir=wire_dir,
         settings_host_path=REPO / "config" / "eval_settings.json",

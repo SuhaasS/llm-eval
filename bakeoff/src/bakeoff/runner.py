@@ -507,6 +507,7 @@ def assemble_record(
     isolated: bool | None = False,
     isolation_evidence: str = "",
     host: HostMetrics | None = None,
+    collection_id: str = "",
     adapter_patches: list[str] | None = None,
     proxy_litellm: str = "",
     crash_error: str = "",
@@ -661,6 +662,7 @@ def assemble_record(
         turns_streamed=int(getattr(runner_result, "turns_streamed", 0) or 0),
         parent_run_id=parent_run_id,
         attempt_number=attempt_number,
+        collection_id=collection_id,
         versions=versions or Versions(
             claude_code=parsed.claude_code_version,
             container_image_digest=task.container_image_digest,

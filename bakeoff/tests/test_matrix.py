@@ -10,6 +10,7 @@ task_id.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -424,3 +425,20 @@ def test_the_spec_carries_the_start_state_not_the_upstream_base():
     assert spec.base_sha != _Task.base_sha
     assert spec.test_paths == ["tests/test_x.py"]
     assert spec.task_set_commit == "c" * 40
+
+
+def test_two_invocations_cannot_share_an_artifacts_path():
+    """Records are immutable; what they point at was not. `artifacts = CACHE /
+    "artifacts"` was a pure function of the cell and run_cell rmtree'd that path
+    before every attempt, so a re-run under a different event log deleted the
+    earlier run's artifacts and left its record pointing at the replacement.
+
+    Confirmed across all 10 stored event logs: 9 run_ids, 6 of them in more
+    than one log (one in seven), and 12 records whose wire_entries_seen
+    disagrees with the file they point at.
+
+    WireLogger's "x" cannot catch it -- the delete precedes the mkdir."""
+    from scripts.run_matrix import artifacts_root
+
+    assert artifacts_root(Path("/c"), "A") != artifacts_root(Path("/c"), "B")
+    assert "A" in str(artifacts_root(Path("/c"), "A"))
