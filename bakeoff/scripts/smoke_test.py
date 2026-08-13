@@ -33,7 +33,6 @@ import json
 import shutil
 import subprocess
 import sys
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -42,29 +41,26 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO))
 
+# Re-exported, not redefined. These moved into the package so the matrix
+# driver could run the eval's real topology instead of a second copy of it
+# (see bakeoff/proxy.py); the names stay importable from here because this
+# script is the Phase 0c gate's operator-facing entry point and its tests
+# address it by that name.
+from bakeoff.proxy import (  # noqa: E402
+    EVAL_ARMS,
+    SSO_LOGIN_HINT,
+    Proxy as _Proxy,
+    freeze_sigv4_credentials,
+    proxy_environment,
+)
+from bakeoff.session import (  # noqa: E402
+    config_differences,
+    config_problems,
+    effective_config,
+)
+
 AGENT_TAG = "bakeoff-eval-agent:smoke"
 PROXY_TAG = "bakeoff-litellm-proxy:smoke"
-
-# The four arms of the eval. NOT one transport: Sonnet 5 runs on
-# bedrock-runtime and the three candidates on bedrock-mantle.
-#
-# That split is not a preference. The mantle passthrough derives
-# `anthropic-beta` HTTP headers from Claude Code's context_management and
-# output_config and mantle rejects them, so the mantle Sonnet arm 400s on
-# every call with "invalid beta flag" -- measured twice on 2026-08-07, and
-# additional_drop_params cannot reach a header. bedrock-runtime carries beta
-# values as a request-body field instead and completes the task.
-#
-# The cost is a section 6.4 confound on the reference arm, tracked in
-# TASKS.md: Sonnet is not transport-identical to the arms it is the reference
-# for. `claude-sonnet-5` stays reachable through --models as the control that
-# demonstrates the difference, but it does not earn a slot in the default set.
-EVAL_ARMS = [
-    "claude-sonnet-5-runtime",
-    "gemma-4-31b",
-    "nemotron-3-super-120b",
-    "kimi-k2-5",
-]
 
 # Phase 0c's exit criterion. One run per arm structurally cannot see a failure
 # RATE, only a failure -- and the two 2026-08-07 runs proved the point: Kimi
@@ -178,99 +174,21 @@ def run_problems(
     ):
         problems.append("no diff: nothing was submitted")
 
-    if not record.isolated:
+    # Tri-state, matching matrix.infra_problems. `not record.isolated` reported
+    # a run whose container never started -- where nobody measured -- as a
+    # section 5.1 violation, a claim invented from an absence.
+    if record.isolated is False:
         problems.append("isolated=False: section 5.1 did not hold")
+    elif record.isolated is None:
+        problems.append(
+            "isolation could not be measured: the container never started, so "
+            "section 5.1 is unverified rather than violated"
+        )
     if record.exclusion is not None:
         problems.append("run was excluded as an infra or adapter failure")
 
     problems.extend(config_problems(config))
     return problems
-
-
-# --- spec section 5.2: what the session actually loaded ----------------------
-
-
-def effective_config(stream: Path) -> dict:
-    """The stream-json init event, or {} if there is not one.
-
-    Read from the agent's STDOUT, not from the session transcript. The
-    transcript records messages; the init event carrying the effective
-    model, tools, MCP servers and permission mode is emitted only on the
-    stream and is nowhere on disk otherwise. Verified against claude
-    2.1.220 -- a transcript from a completed run contains queue-operation,
-    user, attachment, assistant and last-prompt records, and no init.
-
-    Section 5.2 requires dumping and diffing the effective config at session
-    start. This is the only place the harness can see what the session
-    LOADED rather than what it was told to load -- and the difference is
-    the whole point, since Claude Code does not fail on a --settings path
-    that does not exist.
-    """
-    try:
-        lines = stream.read_text().splitlines()
-    except OSError:
-        return {}
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if event.get("type") == "system" and event.get("subtype") == "init":
-            return event
-    return {}
-
-
-def config_problems(config: dict) -> list[str]:
-    """Section 5.2 checks against the dump.
-
-    An empty dump is a failure, never a pass. Treating "nothing observed" as
-    "nothing wrong" would turn the one check that can catch an unloaded
-    settings file into a check that always succeeds.
-    """
-    if not config:
-        problems = ["no init event: cannot verify what the session loaded"]
-        return problems
-
-    problems = []
-    mode = config.get("permissionMode")
-    if mode != "bypassPermissions":
-        # The tell for a --settings path that does not exist. Without the
-        # settings the agent cannot edit anything, so every arm lands no
-        # diff and a harness bug reads as four capability findings.
-        problems.append(
-            f"permissionMode is {mode!r}, not 'bypassPermissions': "
-            "the settings file did not load"
-        )
-    if config.get("mcp_servers"):
-        problems.append(
-            f"{len(config['mcp_servers'])} MCP server(s) loaded despite "
-            "--strict-mcp-config: this arm had tools the others did not"
-        )
-    if not config.get("tools"):
-        problems.append("no tools in the init event: the agent had nothing to call")
-    return problems
-
-
-def config_differences(configs: dict[str, dict]) -> list[str]:
-    """Section 5.2's diff half: identical across arms except the model.
-
-    Two arms configured differently are not comparable, and the comparison
-    is the entire deliverable.
-    """
-    compared = ("permissionMode", "mcp_servers", "tools", "slash_commands")
-    baseline_arm, baseline = next(iter(configs.items()))
-    differences = []
-    for arm, config in configs.items():
-        for key in compared:
-            if config.get(key) != baseline.get(key):
-                differences.append(
-                    f"{arm}.{key} differs from {baseline_arm}: "
-                    f"{config.get(key)!r} vs {baseline.get(key)!r}"
-                )
-    return differences
 
 
 # --- the fixture -------------------------------------------------------------
@@ -365,287 +283,24 @@ def assert_agent_can_verify_its_work(image: str) -> None:
 # --- the proxy ---------------------------------------------------------------
 
 
-class Proxy:
-    """The LiteLLM proxy container, on two networks.
+class Proxy(_Proxy):
+    """`bakeoff.proxy.Proxy` bound to this script's image tag and repo root.
 
-    The agent must be isolated (section 5.1) and the proxy must reach
-    Bedrock. Those are incompatible on one network: `internal=True` removes
-    the external route by definition. So the agent joins the internal
-    network only, and the proxy joins both -- it is the recording hop, and
-    the only thing on the eval network with a way out.
-
-        agent --[internal]-- proxy --[egress]-- Bedrock
-
-    Names are unique per invocation. A leftover `litellm` container from a
-    crashed integration run would otherwise satisfy the healthcheck and
-    answer with the wrong config.
+    The class moved into the package so the matrix driver runs the same
+    topology rather than a second copy of it. This subclass exists only so
+    the call site below, and the operator-facing name, stay unchanged.
     """
 
-    def __init__(
-        self,
-        config_name: str,
-        wire_dir: Path,
-        env: dict[str, str],
-        tag: str,
-        with_stub: bool = False,
-    ):
-        self.config_name = config_name
-        self.wire_dir = wire_dir
-        self.env = env
-        self.tag = tag
-        self.with_stub = with_stub
-        self.stub = None
-        self.internal_name = f"bakeoff-smoke-internal-{tag}"
-        self.egress_name = f"bakeoff-smoke-egress-{tag}"
-        self.container = None
-        self.internal = None
-        self.egress = None
-
-    def __enter__(self):
-        import docker
-
-        client = docker.from_env()
-        self.wire_dir.mkdir(parents=True, exist_ok=True)
-        self.internal = client.networks.create(
-            self.internal_name, driver="bridge", internal=True
+    def __init__(self, config_name, wire_dir, env, tag, with_stub=False):
+        super().__init__(
+            config_name=config_name,
+            wire_dir=wire_dir,
+            env=env,
+            tag=tag,
+            image=PROXY_TAG,
+            repo_root=REPO,
+            with_stub=with_stub,
         )
-        self.egress = client.networks.create(self.egress_name, driver="bridge")
-        if self.with_stub:
-            # On the internal network only. It stands in for Bedrock, so if
-            # it could be reached any other way the offline gate would stop
-            # proving that the agent's only route is through the proxy.
-            self.stub = client.containers.run(
-                PROXY_TAG,
-                entrypoint=["python", "/app/fixtures/anthropic_stub.py"],
-                command=[],
-                name=f"stub-{self.tag}",
-                network=self.internal_name,
-                volumes={
-                    str(REPO / "fixtures"): {"bind": "/app/fixtures", "mode": "ro"}
-                },
-                detach=True,
-            )
-            self.internal.disconnect(self.stub)
-            self.internal.connect(self.stub, aliases=["stub"])
-        self.container = client.containers.run(
-            PROXY_TAG,
-            command=[
-                "--config",
-                f"/app/config/{self.config_name}",
-                "--port",
-                "4000",
-                "--host",
-                "0.0.0.0",
-            ],
-            # The hostname the agent resolves through Docker's embedded DNS.
-            # base_url is http://litellm:4000 for exactly this reason: an
-            # internal network has no host route, so 127.0.0.1 is the
-            # agent's own container.
-            name=f"litellm-{self.tag}",
-            hostname="litellm",
-            network=self.internal_name,
-            environment=self.env,
-            volumes={
-                str(REPO / "src"): {"bind": "/app/src", "mode": "ro"},
-                str(REPO / "config"): {"bind": "/app/config", "mode": "ro"},
-                str(self.wire_dir): {"bind": "/eval/wire", "mode": "rw"},
-            },
-            detach=True,
-        )
-        # Aliased so the name stays `litellm` on the internal network even
-        # though the container name is unique.
-        self.internal.disconnect(self.container)
-        self.internal.connect(self.container, aliases=["litellm"])
-        self.egress.connect(self.container)
-        self._wait()
-        return self
-
-    def _wait(self, timeout_s: int = 120) -> None:
-        """Probe from INSIDE the container: the internal network has no host
-        route, so there is nothing to curl from here."""
-        deadline = time.time() + timeout_s
-        while time.time() < deadline:
-            self.container.reload()
-            if self.container.status != "running":
-                raise RuntimeError(
-                    "proxy exited before serving:\n"
-                    + self.container.logs(tail=40).decode("utf-8", "replace")
-                )
-            probe = self.container.exec_run(
-                [
-                    "python",
-                    "-c",
-                    "import urllib.request;"
-                    "urllib.request.urlopen("
-                    "'http://127.0.0.1:4000/health/liveliness', timeout=2)",
-                ]
-            )
-            if probe.exit_code == 0:
-                return
-            time.sleep(2)
-        raise RuntimeError(
-            "proxy did not become ready:\n"
-            + self.container.logs(tail=40).decode("utf-8", "replace")
-        )
-
-    def logs(self, tail: int = 40) -> str:
-        if self.container is None:
-            return ""
-        return self.container.logs(tail=tail).decode("utf-8", "replace")
-
-    def request_count(self) -> int:
-        """Client requests the proxy served, counted from its own log.
-
-        The independent check on capture: every call the proxy answered must
-        appear in the wire log or in unattributed.jsonl. A call that lands in
-        neither is silently missing evidence, and section 6.2 makes the wire
-        log the record of what went over the wire -- an incomplete one is
-        worse than an absent one, because it looks complete.
-
-        This counts INBOUND requests, which is not the same quantity as the
-        wire log's entries: `num_retries: 3` means one request can produce
-        several provider attempts, each its own callback invocation. The
-        reconciliation in main() is what reads the two against each other.
-
-        Untruncated on purpose. `tail=10000` silently capped the numerator on
-        a long run, so a matrix big enough to matter would under-report served
-        and the check would pass by losing evidence of losing evidence.
-        """
-        return self.logs(tail="all").count("POST /v1/messages")
-
-    def __exit__(self, *_exc):
-        # Kept unconditionally: on a teardown after a failure this is the
-        # only account of what the proxy saw.
-        try:
-            (self.wire_dir.parent / "proxy.log").write_text(self.logs(tail=10000))
-        except Exception:  # noqa: BLE001
-            pass
-        # Containers first, and networks only after. A network with an
-        # attached container refuses to go, and Network.remove() takes no
-        # `force` -- passing one raises TypeError, which a bare except then
-        # swallows, leaking a network per invocation until the daemon runs
-        # out of address space.
-        for container in (self.container, self.stub):
-            if container is None:
-                continue
-            try:
-                container.remove(force=True)
-            except Exception:  # noqa: BLE001 - teardown must not mask a failure
-                pass
-        for network in (self.internal, self.egress):
-            if network is None:
-                continue
-            for _ in range(10):
-                try:
-                    network.remove()
-                    break
-                except Exception:  # noqa: BLE001 - container removal is async
-                    time.sleep(1)
-        return False
-
-
-SSO_LOGIN_HINT = (
-    "  AWS_CONFIG_FILE=bakeoff/.aws/config aws sso login --profile pindrop-bakeoff"
-)
-
-
-def freeze_sigv4_credentials(region: str) -> dict[str, str]:
-    """Resolve the ambient AWS session into literal keys for the container.
-
-    The bedrock-runtime arms sign SigV4, and the proxy container cannot
-    resolve an SSO profile itself: it has no ~/.aws, no SSO cache and no
-    browser to re-authenticate with. Freezing on the host and passing the
-    triple in is the only way those arms reach Bedrock at all.
-
-    These are temporary STS credentials and inherit the SSO session's expiry,
-    the same hours-not-days horizon as the mantle token -- the unattended
-    multi-day run in TASKS.md P1 needs a refresh path that does not exist yet,
-    for both transports rather than just one.
-    """
-    import boto3
-
-    session = boto3.Session(region_name=region)
-    credentials = session.get_credentials()
-    if credentials is None:
-        return {}
-    frozen = credentials.get_frozen_credentials()
-    env = {
-        "AWS_ACCESS_KEY_ID": frozen.access_key,
-        "AWS_SECRET_ACCESS_KEY": frozen.secret_key,
-        # Region twice on purpose: LiteLLM reads AWS_REGION_NAME, botocore
-        # reads AWS_DEFAULT_REGION, and a deployment without aws_region_name
-        # would otherwise sign against a region it guessed.
-        "AWS_REGION_NAME": region,
-        "AWS_DEFAULT_REGION": region,
-    }
-    if frozen.token:
-        env["AWS_SESSION_TOKEN"] = frozen.token
-    return env
-
-
-def proxy_environment(mode: str) -> dict[str, str]:
-    """Credentials for the proxy container. Live mode only.
-
-    The agent is passed none of these and never sees them: it reaches
-    Bedrock through the proxy over HTTP, which is what makes both credentials
-    single-hop secrets.
-
-    Both transports are provisioned, because Sonnet 5 is served over
-    bedrock-runtime while the three candidates are served over
-    bedrock-mantle (see config/litellm_config.yaml). The mantle token is
-    passed as BAKEOFF_MANTLE_TOKEN and NOT as AWS_BEARER_TOKEN_BEDROCK:
-    LiteLLM's bedrock/ handler falls back to the AWS-named variable when a
-    deployment has no api_key, so setting it here would bearer-authenticate
-    every runtime arm and fail them with `bedrock:CallWithBearerToken`.
-    """
-    if mode != "live":
-        return {}
-
-    import os
-
-    from scripts.smoke_bedrock import (
-        ENV_FILE,
-        LITELLM_BEARER_ENV,
-        MANTLE_ENV,
-        derive_mantle_token,
-        load_env_file,
-        normalize_mantle_token,
-        resolve_aws_paths,
-        scrub_placeholders,
-    )
-
-    load_env_file(ENV_FILE)
-    scrub_placeholders()
-    resolve_aws_paths()
-    normalize_mantle_token()
-
-    region = os.environ.get("AWS_REGION_NAME") or "us-east-1"
-
-    token = os.environ.get(MANTLE_ENV, "")
-    if not token:
-        # Minted from the current SSO session, in memory, never written to
-        # disk. A long-lived key in .env would outlive the run that needed
-        # it and sit there with no expiry anyone tracks.
-        token = derive_mantle_token(region)
-        if token:
-            print(f"mantle    derived short-term bearer token (len {len(token)})")
-    if not token:
-        raise SystemExit("No mantle credential. Run:\n" + SSO_LOGIN_HINT)
-
-    sigv4 = freeze_sigv4_credentials(region)
-    if not sigv4:
-        raise SystemExit(
-            "No SigV4 credentials -- every bedrock-runtime arm would fail.\n"
-            + SSO_LOGIN_HINT
-        )
-    print(f"sigv4     froze session credentials for the proxy ({region})")
-
-    environment = {MANTLE_ENV: token, **sigv4}
-    # Belt and braces: the container inherits nothing from this process, but
-    # an image or compose layer that ever sets the AWS-named variable would
-    # silently move the runtime arms onto bearer auth.
-    assert LITELLM_BEARER_ENV not in environment
-    return environment
 
 
 # --- the run -----------------------------------------------------------------
