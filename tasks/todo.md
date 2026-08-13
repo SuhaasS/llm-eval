@@ -1946,3 +1946,38 @@ The second matrix ran the same four cells under a second event log. All four
 `run_id`s appear in both collections — unchanged and intended — and every record
 keeps its own artifacts, separated by `collection_id`. Before this change the
 second run would have deleted the first's.
+
+### Live confirmation on real Bedrock traffic
+
+**2026-08-13 18:49Z**, four arms, click #3360, N=1, schema 3.7.0. 4/4 records,
+no stranded cells, no exclusions, no infra problems, `wire_unattributed: 0`.
+Credential window read and printed before the proxy started: `usable until
+2026-08-13T19:49:30Z (sts)` — one hour, the third independent measurement.
+
+Every 3.7.0 field populated on live traffic:
+
+| arm | turns | `terminal_finish_reason` | `host.samples` | `cpu_pct_p95` | graded |
+|---|---|---|---|---|---|
+| claude-sonnet-5-runtime | 18 | `stop` | 96 | 23.9 | **resolved**, 1623/1623 |
+| kimi-k2-5 | 16 | `stop` | 62 | 27.8 | **resolved**, 1623/1623 |
+| gemma-4-31b | 40 (cap) | `tool_calls` | 460 | 8.1 | failed, no regressions |
+| nemotron-3-super-120b | 2 | `stop` | 5 | 29.4 | failed, 0-byte diff |
+
+`vm_cpus: 2` on every arm, `contention_flag: false` **measured**, `error: ""` —
+no sampler failure on any live run, including the 463-second one.
+
+**The finish reason earned its place on the first live run.** Nemotron emitted
+the text *"Let me check the formatting.py"* and then ended the turn with no tool
+call — `end_turn`, 108 output tokens, nothing edited. The record now says in one
+read that the **provider itself sent `stop`**: not `length`, not an error, no
+failed calls. That rules out truncation and adapter failure without
+decompressing anything, which is exactly the §6.4 call the field was added for.
+
+Also measured: `terminal_finish_reason` agrees with the transcript's translated
+`stop_reason` on all four arms (`stop`↔`end_turn`, `tool_calls`↔`tool_use`). The
+mapping is faithful here. That is a claim the record could not previously make
+in either direction.
+
+Two known items re-triggered, both already tracked: gemma and kimi priced `null`
+(`cache support unconfirmed, saw cache_read` — and they *did* return cache
+accounting this time), and gemma hit the placeholder 40-turn cap.

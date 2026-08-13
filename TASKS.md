@@ -23,15 +23,28 @@ Four arms, `pallets/click` #3360, on the image that fixes the stale `.pyc`.
 on every arm, all four resolved by a hand-run of the oracle. Evidence in the
 next section. Nothing is pending for this.
 
-The only caveat is what the run *means*: all four solved it, so by §3.5's own
-drop rule it is a **ceiling task** with no discriminating signal. It proves the
-path end to end. It is not a measurement of any model.
+**Re-run that evening on schema 3.7.0, and the result inverted.** Same task,
+same four arms, N=1 each: sonnet-runtime and kimi **resolved** (1623/1623 on the
+full suite, no regressions); gemma burned all 40 turns for a 238 b diff that
+fixes nothing; nemotron wrote *"Let me check the formatting.py"*, emitted
+`end_turn` with no tool call, and stopped after 2 turns and 108 output tokens
+with a **0-byte diff**.
+
+So the morning's "ceiling task" reading was a single sample, and so is this one.
+The honest statement is the one neither run supports on its own: **at
+temperature 1.0 and N=1 the between-run variance on this task is larger than the
+between-arm spread.** 4/4 and 2/4 on the same cells, hours apart. That is
+calibration evidence for §3.5's repeat count, not a capability ranking — and it
+is the strongest argument in this file for why N=1 cannot ship.
+
+The task *can* discriminate. Whether it does on any given run is a coin flip,
+which is a different problem from a ceiling task and needs the same fix: repeats.
 
 ### Can I start the large-scale eval? — **No. Five things, in dependency order.**
 
 | # | blocker | why it blocks | where |
 |---|---|---|---|
-| 1 | **The dataset.** 1 task of ~80, and that one is a ceiling task | nothing downstream can start; the calibration pilot needs it too | Out of scope §1 |
+| 1 | **The dataset.** 1 task of ~80. It discriminates 2/4 on one run and 0/4 on another | nothing downstream can start; the calibration pilot needs it too | Out of scope §1 |
 | 2 | **Caps are unset.** 40 turns is a placeholder and is already binding — nemotron used 40/40 on 2026-08-13, mid-verification, and its diff resolved anyway | §5.4 derives caps from the pilot at ~p95×2; a cap tuned to the incumbent scores a style difference as capability | P3 |
 | 3 | **Credential refresh.** Measured 1 h ⇒ **~20 cells per login**; 3,200 cells ⇒ ~160 re-logins | the matrix runs, but never unattended | P1 |
 | 4 | **No run-level retry.** `attempt_number` has no caller | every infra hiccup leaves a permanent hole; today's work bounds it to ~3 cells/arm and names them, but cannot fill them | P1 |
@@ -274,7 +287,8 @@ including after Phase 4. Each P2 item says which it is.
 
 **Renamed 2026-08-13.** A real-task run is no longer blocked — one ran that day
 on all four arms and is recorded above. What is blocked is a task set that can
-tell the arms apart: the one task in the set is a ceiling task, so the section
+tell the arms apart: the set holds one task, whose outcome swung 4/4 to 2/4
+between two N=1 runs on the same day, so the section
 title used to promise something already delivered while the actual gap went
 unnamed.
 
