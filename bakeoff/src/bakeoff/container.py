@@ -439,6 +439,14 @@ class HostSampler:
         return (cpu_delta / sys_delta) * online * 100.0
 
     def _run(self) -> None:
+        # No container is not a failure -- it is nothing to sample. Without
+        # this the thread raises AttributeError on None.stats, the except
+        # below files it, and every record written by a RunContainer double
+        # carries a fabricated `error` -- which is the one field that is
+        # supposed to mean sampling broke. `samples: 0` with an empty error
+        # already says "nobody measured", and it says it truthfully.
+        if self._container is None:
+            return
         try:
             for frame in self._container.stats(stream=True, decode=True):
                 if self._stop.is_set():

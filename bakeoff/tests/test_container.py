@@ -571,3 +571,20 @@ def test_the_eval_container_carries_the_label_the_sampler_counts(alpine_containe
         filters={"label": "bakeoff.eval_agent=1"}
     )
     assert any(c.id == alpine_container._container.id for c in running)
+
+
+def test_no_container_is_nothing_to_sample_not_a_sampling_failure():
+    """The RunContainer doubles in test_fault_injection and test_smoke_test
+    hand back a sampler with no container. Without the guard its thread raises
+    AttributeError on None.stats, `_run` files that, and every record those
+    tests write carries a fabricated `error` -- corrupting the one field whose
+    job is to say that sampling broke.
+
+    `samples: 0` with an empty error already says "nobody measured"."""
+    sampler = HostSampler(container=None, client=None)
+    sampler.start()
+    sampler.stop()
+    metrics = sampler.metrics()
+    assert metrics.error == ""
+    assert metrics.samples == 0
+    assert metrics.contention_flag is None

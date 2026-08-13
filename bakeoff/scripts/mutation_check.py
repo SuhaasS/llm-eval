@@ -1025,6 +1025,22 @@ MUTATIONS = [
         "tests/test_fault_injection.py -k survives_the_whole_orchestrator",
         "not integration",
     ),
+    (
+        # Found in the post-3.7.0 regression audit. Without the guard the
+        # RunContainer doubles' sampler raises AttributeError on None.stats and
+        # files it, so every record those tests write carries a fabricated
+        # `error` -- the one field whose job is to say sampling broke.
+        'host: turn "no container to sample" into a sampling failure',
+        "src/bakeoff/container.py",
+        "        if self._container is None:\n"
+        "            return\n"
+        "        try:",
+        "        if False:\n"
+        "            return\n"
+        "        try:",
+        "tests/test_container.py -k nothing_to_sample",
+        "not integration",
+    ),
 ]
 
 
