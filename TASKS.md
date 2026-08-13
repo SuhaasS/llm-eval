@@ -89,7 +89,23 @@ out-of-scope plans below are about.
    importable, so §3.3's "runs tests, sees failures, self-corrects" terminated
    after "edits" and every arm was scored on one unverified guess. Fixed; the two
    GO runs above are the only data taken after it.
-4. **Six of six "model failures" so far have been harness defects** — Sonnet's
+4. **An eighth harness defect, found 2026-08-13 while testing the seventh, and
+   this one corrupts the self-correction loop itself.** CPython invalidates a
+   `.pyc` on (source mtime in whole seconds, source size) and **both halves are
+   ordinary**: an operator swap, an off-by-one or a boolean flip preserves byte
+   count, and an agent edits and re-runs the suite inside the same second.
+   Measured in the eval image — fix applied, source correct on disk, pytest
+   still red, pyc header reporting `mtime=1786605617 size=32` on both sides.
+   §3.3's loop is "runs tests, sees failures, self-corrects"; this feeds it the
+   pre-fix behaviour, so a correct edit reads as wrong and the agent corrects
+   away from the answer. It was already making `verify_logger.py` fail on **2
+   of 3** consecutive runs, and the first live smoke run shipped a diff whose
+   first hunk was a binary `calc.cpython-312.pyc`. Closed with
+   `PYTHONDONTWRITEBYTECODE=1` in the image. **Every capability figure taken
+   before 2026-08-13 was taken with this live**, on top of the Phase 0c caveat
+   below.
+
+5. **Six of six "model failures" so far have been harness defects** — Sonnet's
    beta header, Kimi's tool-id mangling, Gemma's `propertyNames`, Gemma's
    colliding ids, Gemma's `max_tokens` rejection, Gemma's `reasoning_effort`
    requirement. Each looked deterministic and total beforehand. Weigh that base
@@ -259,15 +275,28 @@ one ends a multi-day run outright.
 - [ ] **Both credentials expire mid-run, and no automated refresh exists.**
   Still open — what closed on 2026-08-12 was the *silent burn*, not the refresh.
 
-  **The window, measured.** Both credentials are frozen once, before the loop,
-  into a proxy container that lives for the whole matrix. `derive_mantle_token`
-  presigns with the SigV4 session (`SigV4QueryAuth(credentials, …)`), so the
-  bearer token embeds `X-Amz-Security-Token` and **cannot outlive that session**
-  whatever its own 12 h cap says. On 2026-08-12 the SSO token and the STS
-  credentials both expired at `2026-08-13T00:54:38Z`, ~8 h after login, against
-  a matrix that needs 4–5 days. Docker cannot change env on a running
-  container, so `aws sso login` mid-run changes nothing until the proxy
-  restarts.
+  **The window, measured — and it is one hour, not eight.** Both credentials
+  are frozen once, before the loop, into a proxy container that lives for the
+  whole matrix. `derive_mantle_token` presigns with the SigV4 session
+  (`SigV4QueryAuth(credentials, …)`), so the bearer token embeds
+  `X-Amz-Security-Token` and **cannot outlive that session** whatever its own
+  12 h cap says — that cap never binds.
+
+  Measured twice: a login at `2026-08-12T23:54Z` expired at
+  `2026-08-13T00:54:38Z`, and one at `2026-08-13T06:29Z` at `07:29:35Z`. Both
+  **1:00**. An earlier note in this file said ~8 h; that came from misreading a
+  UTC/PDT offset and is wrong.
+
+  That changes the size of the problem. Against a 4–5 day matrix, one hour is
+  **~100 re-logins**, not ~12 — so an automated refresh is a hard prerequisite
+  for Gate 2 rather than an ergonomic improvement.
+
+  The hour is a property of the **frozen copy**, not of the session: botocore
+  returns `DeferredRefreshableCredentials` that would mint a fresh hour from
+  the 1 h SSO token by itself, and `freeze_sigv4_credentials` resolving them to
+  literal strings for a container that cannot re-resolve is precisely what
+  defeats that. Docker cannot change env on a running container, so `aws sso
+  login` mid-run changes nothing until the proxy restarts.
 
   **What now happens instead of nothing.** `proxy.credential_window` reads the
   deadline and prints it; `credential_stop` refuses any cell whose
@@ -276,10 +305,20 @@ one ends a multi-day run outright.
   resumes exactly there. `freeze_sigv4_credentials` no longer escapes as a
   `TokenRetrievalError` traceback.
 
-  **What is still missing** is the refresh itself: an unattended multi-day run
-  still needs a human to re-login roughly every 8 h. The options are a proxy
-  the harness restarts with fresh env between rounds, or a credential process
-  the proxy container can call. Neither is built.
+  **What is still missing** is the refresh itself, and at one hour it is the
+  binding constraint on Gate 2 rather than an inconvenience. Two options, and
+  the second is the real one:
+
+  - restart the proxy with freshly frozen env between rounds — cheap to build,
+    but it needs a live SSO token, so it only stretches the unattended window
+    from 1 h to the SSO token's own lifetime (also 1 h here);
+  - give the proxy container a credential path it can refresh through — a
+    mounted `~/.aws` plus SSO cache, or a `credential_process`, so botocore
+    does the hourly refresh it is already capable of. This is the one that
+    actually removes the human from the loop, and it is what
+    `freeze_sigv4_credentials` currently exists to avoid.
+
+  Neither is built.
 
 - [ ] **Auth failures were unclassifiable, and that is now fixed but worth
   keeping written down.** Closed 2026-08-12 at schema 3.6.0; kept here because

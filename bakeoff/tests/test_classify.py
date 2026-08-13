@@ -24,6 +24,7 @@ def signals(**overrides) -> RunSignals:
         container_crashed=False,
         api_error_status=None,
         terminal_error_messages=(),
+        terminal_error_statuses=(),
     )
     base.update(overrides)
     return RunSignals(**base)
@@ -224,6 +225,74 @@ def test_a_crash_still_outranks_an_auth_failure():
     assert classify_exclusion(
         signals(container_crashed=True, api_error_status=401)
     ).reason_code == "container_crashed"
+
+
+def test_the_mantle_routes_own_auth_wording_is_recognised():
+    """Found by a live run, not by reading: gemma with an invalid bearer token
+    says "litellm.AuthenticationError: AuthenticationError: OpenAIException -
+    Invalid bearer token", which matched NOTHING in a signature list derived
+    entirely from bedrock/ SigV4 error text. It still classified via the 401,
+    so the gap only showed when the terminal call carried no status."""
+    exclusion = classify_exclusion(signals(
+        api_error_status=None,
+        terminal_error_messages=(
+            "litellm.AuthenticationError: AuthenticationError: "
+            "OpenAIException - Invalid bearer token",
+        ),
+    ))
+    assert exclusion is not None
+    assert exclusion.reason_code == "api_auth"
+
+
+@pytest.mark.parametrize(
+    "wording",
+    ["Invalid bearer token", "Invalid API key provided", "Incorrect API key"],
+)
+def test_each_openai_route_auth_wording_is_recognised_on_its_own(wording):
+    """Each openai/mantle phrase pinned in isolation, without the
+    "AuthenticationError" type name that the full live message also carries --
+    otherwise one broad signature would cover for every specific one and none
+    of them could be shown to matter."""
+    exclusion = classify_exclusion(
+        signals(api_error_status=None, terminal_error_messages=(wording,))
+    )
+    assert exclusion is not None
+    assert exclusion.reason_code == "api_auth"
+
+
+def test_an_auth_status_anywhere_in_the_block_beats_the_cooldowns_refusal():
+    """The wording-independent half, and the one that would have caught the
+    gap above without anyone guessing at strings.
+
+    This is the measured sequence, live against real Bedrock on 2026-08-13 with
+    cooldowns enabled: two genuine 401s, then six statusless
+    RouterRateLimitErrors from the cooldown they triggered. A run stopping
+    inside that middle stretch has status None and, before the signature fix,
+    no matching message -- so it was labelled `router_no_deployment`, naming
+    the router for the operator's own credential."""
+    refusal = "No deployments available for selected model, Try again in 5 seconds."
+    exclusion = classify_exclusion(signals(
+        api_error_status=None,
+        terminal_error_messages=("some auth failure", "some auth failure",
+                                 refusal, refusal, refusal),
+        terminal_error_statuses=(401, 401, None, None, None),
+    ))
+    assert exclusion is not None
+    assert exclusion.reason_code == "api_auth"
+
+
+def test_a_refusal_with_no_auth_anywhere_is_still_the_router():
+    """The other side: without an auth status or signature in the block, "no
+    deployments available" is the router declining to dispatch for some other
+    reason, and must not be relabelled as a credential problem."""
+    exclusion = classify_exclusion(signals(
+        api_error_status=None,
+        terminal_error_messages=(
+            "No deployments available for selected model, Try again in 5 seconds.",
+        ),
+        terminal_error_statuses=(None,),
+    ))
+    assert exclusion.reason_code == "router_no_deployment"
 
 
 def test_every_reason_code_is_pre_registered():

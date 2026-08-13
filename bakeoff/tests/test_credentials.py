@@ -4,9 +4,14 @@ Both credentials are frozen once, before the loop, into a proxy container that
 lives for the whole matrix -- and the mantle bearer token is presigned with the
 SigV4 session (`SigV4QueryAuth(credentials, ...)`), so it embeds
 X-Amz-Security-Token and cannot outlive that session whatever its own 12 h cap
-says. Measured 2026-08-12: an SSO login gave ~8 h. A matrix needs 4-5 days.
-Docker cannot change env on a running container, so re-logging in mid-run
-changes nothing until the proxy restarts.
+says. Measured twice, 2026-08-12 and 2026-08-13: an SSO login gives ONE HOUR on
+this account. A matrix needs 4-5 days. Docker cannot change env on a running
+container, so re-logging in mid-run changes nothing until the proxy restarts.
+
+The hour is a property of the frozen copy rather than of the session: botocore
+returns DeferredRefreshableCredentials, which would mint a fresh hour from the
+SSO token by itself, and freezing them to literal strings for a container that
+cannot re-resolve is what defeats that.
 """
 
 from __future__ import annotations

@@ -95,7 +95,24 @@ ENV CLAUDE_CONFIG_DIR=/eval/claude-config \
     DISABLE_AUTOUPDATER=1 \
     DISABLE_UPDATES=1 \
     DISABLE_TELEMETRY=1 \
-    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+    # CPython invalidates a .pyc on (source mtime in whole seconds, source
+    # size). An edit that changes neither is invisible, and BOTH halves of that
+    # are ordinary here: an operator swap, an off-by-one or a boolean flip
+    # preserves byte count, and an agent edits and re-runs the suite inside the
+    # same second. Measured 2026-08-13 in this image: fix applied, source
+    # correct on disk, pytest still red, and the pyc header confirming
+    # `mtime=1786605617 size=32` on both sides.
+    #
+    # Spec section 3.3 measures a loop that ends in "runs tests, sees failures,
+    # self-corrects". A stale pyc feeds that loop the OLD behaviour after a
+    # correct fix, so the agent corrects away from the right answer -- and it
+    # is scored as capability. It already made `verify_logger.py`, the section
+    # 6.6 gate, fail on 2 of 3 consecutive runs.
+    #
+    # Never `-B` on one runner: the agent runs its own commands and this has to
+    # hold for every process in the container, including the ones it invents.
+    PYTHONDONTWRITEBYTECODE=1
 
 # Fail the BUILD if the installed version is not the pinned one. Without
 # this the image silently ships whatever the installer resolved, and the

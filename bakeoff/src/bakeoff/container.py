@@ -31,6 +31,13 @@ from bakeoff.schema import HostMetrics
 
 REPO_MOUNT = "/repo"
 
+# How many times `git add -A` may lose the race against the agent's own
+# atomic writes before the failure is treated as real. Three, with a short
+# pause: the window is a single rename, so an attempt that fails twice more
+# is not a race.
+_ADD_ATTEMPTS = 3
+_ADD_RETRY_DELAY_S = 0.2
+
 # Snapshots stage into their own index rather than the repo's. Checkpoints
 # are captured while the agent is working, and `git add -A` against the
 # real index would stage the agent's in-progress work under it: a later
@@ -234,9 +241,31 @@ class RunContainer:
         with the worktree on every call -- additions, modifications,
         deletions and untracked files alike -- so the diff is complete
         without the agent's own staging area being touched.
+
+        `git add -A` IS RETRIED, and only for the one failure that concurrency
+        causes. Checkpoints are captured while the agent is editing, and
+        Claude Code's Write tool is atomic: it creates `<name>.tmpXXXX` and
+        renames it. If the rename lands between git's readdir and its stat,
+        git exits 128 with "unable to stat" -- measured on 2026-08-12, once
+        in seven offline arms, and it took the whole run down with it (0
+        turns, 0 tools, no diff, recorded as CRASHED).
+
+        Retried rather than ignored, because `--ignore-errors` would drop the
+        file from the snapshot and report success. Retried rather than merely
+        contained, because a checkpoint that is missing is still evidence
+        lost from the section 5.5 curve. The failure is preserved and raised
+        if it survives every attempt: a stat error that is not a race is a
+        broken container and must not be smoothed over.
         """
         env = {"GIT_INDEX_FILE": SNAPSHOT_INDEX}
-        self.checked_exec(["git", "add", "-A"], env=env)
+        for attempt in range(_ADD_ATTEMPTS):
+            result = self.exec(["git", "add", "-A"], env=env)
+            if result.exit_code == 0:
+                break
+            message = (result.stderr or result.stdout).strip()
+            if attempt == _ADD_ATTEMPTS - 1 or "unable to stat" not in message:
+                raise ContainerError(f"git add -A failed (exit {result.exit_code}): {message}")
+            time.sleep(_ADD_RETRY_DELAY_S)
         diff = self.checked_exec(["git", "diff", "--cached", base_sha], env=env)
         names = self.checked_exec(
             ["git", "diff", "--cached", "--name-only", base_sha], env=env

@@ -241,3 +241,76 @@ def test_no_network_at_all_is_not_reported_as_isolated(alpine_container):
     assert "null-driver" in evidence
     assert "ROUTABLE" not in evidence
     assert "no recording proxy" in evidence
+
+
+class _AddSequence:
+    """A `git add -A` that fails the way the real race does, N times."""
+
+    def __init__(self, failures: int, message: str):
+        self.failures = failures
+        self.message = message
+        self.add_calls = 0
+
+    def __call__(self, cmd, env=None):
+        from bakeoff.container import ExecResult
+
+        if cmd[:3] == ["git", "add", "-A"]:
+            self.add_calls += 1
+            if self.add_calls <= self.failures:
+                return ExecResult(128, "", self.message, 1)
+            return ExecResult(0, "", "", 1)
+        return ExecResult(0, "diff-body", "", 1)
+
+
+def _container_with(exec_stub) -> RunContainer:
+    container = RunContainer(
+        image="sha256:" + "0" * 64, repo_path="/tmp/x", base_sha="abc"
+    )
+    container.exec = exec_stub  # type: ignore[method-assign]
+    container.checked_exec = lambda cmd, env=None: exec_stub(cmd, env)  # type: ignore
+    return container
+
+
+RACE = "fatal: unable to stat 'calc.py.tmpQ3xR1a': No such file or directory"
+
+
+def test_a_lost_race_against_the_agents_atomic_write_is_retried():
+    """Checkpoints are captured WHILE the agent edits, and Claude Code's
+    Write is atomic: it creates `<name>.tmpXXXX` and renames it. A rename
+    landing between git's readdir and its stat makes `git add -A` exit 128.
+    Measured 2026-08-12, once in seven offline arms -- and it took the whole
+    run down, because the recorder is called from inside the agent's stdout
+    loop.
+
+    Retried rather than ignored: `--ignore-errors` would drop the file from
+    the snapshot and report success, which is a wrong diff rather than a
+    missing one."""
+    stub = _AddSequence(failures=1, message=RACE)
+    container = _container_with(stub)
+
+    diff, _files = container.snapshot_diff("abc")
+
+    assert stub.add_calls == 2
+    assert diff == "diff-body"
+
+
+def test_a_stat_failure_that_is_not_a_race_still_raises():
+    """The window is a single rename, so a failure that survives every
+    attempt is a broken container -- and a snapshot that silently returned
+    empty output would be stored as "the agent had changed nothing", which is
+    a fabricated measurement feeding the section 5.5 curve."""
+    container = _container_with(_AddSequence(failures=99, message=RACE))
+
+    with pytest.raises(ContainerError, match="unable to stat"):
+        container.snapshot_diff("abc")
+
+
+def test_an_unrelated_git_failure_is_not_retried():
+    """Retrying "not a git repository" three times buys nothing and delays
+    the report of a container that will never work."""
+    stub = _AddSequence(failures=99, message="fatal: not a git repository")
+    container = _container_with(stub)
+
+    with pytest.raises(ContainerError, match="not a git repository"):
+        container.snapshot_diff("abc")
+    assert stub.add_calls == 1

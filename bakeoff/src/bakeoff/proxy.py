@@ -312,8 +312,19 @@ def credential_window(region: str, now: datetime | None = None) -> CredentialWin
 
     Both transports die at the same instant and that is not a coincidence:
     `derive_mantle_token` presigns with the SigV4 session, so the bearer token
-    embeds that session's token. Measured 2026-08-12 -- SSO token and STS
-    credentials both expired at 2026-08-13T00:54:38Z, ~8 h after login.
+    embeds that session's token.
+
+    ONE HOUR, measured twice: a login at 2026-08-12T23:54Z expired at
+    2026-08-13T00:54:38Z, and one at 2026-08-13T06:29Z at 07:29:35Z. That is
+    the Identity Center session policy on this account, and MANTLE_TOKEN_TTL's
+    12 h therefore never binds.
+
+    The hour is a property of the FROZEN COPY, not of the session. botocore
+    hands back DeferredRefreshableCredentials, which would mint a fresh hour
+    from the SSO token on its own; `freeze_sigv4_credentials` resolves them to
+    literal strings for a container that cannot re-resolve, and that is exactly
+    what defeats the refresh. Which is why the deadline has to be checked
+    rather than assumed away.
 
     MUST be called after `proxy_environment`, which is what runs
     `resolve_aws_paths` and therefore points AWS_CONFIG_FILE at the

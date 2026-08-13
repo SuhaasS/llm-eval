@@ -243,6 +243,29 @@ def terminal_error_messages(entries: list[dict[str, Any]]) -> tuple[str, ...]:
     return tuple(reversed(messages))
 
 
+def terminal_error_statuses(entries: list[dict[str, Any]]) -> tuple[int | None, ...]:
+    """The statuses of the same trailing block `terminal_error_messages` reads.
+
+    A sibling rather than a second return value, so each can be reverted
+    independently by mutation_check -- they defend against different things.
+
+    `None` elements are kept, not filtered: a statusless RouterRateLimitError
+    is what the cooldown substitutes for the auth error, and the shape of the
+    block is the evidence. Measured live 2026-08-13 against real Bedrock, gemma
+    with an invalid bearer token: 22 entries running AA RRRRRR AAAAAAAAAAAAAA.
+    Which entry a run happens to stop on decides what a last-status rule sees,
+    so the block is read whole.
+    """
+    statuses: list[int | None] = []
+    for entry in reversed(entries):
+        metadata = entry.get("metadata") or {}
+        if not metadata.get("failed"):
+            break
+        status = metadata.get("status_code")
+        statuses.append(status if isinstance(status, int) else None)
+    return tuple(reversed(statuses))
+
+
 def distinct_wire_calls(entries: list[dict[str, Any]]) -> int:
     """Logical provider calls, as opposed to callback invocations.
 
@@ -506,6 +529,7 @@ def assemble_record(
     if api_error_status is None:
         api_error_status = final_api_error_status(entries)
     error_messages = terminal_error_messages(entries)
+    error_statuses = terminal_error_statuses(entries)
     failed_calls = sum(
         1 for e in entries if (e.get("metadata") or {}).get("failed")
     )
@@ -551,6 +575,7 @@ def assemble_record(
         container_crashed=container_crashed,
         api_error_status=api_error_status,
         terminal_error_messages=error_messages,
+        terminal_error_statuses=error_statuses,
     )
 
     inference_ms = sum(t.inference_ms for t in parsed.turns)

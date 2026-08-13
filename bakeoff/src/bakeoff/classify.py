@@ -63,6 +63,15 @@ PRE_REGISTERED_REASONS: frozenset[str] = frozenset(
 # operator's lapsed SSO session is `api_5xx` forever, and the event log has no
 # update API. It is also the only credential failure litellm retries:
 # _should_retry(500) is True, _should_retry(401) and (403) are False.
+# The first eight are bedrock/ SigV4 wordings. The last four are the
+# openai/ mantle route's, and they are here because a live run found the list
+# incomplete: an invalid bearer token on gemma reads
+# "litellm.AuthenticationError: AuthenticationError: OpenAIException - Invalid
+# bearer token", which matched NOTHING above. It classified correctly anyway,
+# but only via the 401 status -- so a run whose terminal call carried no status
+# fell through to `router_no_deployment`, naming the router for the operator's
+# credential. Deriving this list from one transport's error text was the
+# mistake; AUTH_ERROR_STATUSES below is what stops it mattering again.
 AUTH_ERROR_SIGNATURES: tuple[str, ...] = (
     "expiredtoken",
     "security token included in the request is expired",
@@ -74,7 +83,21 @@ AUTH_ERROR_SIGNATURES: tuple[str, ...] = (
     "unable to locate credentials",
     "accessdenied",
     "token has expired",
+    "invalid bearer token",
+    "invalid api key",
+    "incorrect api key",
+    "authenticationerror",
 )
+
+# Statuses that mean auth wherever they appear in the terminal block.
+#
+# Checked across the block rather than on its last entry, and checked at all
+# because message matching is guesswork about wording that varies by transport.
+# Measured live 2026-08-13, gemma with an invalid bearer token: the wire log
+# ran AA RRRRRR AAAAAAAAAAAAAA -- two 401s, six statusless router refusals from
+# the cooldown, then fourteen more 401s. Any prefix ending inside that middle
+# run has status None and, before this, no matching message either.
+AUTH_ERROR_STATUSES = (401, 403)
 
 # litellm's RouterErrors.no_deployments_available, which reaches the harness as
 # a plain ValueError with NO status_code -- so a run that ends on one records
@@ -117,6 +140,14 @@ class RunSignals:
     # recovered error, and a successful completion's own text, from ever
     # reaching the signature match.
     terminal_error_messages: tuple[str, ...] = ()
+    # The statuses of that same trailing block, aligned with it. `None` is a
+    # real element: a statusless RouterRateLimitError sits between two genuine
+    # 401s in a measured cooldown sequence, so "the last status" is a coin
+    # flip on where the retries stopped. An auth status ANYWHERE in the block
+    # is what makes the classification independent of that -- and independent
+    # of each transport's error wording, which is what AUTH_ERROR_SIGNATURES
+    # was found guessing at.
+    terminal_error_statuses: tuple[int | None, ...] = ()
 
     @property
     def malformation_rate(self) -> float:
@@ -172,7 +203,9 @@ def classify_exclusion(signals: RunSignals) -> Exclusion | None:
     # Two named halves rather than one condition, so mutation_check can revert
     # each independently: they answer different questions, and exactly one of
     # them covers the bedrock expired-token case.
-    is_auth_status = status in (401, 403)
+    is_auth_status = status in AUTH_ERROR_STATUSES or any(
+        s in AUTH_ERROR_STATUSES for s in signals.terminal_error_statuses
+    )
     is_auth_message = any(
         signature in message
         for message in messages

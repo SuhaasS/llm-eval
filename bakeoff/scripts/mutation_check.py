@@ -748,9 +748,32 @@ MUTATIONS = [
         # shapes arrive. Without this they get no exclusion at all.
         "classify: stop treating 401/403 as an infra failure",
         "src/bakeoff/classify.py",
-        "    is_auth_status = status in (401, 403)",
-        "    is_auth_status = False",
+        "    is_auth_status = status in AUTH_ERROR_STATUSES or any(",
+        "    is_auth_status = status in () or any(",
         "tests/test_classify.py -k auth_status_is_excluded",
+        "not integration",
+    ),
+    (
+        # Found by a live run against real Bedrock, not by reading: the
+        # openai/mantle route says "Invalid bearer token", which matched
+        # nothing in a signature list derived from bedrock/ SigV4 error text.
+        "classify: know only the bedrock wordings, not the mantle route's",
+        "src/bakeoff/classify.py",
+        '    "invalid bearer token",',
+        '    "\\x00never-matches",',
+        "tests/test_classify.py -k openai_route_auth_wording",
+        "not integration",
+    ),
+    (
+        # The wording-independent half. Measured live: the wire log ran
+        # AA RRRRRR AAAAAAAAAAAAAA, so a run stopping inside the middle stretch
+        # has status None and no matching message -- and gets labelled
+        # router_no_deployment, naming the router for the operator's credential.
+        "classify: read the terminal status only at the end of the block",
+        "src/bakeoff/classify.py",
+        "        s in AUTH_ERROR_STATUSES for s in signals.terminal_error_statuses",
+        "        False for s in signals.terminal_error_statuses",
+        "tests/test_classify.py -k anywhere_in_the_block",
         "not integration",
     ),
     (
