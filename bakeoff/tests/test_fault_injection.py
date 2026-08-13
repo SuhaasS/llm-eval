@@ -190,6 +190,7 @@ def _fake_run(
     event_log=None,
     sample_index=0,
     artifacts_name="artifacts",
+    collection_id="",
 ):
     import bakeoff.runner as runner_module
 
@@ -223,6 +224,7 @@ def _fake_run(
         event_log=event_log or EventLog(tmp_path / "log"),
         repo_path=str(tmp_path / "repo"),
         artifacts_root=tmp_path / artifacts_name,
+        collection_id=collection_id,
     )
 
 
@@ -1856,3 +1858,24 @@ def test_a_record_with_no_collection_states_that_rather_than_guessing(task, tmp_
         destructive_events=[], artifacts_root=tmp_path,
     )
     assert record.collection_id == ""
+
+
+def test_collection_id_survives_the_whole_orchestrator(task, tmp_path, monkeypatch):
+    """The assertion this file's first rule exists for, and it earned its place
+    immediately: `collection_id` was added to assemble_record and NOT to
+    execute_run, so every caller raised TypeError and no unit test noticed --
+    they all drive assemble_record directly. The section 6.6 gate caught it on
+    the offline smoke, one layer from a paid run.
+
+    Exactly the shape of the cache_state defect above: a parameter nobody
+    passed, invisible to a unit test on the function that receives it."""
+    record = _fake_run(
+        monkeypatch, task, tmp_path, collection_id="20260813T184012Z"
+    )
+    assert record.collection_id == "20260813T184012Z"
+
+
+def test_a_run_with_no_collection_named_says_so_end_to_end(task, tmp_path, monkeypatch):
+    """"" is honest and distinguishable from a named episode. It is also every
+    record written before 3.7.0."""
+    assert _fake_run(monkeypatch, task, tmp_path).collection_id == ""

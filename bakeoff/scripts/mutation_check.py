@@ -1007,6 +1007,24 @@ MUTATIONS = [
         "tests/test_fault_injection.py -k which_collection_produced_it",
         "not integration",
     ),
+    (
+        # The half the record-level mutation cannot see. collection_id was
+        # added to assemble_record and not to execute_run, so every caller
+        # raised TypeError and 472 unit tests passed -- they drive
+        # assemble_record directly. The section 6.6 gate caught it on the
+        # offline smoke. Anchored on host=/adapter_patches= because the same
+        # kwarg appears in the RunRecord construction.
+        "collection: drop the collection id between execute_run and the record",
+        "src/bakeoff/runner.py",
+        "        host=host,\n"
+        "        collection_id=collection_id,\n"
+        "        adapter_patches=adapter_patches,",
+        "        host=host,\n"
+        '        collection_id="",\n'
+        "        adapter_patches=adapter_patches,",
+        "tests/test_fault_injection.py -k survives_the_whole_orchestrator",
+        "not integration",
+    ),
 ]
 
 

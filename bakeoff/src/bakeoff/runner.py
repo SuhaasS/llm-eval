@@ -828,6 +828,7 @@ def execute_run(
     parent_run_id: str | None = None,
     proxy_wire_dir: Path | None = None,
     settings_host_path: Path | None = None,
+    collection_id: str = "",
 ) -> RunRecord:
     """Run one sample and write exactly one record.
 
@@ -1138,6 +1139,7 @@ def execute_run(
         isolated=isolated,
         isolation_evidence=isolation_evidence,
         host=host,
+        collection_id=collection_id,
         adapter_patches=adapter_patches,
         proxy_litellm=proxy_litellm,
         crash_error=crash_error,
