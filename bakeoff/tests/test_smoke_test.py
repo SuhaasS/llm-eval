@@ -43,6 +43,14 @@ class _CapturingContainer:
     def __exit__(self, *_exc):
         return False
 
+    def host_sampler(self):
+        # See FakeContainer in test_fault_injection.py: without this the
+        # AttributeError lands in execute_run's catch-all and the run is
+        # recorded CRASHED, so this test fails on an unrelated assertion.
+        from bakeoff.container import HostSampler
+
+        return HostSampler(container=None, client=None)
+
     def exec(self, *_args, **_kwargs):
         return None
 

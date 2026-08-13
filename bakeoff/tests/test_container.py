@@ -1,6 +1,9 @@
+import threading
+import time
+
 import pytest
 
-from bakeoff.container import ContainerError, RunContainer
+from bakeoff.container import ContainerError, HostSampler, RunContainer
 
 integration = pytest.mark.integration
 
@@ -314,3 +317,257 @@ def test_an_unrelated_git_failure_is_not_retried():
     with pytest.raises(ContainerError, match="not a git repository"):
         container.snapshot_diff("abc")
     assert stub.add_calls == 1
+
+
+# --- HostSampler: the host block is measured, or says it was not -------------
+
+
+def test_a_first_stream_frame_yields_no_percentage():
+    """Measured against docker SDK 7.2.0 / daemon 29.5.2: the FIRST frame of a
+    stats stream has `precpu_stats.cpu_usage.total_usage == 0` and NO
+    `system_cpu_usage` key at all.
+
+    That absence is the trap. `pre.get("system_cpu_usage", 0)` defaults the
+    missing key to zero, so sys_delta becomes the ABSOLUTE system total --
+    enormous and positive -- the guard passes, and a fabricated ~0.000003%
+    reading enters the series on every run. Guard on the key, not on the sign.
+    """
+    frame = {
+        "cpu_stats": {"cpu_usage": {"total_usage": 9_310_000},
+                      "system_cpu_usage": 791_801_200_000_000, "online_cpus": 2},
+        "precpu_stats": {"cpu_usage": {"total_usage": 0}},
+    }
+    assert HostSampler(container=None, client=None)._cpu_pct(frame) is None
+
+
+def test_cpu_percent_is_scaled_by_online_cpus():
+    """Docker reports a fraction of total system jiffies; multiplying by the
+    core count is what turns it into the percentage `docker stats` prints. On
+    this daemon online_cpus is 2 -- the VM's allocation, not the Mac's 18."""
+    assert HostSampler(container=None, client=None)._cpu_pct({
+        "cpu_stats": {"cpu_usage": {"total_usage": 1_000}, "system_cpu_usage": 8_000,
+                      "online_cpus": 2},
+        "precpu_stats": {"cpu_usage": {"total_usage": 0}, "system_cpu_usage": 0},
+    }) == pytest.approx(25.0)
+
+
+def test_a_malformed_frame_is_skipped_not_counted_as_zero():
+    """Docker has changed this payload before -- cgroup v2 already dropped
+    max_usage. A KeyError must cost the sample, never the run, and must not
+    enter the series as a zero."""
+    assert HostSampler(container=None, client=None)._cpu_pct({"cpu_stats": {}}) is None
+
+
+def test_the_p95_ignores_one_spike_and_catches_a_sustained_one():
+    """Nearest-rank p95: index ceil(0.95*n)-1 of the sorted series. One outlier
+    in twenty is below it by construction -- that is the point, a single
+    scheduling blip is not contention -- while two in twenty is above it."""
+    sampler = HostSampler(container=None, client=None)
+    sampler._cpu = [10.0] * 19 + [400.0]
+    assert sampler.metrics().cpu_pct_p95 == 10.0
+    sampler._cpu = [10.0] * 18 + [400.0, 400.0]
+    assert sampler.metrics().cpu_pct_p95 == 400.0
+
+
+def test_an_unsampled_run_claims_nothing():
+    """The defect this class exists for. `contention_flag: bool = False` put
+    "this run had the host to itself" into every record ever written, while
+    nothing called stats() at all -- one fabricated false beside two honest
+    nulls."""
+    metrics = HostSampler(container=None, client=None).metrics()
+    assert metrics.contention_flag is None
+    assert metrics.cpu_pct_p95 is None
+    assert metrics.mem_peak_mb is None
+    assert metrics.load_p95 is None
+    assert metrics.vm_cpus is None
+    assert metrics.samples == 0
+
+
+def test_a_sampler_that_dies_names_it_and_does_not_raise():
+    """Measured 2026-08-12: a raise from inside the run body unwound past the
+    container and recorded CRASHED with zero turns for a run that worked. A CPU
+    reading is supplementary; the trajectory is the product."""
+    entered = threading.Event()
+
+    class _Boom:
+        def stats(self, **_kw):
+            entered.set()
+            raise RuntimeError("docker went away")
+
+    sampler = HostSampler(container=_Boom(), client=None)
+    sampler.start()
+    # Join, then assert, THEN stop. Calling stop() first races the thread: with
+    # _stop already set, `_run` swallows the error by design and this asserts
+    # on an empty string -- measured 9 failures in 2000 iterations at
+    # sys.setswitchinterval(1e-6). An Event set before the raise does not close
+    # it either (3 in 5000): the raise and the _stop check are still ahead of
+    # the waiter. The thread terminates on its own and `_run` catches
+    # everything, so joining it is deterministic.
+    assert entered.wait(5)
+    sampler._thread.join(5)
+    assert "docker went away" in sampler.metrics().error
+    assert sampler.metrics().samples == 0
+    sampler.stop()
+
+
+def test_a_refused_thread_is_recorded_and_never_raised(monkeypatch):
+    """`Thread.start()` raises RuntimeError at the OS thread limit. Outside a
+    guard that reaches execute_run's catch-all and records CRASHED with zero
+    turns for a run that would have worked."""
+    def _refuse(_self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(threading.Thread, "start", _refuse)
+    sampler = HostSampler(container=None, client=None)
+    sampler.start()
+
+    assert "can't start new thread" in sampler.metrics().error
+    assert sampler._thread is None
+
+
+def test_stop_is_total_even_when_the_thread_never_started():
+    """The most load-bearing line in this class. stop() is called from
+    execute_run's OUTER finally, which is not inside a try -- so a raise there
+    escapes execute_run and the run produces no record at all, not even
+    record.unwritten.json. `join()` on a constructed-but-never-started thread
+    raises "cannot join thread before it is started", which is precisely the
+    state a refused start leaves behind."""
+    sampler = HostSampler(container=None, client=None)
+    sampler._thread = threading.Thread(target=lambda: None)  # never started
+    sampler.stop()   # must not raise
+    sampler.stop()   # idempotent
+    assert sampler.metrics().samples == 0
+
+
+def test_a_raise_after_stop_is_teardown_not_a_sampling_failure():
+    """__exit__ kills and force-removes the container, so a thread blocked in
+    stats(stream=True) raises as a matter of course. The lifecycle stops the
+    sampler inside the `with` on every path, but stop() only sets a flag and
+    joins with a 3 s timeout -- it cannot interrupt a blocking read -- so on a
+    join timeout this thread is still streaming when the container goes away.
+    Without the flag that lands in HostMetrics.error as a sampling failure,
+    non-deterministically, on runs that sampled fine."""
+    raised = threading.Event()
+
+    class _DiesWhenRemoved:
+        def __init__(self, stop_event):
+            self._stop = stop_event
+
+        def stats(self, **_kw):
+            yield {"cpu_stats": {}, "memory_stats": {}}
+            raised.set()
+            # The EVENT, never sampler.stop(): stop() joins, and joining from
+            # inside the sampler thread raises "cannot join current thread" --
+            # which the sampler would then record, so the test would pass on
+            # the wrong exception and prove nothing.
+            self._stop.set()
+            raise RuntimeError("container 4f2a is not running")
+
+    sampler = HostSampler(container=None, client=None)
+    sampler._container = _DiesWhenRemoved(sampler._stop)
+    sampler.start()
+    assert raised.wait(5)
+    sampler._thread.join(5)
+    assert sampler.metrics().error == ""
+    sampler.stop()
+
+
+def test_contention_is_flagged_when_another_eval_container_shares_the_host():
+    """Deliberately narrow, and the docstring says so. The matrix is sequential
+    by design, so this fires rarely -- and the alternatives were worse: a
+    loadavg threshold needs host load above os.cpu_count() (18 here) while the
+    agent's real budget is a 2-vCPU VM, so it can never fire, and mixing the
+    two puts denominators from different machines in one boolean."""
+    sampler = HostSampler(container=None, client=None)
+    sampler._frames, sampler._peers = 2, [1, 2]
+    assert sampler.metrics().contention_flag is True
+
+
+def test_a_run_that_saw_only_itself_is_a_measured_false():
+    sampler = HostSampler(container=None, client=None)
+    sampler._frames, sampler._peers = 2, [1, 1]
+    assert sampler.metrics().contention_flag is False
+
+
+def test_frames_without_a_single_peer_observation_claim_nothing():
+    """`any([])` is False, so gating this on frames rather than on peers would
+    assert "no other eval container shared the host" from zero peer
+    observations -- true of every run with no docker client and every run whose
+    polls all failed. That is the fabricated false this class exists to remove,
+    reintroduced one layer down. The poll failure gets named too."""
+    sampler = HostSampler(container=None, client=None)
+    sampler._frames, sampler._peers = 30, []
+    sampler._peer_error = "peer poll: APIError: boom"
+    metrics = sampler.metrics()
+    assert metrics.contention_flag is None
+    assert "peer poll" in metrics.error
+
+
+def test_a_frame_with_no_memory_block_is_not_zero_megabytes():
+    """The same rule _cpu_pct follows, on the memory axis. A frame that carried
+    no `usage` must not report "the container used 0 MB"."""
+    sampler = HostSampler(container=None, client=None)
+    sampler._frames = 3
+    assert sampler.metrics().mem_peak_mb is None
+    sampler._mem_bytes = 5 * 1024 * 1024
+    assert sampler.metrics().mem_peak_mb == 5
+
+
+def test_load_is_recorded_as_a_number_and_never_as_a_verdict():
+    """The harness measures and does not decide. load_p95 is host loadavg over
+    host CPUs -- a different machine from cpu_pct_p95's VM -- so it is stored
+    for a derived view to interpret and is NOT folded into contention_flag."""
+    sampler = HostSampler(container=None, client=None)
+    sampler._frames, sampler._peers, sampler._load = 2, [1, 1], [0.1, 9.0]
+    metrics = sampler.metrics()
+    assert metrics.load_p95 == 9.0
+    assert metrics.contention_flag is False
+
+
+@integration
+def test_a_real_container_reports_cpu_and_memory(alpine_container):
+    """The unit tests pin the arithmetic; this pins that the frames arrive at
+    all and that the sampler survives a CONCURRENT exec_stream -- Container.stats
+    and the agent's stream share one APIClient and requests.Session, and
+    docker-py guarantees nothing about that. The sampler is written to fail
+    quietly, so without this a payload change or a client collision would
+    surface as a record full of honest nulls."""
+    sampler = alpine_container.host_sampler()
+    sampler.start()
+    # exec_stream(cmd, on_stdout_line, env=None) -> ExecResult. It is NOT a
+    # generator and the callback is required.
+    alpine_container.exec_stream(
+        ["sh", "-c", "i=0; while [ $i -lt 3000000 ]; do i=$((i+1)); done; echo done"],
+        lambda _line: None,
+    )
+    # Poll rather than sizing the workload. Measured frame cadence is ~1 s, so
+    # a fixed workload sits one scheduling hiccup away from a flaky failure.
+    deadline = time.monotonic() + 30
+    while sampler._frames < 2 and time.monotonic() < deadline:
+        time.sleep(0.2)
+    sampler.stop()
+
+    metrics = sampler.metrics()
+    assert metrics.error == ""
+    assert metrics.samples >= 2, "one frame yields no percentage by construction"
+    assert metrics.cpu_pct_p95 is not None
+    assert metrics.mem_peak_mb is not None
+    assert metrics.vm_cpus and metrics.vm_cpus > 0
+    assert metrics.load_p95 is not None
+    # Not `is False`. The peer count is over every running bakeoff.eval_agent
+    # container, and this same label is how a container leaked by a crashed run
+    # is found -- so a dirty machine would fail this on a correct
+    # implementation. What is under test is that a peer observation was made.
+    assert metrics.contention_flag in (False, True)
+
+
+@integration
+def test_the_eval_container_carries_the_label_the_sampler_counts(alpine_container):
+    """The label is also what makes a container leaked by a crashed run
+    identifiable: docker ps -a --filter label=bakeoff.eval_agent."""
+    import docker
+
+    running = docker.from_env().containers.list(
+        filters={"label": "bakeoff.eval_agent=1"}
+    )
+    assert any(c.id == alpine_container._container.id for c in running)

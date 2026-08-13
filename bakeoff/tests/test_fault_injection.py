@@ -115,6 +115,17 @@ class FakeContainer:
     def __exit__(self, *_exc):
         return False
 
+    def host_sampler(self):
+        # A sampler with no container and no client: start() spawns a thread
+        # that returns immediately, and metrics() reports samples=0 with
+        # contention_flag None -- "nobody measured", which is the truth for a
+        # run whose container is a stub. Without this the AttributeError is
+        # swallowed by execute_run's catch-all and every test here fails on an
+        # unrelated assertion.
+        from bakeoff.container import HostSampler
+
+        return HostSampler(container=None, client=None)
+
     def exec(self, *_args, **_kwargs):
         return None
 
@@ -1803,3 +1814,17 @@ def test_a_routable_network_is_recorded_as_not_isolated(agent_image, tmp_path):
     assert record.isolated is False, record.isolation_evidence
     assert "ROUTABLE" in record.isolation_evidence
     assert network.name in record.isolation_evidence
+
+
+def test_an_unsampled_run_does_not_claim_the_host_was_quiet(task, tmp_path):
+    """assemble_record with no host argument is every path that could not
+    sample -- a crash before the container started, a dry run, a test. Through
+    3.6.0 all of them said `contention_flag: false`."""
+    record = assemble_record(
+        task=task, model="kimi-k2-5", sample_index=0,
+        started_at="2026-08-13T00:00:00Z", finished_at="2026-08-13T00:00:30Z",
+        trajectory_path=None, runner_result=None, checkpoints=[],
+        destructive_events=[], artifacts_root=tmp_path,
+    )
+    assert record.host.contention_flag is None
+    assert record.host.samples == 0

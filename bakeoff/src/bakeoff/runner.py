@@ -46,7 +46,7 @@ from bakeoff.claude_runner import (
     config_digest,
 )
 from bakeoff.classify import RunSignals, classify_exclusion, classify_failure
-from bakeoff.container import RunContainer
+from bakeoff.container import HostSampler, RunContainer
 from bakeoff.costs import PRICING_BASIS
 from bakeoff.eventlog import EventLog
 from bakeoff.proxy_callback import read_manifest, read_run_entries, unattributed_count
@@ -56,6 +56,7 @@ from bakeoff.schema import (
     CacheState,
     Checkpoint,
     DestructiveEvent,
+    HostMetrics,
     Outcome,
     RunRecord,
     Severity,
@@ -505,6 +506,7 @@ def assemble_record(
     # "this run was not isolated", and only the second is a defect in the setup.
     isolated: bool | None = False,
     isolation_evidence: str = "",
+    host: HostMetrics | None = None,
     adapter_patches: list[str] | None = None,
     proxy_litellm: str = "",
     crash_error: str = "",
@@ -762,6 +764,10 @@ def assemble_record(
         ),
         isolated=isolated,
         isolation_evidence=isolation_evidence,
+        # `or HostMetrics()` and not a mutable default: an unsampled run --
+        # a crash before the container started, a dry run, a test -- must say
+        # "nobody measured" rather than inherit a shared object.
+        host=host or HostMetrics(),
         artifacts=Artifacts(
             trajectory_jsonl_gz=str(trajectory_path) if trajectory_path else None,
             # Existence-checked AND ownership-checked. Existence alone was
@@ -895,6 +901,11 @@ def execute_run(
     # record with an empty checkpoint list -- data loss that looks like a
     # quiet run.
     recorder: CheckpointRecorder | None = None
+    # Same reasoning, and one step further: `host` is read in the outer
+    # `finally`, which is not itself inside a `try`, so both `stop()` and
+    # `metrics()` have to be total. See HostSampler.stop.
+    sampler: HostSampler | None = None
+    host = HostMetrics()
 
     # Added to, never replacing: the config dir is how the transcript is
     # found afterwards, and a run with no transcript parses to zero turns,
@@ -944,58 +955,86 @@ def execute_run(
             container.checked_exec(["git", "checkout", "--detach", task.base_sha])
             container.checked_exec(["git", "clean", "-xfd"])
 
-            recorder = CheckpointRecorder(container, task.base_sha, every_k_turns)
-            backend = ContainerBackend(container, str(host_config_dir))
-            runner = ClaudeCodeRunner(
-                replace(
-                    config,
-                    config_dir=CONTAINER_CONFIG_DIR,
-                    # Stamped per run so the proxy can attribute each call.
-                    custom_headers=f"X-Bakeoff-Run-Id: {run_id}",
-                ),
-                backend=backend,
-            )
+            # After the setup execs, so `git checkout` and `git clean` are not
+            # counted as the agent's CPU. INSIDE the try: Thread.start() raises
+            # RuntimeError when the OS refuses a thread, and outside it that
+            # unwinds into the catch-all below -- CRASHED, zero turns, for a run
+            # that would have worked.
+            try:
+                sampler = container.host_sampler()
+                sampler.start()
 
-            # Capture as each turn lands, not afterwards. Snapshotting after
-            # the run would record the same end state under every turn
-            # number -- a progression that never happened.
-            runner_result = runner.run(
-                task.prompt, cwd=repo_path, on_turn=recorder.maybe_capture
-            )
-            trajectory_path = runner_result.transcript_path
+                recorder = CheckpointRecorder(container, task.base_sha, every_k_turns)
+                backend = ContainerBackend(container, str(host_config_dir))
+                runner = ClaudeCodeRunner(
+                    replace(
+                        config,
+                        config_dir=CONTAINER_CONFIG_DIR,
+                        # Stamped per run so the proxy can attribute each call.
+                        custom_headers=f"X-Bakeoff-Run-Id: {run_id}",
+                    ),
+                    backend=backend,
+                )
 
-            recorder.force_capture(
-                turn=runner_result.turns_streamed,
-                elapsed_ms=runner_result.wall_clock_ms,
-            )
+                # Capture as each turn lands, not afterwards. Snapshotting after
+                # the run would record the same end state under every turn
+                # number -- a progression that never happened.
+                runner_result = runner.run(
+                    task.prompt, cwd=repo_path, on_turn=recorder.maybe_capture
+                )
+                trajectory_path = runner_result.transcript_path
 
-            if trajectory_path and trajectory_path.exists():
-                # TWO try blocks, not one, and the split is the whole point.
-                # They used to share one, so a failure in the SCANNER left
-                # `destructive = []` while assemble_record's independent
-                # re-parse succeeded -- `trajectory_parse_error` empty,
-                # `destructive_events` empty, and nothing anywhere saying the
-                # scan had not run. That is a positive safety claim (spec
-                # section 7) produced by a failure, which is precisely what the
-                # comment below was written to prevent.
-                parsed = None
-                try:
-                    parsed = parse_trajectory(trajectory_path, model=model)
-                except Exception:  # noqa: BLE001 - assemble_record re-reports it
-                    # Only a genuine parse failure reaches here now. A pricing
-                    # failure used to, and it silently emptied this list --
-                    # so a run with an unpriceable model reported NO
-                    # destructive commands, which reads as a positive safety
-                    # claim (spec section 7) rather than as missing data.
-                    destructive = []
-                if parsed is not None:
+                # Immediately, not in the finally. force_capture ->
+                # snapshot_diff issues exec calls on the same APIClient and
+                # requests.Session the stats stream is using, and force_capture
+                # is ALLOWED to raise -- its diff is the submission. A client
+                # collision there turns a healthy run into CRASHED with no
+                # submission diff.
+                #
+                # This NARROWS that window rather than closing it: stop() sets
+                # a flag and joins with a timeout, and the thread is parked in
+                # a blocking read it only leaves at the next frame (~1 s), so
+                # on a join timeout it is still streaming here.
+                sampler.stop()
+
+                recorder.force_capture(
+                    turn=runner_result.turns_streamed,
+                    elapsed_ms=runner_result.wall_clock_ms,
+                )
+
+                if trajectory_path and trajectory_path.exists():
+                    # TWO try blocks, not one, and the split is the whole point.
+                    # They used to share one, so a failure in the SCANNER left
+                    # `destructive = []` while assemble_record's independent
+                    # re-parse succeeded -- `trajectory_parse_error` empty,
+                    # `destructive_events` empty, and nothing anywhere saying the
+                    # scan had not run. That is a positive safety claim (spec
+                    # section 7) produced by a failure, which is precisely what the
+                    # comment below was written to prevent.
+                    parsed = None
                     try:
-                        destructive = scan_destructive(
-                            parsed.bash_commands, task.test_paths
-                        )
-                    except Exception as exc:  # noqa: BLE001
+                        parsed = parse_trajectory(trajectory_path, model=model)
+                    except Exception:  # noqa: BLE001 - assemble_record re-reports it
+                        # Only a genuine parse failure reaches here now. A pricing
+                        # failure used to, and it silently emptied this list --
+                        # so a run with an unpriceable model reported NO
+                        # destructive commands, which reads as a positive safety
+                        # claim (spec section 7) rather than as missing data.
                         destructive = []
-                        scanner_error = f"{type(exc).__name__}: {exc}"
+                    if parsed is not None:
+                        try:
+                            destructive = scan_destructive(
+                                parsed.bash_commands, task.test_paths
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            destructive = []
+                            scanner_error = f"{type(exc).__name__}: {exc}"
+            finally:
+                # Backstop for a raise between start() and the stop after
+                # runner.run. Tolerates None: `sampler` is assigned inside the
+                # try, so a failure in host_sampler() itself lands here first.
+                if sampler is not None:
+                    sampler.stop()
     except Exception as exc:  # noqa: BLE001 - a crash must still produce a record
         crashed = True
         # The cause, not just the fact. Without it a harness defect and a
@@ -1028,6 +1067,9 @@ def execute_run(
         stderr = getattr(runner_result, "stderr", "") or ""
         if stderr:
             (artifacts_root / STDERR_NAME).write_text(stderr)
+        if sampler is not None:
+            sampler.stop()  # idempotent, and contractually cannot raise
+            host = sampler.metrics()
         if recorder is not None:
             checkpoints = recorder.captured
             # Beside the checkpoints, never instead of them. A short list
@@ -1093,6 +1135,7 @@ def execute_run(
         # The measurement, never `bool(network)`. See RunContainer.
         isolated=isolated,
         isolation_evidence=isolation_evidence,
+        host=host,
         adapter_patches=adapter_patches,
         proxy_litellm=proxy_litellm,
         crash_error=crash_error,

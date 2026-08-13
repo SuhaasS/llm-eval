@@ -525,9 +525,58 @@ class CacheState:
 
 @dataclass(frozen=True)
 class HostMetrics:
+    """What the machine was doing while the agent ran (spec section 6.1,
+    line 458).
+
+    Every field is tri-state and `None` is "nobody measured". `contention_flag`
+    was `bool = False` through 3.6.0 while `RunContainer.stats()` had zero
+    callers, so every record ever written carried a positive claim -- "this run
+    had the host to itself" -- manufactured by a dataclass default, beside two
+    honest nulls.
+
+    `contention_flag` claims ONE thing: another container labelled
+    `bakeoff.eval_agent` was running at some sample. It does not claim the
+    machine was otherwise idle, and it is deliberately not derived from load.
+    Measured on the collection host: `docker info` NCPU is 2 while
+    `os.cpu_count()` is 18, so the agent's budget is a 2-vCPU VM on an 18-core
+    Mac. A `loadavg / os.cpu_count()` threshold cannot fire before host load
+    exceeds 18, and folding it in here would put denominators from two
+    different machines behind one boolean. `load_p95`, `vm_cpus` and
+    `cpu_pct_p95` are recorded instead, and an offline view decides.
+
+    It is also `None` whenever no peer observation was made -- no docker client,
+    or every poll failed -- because `any([])` is False and a frames-based gate
+    would turn zero observations into "nobody else was here". `error` names the
+    poll failure when that is why.
+
+    `cpu_pct_p95` is the CONTAINER's share, scaled by `online_cpus` -- 200%
+    means both vCPUs pinned. `load_p95` is the HOST's 1-minute loadavg over
+    `os.cpu_count()`. They describe different machines and must not be compared.
+
+    `mem_peak_mb` is the peak of SAMPLED instantaneous usage, not a true peak:
+    cgroup v2 exposes no `memory_stats.max_usage` (measured -- the keys are
+    exactly `limit`, `stats`, `usage`), so a spike between frames is invisible.
+    `None` when no frame carried a `usage` at all, never 0.
+    """
+
     cpu_pct_p95: float | None = None
     mem_peak_mb: int | None = None
-    contention_flag: bool = False
+    contention_flag: bool | None = None
+    # p95 of loadavg[0] / cpu_count, so contention_flag stays auditable rather
+    # than a bare boolean a reader has to trust.
+    load_p95: float | None = None
+    # online_cpus from the stats frame: what the container could actually use.
+    # Without it cpu_pct_p95 is uninterpretable -- 150% is saturation on a
+    # 2-vCPU VM and idling on a 16-core one.
+    vm_cpus: int | None = None
+    # Frames the sampler saw. A short series with no error is byte-identical to
+    # a quiet host -- the defect `checkpoint_error` exists for. Frames, not
+    # accepted CPU readings, so it stays the denominator for every series here
+    # even though the first frame yields no percentage.
+    samples: int = 0
+    # Why sampling stopped or never started. Contained rather than raised: this
+    # is supplementary and the trajectory is the product.
+    error: str = ""
 
 
 @dataclass(frozen=True)
