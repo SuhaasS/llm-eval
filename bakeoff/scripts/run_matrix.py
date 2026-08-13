@@ -390,6 +390,11 @@ def main() -> int:
         print(f"creds     usable until {window.expires_at.isoformat()} ({window.source})")
         if window.error:
             print(f"          {window.error}")
+    elif window.source == "offline":
+        # No credentials exist to expire -- the stub answers. Said plainly
+        # rather than reported as an unreadable expiry, which would read as a
+        # degraded live run.
+        print("creds     none needed (offline: the stub answers, nothing is spent)")
     else:
         print(f"creds     expiry unreadable ({window.source}): {window.error}")
         print("          the abort streak is the only backstop on this run")

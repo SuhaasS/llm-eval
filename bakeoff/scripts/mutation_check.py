@@ -652,6 +652,196 @@ MUTATIONS = [
         "tests/test_container.py -k no_network_at_all",
         "integration",
     ),
+    (
+        # The 2026-08-12 defect: `maybe_capture` runs inside the agent's
+        # stdout loop, so a raise there unwinds past the container into
+        # execute_run's catch-all and the record says CRASHED with zero
+        # turns, zero tokens and no diff -- for a run that was working.
+        # Measured once in seven offline arms. Removing the guard restores it.
+        "checkpoints: let a mid-run snapshot failure take the whole run down",
+        "src/bakeoff/checkpoints.py",
+        '            self.errors.append(f"turn {turn}: {type(exc).__name__}: {exc}")\n            return None',
+        "            raise",
+        "tests/test_checkpoints.py -k destroy_the_run",
+        "not integration",
+    ),
+    (
+        # Containment alone swaps a loud wrong record for a quiet one: a
+        # short `checkpoints` list is byte-identical to an agent that changed
+        # nothing, and the section 5.5 curve is computed over exactly that
+        # list. Dropping the error record reproduces the quiet version.
+        "checkpoints: contain the failure but stop recording that it happened",
+        "src/bakeoff/runner.py",
+        'checkpoint_error = "; ".join(recorder.errors)',
+        'checkpoint_error = ""',
+        "tests/test_fault_injection.py -k checkpoint_gap",
+        "not integration",
+    ),
+    (
+        # `git add -A` races Claude Code's atomic Write (`<name>.tmpXXXX`,
+        # created then renamed) and exits 128 "unable to stat". Without the
+        # retry the checkpoint is lost every time the race is lost.
+        "checkpoints: stop retrying the lost race against an atomic write",
+        "src/bakeoff/container.py",
+        "        for attempt in range(_ADD_ATTEMPTS):",
+        "        for attempt in range(1):",
+        "tests/test_container.py -k lost_race",
+        "not integration",
+    ),
+    (
+        # base_sha is what the container detaches to. An abbreviation or a
+        # branch name both resolve, and both resolve to something that can
+        # move -- so accepting them makes section 5.1's pinning decorative.
+        "tasks: accept an abbreviated or symbolic base_sha",
+        "src/bakeoff/tasks.py",
+        "    if not _SHA_RE.match(base_sha):",
+        "    if False:",
+        "tests/test_tasks.py -k could_run_the_wrong_thing",
+        "not integration",
+    ),
+    (
+        # The pin is what catches a re-cut patch or an edited manifest moving
+        # the start state. Without it every record already written against
+        # the old SHA silently describes a different task.
+        "tasks: stop verifying the pinned start state",
+        "src/bakeoff/tasks.py",
+        "    if task.declared_start_sha and task.declared_start_sha != start_sha:",
+        "    if False:",
+        "tests/test_tasks.py -k start_state_that_moved",
+        "not integration",
+    ),
+    (
+        # task_version is not part of run_id, so resume would silently mix
+        # records of two different tasks under one task_id.
+        "matrix: resume across an edited task without noticing",
+        "src/bakeoff/matrix.py",
+        "        if stored_version != versions.get(cell.task_id):",
+        "        if False:",
+        "tests/test_matrix.py -k edited_task",
+        "not integration",
+    ),
+    (
+        # The Phase 0c failure in one operator: ModuleNotFoundError is also a
+        # non-zero exit, so `!= 0` accepts a broken environment as "the bug is
+        # present" and every arm is scored on a task that was never runnable.
+        "preflight: accept any non-zero exit as evidence the bug is present",
+        "src/bakeoff/preflight.py",
+        "        elif red.exit_code != EXIT_TESTS_FAILED:",
+        "        elif False:",
+        "tests/test_preflight.py -k cannot_even_run",
+        "integration",
+    ),
+    (
+        # Measured against litellm 1.95.0: _map_bedrock_exception matches auth
+        # on "invalid" and not "expired", and has no 403 branch -- so an
+        # ExpiredTokenException arrives as APIConnectionError at status 500 and
+        # is filed as an AWS outage, permanently, in an append-only log.
+        "classify: read only the status, so an expired token is an AWS outage",
+        "src/bakeoff/classify.py",
+        "    is_auth_message = any(",
+        "    is_auth_message = False and any(",
+        "tests/test_classify.py -k expired_token_is_auth",
+        "not integration",
+    ),
+    (
+        # 401/403 are how the three mantle arms and three of four bedrock auth
+        # shapes arrive. Without this they get no exclusion at all.
+        "classify: stop treating 401/403 as an infra failure",
+        "src/bakeoff/classify.py",
+        "    is_auth_status = status in (401, 403)",
+        "    is_auth_status = False",
+        "tests/test_classify.py -k auth_status_is_excluded",
+        "not integration",
+    ),
+    (
+        # An auth failure cools the deployment down and the retries come back
+        # as statusless RouterRateLimitErrors, so the LAST message says "No
+        # deployments available" and matches nothing. Reading only the last
+        # message loses the very event the classifier exists to catch.
+        "classify: read only the last error message, which the cooldown replaced",
+        "src/bakeoff/classify.py",
+        "        for message in messages",
+        "        for message in messages[-1:]",
+        "tests/test_classify.py -k hidden_behind_the_routers_cooldown",
+        "not integration",
+    ),
+    (
+        # RouterRateLimitError is a plain ValueError with no status_code, so
+        # `failed: True` + `status_code: None` was unclassifiable and returned
+        # no exclusion at all.
+        "classify: leave a statusless router refusal unclassified",
+        "src/bakeoff/classify.py",
+        "    if messages and NO_DEPLOYMENT_SIGNATURE in messages[-1]:",
+        "    if False:",
+        "tests/test_classify.py -k statusless_router_refusal",
+        "not integration",
+    ),
+    (
+        # ExclusionClass has no MODEL_FAILURE, so an exclusion is by
+        # construction not model data. Dropping this check is what let a dead
+        # credential reset the abort streak on every cell it killed.
+        "matrix: let an excluded cell reset the abort streak",
+        "src/bakeoff/matrix.py",
+        "    if record.exclusion is not None:",
+        "    if False:",
+        "tests/test_matrix.py -k excluded_run_is_not_collection_data",
+        "not integration",
+    ),
+    (
+        # The status-agnostic backstop -- the only gate that holds when litellm
+        # classifies an expiry as a 500 or as nothing at all.
+        "matrix: accept a zero-turn row as a measurement of the model",
+        "src/bakeoff/matrix.py",
+        "    if record.turns_used <= 0:",
+        "    if False:",
+        "tests/test_matrix.py -k no_turns_is_reported",
+        "not integration",
+    ),
+    (
+        # Section 5.7 interleaves the arms, so one dead arm's failures are
+        # never adjacent. Simulated on 20x4x3 with the reference arm dead: the
+        # global counter never fires and all 60 of its cells are lost.
+        "matrix: count the abort streak globally only, as section 5.7 hides it",
+        "src/bakeoff/matrix.py",
+        "        if self.by_model[model] >= self.per_arm:",
+        "        if False:",
+        "tests/test_matrix.py -k never_adjacent",
+        "not integration",
+    ),
+    (
+        # None is "the container never started, nobody measured". Reporting it
+        # as a section 5.1 violation invents a claim from an absence and feeds
+        # the abort streak with it.
+        "matrix: collapse unmeasured isolation into a violation",
+        "src/bakeoff/matrix.py",
+        "    if record.isolated is False:",
+        "    if not record.isolated:",
+        "tests/test_matrix.py -k unmeasured_isolation",
+        "not integration",
+    ),
+    (
+        # Starting a cell that cannot finish spends the tokens and then writes
+        # a row measuring nothing -- and run_id is deterministic under mode
+        # "x", so that cell is consumed forever.
+        "credentials: start a cell that cannot finish before the session dies",
+        "src/bakeoff/proxy.py",
+        "    if remaining > needed_s:",
+        "    if True:",
+        "tests/test_credentials.py -k cannot_finish_before_expiry",
+        "not integration",
+    ),
+    (
+        # Single-line anchor on purpose: a multi-line one spanning the print
+        # would break on any whitespace edit and fail as a stale anchor.
+        # KeyboardInterrupt does not catch TokenRetrievalError, so the guard is
+        # present syntactically and dead in practice -- which is the defect.
+        "credentials: let an expired session escape as a traceback",
+        "src/bakeoff/proxy.py",
+        "    except Exception as exc:  # noqa: BLE001 - expired-session guard, see below",
+        "    except KeyboardInterrupt as exc:",
+        "tests/test_credentials.py -k rather_than_a_traceback",
+        "not integration",
+    ),
 ]
 
 

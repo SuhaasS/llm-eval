@@ -14,7 +14,45 @@ Harness plan: [docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md](doc
 
 **The harness works and the record is honest.** Tasks 1–11 complete, Task 12's
 offline half done, Gate 0 (every CAPTURE-class observability gap) closed at
-schema 3.3.0. `verify_logger.py` PASSED, `mutation_check.py` 61/61.
+schema 3.3.0. Gate 1's **harness half** closed at schema 3.5.0 — a task is now
+a directory on disk, validated before anything is spent, and scheduled by a
+resumable driver. `verify_logger.py` PASSED, `mutation_check.py` 68/68.
+
+**A seventh harness defect, found while verifying that work, and this one
+destroyed records rather than misattributing them.** `git add -A` runs
+concurrently with the agent, and Claude Code's Write is atomic
+(`calc.py.tmpXXXX`, created then renamed). A rename landing between git's
+readdir and its stat makes git exit 128, and because the checkpoint recorder is
+called from inside the agent's stdout loop the exception unwound past the
+container into `execute_run`'s catch-all: **CRASHED, zero turns, zero tokens,
+no diff, for a run that was working.** Measured once in seven offline arms.
+Fixed three ways — the race is retried, the residual failure is contained, and
+`checkpoint_error` names the gap, because containment alone swaps a loud wrong
+record for a quiet one. At N=10 over 2,400 runs this would have shown up as an
+arm-correlated crash rate.
+
+**Gate 1's exit criterion is met: one real issue, end to end, on all four
+arms** (`eventlog-gate1`, 2026-08-12, `pallets/click` #3360). Four records, no
+stranded cells, no uninterpretable rows, every arm isolated with full wire
+attribution.
+
+| arm | turns | tools | wall | cost | diff | terminated_by |
+|---|---|---|---|---|---|---|
+| claude-sonnet-5-runtime | 16 | 15 | 98.9 s | $0.349 | 618 B | agent_finish |
+| kimi-k2-5 | 23 | 22 | 62.3 s | unpriced | 1,485 B | agent_finish |
+| nemotron-3-super-120b | 40 | 40 | 101.3 s | $0.180 | 2,493 B | **turns** |
+| gemma-4-31b | 40 | 38 | 369.5 s | unpriced | 1,215 B | agent_finish |
+
+**All four resolved it**, by a hand-run of the oracle over the four stored
+diffs — every submission applied cleanly, and f2p and p2p both pass after
+restoring the test files (§4.2.1 check 2). That pass was run by hand, not by
+the harness, which still never grades.
+
+**Read it as a proof of the path, not as a result.** N=1 per arm on one task
+is not a rate, and by §3.5's own drop rule a task all four models solve is a
+**ceiling** task with no discriminating signal — this one would be dropped
+during the calibration pilot. It is the right task to prove Gate 1 and the
+wrong task to keep in the frozen set.
 
 **Phase 0c is GO on the fixture task**, twice: a four-arm N=3 on 2026-08-12
 (`20260812T175513Z`, 12/12) and a four-arm N=1 confirming Gate 0 live
@@ -64,7 +102,7 @@ Four gates. Each blocks the next; the section numbering below follows them.
 | gate | what it unlocks | state |
 |---|---|---|
 | **0 — capture** | the record can describe a run honestly | **done** (schema 3.3.0) |
-| **1 — a real task** | one real issue, end to end, on all four arms | **P0 below.** Nothing exists yet |
+| **1 — a real task** | one real issue, end to end, on all four arms | **harness half done** (schema 3.5.0); the dataset is the rest |
 | **2 — scale** | a 2,400-run unattended matrix | **P1 below** |
 | **3 — numbers** | a scorecard anyone can defend | **P2 + P3 below**, plus the offline grader |
 
@@ -78,41 +116,82 @@ including after Phase 4. Each P2 item says which it is.
 
 ## P0 — Blocking a real-task run (Gate 1)
 
-None of this exists. `execute_run` has three callers — `smoke_test.py`,
-`dry_run.py` and the tests — and `TaskSpec` is constructed by hand in each. The
-harness cannot be pointed at a real issue today, not because of a defect but
-because the input path was never built.
+**The harness half is built** (2026-08-12, schema 3.5.0). The input path exists:
+`tasks.py` (manifest, loader, reference split, materialization),
+`images.py` (generated per-task Dockerfiles), `preflight.py` (the task gate),
+`matrix.py` + `scripts/run_matrix.py` (the collection driver). `proxy.py` and
+`session.py` are the topology and the §5.2 dump, moved out of `smoke_test.py`
+so the Phase 0c gate and the real run are the same environment rather than two
+implementations of it.
 
-- [ ] **No task manifest and no loader.** `TaskSpec` (task_id, task_version,
-  repo, base_sha, container_image_digest, prompt, test_paths) is a dataclass
-  nothing reads from disk. Needs a manifest format, a loader, and validation that
-  fails loudly on a task whose image digest or base_sha does not resolve —
-  silently running the wrong commit is the failure mode, and it looks like a
-  quiet run.
+One real task exists and is validated: `taskset/click-3360-write-usage-empty-args`
+— `pallets/click` issue #3360 / PR #3434, 7 fail-to-pass tests, 1,615
+pass-to-pass, 1.4 s suite. **What remains for Gate 1 is the dataset itself**
+(~80 tasks, §3.5), which is the out-of-scope plan below.
 
-- [ ] **No matrix driver.** Nothing iterates task × model × sample. `smoke_test`
-  loops arms for one fixture task and is a gate, not a scheduler. §5.7 requires
-  randomised and interleaved execution and §5.8 requires the ordering actually
-  used be *reported*, not assumed — `smoke_test.print_run_order` is the shape to
-  reuse.
+- [x] **Task manifest and loader.** `task.yaml` per §3.7 plus `reference.diff`,
+  the merged PR verbatim, split into a test half and a solution half by path —
+  a partition, checked as one, so nothing can be dropped from the reference.
+  Loud on: a `base_sha` that is not 40 hex, a `base_sha` the repo does not
+  contain, a reference with no test half or no solution half, a rename crossing
+  the boundary, a duplicate `task_id`, an unknown `--tasks` id.
 
-- [ ] **Per-task container images, each with a working test runner.** The image
-  is digest-pinned and has no route to a package mirror during a run, so whatever
-  the task needs must be baked in. `smoke_test.assert_agent_can_verify_its_work`
-  is the precondition to run per task image — a precondition and not a run
-  criterion, because by the time a record exists the tokens are spent. This is
-  the defect that invalidated all of Phase 0c's capability figures; it must not
-  recur per task.
+- [x] **Per-task container images.** Generated from the manifest rather than
+  hand-written, because the two most expensive failures are structural and a
+  generator cannot emit them: an image left as `USER root` makes Claude Code
+  refuse `bypassPermissions` and exit before one event, and an inherited
+  `ENTRYPOINT` turns `sleep infinity` into an immediate exit. Task pins beat the
+  base image's — measured: click's suite does not *collect* under the base's
+  pinned pytest 9.1.1.
 
-- [ ] **CAPTURE. Every dataset task repo needs a `.gitignore`.** §5.6 stages
-  everything (`git add -A`), so the first live run's diff led with a binary
-  `__pycache__/calc.cpython-312.pyc`. Without one, diff size and file counts
-  measure the interpreter rather than the agent. Done for the smoke fixture only.
+- [x] **A per-task precondition that is stronger than "pytest is on PATH".**
+  `preflight.py` proves the task is red before the reference fix and green
+  after it, inside the pinned image, offline, before the proxy starts. The
+  load-bearing detail is pytest's exit code: `1` is "tests ran and failed",
+  `2`/`4`/`5` are "the environment is broken", and `returncode != 0` accepts
+  the Phase 0c failure as evidence the bug is present.
+  It earned its place on the first real task: click's suite needs `less` on
+  `PATH`, and without it the pager test closes the borrowed stdout and 189
+  unrelated tests error — invisible on macOS, and an agent handed that suite is
+  debugging the image.
 
-- [ ] **`task_set_commit` stays `""` until the dataset exists.** Asserted empty on
-  purpose so nobody reads it as populated. Populate it from the dataset repo when
-  there is one; it is what makes a stored record re-derivable against the task
-  set it ran.
+- [x] **Matrix driver.** Round-major with a recorded seed: every (task, arm)
+  once per round, shuffled within the round, so §5.7's randomised-and-
+  interleaved holds and repeats are separated by a whole round rather than by
+  luck. Resumable across invocations, which is mandatory rather than nice —
+  `write_run` opens `"x"` and `run_id` is deterministic, so the smoke script's
+  fresh-root-per-invocation trick cannot work for a multi-day matrix.
+  **Resume's trap is closed too:** `task_version` is not part of `run_id`, so
+  an edited task would leave every cell looking complete and silently mix two
+  tasks under one `task_id`. That is a hard refusal, per cell. A differing
+  image digest warns and requires `--allow-mixed-images`.
+
+- [x] **The `.gitignore` item, restated as the property that matters.** Checked
+  as "running the suite leaves `git status` clean", not as "the repo has a
+  `.gitignore`" — a `.gitignore` that does not cover what *this* suite drops
+  passes the second and fails the first. Remedy is a manifest-declared
+  `gitignore_extra`, applied in the setup commit and therefore visible in
+  `start_sha`.
+
+- [x] **`task_set_commit` is populated** from the task-set repo's git state,
+  `-dirty` scoped to the set rather than the whole worktree. Schema 3.4.0,
+  because an empty string changed meaning: it used to say "no dataset exists",
+  and now says "this task did not come from a task set".
+
+- [ ] **Two Gate-1 items are still open and both are the dataset, not the
+  harness.** Harvest the remaining tasks (§3.5's ~80) and decide the prompt
+  policy below. Everything above runs against as many tasks as exist.
+
+- [ ] **The test half is applied at setup, and that is a methodology choice.**
+  A real bug-fix PR carries the test that proves the fix, so at `base_sha` the
+  oracle does not exist and §3.3's "runs tests, sees failures, self-corrects"
+  loop has nothing to run — the Phase 0c truncation arriving through the
+  dataset instead of the image. Applying it makes the task "make this test
+  pass", which is what SWE-bench measures and is *not* identical to the
+  harvested workflow. The alternative — a hidden oracle applied only at
+  grading — makes every task's difficulty depend on the agent's test-writing
+  habits, confounding the thing being measured. **Default: apply.** It has to
+  be stated on the scorecard, not left implicit.
 
 - [ ] **Nemotron 3 Super quits mid-plan, and the ruling gates N.** Investigated
   2026-08-11 and confirmed to be the model, not the bridge. The failing response,
@@ -177,14 +256,44 @@ because the input path was never built.
 None of these can appear at N=1. All will appear at N=10, and the credentials
 one ends a multi-day run outright.
 
-- [ ] **Both credentials expire mid-run, and every arm is exposed.** The mantle
-  bearer token is minted in memory by `smoke_bedrock.derive_mantle_token`; the
-  SigV4 keys are frozen out of the SSO session by
-  `smoke_test.freeze_sigv4_credentials`. Both inherit the SSO session's expiry —
-  hours, not days. Phase 4 is 3–4 days mostly unattended, so the mantle arms
-  start returning 401 and the runtime arms start failing signature validation
-  partway through. **No refresh path exists for either.** This is the single
-  hardest blocker on an unattended matrix.
+- [ ] **Both credentials expire mid-run, and no automated refresh exists.**
+  Still open — what closed on 2026-08-12 was the *silent burn*, not the refresh.
+
+  **The window, measured.** Both credentials are frozen once, before the loop,
+  into a proxy container that lives for the whole matrix. `derive_mantle_token`
+  presigns with the SigV4 session (`SigV4QueryAuth(credentials, …)`), so the
+  bearer token embeds `X-Amz-Security-Token` and **cannot outlive that session**
+  whatever its own 12 h cap says. On 2026-08-12 the SSO token and the STS
+  credentials both expired at `2026-08-13T00:54:38Z`, ~8 h after login, against
+  a matrix that needs 4–5 days. Docker cannot change env on a running
+  container, so `aws sso login` mid-run changes nothing until the proxy
+  restarts.
+
+  **What now happens instead of nothing.** `proxy.credential_window` reads the
+  deadline and prints it; `credential_stop` refuses any cell whose
+  `wall_clock_timeout_s + CELL_OVERHEAD_S` reaches past it, before the proxy is
+  built and again before every cell; the driver exits **2** and a re-invocation
+  resumes exactly there. `freeze_sigv4_credentials` no longer escapes as a
+  `TokenRetrievalError` traceback.
+
+  **What is still missing** is the refresh itself: an unattended multi-day run
+  still needs a human to re-login roughly every 8 h. The options are a proxy
+  the harness restarts with fresh env between rounds, or a credential process
+  the proxy container can call. Neither is built.
+
+- [ ] **Auth failures were unclassifiable, and that is now fixed but worth
+  keeping written down.** Closed 2026-08-12 at schema 3.6.0; kept here because
+  every figure taken before it is affected. litellm's `_map_bedrock_exception`
+  recognises auth from `"…token…is invalid"` and not `"expired"`, and has no
+  403 branch — so an `ExpiredTokenException` arrived as `APIConnectionError` at
+  **status 500** and was excluded as `api_5xx`. Every other auth shape, and all
+  three mantle arms, arrived as 401/403 and got **no exclusion at all**. And a
+  single 401 cools a single-deployment group down for 5 s, after which
+  `num_retries: 3` returns `RouterRateLimitError` — a plain `ValueError` with
+  no `status_code` — so the run's *last* wire entry said "No deployments
+  available" at status `None` and matched nothing. Now `api_auth` /
+  `router_no_deployment`, with `router_settings.disable_cooldowns: true`
+  removing the masking at the source.
 
 - [ ] **No run-level retry exists, despite the schema being built for it.**
   `attempt_number` and `parent_run_id` are defined and hashed into `run_id`, and
@@ -192,6 +301,26 @@ one ends a multi-day run outright.
   the matrix moves on. Combined with the stale-`.partial` item below, re-running
   a sample needs a new event-log root or a hand-passed `attempt_number` — which a
   2,400-run matrix will need.
+
+  **Bounded and made visible on 2026-08-12, not fixed.** `StreakTracker` stops
+  the matrix within ~3 uninterpretable cells *per arm* rather than never (see
+  §5.7 below), and `plan_resume` now reports every already-written cell whose
+  record carries an exclusion — so the holes are enumerable instead of needing
+  a hand-grep of the event log. Filling them still needs `attempt_number`.
+
+- [ ] **§5.7's interleaving and consecutive-failure detection pull against each
+  other, and `StreakTracker` is where that is reconciled.** Round-major
+  ordering is right for the cache and ordering confounds and is exactly what
+  defeats a global consecutive-failure counter: one dead arm's failures are
+  never adjacent. Simulated on 20 tasks × 4 arms × 3 repeats with
+  `claude-sonnet-5-runtime` dead, the global counter of 5 **never fires** and
+  all 60 of that arm's cells are lost; a per-arm counter of 3 fires at cell 4
+  having lost 3. Both are counted now, and both are flags
+  (`--abort-streak`, `--abort-streak-per-arm`) because stored records already
+  carry `api_throttle` exclusions and a heavily throttled run should raise the
+  threshold rather than lose the gate. Left here because the *thresholds* are
+  unmeasured — they should be set from the observed throttle rate at scale, not
+  from the credential case they were tuned for.
 
 - [ ] **The prior-run lookup is unsafe under §5.7 parallelism.** `index.jsonl` is
   appended unlocked and `last_run_id_for` runs before the container starts, so
@@ -235,6 +364,12 @@ one ends a multi-day run outright.
   randomize-and-interleave is the mitigation and the spec says to *verify* it,
   not assume it.
 
+- [ ] **The per-run repo is created by the harness user; the container writes
+  as uid 1000.** On macOS virtiofs ignores ownership, which is why this has
+  never bitten. On a Linux host the agent would be unable to write to `/repo`
+  and every arm would land no diff. Pre-existing, unrelated to any one task,
+  and it becomes real the moment the matrix moves off a laptop.
+
 - [ ] **Durability: five narrow windows in an append-only claim.**
   (a) No `os.fsync` of the runs directory after the rename, so a power loss can
   leave the index line durable and the record's directory entry lost — the exact
@@ -267,6 +402,16 @@ one ends a multi-day run outright.
   on the 2026-08-12 GO run (`cache_read=18016` across the set: 16512 / 0 / 1504,
   where a 2026-08-08 measurement had recorded gemma returning no cache fields in
   9 runs). Neither appeared because anything on this side changed.
+
+  **Confirmed on the first real task, and it is worse there than on the
+  fixture.** Both candidate arms that returned cache tokens priced to `null`
+  on the 2026-08-12 real-task run — gemma with `cache_read` 297,824 against
+  672,044 input, kimi likewise — with `pricing_error` naming the cause and the
+  tokens intact. On a 20k-line repository the cache is warm on essentially
+  every turn, so **2 of 3 candidate rows were unpriced while both priced rows
+  were Sonnet and Nemotron**. A cost headline computed from that compares
+  Sonnet's full distribution against whichever candidates happened to be
+  priceable.
 
   A pricing failure now costs only the price — the tokens survive and the run
   stays repriceable — but **there is no rate to reprice it with**. At N=10 per
@@ -379,6 +524,25 @@ size. Two exceptions are marked CAPTURE and should ride along with Gate 1.
   added `litellm_call_id` to every wire entry, which is what makes grouping the
   attempts of one logical call possible at all — the timing still is not there.
 
+- [ ] **DERIVATION. `Checkpoint.turn` and `turns_used` count different things
+  and are both called "turn".** Measured on the first real-task run
+  (nemotron, 2026-08-12): `turns_used` 40, `assistant_records` 80,
+  `turns_streamed` 71, and **71 checkpoints numbered 1–71**. Checkpoints are
+  indexed by the stdout callback, which fires per assistant event — one per
+  content block — while `per_turn` and every §5.4 budget are indexed by API
+  call. So §5.5's promise, "the pass rate at any budget K computed post-hoc",
+  is computed against the wrong axis unless the grader knows: checkpoint 40 is
+  not the state after 40 turns, it is the state after 40 content blocks, which
+  on this run was about turn 20.
+
+  This is the 3.0.0 collapse arriving in a place 3.0.0 did not reach.
+  Derivable, but only from `agent_stdout.jsonl`: the *n*-th assistant event on
+  stdout is checkpoint *n*, and each event carries `message.id`, which is the
+  same key `parse_trajectory` dedupes on. So the mapping is exact and the
+  artifact that carries it must not be dropped. The cheaper alternative is to
+  stamp the API-turn index on the checkpoint at capture time, which needs the
+  dedupe to move into `claude_runner`'s callback.
+
 - [ ] **DERIVATION. `TurnRecord` has no absolute timestamp.** Per-turn data,
   checkpoints (`elapsed_ms`) and wire entries (`logged_at`) use three time bases
   that never join, so no per-call latency can be attached to the turn that
@@ -469,6 +633,15 @@ These need a call, not code. Most are cheap to make and expensive to make late.
   AWS SKU beats another. Check the pricing page before any cost figure leaves the
   team, and note that `Versions.pricing_basis` is what lets a reader tell which
   book a stored record used.
+
+- [ ] **The 40-turn cap is a placeholder and it is already binding.** On the
+  first real-task run Nemotron used all 40 turns and terminated on `turns`,
+  with a plausible submission in hand. §5.4 says caps come from the §3.5
+  calibration pilot's slowest-converging model at roughly p95 × 2, applied
+  identically to all four arms — and that a cap tuned to the incumbent
+  converts a style difference into a capability score. Nothing measured has
+  set these yet, so no turn-limited result from before the pilot means what it
+  looks like.
 
 - [ ] **Sonnet's tokenizer is ~30% denser.** A uniform token cap gives Sonnet
   ~30% less *text* budget than the other arms — a config choice that would be
