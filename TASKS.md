@@ -10,6 +10,75 @@ Harness plan: [docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md](doc
 
 ---
 
+## READINESS — answer this before reading anything else
+
+There are 40-odd open items below. **Five of them block collection.** The rest
+block *publication*, or are recoverable from stored artifacts at any time. This
+section exists so that distinction does not have to be re-derived.
+
+### Can I do a real-issue test run? — **Done. 2026-08-13.**
+
+Four arms, `pallets/click` #3360, on the image that fixes the stale `.pyc`.
+4/4 records, no stranded cells, no uninterpretable rows, `wire_unattributed: 0`
+on every arm, all four resolved by a hand-run of the oracle. Evidence in the
+next section. Nothing is pending for this.
+
+The only caveat is what the run *means*: all four solved it, so by §3.5's own
+drop rule it is a **ceiling task** with no discriminating signal. It proves the
+path end to end. It is not a measurement of any model.
+
+### Can I start the large-scale eval? — **No. Five things, in dependency order.**
+
+| # | blocker | why it blocks | where |
+|---|---|---|---|
+| 1 | **The dataset.** 1 task of ~80, and that one is a ceiling task | nothing downstream can start; the calibration pilot needs it too | Out of scope §1 |
+| 2 | **Caps are unset.** 40 turns is a placeholder and is already binding — nemotron used 40/40 on 2026-08-13, mid-verification, and its diff resolved anyway | §5.4 derives caps from the pilot at ~p95×2; a cap tuned to the incumbent scores a style difference as capability | P3 |
+| 3 | **Credential refresh.** Measured 1 h ⇒ **~20 cells per login**; 3,200 cells ⇒ ~160 re-logins | the matrix runs, but never unattended | P1 |
+| 4 | **No run-level retry.** `attempt_number` has no caller | every infra hiccup leaves a permanent hole; today's work bounds it to ~3 cells/arm and names them, but cannot fill them | P1 |
+| 5 | **The offline grader.** | the harness never grades, by design — until this exists nothing in the log is a result | Out of scope §2 |
+
+1 and 2 are one project: harvest the set, run the pilot, read the caps off it.
+
+### Sizing, measured 2026-08-13 rather than assumed
+
+Mean cell wall clock across the four arms was **150 s** (89.6 / 147.5 / 109.2 /
+255.7) plus ~25 s of harness overhead. The driver is strictly sequential.
+
+| shape | cells | sequential | logins at 1 h |
+|---|---|---|---|
+| 80 tasks × 4 arms × N=10 | 3,200 | **6.5 days** | ~160 |
+| 80 tasks × 4 arms × N=3 | 960 | 1.9 days | ~48 |
+| 30 tasks × 4 arms × N=3 | 360 | **18 hours** | ~18 |
+
+The last row is the smallest shape that yields a defensible scorecard. It needs
+blockers 1, 2 and 5, and makes 3 tolerable. It will not support pass^k or tight
+intervals.
+
+### Do before collection, cheap, not blocking
+
+- **Record the raw `finish_reason`** beside the translated `stop_reason`. Today
+  the record cannot tell "the model decided it was done" from "the adapter said
+  so" — the 2026-08-13 finish analysis had to be done by hand from
+  `wire.jsonl.gz`. CAPTURE-adjacent and it costs a field. (P2)
+- **Wire up `host` metrics.** `RunContainer.stats()` has zero callers, so
+  `contention_flag: false` ships on every record as a measured-looking claim,
+  and no wall-clock figure can be attributed to the model rather than the
+  machine. (P1)
+
+### Blocks the number, not the collection
+
+Candidate cache pricing — gemma and kimi both priced `null` again on
+2026-08-13. Every P3 decision. The repricing of the pre-3.0.0 archive.
+
+### Read every pre-2026-08-13 figure with the pyc caveat
+
+The base image digest changed with that fix, so nothing before it is
+environment-comparable, and the defect could hand an agent its own pre-fix
+code. Re-measure rather than mix; `--allow-mixed-images` exists and should not
+be used across that boundary.
+
+---
+
 ## Where things stand — 2026-08-13
 
 **The harness works and the record is honest.** Tasks 1–11 complete, Task 12's
@@ -188,7 +257,13 @@ including after Phase 4. Each P2 item says which it is.
 
 ---
 
-## P0 — Blocking a real-task run (Gate 1)
+## P0 — Blocking a DISCRIMINATING task set (Gate 1)
+
+**Renamed 2026-08-13.** A real-task run is no longer blocked — one ran that day
+on all four arms and is recorded above. What is blocked is a task set that can
+tell the arms apart: the one task in the set is a ceiling task, so the section
+title used to promise something already delivered while the actual gap went
+unnamed.
 
 **The harness half is built** (2026-08-12, schema 3.5.0). The input path exists:
 `tasks.py` (manifest, loader, reference split, materialization),
