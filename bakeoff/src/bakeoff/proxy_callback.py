@@ -364,6 +364,34 @@ def _error(kwargs: dict) -> dict[str, Any] | None:
     }
 
 
+def finish_reason(response: dict[str, Any]) -> str | None:
+    """The provider's own word for why generation stopped, or None.
+
+    The record already carries `per_turn[].stop_reason`, but that is Claude
+    Code's TRANSLATED value read from the transcript -- Anthropic vocabulary
+    (`end_turn` / `tool_use` / `max_tokens`) that litellm produced from whatever
+    the route returned. `terminated_by` is derived from the last of those, so
+    every claim the record makes about how a run ended passes through one
+    mapping that nothing recorded.
+
+    Measured 2026-08-13 across all four arms: the logged response is an
+    OpenAI-shaped ModelResponse dump, so `choices[0].finish_reason` is present
+    on every arm -- including claude-sonnet-5-runtime, whose bedrock Invoke
+    route carries a native Anthropic body. `stop_reason` is the fallback for a
+    route that logs the Anthropic shape instead.
+
+    None on a failure and on an unparsed `raw_completion`: no stopping decision
+    was reached there, and any string would be a claim invented from an absence.
+    """
+    choices = response.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        value = choices[0].get("finish_reason")
+        if isinstance(value, str) and value:
+            return value
+    value = response.get("stop_reason")
+    return value if isinstance(value, str) and value else None
+
+
 def _iso(value: Any) -> str | None:
     """A callback timestamp as ISO-8601, or None if it was not one.
 
@@ -431,6 +459,10 @@ class BakeoffProxyCallback(CustomLogger):
                     "call_index": index,
                     "failed": failed,
                     "status_code": _status_code(kwargs) if failed else None,
+                    # The route's own word, beside the status. Kept here rather
+                    # than left inside `choices` so a reader does not have to
+                    # know which shape this route logs.
+                    "finish_reason": finish_reason(response),
                     "latency_ms": latency,
                     # The real call boundaries, not the moment this callback got
                     # around to writing. Nothing else in the artifact carries

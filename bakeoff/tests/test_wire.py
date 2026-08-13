@@ -4,7 +4,62 @@ from datetime import UTC, datetime
 
 import pytest
 
+from bakeoff.proxy_callback import finish_reason
 from bakeoff.wire import BakeoffCallback, WireLogger
+
+
+def test_the_providers_own_finish_reason_is_stamped_on_every_entry(tmp_path):
+    """Measured 2026-08-13 across all four arms: the logged response is an
+    OpenAI-shaped ModelResponse dump, so `choices[0].finish_reason` is uniform
+    -- including on claude-sonnet-5-runtime, whose bedrock Invoke route carries
+    a native Anthropic body. The record's per_turn[].stop_reason is Claude
+    Code's TRANSLATED value from the transcript; this is the route's own word.
+
+    Through the CALLBACK, not WireLogger.log_call: log_call stores metadata
+    verbatim and must keep doing so -- it is the shared sink for both capture
+    paths and for replayed proxy entries."""
+    logger = WireLogger(tmp_path / "wire.jsonl.gz")
+    callback = BakeoffCallback(logger, run_id="r-1")
+
+    callback.log_success_event(
+        {"model": "kimi-k2-5"},
+        {"choices": [{"finish_reason": "tool_calls"}]},
+        datetime(2026, 8, 13, tzinfo=UTC),
+        datetime(2026, 8, 13, tzinfo=UTC),
+    )
+    logger.close()
+
+    assert logger.entries()[0]["metadata"]["finish_reason"] == "tool_calls"
+
+
+def test_an_anthropic_shaped_response_still_yields_a_finish_reason():
+    """The fallback, and not dead code: `stop_reason` is what an
+    Anthropic-shaped dump carries, and a route that logs one must not read as
+    uncaptured."""
+    assert finish_reason({"stop_reason": "end_turn"}) == "end_turn"
+
+
+def test_a_failed_call_has_no_finish_reason_rather_than_a_default():
+    """A failure's response is `{"error": ...}` -- no stopping decision was
+    reached, and "" or "stop" there is a claim invented from an absence."""
+    assert finish_reason({"error": {"message": "boom"}}) is None
+    assert finish_reason({"raw_completion": "None"}) is None
+    assert finish_reason({"choices": [{"finish_reason": None}]}) is None
+
+
+def test_both_capture_paths_stamp_the_same_key():
+    """The two metadata dicts are built independently. A key on one path only
+    reads as "this arm did not report one" -- the failure mode the shared
+    REQUEST_KEYS constant exists to prevent on the request side."""
+    import inspect
+
+    from bakeoff import proxy_callback, wire
+
+    for source in (
+        inspect.getsource(proxy_callback.BakeoffProxyCallback._write),
+        inspect.getsource(wire.BakeoffCallback._record),
+    ):
+        assert '"finish_reason"' in source
 
 
 def test_writes_gzipped_jsonl(tmp_path):

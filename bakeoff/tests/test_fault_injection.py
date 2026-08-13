@@ -1058,6 +1058,26 @@ def test_a_5xx_is_excluded_as_infra_under_its_own_reason_code(task, tmp_path):
     assert record.exclusion.reason_code == "api_5xx"
 
 
+def test_the_providers_finish_reason_reaches_the_record(task, tmp_path):
+    """The chain on the shape today's arms produce: tool_calls through the run,
+    `stop` on the last call. Before 3.7.0 the record said only
+    `terminated_by: agent_finish` -- Claude Code's reading of it."""
+    record = assemble_record(
+        task=task, model="kimi-k2-5", sample_index=0,
+        started_at="2026-08-13T00:00:00Z", finished_at="2026-08-13T00:00:30Z",
+        trajectory_path=None, runner_result=None, checkpoints=[],
+        destructive_events=[], artifacts_root=tmp_path,
+        wire_entries=[
+            {"request": {}, "response": {},
+             "metadata": {"failed": False, "finish_reason": "tool_calls"}},
+            {"request": {}, "response": {},
+             "metadata": {"failed": False, "finish_reason": "stop"}},
+        ],
+    )
+    assert record.finish_reasons == {"tool_calls": 1, "stop": 1}
+    assert record.terminal_finish_reason == "stop"
+
+
 def test_an_expired_credential_reaches_the_record_as_an_auth_failure(task, tmp_path):
     """The whole chain, on the shape a real expiry produces: the verbatim
     litellm 1.95.0 message for a bedrock/ ExpiredTokenException, and the 500

@@ -27,7 +27,7 @@ from litellm.integrations.custom_logger import CustomLogger
 # whose docstring owns it. Importing it here is safe and importing
 # bakeoff.litellm_patches would not be -- that one applies its patches on
 # import. proxy_callback holds no patches, only the file-handoff contract.
-from bakeoff.proxy_callback import _error, _iso, project
+from bakeoff.proxy_callback import _error, _iso, finish_reason, project
 from bakeoff.scanners import scan_secrets
 
 
@@ -162,6 +162,13 @@ class BakeoffCallback(CustomLogger):
             raw = dict(response_obj.__dict__)
 
         error = _error(kwargs) if failed else None
+        # Built once, so the projection below and the finish_reason stamp in
+        # `metadata` are reading the same object.
+        payload = (
+            {"error": error}
+            if error is not None
+            else raw if isinstance(raw, dict) else {"raw_completion": str(raw)}
+        )
         self.logger.log_call(
             # Projected through the shared allowlist, so this path and the proxy
             # one cannot drift: a run's canonical artifact is written from
@@ -174,16 +181,15 @@ class BakeoffCallback(CustomLogger):
             # claim an observation of the provider boundary that this path never
             # makes.
             resolved=None,
-            response=(
-                {"error": error}
-                if error is not None
-                else raw if isinstance(raw, dict) else {"raw_completion": str(raw)}
-            ),
+            response=payload,
             metadata={
                 "run_id": self.run_id,
                 "call_index": self._call_index,
                 "failed": failed,
                 "status_code": self._status_code(kwargs) if failed else None,
+                # Same key as proxy_callback._write. A field on one capture
+                # path only reads as "this arm did not report one".
+                "finish_reason": finish_reason(payload),
                 # Measured generation time, as opposed to the trajectory
                 # parser's estimate from transcript timestamps.
                 "latency_ms": self._latency_ms(start_time, end_time),

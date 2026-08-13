@@ -3,7 +3,12 @@ import json
 import pytest
 
 from bakeoff.eventlog import EventLog
-from bakeoff.runner import TaskSpec, assemble_record
+from bakeoff.runner import (
+    TaskSpec,
+    assemble_record,
+    finish_reasons,
+    terminal_finish_reason,
+)
 from bakeoff.schema import (
     FailureClass,
     Checkpoint,
@@ -766,3 +771,32 @@ def test_token_ceiling_is_budget_exhausted_and_counts_as_truncation(task, tmp_pa
     assert record.outcome == Outcome.BUDGET_EXHAUSTED
     assert record.terminated_by == TerminationReason.TOKENS
     assert record.failure_class is FailureClass.TRUNCATION
+
+
+def _entry(reason, failed=False):
+    return {"metadata": {"failed": failed, "finish_reason": reason}}
+
+
+def test_finish_reasons_counts_only_calls_that_returned():
+    """The failed entry carries a reason here on purpose. A real failure has
+    none, so the isinstance check alone would appear to be enough -- and then
+    nothing would pin the guard. litellm double-logs a failure and retries land
+    here too, so a failed entry that carries a stale reason is reachable."""
+    entries = [_entry("tool_calls"), _entry("stop", failed=True), _entry("stop")]
+    assert finish_reasons(entries) == {"tool_calls": 1, "stop": 1}
+
+
+def test_the_terminal_finish_reason_is_the_last_call_that_returned():
+    """`terminated_by` is derived from the transcript's last stop_reason. This
+    is the route's answer to the same question, and the two disagreeing is the
+    section 6.4 adapter-vs-model call -- which the record could not pose,
+    because only one of the two was in it."""
+    entries = [_entry("tool_calls"), _entry("stop"), _entry("length", failed=True)]
+    assert terminal_finish_reason(entries) == "stop"
+
+
+def test_no_successful_call_yields_none_not_an_empty_string():
+    """None is "nobody reported one". "" would sort and compare with the real
+    values."""
+    assert terminal_finish_reason([_entry("stop", failed=True)]) is None
+    assert finish_reasons([]) == {}

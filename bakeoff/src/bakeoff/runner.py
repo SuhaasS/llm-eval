@@ -298,6 +298,63 @@ def distinct_wire_calls(entries: list[dict[str, Any]]) -> int:
     return len(seen) + unkeyed
 
 
+def finish_reasons(entries: list[dict[str, Any]]) -> dict[str, int]:
+    """How the provider said generation stopped, counted over WIRE ENTRIES.
+
+    Entries, not logical calls -- the same units as `wire_entries_seen`, so the
+    two can be read against each other without a conversion. That framing is
+    the only claim being made here, and deliberately not a stronger one:
+    litellm double-logs FAILURES and `num_retries` adds entries, but failed
+    entries are skipped below, so neither can inflate this count. Measured
+    across all 9 stored wire logs -- 112 successful entries, zero duplicate
+    `litellm_call_id` among them -- successes are 1:1 with logical calls, and
+    `wire_entries_distinct` is beside `wire_entries_seen` for the failures that
+    are not.
+
+    Failed entries are skipped: no stopping decision was reached, and
+    `tool_calls.api_calls_failed` is where failures are counted.
+
+    Beside `per_turn[].stop_reason`, never instead of it. Record-level rather
+    than per-turn because the join does not exist -- checked 2026-08-13 on an
+    intact run: the transcript keys on `message.id` (`msg_bdrk_...`), the wire
+    log's `response.id` is a litellm-generated UUID, `bedrock_request_id` was
+    None on the transcript side and is never written on the proxy side at all.
+    Joining by position is wrong on any arm that retried.
+    """
+    counts: dict[str, int] = {}
+    for entry in entries:
+        metadata = entry.get("metadata") or {}
+        if metadata.get("failed"):
+            continue
+        reason = metadata.get("finish_reason")
+        if isinstance(reason, str) and reason:
+            counts[reason] = counts.get(reason, 0) + 1
+    return counts
+
+
+def terminal_finish_reason(entries: list[dict[str, Any]]) -> str | None:
+    """The provider's word for how the LAST returning call stopped, or None.
+
+    The counterpart to `terminated_by`, which runner derives from the
+    transcript's last `stop_reason`. Answering "did this run finish or get cut
+    off" from the provider's side cost a hand-decompression of the wire log on
+    2026-08-13; this is that answer, in the record.
+
+    Trailing failures are SKIPPED rather than ending the walk -- the opposite of
+    `terminal_error_messages`, which reads that same trailing block because the
+    failure is its subject. A run whose last call 401'd still stopped somewhere,
+    and the exclusion machinery already says it failed.
+    """
+    for entry in reversed(entries):
+        metadata = entry.get("metadata") or {}
+        if metadata.get("failed"):
+            continue
+        reason = metadata.get("finish_reason")
+        if isinstance(reason, str) and reason:
+            return reason
+    return None
+
+
 def resolve_reverts(
     events: list[DestructiveEvent], checkpoints: list[Checkpoint]
 ) -> list[DestructiveEvent]:
@@ -530,6 +587,8 @@ def assemble_record(
         api_error_status = final_api_error_status(entries)
     error_messages = terminal_error_messages(entries)
     error_statuses = terminal_error_statuses(entries)
+    reason_counts = finish_reasons(entries)
+    provider_finish = terminal_finish_reason(entries)
     failed_calls = sum(
         1 for e in entries if (e.get("metadata") or {}).get("failed")
     )
@@ -661,6 +720,8 @@ def assemble_record(
         # attribute any of it", and the two are different failures.
         wire_entries_seen=len(entries),
         wire_entries_distinct=distinct_wire_calls(entries),
+        finish_reasons=reason_counts,
+        terminal_finish_reason=provider_finish,
         wire_unattributed=wire_unattributed,
         exclusion=classify_exclusion(signals),
         failure_class=classify_failure(signals),

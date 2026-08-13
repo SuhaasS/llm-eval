@@ -230,7 +230,30 @@ from typing import Any
 # `router_no_deployment`. A reader summing `api_5xx` across the boundary counts
 # operator session lapses as AWS outages; a reader taking a 3.5.0 zero-turn row
 # as a capability observation is reading an expired credential.
-SCHEMA_VERSION = "3.6.0"
+# 3.7.0 adds `finish_reasons`, `terminal_finish_reason`, `collection_id`, and
+# rebuilds `host`.
+#
+# Through 3.6.0 the record described how a run ended only in Claude Code's
+# translated vocabulary -- `per_turn[].stop_reason`, and `terminated_by` derived
+# from it. The route's own word was captured in the wire log and reachable only
+# by decompressing an artifact, which is what answering "did it finish or get
+# cut off" cost on 2026-08-13.
+#
+# `host.contention_flag` defaulted to `false` on every record ever written while
+# nothing called `RunContainer.stats()` -- measured, all 24 stored records carry
+# `{"contention_flag": false, "cpu_pct_p95": null, "mem_peak_mb": null}`. That is
+# a positive claim, "this run had the host to itself", produced by a dataclass
+# default. From 3.7.0 it is `bool | None` and `None` on every unsampled run;
+# every pre-3.7.0 `false` must be read as unmeasured.
+#
+# `collection_id` is "" on every earlier record, and those are the records where
+# it matters most: `run_id` names no episode, so two collections over the same
+# cells minted identical ids -- 6 such ids across the 10 stored event logs, one
+# of them in seven. Their artifacts are also gone, since the later run's rmtree
+# took them, so an `artifacts.*` path on a pre-3.7.0 record resolves to the LAST
+# run of that cell rather than necessarily to this one. 12 stored records
+# already disagree with the file they point at.
+SCHEMA_VERSION = "3.7.0"
 
 
 class Outcome(str, Enum):
@@ -629,6 +652,22 @@ class RunRecord:
     # disagree informatively -- the same reason `assistant_records` sits beside
     # `turns_used`.
     wire_entries_distinct: int = 0
+    # How the PROVIDER said generation stopped, counted over wire ENTRIES --
+    # the same units as wire_entries_seen, because a callback invocation is not
+    # a provider call. `per_turn[].stop_reason` is the value Claude Code wrote
+    # into the transcript and `terminated_by` is derived from the last of those,
+    # so every claim this record made about how a run ended had passed through a
+    # litellm mapping (`stop`/`tool_calls`/`length` ->
+    # `end_turn`/`tool_use`/`max_tokens`) that nothing recorded.
+    #
+    # Record-level rather than per-turn because no join key exists on either
+    # side; see runner.finish_reasons. Empty when no entry returned --
+    # `wire_entries_seen` beside it says whether anybody was counting.
+    finish_reasons: dict[str, int] = field(default_factory=dict)
+    # The last returning entry's, which is the one `terminated_by` is about.
+    # None means nothing returned or nothing reported a reason, never "it just
+    # stopped".
+    terminal_finish_reason: str | None = None
     wire_unattributed: int | None = None
     # Non-empty when the canonical wire artifact could not be opened -- a name
     # collision, an unwritable directory. The run still happened and its
