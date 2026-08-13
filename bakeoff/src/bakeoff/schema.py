@@ -182,7 +182,55 @@ from typing import Any
 # version still has to move, because in 3.2.0 an absent `crash_error`, a
 # `transcript_malformed_lines` of 0 and an `isolated` of `true` were not claims
 # about anything, and from 3.3.0 on each of them is.
-SCHEMA_VERSION = "3.3.0"
+#
+# 3.4.0 adds no field. It moves because `Versions.task_set_commit` changes what
+# an empty string MEANS, and that is the case this rule exists for.
+#
+# Through 3.3.0 the field was blank on every record and documented as blank by
+# design -- there was no dataset for a record to come from, so the blank was a
+# statement about the project. From 3.4.0 tasks are loaded from a task set
+# (tasks.py) and the field carries that set's commit, `-dirty` included. A
+# blank now says "this task did not come from a task set" -- a hand-built
+# TaskSpec, which is what the dry run, the smoke gate and the test suite use.
+#
+# Same bytes, different claim, and no reader can tell them apart without the
+# version. A reader that could not would take a 3.3.0 record's blank as
+# evidence that a real matrix run had no task-set provenance, when in fact
+# none could exist yet.
+#
+# 3.5.0 adds `checkpoint_error`, and it is the same rule a third time: through
+# 3.4.0 a per-turn snapshot that failed took the ENTIRE RUN with it -- the
+# recorder is called from inside the agent's stdout loop, so the exception
+# unwound past the container into `execute_run`'s catch-all and the record
+# said CRASHED, zero turns, zero tokens, no diff, for a run that was working.
+# Measured 2026-08-12, once in seven offline arms: `git add -A` raced Claude
+# Code's atomic Write and git exited 128 "unable to stat".
+#
+# From 3.5.0 that failure is contained and named. A 3.4.0 record's empty
+# `checkpoints` therefore cannot be read the way a 3.5.0 one can: before, a
+# short list meant either an idle agent or a crash somewhere else entirely;
+# now it means an idle agent unless this field says otherwise.
+#
+# 3.6.0 adds no field. It changes what `exclusion.reason_code` can say, and one
+# value it used to say was wrong.
+#
+# Through 3.5.0 a credential failure was recorded one of three ways, none true.
+# On the bedrock/ arms an ExpiredTokenException reached the record as `api_5xx`
+# -- litellm's `_map_bedrock_exception` matches auth on "invalid" and not
+# "expired" and has no 403 branch, so the error falls through to a generic
+# APIConnectionError at status 500. On every other auth shape, and on all three
+# mantle arms, `exclusion` was None and the run read as a model that made zero
+# turns. And when the router's own cooldown intervened -- one 401 cools a
+# single-deployment group down for 5 s -- the retries came back as
+# RouterRateLimitError, a plain ValueError with no status_code, so the record
+# ended on `failed: true` with `status_code: null` and no exclusion at all.
+#
+# From 3.6.0 the first two are `api_auth` and the third is either `api_auth`
+# (when the trailing block still names the credential) or the new
+# `router_no_deployment`. A reader summing `api_5xx` across the boundary counts
+# operator session lapses as AWS outages; a reader taking a 3.5.0 zero-turn row
+# as a capability observation is reading an expired credential.
+SCHEMA_VERSION = "3.6.0"
 
 
 class Outcome(str, Enum):
@@ -654,6 +702,21 @@ class RunRecord:
     # `trajectory_parse_error` empty and `destructive_events: []` -- a positive
     # safety claim (spec section 7) manufactured by a failure.
     scanner_error: str = ""
+    # Turns whose per-turn snapshot could not be taken, so `checkpoints` is
+    # incomplete rather than short. A gap in the section 5.5 curve reads
+    # exactly like an agent that changed nothing for several turns, and the
+    # curve is computed post-hoc over these diffs -- so the pass rate at
+    # budget K would be understated with nothing anywhere saying why.
+    #
+    # It exists because mid-run capture used to take the whole run down with
+    # it: the recorder is called from inside the agent's stdout loop, so a
+    # raise there unwound past the container and `execute_run` recorded
+    # CRASHED with zero turns, zero tokens and no diff for a run that was
+    # working. Measured 2026-08-12 -- `git add -A` lost a race against Claude
+    # Code's atomic Write (`calc.py.tmpXXXX`, created then renamed) and git
+    # exited 128 "unable to stat". Containment without this field would have
+    # replaced a loud wrong record with a quiet one.
+    checkpoint_error: str = ""
     # Why a CRASHED run crashed: the exception type and message from the run
     # body. Empty on every other outcome. Through 3.2.0 the whole run body was
     # caught with `except Exception: crashed = True` and nothing was kept, so a

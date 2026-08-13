@@ -91,6 +91,16 @@ class TaskSpec:
     container_image_digest: str
     prompt: str
     test_paths: list[str] = field(default_factory=list)
+    # Commit of the task set this task was loaded from (see tasks.py). It
+    # travels on the task rather than arriving as an execute_run parameter
+    # because it is a property of where the task came from, and a parameter
+    # is a thing a caller can forget -- which is how `cache_state` claimed
+    # `warm: false` on every record through schema 2.0.0.
+    #
+    # "" for a TaskSpec built by hand: tests, the dry run and the smoke gate
+    # do not come from a task set, and an invented value would be worse than
+    # an honest blank.
+    task_set_commit: str = ""
 
 
 def make_run_id(
@@ -189,6 +199,48 @@ def final_api_error_status(entries: list[dict[str, Any]]) -> int | None:
         return None
     status = metadata.get("status_code")
     return status if isinstance(status, int) else None
+
+
+def terminal_error_messages(entries: list[dict[str, Any]]) -> tuple[str, ...]:
+    """The messages of the failure a run ENDED on: every failed call from the
+    last successful one onward, in order. Empty if the last call succeeded.
+
+    The TRAILING BLOCK, not the last entry and not every failure. Both of the
+    obvious rules are wrong, in opposite directions.
+
+    Last-entry-only is wrong because the last entry lies. Measured against
+    litellm 1.95.0: one 401 cools the deployment down for 5 s -- the
+    `_should_retry(...) is False` branch of `_should_cooldown_deployment` is
+    the one branch of four not guarded by `is_single_deployment_model_group`,
+    and every group in litellm_config.yaml is single-deployment because
+    CLAUDE.md requires every model_name distinct. `num_retries: 3` then retries
+    into the cooldown and gets RouterRateLimitError, a plain ValueError with no
+    status_code at all. So a credential expiry's last entry says "No
+    deployments available" at status None, and classifying on it yields no
+    exclusion for the very event the classifier exists to catch.
+
+    Every-failure is wrong the other way: a 403 that a later call recovered
+    from -- clock skew, IAM eventual consistency on a fresh role -- would
+    exclude a run that completed. `final_api_error_status` has always held that
+    a recovered error costs nothing and must not be excluded, and this keeps
+    the same bar rather than inventing a second one.
+
+    The trailing block satisfies both: it is exactly the failure that killed
+    the run, however many callback invocations that failure was split across.
+
+    `proxy_callback._error` puts the message at response.error.message, under
+    `response` so WireLogger's secret scan can see it.
+    """
+    messages: list[str] = []
+    for entry in reversed(entries):
+        metadata = entry.get("metadata") or {}
+        if not metadata.get("failed"):
+            break
+        error = (entry.get("response") or {}).get("error") or {}
+        message = error.get("message")
+        if isinstance(message, str) and message:
+            messages.append(message)
+    return tuple(reversed(messages))
 
 
 def distinct_wire_calls(entries: list[dict[str, Any]]) -> int:
@@ -377,6 +429,7 @@ def assemble_record(
     proxy_litellm: str = "",
     crash_error: str = "",
     scanner_error: str = "",
+    checkpoint_error: str = "",
     wire_log_error: str = "",
 ) -> RunRecord:
     parsed = ParsedTrajectory(model=model)
@@ -452,6 +505,7 @@ def assemble_record(
     )
     if api_error_status is None:
         api_error_status = final_api_error_status(entries)
+    error_messages = terminal_error_messages(entries)
     failed_calls = sum(
         1 for e in entries if (e.get("metadata") or {}).get("failed")
     )
@@ -496,6 +550,7 @@ def assemble_record(
         p2p_regressions=[],
         container_crashed=container_crashed,
         api_error_status=api_error_status,
+        terminal_error_messages=error_messages,
     )
 
     inference_ms = sum(t.inference_ms for t in parsed.turns)
@@ -529,9 +584,12 @@ def assemble_record(
             # the wire rather than from config: the alias is what was asked
             # for, this is what answered.
             bedrock_model_id=first_request.get("model", "") if entries else "",
-            # Deliberately blank until the dataset plan exists. Inventing a
-            # value would be worse than an honest gap.
-            task_set_commit="",
+            # From the task, which got it from the task set's git state --
+            # not from a parameter and not invented here. Blank means the
+            # task did not come from a task set (a hand-built TaskSpec), which
+            # is a different claim from the blank every record carried before
+            # 3.4.0, when no dataset existed for any record to come from.
+            task_set_commit=task.task_set_commit,
             # What the PROXY reported patching in its own litellm, read from
             # the manifest it wrote. Not derived from our config: section 6.1's
             # rule is that configuration is never reported as observation, and
@@ -601,6 +659,7 @@ def assemble_record(
         trajectory_parse_error=parse_error,
         pricing_error=parsed.pricing_error,
         scanner_error=scanner_error,
+        checkpoint_error=checkpoint_error,
         crash_error=crash_error,
         wire_log_error=wire_log_error,
         agent_exit_code=(
@@ -734,6 +793,7 @@ def execute_run(
     crashed = False
     crash_error = ""
     scanner_error = ""
+    checkpoint_error = ""
     wire_log_error = ""
     # bool(network) until the container is up and the real thing can be read.
     # Section 5.1's guarantee is not this value; it is what network_isolation()
@@ -884,6 +944,9 @@ def execute_run(
             (artifacts_root / STDERR_NAME).write_text(stderr)
         if recorder is not None:
             checkpoints = recorder.captured
+            # Beside the checkpoints, never instead of them. A short list
+            # with no error reads as an agent that changed nothing.
+            checkpoint_error = "; ".join(recorder.errors)
         if wire is not None:
             if proxy_wire_dir is not None:
                 # The agent's calls were made by the proxy process; replay
@@ -948,6 +1011,7 @@ def execute_run(
         proxy_litellm=proxy_litellm,
         crash_error=crash_error,
         scanner_error=scanner_error,
+        checkpoint_error=checkpoint_error,
         wire_log_error=wire_log_error,
     )
     _write_or_strand(record, event_log, artifacts_root)

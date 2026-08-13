@@ -547,6 +547,12 @@ def test_checkpoint_write_failure_keeps_the_checkpoints_already_captured(
     snapshot failed is the exact 'nothing lost' violation section 6.6 is
     written to catch -- and it is invisible from the outside, because the
     record still looks well-formed with an empty checkpoint list.
+
+    The run is still CRASHED here, and since 3.5.0 that is due to the FINAL
+    snapshot rather than the mid-run ones: `force_capture` runs after the
+    agent has exited and its diff is the submission (section 5.6), so it is
+    deliberately still allowed to fail loudly. The mid-run failures are
+    contained -- see the two cases below.
     """
     record = _fake_run(
         monkeypatch, task, tmp_path,
@@ -557,6 +563,69 @@ def test_checkpoint_write_failure_keeps_the_checkpoints_already_captured(
     assert record.outcome is Outcome.CRASHED
     assert len(record.checkpoints) == 1
     assert record.checkpoints[0].diff_vs_base == "diff-1"
+
+
+def test_a_mid_run_snapshot_failure_does_not_crash_a_working_run(
+    task, tmp_path, monkeypatch
+):
+    """Measured 2026-08-12, once in seven offline arms.
+
+    `maybe_capture` is called from inside the agent's stdout loop, so a raise
+    there did not merely lose a checkpoint -- it unwound out of
+    `ClaudeCodeRunner.run`, past the container context manager, into
+    `execute_run`'s catch-all, and the record said CRASHED with zero turns,
+    zero tokens, no diff and no cost. For a run that was working: `git add
+    -A` had lost a race against Claude Code's atomic Write.
+
+    Checkpoints are supplementary evidence (section 5.5's cost/quality
+    curve); the trajectory and the final diff are the run's product. The
+    cheap thing must never cost the expensive one, and by the time this is
+    called the tokens are spent.
+    """
+    container = FakeContainer(fail_snapshot_after=1)
+    # Succeeds on the FINAL capture, so the only failures are mid-run.
+    original = container.snapshot_diff
+
+    def snapshot(base_sha):
+        if container.snapshots >= 3:
+            container.fail_snapshot_after = None
+        return original(base_sha)
+
+    container.snapshot_diff = snapshot
+
+    record = _fake_run(
+        monkeypatch, task, tmp_path,
+        container=container,
+        runner=FakeRunner(turns=3),
+    )
+
+    assert record.outcome is not Outcome.CRASHED
+    assert record.crash_error == ""
+    # The submission survived. This is the field the run exists to produce,
+    # and under the old behaviour it was None on a record marked CRASHED.
+    assert record.artifacts.final_diff == "diff-4"
+    assert record.checkpoint_error, "the gap still has to be named"
+
+
+def test_a_checkpoint_gap_is_named_rather_than_left_looking_like_an_idle_turn(
+    task, tmp_path, monkeypatch
+):
+    """Containment alone would swap a loud wrong record for a quiet one.
+
+    The section 5.5 curve -- the pass rate at any budget K -- is computed
+    post-hoc over `checkpoints`. A list that is short because two snapshots
+    failed is byte-identical to one that is short because the agent changed
+    nothing for two turns, so the curve would be understated with nothing
+    anywhere saying why.
+    """
+    record = _fake_run(
+        monkeypatch, task, tmp_path,
+        container=FakeContainer(fail_snapshot_after=1),
+        runner=FakeRunner(turns=3),
+    )
+
+    assert "No space left on device" in record.checkpoint_error
+    assert "turn 2" in record.checkpoint_error
 
 
 # --- case 8b: disk full during the record write ------------------------------
@@ -989,6 +1058,111 @@ def test_a_5xx_is_excluded_as_infra_under_its_own_reason_code(task, tmp_path):
     assert record.exclusion.reason_code == "api_5xx"
 
 
+def test_an_expired_credential_reaches_the_record_as_an_auth_failure(task, tmp_path):
+    """The whole chain, on the shape a real expiry produces: the verbatim
+    litellm 1.95.0 message for a bedrock/ ExpiredTokenException, and the 500
+    that mapping invents. Before 3.6.0 this record said `api_5xx` -- the
+    operator's lapsed SSO session, written into an append-only log as an AWS
+    outage, on the reference arm."""
+    record = assemble_record(
+        task=task, model="claude-sonnet-5-runtime", sample_index=0,
+        started_at="2026-08-12T00:00:00Z", finished_at="2026-08-12T00:00:30Z",
+        trajectory_path=None, runner_result=None, checkpoints=[],
+        destructive_events=[], artifacts_root=tmp_path,
+        wire_entries=[
+            {
+                "request": {"model": "claude-sonnet-5-runtime"},
+                "response": {"error": {
+                    "type": "APIConnectionError",
+                    "message": (
+                        "bedrock - An error occurred (ExpiredTokenException) when "
+                        "calling the InvokeModel operation: The security token "
+                        "included in the request is expired"
+                    ),
+                }},
+                "metadata": {"failed": True, "status_code": 500},
+            },
+        ],
+    )
+    assert record.exclusion is not None
+    assert record.exclusion.reason_code == "api_auth"
+    # The other half of what makes this row unreadable, and the half
+    # infra_problems keys on.
+    assert record.turns_used == 0
+
+
+def test_an_auth_failure_the_router_cooldown_masked_still_reaches_the_record(
+    task, tmp_path
+):
+    """The sequence a real expiry actually produces, end to end.
+
+    One 401 cools the deployment down for 5 s, `num_retries: 3` retries into
+    the cooldown, and RouterRateLimitError carries no status_code -- so the
+    LAST entry is `failed: true` with `status_code: null` and a message that
+    names no credential. Classifying on it alone yields no exclusion at all,
+    which is the failure this whole change exists to prevent."""
+    from bakeoff.runner import final_api_error_status
+
+    refusal = {
+        "request": {"model": "claude-sonnet-5-runtime"},
+        "response": {"error": {
+            "type": "RouterRateLimitError",
+            "message": (
+                "No deployments available for selected model, Try again in 5.0 "
+                "seconds. Passed model=claude-sonnet-5-runtime."
+            ),
+        }},
+        "metadata": {"failed": True, "status_code": None},
+    }
+    entries = [
+        {
+            "request": {"model": "claude-sonnet-5-runtime"},
+            "response": {"error": {
+                "type": "AuthenticationError",
+                "message": (
+                    "BedrockException Invalid Authentication - The security "
+                    "token included in the request is invalid"
+                ),
+            }},
+            "metadata": {"failed": True, "status_code": 403},
+        },
+        refusal, refusal, refusal,
+    ]
+    # The status the old rule would have classified on: the cooldown's refusal
+    # carries none, so there was nothing to classify and the run was excluded
+    # for nothing at all.
+    assert final_api_error_status(entries) is None
+
+    record = assemble_record(
+        task=task, model="claude-sonnet-5-runtime", sample_index=0,
+        started_at="2026-08-12T00:00:00Z", finished_at="2026-08-12T00:00:30Z",
+        trajectory_path=None, runner_result=None, checkpoints=[],
+        destructive_events=[], artifacts_root=tmp_path,
+        wire_entries=entries,
+    )
+    assert record.exclusion is not None
+    assert record.exclusion.reason_code == "api_auth"
+
+
+def test_a_recovered_failure_leaves_no_error_message_behind(task, tmp_path):
+    """terminal_error_messages is empty when the last call SUCCEEDED, the same
+    bar final_api_error_status has always held. A throttle the retry recovered
+    produced a complete run and must not be excluded by its own error text --
+    and neither must a 403 that a later call recovered from."""
+    record = assemble_record(
+        task=task, model="gemma-4-31b", sample_index=0,
+        started_at="2026-08-12T00:00:00Z", finished_at="2026-08-12T00:00:30Z",
+        trajectory_path=None, runner_result=None, checkpoints=[],
+        destructive_events=[], artifacts_root=tmp_path,
+        wire_entries=[
+            {"request": {}, "response": {"error": {"message": "ExpiredTokenException"}},
+             "metadata": {"failed": True, "status_code": 500}},
+            {"request": {}, "response": {}, "metadata": {"failed": False}},
+        ],
+    )
+    assert record.exclusion is None
+
+
 def test_a_client_error_is_not_an_infra_failure(task, tmp_path):
     """A 400 is the adapter or the request, not the platform. Excluding it
     as infra would quietly drop the runs that reveal a broken tool
@@ -1006,10 +1180,21 @@ def test_a_client_error_is_not_an_infra_failure(task, tmp_path):
     assert record.exclusion is None
 
 
-def test_task_set_commit_is_deliberately_empty_until_the_dataset_exists(task, tmp_path):
-    """The one version field with nothing to populate it. Asserted as empty
-    on purpose: inventing a value would be worse than an honest blank, and
-    when the dataset plan lands this test is the reminder to wire it."""
+def test_task_set_commit_is_blank_for_a_task_that_came_from_no_task_set(
+    task, tmp_path
+):
+    """A hand-built TaskSpec carries no provenance, and says so.
+
+    The dry run, the smoke gate and this suite all construct TaskSpec
+    directly. None of them came from a task set, so the honest value is
+    blank -- inventing one would attach a dataset commit to a fixture.
+
+    Paired with the test below. Together they pin the 3.4.0 contract: the
+    blank is a property of the TASK now, not of the project. Before 3.4.0 it
+    was blank on every record because no dataset existed, and a reader
+    handed the two cannot tell them apart without the schema version, which
+    is why the version moved for a change that added no field.
+    """
     record = assemble_record(
         task=task, model="gemma-4-31b", sample_index=0,
         started_at="2026-08-04T00:00:00Z", finished_at="2026-08-04T00:01:00Z",
@@ -1017,6 +1202,26 @@ def test_task_set_commit_is_deliberately_empty_until_the_dataset_exists(task, tm
         destructive_events=[], artifacts_root=tmp_path,
     )
     assert record.versions.task_set_commit == ""
+
+
+def test_task_set_commit_is_carried_from_the_task_that_declared_it(task, tmp_path):
+    """...and is NOT re-derived, guessed, or read from the harness's own git.
+
+    It is the one thing that makes a stored record re-derivable against the
+    task set it ran: task_id plus task_version name a manifest, and only this
+    field says which revision of the set that manifest came from. A record
+    that named a task nobody can reconstruct is a record that cannot be
+    re-scored, which is the entire premise of an append-only log."""
+    from dataclasses import replace
+
+    dated = replace(task, task_set_commit="deadbeef" * 5 + "-dirty")
+    record = assemble_record(
+        task=dated, model="gemma-4-31b", sample_index=0,
+        started_at="2026-08-04T00:00:00Z", finished_at="2026-08-04T00:01:00Z",
+        trajectory_path=None, runner_result=None, checkpoints=[],
+        destructive_events=[], artifacts_root=tmp_path,
+    )
+    assert record.versions.task_set_commit == "deadbeef" * 5 + "-dirty"
 
 
 # --- case 2 (derivation half): throttles reach the classifier ---------------

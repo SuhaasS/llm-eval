@@ -23,6 +23,7 @@ def signals(**overrides) -> RunSignals:
         p2p_regressions=[],
         container_crashed=False,
         api_error_status=None,
+        terminal_error_messages=(),
     )
     base.update(overrides)
     return RunSignals(**base)
@@ -93,6 +94,138 @@ def test_ordinary_model_failure_is_never_excluded():
     assert classify_exclusion(signals()) is None
 
 
+def test_an_expired_token_is_auth_not_a_server_error():
+    """Measured against litellm 1.95.0: `_map_bedrock_exception` recognises auth
+    from "Unable to locate credentials" and "...token...is invalid" only. An
+    EXPIRED token matches neither, and that function's status ladder has no 403
+    branch and no else, so it falls through to exception_type's generic
+    APIConnectionError -- status 500. Classified on status alone, the single
+    most likely credential event on the reference arm is written into an
+    append-only log as an AWS outage. It is also the one litellm retries:
+    _should_retry(500) is True, _should_retry(401) and (403) are False."""
+    exclusion = classify_exclusion(signals(
+        api_error_status=500,
+        terminal_error_messages=(
+            "BedrockException - An error occurred (ExpiredTokenException) when "
+            "calling the InvokeModel operation: The security token included in "
+            "the request is expired",
+        ),
+    ))
+    assert exclusion is not None
+    assert exclusion.reason_code == "api_auth"
+
+
+def test_an_auth_failure_hidden_behind_the_routers_cooldown_is_still_auth():
+    """The reason this scans the trailing block rather than the last message.
+
+    Measured, litellm 1.95.0: `_should_cooldown_deployment` has four branches
+    and the `_should_retry(status) is False` one is NOT guarded by
+    `is_single_deployment_model_group` -- so one 401 immediately cools the
+    deployment down for DEFAULT_COOLDOWN_TIME_SECONDS (5). Every model group in
+    litellm_config.yaml is single-deployment, because CLAUDE.md requires every
+    model_name distinct to stop load-balancing. `num_retries: 3` then retries
+    into the cooldown and gets RouterRateLimitError -- a plain ValueError with
+    NO status_code attribute, so `proxy_callback._status_code` records None.
+
+    Reading entries[-1] therefore sees status None and "No deployments
+    available", matches nothing, and returns no exclusion at all. The rule is
+    the TRAILING BLOCK of failed calls -- exactly the failure that killed the
+    run, however many callback invocations it was split across."""
+    exclusion = classify_exclusion(signals(
+        api_error_status=None,
+        terminal_error_messages=(
+            "AuthenticationError: BedrockException Invalid Authentication - "
+            "The security token included in the request is invalid",
+            "No deployments available for selected model, Try again in 5.0 "
+            "seconds. Passed model=claude-sonnet-5-runtime.",
+            "No deployments available for selected model, Try again in 5.0 "
+            "seconds. Passed model=claude-sonnet-5-runtime.",
+        ),
+    ))
+    assert exclusion is not None
+    assert exclusion.reason_code == "api_auth"
+
+
+def test_a_statusless_router_refusal_is_never_silently_unclassified():
+    """RouterRateLimitError carries no status_code, so a run that ends on one
+    has `failed: True` and `status_code: None` -- unclassifiable before this,
+    and therefore no exclusion at all. Without a preceding auth error the cause
+    is the router refusing to dispatch, which is infra either way."""
+    exclusion = classify_exclusion(signals(
+        api_error_status=None,
+        terminal_error_messages=(
+            "No deployments available for selected model, Try again in 5.0 seconds.",
+        ),
+    ))
+    assert exclusion is not None
+    assert exclusion.reason_code == "router_no_deployment"
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_an_auth_status_is_excluded_as_infra(status):
+    """How the three mantle arms and three of the four bedrock auth shapes
+    arrive: a status, and a message the signature list would not catch."""
+    exclusion = classify_exclusion(signals(api_error_status=status))
+    assert exclusion is not None
+    assert exclusion.cls == ExclusionClass.INFRA_FAILURE
+    assert exclusion.reason_code == "api_auth"
+
+
+def test_an_auth_signature_alone_is_enough_without_any_status():
+    """The message path must stand on its own. `_status_code` reads
+    `exception.status_code` and returns None when the exception carries none --
+    which RouterRateLimitError and every connection-level failure do."""
+    exclusion = classify_exclusion(
+        signals(terminal_error_messages=("Unable to locate credentials",))
+    )
+    assert exclusion is not None
+    assert exclusion.reason_code == "api_auth"
+
+
+def test_a_genuine_server_error_is_still_api_5xx():
+    """The auth check must not swallow the class it was carved out of.
+    Collapsing them would hide whether Bedrock was failing or the operator's
+    session had lapsed -- different problems with different fixes."""
+    exclusion = classify_exclusion(signals(
+        api_error_status=503,
+        terminal_error_messages=("BedrockException - service unavailable",),
+    ))
+    assert exclusion.reason_code == "api_5xx"
+
+
+def test_a_400_is_still_not_an_infra_failure():
+    """Section 6.4: a 400 is the adapter or the request, not the platform.
+    Excluding it would drop exactly the runs that reveal a broken tool
+    translation -- Gemma's max_tokens and reasoning_effort rejections were both
+    400s and both were harness defects worth keeping."""
+    assert classify_exclusion(signals(api_error_status=400)) is None
+
+
+def test_an_auth_signature_is_matched_case_insensitively():
+    """Providers differ on casing; `ExpiredTokenException` and `expiredtoken`
+    are the same event and must not classify differently."""
+    assert classify_exclusion(
+        signals(terminal_error_messages=("EXPIREDTOKENEXCEPTION",))
+    ).reason_code == "api_auth"
+
+
+def test_a_run_that_died_on_a_throttle_is_still_a_throttle():
+    """The trailing block holds the failure that killed the run. No auth
+    signature is present, so it falls through to the status ladder."""
+    assert classify_exclusion(signals(
+        api_error_status=429,
+        terminal_error_messages=("RateLimitError: throttlingException",),
+    )).reason_code == "api_throttle"
+
+
+def test_a_crash_still_outranks_an_auth_failure():
+    """Ordering. If the container died we do not know what the API did, and
+    `container_crashed` is the more specific claim."""
+    assert classify_exclusion(
+        signals(container_crashed=True, api_error_status=401)
+    ).reason_code == "container_crashed"
+
+
 def test_every_reason_code_is_pre_registered():
     """Spec section 6.4: exclusion criteria are written down before the run.
     An ad-hoc reason code would be the mechanism by which results get
@@ -102,6 +235,10 @@ def test_every_reason_code_is_pre_registered():
         signals(api_error_status=503),
         signals(api_error_status=429),
         signals(tool_calls_total=10, tool_calls_malformed=5),
+        signals(api_error_status=401),
+        signals(api_error_status=403),
+        signals(terminal_error_messages=("ExpiredTokenException",)),
+        signals(terminal_error_messages=("No deployments available for selected model",)),
     ]
     for case in cases:
         exclusion = classify_exclusion(case)

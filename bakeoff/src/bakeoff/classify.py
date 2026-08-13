@@ -39,13 +39,55 @@ PRE_REGISTERED_REASONS: frozenset[str] = frozenset(
     {
         "container_crashed",
         "api_5xx",
+        "api_auth",
         "api_throttle",
         "api_timeout",
+        "router_no_deployment",
         "tool_translation_failure",
         "task_defect_flaky_test",
         "task_defect_bad_base_sha",
     }
 )
+
+# Substrings identifying a credential failure in a provider error message,
+# matched against the lowercased message.
+#
+# This list exists because the status code is not sufficient and, on the arm
+# that matters most, is actively misleading. Measured against litellm 1.95.0:
+# `_map_bedrock_exception` recognises auth from the literal strings "Unable to
+# locate credentials" and "The security token included in the request is
+# invalid". An EXPIRED token says *expired*, matches neither, and that
+# function's status ladder (500/401/400/404/408/422/429/503) has no 403 branch
+# and no else -- so it falls through to exception_type's generic
+# APIConnectionError, which reports status 500. Classified on status alone, an
+# operator's lapsed SSO session is `api_5xx` forever, and the event log has no
+# update API. It is also the only credential failure litellm retries:
+# _should_retry(500) is True, _should_retry(401) and (403) are False.
+AUTH_ERROR_SIGNATURES: tuple[str, ...] = (
+    "expiredtoken",
+    "security token included in the request is expired",
+    "security token included in the request is invalid",
+    "unrecognizedclient",
+    "invalidclienttokenid",
+    "invalidsignature",
+    "signaturedoesnotmatch",
+    "unable to locate credentials",
+    "accessdenied",
+    "token has expired",
+)
+
+# litellm's RouterErrors.no_deployments_available, which reaches the harness as
+# a plain ValueError with NO status_code -- so a run that ends on one records
+# `failed: True` and `status_code: None` and would otherwise be unclassifiable.
+#
+# It is not a provider rate limit. Measured: one 401 cools the deployment down
+# for 5 s via the `_should_retry(...) is False` branch, which is the one branch
+# of four that is NOT guarded by `is_single_deployment_model_group` -- and every
+# group in litellm_config.yaml is single-deployment. So in this configuration
+# the cooldown fires on essentially nothing except an auth failure, and this
+# string is what the auth failure gets replaced by. Checked AFTER auth for
+# exactly that reason.
+NO_DEPLOYMENT_SIGNATURE = "no deployments available"
 
 
 @dataclass(frozen=True)
@@ -64,6 +106,17 @@ class RunSignals:
     p2p_regressions: list[str] = field(default_factory=list)
     container_crashed: bool = False
     api_error_status: int | None = None
+    # The messages of the failure this run ENDED on -- the trailing block of
+    # failed calls, not the last one and not every failure.
+    #
+    # A tuple because the last entry lies. An auth failure cools the deployment
+    # down (see NO_DEPLOYMENT_SIGNATURE), so the entries after it are statusless
+    # router refusals and `entries[-1]` says "No deployments available" rather
+    # than what actually happened -- one logical failure, several callback
+    # invocations. Empty when the last call succeeded, which is what keeps a
+    # recovered error, and a successful completion's own text, from ever
+    # reaching the signature match.
+    terminal_error_messages: tuple[str, ...] = ()
 
     @property
     def malformation_rate(self) -> float:
@@ -114,6 +167,37 @@ def classify_exclusion(signals: RunSignals) -> Exclusion | None:
         )
 
     status = signals.api_error_status
+    messages = [m.lower() for m in signals.terminal_error_messages if m]
+
+    # Two named halves rather than one condition, so mutation_check can revert
+    # each independently: they answer different questions, and exactly one of
+    # them covers the bedrock expired-token case.
+    is_auth_status = status in (401, 403)
+    is_auth_message = any(
+        signature in message
+        for message in messages
+        for signature in AUTH_ERROR_SIGNATURES
+    )
+    # BEFORE the status ladder, deliberately. The expired-token case arrives as
+    # status 500 and would otherwise be filed as an AWS server error.
+    if is_auth_status or is_auth_message:
+        return Exclusion(
+            cls=ExclusionClass.INFRA_FAILURE,
+            reason_code="api_auth",
+            pre_registered=True,
+        )
+
+    # AFTER auth, and only on the LAST message: a router refusal caused by an
+    # auth failure is an auth failure, and the branch above has already claimed
+    # it. What is left here is the router declining to dispatch for some other
+    # reason -- infra either way, and it carries no status to classify by.
+    if messages and NO_DEPLOYMENT_SIGNATURE in messages[-1]:
+        return Exclusion(
+            cls=ExclusionClass.INFRA_FAILURE,
+            reason_code="router_no_deployment",
+            pre_registered=True,
+        )
+
     if status is not None:
         if status == 429:
             code = "api_throttle"
