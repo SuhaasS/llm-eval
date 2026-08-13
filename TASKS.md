@@ -10,13 +10,20 @@ Harness plan: [docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md](doc
 
 ---
 
-## Where things stand — 2026-08-12
+## Where things stand — 2026-08-13
 
 **The harness works and the record is honest.** Tasks 1–11 complete, Task 12's
 offline half done, Gate 0 (every CAPTURE-class observability gap) closed at
 schema 3.3.0. Gate 1's **harness half** closed at schema 3.5.0 — a task is now
 a directory on disk, validated before anything is spent, and scheduled by a
-resumable driver. `verify_logger.py` PASSED, `mutation_check.py` 68/68.
+resumable driver. The credential-expiry blind spot closed at **schema 3.6.0**.
+`verify_logger.py` PASSED on 3 of 3 consecutive runs, unit suite 446,
+integration 35, `mutation_check.py` **80/80**.
+
+**That `verify_logger.py` line used to be worth less than it looked.** Until
+2026-08-13 the gate failed on 2 of 3 runs from a stale-`.pyc` defect (see item
+4 below), so a recorded PASS was partly luck. It is deterministic now, and the
+3-of-3 is the claim.
 
 **A seventh harness defect, found while verifying that work, and this one
 destroyed records rather than misattributing them.** `git add -A` runs
@@ -32,21 +39,47 @@ record for a quiet one. At N=10 over 2,400 runs this would have shown up as an
 arm-correlated crash rate.
 
 **Gate 1's exit criterion is met: one real issue, end to end, on all four
-arms** (`eventlog-gate1`, 2026-08-12, `pallets/click` #3360). Four records, no
-stranded cells, no uninterpretable rows, every arm isolated with full wire
-attribution.
+arms** (`pallets/click` #3360). Re-run 2026-08-13 on the image that fixes the
+stale-`.pyc` defect; the 2026-08-12 figures are superseded and are kept below
+only as the before/after. Four records, no stranded cells, no uninterpretable
+rows, every arm isolated with full wire attribution, `wire_unattributed` 0 on
+all four.
 
 | arm | turns | tools | wall | cost | diff | terminated_by |
 |---|---|---|---|---|---|---|
-| claude-sonnet-5-runtime | 16 | 15 | 98.9 s | $0.349 | 618 B | agent_finish |
-| kimi-k2-5 | 23 | 22 | 62.3 s | unpriced | 1,485 B | agent_finish |
-| nemotron-3-super-120b | 40 | 40 | 101.3 s | $0.180 | 2,493 B | **turns** |
-| gemma-4-31b | 40 | 38 | 369.5 s | unpriced | 1,215 B | agent_finish |
+| claude-sonnet-5-runtime | 16 | 15 | 89.6 s | $0.329 | 791 B | agent_finish |
+| gemma-4-31b | 23 | 22 | 147.5 s | unpriced | 2,772 B | agent_finish |
+| kimi-k2-5 | 24 | 23 | 109.2 s | unpriced | 2,091 B | agent_finish |
+| nemotron-3-super-120b | 40 | 40 | 255.7 s | $0.203 | 13,552 B | **turns** |
+
+Superseded 2026-08-12 run, taken while the stale `.pyc` was live — every one of
+these figures was produced in an environment that could hand the agent its own
+pre-fix code: sonnet 16/98.9 s/$0.349/618 B, kimi 23/62.3 s/1,485 B, nemotron
+40/101.3 s/$0.180/2,493 B, gemma **40 turns (cap)**/369.5 s/1,215 B. Gemma is
+the visible move — 40 turns and the cap, down to 23 and `agent_finish`.
 
 **All four resolved it**, by a hand-run of the oracle over the four stored
 diffs — every submission applied cleanly, and f2p and p2p both pass after
 restoring the test files (§4.2.1 check 2). That pass was run by hand, not by
 the harness, which still never grades.
+
+**Three of the four properly finished, and it is checkable from the wire log.**
+Raw provider `finish_reason` runs *n−1* × `tool_calls` then exactly one `stop`
+on sonnet, gemma and kimi, with a final message reporting verification already
+done — the opposite of the quit-mid-plan signature, which is prose promising a
+*next* action with no call attached. Nemotron shows 40 × `tool_calls` including
+the last, with a tool call in flight and the text *"Let me also verify … by
+checking our change:"* — it was truncated by the turn cap mid-verification, not
+an early stop, and its diff resolves anyway. Every `tool_use` id issued was
+answered by a `tool_result` in the next request (15/22/23/39, zero unmatched),
+so no call was silently dropped. **None of this is in the record** — see the
+`finish_reason` coercion item in P2.
+
+Two arms left scratch files in the submission — nemotron
+`src/click/formatting.py.fixed` (most of its 13,552 B) and gemma
+`reproduce_issue.py`. Model behaviour, correctly captured by §5.6, and a reason
+diff size measures tidiness as well as the fix. **No `__pycache__` in any
+diff**, which is the pyc fix holding.
 
 **Read it as a proof of the path, not as a result.** N=1 per arm on one task
 is not a rate, and by §3.5's own drop rule a task all four models solve is a
@@ -56,7 +89,10 @@ wrong task to keep in the frozen set.
 
 **Phase 0c is GO on the fixture task**, twice: a four-arm N=3 on 2026-08-12
 (`20260812T175513Z`, 12/12) and a four-arm N=1 confirming Gate 0 live
-(`20260812T222630Z`, 4/4). Every run lands the same 157-byte diff.
+(`20260812T222630Z`, 4/4). Every run lands the same 157-byte diff. **Both
+predate the stale-`.pyc` fix**, and the fixture's one-line change is exactly
+the same-size edit that defect hides — so read them as evidence the loop runs,
+not as evidence of what any arm can do.
 
 **Read both the way 2026-08-11 taught us.** Run A that day was GO and run B
 immediately after was NO-GO on Nemotron alone. One GO is one observation, not a
@@ -105,10 +141,12 @@ out-of-scope plans below are about.
    before 2026-08-13 was taken with this live**, on top of the Phase 0c caveat
    below.
 
-5. **Six of six "model failures" so far have been harness defects** — Sonnet's
-   beta header, Kimi's tool-id mangling, Gemma's `propertyNames`, Gemma's
-   colliding ids, Gemma's `max_tokens` rejection, Gemma's `reasoning_effort`
-   requirement. Each looked deterministic and total beforehand. Weigh that base
+5. **Eight of eight "model failures" so far have been harness defects** —
+   Sonnet's beta header, Kimi's tool-id mangling, Gemma's `propertyNames`,
+   Gemma's colliding ids, Gemma's `max_tokens` rejection, Gemma's
+   `reasoning_effort` requirement, the `git add -A` checkpoint race, and the
+   stale `.pyc`. Each looked deterministic and total beforehand, and the last
+   two were found while verifying a fix for something else. Weigh that base
    rate before reading the next total failure as capability.
 
 ### The road to a published result
@@ -117,10 +155,30 @@ Four gates. Each blocks the next; the section numbering below follows them.
 
 | gate | what it unlocks | state |
 |---|---|---|
-| **0 — capture** | the record can describe a run honestly | **done** (schema 3.3.0) |
-| **1 — a real task** | one real issue, end to end, on all four arms | **harness half done** (schema 3.5.0); the dataset is the rest |
-| **2 — scale** | a 2,400-run unattended matrix | **P1 below** |
+| **0 — capture** | the record can describe a run honestly | **done for the unrecoverable half** (3.3.0, extended 3.6.0); ~7 fields still structurally unpopulated, listed below |
+| **1 — a real task** | one real issue, end to end, on all four arms | **harness half done** (3.5.0, image fixed 2026-08-13); the dataset is the rest |
+| **2 — scale** | a 2,400-run unattended matrix | **P1 below.** Binding constraint measured 2026-08-13: ~20 cells per credential window |
 | **3 — numbers** | a scorecard anyone can defend | **P2 + P3 below**, plus the offline grader |
+
+**Gate 0 is done in the sense that matters and not in every sense**, and the
+distinction is worth keeping straight. What is closed is the *unrecoverable*
+half: no observation the harness can make is now lost at write time, and a
+credential failure that used to read as a quiet model failure is labelled and
+stops the run. What is still open is a set of fields that are **structurally
+empty on every record**, measured across the four live runs of 2026-08-13:
+
+| field | why it is empty | class |
+|---|---|---|
+| `host.cpu_pct_p95`, `host.mem_peak_mb`, `host.contention_flag` | `RunContainer.stats()` has zero callers | **capture**, and `contention_flag: false` reads as measured |
+| `time.retry_backoff_ms` | the proxy retries up to 3× and nothing records the backoff, so retry latency hides inside `inference_ms` | **capture** |
+| `tokens.reasoning` | not representable on the candidate adapters, and the provider returns 0 anyway | **capture**, only bites if thinking is turned on |
+| `tokens.cache_write_1h` | LiteLLM's Converse bridge drops Bedrock's `cacheDetails` | **capture**, harmless while the TTL is hardcoded 5m |
+| `truncation_events`, `tool_calls.malformed`, `tool_calls.errored`, `p2p_regressions`, `failure_class` | need the oracle or raw completions; §6.4 puts both offline | **derivation, by design** |
+
+The rest of the 29 empty fields on those runs are honest zeros — no crash, no
+scanner error, no unattributed call, a clean parse. `wire_unattributed: 0` in
+particular is a *measurement*, and it is what licenses trusting the
+wire-derived fields.
 
 Gate 0 was urgent because a capture gap is unrecoverable: the observation is
 never written and no offline pass can invent it. Everything left is either a
