@@ -146,6 +146,11 @@ class ResumeReport:
     stale_partials: list[str] = field(default_factory=list)
     version_conflicts: list[str] = field(default_factory=list)
     image_conflicts: list[str] = field(default_factory=list)
+    #: Cells whose stored record is an exclusion -- a valid record that is not
+    #: an observation of any model. Reported, never acted on: run_id is
+    #: deterministic and nothing increments attempt_number, so these are holes
+    #: no re-invocation can fill (TASKS.md P1).
+    excluded: list[str] = field(default_factory=list)
 
 
 def plan_resume(
@@ -201,6 +206,18 @@ def plan_resume(
             report.image_conflicts.append(
                 f"{cell.label}: stored image {str(stored_image)[:19]}... != "
                 f"{str(images.get(cell.task_id))[:19]}..."
+            )
+        # Named, never acted on. The abort streak and the credential deadline
+        # bound the damage of an infra incident; neither undoes it. The record
+        # is valid and the log is append-only, `run_id` is deterministic, and
+        # nothing increments attempt_number -- so this cell is a hole no
+        # re-invocation fills, and the only alternative to naming it is
+        # grepping the event log by hand.
+        stored_exclusion = stored.get("exclusion")
+        if stored_exclusion:
+            report.excluded.append(
+                f"{cell.label}: {stored_exclusion.get('cls')}/"
+                f"{stored_exclusion.get('reason_code')}"
             )
     return report
 

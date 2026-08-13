@@ -328,6 +328,19 @@ def main() -> int:
     )
     if resume.done:
         print(f"resume    {len(resume.done)} cell(s) already written, skipping")
+    if resume.excluded:
+        print(f"\n{len(resume.excluded)} already-written cell(s) hold an exclusion:")
+        for line in resume.excluded[:20]:
+            print(f"  - {line}")
+        if len(resume.excluded) > 20:
+            print(f"  ... and {len(resume.excluded) - 20} more")
+        print(
+            "These are holes in the matrix, not work to redo: the records are "
+            "valid and the log is append-only, run_id is deterministic, and "
+            "nothing increments attempt_number. Not a blocker -- stated so a "
+            "reader of the finished matrix knows which cells are missing and "
+            "why (TASKS.md P1)."
+        )
     if resume.stale_partials:
         print("\nSTALE PARTIAL WRITES -- these cells can never be written again:")
         for line in resume.stale_partials:

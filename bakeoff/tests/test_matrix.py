@@ -184,6 +184,44 @@ def test_an_unreadable_record_blocks_resume_rather_than_re_running_it(tmp_path):
     assert "could not be read" in report.version_conflicts[0]
 
 
+def test_a_cell_that_recorded_an_infra_failure_is_named_not_re_run(tmp_path):
+    """The account of what a credential incident cost. The abort streak and the
+    deadline check bound the damage and cannot undo it: the record is valid,
+    run_id is deterministic, write_run opens mode "x", and nothing increments
+    attempt_number -- so the cell is a hole no re-invocation fills.
+
+    Warned rather than blocked. The record is legitimate and the log is
+    append-only; refusing to resume over it would make one expired session
+    permanently fatal to a matrix."""
+    log = EventLog(tmp_path / "log")
+    order = matrix_order(["t"], ["a"], repeats=1, seed=1)
+    run_id = make_run_id("t", "a", 0)
+    (log.runs_dir / f"{run_id}.json").write_text(json.dumps({
+        "task_version": 1,
+        "exclusion": {"cls": "infra_failure", "reason_code": "api_auth",
+                      "pre_registered": True},
+        "versions": {"container_image_digest": "img"},
+    }))
+
+    report = plan_resume(order, log, versions={"t": 1}, images={"t": "img"})
+
+    assert report.excluded == ["t/a/0: infra_failure/api_auth"]
+    assert not report.version_conflicts
+    assert report.done
+
+
+def test_a_clean_stored_record_is_not_reported_as_damage(tmp_path):
+    log = EventLog(tmp_path / "log")
+    order = matrix_order(["t"], ["a"], repeats=1, seed=1)
+    run_id = make_run_id("t", "a", 0)
+    (log.runs_dir / f"{run_id}.json").write_text(json.dumps({
+        "task_version": 1, "exclusion": None,
+        "versions": {"container_image_digest": "img"},
+    }))
+
+    assert plan_resume(order, log, versions={"t": 1}, images={"t": "img"}).excluded == []
+
+
 # --- what the driver gates on ------------------------------------------------
 
 
