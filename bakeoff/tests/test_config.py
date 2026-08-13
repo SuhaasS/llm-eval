@@ -135,6 +135,33 @@ def test_every_proxy_config_registers_both_callbacks():
         assert "bakeoff.litellm_patches.instance" in callbacks, path.name
 
 
+def test_the_router_does_not_cool_down_a_single_deployment_group():
+    """Measured, litellm 1.95.0: `_should_cooldown_deployment` has four
+    branches, and the `_should_retry(status) is False` one is NOT guarded by
+    `is_single_deployment_model_group`. _should_retry(401) and (403) are both
+    False, so ONE auth failure cools the deployment down for
+    DEFAULT_COOLDOWN_TIME_SECONDS (5).
+
+    Every model group here is single-deployment -- the model_names are distinct
+    by design so LiteLLM cannot load-balance and randomise transport per call --
+    so there is nothing to fail over to and the cooldown buys nothing. What it
+    costs is the diagnosability of every auth failure: `num_retries: 3` retries
+    into the cooldown and gets RouterRateLimitError, a plain ValueError with no
+    status_code, so the run's last wire entry says "No deployments available" at
+    status None instead of naming the credential problem that caused it.
+
+    Checked across every proxy config, for the reason
+    test_every_proxy_config_registers_both_callbacks gives: a setting missing
+    from one of them means the offline gate certifies a different router policy
+    from the one the paid run uses, under the same name.
+    """
+    for path in sorted(CONFIG.parent.glob("litellm*.yaml")):
+        config = yaml.safe_load(path.read_text())
+        names = [d["model_name"] for d in config["model_list"]]
+        assert len(names) == len(set(names)), f"{path.name}: would load-balance"
+        assert config["router_settings"]["disable_cooldowns"] is True, path.name
+
+
 def test_no_deployment_targets_the_real_anthropic_api():
     """The assumption that makes the tool-id patch safe, written down.
 

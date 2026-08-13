@@ -59,6 +59,30 @@ litellm_settings:
   drop_params: false
   set_verbose: false
 
+router_settings:
+  # Measured against litellm 1.95.0. `_should_cooldown_deployment` has four
+  # branches; three are guarded by `is_single_deployment_model_group` and the
+  # fourth -- `elif litellm._should_retry(status_code) is False` -- is not.
+  # _should_retry(401) and (403) are both False, so ONE auth failure cools the
+  # deployment down for DEFAULT_COOLDOWN_TIME_SECONDS (5).
+  #
+  # Every model group below is single-deployment: the model_names are distinct
+  # by design, so LiteLLM cannot load-balance and randomise transport per call.
+  # There is therefore nothing to fail over TO, and the cooldown buys nothing
+  # while costing the diagnosability of every auth failure -- `num_retries: 3`
+  # retries into it and gets RouterRateLimitError, a plain ValueError with NO
+  # status_code, so the wire log's last entry reads "No deployments available"
+  # at status None instead of naming the credential problem that caused it.
+  #
+  # The other unguarded branch needs 1000 requests in one minute
+  # (SINGLE_DEPLOYMENT_TRAFFIC_FAILURE_THRESHOLD) and is unreachable here. So in
+  # this configuration the cooldown mechanism fires on essentially nothing
+  # except an auth failure, and disabling it loses nothing.
+  #
+  # Applied to every deployment identically -- not a section 5.3 divergence.
+  disable_cooldowns: true
+
+
 general_settings:
   # No retries here, unlike production. A retry would turn one injected 429
   # into four wire entries and make the test assert on retry behaviour
