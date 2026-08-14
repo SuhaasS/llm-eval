@@ -128,6 +128,7 @@ def main() -> int:
             repo_path=str(repo),
             artifacts_root=workdir / "artifacts",
             collection_id=workdir.name,
+            invocation_stamp=workdir.name,
         )
 
         print()

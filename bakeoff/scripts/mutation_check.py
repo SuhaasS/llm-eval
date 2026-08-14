@@ -279,8 +279,8 @@ MUTATIONS = [
         # smoke_test.py, which does not run during an eval.
         "wire: stop recording the calls the proxy could not attribute",
         "src/bakeoff/runner.py",
-        "        wire_unattributed=wire_unattributed,\n        # The measurement",
-        "        wire_unattributed=None,\n        # The measurement",
+        "            wire_unattributed=wire_unattributed,\n            # The measurement",
+        "            wire_unattributed=None,\n            # The measurement",
         "tests/test_fault_injection.py -k could_not_attribute or this_runs_lost_calls",
         "not integration",
     ),
@@ -368,16 +368,16 @@ MUTATIONS = [
     (
         "defect 3: discard checkpoints on a mid-run failure",
         "src/bakeoff/runner.py",
-        "        if recorder is not None:\n            checkpoints = recorder.captured",
-        "        pass",
+        "            if recorder is not None:\n                checkpoints = recorder.captured",
+        "            if False:\n                checkpoints = recorder.captured",
         "tests/test_fault_injection.py -k 'checkpoint_write_failure or killed_mid_stream'",
         "not integration",
     ),
     (
         "defect 4: stop reading the proxy's wire log",
         "src/bakeoff/runner.py",
-        "            if proxy_wire_dir is not None:",
-        "            if False:",
+        "            if proxy_wire_dir is not None:\n                raw_entries = read_run_entries",
+        "            if False:\n                raw_entries = read_run_entries",
         "tests/test_fault_injection.py -k proxy_side_capture",
         "integration",
     ),
@@ -448,7 +448,7 @@ MUTATIONS = [
     (
         "new: let a truncated line kill the whole wire log",
         "src/bakeoff/proxy_callback.py",
-        "        except json.JSONDecodeError:\n            continue",
+        "        except json.JSONDecodeError:\n            malformed += 1\n            continue",
         "        except json.JSONDecodeError:\n            raise",
         "tests/test_proxy_callback.py -k partial_final_line",
         "not integration",
@@ -1016,13 +1016,105 @@ MUTATIONS = [
         # kwarg appears in the RunRecord construction.
         "collection: drop the collection id between execute_run and the record",
         "src/bakeoff/runner.py",
-        "        host=host,\n"
-        "        collection_id=collection_id,\n"
-        "        adapter_patches=adapter_patches,",
-        "        host=host,\n"
-        '        collection_id="",\n'
-        "        adapter_patches=adapter_patches,",
+        "            host=host,\n"
+        "            collection_id=collection_id,\n"
+        "            invocation_stamp=invocation_stamp,",
+        "            host=host,\n"
+        '            collection_id="",\n'
+        "            invocation_stamp=invocation_stamp,",
         "tests/test_fault_injection.py -k survives_the_whole_orchestrator",
+        "not integration",
+    ),
+    (
+        # Schema 3.8.0. Every one of the next six used to destroy the record
+        # outright or, worse, publish something false in its place.
+        "finalize: let a failing finalize step take the record with it",
+        "src/bakeoff/runner.py",
+        "            except Exception as exc:  # noqa: BLE001 - see above\n"
+        "                finalize_errors.append",
+        "            except Exception:\n"
+        "                raise\n"
+        "                finalize_errors.append",
+        "tests/test_fault_injection.py -k finalize_step_that_raises",
+        "not integration",
+    ),
+    (
+        "finalize: stop the driver seeing that finalize did not complete",
+        "src/bakeoff/matrix.py",
+        'if getattr(record, "finalize_error", ""):',
+        "if False:",
+        "tests/test_matrix.py -k finalize_failure_makes_the_row",
+        "not integration",
+    ),
+    (
+        "finalize: stop the driver seeing a dead wire log after the H1 hoist",
+        "src/bakeoff/matrix.py",
+        'if getattr(record, "wire_log_error", ""):',
+        "if False:",
+        "tests/test_matrix.py -k dead_wire_log_still_aborts",
+        "not integration",
+    ),
+    (
+        "assembly: lose the run when assemble_record itself raises",
+        "src/bakeoff/runner.py",
+        "    except Exception as exc:  # noqa: BLE001 - the tokens are already spent\n"
+        "        record = _minimal_record(",
+        "    except Exception:\n"
+        "        raise\n"
+        "        record = _minimal_record(",
+        "tests/test_fault_injection.py -k assembly_that_raises",
+        "not integration",
+    ),
+    (
+        # `[]` beside `scanner_error: ""` is a positive spec section 7 safety
+        # claim manufactured by a failure -- the pair scanner_error exists for.
+        "assembly: let the minimal record manufacture a safety claim",
+        "src/bakeoff/runner.py",
+        "        destructive_events=events,",
+        "        destructive_events=[],",
+        "tests/test_fault_injection.py -k manufacture_a_safety_claim",
+        "not integration",
+    ),
+    (
+        # The per-turn diffs live only in memory and only in the record, and
+        # the materialized repo is deleted after the run.
+        "assembly: let the minimal record throw away the submission diff",
+        "src/bakeoff/runner.py",
+        "        checkpoints=checkpoints,\n        destructive_events=events,",
+        "        checkpoints=[],\n        destructive_events=events,",
+        "tests/test_fault_injection.py -k keeps_the_submission_diff",
+        "not integration",
+    ),
+    (
+        # A truncation splitting a multi-byte character raises
+        # UnicodeDecodeError -- a ValueError -- before any line is examined.
+        "wire: read the proxy log strictly and lose it to one torn character",
+        "src/bakeoff/proxy_callback.py",
+        'path.read_text(encoding="utf-8", errors="replace")',
+        'path.read_text(encoding="utf-8")',
+        "tests/test_fault_injection.py -k torn_multibyte_wire_line",
+        "not integration",
+    ),
+    (
+        "wire: let a non-object line reach the caller's .get",
+        "src/bakeoff/proxy_callback.py",
+        "        if not isinstance(parsed, dict):\n            malformed += 1\n            continue",
+        "        if False:\n            malformed += 1\n            continue",
+        "tests/test_fault_injection.py -k non_object_wire_line",
+        "not integration",
+    ),
+    (
+        # Publishing a truncated gz as the section 6.2 artifact resolves, which
+        # is worse than the null it replaced.
+        "wire: publish a truncated wire log as the section 6.2 artifact",
+        "src/bakeoff/runner.py",
+        '                                f"replay failed: {type(exc).__name__}: {exc}"\n'
+        "                            )\n"
+        "                            break",
+        '                                ""\n'
+        "                            )\n"
+        "                            break",
+        "tests/test_fault_injection.py -k truncated_wire_log",
         "not integration",
     ),
     (

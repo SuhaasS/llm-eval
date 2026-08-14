@@ -191,6 +191,8 @@ def _fake_run(
     sample_index=0,
     artifacts_name="artifacts",
     collection_id="",
+    invocation_stamp="",
+    proxy_wire_dir=None,
 ):
     import bakeoff.runner as runner_module
 
@@ -225,6 +227,8 @@ def _fake_run(
         repo_path=str(tmp_path / "repo"),
         artifacts_root=tmp_path / artifacts_name,
         collection_id=collection_id,
+        invocation_stamp=invocation_stamp,
+        proxy_wire_dir=proxy_wire_dir,
     )
 
 
@@ -1879,3 +1883,335 @@ def test_a_run_with_no_collection_named_says_so_end_to_end(task, tmp_path, monke
     """"" is honest and distinguishable from a named episode. It is also every
     record written before 3.7.0."""
     assert _fake_run(monkeypatch, task, tmp_path).collection_id == ""
+
+
+# --- schema 3.8.0: the finalize phase, and the record that survives it -------
+#
+# Every case here used to produce NO RECORD AT ALL. `execute_run`'s `finally`
+# and its whole assembly stretch sat outside every `try`, so a raise in either
+# escaped past `_write_or_strand` -- not even `record.unwritten.json`. The
+# tokens for these runs are already spent by the time the failure happens.
+
+
+class _TalkativeRunner(FakeRunner):
+    """A FakeRunner that emits stdout, so the stdout finalize step has work to
+    do. The default double returns "" and the step is then a no-op, which
+    would make a test of its failure pass for the wrong reason."""
+
+    def run(self, prompt, cwd, on_turn=None):
+        result = super().run(prompt, cwd, on_turn)
+        return replace(result, stdout='{"type":"system","subtype":"init"}\n')
+
+
+def _wire_dir_with(tmp_path, run_id, lines):
+    wire_dir = tmp_path / "wire"
+    wire_dir.mkdir(parents=True, exist_ok=True)
+    (wire_dir / f"{run_id}.jsonl").write_bytes(lines)
+    return wire_dir
+
+
+def _entry(index, *, failed=False, status=None, message=""):
+    return {
+        "logged_at": "2026-08-13T00:00:0%dZ" % index,
+        "request": {"model": "gemma-4-31b", "max_tokens": 8},
+        "resolved": None,
+        "response": ({"error": {"message": message}} if failed else {"id": f"m{index}"}),
+        "metadata": {
+            "run_id": "r",
+            "call_index": index,
+            "failed": failed,
+            "status_code": status,
+            "litellm_call_id": f"c{index}",
+        },
+    }
+
+
+def test_a_finalize_step_that_raises_still_produces_a_record(
+    task, tmp_path, monkeypatch
+):
+    """The whole point of the phase. A failing step is named, not fatal."""
+    import bakeoff.runner as runner_module
+
+    def boom(*_a, **_k):
+        raise OSError("[Errno 28] No space left on device")
+
+    monkeypatch.setattr(runner_module.Path, "write_text", boom)
+    record = _fake_run(
+        monkeypatch, task, tmp_path, runner=_TalkativeRunner()
+    )
+
+    assert record.finalize_error, "a failed finalize step must name itself"
+    assert "stdout" in record.finalize_error
+    assert record.run_id
+
+
+def test_one_failing_finalize_step_does_not_skip_the_others(
+    task, tmp_path, monkeypatch
+):
+    """Per step, not one try around the block.
+
+    A single guard would let a stdout failure cost the checkpoints too -- and
+    the checkpoints are the only copy of the submission diff.
+    """
+    import bakeoff.runner as runner_module
+
+    real_write = runner_module.Path.write_text
+
+    def selective(self, *args, **kwargs):
+        if self.name == runner_module.STDOUT_NAME:
+            raise OSError("[Errno 28] No space left on device")
+        return real_write(self, *args, **kwargs)
+
+    monkeypatch.setattr(runner_module.Path, "write_text", selective)
+    record = _fake_run(
+        monkeypatch, task, tmp_path, runner=_TalkativeRunner()
+    )
+
+    assert "stdout" in record.finalize_error
+    # The steps after the failing one still ran.
+    assert "checkpoints" not in record.finalize_error
+    assert "wire" not in record.finalize_error
+
+
+def test_assembly_that_raises_yields_a_minimal_record_not_a_lost_one(
+    task, tmp_path, monkeypatch
+):
+    import bakeoff.runner as runner_module
+
+    def boom(**_kwargs):
+        raise ValueError("assembly blew up")
+
+    monkeypatch.setattr(runner_module, "assemble_record", boom)
+    log = EventLog(tmp_path / "log")
+    record = _fake_run(monkeypatch, task, tmp_path, event_log=log)
+
+    assert record.assembly_error.startswith("ValueError: assembly blew up")
+    # Read back: the record is IN THE LOG, not merely returned.
+    assert log.read_run(record.run_id).assembly_error == record.assembly_error
+
+
+def test_the_minimal_record_does_not_fabricate_claims(task, tmp_path, monkeypatch):
+    """Every field it defaults is a claim it makes.
+
+    `cost_usd=0.0` is a genuine zero, `isolated=False` says section 5.1 did
+    not hold, and FAILED with zero turns is filed GAVE_UP -- a permanent
+    behavioural claim about the model, produced by a defect in the harness.
+    """
+    import bakeoff.runner as runner_module
+
+    monkeypatch.setattr(
+        runner_module, "assemble_record", lambda **_k: (_ for _ in ()).throw(
+            ValueError("nope")
+        )
+    )
+    record = _fake_run(monkeypatch, task, tmp_path)
+
+    assert record.cost_usd is None, "0.0 is a measured zero cost"
+    assert record.isolated is None, "False is a section 5.1 violation claim"
+    assert record.outcome is Outcome.CRASHED
+    assert record.terminated_by is TerminationReason.CRASH
+    assert record.exclusion is None, "an invented exclusion removes the row"
+
+
+def test_the_minimal_record_carries_the_image_digest(task, tmp_path, monkeypatch):
+    """Otherwise plan_resume refuses to resume the whole matrix, forever.
+
+    `Versions()` defaults `container_image_digest` to "", and plan_resume
+    compares a stored record's digest against the image about to be used --
+    so a defaulted minimal record is a permanent image conflict, and
+    run_matrix exits 1 on any of them unless --allow-mixed-images is passed.
+    """
+    import bakeoff.runner as runner_module
+
+    monkeypatch.setattr(
+        runner_module, "assemble_record", lambda **_k: (_ for _ in ()).throw(
+            ValueError("nope")
+        )
+    )
+    record = _fake_run(monkeypatch, task, tmp_path)
+
+    assert record.versions.container_image_digest == task.container_image_digest
+
+
+def test_the_minimal_record_keeps_the_submission_diff(task, tmp_path, monkeypatch):
+    """The payload, not just the claim fields.
+
+    The per-turn diffs live only in memory and only in the record, and the
+    materialized repo is deleted after the run -- so a minimal record without
+    them throws away the submission of the very cell it is rescuing.
+    """
+    import bakeoff.runner as runner_module
+
+    monkeypatch.setattr(
+        runner_module, "assemble_record", lambda **_k: (_ for _ in ()).throw(
+            ValueError("nope")
+        )
+    )
+    box = FakeContainer()
+    record = _fake_run(monkeypatch, task, tmp_path, container=box)
+
+    assert record.checkpoints, "the per-turn diffs exist nowhere else"
+    assert record.artifacts.final_diff is not None
+
+
+def test_the_minimal_record_does_not_manufacture_a_safety_claim(
+    task, tmp_path, monkeypatch
+):
+    """`destructive_events: []` beside `scanner_error: ""` is a positive spec
+    section 7 claim -- "the scan ran and found nothing" -- and `scanner_error`
+    exists precisely so a failure cannot produce it."""
+    import bakeoff.runner as runner_module
+    from bakeoff.schema import DestructiveCategory, DestructiveEvent
+
+    event = DestructiveEvent(
+        turn=1,
+        command="rm -rf tests/",
+        paths_touched=["tests/"],
+        category=DestructiveCategory.TEST_DELETION,
+        reverted_by_agent=False,
+        affected_outcome=False,
+        severity=Severity.HIGH,
+    )
+    monkeypatch.setattr(runner_module, "scan_destructive", lambda *_a, **_k: [event])
+    monkeypatch.setattr(
+        runner_module, "assemble_record", lambda **_k: (_ for _ in ()).throw(
+            ValueError("nope")
+        )
+    )
+    transcript = _write(
+        tmp_path,
+        [_assistant(1, tool="Bash", tool_input={"command": "rm -rf tests/"}),
+         _assistant(2, stop_reason="end_turn")],
+    )
+    record = _fake_run(
+        monkeypatch, task, tmp_path, runner=FakeRunner(transcript_path=transcript)
+    )
+
+    assert [e.command for e in record.destructive_events] == ["rm -rf tests/"]
+
+
+def test_a_torn_multibyte_wire_line_does_not_cost_the_record(
+    task, tmp_path, monkeypatch
+):
+    """A truncation splitting a multi-byte character raises UnicodeDecodeError
+    -- a ValueError, so the JSONDecodeError catch never saw it -- before a
+    single line had been examined, inside the finalize phase."""
+    from bakeoff.runner import make_run_id
+
+    run_id = make_run_id(task.task_id, "gemma-4-31b", 0, 1)
+    payload = (json.dumps(_entry(1)) + "\n").encode("utf-8")
+    payload += '{"metadata": {"run_id": "r"}, "x": "café'.encode("utf-8")[:-1]
+    wire_dir = _wire_dir_with(tmp_path, run_id, payload)
+
+    record = _fake_run(monkeypatch, task, tmp_path, proxy_wire_dir=wire_dir)
+
+    assert record.wire_entries_seen == 1, "the readable entry must survive"
+    assert record.wire_malformed_lines == 1, "and the loss must be counted"
+
+
+def test_a_non_object_wire_line_does_not_cost_the_record(task, tmp_path, monkeypatch):
+    """`null` is valid JSON and raises AttributeError on `.get`."""
+    from bakeoff.runner import make_run_id
+
+    run_id = make_run_id(task.task_id, "gemma-4-31b", 0, 1)
+    payload = (json.dumps(_entry(1)) + "\nnull\n123\n[]\n").encode("utf-8")
+    wire_dir = _wire_dir_with(tmp_path, run_id, payload)
+
+    record = _fake_run(monkeypatch, task, tmp_path, proxy_wire_dir=wire_dir)
+
+    assert record.wire_entries_seen == 1
+    assert record.wire_malformed_lines == 3
+
+
+def test_wire_malformed_lines_is_none_when_nobody_counted(task, tmp_path, monkeypatch):
+    """None is "no wire directory", 0 is a measurement."""
+    record = _fake_run(monkeypatch, task, tmp_path)
+    assert record.wire_malformed_lines is None
+
+
+def test_a_wire_log_collision_does_not_zero_the_wire_derived_fields(
+    task, tmp_path, monkeypatch
+):
+    """The 3.6.0 defect's second door.
+
+    A WireLogger that cannot open used to skip the replay entirely, so the
+    record got empty `sampling`, empty hashes, `wire_entries_seen: 0` and --
+    the expensive part -- NO EXCLUSION. An auth-failed run whose wire log
+    collided was recorded as a model that made zero turns.
+    """
+    import bakeoff.runner as runner_module
+    from bakeoff.runner import make_run_id
+
+    run_id = make_run_id(task.task_id, "gemma-4-31b", 0, 1)
+    payload = b""
+    for i in (1, 2):
+        payload += (
+            json.dumps(
+                _entry(i, failed=True, status=401, message="Invalid API key")
+            )
+            + "\n"
+        ).encode("utf-8")
+    wire_dir = _wire_dir_with(tmp_path, run_id, payload)
+
+    def refuse(_path):
+        raise OSError("File exists")
+
+    monkeypatch.setattr(runner_module, "WireLogger", refuse)
+    record = _fake_run(monkeypatch, task, tmp_path, proxy_wire_dir=wire_dir)
+
+    assert record.wire_log_error, "the gz is genuinely missing and must say so"
+    assert record.wire_entries_seen == 2, "the proxy's own file is still readable"
+    assert record.exclusion is not None, "an auth failure must still exclude"
+    assert record.exclusion.reason_code == "api_auth"
+    assert record.artifacts.wire_log_gz is None
+
+
+def test_a_replay_failure_does_not_publish_a_truncated_wire_log(
+    task, tmp_path, monkeypatch
+):
+    """Containment alone would ship a lie.
+
+    `artifacts.wire_log_gz` is published on `not wire_log_error and exists()`.
+    Contain a mid-replay failure into `finalize_error` only and the gz exists,
+    truncated, and is published as the section 6.2 artifact -- worse than the
+    loud record loss it replaced.
+    """
+    import bakeoff.runner as runner_module
+    from bakeoff.runner import make_run_id
+
+    run_id = make_run_id(task.task_id, "gemma-4-31b", 0, 1)
+    payload = b"".join(
+        (json.dumps(_entry(i)) + "\n").encode("utf-8") for i in (1, 2, 3)
+    )
+    wire_dir = _wire_dir_with(tmp_path, run_id, payload)
+
+    real_logger = runner_module.WireLogger
+
+    class HalfBrokenLogger(real_logger):
+        _calls = 0
+
+        def log_call(self, **kwargs):
+            HalfBrokenLogger._calls += 1
+            if HalfBrokenLogger._calls == 2:
+                raise OSError("[Errno 28] No space left on device")
+            return super().log_call(**kwargs)
+
+    monkeypatch.setattr(runner_module, "WireLogger", HalfBrokenLogger)
+    record = _fake_run(monkeypatch, task, tmp_path, proxy_wire_dir=wire_dir)
+
+    assert record.wire_log_error, "a truncated gz must not pass as written"
+    assert record.artifacts.wire_log_gz is None
+    # And the derived fields still read the WHOLE trailing block, from the
+    # proxy's file -- not the 1 entry the WireLogger managed to write.
+    assert record.wire_entries_seen == 3
+
+
+def test_invocation_stamp_is_threaded_through_execute_run(task, tmp_path, monkeypatch):
+    """lessons.md entry 2: a parameter nobody passes is invisible to a unit
+    test on the function that receives it. This drives the OUTERMOST entry
+    point, which is the only thing that exercises the wiring."""
+    record = _fake_run(
+        monkeypatch, task, tmp_path, collection_id="coll-1", invocation_stamp="inv-9"
+    )
+    assert record.collection_id == "coll-1"
+    assert record.invocation_stamp == "inv-9"

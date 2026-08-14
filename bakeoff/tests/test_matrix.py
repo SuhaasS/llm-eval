@@ -232,6 +232,9 @@ class _Record:
         self.isolated = kwargs.get("isolated", True)
         self.turns_used = kwargs.get("turns", 10)
         self.exclusion = kwargs.get("exclusion", None)
+        self.wire_log_error = kwargs.get("wire_log_error", "")
+        self.finalize_error = kwargs.get("finalize_error", "")
+        self.assembly_error = kwargs.get("assembly_error", "")
 
         class _Artifacts:
             final_diff = kwargs.get("diff", "")
@@ -442,3 +445,72 @@ def test_two_invocations_cannot_share_an_artifacts_path():
 
     assert artifacts_root(Path("/c"), "A") != artifacts_root(Path("/c"), "B")
     assert "A" in str(artifacts_root(Path("/c"), "A"))
+
+
+# --- schema 3.8.0: containment has to reach the thing that can stop the spend
+
+
+def test_a_finalize_failure_makes_the_row_uninterpretable():
+    """Otherwise RC1's containment is a NET LOSS.
+
+    Before 3.8.0 a finalize failure raised into run_matrix, became a
+    `stranded` entry and counted toward the abort streak. Contained and not
+    reported, a host that has hit ENOSPC runs every remaining cell to the end
+    writing records with no stdout, no checkpoints and half a wire log --
+    every one of them reported green.
+    """
+    record = _Record(finalize_error="stdout: OSError: No space left on device")
+
+    problems = infra_problems(
+        record, wire_entries=5, unattributed=0, config=GOOD_CONFIG
+    )
+
+    assert any("finalize incomplete" in p for p in problems)
+
+
+def test_a_minimal_record_makes_the_row_uninterpretable():
+    record = _Record(assembly_error="ValueError: boom")
+
+    problems = infra_problems(
+        record, wire_entries=5, unattributed=0, config=GOOD_CONFIG
+    )
+
+    assert any("assembled minimally" in p for p in problems)
+
+
+def test_a_dead_wire_log_still_aborts_after_the_h1_hoist():
+    """A REGRESSION GUARD, not new loudness.
+
+    Until 3.8.0 a `wire_log_error` run tripped the `wire_entries <= 0` check
+    above -- `wire is None` meant the replay was skipped, so the count was 0.
+    The H1 hoist reads the proxy's own file instead, so such a run now has
+    entries and passes that check. Without this clause the abort silently
+    stops firing on exactly the failure it was written for.
+    """
+    record = _Record(wire_log_error="File exists")
+
+    problems = infra_problems(
+        record, wire_entries=7, unattributed=0, config=GOOD_CONFIG
+    )
+
+    assert any("wire log not written" in p for p in problems)
+
+
+def test_five_finalize_failures_on_one_arm_stop_the_matrix():
+    """The streak is what turns a per-row problem into a stop."""
+    tracker = StreakTracker()
+    record = _Record(finalize_error="stdout: OSError: No space left on device")
+
+    aborts = [
+        tracker.record(
+            "gemma-4-31b",
+            bad=bool(
+                infra_problems(
+                    record, wire_entries=5, unattributed=0, config=GOOD_CONFIG
+                )
+            ),
+        )
+        for _ in range(5)
+    ]
+
+    assert aborts[-1], "five uninterpretable rows on one arm must stop the driver"

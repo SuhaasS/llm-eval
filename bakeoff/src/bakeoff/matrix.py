@@ -270,6 +270,37 @@ def infra_problems(
         )
     if wire_entries <= 0:
         problems.append("wire log is empty: section 6.2 capture is dead")
+    # THESE THREE ARE WHY CONTAINMENT IS NOT A NET LOSS, and one of them is a
+    # regression guard rather than new loudness.
+    #
+    # Schema 3.8.0 contains the failures in `execute_run`'s finalize phase and
+    # in assembly instead of letting them destroy the record. Contained and not
+    # reported, that is strictly worse than the crash it replaced: a host that
+    # has hit ENOSPC would run every remaining cell to the end, writing records
+    # with no stdout, no checkpoints and half a wire log, and the driver would
+    # report all of them green. Before 3.8.0 the raise reached run_matrix,
+    # became a `stranded` entry, and five in a row stopped the matrix.
+    #
+    # `wire_log_error` is the regression guard. Until 3.8.0 a dead wire log
+    # tripped the check above -- `wire is None` meant the replay was skipped and
+    # `wire_entries_seen` was 0. The H1 hoist reads the proxy's own file
+    # instead, so that run now has entries and passes; without this clause the
+    # abort silently stops firing.
+    if getattr(record, "wire_log_error", ""):
+        problems.append(
+            f"wire log not written: {record.wire_log_error} -- the section 6.2 "
+            "artifact is missing or truncated for this run"
+        )
+    if getattr(record, "finalize_error", ""):
+        problems.append(
+            f"finalize incomplete: {record.finalize_error} -- an artifact this "
+            "row is read against was not captured"
+        )
+    if getattr(record, "assembly_error", ""):
+        problems.append(
+            f"record assembled minimally: {record.assembly_error} -- every "
+            "derived field is absent rather than zero"
+        )
     if unattributed:
         problems.append(
             f"{unattributed} call(s) landed in unattributed.jsonl: attribution lost"

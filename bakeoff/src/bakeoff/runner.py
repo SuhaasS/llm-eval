@@ -36,6 +36,7 @@ from datetime import UTC, datetime
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 from bakeoff.checkpoints import CheckpointRecorder
@@ -49,7 +50,12 @@ from bakeoff.classify import RunSignals, classify_exclusion, classify_failure
 from bakeoff.container import HostSampler, RunContainer
 from bakeoff.costs import PRICING_BASIS
 from bakeoff.eventlog import EventLog
-from bakeoff.proxy_callback import read_manifest, read_run_entries, unattributed_count
+from bakeoff.proxy_callback import (
+    read_manifest,
+    read_run_entries,
+    unattributed_count,
+    unreadable_entry_count,
+)
 from bakeoff.scanners import scan_destructive
 from bakeoff.schema import (
     Artifacts,
@@ -508,6 +514,14 @@ def assemble_record(
     isolation_evidence: str = "",
     host: HostMetrics | None = None,
     collection_id: str = "",
+    invocation_stamp: str = "",
+    # Which finalize steps failed. Threaded rather than derived, because the
+    # finalize phase runs in execute_run's `finally` and this function is
+    # called after it.
+    finalize_error: str = "",
+    # None, not 0, on the same argument as `wire_unattributed`: no wire
+    # directory means nobody counted.
+    wire_malformed_lines: int | None = None,
     adapter_patches: list[str] | None = None,
     proxy_litellm: str = "",
     crash_error: str = "",
@@ -663,6 +677,9 @@ def assemble_record(
         parent_run_id=parent_run_id,
         attempt_number=attempt_number,
         collection_id=collection_id,
+        invocation_stamp=invocation_stamp,
+        finalize_error=finalize_error,
+        wire_malformed_lines=wire_malformed_lines,
         versions=versions or Versions(
             claude_code=parsed.claude_code_version,
             container_image_digest=task.container_image_digest,
@@ -770,47 +787,178 @@ def assemble_record(
         # a crash before the container started, a dry run, a test -- must say
         # "nobody measured" rather than inherit a shared object.
         host=host or HostMetrics(),
-        artifacts=Artifacts(
-            trajectory_jsonl_gz=str(trajectory_path) if trajectory_path else None,
-            # Existence-checked AND ownership-checked. Existence alone was
-            # asserted unconditionally at first, so a run whose WireLogger never
-            # opened published a path to a file that was not there. But it does
-            # not cover the collision it was written for: on a name collision
-            # the file exists and belongs to an EARLIER attempt, so an existence
-            # check publishes another run's wire log under this run's record --
-            # a worse failure than the null it replaced, because it resolves.
-            # `wire_log_error` is what says this run did not write it.
-            wire_log_gz=(
-                str(artifacts_root / WIRE_NAME)
-                if not wire_log_error and (artifacts_root / WIRE_NAME).exists()
-                else None
-            ),
-            final_diff=checkpoints[-1].diff_vs_base if checkpoints else None,
-            # The agent's stream-json stdout, which is NOT the session
-            # transcript: the transcript records messages, while the init
-            # event carrying the effective config (spec section 5.2) is
-            # emitted only on stdout and appears nowhere on disk otherwise.
-            # It is also the only record of what the agent printed when a
-            # run failed before writing a transcript at all.
-            container_stdout=(
-                str(artifacts_root / STDOUT_NAME)
-                if (artifacts_root / STDOUT_NAME).exists()
-                else None
-            ),
-            # Where the agent says why it could not start. Existence-checked
-            # like the two above: a path to a file that was never written sends
-            # a consumer to a FileNotFoundError instead of a null it can handle.
-            container_stderr=(
-                str(artifacts_root / STDERR_NAME)
-                if (artifacts_root / STDERR_NAME).exists()
-                else None
-            ),
-            harness_traceback=(
-                str(artifacts_root / HARNESS_TRACEBACK_NAME)
-                if (artifacts_root / HARNESS_TRACEBACK_NAME).exists()
-                else None
-            ),
+        artifacts=_artifacts_block(
+            artifacts_root, checkpoints, wire_log_error, trajectory_path
         ),
+    )
+
+
+def _artifacts_block(
+    artifacts_root: Path,
+    checkpoints: list[Checkpoint],
+    wire_log_error: str,
+    trajectory_path: Path | None = None,
+) -> Artifacts:
+    """The `artifacts.*` paths, existence- and ownership-checked.
+
+    Shared by the full assembly and by `_minimal_record`, because the rules
+    below are the ones a hand-built fallback is most likely to get wrong, and
+    a second copy of them is a second place for them to drift.
+
+    Every `Path.exists()` here can raise on a broken filesystem, and this runs
+    after the tokens are spent -- the caller contains it.
+    """
+    return Artifacts(
+        trajectory_jsonl_gz=str(trajectory_path) if trajectory_path else None,
+        # Existence-checked AND ownership-checked. Existence alone was
+        # asserted unconditionally at first, so a run whose WireLogger never
+        # opened published a path to a file that was not there. But it does
+        # not cover the collision it was written for: on a name collision
+        # the file exists and belongs to an EARLIER attempt, so an existence
+        # check publishes another run's wire log under this run's record --
+        # a worse failure than the null it replaced, because it resolves.
+        # `wire_log_error` is what says this run did not write it, and since
+        # 3.8.0 that includes a replay or close that failed part way, where the
+        # file exists and is TRUNCATED.
+        wire_log_gz=(
+            str(artifacts_root / WIRE_NAME)
+            if not wire_log_error and (artifacts_root / WIRE_NAME).exists()
+            else None
+        ),
+        final_diff=checkpoints[-1].diff_vs_base if checkpoints else None,
+        # The agent's stream-json stdout, which is NOT the session
+        # transcript: the transcript records messages, while the init
+        # event carrying the effective config (spec section 5.2) is
+        # emitted only on stdout and appears nowhere on disk otherwise.
+        # It is also the only record of what the agent printed when a
+        # run failed before writing a transcript at all.
+        container_stdout=(
+            str(artifacts_root / STDOUT_NAME)
+            if (artifacts_root / STDOUT_NAME).exists()
+            else None
+        ),
+        # Where the agent says why it could not start. Existence-checked
+        # like the two above: a path to a file that was never written sends
+        # a consumer to a FileNotFoundError instead of a null it can handle.
+        container_stderr=(
+            str(artifacts_root / STDERR_NAME)
+            if (artifacts_root / STDERR_NAME).exists()
+            else None
+        ),
+        harness_traceback=(
+            str(artifacts_root / HARNESS_TRACEBACK_NAME)
+            if (artifacts_root / HARNESS_TRACEBACK_NAME).exists()
+            else None
+        ),
+    )
+
+
+def _minimal_record(
+    *,
+    task: TaskSpec,
+    model: str,
+    sample_index: int,
+    started_at: str,
+    finished_at: str,
+    attempt_number: int,
+    parent_run_id: str | None,
+    checkpoints: list[Checkpoint],
+    destructive: list[DestructiveEvent],
+    artifacts_root: Path,
+    collection_id: str,
+    invocation_stamp: str,
+    crash_error: str,
+    scanner_error: str,
+    checkpoint_error: str,
+    wire_log_error: str,
+    finalize_error: str,
+    wire_malformed_lines: int | None,
+    assembly_error: str,
+) -> RunRecord:
+    """The record to write when `assemble_record` itself raised.
+
+    EVERY FIELD THIS DEFAULTS IS A CLAIM IT FABRICATES, which is why almost
+    nothing here is left to the dataclass:
+
+    `cost_usd=None` and `isolated=None` -- the defaults are `0.0` and `False`,
+    a genuine zero cost and a positive "section 5.1 did not hold". `None` is
+    what the rest of the schema uses for not-measured.
+
+    `outcome=CRASHED` with `terminated_by=CRASH`, meaning the HARNESS crashed,
+    not the container. `FAILED` with zero turns would be filed `GAVE_UP` by
+    classify -- a permanent behavioural claim about the model, produced by a
+    defect in this process.
+
+    No `exclusion`, and deliberately not re-derived: `assemble_record` is what
+    calls `classify_exclusion`, and retrying it here with
+    `container_crashed=True` would stamp INFRA_FAILURE on a run whose container
+    was fine, removing the row from the denominator on the one mechanism by
+    which results can be massaged.
+
+    `checkpoints` and the artifacts block, because they are the PAYLOAD. The
+    per-turn diffs live only in memory and only in the record --
+    `artifacts.final_diff` is `checkpoints[-1].diff_vs_base` and the
+    materialized repo is deleted after the run -- so a "claim fields only"
+    fallback would throw away the submission of the very cell it was rescuing.
+
+    `destructive_events` with `scanner_error` beside it, because `[]` and `""`
+    together are a spec section 7 safety claim manufactured by a failure --
+    the exact pair `scanner_error` was added to prevent. `resolve_reverts` is
+    pure and returns its input unchanged when `checkpoints` is empty, but it is
+    contained anyway and falls back to the UNRESOLVED events: those carry
+    `reverted_by_agent=False`, so the fallback errs toward HIGH severity, which
+    is the direction that function's own contract requires.
+
+    `versions` carries the image digest, because `matrix.plan_resume` refuses a
+    stored record whose digest does not match the image about to be used, and
+    `Versions()` defaults it to "" -- so a defaulted minimal record would make
+    every later invocation refuse to resume the entire matrix.
+    """
+    try:
+        events = resolve_reverts(destructive, checkpoints)
+    except Exception:  # noqa: BLE001 - see the docstring: HIGH is the safe way to be wrong
+        events = destructive
+    try:
+        artifacts = _artifacts_block(artifacts_root, checkpoints, wire_log_error)
+    except Exception:  # noqa: BLE001 - this function is the last line before the write
+        artifacts = Artifacts(
+            final_diff=checkpoints[-1].diff_vs_base if checkpoints else None
+        )
+    return RunRecord(
+        run_id=make_run_id(task.task_id, model, sample_index, attempt_number),
+        task_id=task.task_id,
+        task_version=task.task_version,
+        model=model,
+        harness="claude-code",
+        sample_index=sample_index,
+        started_at=started_at,
+        finished_at=finished_at,
+        outcome=Outcome.CRASHED,
+        terminated_by=TerminationReason.CRASH,
+        turns_used=0,
+        parent_run_id=parent_run_id,
+        attempt_number=attempt_number,
+        collection_id=collection_id,
+        invocation_stamp=invocation_stamp,
+        versions=Versions(
+            container_image_digest=task.container_image_digest,
+            task_set_commit=task.task_set_commit,
+            harness_commit=harness_commit(),
+            litellm=litellm_version(),
+        ),
+        cost_usd=None,
+        isolated=None,
+        isolation_evidence="not assembled: see assembly_error",
+        checkpoints=checkpoints,
+        destructive_events=events,
+        artifacts=artifacts,
+        crash_error=crash_error,
+        scanner_error=scanner_error,
+        checkpoint_error=checkpoint_error,
+        wire_log_error=wire_log_error,
+        finalize_error=finalize_error,
+        wire_malformed_lines=wire_malformed_lines,
+        assembly_error=assembly_error,
     )
 
 
@@ -829,6 +977,7 @@ def execute_run(
     proxy_wire_dir: Path | None = None,
     settings_host_path: Path | None = None,
     collection_id: str = "",
+    invocation_stamp: str = "",
 ) -> RunRecord:
     """Run one sample and write exactly one record.
 
@@ -844,6 +993,15 @@ def execute_run(
     callback never sees them. The two sources are never merged -- one call
     would be counted twice and the retry-aware error status would read the
     wrong last entry.
+
+    ENFORCED SINCE 3.8.0, not merely asserted. The derived fields used to read
+    `wire.entries()`, which is the in-process entries PLUS the replay, so the
+    sentence above was true only because the in-process callback happens to
+    observe nothing on a real run. They now read the proxy's own file, which
+    makes the claim structural. It also fixes the failure that motivated the
+    change: the replay is contained per entry, and deriving from a WireLogger
+    that stopped at entry 2 of N would silently undercount `wire_entries_seen`
+    and hand `terminal_error_messages` a truncated trailing block.
 
     `settings_host_path` is the host file mounted at `config.settings_path`,
     the container path `--settings` names. Claude Code does not fail on a
@@ -878,11 +1036,29 @@ def execute_run(
     # trusts that whatever it finds belongs to this run.
     host_config_dir = artifacts_root / "claude-config"
     shutil.rmtree(host_config_dir, ignore_errors=True)
-    host_config_dir.mkdir(parents=True)
+    # `exist_ok`, because the line above cannot fail loudly: `ignore_errors`
+    # guarantees a removal that did not work is silent, and the bare `mkdir`
+    # then raised `FileExistsError` on exactly that case -- outside every `try`
+    # in this function, so the run died with no record at all.
+    host_config_dir.mkdir(parents=True, exist_ok=True)
+    # Not ignored, because transcript discovery globs this directory and trusts
+    # that whatever it finds belongs to this run. Leftovers mean that trust is
+    # misplaced, and a wrong transcript is worse than a missing one.
+    stale_config = ""
+    try:
+        leftover = list(host_config_dir.iterdir())
+        if leftover:
+            stale_config = (
+                f"config dir not empty after rmtree: {len(leftover)} entry(ies); "
+                "transcript discovery may find another run's file"
+            )
+    except OSError as exc:  # noqa: BLE001 - naming it is the point, not raising
+        stale_config = f"config dir unreadable: {type(exc).__name__}: {exc}"
 
     checkpoints: list[Checkpoint] = []
     destructive: list[DestructiveEvent] = []
     wire_entries: list[dict[str, Any]] = []
+    wire_malformed: int | None = None
     runner_result = None
     trajectory_path: Path | None = None
     crashed = False
@@ -890,6 +1066,9 @@ def execute_run(
     scanner_error = ""
     checkpoint_error = ""
     wire_log_error = ""
+    # Accumulated by the finalize phase below, one entry per step that failed.
+    finalize_errors: list[str] = [stale_config] if stale_config else []
+    finalize_error = ""
     # bool(network) until the container is up and the real thing can be read.
     # Section 5.1's guarantee is not this value; it is what network_isolation()
     # returns below, and if the container never starts the honest answer is that
@@ -1055,47 +1234,142 @@ def execute_run(
             # was describing. crash_error above still names the cause.
             pass
     finally:
-        # Global state: leaving this set would let one run's logger capture
-        # the next run's calls, silently cross-contaminating wire logs.
+        # THE FINALIZE PHASE, AND EVERY STEP IS CONTAINED SEPARATELY.
+        #
+        # This block is not inside a `try` -- a `finally` never is -- and until
+        # 3.8.0 it raised straight past `_write_or_strand`, so an ENOSPC, a
+        # read-only artifacts directory or a torn wire log destroyed the record
+        # outright. Not `record.unwritten.json` either: that is written by the
+        # assembly below, which never ran.
+        #
+        # Per step rather than one `try` around the block, because one failure
+        # must not skip the other four. A missing stdout is a gap; a missing
+        # stdout that also cost the checkpoints is the data loss the recorder is
+        # held outside the try to prevent.
+        #
+        # `Exception`, not `BaseException`: an operator's Ctrl-C should still
+        # stop the harness, and run_matrix's signal handling is cooperative for
+        # exactly that reason.
+        def _step(name: str, action: Callable[[], None]) -> None:
+            try:
+                action()
+            except Exception as exc:  # noqa: BLE001 - see above
+                finalize_errors.append(f"{name}: {type(exc).__name__}: {exc}")
+
+        # Global state, and first: leaving this set would let one run's logger
+        # capture the next run's calls, silently cross-contaminating wire logs.
+        # Not in a _step -- a plain assignment cannot raise, and putting it
+        # behind a guard would suggest it can.
         litellm.callbacks = previous_callbacks
-        # In the finally: a run that crashed part way through is exactly the
-        # one whose stdout is worth having.
-        stdout = getattr(runner_result, "stdout", "") or ""
-        if stdout:
-            (artifacts_root / STDOUT_NAME).write_text(stdout)
-        # And its stderr, for the same reason and with more force: stderr is
-        # where the agent says why it could not start. It was captured all
-        # along (ClaudeRunResult.stderr, ExecResult.stderr) and thrown away
-        # here, so `Artifacts.container_stderr` was a field no code ever set.
-        stderr = getattr(runner_result, "stderr", "") or ""
-        if stderr:
-            (artifacts_root / STDERR_NAME).write_text(stderr)
-        if sampler is not None:
-            sampler.stop()  # idempotent, and contractually cannot raise
-            host = sampler.metrics()
-        if recorder is not None:
-            checkpoints = recorder.captured
-            # Beside the checkpoints, never instead of them. A short list
-            # with no error reads as an agent that changed nothing.
-            checkpoint_error = "; ".join(recorder.errors)
-        if wire is not None:
+
+        def _write_stdout() -> None:
+            # A run that crashed part way through is exactly the one whose
+            # stdout is worth having.
+            stdout = getattr(runner_result, "stdout", "") or ""
+            if stdout:
+                (artifacts_root / STDOUT_NAME).write_text(stdout)
+
+        def _write_stderr() -> None:
+            # Same reason and with more force: stderr is where the agent says
+            # why it could not start. It was captured all along
+            # (ClaudeRunResult.stderr, ExecResult.stderr) and thrown away here,
+            # so `Artifacts.container_stderr` was a field no code ever set.
+            stderr = getattr(runner_result, "stderr", "") or ""
+            if stderr:
+                (artifacts_root / STDERR_NAME).write_text(stderr)
+
+        def _collect_host() -> None:
+            nonlocal host
+            if sampler is not None:
+                sampler.stop()  # idempotent, and contractually cannot raise
+                host = sampler.metrics()
+
+        def _collect_checkpoints() -> None:
+            nonlocal checkpoints, checkpoint_error
+            if recorder is not None:
+                checkpoints = recorder.captured
+                # Beside the checkpoints, never instead of them. A short list
+                # with no error reads as an agent that changed nothing.
+                checkpoint_error = "; ".join(recorder.errors)
+
+        def _collect_wire() -> None:
+            nonlocal wire_entries, wire_malformed, wire_log_error
+            raw_entries: list[dict[str, Any]] = []
             if proxy_wire_dir is not None:
-                # The agent's calls were made by the proxy process; replay
-                # them through WireLogger so there is still exactly one
-                # canonical artifact, secret-scanned in one place.
-                for entry in read_run_entries(proxy_wire_dir, run_id):
-                    wire.log_call(
-                        request=entry.get("request", {}),
-                        resolved=entry.get("resolved"),
-                        response=entry.get("response", {}),
-                        metadata=entry.get("metadata", {}),
-                        # The proxy's capture time, carried through. Stamping
-                        # now() here instead gave every line in the canonical
-                        # artifact the same post-run reading.
-                        logged_at=entry.get("logged_at"),
+                raw_entries = read_run_entries(proxy_wire_dir, run_id)
+                wire_malformed = unreadable_entry_count(proxy_wire_dir, run_id)
+                if wire is not None:
+                    # The agent's calls were made by the proxy process; replay
+                    # them through WireLogger so there is still exactly one
+                    # canonical artifact, secret-scanned in one place.
+                    for entry in raw_entries:
+                        try:
+                            wire.log_call(
+                                request=entry.get("request", {}),
+                                resolved=entry.get("resolved"),
+                                response=entry.get("response", {}),
+                                metadata=entry.get("metadata", {}),
+                                # The proxy's capture time, carried through.
+                                # Stamping now() here instead gave every line in
+                                # the canonical artifact the same post-run
+                                # reading.
+                                logged_at=entry.get("logged_at"),
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            # `wire_log_error`, not just `finalize_error`, and
+                            # this is the whole point of catching here.
+                            # `artifacts.wire_log_gz` is published on
+                            # `not wire_log_error and path.exists()` -- so a
+                            # contained failure that left only `finalize_error`
+                            # set would publish a TRUNCATED gz as the section
+                            # 6.2 artifact. Losing the record was loud; shipping
+                            # a short wire log under a well-formed record is not.
+                            wire_log_error = wire_log_error or (
+                                f"replay failed: {type(exc).__name__}: {exc}"
+                            )
+                            break
+                try:
+                    if wire is not None:
+                        wire.close()
+                except Exception as exc:  # noqa: BLE001 - same gz argument
+                    wire_log_error = wire_log_error or (
+                        f"close failed: {type(exc).__name__}: {exc}"
                     )
-            wire_entries = wire.entries()
-            wire.close()
+            elif wire is not None:
+                try:
+                    wire.close()
+                except Exception as exc:  # noqa: BLE001
+                    wire_log_error = wire_log_error or (
+                        f"close failed: {type(exc).__name__}: {exc}"
+                    )
+            # THE PROXY'S FILE IS THE AUTHORITY WHEN THERE IS ONE, and the
+            # WireLogger copy is not a substitute for it. Two reasons, and the
+            # second is the one that bites:
+            #
+            # `wire.entries()` is the in-process callback's entries PLUS this
+            # replay. On a real run the in-process callback observes nothing, so
+            # the two agree -- but "the two sources are never merged" was an
+            # assertion nothing enforced, and reading the proxy's file enforces
+            # it.
+            #
+            # And under the per-entry containment above, a replay that failed on
+            # entry 2 of N leaves `wire.entries()` holding 1. Deriving from that
+            # would undercount `wire_entries_seen` and hand
+            # `terminal_error_messages` a TRUNCATED trailing block -- which is
+            # the exclusion-zeroing this hoist exists to fix, arriving through
+            # the containment meant to fix it.
+            wire_entries = (
+                raw_entries
+                if proxy_wire_dir is not None
+                else (wire.entries() if wire is not None else [])
+            )
+
+        _step("stdout", _write_stdout)
+        _step("stderr", _write_stderr)
+        _step("host", _collect_host)
+        _step("checkpoints", _collect_checkpoints)
+        _step("wire", _collect_wire)
+        finalize_error = "; ".join(finalize_errors)
 
     # What the proxy reported doing to its own litellm. Read from the manifest
     # the proxy wrote into the shared wire directory rather than asserted from
@@ -1116,37 +1390,63 @@ def execute_run(
 
     finished_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
-    record = assemble_record(
-        task=task,
-        model=model,
-        sample_index=sample_index,
-        started_at=started_at,
-        finished_at=finished_at,
-        trajectory_path=trajectory_path,
-        runner_result=runner_result,
-        checkpoints=checkpoints,
-        destructive_events=destructive,
-        artifacts_root=artifacts_root,
-        attempt_number=attempt_number,
-        parent_run_id=parent_run_id,
-        container_crashed=crashed,
-        cfg_digest=config_digest(config),
-        prior_same_task_run_id=prior_run_id,
-        prior_started_at=prior_started_at,
-        wire_entries=wire_entries,
-        wire_unattributed=wire_unattributed,
-        # The measurement, never `bool(network)`. See RunContainer.
-        isolated=isolated,
-        isolation_evidence=isolation_evidence,
-        host=host,
-        collection_id=collection_id,
-        adapter_patches=adapter_patches,
-        proxy_litellm=proxy_litellm,
-        crash_error=crash_error,
-        scanner_error=scanner_error,
-        checkpoint_error=checkpoint_error,
-        wire_log_error=wire_log_error,
-    )
+    try:
+        record = assemble_record(
+            task=task,
+            model=model,
+            sample_index=sample_index,
+            started_at=started_at,
+            finished_at=finished_at,
+            trajectory_path=trajectory_path,
+            runner_result=runner_result,
+            checkpoints=checkpoints,
+            destructive_events=destructive,
+            artifacts_root=artifacts_root,
+            attempt_number=attempt_number,
+            parent_run_id=parent_run_id,
+            container_crashed=crashed,
+            cfg_digest=config_digest(config),
+            prior_same_task_run_id=prior_run_id,
+            prior_started_at=prior_started_at,
+            wire_entries=wire_entries,
+            wire_unattributed=wire_unattributed,
+            # The measurement, never `bool(network)`. See RunContainer.
+            isolated=isolated,
+            isolation_evidence=isolation_evidence,
+            host=host,
+            collection_id=collection_id,
+            invocation_stamp=invocation_stamp,
+            adapter_patches=adapter_patches,
+            proxy_litellm=proxy_litellm,
+            crash_error=crash_error,
+            scanner_error=scanner_error,
+            checkpoint_error=checkpoint_error,
+            wire_log_error=wire_log_error,
+            finalize_error=finalize_error,
+            wire_malformed_lines=wire_malformed,
+        )
+    except Exception as exc:  # noqa: BLE001 - the tokens are already spent
+        record = _minimal_record(
+            task=task,
+            model=model,
+            sample_index=sample_index,
+            started_at=started_at,
+            finished_at=finished_at,
+            attempt_number=attempt_number,
+            parent_run_id=parent_run_id,
+            checkpoints=checkpoints,
+            destructive=destructive,
+            artifacts_root=artifacts_root,
+            collection_id=collection_id,
+            invocation_stamp=invocation_stamp,
+            crash_error=crash_error,
+            scanner_error=scanner_error,
+            checkpoint_error=checkpoint_error,
+            wire_log_error=wire_log_error,
+            finalize_error=finalize_error,
+            wire_malformed_lines=wire_malformed,
+            assembly_error=f"{type(exc).__name__}: {exc}",
+        )
     _write_or_strand(record, event_log, artifacts_root)
     return record
 

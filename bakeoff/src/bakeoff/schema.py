@@ -253,7 +253,35 @@ from typing import Any
 # took them, so an `artifacts.*` path on a pre-3.7.0 record resolves to the LAST
 # run of that cell rather than necessarily to this one. 12 stored records
 # already disagree with the file they point at.
-SCHEMA_VERSION = "3.7.0"
+#
+# 3.8.0 adds `finalize_error`, `assembly_error`, `wire_malformed_lines` and
+# `invocation_stamp`, and is the version in which "a run always produces a
+# record" stopped being partly aspirational.
+#
+# Through 3.7.0 `execute_run`'s `finally` and its whole assembly stretch sat
+# outside every `try` -- about 100 lines, with at least eight raise sites
+# (`write_text` on stdout and stderr, the wire replay, `wire.close()`,
+# `sampler.metrics()`, `config_digest`, `assemble_record`). Anything raising
+# there escaped past `_write_or_strand`, so the run produced no record at all
+# and not even `record.unwritten.json`. `finalize_error` names which finalize
+# step failed; `assembly_error` says the record was assembled minimally because
+# the full assembly raised. Both are empty on a healthy run, and a non-empty
+# value makes the row uninterpretable rather than bad -- `matrix.infra_problems`
+# reads them, because containment that does not reach the driver converts a
+# loud abort into a silent degradation across every remaining cell.
+#
+# `wire_malformed_lines` is `int | None`: `None` means there was no wire
+# directory and nobody counted, `0` is a measurement. It sits beside
+# `transcript_malformed_lines` and `stdout_malformed_lines` for the same
+# reason they exist.
+#
+# `invocation_stamp` names the process; `collection_id` now names the whole
+# collection rather than one invocation of it. Every 3.7.0 record carries the
+# invocation stamp under `collection_id` -- measured, three stored event logs
+# hold three distinct values over the same four `run_id`s -- so the field
+# changed meaning at this version and the log has no update API. Read a
+# pre-3.8.0 `collection_id` as an invocation, not as an episode.
+SCHEMA_VERSION = "3.8.0"
 
 
 class Outcome(str, Enum):
@@ -638,8 +666,7 @@ class RunRecord:
     schema_version: str = SCHEMA_VERSION
     parent_run_id: str | None = None
     attempt_number: int = 1
-    # Which collection episode produced this run -- run_matrix's invocation
-    # stamp, "" when nothing said.
+    # Which collection produced this run, "" when nothing said.
     #
     # `run_id` is sha256(task|model|sample|attempt) and names no episode, so it
     # is unique WITHIN a collection and not across one: two matrices over the
@@ -649,7 +676,21 @@ class RunRecord:
     #
     # This does not make ids unique; that would change the identity scheme every
     # stored record was written under. It makes a collision visible.
+    #
+    # THE COLLECTION, NOT THE INVOCATION, and that is a 3.8.0 meaning change.
+    # A collection takes one invocation per credential window -- measured at ~20
+    # cells an hour, so ~160 of them for the full matrix -- and through 3.7.0
+    # this field held run_matrix's per-process stamp, which named every one of
+    # them differently. Grouping by it split one collection into 160. The
+    # collection is the event log, so the id is minted on the first record
+    # written against a log and inherited from its last index line thereafter.
     collection_id: str = ""
+    # Which invocation of that collection, "" when nothing said. The artifacts
+    # root and the wire directory are keyed on it, and recovering it from an
+    # absolute `artifacts.*` path is exactly the "identity of an artifact is its
+    # path" defect that cost 12 records their provenance -- so the record names
+    # the episode itself rather than making a reader parse one out of a path.
+    invocation_stamp: str = ""
 
     # Two independent counts of the same thing, stored because they disagree in
     # informative ways and a single number hid a 2x token inflation for months.
@@ -838,6 +879,34 @@ class RunRecord:
     # cross-check each other.
     transcript_malformed_lines: int = 0
     stdout_malformed_lines: int = 0
+    # Lines of the proxy's wire log that could not be turned into an entry.
+    # `None` means no wire directory was configured and nobody counted; `0` is
+    # a measurement, and it is what licenses reading `wire_entries_seen` as the
+    # whole of what the proxy captured for this run.
+    wire_malformed_lines: int | None = None
+    # Which finalize steps failed, and why. Empty means every one of them
+    # completed -- not that none was attempted.
+    #
+    # The finalize phase writes stdout and stderr, stops the host sampler,
+    # collects checkpoints and folds the proxy's wire entries into the
+    # canonical artifact. Through 3.7.0 it ran in a `finally` that was not
+    # inside a `try`, so any of those raising destroyed the record entirely.
+    # Containing them without naming the failure would have been worse than
+    # the crash: a record missing its stdout, its checkpoints or half its wire
+    # log is byte-identical to a run that produced little.
+    finalize_error: str = ""
+    # Non-empty when full assembly raised and this record was built minimally
+    # from the values already in hand. It discriminates the fields assembly
+    # DERIVES -- turns, tokens, cost, the wire projection -- which is why
+    # `cost_usd` is `None` rather than `0.0` on such a record.
+    #
+    # It does not discriminate the fields assembly is merely PASSED:
+    # `destructive_events` has `scanner_error`, `checkpoints` has
+    # `checkpoint_error`, the wire log has `wire_log_error`. A minimal record
+    # carries all of those verbatim, because defaulting them would manufacture
+    # a positive claim -- an empty `destructive_events` with an empty
+    # `scanner_error` is a spec section 7 safety claim produced by a failure.
+    assembly_error: str = ""
 
     diff_stats: dict[str, int] = field(default_factory=dict)
     p2p_regressions: list[str] = field(default_factory=list)

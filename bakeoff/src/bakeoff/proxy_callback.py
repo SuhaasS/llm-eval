@@ -572,26 +572,71 @@ def read_manifest(wire_dir: Path) -> tuple[list[str], str]:
     return [str(p) for p in (data.get("patches") or [])], str(data.get("litellm") or "")
 
 
-def read_run_entries(wire_dir: Path, run_id: str) -> list[dict[str, Any]]:
-    """Entries the proxy recorded for one run, in call order.
+def _parse_run_entries(wire_dir: Path, run_id: str) -> tuple[list[dict[str, Any]], int]:
+    """(entries, unreadable line count) for one run's proxy wire log.
 
     Tolerant of a partial final line: the proxy may be mid-write when the run
     ends, and losing every captured call over one truncated line is the data
-    loss this whole module exists to prevent.
+    loss this whole module exists to prevent. That claim used to be false in
+    two ways, and both are reached from `execute_run`'s finalize phase, where a
+    raise costs the whole record:
+
+    `errors="replace"`, because the decode is the first thing that happens and
+    a truncation splitting a multi-byte character raises `UnicodeDecodeError`
+    -- a `ValueError`, so the `JSONDecodeError` catch below never sees it --
+    before a single line has been examined. `eventlog.last_run_for` already
+    carries this fix and names the same exception; the tolerance claim above
+    was written for a decode that does not have it.
+
+    `isinstance(parsed, dict)`, because a line that is valid JSON but not an
+    object -- `null`, `123`, `[]`, what a torn-then-appended write produces --
+    parses cleanly and then raises `AttributeError` on the caller's
+    `entry.get(...)`, at the same distance from the cause.
+
+    The count is returned rather than swallowed because the record says how
+    much of its own input it could not read (`transcript_malformed_lines`,
+    `stdout_malformed_lines`); a silently shortened wire log is exactly the
+    class of miscount those fields exist to make visible.
     """
     path = Path(wire_dir) / f"{run_id}.jsonl"
     if not path.is_file():
-        return []
+        return [], 0
     entries: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    malformed = 0
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         line = line.strip()
         if not line:
             continue
         try:
-            entries.append(json.loads(line))
+            parsed = json.loads(line)
         except json.JSONDecodeError:
+            malformed += 1
             continue
-    return entries
+        if not isinstance(parsed, dict):
+            malformed += 1
+            continue
+        entries.append(parsed)
+    return entries, malformed
+
+
+def read_run_entries(wire_dir: Path, run_id: str) -> list[dict[str, Any]]:
+    """Entries the proxy recorded for one run, in call order.
+
+    Split from `unreadable_entry_count` rather than returning both, so the many
+    call sites that only want the entries keep reading as they did. The file is
+    written only while the run is live and both functions run after it, so the
+    second read cannot disagree with the first.
+    """
+    return _parse_run_entries(wire_dir, run_id)[0]
+
+
+def unreadable_entry_count(wire_dir: Path, run_id: str) -> int:
+    """Lines of this run's wire log that could not be turned into an entry.
+
+    Feeds `RunRecord.wire_malformed_lines`. `0` is a measurement; the caller
+    supplies `None` when there was no wire directory and nobody counted.
+    """
+    return _parse_run_entries(wire_dir, run_id)[1]
 
 
 def unattributed_count(wire_dir: Path) -> int:

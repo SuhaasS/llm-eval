@@ -191,7 +191,7 @@ def artifacts_root(cache: Path, stamp: str) -> Path:
 
 
 def run_cell(cell, task, resolved, args, event_log, wire_dir, network, artifacts,
-             collection_id):
+             collection_id, invocation_stamp):
     from bakeoff.claude_runner import ClaudeCodeConfig
     from bakeoff.proxy_callback import unattributed_count
     from bakeoff.runner import execute_run
@@ -237,6 +237,7 @@ def run_cell(cell, task, resolved, args, event_log, wire_dir, network, artifacts
         repo_path=str(repo),
         artifacts_root=run_root / "artifacts",
         collection_id=collection_id,
+        invocation_stamp=invocation_stamp,
         network=network,
         proxy_wire_dir=wire_dir,
         # Section 5.2's highest-risk contamination source. Claude Code does
@@ -493,7 +494,13 @@ def main() -> int:
                 record, config_dump, unattributed = run_cell(
                     cell, task, resolved[cell.task_id], args,
                     event_log, wire_dir, proxy.internal_name, artifacts,
-                    stamp,
+                    # Both are this invocation's stamp today, which is exactly
+                    # the 3.7.0 behaviour `collection_id` is documented as
+                    # having. Minting the collection id from the event log's
+                    # last index line -- so ~160 invocations of one matrix stop
+                    # reading as 160 collections -- is a separate change; the
+                    # record now has somewhere honest to put each of them.
+                    stamp, stamp,
                 )
                 cell_wall_s = time.monotonic() - cell_started
             except Exception as exc:  # noqa: BLE001 - one cell, not the matrix
