@@ -75,14 +75,25 @@ and what measuring the first one exposed.
 **Read every pre-3.7.0 record with three caveats.** They are permanent — the log
 is append-only.
 
-- `host.contention_flag: false` is a dataclass default, not a measurement. All
-  24 stored records carry it.
+Counts below are scoped and stamped: the 25 records in the 7 event logs under
+`~/.cache/bakeoff`, as of 2026-08-14. That scope matters — the sibling
+`~/.cache/bakeoff-*` directories are test and gate fixtures, not collected data,
+and the repricing item in P1 below counts a different archive again. The counts
+have already drifted once, downward, because three event logs were deleted: the
+event log is append-only, the *directory* of event logs is not.
+
+- `host.contention_flag: false` is a dataclass default, not a measurement, on
+  the **9** pre-3.7.0 records. It is a real measurement from 3.7.0 on, and the
+  earlier form of this line — "all 24 stored records carry it" — is now false as
+  well as stale: 3.7.0 and later carry 12 `false`, 3 `None` and one **`true`**.
 - `artifacts.*` paths resolve to the **last** run of that cell, not necessarily
   to the record holding them: an unstamped artifacts root plus a per-cell
-  `rmtree` meant a later matrix deleted an earlier run's files. 12 stored
-  records provably disagree with the file they point at.
-- `run_id` names no collection episode, so 6 ids appear in more than one event
-  log — `11ab9cf6527a188f` in **seven**. An offline pass merging logs must key
+  `rmtree` meant a later matrix deleted an earlier run's files. **5** stored
+  records provably disagree with the file they point at (was 12; the drop is
+  deleted logs, not a smaller blast radius — all 25 survivors are checkable).
+- `run_id` names no collection episode, so **5** ids appear in more than one
+  event log — `11ab9cf6527a188f` in **six**, and this caveat alone is not confined
+  to pre-3.7.0: that id collides at 3.8.0 too. An offline pass merging logs must key
   on `(collection_id, run_id)` and treat `collection_id: ""` as unknown rather
   than as a shared episode.
 
@@ -97,12 +108,33 @@ Candidate cache pricing — gemma and kimi both priced `null` again on
 
 ### Read every pre-2026-08-13 figure with the pyc caveat
 
+Keyed on `versions.container_image_digest`, which is what `--allow-mixed-images`
+gates on (`matrix.py:204`, enforced at `run_matrix.py:393`): `sha256:1521e391…`
+is pre-fix, `sha256:8942bd48…` is post. 9 of the 25 stored records are pre-fix.
+The heading says "figure" advisedly — this caveat is about published numbers —
+and the digest extends it to records, which is a broadening, not a correction.
+
+**The heading's date is local; `started_at` is UTC**, which puts three of those
+nine on 2026-08-13Z though they ran 17:03, 17:04 and 18:07 on 2026-08-12 local.
+Nothing in the record says which zone it is in, and reading one against this
+prose is exactly the UTC/PDT misread `CLAUDE.md` records costing a session.
+
 The base image digest changed with that fix, so nothing before it is
 environment-comparable, and the defect could hand an agent its own pre-fix
 code. Re-measure rather than mix; `--allow-mixed-images` exists and should not
 be used across that boundary.
 
 ### Read every record written before 2026-08-14 with the run-tree caveat
+
+Keyed on `versions.harness_commit`, not on the date in this heading — 2026-08-14
+is both the day the prune landed and the day the clean records were written, so
+a same-day record has no date-visible side. Of the 25 stored records, 21 are at
+`b4301ce8`, `dd6c4368` or `715d206f`; the 4 at `1d6bafdd` ("fix: the run tree
+contained the answer") are clean. Every record carries `-dirty`, so the field
+names the last *commit*, not the working tree — `1d6bafdd-dirty` certainly has the
+prune, and nothing earlier can, because `pruned_mirror_path` did not exist before
+that commit (2026-08-14 10:33:07 local) and nothing under `~/.cache/bakeoff` was
+written between then and the first clean collection at 13:53.
 
 **The reference fix was reachable in the agent's own repository.** `materialize`
 cloned run trees from the full upstream mirror, so `refs/heads/main` sat 181
@@ -112,11 +144,25 @@ commits ahead of the start state on `pallets/click` and
 `git branch` and `git show main` did not. Closed by `ensure_pruned_mirror`.
 
 This is **not** evidence that any stored run used it — no record captures the
-agent's git invocations, so it cannot be checked either way. It is a confound
-that cannot be ruled out retrospectively, and the log is append-only. It is
-also *differential*: an arm that greps history while orienting was advantaged
-over one that did not, which is a §6.4 problem rather than a uniform bias an
-offline pass could subtract.
+agent's git invocations, so for those 21 it cannot be checked either way. None
+of `RunRecord`'s 58 fields (51, 54 or 58 present per record, by schema version)
+describes the run tree's object store, and kept trees exist only for the 08-14
+collection. It is a confound that cannot be ruled out retrospectively, and the
+log is append-only. It is also *differential*: an arm that greps history while
+orienting was advantaged over one that did not, which is a §6.4 problem rather
+than a uniform bias an offline pass could subtract.
+
+**Distinct from the leak above, which stays unfalsifiable for those 21: the two
+prune-cache defects fixed in `ad193f2` affected zero stored records.** One raised
+before any run started — `materialize` is called at `run_matrix.py:211`, ahead of
+`execute_run` at `:231`, so a `TaskError` there produces no record at all, not
+even a CRASHED row. The other needed a write into a pruned mirror, which existed
+only from `1d6bafdd`, and all four records under it were checked from their kept
+trees: `rev-list --count HEAD` is 3,131 and so is the store's total commit-object
+count, so no commit outside the start state's history survived — which is what
+`git log --all` would need. That is direct evidence about what the agent could
+see; the first defect's argument is a code path and needs no timeline at all,
+and only the scoping of the second to `1d6bafdd` rests on the clock above.
 
 - [ ] **Pruned mirrors accumulate too.** One bare mirror per `(repo, base_sha)`,
   ~5 MB for click, ~400 MB at 80 tasks. Same retention question as the
@@ -225,7 +271,7 @@ fixture task, one 157-byte diff, and the harness does not grade. There is no
 dataset, no matrix driver and no offline grader, which is what P0 and the
 out-of-scope plans below are about.
 
-### Four things every reader of an old number needs
+### Six things every reader of an old number needs
 
 1. **Every cost and turn figure predating schema 3.0.0 is inflated ~2×.** Claude
    Code emits one transcript record per content block with the whole `usage`
@@ -254,15 +300,28 @@ out-of-scope plans below are about.
    first hunk was a binary `calc.cpython-312.pyc`. Closed with
    `PYTHONDONTWRITEBYTECODE=1` in the image. **Every capability figure taken
    before 2026-08-13 was taken with this live**, on top of the Phase 0c caveat
-   below.
+   below. The checkable form of that boundary is
+   `versions.container_image_digest == sha256:1521e391…`, not the date — see the
+   pyc caveat above, where the two disagree by three records under UTC.
 
-5. **Eight of eight "model failures" so far have been harness defects** —
+5. **Every record from before `1d6bafdd` was taken with the merged fix readable
+   in the agent's own repository.** The one item on this list that is not about
+   a number being wrong — it is about the task being easier than it looks, and
+   *differentially* so, since only an arm that runs `git log --all` collects it.
+   Keyed on `versions.harness_commit`; 21 of 25 stored records are exposed. See
+   the run-tree caveat above, including why the two prune-cache defects found
+   while fixing it affected zero records.
+
+6. **Eight of eight "model failures" so far have been harness defects** —
    Sonnet's beta header, Kimi's tool-id mangling, Gemma's `propertyNames`,
    Gemma's colliding ids, Gemma's `max_tokens` rejection, Gemma's
    `reasoning_effort` requirement, the `git add -A` checkpoint race, and the
    stale `.pyc`. Each looked deterministic and total beforehand, and the last
-   two were found while verifying a fix for something else. Weigh that base
-   rate before reading the next total failure as capability.
+   two were found while verifying a fix for something else. The run-tree leak in
+   item 5 is not on this list — it was found by reading the materialization path,
+   not by investigating a failure — which is the point: it would never have
+   surfaced as one. Weigh that base rate before reading the next total failure as
+   capability.
 
 ### The road to a published result
 
