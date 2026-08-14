@@ -1,0 +1,141 @@
+# Spec section 3.7. See src/bakeoff/tasks.py for what each key has to satisfy
+# and why; every one of them is validated before a container starts.
+#
+# Tier B (section 3.2): a tested PR with no transcript. The oracle is
+# executable and the merged PR is the reference diff.
+
+task_id: click-3360-write-usage-empty-args
+task_version: 1
+tier: B
+stratum: small-edit
+
+repo:
+  url: https://github.com/pallets/click.git
+  # merge_commit^1 -- the real parent of the merge, not the PR's recorded
+  # base.sha. The base branch advanced between the PR being opened and merged
+  # (7c99ebe -> 63274a7), and diffing against the stale one would put
+  # unrelated commits into the reference.
+  base_sha: 63274a79d08fdc5c19220696144489f7144a8547
+  # base_sha + the test half, committed with a fixed identity and date. Pinned
+  # so that a re-cut patch or a different git moving the start state is a load
+  # error rather than a silent change to what every arm was asked to do.
+  start_sha: 33575cc0b75608fa5cbcb1d3ae3347b81eac437f
+
+# Section 3.3: verbatim. The issue title, then the issue body exactly as
+# filed, including the reporter's template comment. Nothing added -- a
+# harness-authored sentence ("the tests are in ...", "do not edit the tests")
+# would be a different task from the one a human actually opened, and this
+# eval exists to measure the workflow that happens rather than a tidied one.
+prompt: |
+  Empty output from `HelpFormatter.write_usage` for a program without arguments
+
+  If no `args` are passed to `HelpFormatter.write_usage`, the Usage line is not printed.
+
+  ### Reproduction
+
+  ```python
+  import click
+
+  f = click.HelpFormatter()
+  f.write_usage("program")
+  print(f.getvalue())
+  ```
+  <!--
+  Describe how to replicate the bug.
+
+  Include a minimal reproducible example that demonstrates the bug.
+  Include the full traceback if there was an exception.
+  -->
+
+  ### Expected output
+  ```
+  Usage: program
+  ```
+
+  ### Actual output
+  (an empty line)
+
+  ### Environment
+
+  - Python version: 3.12.3
+  - Click version: 8.3.1
+
+  ### Additional information
+
+  We use `click` for a CLI program with interactive mode. We are about to use `click.HelpFormatter` to print help for internal commands, some of which do not accept any arguments (`exit`, for example).
+
+tests:
+  # What splits reference.diff into the oracle the agent starts with and the
+  # fix it is graded against.
+  paths: ["tests/"]
+  # `-p no:cacheprovider` so the suite writes no .pytest_cache into the tree:
+  # section 5.6 stages everything, so anything the test run drops lands in
+  # every submission diff.
+  runner: ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider"]
+  # Measured, not guessed: these are exactly the tests that fail at the start
+  # state and pass after the reference fix. They assert rendered output rather
+  # than any internal name, so a different-but-correct fix passes -- which is
+  # why this PR was chosen over #3678, whose tests pin an arbitrary storage
+  # name and would score a correct alternative as a failure.
+  f2p:
+    - "tests/test_formatting.py::test_help_formatter_write_usage[empty-args-default-prefix]"
+    - "tests/test_formatting.py::test_help_formatter_write_usage[empty-args-custom-prefix]"
+    - "tests/test_formatting.py::test_help_formatter_write_usage[empty-args-indented]"
+    - "tests/test_formatting.py::test_help_formatter_write_usage[empty-args-long-prog]"
+    - "tests/test_formatting.py::test_help_formatter_write_usage_without_args_styled_prefix"
+    - "tests/test_formatting.py::test_command_write_usage_no_args[empty-options-metavar-no-params]"
+    - "tests/test_formatting.py::test_command_write_usage_no_args[none-options-metavar-no-params]"
+  # Empty: everything else the runner collects. 1,615 tests at this base_sha,
+  # green before and after. An explicit list would go stale against a pinned
+  # suite for no benefit.
+  p2p: []
+  # Files in the merged PR that belong to NEITHER half. The changelog entry
+  # cites `:issue:`3360` :pr:`3434`` -- no agent will write that, so leaving it
+  # in the solution half makes preflight apply documentation it does not need
+  # and would make any later diff-similarity metric measure changelog
+  # authorship. Explicit rather than inferred: nothing available at load time
+  # can tell a changelog from a source file, so an UNLISTED extra file still
+  # lands in the fix half exactly as before.
+  allow_extra_paths: ["CHANGES.rst"]
+
+image:
+  # `less` is a TEST dependency of this repository and the base image ships no
+  # pager. tests/test_utils.py parametrizes `test_echo_via_pager` over
+  # ["cat", "less", ...]; with no `less` on PATH the pager path closes the
+  # borrowed stdout on its way out, and pytest's capfd then raises
+  # "ValueError: I/O operation on closed file" in the setup AND teardown of
+  # every remaining test in the file -- 189 errors, none of them about the
+  # code under test. Measured: preflight caught this and it does not happen on
+  # macOS, so nothing short of running the suite inside the pinned image would
+  # have found it. An agent handed that suite is debugging the image.
+  apt: ["less"]
+  # The base image pins pytest 9.1.1 and this repository cannot use it: click
+  # sets `filterwarnings = ["error"]` and pytest 9 raises
+  # PytestRemovedIn10Warning during collection of tests/test_basic.py, so the
+  # suite exits 2 with `1 error during collection` -- red before AND after any
+  # fix. Upstream fixed it in #3656, two months after this base_sha. Section
+  # 5.1's "dependencies from lockfile, pre-installed into the image" is per
+  # task, and this is what that means in practice.
+  pip: ["pytest==8.3.5"]
+  # EDITABLE, and it has to be. A plain `pip install .` resolves imports to
+  # site-packages, so nothing the agent writes to /repo takes effect and every
+  # arm fails identically -- preflight's green-after check is what catches it.
+  build: ["pip install -e ."]
+
+budget:
+  # Section 5.4 placeholders. Real caps come from the section 3.5 calibration
+  # pilot's slowest-converging model, not from the incumbent.
+  max_turns: 40
+  wall_clock_timeout_s: 900
+
+provenance:
+  repo: pallets/click
+  issue: 3360
+  pr: 3434
+  merge_commit: 3bb230dcd5d751f8605b46e9df5a541639d5fd4e
+  merged_at: "2026-05-16"
+  license: BSD-3-Clause
+  # Tier B: no transcript exists for this work, so there is no session id and
+  # no original model. Stated rather than omitted.
+  session_id: null
+  original_model: null
