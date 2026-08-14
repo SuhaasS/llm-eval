@@ -466,29 +466,59 @@ def test_an_annotated_tag_on_the_history_survives(tmp_path, upstream):
     assert _sh("git", "describe", cwd=repo).startswith("v1.0")
 
 
-def test_an_inherited_commit_graph_does_not_reach_the_run_tree(tmp_path, upstream):
+@pytest.mark.parametrize(
+    "layout",
+    [["--reachable"], ["--reachable", "--split"]],
+    ids=("single", "split"),
+)
+def test_an_inherited_commit_graph_does_not_reach_the_run_tree(
+    tmp_path, upstream, layout
+):
     """A commit-graph is HARDLINKED by `clone --mirror --local` and carries
     future commit ids verbatim. Under `gc.writeCommitGraph=false` gc exits 0
     and leaves the inherited copy -- measured: the object post-condition still
     reports zero outside commits and PASSES, while `git fsck` in the run tree
-    exits non-zero printing `Could not read <the fix's sha>`. The same shape
-    holds for a stale `.keep`, which makes gc refuse the pack entirely.
+    exits non-zero printing `Could not read <the fix's sha>`.
 
-    So this is the only coverage for the strip step, and the object sweep is
-    provably blind to it."""
+    Both layouts, because `--split` writes a DIRECTORY,
+    `objects/info/commit-graphs/`, which `clone --mirror --local` hardlinks
+    through just the same -- a limb of the strip a single-file fixture never
+    reaches. Verified against git 2.50.1.
+
+    The `.keep` is a real `pack-<hash>.keep`. Measured: a .keep matching no
+    existing pack is ignored by git entirely, so the earlier `stale.keep`
+    fixture exercised the glob and nothing else. A real one makes gc refuse the
+    pack and the fix survives EVEN under `repack.packKeptObjects=true`, which
+    leaves `_strip_derived`'s unlink as the only thing that saves that case.
+    It needs a pack to match, hence the repack: `ensure_mirror` clones from a
+    local path and hardlinks the fixture's loose objects, leaving zero packs.
+
+    The object sweep is blind to all of this -- emptying `_DERIVED_PATHS`
+    empties `_verify_pruned`'s leftover list too, so nothing raises and the
+    inherited graph reaches the run tree, where the assertions below catch it.
+    """
     from bakeoff.tasks import ensure_mirror
 
     cache = tmp_path / "cache"
     mirror = ensure_mirror(str(upstream["path"]), upstream["base"], cache)
-    _sh("git", "commit-graph", "write", "--reachable", cwd=mirror)
-    (mirror / "objects" / "pack" / "stale.keep").write_text("")
-    assert (mirror / "objects" / "info" / "commit-graph").exists()
+    _sh("git", "repack", "-adq", cwd=mirror)
+    _sh("git", "commit-graph", "write", *layout, cwd=mirror)
+    pack = next((mirror / "objects" / "pack").glob("pack-*.pack"))
+    pack.with_suffix(".keep").write_text("")
+    # Asserted, not assumed: a git that declined to split so small a history
+    # would make this param a silent duplicate of the other one.
+    info = mirror / "objects" / "info"
+    assert (info / "commit-graphs").is_dir() if "--split" in layout else (
+        info / "commit-graph"
+    ).exists()
 
     task = load_task(_write_task(tmp_path / "set", upstream))
     repo = tmp_path / "run" / "repo"
     materialize(task, repo, cache)
 
-    assert not (repo / ".git" / "objects" / "info" / "commit-graph").exists()
+    run_info = repo / ".git" / "objects" / "info"
+    assert not (run_info / "commit-graph").exists()
+    assert not (run_info / "commit-graphs").exists()
     assert subprocess.run(
         ["git", "fsck", "--no-progress"], cwd=repo, capture_output=True
     ).returncode == 0
@@ -516,11 +546,23 @@ def test_a_prune_that_left_the_future_behind_is_refused(tmp_path, upstream, monk
         materialize(task, tmp_path / "run" / "repo", tmp_path / "cache")
 
 
-def test_a_cached_prune_from_an_older_revision_is_rebuilt(tmp_path, upstream):
+@pytest.mark.parametrize(
+    "marker_body",
+    ["0 stale stale\n", "corrupt\n"],
+    ids=("older_revision", "unparseable"),
+)
+def test_a_cached_prune_from_an_older_revision_is_rebuilt(
+    tmp_path, upstream, marker_body
+):
     """A pruned mirror built by an earlier revision of the prune must not be
     served forever -- that is the silent-wrong-cache failure `ensure_mirror`
     re-checks on every call to avoid. The rebuild has to survive the old mirror
-    still being there: `os.replace` onto a non-empty directory raises."""
+    still being there: `os.replace` onto a non-empty directory raises.
+
+    Both shapes a marker can be wrong in. `corrupt` is the one that unpacks to
+    the wrong number of fields, which a truncated write leaves behind -- and
+    which must fall through to a rebuild rather than raise `ValueError` out of
+    a cache read."""
     from bakeoff.tasks import pruned_mirror_path
 
     cache = tmp_path / "cache"
@@ -528,7 +570,7 @@ def test_a_cached_prune_from_an_older_revision_is_rebuilt(tmp_path, upstream):
     first = materialize(task, tmp_path / "a" / "repo", cache)
 
     pruned = pruned_mirror_path(str(upstream["path"]), upstream["base"], cache)
-    (pruned / "bakeoff-prune-version").write_text("0 stale stale\n")
+    (pruned / "bakeoff-prune-version").write_text(marker_body)
 
     assert materialize(task, tmp_path / "b" / "repo", cache) == first
 
@@ -577,6 +619,205 @@ def test_a_base_sha_off_the_default_branch_materializes(tmp_path, upstream):
         ["git", "cat-file", "-e", f"{upstream['head']}^{{commit}}"],
         cwd=repo, capture_output=True,
     ).returncode != 0
+
+
+# --- the pruned mirror is a CACHE, and a cache is not evidence ----------------
+
+
+def test_a_fetch_into_the_cache_does_not_reach_the_run_tree(tmp_path, upstream):
+    """The pruned mirror is kept across invocations and trusted on a
+    fingerprint of its `*.idx` names and sizes -- deliberately, so a run tree
+    staging a file cannot invalidate it.
+
+    Measured against git 2.50.1: a fetch into that cache lands its objects
+    LOOSE, because under `transfer.unpackLimit` no pack is written. No `.idx`
+    moves, the fingerprint is byte-identical, the fast path returns the mirror
+    unchecked, and `git cat-file -p <the merged fix>` works in the next run
+    tree -- same `start_sha`, no error, nothing recorded. The leak this module
+    exists to close, reintroduced one layer up. `_pack_fingerprint` counts
+    loose objects for exactly this."""
+    from bakeoff.tasks import pruned_mirror_path
+
+    cache = tmp_path / "cache"
+    task = load_task(_write_task(tmp_path / "set", upstream))
+    first = materialize(task, tmp_path / "a" / "repo", cache)
+
+    pruned = pruned_mirror_path(str(upstream["path"]), upstream["base"], cache)
+    _sh("git", "fetch", str(upstream["path"]), "+refs/heads/*:refs/future/*",
+        cwd=pruned)
+
+    repo = tmp_path / "b" / "repo"
+
+    assert materialize(task, repo, cache) == first
+    assert subprocess.run(
+        ["git", "cat-file", "-e", f"{upstream['head']}^{{commit}}"],
+        cwd=repo, capture_output=True,
+    ).returncode != 0, "a fetch into the cache reached the agent's own tree"
+
+
+def _gut_the_object_store(pruned: Path) -> None:
+    for path in (pruned / "objects" / "pack").glob("*"):
+        path.unlink()
+
+
+def _grow_a_commit_graph(pruned: Path) -> None:
+    _sh("git", "commit-graph", "write", "--reachable", cwd=pruned)
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [_gut_the_object_store, _grow_a_commit_graph],
+    ids=("objects_gone", "commit_graph_grew"),
+)
+def test_a_damaged_prune_cache_heals_itself(tmp_path, upstream, damage):
+    """A pruned mirror that cannot be shown to be pruned must be REBUILT, not
+    refused. An earlier revision re-verified it and raised -- before the
+    rebuild block, so the damaged entry stayed on disk and every cell of every
+    task on that (repo, base_sha) died on every re-invocation, with a message
+    that reads like a prune bug and no instruction to delete anything.
+    Measured: three identical TaskErrors in a row. The stale-`prune-*.tmp`
+    sweep in the same function refuses that failure class explicitly.
+
+    Only `objects_gone` is an unforced reproduction: emptying the pack empties
+    the `.idx` set, so the fingerprint mismatches on its own. A stray
+    commit-graph leaves the fingerprint identical and would take the fast path,
+    so the marker below is rewritten as a deliberate ROUTING DEVICE -- correct
+    version and base_sha so it parses and matches, a fingerprint that cannot
+    match because `_pack_fingerprint` returns hex -- to reach the guard at all.
+
+    Unlinking `objects/pack/*` rather than `objects/` on purpose: the first
+    leaves a valid bare repository with an empty object store (`cat-file -e`
+    exits 128 "Not a valid object name", `rev-parse --is-bare-repository` still
+    true), which is the truncated-mirror shape the guard names. Removing
+    `objects/` outright stops git recognising the directory at all."""
+    from bakeoff.tasks import _PRUNE_VERSION, pruned_mirror_path
+
+    cache = tmp_path / "cache"
+    task = load_task(_write_task(tmp_path / "set", upstream))
+    first = materialize(task, tmp_path / "a" / "repo", cache)
+
+    pruned = pruned_mirror_path(str(upstream["path"]), upstream["base"], cache)
+    damage(pruned)
+    (pruned / "bakeoff-prune-version").write_text(
+        f"{_PRUNE_VERSION} {upstream['base']} {'x' * 16}\n"
+    )
+
+    repo = tmp_path / "b" / "repo"
+
+    assert materialize(task, repo, cache) == first
+    assert subprocess.run(
+        ["git", "cat-file", "-e", f"{upstream['head']}^{{commit}}"],
+        cwd=repo, capture_output=True,
+    ).returncode != 0
+
+
+def test_a_pruned_mirror_missing_its_base_sha_is_refused(tmp_path):
+    """Belt and braces, and called directly because nothing else can reach it:
+    the one caller passes a mirror it just cloned from a source `ensure_mirror`
+    resolved `base_sha` in, so on any passing path the commit is present by
+    construction.
+
+    Kept anyway because without it `_commits_outside` over an empty store
+    returns `[]`, which is byte-identical to a correct prune -- the object
+    check would pass VACUOUSLY, and the failure would surface later out of
+    `git checkout --detach`, from the wrong place, naming nothing."""
+    from bakeoff.tasks import _verify_pruned
+
+    repo = tmp_path / "empty.git"
+    _sh("git", "init", "-q", "--bare", str(repo), cwd=tmp_path)
+
+    with pytest.raises(TaskError, match="pruned mirror does not contain base_sha"):
+        _verify_pruned(repo, "0" * 40)
+
+
+def test_a_pruned_mirror_that_kept_a_derived_file_is_refused(tmp_path, upstream):
+    """`git gc` writes a commit-graph BY DEFAULT, so this guard fires on gc's
+    own output whenever `-c gc.writeCommitGraph=false` is missing -- it is not
+    only about what `clone --mirror --local` inherits.
+
+    It matters because a commit-graph carries future commit ids verbatim,
+    passes the object sweep untouched, and then makes `git fsck` in the run
+    tree print the reference fix's SHA at the agent. Checked BEFORE the sweep,
+    which is why a mirror that was never pruned at all lands here rather than
+    in the outside-commits branch."""
+    from bakeoff.tasks import _verify_pruned
+
+    mirror = tmp_path / "mirror.git"
+    _sh("git", "clone", "-q", "--bare", str(upstream["path"]), str(mirror),
+        cwd=tmp_path)
+    _sh("git", "commit-graph", "write", "--reachable", cwd=mirror)
+
+    with pytest.raises(TaskError, match="carries future commit ids"):
+        _verify_pruned(mirror, upstream["base"])
+
+
+def test_the_prune_holds_under_a_hostile_gitconfig(tmp_path, upstream, monkeypatch):
+    """`_GC_CONFIG`'s `-c` overrides exist because the operator's own
+    `~/.gitconfig` otherwise decides whether a prune prunes. Nothing that runs
+    in CI exercised them, so a later edit could trim them as noise and stay
+    green.
+
+    The failure pinned here is NOT a silent leak -- `_verify_pruned` catches
+    those and would raise. It is that an operator's config makes every task
+    refuse to materialize, which is the whole task set down until someone
+    finds the setting.
+
+    `GIT_CONFIG_GLOBAL` replaces the operator's global entirely, so the verdict
+    is a property of this repository rather than of the laptop. Two of the
+    seven overrides are load-bearing, measured leave-one-out:
+    `gc.bigPackThreshold` (the fix survives with every ref gone) and
+    `gc.writeCommitGraph` (gc re-creates the file `_strip_derived` removed).
+    The other five are shadowed by an explicit argument elsewhere.
+
+    No `[user]` block on purpose: `materialize` commits the test half and
+    survives an identity-less config only because `_SETUP_ENV` supplies
+    `GIT_{AUTHOR,COMMITTER}_{NAME,EMAIL,DATE}` and the commit is
+    `-c commit.gpgsign=false`."""
+    hostile = tmp_path / "hostile.gitconfig"
+    hostile.write_text(
+        "[gc]\n"
+        "\tbigPackThreshold = 1\n"
+        "\twriteCommitGraph = true\n"
+        "\tcruftPacks = true\n"
+        "\tpruneExpire = never\n"
+        "\treflogExpire = never\n"
+        "\treflogExpireUnreachable = never\n"
+        "[core]\n"
+        "\tlogAllRefUpdates = true\n"
+        "[repack]\n"
+        "\tpackKeptObjects = false\n"
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(hostile))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    # Loose objects would leave no pack for `gc.bigPackThreshold` to keep, so
+    # the hostile setting could not bite and this would pass whether or not the
+    # override existed.
+    _sh("git", "repack", "-adq", cwd=upstream["path"])
+    assert _sh("git", "config", "--get", "gc.bigPackThreshold",
+               cwd=upstream["path"]) == "1", "the hostile config is not being read"
+
+    task = load_task(_write_task(tmp_path / "set", upstream))
+    repo = tmp_path / "run" / "repo"
+    cache = tmp_path / "cache"
+
+    materialize(task, repo, cache)
+
+    assert subprocess.run(
+        ["git", "cat-file", "-e", f"{upstream['head']}^{{commit}}"],
+        cwd=repo, capture_output=True,
+    ).returncode != 0
+    assert subprocess.run(
+        ["git", "fsck", "--no-progress"], cwd=repo, capture_output=True
+    ).returncode == 0
+    # `core.logAllRefUpdates=true` makes the run tree keep reflogs it normally
+    # would not; `materialize`'s explicit `--expire=now` beats
+    # `gc.reflogExpire=never` because an argument outranks config.
+    logs = repo / ".git" / "logs"
+    assert [
+        path
+        for path in logs.rglob("*")
+        if path.is_file() and str(cache) in path.read_text()
+    ] == []
 
 
 def test_a_test_declared_as_both_f2p_and_p2p_is_refused(tmp_path, upstream):

@@ -760,12 +760,25 @@ _DERIVED_PATHS = (
 )
 
 # The operator's ~/.gitconfig decides whether a prune prunes, so none of this
-# is left to it. Each was measured to defeat the prune while leaving every
-# assertion short of the object sweep passing:
-#   gc.bigPackThreshold below the pack size keeps the pack wholesale;
-#   a stale objects/pack/*.keep makes gc refuse the pack entirely;
-#   the reflog written by the update-ref calls below is a reachability root,
-#     and gc's default expiry keeps entries for 90d/30d.
+# is left to it. TWO of these are load-bearing, measured leave-one-out against
+# a hostile global config on a packed repository:
+#   gc.bigPackThreshold below the pack size keeps the pack wholesale, and the
+#     fix survives with every ref gone;
+#   gc.writeCommitGraph -- gc writes a commit-graph by DEFAULT, so without the
+#     override it re-creates, after _strip_derived, the very file that carries
+#     future commit ids into the run tree.
+# The other five are shadowed by an explicit argument elsewhere and are kept to
+# state intent, not because removing one was measured to break anything:
+# gc.pruneExpire and gc.cruftPacks lose to `--prune=now` on the same command
+# line, gc.reflogExpire* lose to the explicit `reflog expire --expire=now
+# --all` below, and repack.packKeptObjects is shadowed by _strip_derived's
+# .keep unlink -- with a pack-<hash>.keep present at gc time the fix survives
+# EVEN WITH the override set, so the unlink is what saves that case. A .keep
+# whose name matches no existing pack is ignored by git entirely (measured,
+# git 2.50.1); an earlier revision of this comment claimed otherwise.
+# The reflog written by the update-ref calls below is a reachability root and
+# gc's default expiry keeps entries for 90d/30d, which is what the reflog
+# flags are for -- but the explicit expire below already covers it.
 # `gc.writeMultiPackIndex` is deliberately absent -- it is not a real config
 # name (checked against `git help -c`, git 2.50.1); the MIDX is handled by
 # _DERIVED_PATHS instead.
@@ -815,14 +828,32 @@ def _pack_fingerprint(repo: Path) -> str:
     turning the cheap path into the expensive one it exists to bound.
 
     An `.idx` name is content-addressed and its size changes when the store is
-    repacked, which is the only change that matters here. It cannot see loose
-    objects added to a cached mirror; nothing writes there, because `origin` is
-    removed at build time.
+    repacked, which is the only change that matters here.
+
+    LOOSE OBJECTS ARE COUNTED BESIDE THE PACKS, and an earlier revision's
+    docstring claiming nothing writes to a cached mirror was wrong. Measured
+    against git 2.50.1: `git fetch <upstream> +refs/*:refs/future/*` in a cached
+    pruned mirror lands 5 objects LOOSE -- under `transfer.unpackLimit` no pack
+    is written -- so no `.idx` moves, the digest is byte-identical, the fast
+    path returns, and `git cat-file -p <the merged fix>` works in the next run
+    tree. That is the whole leak this module exists to close, reintroduced one
+    layer up and silently.
+
+    The safety property is not "the count is zero" but that the count cannot
+    return to its recorded value without also moving the `.idx` set: packing
+    those objects rewrites an index. It does not reintroduce the freshening
+    problem above -- a run tree has its own `.git/objects` and no
+    `objects/info/alternates` (`clone --local` hardlinks, so there is no write
+    channel back), and the mirror's digest is unchanged across a run tree's
+    `git add -A`, `commit`, `gc --prune=now` and `repack -adq`.
     """
     packs = sorted(
         (p.name, p.stat().st_size) for p in (repo / "objects" / "pack").glob("*.idx")
     )
-    return hashlib.sha256(repr(packs).encode("utf-8")).hexdigest()[:16]
+    # Two hex characters exactly, so `objects/info` and `objects/pack` -- four
+    # characters each -- are not matched.
+    loose = sum(1 for _ in (repo / "objects").glob("[0-9a-f][0-9a-f]/*"))
+    return hashlib.sha256(repr((packs, loose)).encode("utf-8")).hexdigest()[:16]
 
 
 def _commits_outside(repo: Path, ancestors: set[str]) -> list[str]:
@@ -916,19 +947,27 @@ def ensure_pruned_mirror(repo_url: str, base_sha: str, cache_root: Path) -> Path
             version, marked_sha, fingerprint = marker.read_text().split()
         except ValueError:
             version = marked_sha = fingerprint = ""
-        if version == _PRUNE_VERSION and marked_sha == base_sha:
-            # The fingerprint is the cheap path; a mismatch re-runs the full
-            # sweep rather than rebuilding, because a repack is not a leak.
-            if fingerprint == _pack_fingerprint(dest):
-                if _git("cat-file", "-e", f"{base_sha}^{{commit}}", cwd=dest,
-                        check=False).returncode == 0:
-                    return dest
-            else:
-                _verify_pruned(dest, base_sha)
-                marker.write_text(
-                    f"{_PRUNE_VERSION} {base_sha} {_pack_fingerprint(dest)}\n"
-                )
-                return dest
+        # ONE condition, and everything else falls through to the rebuild.
+        # An earlier revision re-verified the mirror on a fingerprint mismatch
+        # and RAISED when that failed -- before the rebuild block, so the bad
+        # entry stayed on disk and the task was unmaterializable on every future
+        # invocation until an operator rm -rf'd it. Measured: three identical
+        # TaskErrors in a row. That is the same failure class the stale-tmp
+        # sweep below refuses, handled the opposite way.
+        #
+        # Nothing is lost by rebuilding instead. The re-verify limb existed to
+        # skip a rebuild when a mismatch is benign, but the only benign trigger
+        # is an operator repack -- and a repack leaves the digest identical
+        # (measured), so it does not reach here at all. Every mismatch that does
+        # fire is one that should be rebuilt. The rebuild ends in
+        # `_verify_pruned(tmp, ...)`, which still raises: refusing a prune this
+        # function just built is a code defect, refusing one it found on disk is
+        # a cache defect, and only the second is recoverable.
+        if (version == _PRUNE_VERSION and marked_sha == base_sha
+                and fingerprint == _pack_fingerprint(dest)
+                and _git("cat-file", "-e", f"{base_sha}^{{commit}}", cwd=dest,
+                         check=False).returncode == 0):
+            return dest
 
     # Rebuild. Sweep first: a tmp left behind by a killed process would make
     # `git clone --mirror --local` exit 128 ("destination path already exists

@@ -1981,3 +1981,102 @@ in either direction.
 Two known items re-triggered, both already tracked: gemma and kimi priced `null`
 (`cache support unconfirmed, saw cache_read` — and they *did* return cache
 accounting this time), and gemma hit the placeholder 40-turn cap.
+
+## The prune cache was a claim, not evidence — 2026-08-14
+
+Started as coverage work: five lines of `1d6bafd`'s pruned-mirror code were
+uncovered (`_strip_derived`'s directory limb, both `_verify_pruned` raises, the
+marker `except ValueError`, the fingerprint-mismatch limb). Writing tests for
+them found **two defects**, both in the cache-hit branch tree, and both
+invisible for the same reason: every existing test drove `materialize` against a
+*fresh* cache, so that whole branch tree had never executed.
+
+### Defect 1 — the fast path could hand over the answer
+
+`_pack_fingerprint` digests `*.idx` names and sizes, chosen so a run tree's
+`git add -A` cannot invalidate it. Measured against git 2.50.1: `git fetch
+<upstream> +refs/heads/*:refs/future/*` into the **cached pruned mirror** lands
+its objects **loose** — under `transfer.unpackLimit` no pack is written — so no
+`.idx` moves, the digest is byte-identical, the fast path returns unchecked, and
+`git cat-file -p <the merged fix>` works in the next run tree. Same `start_sha`,
+no error, nothing recorded.
+
+That is the leak `1d6bafd` closed, reintroduced one layer up. Fixed by folding a
+loose-object count into the digest. The safety property is not "the count is
+zero" but that it cannot return to its recorded value without also moving an
+`.idx` — packing those objects rewrites an index. Verified it does not
+reintroduce the freshening problem the `.idx`-only rule exists for: a run tree
+has its own `.git/objects` and no `objects/info/alternates`, and the mirror's
+digest is unchanged across a run tree's `git add -A`, `commit`, `gc --prune=now`
+and `repack -adq`.
+
+### Defect 2 — the slow path wedged the task forever
+
+A fingerprint mismatch re-verified the cached mirror and **raised** when that
+failed — before the rebuild block, so the damaged entry stayed on disk.
+Measured: same damage, three consecutive `materialize` calls, three identical
+`TaskError`s, marker still present. Every cell of every task on that
+`(repo, base_sha)` would die on every re-invocation, with a message that reads
+like a prune bug and no instruction to delete anything — the same failure class
+the stale-`prune-*.tmp` sweep three lines below refuses explicitly.
+
+Fixed by **deleting** the re-verify limb rather than wrapping it: the whole
+cache branch collapsed to one condition, and everything else falls through to
+the rebuild. Net −7 lines. The limb existed to skip a rebuild when a mismatch is
+benign, but the only benign trigger is an operator repack — and a repack leaves
+the digest identical (measured), so it never reached the limb at all. Safety is
+unchanged: the rebuild still ends in `_verify_pruned` on the `tmp` it just
+built, which still raises and still gates the atomic rename.
+
+### What the tests pin
+
+56 in `test_tasks.py` (was 48), 529 in the suite, **116/116 mutations**, five of
+them new. Each new test was checked against the defect it names: the fetch test
+**fails** with the loose term removed (the fix is readable in the run tree), and
+both heal params **fail** under the old raising branch.
+
+`tasks.py` coverage 91 % → 93 %; all five target lines closed, one of them by
+deleting the code.
+
+Two of the five branches are covered by calling `_verify_pruned` directly rather
+than through `materialize`, and the docstrings say why: under the collapsed
+branch it has one call site, where `base_sha` is present by construction. They
+are defensive asserts, and the honest way to cover a defensive assert is to call
+it. Without the `base_sha` guard, `_commits_outside` over an empty store returns
+`[]` — byte-identical to a correct prune.
+
+### Three comments that were measurably wrong
+
+- `_GC_CONFIG` claimed each of its seven overrides "was measured to defeat the
+  prune". Leave-one-out against a hostile global config on a packed repository:
+  **two** are load-bearing (`gc.bigPackThreshold`, `gc.writeCommitGraph`). The
+  other five are shadowed by an explicit argument elsewhere — `gc.pruneExpire`
+  and `gc.cruftPacks` by `--prune=now` on the same command line,
+  `gc.reflogExpire*` by the explicit `reflog expire --expire=now --all`, and
+  `repack.packKeptObjects` by `_strip_derived`'s unlink. Kept, but the comment
+  now says which is which.
+- A `.keep` "makes gc refuse the pack entirely" — only if it matches an existing
+  pack. A `.keep` naming no pack is ignored by git. The old `stale.keep` fixture
+  was therefore vacuous; it is now a real `pack-<hash>.keep`, which **does**
+  survive `repack.packKeptObjects=true`, so the unlink is what saves that case
+  and it now has a mutation anchor.
+- `_pack_fingerprint`'s "nothing writes there, because `origin` is removed at
+  build time" — see defect 1.
+
+### The one guarantee still not falsifiable
+
+`_DERIVED_PATHS`' `objects/pack/multi-pack-index` is defensive and cannot be
+anchored through `materialize`: `gc --prune=now` deletes an inherited midx
+whenever the refs were retargeted first, which `ensure_pruned_mirror` always
+does. Isolated: `delrefs=False` → midx survives, `delrefs=True` → midx gone. A
+fixture for it would pass with or without the strip. Recorded rather than
+papered over with an assertion that proves nothing.
+
+### Also new
+
+`test_the_prune_holds_under_a_hostile_gitconfig` — `GIT_CONFIG_GLOBAL` pointed
+at a written file with every measured bypass set. Not for a silent leak
+(`_verify_pruned` catches those) but for the other failure: an operator's own
+gitconfig making every task refuse to materialize. It asserts the hostile file
+is actually being read, because otherwise it would pass vacuously and take two
+mutation entries down with it.

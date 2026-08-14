@@ -1106,9 +1106,10 @@ MUTATIONS = [
         # future commit ids verbatim; under `gc.writeCommitGraph=false` gc exits
         # 0 and leaves it. Measured: the object sweep below still reports zero
         # outside commits and PASSES, while `git fsck` in the run tree prints
-        # `Could not read <the fix's sha>` at the agent. A stale `.keep` is the
-        # same shape -- it makes gc refuse the pack entirely.
-        "tasks: inherit the mirror's commit-graph and .keep into the run tree",
+        # `Could not read <the fix's sha>` at the agent. Both layouts, because
+        # `--split` writes a DIRECTORY the strip reaches through a different
+        # limb.
+        "tasks: inherit the mirror's commit-graph into the run tree",
         "src/bakeoff/tasks.py",
         '    "objects/info/commit-graph",\n    "objects/info/commit-graphs",',
         "",
@@ -1125,6 +1126,76 @@ MUTATIONS = [
         "    if outside:",
         "    if False:",
         "tests/test_tasks.py -k prune_that_left_the_future_behind",
+        "not integration",
+    ),
+    (
+        # The pruned mirror is a CACHE, and the fingerprint decides whether to
+        # trust one. Measured against git 2.50.1: `git fetch` into a cached
+        # mirror lands its objects LOOSE -- under `transfer.unpackLimit` no
+        # pack is written -- so the `.idx` set is untouched, an idx-only digest
+        # is byte-identical, the fast path returns unchecked, and the merged
+        # fix is readable in the next run tree. Same start_sha, no error.
+        "tasks: trust a cached mirror a fetch could have written into",
+        "src/bakeoff/tasks.py",
+        '    loose = sum(1 for _ in (repo / "objects").glob("[0-9a-f][0-9a-f]/*"))',
+        "    loose = 0",
+        "tests/test_tasks.py -k fetch_into_the_cache",
+        "not integration",
+    ),
+    (
+        # A .keep makes gc refuse the pack wholesale, so the future survives
+        # with rc=0 -- and `repack.packKeptObjects=true` does NOT save it
+        # (measured). The unlink is the only thing that does. Note the fixture
+        # has to be a `pack-<hash>.keep`: a name matching no existing pack is
+        # ignored by git entirely, which is what made an earlier `stale.keep`
+        # fixture vacuous.
+        "tasks: stop unlinking an inherited pack .keep",
+        "src/bakeoff/tasks.py",
+        '    for keep in (repo / "objects" / "pack").glob("*.keep"):',
+        "    for keep in ():",
+        "tests/test_tasks.py -k inherited_commit_graph",
+        "not integration",
+    ),
+    (
+        # `_commits_outside` over an empty object store returns [], which is
+        # byte-identical to a correct prune -- so without this the check passes
+        # VACUOUSLY on a truncated mirror and the failure surfaces later, out
+        # of `git checkout --detach`, naming nothing. Anchored by a direct call
+        # because the one production call site passes a mirror it just cloned
+        # from a source `ensure_mirror` already resolved base_sha in.
+        "tasks: accept a pruned mirror whose base_sha is gone",
+        "src/bakeoff/tasks.py",
+        '    if _git("cat-file", "-e", f"{base_sha}^{{commit}}", cwd=repo,\n'
+        "            check=False).returncode != 0:",
+        "    if False:",
+        "tests/test_tasks.py -k missing_its_base_sha",
+        "not integration",
+    ),
+    (
+        # gc.bigPackThreshold below the pack size keeps the pack wholesale:
+        # every ref gone and `cat-file -e <the fix>` still resolving. The
+        # DELETION shape, not a value flip -- flipping 0 to 1 IS the hostile
+        # setting, applied via argv, so it is caught even with no hostile
+        # gitconfig and would anchor the wrong claim.
+        "tasks: let the operator's gitconfig keep the big pack",
+        "src/bakeoff/tasks.py",
+        '    "-c", "gc.bigPackThreshold=0",\n',
+        "",
+        "tests/test_tasks.py -k hostile_gitconfig",
+        "not integration",
+    ),
+    (
+        # gc writes a commit-graph BY DEFAULT, so without this override it
+        # re-creates, after _strip_derived ran, the very file that carries
+        # future commit ids into the run tree. Selector is the hostile-config
+        # test on purpose: on a host whose operator sets gc.writeCommitGraph or
+        # core.commitGraph to false this mutation is MISSED by every other
+        # test, since nothing else neutralises ~/.gitconfig.
+        "tasks: let gc write the commit-graph it just stripped",
+        "src/bakeoff/tasks.py",
+        '    "-c", "gc.writeCommitGraph=false",\n',
+        "",
+        "tests/test_tasks.py -k hostile_gitconfig",
         "not integration",
     ),
     (
