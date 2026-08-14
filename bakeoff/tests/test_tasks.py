@@ -128,12 +128,14 @@ def test_the_reference_diff_is_partitioned_not_filtered(upstream):
     either one is invisible: the agent would start without part of its
     oracle, or the offline grader would compare against a reference that is
     missing part of the fix. A partition can be checked, so it is."""
-    test_half, solution_half, files = split_reference_diff(
-        upstream["reference"], ("tests/",)
+    test_half, solution_half, files, solution_files, extra_files = (
+        split_reference_diff(upstream["reference"], ("tests/",))
     )
 
     chunks = diff_chunks(upstream["reference"])
     assert len(diff_chunks(test_half)) + len(diff_chunks(solution_half)) == len(chunks)
+    assert extra_files == (), "this fixture declares no allow_extra_paths"
+    assert solution_files == ("calc.py",)
     assert "tests/test_calc.py" in test_half
     assert "tests/test_calc.py" not in solution_half
     assert "calc.py" in solution_half
@@ -151,7 +153,17 @@ def test_a_rename_across_the_boundary_is_refused():
     """`tests/x.py -> src/x.py` is simultaneously the agent's oracle and part
     of the fix. Guessing a half would either hand the agent its own
     submission or delete the test it is measured by."""
-    diff = "diff --git a/tests/x.py b/src/x.py\nsimilarity index 100%\n"
+    # Real `git diff` output. The synthetic form this test used before -- a
+    # `similarity index` line with no `rename from`/`rename to` -- is not a
+    # shape git emits, and git rejects it outright ("header lacks filename
+    # information"), so the test used to pass only because a hand-rolled greedy
+    # regex happened to accept it.
+    diff = (
+        "diff --git a/tests/x.py b/src/x.py\n"
+        "similarity index 100%\n"
+        "rename from tests/x.py\n"
+        "rename to src/x.py\n"
+    )
     with pytest.raises(TaskError, match="across the test/solution boundary"):
         split_reference_diff(diff, ("tests/",))
 
@@ -372,3 +384,247 @@ def test_a_test_declared_as_both_f2p_and_p2p_is_refused(tmp_path, upstream):
     )
     with pytest.raises(TaskError, match="both f2p and p2p"):
         load_task(task_dir)
+
+
+# --- RC4: the reference diff is parsed by git, not by a regex ----------------
+#
+# Five drafts of a hand-rolled header parser each shipped a different
+# silent-wrong-path bug. Every case below is one of those, plus the three
+# raises that replaced them.
+
+
+def _chunks_of(*headers: str) -> str:
+    """A minimal well-formed multi-file diff, one modification per header."""
+    body = "index 1111111..2222222 100644\n@@ -1 +1,2 @@\n a\n+b\n"
+    return "".join(f"{h}\n{body}" for h in headers)
+
+
+def test_chunking_is_byte_exact():
+    """`test_diff`'s bytes feed the setup commit, so one byte moves `start_sha`
+    and breaks its pin. The naive `[l + "\\n" for l in split("\\n")]` re-add is
+    off by exactly +1 on a diff that ends with a newline."""
+    diff = _chunks_of("diff --git a/src/x.py b/src/x.py")
+
+    assert "".join(diff_chunks(diff)) == diff
+    assert "".join(diff_chunks(diff.rstrip("\n"))) == diff.rstrip("\n")
+
+
+def test_a_form_feed_in_a_hunk_does_not_create_a_phantom_chunk():
+    """`str.splitlines()` also breaks on \\v \\f \\x1c \\x1d \\x1e \\x85 \\u2028
+    \\u2029. A form feed is ordinary in Emacs-era Python and C sources, and one
+    line of git output carrying one becomes TWO -- so a phantom chunk appears
+    and half a real test file's diff moves into the fix half. Every in-file
+    line counter is fooled identically on both sides, which is why the witness
+    has to be git."""
+    diff = (
+        "diff --git a/tests/t.py b/tests/t.py\n"
+        "index 1111111..2222222 100644\n"
+        "@@ -1 +1,2 @@\n"
+        " a\n"
+        "+\x0cdiff --git a/evil.py b/evil.py\n"
+    )
+
+    assert len(diff_chunks(diff)) == 1
+
+
+def test_a_quoted_header_is_not_absorbed():
+    """Git C-quotes a header whenever a path holds a byte >= 0x80, a
+    backslash, a quote or a control char. A boundary demanding ` b/` misses it
+    and the whole file is absorbed into the previous chunk."""
+    diff = _chunks_of(
+        "diff --git a/src/plain.py b/src/plain.py",
+        r'diff --git "a/src/caf\303\251.py" "b/src/caf\303\251.py"',
+    )
+
+    assert len(diff_chunks(diff)) == 2
+
+
+def test_a_no_prefix_reference_is_refused():
+    """`git apply`'s -p1 strips a REAL component from a --no-prefix diff.
+    Measured on a tree with `src/tests/conftest.py` and `tests/test_main.py`,
+    git reports `tests/conftest.py` and `test_main.py` -- so a source file
+    becomes the oracle and the oracle becomes part of the fix, with every other
+    check here passing. Asserted on THIS message, not on the empty-half one,
+    which does not fire on a layout with a nested `tests/`."""
+    diff = _chunks_of("diff --git src/tests/conftest.py src/tests/conftest.py")
+
+    with pytest.raises(TaskError, match="no `a/` prefix"):
+        diff_chunks(diff)
+
+
+@pytest.mark.parametrize("prefix", ["diff --cc ", "diff --combined "])
+def test_a_combined_diff_header_is_refused(prefix):
+    """Two spellings from one call site: `--cc` when the output is dense (the
+    `git show` default on a merge) and `--combined` when it is not.
+
+    Measured: mixed after a real chunk, git's own parser silently ignores the
+    combined patch and still reports exactly one entry -- so the per-chunk
+    entry check does NOT catch it and this raise is the only thing that does.
+    """
+    diff = _chunks_of("diff --git a/src/x.py b/src/x.py") + f"{prefix}src/y.py\n"
+
+    with pytest.raises(TaskError, match="combined-diff header"):
+        diff_chunks(diff)
+
+
+def test_a_smuggled_second_file_is_refused():
+    """The case a whole-diff count cannot see.
+
+    2 chunks, 2 forward entries, 2 reverse entries -- all agreeing -- and the
+    zip is still wrong: chunk 0 carries a traditional hunk for a second file
+    and pairs with `tests/t.py`, so the `src/other.py` change is classified as
+    oracle and rides into the START STATE. The fix, pre-applied, on every arm.
+    Per chunk the same diff yields entry counts [2, 0].
+    """
+    diff = (
+        "diff --git a/tests/t.py b/tests/t.py\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/tests/t.py\n+++ b/tests/t.py\n@@ -1 +1,2 @@\n y\n+w\n"
+        "--- a/src/other.py\n+++ b/src/other.py\n@@ -1 +1,2 @@\n o\n+p\n"
+        "diff --git a/src/ghost.py b/src/ghost.py\n"
+    )
+
+    with pytest.raises(TaskError, match="expected\n?\\s*exactly one of each|exactly one"):
+        split_reference_diff(diff, ("tests/",))
+
+
+def test_paths_are_matched_by_component_not_by_prefix_string():
+    """`str.startswith` over-claims on a first segment that merely starts with
+    the prefix: under `paths: ["tests"]` it also takes `tests_helper.py`,
+    `testsuite/x.py` and `tests2/x.py`. Slash-terminated prefixes behave
+    identically under both, so no existing manifest changes."""
+    diff = _chunks_of(
+        "diff --git a/tests/real.py b/tests/real.py",
+        "diff --git a/tests_helper.py b/tests_helper.py",
+    )
+
+    test_half, solution_half, files, solution_files, _ = split_reference_diff(
+        diff, ("tests",)
+    )
+
+    assert files == ("tests/real.py",)
+    assert solution_files == ("tests_helper.py",)
+
+
+def test_an_extra_path_leaves_both_halves():
+    """A changelog citing the issue number: no agent writes one, and leaving it
+    in `solution_diff` makes preflight apply documentation it does not need."""
+    diff = _chunks_of(
+        "diff --git a/tests/t.py b/tests/t.py",
+        "diff --git a/src/x.py b/src/x.py",
+        "diff --git a/CHANGES.rst b/CHANGES.rst",
+    )
+
+    test_half, solution_half, _, solution_files, extra_files = split_reference_diff(
+        diff, ("tests/",), extra_paths=("CHANGES.rst",)
+    )
+
+    assert extra_files == ("CHANGES.rst",)
+    assert solution_files == ("src/x.py",)
+    assert "CHANGES.rst" not in solution_half
+    assert "CHANGES.rst" not in test_half
+
+
+def test_an_unlisted_extra_still_lands_in_the_fix_half():
+    """Deliberate scope limit. Deciding "not part of the fix" needs a
+    source-tree oracle the harness does not have, so the Gate-1 plan's "a file
+    that is neither is a load error" cannot be implemented -- an unlisted file
+    behaves exactly as it did before."""
+    diff = _chunks_of(
+        "diff --git a/tests/t.py b/tests/t.py",
+        "diff --git a/CHANGES.rst b/CHANGES.rst",
+    )
+
+    _, solution_half, _, solution_files, extra_files = split_reference_diff(
+        diff, ("tests/",)
+    )
+
+    assert extra_files == ()
+    assert solution_files == ("CHANGES.rst",)
+    assert "CHANGES.rst" in solution_half
+
+
+def test_a_rename_out_of_the_extra_class_is_refused():
+    """The three-class boundary check. `a_is_test != b_is_test` misses this:
+    both endpoints are non-test, so a two-class comparison stays silent while
+    an excluded file is renamed into the fix half."""
+    diff = (
+        "diff --git a/CHANGES.rst b/docs/CHANGES.rst\n"
+        "similarity index 100%\n"
+        "rename from CHANGES.rst\n"
+        "rename to docs/CHANGES.rst\n"
+    )
+
+    with pytest.raises(TaskError, match="across the test/solution boundary"):
+        split_reference_diff(diff, ("tests/",), extra_paths=("CHANGES.rst",))
+
+
+def test_overlapping_test_and_extra_paths_are_refused():
+    """Containment both ways, not set intersection: `tests/` and
+    `tests/fixtures/x.rst` share no element, and with tests.paths applied first
+    the extra entry is a silent no-op -- a manifest key that looks like it
+    excludes a file and does nothing."""
+    diff = _chunks_of("diff --git a/tests/t.py b/tests/t.py")
+
+    with pytest.raises(TaskError, match="overlaps tests.paths"):
+        split_reference_diff(
+            diff, ("tests/",), extra_paths=("tests/fixtures/x.rst",)
+        )
+
+
+@pytest.mark.parametrize("bad", ["", "/abs/path", "../escape"])
+def test_a_malformed_path_prefix_is_refused(bad):
+    diff = _chunks_of("diff --git a/tests/t.py b/tests/t.py")
+
+    with pytest.raises(TaskError):
+        split_reference_diff(diff, (bad,))
+
+
+def test_a_missing_git_is_a_task_error_not_a_traceback(monkeypatch):
+    """`load_task` promises one exception type and `run_matrix` catches only
+    that, so a subprocess failure must not escape as a traceback from a module
+    that previously ran no subprocesses at all."""
+    import bakeoff.tasks as tasks_module
+
+    def no_git(*_a, **_k):
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(tasks_module.subprocess, "run", no_git)
+    diff = _chunks_of("diff --git a/tests/t.py b/tests/t.py")
+
+    with pytest.raises(TaskError, match="could not run"):
+        split_reference_diff(diff, ("tests/",))
+
+
+def test_the_oracle_does_not_inherit_the_callers_cwd(tmp_path, monkeypatch):
+    """Measured: run from a repository SUBDIRECTORY, `git apply --numstat`
+    filters the patch to the cwd prefix and reports zero entries, exit 0, empty
+    stderr -- byte-identical to a patch that touches nothing. The temp
+    directory is what makes that unreachable; without this test it is one
+    refactor away."""
+    import subprocess as sp
+
+    repo = tmp_path / "repo"
+    (repo / "sub").mkdir(parents=True)
+    sp.run(["git", "init", "-q", str(repo)], check=True)
+    monkeypatch.chdir(repo / "sub")
+
+    diff = _chunks_of("diff --git a/tests/t.py b/tests/t.py")
+    _, _, files, _, _ = split_reference_diff(diff, ("tests/",))
+
+    assert files == ("tests/t.py",), "the oracle must not see the caller's cwd"
+
+
+def test_leading_blank_lines_are_refused_rather_than_dropped():
+    """The one live trigger of the byte-exactness guard.
+
+    Leading blank lines are not "content before the first header" -- the
+    existing check tests `.strip()`, so they fall through and are silently
+    discarded with the chunk that replaces them. A test asserting only that
+    the round trip HOLDS cannot see that: it holds for every well-formed
+    input. This exercises the raise.
+    """
+    diff = "\n\n" + _chunks_of("diff --git a/src/x.py b/src/x.py")
+
+    with pytest.raises(TaskError, match="byte for byte"):
+        diff_chunks(diff)

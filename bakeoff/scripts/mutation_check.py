@@ -1026,6 +1026,67 @@ MUTATIONS = [
         "not integration",
     ),
     (
+        # RC4. The reference diff is parsed by git, not by a regex here.
+        "tasks: split the reference on a boundary that drops the `a/` guard",
+        "src/bakeoff/tasks.py",
+        "_DIFF_HEADER = re.compile(r'^diff --git (?=a/|\"a/)')",
+        "_DIFF_HEADER = re.compile(r'^diff --git ')",
+        "tests/test_tasks.py -k no_prefix_reference_is_refused",
+        "not integration",
+    ),
+    (
+        "tasks: chunk the reference with splitlines, so a form feed forks a file",
+        "src/bakeoff/tasks.py",
+        'raw = diff.split("\\n")',
+        'raw = diff.splitlines()',
+        "tests/test_tasks.py -k form_feed",
+        "not integration",
+    ),
+    (
+        # A whole-diff count agrees while the zip is wrong; only per chunk does
+        # a smuggled second file become visible.
+        "tasks: accept a chunk git reads as more or fewer than one file",
+        "src/bakeoff/tasks.py",
+        "    if len(forward) != 1 or len(reverse) != 1:",
+        "    if False:",
+        "tests/test_tasks.py -k smuggled_second_file",
+        "not integration",
+    ),
+    (
+        "tasks: let a combined-diff header through, which git ignores in silence",
+        "src/bakeoff/tasks.py",
+        "        if _COMBINED_HEADER.match(stripped):",
+        "        if False:",
+        "tests/test_tasks.py -k combined_diff_header",
+        "not integration",
+    ),
+    (
+        "tasks: stop checking the chunking survived byte for byte",
+        "src/bakeoff/tasks.py",
+        '    if "".join(chunks) != diff:',
+        "    if False:",
+        "tests/test_tasks.py -k leading_blank_lines",
+        "not integration",
+    ),
+    (
+        # `startswith` over-claims any first segment that merely starts with
+        # the prefix -- tests_helper.py, testsuite/, tests2/.
+        "tasks: match test paths by string prefix instead of by path component",
+        "src/bakeoff/tasks.py",
+        "    return any(candidate.is_relative_to(PurePosixPath(p)) for p in prefixes)",
+        "    return any(path.startswith(p) for p in prefixes)",
+        "tests/test_tasks.py -k matched_by_component",
+        "not integration",
+    ),
+    (
+        "tasks: compare only the test class, so an extra-class rename is silent",
+        "src/bakeoff/tasks.py",
+        "            if kind_a != kind_b:",
+        "            if False:",
+        "tests/test_tasks.py -k rename_out_of_the_extra_class",
+        "not integration",
+    ),
+    (
         # Schema 3.8.0. Every one of the next six used to destroy the record
         # outright or, worse, publish something false in its place.
         "finalize: let a failing finalize step take the record with it",

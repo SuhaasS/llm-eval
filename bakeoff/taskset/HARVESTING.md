@@ -221,7 +221,28 @@ assert rendered strings rather than internal names.
    disqualifies most candidates, and it is cheapest to check before anything
    else.
 2. `base_sha` is `git rev-parse <merge_commit>^1`.
-3. `git diff <base_sha> <merge_commit> > reference.diff`, stored verbatim.
+3. Cut the reference with the flags pinned, and store it verbatim:
+
+   ```bash
+   git -c diff.noprefix=false -c diff.renames=true \
+       diff --binary <base_sha> <merge_commit> > reference.diff
+   ```
+
+   **The flags are not cosmetic — without them the diff's SHAPE is a property of
+   the harvester's `~/.gitconfig` rather than of the task**, and 80 references cut
+   on different machines would not be the same kind of object.
+
+   - `diff.noprefix=false` — a `--no-prefix` diff is refused at load, because
+     `git apply`'s `-p1` would strip a *real* path component and silently swap
+     which files are the oracle.
+   - `diff.renames=true` — `copies` turns plain modifications into copy chunks.
+   - `--binary` — a plain `git diff` renders a binary change as `Binary files …
+     differ` with no payload. That loads clean and then fails in *preflight*
+     ("cannot apply binary patch without full index line").
+
+   Leave `core.quotepath` at its default. Quoted headers are never parsed for
+   paths, and turning it off writes raw non-UTF-8 bytes into `reference.diff`,
+   which fails to decode at load.
 4. Write `task.yaml` per §3.7. Copy the structure from
    `click-3360-write-usage-empty-args/task.yaml`, whose comments explain what
    each key has to satisfy.

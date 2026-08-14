@@ -36,8 +36,9 @@ from __future__ import annotations
 import hashlib
 import re
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 MANIFEST_NAME = "task.yaml"
@@ -57,7 +58,34 @@ _SETUP_ENV = {
 _SETUP_MESSAGE = "bakeoff: task setup (test oracle)"
 
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-_DIFF_HEADER = re.compile(r"^diff --git a/(?P<a>.+) b/(?P<b>.+)$")
+#: A chunk boundary, and deliberately NOT a path parser. Paths come from git
+#: itself (see `_chunk_path`); five drafts of a hand-rolled header parser each
+#: shipped a different silent-wrong-path bug, because this line is not an
+#: unambiguous encoding: git appends a TAB when a path holds a space, C-quotes
+#: the whole side when it holds a byte >= 0x80 or a backslash/quote/control
+#: char, and a greedy `a/(.+) b/(.+)` fabricates two paths for any file whose
+#: name contains " b/".
+#:
+#: The `a/` lookahead is load-bearing in BOTH directions. Without it,
+#: `--no-prefix` output is admitted and `git apply`'s `-p1` then strips a REAL
+#: path component: measured on a tree with `src/tests/conftest.py` and
+#: `tests/test_main.py`, git reports `tests/conftest.py` and `test_main.py`, so
+#: under `tests.paths: ["tests/"]` a source file becomes the oracle and the
+#: oracle becomes part of the fix -- with every other check here passing. With
+#: a stricter form that demands ` b/` too, every C-quoted header is absorbed
+#: into the previous chunk instead.
+_DIFF_HEADER = re.compile(r'^diff --git (?=a/|"a/)')
+#: Matched to tell a genuine header we cannot accept from an ordinary body
+#: line, so the refusal names the cause instead of surfacing as a chunk/entry
+#: disagreement several steps later.
+_ANY_DIFF_HEADER = re.compile(r"^diff --git ")
+#: Combined diffs, both spellings git emits from one call site: `--cc` when the
+#: output is dense (the `git show` default on a merge) and `--combined` when it
+#: is not (`git show -c`). Neither is a `diff --git` header, so a MIXED diff
+#: absorbs one into the previous chunk -- and measured, git's own parser
+#: silently ignores it too, so the per-chunk entry count still comes back 1 and
+#: does not catch it. This raise is the only thing that does.
+_COMBINED_HEADER = re.compile(r"^diff --(cc|combined) ")
 
 
 class TaskError(ValueError):
@@ -82,6 +110,11 @@ class TaskTests:
     #: which is the honest default -- an explicit list would go stale against
     #: a pinned suite for no benefit.
     p2p: tuple[str, ...] = ()
+    #: Paths that belong to NEITHER half -- a changelog entry citing the issue
+    #: number is the motivating case. Explicit, because deciding "not part of
+    #: the fix" needs a source-tree oracle the harness does not have; an
+    #: unlisted file still lands in the solution half.
+    allow_extra_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -128,6 +161,14 @@ class TaskManifest:
     #: uncommitted changes. This is what makes a stored record re-derivable
     #: against the task set it ran (spec section 6.1, `Versions`).
     task_set_commit: str = ""
+    #: Files the solution half touches, derived the same way `test_files` is.
+    #: What a human scans when reviewing 80 harvested tasks -- a forgotten
+    #: changelog shows up here, which is how it gets caught, since no rule
+    #: available at load time can tell a changelog from a source file.
+    solution_files: tuple[str, ...] = ()
+    #: Files `allow_extra_paths` excluded from both halves. Recorded so the
+    #: offline grader can drop them from any diff-similarity metric.
+    extra_files: tuple[str, ...] = ()
     #: Content hash of (manifest bytes, reference diff bytes). Not provenance
     #: -- it keys the preflight cache, so an edited task re-validates and an
     #: untouched one does not pay for the check on every resume.
@@ -137,86 +178,267 @@ class TaskManifest:
 # --- the reference diff ------------------------------------------------------
 
 
-def diff_chunks(diff: str) -> list[tuple[str, str, str]]:
-    """Split a git diff into (path_a, path_b, text) per file.
+def diff_chunks(diff: str) -> list[str]:
+    """Split a git diff into one text per file, in diff order.
 
-    Splits on `diff --git` headers, which is the only boundary git guarantees.
+    Texts only -- paths come from `_chunk_path`, which asks git. Splitting and
+    naming are separate jobs and only one of them is safely done with a regex.
+
+    `split("\n")`, NOT `splitlines()`. Python also breaks on \v \f \x1c \x1d
+    \x1e \x85 \u2028 \u2029, and a form feed is ordinary in Emacs-era Python
+    and C sources. Measured: one line of git output reading
+    `+\x0cdiff --git a/evil.py b/evil.py` becomes TWO under `splitlines`, so a
+    phantom chunk appears and half a real test file's diff moves into the fix
+    half. Every in-file line counter is fooled the same way on both sides, so
+    the disagreement is invisible; only git's own parse is immune.
+
     Anything before the first header -- a commit message, a stray log line --
-    is a loud error rather than silently dropped text, because a reference
-    diff that is not exactly a diff is a reference nobody can reproduce.
+    is a loud error rather than silently dropped text, because a reference diff
+    that is not exactly a diff is a reference nobody can reproduce.
     """
     if not diff.strip():
         return []
-    lines = diff.splitlines(keepends=True)
-    chunks: list[tuple[str, str, str]] = []
+    # Separators re-added exactly. The naive `[l + "\n" for l in split("\n")]`
+    # appends a phantom byte to a diff that does not end in a newline --
+    # measured +1 on the real reference -- and `test_diff`'s bytes feed the
+    # setup commit, so one byte moves `start_sha` and breaks its pin.
+    raw = diff.split("\n")
+    lines = [piece + "\n" for piece in raw[:-1]]
+    if raw[-1]:
+        lines.append(raw[-1])
+
+    chunks: list[str] = []
     current: list[str] = []
-    header: tuple[str, str] | None = None
+    started = False
     for line in lines:
-        match = _DIFF_HEADER.match(line.rstrip("\n"))
-        if match:
-            if header is not None:
-                chunks.append((*header, "".join(current)))
+        stripped = line.rstrip("\n")
+        if _COMBINED_HEADER.match(stripped):
+            raise TaskError(
+                f"reference diff contains a combined-diff header ({stripped!r}). "
+                "That is `git show` on a merge commit; cut the reference with the "
+                "command in taskset/HARVESTING.md instead. Git's own parser "
+                "ignores these silently, so nothing else here would catch it."
+            )
+        if _ANY_DIFF_HEADER.match(stripped) and not _DIFF_HEADER.match(stripped):
+            raise TaskError(
+                f"reference diff header has no `a/` prefix ({stripped!r}); it was "
+                "cut with --no-prefix or a custom --src-prefix. `git apply` would "
+                "then strip a real path component and the test/solution split "
+                "would be silently wrong. Re-cut with `-c diff.noprefix=false`."
+            )
+        if _DIFF_HEADER.match(stripped):
+            if started:
+                chunks.append("".join(current))
             elif current and "".join(current).strip():
                 raise TaskError(
                     "reference diff has content before its first `diff --git` "
                     "header; store it verbatim from `git diff`"
                 )
-            header = (match.group("a"), match.group("b"))
+            started = True
             current = [line]
             continue
         current.append(line)
-    if header is None:
+    if not started:
         raise TaskError("reference diff contains no `diff --git` header")
-    chunks.append((*header, "".join(current)))
+    chunks.append("".join(current))
+
+    # The one residue git's per-chunk parse cannot witness: text this function
+    # dropped rather than misfiled. `raise`, never `assert` -- `python -O`
+    # strips asserts, and an AssertionError escapes both this module's
+    # single-exception contract and run_matrix's `except TaskError`.
+    if "".join(chunks) != diff:
+        raise TaskError(
+            "reference diff did not survive chunking byte for byte; the usual "
+            "cause is leading blank lines before the first header, which are "
+            "dropped rather than refused"
+        )
     return chunks
 
 
-def split_reference_diff(
-    diff: str, test_paths: tuple[str, ...]
-) -> tuple[str, str, tuple[str, ...]]:
-    """Partition the merged PR into its oracle half and its fix half.
+def _numstat(chunk: str, workdir: Path, reverse: bool) -> list[str]:
+    """Paths git reports for one chunk, from git's own header parser.
 
-    Returns (test_diff, solution_diff, test_files).
+    `-z` gives raw, unquoted, NUL-terminated paths -- no C-quoting to undo, no
+    TAB terminator to strip, no ambiguity on a name containing " b/". `-R`
+    swaps old and new during the parse, so the same command yields the SOURCE
+    of a rename or copy. `git apply --summary` also reports sources and must
+    not be used: it ignores `-z`, does not quote, brace-compresses via git's
+    own `pprint_rename`, is ambiguous on ` => `, is not 1:1 with `--numstat`,
+    and -- fatally -- ZERO summary lines is legitimate output for an
+    all-modification diff, so a failure is indistinguishable from "no renames".
 
-    A PARTITION, checked as one. Every chunk lands in exactly one half and
-    the two halves together are the whole reference -- so nothing can be
-    quietly dropped from the thing the offline grader compares against, which
-    is the failure a pair of hand-maintained patch files invites.
+    Bytes in, bytes out. Git paths are bytes and `-z` emits them raw, including
+    a literal newline inside a filename; `text=True` would raise
+    UnicodeEncodeError or UnicodeDecodeError out of `load_task`.
 
-    A rename that crosses the boundary raises. `tests/x.py -> src/x.py` is
-    simultaneously oracle and fix, and guessing which half it belongs to
-    would put the agent's oracle in its own submission or vice versa.
+    `cwd` must be outside any repository, and the caller owns that. Measured:
+    run from a repository SUBDIRECTORY this command filters the patch to the
+    cwd prefix and reports zero entries, exit 0, empty stderr -- the silent
+    zero `container._checked_exec` exists to refuse.
     """
+    argv = ["git", "apply"] + (["-R"] if reverse else []) + ["--numstat", "-z"]
+    try:
+        proc = subprocess.run(
+            argv, input=chunk.encode("utf-8", "surrogateescape"),
+            cwd=workdir, capture_output=True,
+        )
+    except (OSError, FileNotFoundError) as exc:
+        # `load_task` promises one exception type; run_matrix catches only that.
+        raise TaskError(f"could not run {' '.join(argv)}: {exc}") from exc
+    if proc.returncode != 0:
+        raise TaskError(
+            "git refused a chunk of the reference diff: "
+            f"{proc.stderr.decode('utf-8', 'replace').strip()}"
+        )
+    return [
+        field.decode("utf-8", "surrogateescape").split("\t")[-1]
+        for field in proc.stdout.split(b"\0")
+        if field.strip()
+    ]
+
+
+def _chunk_path(chunk: str, workdir: Path) -> tuple[str, str]:
+    """(source, destination) for one chunk, as git names them.
+
+    EXACTLY ONE ENTRY EACH WAY, and that is the check that binds a path to its
+    chunk. A whole-diff count agreeing is not enough -- measured, this diff has
+    2 chunks, 2 forward entries and 2 reverse entries, all agreeing, and the
+    zip is still wrong:
+
+        diff --git a/tests/t.py b/tests/t.py      <- chunk 0
+        --- a/tests/t.py            ... its own hunk ...
+        --- a/src/other.py          <- a TRADITIONAL hunk smuggled into chunk 0
+        diff --git a/src/ghost.py b/src/ghost.py  <- chunk 1, header only
+
+    Positionally chunk 0 pairs with `tests/t.py`, is classified as the oracle,
+    and the `src/other.py` change rides into the start state -- the fix
+    pre-applied, on every arm, silently. Per chunk the same diff yields entry
+    counts [2, 0] and raises.
+    """
+    forward = _numstat(chunk, workdir, reverse=False)
+    reverse = _numstat(chunk, workdir, reverse=True)
+    if len(forward) != 1 or len(reverse) != 1:
+        first = chunk.split("\n", 1)[0]
+        raise TaskError(
+            f"git reads {len(forward)} file(s) forward and {len(reverse)} in "
+            f"reverse from one chunk of the reference diff ({first!r}); expected "
+            "exactly one of each. A chunk carrying a second file's hunk, or a "
+            "header with no body, splits wrongly however the halves are counted."
+        )
+    return reverse[0], forward[0]
+
+
+def _under(path: str, prefixes: tuple[str, ...]) -> bool:
+    """Whether `path` sits under any of `prefixes`.
+
+    `PurePosixPath.is_relative_to`, never `str.startswith`. Measured, the two
+    differ on exactly one class -- a first segment that merely starts with the
+    prefix -- and the difference is a silent over-claim: under
+    `paths: ["tests"]`, `startswith` also claims `tests_helper.py`,
+    `testsuite/x.py` and `tests2/x.py`. Slash-terminated prefixes behave
+    identically under both, so no manifest has to change.
+    """
+    candidate = PurePosixPath(path)
+    return any(candidate.is_relative_to(PurePosixPath(p)) for p in prefixes)
+
+
+def _validate_prefixes(prefixes: tuple[str, ...], where: str) -> None:
+    for prefix in prefixes:
+        if not prefix or prefix != prefix.strip():
+            raise TaskError(f"{where}: {prefix!r} is empty or padded")
+        if prefix.startswith("/") or ".." in PurePosixPath(prefix).parts:
+            raise TaskError(f"{where}: {prefix!r} must be relative and free of '..'")
+
+
+def split_reference_diff(
+    diff: str, test_paths: tuple[str, ...], *, extra_paths: tuple[str, ...] = ()
+) -> tuple[str, str, tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Partition the merged PR by path.
+
+    Returns (test_diff, solution_diff, test_files, solution_files, extra_files).
+
+    THREE CLASSES, not two. `extra_paths` names files that belong to neither
+    half -- a changelog entry citing the issue number is the motivating case:
+    no agent writes one, and leaving it in `solution_diff` means preflight
+    applies documentation it does not need and any later diff-similarity metric
+    measures changelog authorship. Solution stays the `else`: deciding "not
+    part of the fix" needs a source-tree oracle the harness does not have, so
+    an UNLISTED extra file still lands in the fix half exactly as before.
+
+    THERE IS NO PARTITION SELF-CHECK, deliberately. Four were written and all
+    four were circular -- a length check, an `assignment[i] is None` over an
+    exhaustive branch, and two recomposition checks -- because any property
+    computed from the assignment restates the assignment. The external witness
+    is `_chunk_path`: git parses each chunk independently and must find exactly
+    one file in it.
+
+    A rename that crosses ANY class boundary raises. `tests/x.py -> src/x.py`
+    is simultaneously oracle and fix, and guessing a half would either hand the
+    agent its own submission or delete the test it is measured by. Checked over
+    the full class of both endpoints, not `a_is_test != b_is_test`, so a
+    listed-extra file renamed into the fix half is caught too.
+    """
+    _validate_prefixes(test_paths, "tests.paths")
+    _validate_prefixes(extra_paths, "allow_extra_paths")
+    # Containment BOTH ways, not set intersection: `tests/` and
+    # `tests/fixtures/CHANGES.rst` share no element, and with test evaluated
+    # first the extra entry is a silent no-op -- a manifest key that looks like
+    # it excludes a file and does nothing.
+    for extra in extra_paths:
+        for test in test_paths:
+            if _under(extra, (test,)) or _under(test, (extra,)):
+                raise TaskError(
+                    f"allow_extra_paths {extra!r} overlaps tests.paths {test!r}; "
+                    "tests.paths is applied first, so the entry would silently "
+                    "do nothing"
+                )
+
+    chunks = diff_chunks(diff)
     test_parts: list[str] = []
     solution_parts: list[str] = []
     test_files: list[str] = []
-    chunks = diff_chunks(diff)
+    solution_files: list[str] = []
+    extra_files: list[str] = []
 
-    for path_a, path_b, text in chunks:
-        a_is_test = any(path_a.startswith(prefix) for prefix in test_paths)
-        b_is_test = any(path_b.startswith(prefix) for prefix in test_paths)
-        if a_is_test != b_is_test:
-            raise TaskError(
-                f"reference diff renames {path_a!r} to {path_b!r} across the "
-                "test/solution boundary; the harness cannot tell whether that "
-                "file is the agent's oracle or part of the fix"
-            )
-        if b_is_test:
-            test_parts.append(text)
-            test_files.extend({path_a, path_b})
-        else:
-            solution_parts.append(text)
+    def classify(path: str) -> str:
+        if _under(path, test_paths):
+            return "test"
+        if _under(path, extra_paths):
+            return "extra"
+        return "solution"
 
-    if len(test_parts) + len(solution_parts) != len(chunks):
-        raise TaskError("reference diff split lost a file")
-    if "".join(test_parts) + "".join(solution_parts) != "".join(
-        text for _, _, text in chunks
-    ) and sorted(test_parts + solution_parts) != sorted(
-        text for _, _, text in chunks
-    ):
-        raise TaskError("reference diff split did not preserve its content")
+    # One temp directory for the whole diff, and it must be outside any git
+    # repository -- see `_numstat`. TemporaryDirectory honours TMPDIR, so a
+    # TMPDIR inside a worktree re-arms the silent zero; the per-chunk entry
+    # check is what converts that into a raise.
+    with tempfile.TemporaryDirectory(prefix="bakeoff-diff-") as tmp:
+        workdir = Path(tmp)
+        for text in chunks:
+            source, destination = _chunk_path(text, workdir)
+            kind_a, kind_b = classify(source), classify(destination)
+            if kind_a != kind_b:
+                raise TaskError(
+                    f"reference diff renames {source!r} ({kind_a}) to "
+                    f"{destination!r} ({kind_b}), across the test/solution "
+                    "boundary; the harness cannot tell whether that file is the "
+                    "agent's oracle or part of the fix"
+                )
+            if kind_b == "test":
+                test_parts.append(text)
+                test_files.extend({source, destination})
+            elif kind_b == "extra":
+                extra_files.extend({source, destination})
+            else:
+                solution_parts.append(text)
+                solution_files.extend({source, destination})
 
-    return "".join(test_parts), "".join(solution_parts), tuple(sorted(set(test_files)))
+    return (
+        "".join(test_parts),
+        "".join(solution_parts),
+        tuple(sorted(set(test_files))),
+        tuple(sorted(set(solution_files))),
+        tuple(sorted(set(extra_files))),
+    )
 
 
 # --- loading -----------------------------------------------------------------
@@ -356,7 +578,12 @@ def load_task(task_dir: Path, set_commit: str = "") -> TaskManifest:
         raise TaskError(f"{reference_path}: no reference diff")
     raw_reference = reference_path.read_bytes()
     reference = raw_reference.decode("utf-8")
-    test_diff, solution_diff, test_files = split_reference_diff(reference, test_paths)
+    extra_paths = _strs(
+        tests_raw.get("allow_extra_paths"), f"{where}:tests.allow_extra_paths"
+    )
+    test_diff, solution_diff, test_files, solution_files, extra_files = (
+        split_reference_diff(reference, test_paths, extra_paths=extra_paths)
+    )
     if not test_diff.strip():
         raise TaskError(
             f"{reference_path}: nothing under {list(test_paths)} -- the start "
@@ -364,9 +591,12 @@ def load_task(task_dir: Path, set_commit: str = "") -> TaskManifest:
             "run and no arm's result would be attributable"
         )
     if not solution_diff.strip():
+        # Reachable two ways since allow_extra_paths exists, so the message
+        # names both keys rather than sending the author to the wrong one.
         raise TaskError(
-            f"{reference_path}: everything is under {list(test_paths)} -- there "
-            "is no reference fix to validate the task against"
+            f"{reference_path}: nothing is left for the fix -- every file is "
+            f"under tests.paths {list(test_paths)} or "
+            f"allow_extra_paths {list(extra_paths)}"
         )
 
     return TaskManifest(
@@ -377,7 +607,10 @@ def load_task(task_dir: Path, set_commit: str = "") -> TaskManifest:
         repo_url=repo_url,
         base_sha=base_sha,
         prompt=prompt,
-        tests=TaskTests(paths=test_paths, runner=runner, f2p=f2p, p2p=p2p),
+        tests=TaskTests(
+            paths=test_paths, runner=runner, f2p=f2p, p2p=p2p,
+            allow_extra_paths=extra_paths,
+        ),
         image=TaskImage(
             apt=_strs(image_raw.get("apt"), f"{where}:image.apt"),
             pip=_strs(image_raw.get("pip"), f"{where}:image.pip"),
@@ -393,6 +626,8 @@ def load_task(task_dir: Path, set_commit: str = "") -> TaskManifest:
         test_diff=test_diff,
         solution_diff=solution_diff,
         test_files=test_files,
+        solution_files=solution_files,
+        extra_files=extra_files,
         root=task_dir,
         declared_start_sha=str(declared_start),
         gitignore_extra=_strs(data.get("gitignore_extra"), f"{where}:gitignore_extra"),
