@@ -359,3 +359,32 @@ def test_gemma_has_no_bedrock_runtime_entry():
     for entry in _model_list():
         if entry["model_name"].startswith("gemma-4-31b"):
             assert not entry["litellm_params"]["model"].startswith("bedrock/")
+
+
+def test_litellm_is_the_version_the_patches_were_verified_against():
+    """`litellm_patches` monkeypatches litellm internals, and its own guards
+    cannot detect drift: two of them use `hasattr` against names a base class
+    declares, so they stay true after the override they check is gone. Every
+    behavioural claim in that module is annotated against one version. The pin
+    in pyproject.toml is what makes drift impossible rather than undetected;
+    this asserts the installed tree actually honours it.
+
+    If this fails, do not just bump the number: re-run the patch probes and
+    re-read the annotations first.
+    """
+    from importlib.metadata import version
+
+    assert version("litellm") == "1.95.0"
+
+
+def test_pyyaml_is_a_runtime_dependency_not_a_dev_one():
+    """`tasks.py` imports yaml on the input path -- every real task goes
+    through it. Declared under `dev`, a non-dev install fails at task load
+    rather than at import, which is after the environment looks healthy."""
+    import tomllib
+    from pathlib import Path
+
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    deps = tomllib.loads(pyproject.read_text())["project"]["dependencies"]
+
+    assert any(d.startswith("pyyaml") for d in deps)
