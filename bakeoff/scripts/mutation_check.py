@@ -1087,6 +1087,47 @@ MUTATIONS = [
         "not integration",
     ),
     (
+        # The run tree used to contain the answer. `git clone --local` hardlinks
+        # the whole object store, so measured on pallets/click the agent's tree
+        # carried `refs/heads/main` 181 commits ahead of the start state and
+        # `git log main --grep=3360` named the merged fix. Deleting the refs is
+        # only half; note the selector -- the fixture's one branch is retargeted
+        # to base_sha, so without a FUTURE TAG the delete list is empty and gc
+        # alone prunes the future.
+        "tasks: keep refs pointing past the start state in the pruned mirror",
+        "src/bakeoff/tasks.py",
+        "        if deletions:",
+        "        if False:",
+        "tests/test_tasks.py -k tag_on_the_future",
+        "not integration",
+    ),
+    (
+        # A commit-graph is HARDLINKED by `clone --mirror --local` and holds
+        # future commit ids verbatim; under `gc.writeCommitGraph=false` gc exits
+        # 0 and leaves it. Measured: the object sweep below still reports zero
+        # outside commits and PASSES, while `git fsck` in the run tree prints
+        # `Could not read <the fix's sha>` at the agent. A stale `.keep` is the
+        # same shape -- it makes gc refuse the pack entirely.
+        "tasks: inherit the mirror's commit-graph and .keep into the run tree",
+        "src/bakeoff/tasks.py",
+        '    "objects/info/commit-graph",\n    "objects/info/commit-graphs",',
+        "",
+        "tests/test_tasks.py -k inherited_commit_graph",
+        "not integration",
+    ),
+    (
+        # Success was inferred from three exit codes until this check existed.
+        # Every bypass found -- gc.bigPackThreshold, a cruft pack, a .keep, an
+        # operator reflog -- leaves the refs gone and the objects readable,
+        # which is indistinguishable from a correct prune at every other layer.
+        "tasks: trust the prune instead of verifying the future is gone",
+        "src/bakeoff/tasks.py",
+        "    if outside:",
+        "    if False:",
+        "tests/test_tasks.py -k prune_that_left_the_future_behind",
+        "not integration",
+    ),
+    (
         # Schema 3.8.0. Every one of the next six used to destroy the record
         # outright or, worse, publish something false in its place.
         "finalize: let a failing finalize step take the record with it",

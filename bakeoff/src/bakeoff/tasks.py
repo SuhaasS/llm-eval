@@ -34,7 +34,9 @@ Three things are load-bearing and are argued where they happen:
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -677,12 +679,12 @@ def load_task_set(root: Path, only: list[str] | None = None) -> list[TaskManifes
 
 
 def _git(*args: str, cwd: Path | None = None, env: dict[str, str] | None = None,
-         check: bool = True) -> subprocess.CompletedProcess:
-    import os
-
+         check: bool = True,
+         input: str | None = None) -> subprocess.CompletedProcess:
     full_env = {**os.environ, **(env or {})}
     result = subprocess.run(
-        ["git", *args], cwd=cwd, capture_output=True, text=True, env=full_env
+        ["git", *args], cwd=cwd, capture_output=True, text=True, env=full_env,
+        input=input,
     )
     if check and result.returncode != 0:
         raise TaskError(
@@ -736,6 +738,267 @@ def ensure_mirror(repo_url: str, base_sha: str, cache_root: Path) -> Path:
     return mirror
 
 
+# Bumping this invalidates every cached pruned mirror. Bump it whenever the
+# prune changes what it removes, or an older revision's output is served
+# forever -- which is the silent-wrong-cache failure `ensure_mirror` re-checks
+# on every call to avoid.
+_PRUNE_VERSION = "1"
+_PRUNE_MARKER = "bakeoff-prune-version"
+
+# What `git clone --mirror --local` HARDLINKS from the source and `gc` does not
+# reliably rewrite. Measured: the commit-graph carries future commit OIDs
+# verbatim, and under `gc.writeCommitGraph=false` gc exits 0 and leaves the
+# inherited copy -- the object sweep below still passes, and `git fsck` in the
+# run tree then prints the reference fix's SHA at the agent.
+#
+# A tuple because emptying it is the mutation anchor for that guarantee: there
+# is no `if` here to neutralise.
+_DERIVED_PATHS = (
+    "objects/info/commit-graph",
+    "objects/info/commit-graphs",
+    "objects/pack/multi-pack-index",
+)
+
+# The operator's ~/.gitconfig decides whether a prune prunes, so none of this
+# is left to it. Each was measured to defeat the prune while leaving every
+# assertion short of the object sweep passing:
+#   gc.bigPackThreshold below the pack size keeps the pack wholesale;
+#   a stale objects/pack/*.keep makes gc refuse the pack entirely;
+#   the reflog written by the update-ref calls below is a reachability root,
+#     and gc's default expiry keeps entries for 90d/30d.
+# `gc.writeMultiPackIndex` is deliberately absent -- it is not a real config
+# name (checked against `git help -c`, git 2.50.1); the MIDX is handled by
+# _DERIVED_PATHS instead.
+_GC_CONFIG = (
+    "-c", "gc.bigPackThreshold=0",
+    "-c", "gc.cruftPacks=false",
+    "-c", "gc.pruneExpire=now",
+    "-c", "gc.reflogExpire=now",
+    "-c", "gc.reflogExpireUnreachable=now",
+    "-c", "gc.writeCommitGraph=false",
+    "-c", "repack.packKeptObjects=true",
+)
+
+
+def pruned_mirror_path(repo_url: str, base_sha: str, cache_root: Path) -> Path:
+    """Keyed on base_sha as well as the URL.
+
+    Two tasks on one repository at different base_shas need different pruned
+    mirrors -- each is pruned to its own history.
+    """
+    return mirror_path(repo_url, cache_root).with_name(
+        f"{mirror_path(repo_url, cache_root).name[:-4]}-{base_sha}.git"
+    )
+
+
+def _strip_derived(repo: Path) -> None:
+    for rel in _DERIVED_PATHS:
+        target = repo / rel
+        if target.is_dir():
+            shutil.rmtree(target, ignore_errors=True)
+        else:
+            target.unlink(missing_ok=True)
+    for keep in (repo / "objects" / "pack").glob("*.keep"):
+        keep.unlink(missing_ok=True)
+
+
+def _pack_fingerprint(repo: Path) -> str:
+    """A digest of the object store that a run tree cannot invalidate.
+
+    `*.idx` names and sizes, never `*.pack` and never mtimes. `git clone
+    --local` hardlinks the pack into every run tree, and git FRESHENS (utimes)
+    a pack when objects are written -- so `container.py`'s checkpoint
+    `git add -A` moves the mtime of the shared pack in every real cell.
+    Measured: after one run tree staged a file, only `pack-*.pack` changed;
+    `.idx`, `.rev` and `.bitmap` did not. A pack-and-mtime fingerprint would
+    therefore mismatch forever after the first cell and never re-converge,
+    turning the cheap path into the expensive one it exists to bound.
+
+    An `.idx` name is content-addressed and its size changes when the store is
+    repacked, which is the only change that matters here. It cannot see loose
+    objects added to a cached mirror; nothing writes there, because `origin` is
+    removed at build time.
+    """
+    packs = sorted(
+        (p.name, p.stat().st_size) for p in (repo / "objects" / "pack").glob("*.idx")
+    )
+    return hashlib.sha256(repr(packs).encode("utf-8")).hexdigest()[:16]
+
+
+def _commits_outside(repo: Path, ancestors: set[str]) -> list[str]:
+    """Commit objects present in `repo` that `ancestors` does not contain.
+
+    THE post-condition, and it is stated over objects rather than refs because
+    the leak is an object-level one: `clone --local` hardlinks the whole store,
+    so the merged fix is readable through `cat-file -p`, `--batch-all-objects`
+    and `fsck --lost-found` with no ref pointing at it. A ref-level check is
+    satisfied by a prune that leaves the oracle sitting there.
+
+    `--batch-all-objects` lists cruft-pack objects too, which is what makes
+    this catch the `gc.cruftPacks` and `gc.bigPackThreshold` bypasses rather
+    than merely surviving them. `--unordered` because the sort is pure cost.
+    """
+    listing = _git(
+        "cat-file", "--batch-all-objects", "--unordered",
+        "--batch-check=%(objecttype) %(objectname)", cwd=repo,
+    ).stdout
+    return [
+        name
+        for kind, _, name in (line.partition(" ") for line in listing.splitlines())
+        if kind == "commit" and name not in ancestors
+    ]
+
+
+def _ancestors(repo: Path, base_sha: str) -> set[str]:
+    return set(_git("rev-list", base_sha, cwd=repo).stdout.split())
+
+
+def _verify_pruned(repo: Path, base_sha: str) -> None:
+    """Refuse a pruned mirror that cannot be shown to be pruned.
+
+    Not inferred from three exit codes. `ensure_mirror` re-checks `base_sha`
+    with `cat-file -e` on every call for the same reason: in this module the
+    expensive failures are the quiet ones, and a prune that silently did
+    nothing produces a start state indistinguishable from a correct one.
+    """
+    if _git("cat-file", "-e", f"{base_sha}^{{commit}}", cwd=repo,
+            check=False).returncode != 0:
+        raise TaskError(
+            f"{repo}: pruned mirror does not contain base_sha {base_sha}. "
+            "Without this the object check below passes vacuously on an empty "
+            "or truncated mirror."
+        )
+    leftover = [rel for rel in _DERIVED_PATHS if (repo / rel).exists()]
+    leftover += [p.name for p in (repo / "objects" / "pack").glob("*.keep")]
+    if leftover:
+        raise TaskError(
+            f"{repo}: inherited {', '.join(leftover)} survived the prune. A "
+            "commit-graph carries future commit ids verbatim and a .keep makes "
+            "gc refuse the pack, so the run tree would still hand the agent the "
+            "reference fix."
+        )
+    outside = _commits_outside(repo, _ancestors(repo, base_sha))
+    if outside:
+        raise TaskError(
+            f"{repo}: {len(outside)} commit(s) outside {base_sha}'s history "
+            f"survived the prune, e.g. {', '.join(sorted(outside)[:3])}. The "
+            "run tree would contain the merged fix the task was cut from."
+        )
+
+
+def ensure_pruned_mirror(repo_url: str, base_sha: str, cache_root: Path) -> Path:
+    """A bare mirror holding `base_sha`'s history and NOTHING after it.
+
+    Run trees clone from this rather than from the full mirror, because
+    `git clone --local` hardlinks the entire object store: measured on
+    `pallets/click`, the run tree carried all 30,766 objects of the mirror,
+    including the merge commit of the very PR the task was cut from, reachable
+    as `refs/heads/main` 181 commits ahead of the start state. `git log --all`
+    or `git show main` hands the model the answer it is being scored on, and it
+    does so unevenly across arms -- a section 6.4 confound recorded as
+    capability. `git remote remove origin` did not cover it: that deletes
+    `refs/remotes/origin/*`, not the local branch a clone creates, and not tags.
+
+    ONCE PER (repo, base_sha), cached across invocations, because the prune
+    ends in a `gc` that repacks the whole store. Doing it per run tree would
+    cost that on every one of ~3,200 cells and break the hardlink sharing
+    `materialize` depends on.
+
+    `ensure_mirror` FIRST: an unresolvable `base_sha` has to fail there, with
+    the message that names it, rather than deeper in here.
+    """
+    source = ensure_mirror(repo_url, base_sha, cache_root)
+    dest = pruned_mirror_path(repo_url, base_sha, cache_root)
+
+    marker = dest / _PRUNE_MARKER
+    if marker.exists():
+        try:
+            version, marked_sha, fingerprint = marker.read_text().split()
+        except ValueError:
+            version = marked_sha = fingerprint = ""
+        if version == _PRUNE_VERSION and marked_sha == base_sha:
+            # The fingerprint is the cheap path; a mismatch re-runs the full
+            # sweep rather than rebuilding, because a repack is not a leak.
+            if fingerprint == _pack_fingerprint(dest):
+                if _git("cat-file", "-e", f"{base_sha}^{{commit}}", cwd=dest,
+                        check=False).returncode == 0:
+                    return dest
+            else:
+                _verify_pruned(dest, base_sha)
+                marker.write_text(
+                    f"{_PRUNE_VERSION} {base_sha} {_pack_fingerprint(dest)}\n"
+                )
+                return dest
+
+    # Rebuild. Sweep first: a tmp left behind by a killed process would make
+    # `git clone --mirror --local` exit 128 ("destination path already exists
+    # and is not an empty directory") for this task forever.
+    for stale in dest.parent.glob("prune-*.tmp"):
+        shutil.rmtree(stale, ignore_errors=True)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(dir=dest.parent, prefix="prune-", suffix=".tmp"))
+    try:
+        # mkdtemp created it; clone refuses a non-empty target and tolerates an
+        # empty one only if it does not exist.
+        shutil.rmtree(tmp)
+        _git("clone", "--mirror", "--local", str(source), str(tmp))
+        # `--mirror` leaves remote.origin.fetch=+refs/*:refs/* and
+        # remote.origin.mirror=true behind. One `git fetch` in this directory
+        # would restore the entire future and nothing downstream would notice.
+        _git("remote", "remove", "origin", cwd=tmp, check=False)
+        _strip_derived(tmp)
+
+        # The default branch, but only where pointing it at `base_sha` is TRUE.
+        # `base_sha` is often not on it (a release branch, a merge parent), and
+        # a `main` retargeted anyway would show the agent history that never
+        # was. A harness-invented branch name is a tell. Detached is honest.
+        #
+        # check=False on both: `symbolic-ref` exits 128 on a detached bare
+        # repo, and it returns 0 with a branch name even when that ref does not
+        # exist, in which case `merge-base` exits 128 rather than 1.
+        head_ref = _git("symbolic-ref", "HEAD", cwd=tmp, check=False)
+        branch = head_ref.stdout.strip() if head_ref.returncode == 0 else ""
+        on_branch = branch and _git(
+            "merge-base", "--is-ancestor", base_sha, branch, cwd=tmp, check=False
+        ).returncode == 0
+        if on_branch:
+            _git("update-ref", branch, base_sha, cwd=tmp)
+            _git("symbolic-ref", "HEAD", branch, cwd=tmp)
+        else:
+            _git("update-ref", "--no-deref", "HEAD", base_sha, cwd=tmp)
+
+        ancestors = _ancestors(tmp, base_sha)
+        refs = _git(
+            "for-each-ref",
+            "--format=%(refname) %(objectname) %(*objectname)", cwd=tmp,
+        ).stdout
+        # `%(*objectname)` is the peeled target and is empty for a lightweight
+        # tag, so the last field is the commit for both tag kinds. Ref names
+        # cannot contain spaces (git check-ref-format rule 4).
+        deletions = [
+            f"delete {line.split()[0]}\n"
+            for line in refs.splitlines()
+            if line.split()[-1] not in ancestors
+        ]
+        if deletions:
+            _git("update-ref", "--stdin", cwd=tmp, input="".join(deletions))
+        _git("reflog", "expire", "--expire=now", "--all", cwd=tmp, check=False)
+        _git(*_GC_CONFIG, "gc", "--prune=now", "--quiet", cwd=tmp)
+
+        _verify_pruned(tmp, base_sha)
+        (tmp / _PRUNE_MARKER).write_text(
+            f"{_PRUNE_VERSION} {base_sha} {_pack_fingerprint(tmp)}\n"
+        )
+        # rmtree first: os.replace onto a non-empty directory raises
+        # ENOTEMPTY, and the marker-mismatch path arrives here with the old
+        # mirror still in place -- which is the very case the marker exists for.
+        shutil.rmtree(dest, ignore_errors=True)
+        os.replace(tmp, dest)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return dest
+
+
 def materialize(task: TaskManifest, dest: Path, cache_root: Path) -> str:
     """Build the run's start state on disk and return its commit SHA.
 
@@ -744,20 +1007,27 @@ def materialize(task: TaskManifest, dest: Path, cache_root: Path) -> str:
     diff its own agent never made.
 
     The clone is `--local`, which hardlinks objects rather than copying them,
-    so 2,400 materializations of a real repository cost neither time nor disk.
+    so 2,400 materializations of a real repository cost neither time nor disk
+    -- and it is cloned from the PRUNED mirror, which is what keeps that true
+    while still removing the future. Pruning here instead would repack the
+    whole store per run and break the hardlink.
+
     `origin` is then removed -- it points at a host path that does not exist
     inside the container, which is both a confusing error surface for the
-    agent and a host path leaked into the run.
+    agent and a host path leaked into the run. The reflog is expired for the
+    same reason: the clone records `clone: from <host cache path>` in
+    `.git/logs/HEAD`, which now carries the cache layout and `base_sha`.
     """
     dest = Path(dest)
     if dest.exists():
         raise TaskError(f"{dest}: already exists; every run needs its own tree")
-    mirror = ensure_mirror(task.repo_url, task.base_sha, cache_root)
+    mirror = ensure_pruned_mirror(task.repo_url, task.base_sha, cache_root)
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     _git("clone", "--local", "--no-checkout", str(mirror), str(dest))
     _git("checkout", "--detach", task.base_sha, cwd=dest)
     _git("remote", "remove", "origin", cwd=dest, check=False)
+    _git("reflog", "expire", "--expire=now", "--all", cwd=dest, check=False)
 
     staged = False
     if task.test_diff.strip():

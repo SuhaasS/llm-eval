@@ -126,6 +126,17 @@ rather than by reasoning:
   timeout, and the agent re-runs it inside `wall_clock_timeout_s`. ~40 s is the
   practical ceiling; `click`'s 1.4 s is what comfortable looks like.
 
+One consequence of the run tree being pruned to `base_sha`'s history, since it
+shows up in exactly the repos the second bullet is about: **tags that are
+ancestors of `base_sha` are kept**, so `git describe` still resolves and a
+`setuptools_scm`/`hatch-vcs` repo can still derive a version. But the
+abbreviated SHA shortens — `8.3.3-69-g63274a79` becomes `8.3.3-69-g63274a7`,
+measured — because `core.abbrev` auto-sizes to the smaller object count. A
+package installed at image-build time and one the agent rebuilds in the run tree
+therefore disagree on version string. Nothing asserts this: preflight already
+runs the suite inside the image, so a mismatch that breaks anything surfaces
+there.
+
 ---
 
 ## Layer 3 — properties of the set, not of any task

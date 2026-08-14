@@ -364,13 +364,219 @@ def test_materialize_refuses_to_reuse_a_tree(tmp_path, upstream):
 def test_the_host_path_does_not_travel_into_the_run(tmp_path, upstream):
     """`origin` points at a mirror under the harness's cache, which does not
     exist inside the container: a confusing error surface for the agent, and
-    a host path leaked into a run that is supposed to be hermetic."""
+    a host path leaked into a run that is supposed to be hermetic.
+
+    The reflog is the second copy of that path and was missed: `git clone`
+    records `clone: from <host cache path>` in `.git/logs/HEAD`, and the
+    pruned mirror's name carries the cache layout AND `base_sha`."""
+    task = load_task(_write_task(tmp_path / "set", upstream))
+    repo = tmp_path / "run" / "repo"
+    cache = tmp_path / "cache"
+
+    materialize(task, repo, cache)
+
+    assert _sh("git", "remote", cwd=repo) == ""
+    logs = repo / ".git" / "logs"
+    leaked = [
+        path
+        for path in logs.rglob("*")
+        if path.is_file() and str(cache) in path.read_text()
+    ]
+    assert leaked == []
+
+
+# --- the run tree does not contain the answer --------------------------------
+#
+# `git clone --local` hardlinks the whole object store, so before the pruned
+# mirror the run tree carried every object the upstream mirror had -- including
+# the merge commit of the PR the task was cut from. Measured on pallets/click:
+# `refs/heads/main` 181 commits ahead of the start state, and `git log main
+# --grep=3360` naming the fix. The tests below are stated over OBJECTS, because
+# a ref-level guarantee is satisfied by a prune that leaves the oracle readable
+# through `cat-file -p` or `fsck --lost-found`.
+
+
+def test_the_reference_fix_is_not_in_the_run_tree(tmp_path, upstream):
+    """The one assertion that carries the whole guarantee.
+
+    `git log --all` equalling `git log` is nearly vacuous here -- `--all` means
+    refs plus HEAD, and the fixture has one ref -- so it is checked for shape
+    only. Object absence is the claim."""
     task = load_task(_write_task(tmp_path / "set", upstream))
     repo = tmp_path / "run" / "repo"
 
     materialize(task, repo, tmp_path / "cache")
 
-    assert _sh("git", "remote", cwd=repo) == ""
+    assert subprocess.run(
+        ["git", "cat-file", "-e", f"{upstream['head']}^{{commit}}"],
+        cwd=repo, capture_output=True,
+    ).returncode != 0, "the merged fix is readable in the agent's own tree"
+    # Sets, not the raw output: `--all` walks the refs in a different order.
+    assert set(_sh("git", "rev-list", "--all", cwd=repo).split()) == set(
+        _sh("git", "rev-list", "HEAD", cwd=repo).split()
+    )
+
+
+def test_a_tag_on_the_future_is_not_in_the_run_tree(tmp_path, upstream):
+    """Tags are copied straight into `refs/tags/*` by a clone, so
+    `git remote remove origin` never touched them. This is also the only test
+    that exercises ref DELETION: the fixture's single branch is retargeted to
+    `base_sha`, so without a future tag the delete list is empty and gc alone
+    would prune the future."""
+    _sh("git", "tag", "v9.9", upstream["head"], cwd=upstream["path"])
+    task = load_task(_write_task(tmp_path / "set", upstream))
+    repo = tmp_path / "run" / "repo"
+
+    materialize(task, repo, tmp_path / "cache")
+
+    assert "v9.9" not in _sh("git", "tag", cwd=repo).split()
+
+
+def test_history_before_the_start_state_survives(tmp_path, upstream):
+    """The prune must not be satisfied by destroying history. Section 3.3's
+    loop includes reading the repository, and a run tree with no past is as
+    unlike the harvested workflow as one with the answer in it."""
+    task = load_task(_write_task(tmp_path / "set", upstream))
+    repo = tmp_path / "run" / "repo"
+
+    materialize(task, repo, tmp_path / "cache")
+
+    assert subprocess.run(
+        ["git", "cat-file", "-e", f"{upstream['base']}^{{commit}}"],
+        cwd=repo, capture_output=True,
+    ).returncode == 0
+    assert upstream["base"][:7] in _sh("git", "log", "--oneline", cwd=repo)
+
+
+def test_an_annotated_tag_on_the_history_survives(tmp_path, upstream):
+    """`git describe` is why ancestor tags are kept rather than all refs
+    dropped: `setuptools_scm` and `hatch-vcs` derive a package version from it,
+    and a repo the agent reinstalls would fail on a tagless tree.
+
+    Annotated on purpose -- `git describe` shows only annotated tags by
+    default, so a lightweight one fails this whether or not the prune exists."""
+    _sh("git", "tag", "-a", "v1.0", "-m", "v1.0", upstream["base"],
+        cwd=upstream["path"])
+    task = load_task(_write_task(tmp_path / "set", upstream))
+    repo = tmp_path / "run" / "repo"
+
+    materialize(task, repo, tmp_path / "cache")
+
+    assert "v1.0" in _sh("git", "tag", cwd=repo).split()
+    assert _sh("git", "describe", cwd=repo).startswith("v1.0")
+
+
+def test_an_inherited_commit_graph_does_not_reach_the_run_tree(tmp_path, upstream):
+    """A commit-graph is HARDLINKED by `clone --mirror --local` and carries
+    future commit ids verbatim. Under `gc.writeCommitGraph=false` gc exits 0
+    and leaves the inherited copy -- measured: the object post-condition still
+    reports zero outside commits and PASSES, while `git fsck` in the run tree
+    exits non-zero printing `Could not read <the fix's sha>`. The same shape
+    holds for a stale `.keep`, which makes gc refuse the pack entirely.
+
+    So this is the only coverage for the strip step, and the object sweep is
+    provably blind to it."""
+    from bakeoff.tasks import ensure_mirror
+
+    cache = tmp_path / "cache"
+    mirror = ensure_mirror(str(upstream["path"]), upstream["base"], cache)
+    _sh("git", "commit-graph", "write", "--reachable", cwd=mirror)
+    (mirror / "objects" / "pack" / "stale.keep").write_text("")
+    assert (mirror / "objects" / "info" / "commit-graph").exists()
+
+    task = load_task(_write_task(tmp_path / "set", upstream))
+    repo = tmp_path / "run" / "repo"
+    materialize(task, repo, cache)
+
+    assert not (repo / ".git" / "objects" / "info" / "commit-graph").exists()
+    assert subprocess.run(
+        ["git", "fsck", "--no-progress"], cwd=repo, capture_output=True
+    ).returncode == 0
+
+
+def test_a_prune_that_left_the_future_behind_is_refused(tmp_path, upstream, monkeypatch):
+    """The post-condition is what makes the prune trustworthy, so it is checked
+    rather than assumed. Every bypass found -- `gc.bigPackThreshold`, a cruft
+    pack, a `.keep`, an operator reflog -- leaves the refs gone and the objects
+    readable, which is indistinguishable from success at every other layer."""
+    import bakeoff.tasks as tasks_module
+
+    real_git = tasks_module._git
+
+    def skip_gc(*args, **kwargs):
+        # The invocation begins with `-c`, so match anywhere in argv.
+        if "gc" in args:
+            return subprocess.CompletedProcess(list(args), 0, "", "")
+        return real_git(*args, **kwargs)
+
+    monkeypatch.setattr(tasks_module, "_git", skip_gc)
+    task = load_task(_write_task(tmp_path / "set", upstream))
+
+    with pytest.raises(TaskError, match="survived the prune"):
+        materialize(task, tmp_path / "run" / "repo", tmp_path / "cache")
+
+
+def test_a_cached_prune_from_an_older_revision_is_rebuilt(tmp_path, upstream):
+    """A pruned mirror built by an earlier revision of the prune must not be
+    served forever -- that is the silent-wrong-cache failure `ensure_mirror`
+    re-checks on every call to avoid. The rebuild has to survive the old mirror
+    still being there: `os.replace` onto a non-empty directory raises."""
+    from bakeoff.tasks import pruned_mirror_path
+
+    cache = tmp_path / "cache"
+    task = load_task(_write_task(tmp_path / "set", upstream))
+    first = materialize(task, tmp_path / "a" / "repo", cache)
+
+    pruned = pruned_mirror_path(str(upstream["path"]), upstream["base"], cache)
+    (pruned / "bakeoff-prune-version").write_text("0 stale stale\n")
+
+    assert materialize(task, tmp_path / "b" / "repo", cache) == first
+
+
+def test_a_stale_temporary_prune_does_not_wedge_the_task(tmp_path, upstream):
+    """`git clone --mirror --local` exits 128 into a non-empty directory, so a
+    tmp left behind by a killed process would make this task unmaterializable
+    forever."""
+    from bakeoff.tasks import pruned_mirror_path
+
+    cache = tmp_path / "cache"
+    task = load_task(_write_task(tmp_path / "set", upstream))
+    pruned = pruned_mirror_path(str(upstream["path"]), upstream["base"], cache)
+    stale = pruned.parent / "prune-leftover.tmp"
+    stale.mkdir(parents=True)
+    (stale / "junk").write_text("x")
+
+    materialize(task, tmp_path / "run" / "repo", cache)
+
+    assert not stale.exists()
+
+
+def test_a_base_sha_off_the_default_branch_materializes(tmp_path, upstream):
+    """`base_sha` is often not on the default branch -- a release branch, a
+    merge parent. Retargeting `main` at it anyway would show the agent history
+    that never was, so the prune leaves HEAD detached instead. That limb is the
+    newer one and depends on `clone --local` propagating a detached HEAD, so it
+    is pinned here rather than left to the branch path every other test takes."""
+    repo_path = upstream["path"]
+    _sh("git", "checkout", "-q", "-b", "sidebranch", upstream["base"], cwd=repo_path)
+    (repo_path / "side.txt").write_text("side\n")
+    _sh("git", "add", "-A", cwd=repo_path)
+    _sh("git", "commit", "-q", "-m", "side", cwd=repo_path)
+    side = _sh("git", "rev-parse", "HEAD", cwd=repo_path)
+    _sh("git", "checkout", "-q", "master" if _sh(
+        "git", "branch", "--list", "master", cwd=repo_path
+    ) else "main", cwd=repo_path)
+
+    task = load_task(_write_task(tmp_path / "set", upstream, base_sha=side))
+    repo = tmp_path / "run" / "repo"
+
+    start = materialize(task, repo, tmp_path / "cache")
+
+    assert _sh("git", "rev-parse", "HEAD", cwd=repo) == start
+    assert subprocess.run(
+        ["git", "cat-file", "-e", f"{upstream['head']}^{{commit}}"],
+        cwd=repo, capture_output=True,
+    ).returncode != 0
 
 
 def test_a_test_declared_as_both_f2p_and_p2p_is_refused(tmp_path, upstream):

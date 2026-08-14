@@ -102,6 +102,26 @@ environment-comparable, and the defect could hand an agent its own pre-fix
 code. Re-measure rather than mix; `--allow-mixed-images` exists and should not
 be used across that boundary.
 
+### Read every record written before 2026-08-14 with the run-tree caveat
+
+**The reference fix was reachable in the agent's own repository.** `materialize`
+cloned run trees from the full upstream mirror, so `refs/heads/main` sat 181
+commits ahead of the start state on `pallets/click` and
+`git log main --grep=3360` named the merged PR. `HEAD` was detached at
+`start_sha`, so `git log` and `git diff` looked clean; `git log --all`,
+`git branch` and `git show main` did not. Closed by `ensure_pruned_mirror`.
+
+This is **not** evidence that any stored run used it — no record captures the
+agent's git invocations, so it cannot be checked either way. It is a confound
+that cannot be ruled out retrospectively, and the log is append-only. It is
+also *differential*: an arm that greps history while orienting was advantaged
+over one that did not, which is a §6.4 problem rather than a uniform bias an
+offline pass could subtract.
+
+- [ ] **Pruned mirrors accumulate too.** One bare mirror per `(repo, base_sha)`,
+  ~5 MB for click, ~400 MB at 80 tasks. Same retention question as the
+  artifacts item above, and it belongs in the same policy. (P3)
+
 ---
 
 ## Where things stand — 2026-08-13
