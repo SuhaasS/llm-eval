@@ -10,7 +10,10 @@ of a matrix, after the tokens are spent.
 
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -575,22 +578,53 @@ def test_a_cached_prune_from_an_older_revision_is_rebuilt(
     assert materialize(task, tmp_path / "b" / "repo", cache) == first
 
 
-def test_a_stale_temporary_prune_does_not_wedge_the_task(tmp_path, upstream):
-    """`git clone --mirror --local` exits 128 into a non-empty directory, so a
-    tmp left behind by a killed process would make this task unmaterializable
-    forever."""
-    from bakeoff.tasks import pruned_mirror_path
+def test_an_abandoned_build_is_reclaimed_but_a_live_one_is_not(tmp_path, upstream):
+    """The sweep reclaims DISK, and an earlier docstring here -- and the comment
+    in the code -- claimed it prevented a wedge: that a leftover tmp made
+    `git clone --mirror --local` exit 128 "for this task forever". That was
+    wrong. `tmp` comes from `mkdtemp`, so its name is unique on every call
+    (measured: 200 calls, 200 distinct names, never colliding with a planted
+    leftover) and the clone can never fail into one. What a leftover costs is a
+    whole pruned mirror of disk per abandoned build.
+
+    Which makes the age floor the load-bearing half, and it is asserted in both
+    directions: an old leftover must go, and a FRESH one must survive, because
+    a sweep that deleted recent directories would delete the live build of a
+    concurrent invocation -- the sweep runs in a cache directory shared by every
+    repo and every base_sha.
+
+    The legacy name is used deliberately. The scoped `prune-<dest>-*` pattern
+    matches none of the names the previous revision wrote (measured: 0 of 201),
+    so sweeping only the new one would strand every existing leftover."""
+    from bakeoff.tasks import _STALE_TMP_AGE_S, pruned_mirror_path
 
     cache = tmp_path / "cache"
     task = load_task(_write_task(tmp_path / "set", upstream))
     pruned = pruned_mirror_path(str(upstream["path"]), upstream["base"], cache)
-    stale = pruned.parent / "prune-leftover.tmp"
-    stale.mkdir(parents=True)
-    (stale / "junk").write_text("x")
+
+    abandoned = pruned.parent / "prune-leftover.tmp"
+    abandoned.mkdir(parents=True)
+    (abandoned / "junk").write_text("x")
+    old = time.time() - _STALE_TMP_AGE_S - 60
+    os.utime(abandoned, (old, old))
+
+    # An interrupted publish renames the old mirror aside into this same
+    # namespace, and `dest` is allowed to be a file -- so the sweep has to
+    # reclaim a FILE too. `shutil.rmtree` does nothing to one.
+    orphan = pruned.parent / f"prune-{pruned.name}-999-deadbeef.tmp"
+    orphan.parent.mkdir(parents=True, exist_ok=True)
+    orphan.write_text("a publish that died between the two renames\n")
+    os.utime(orphan, (old, old))
+
+    live = pruned.parent / "prune-someone-elses-build.tmp"
+    live.mkdir()
+    (live / "junk").write_text("x")
 
     materialize(task, tmp_path / "run" / "repo", cache)
 
-    assert not stale.exists()
+    assert not abandoned.exists(), "an abandoned build was not reclaimed"
+    assert not orphan.exists(), "an interrupted publish left a file nothing reclaims"
+    assert live.exists(), "the sweep deleted a build that may still be running"
 
 
 def test_a_base_sha_off_the_default_branch_materializes(tmp_path, upstream):
@@ -653,6 +687,174 @@ def test_a_fetch_into_the_cache_does_not_reach_the_run_tree(tmp_path, upstream):
         ["git", "cat-file", "-e", f"{upstream['head']}^{{commit}}"],
         cwd=repo, capture_output=True,
     ).returncode != 0, "a fetch into the cache reached the agent's own tree"
+
+
+def _borrow_the_future(pruned: Path, upstream) -> None:
+    (pruned / "objects" / "info").mkdir(parents=True, exist_ok=True)
+    (pruned / "objects" / "info" / "alternates").write_text(
+        f"{(upstream['path'] / '.git' / 'objects').resolve()}\n"
+    )
+
+
+def _regrow_a_commit_graph(pruned: Path, upstream) -> None:
+    _sh("git", "commit-graph", "write", "--reachable", cwd=pruned)
+
+
+def _plant_a_real_keep(pruned: Path, upstream) -> None:
+    idx = next((pruned / "objects" / "pack").glob("*.idx"))
+    (pruned / "objects" / "pack" / f"{idx.stem}.keep").write_text("")
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [_borrow_the_future, _regrow_a_commit_graph, _plant_a_real_keep],
+    ids=("alternates", "commit_graph", "pack_keep"),
+)
+def test_a_cache_that_stopped_being_pruned_is_not_served(tmp_path, upstream, damage):
+    """`_pack_fingerprint` detects changes to the LOCAL PACK SET. The fast path
+    used it as proof the mirror still satisfied `_verify_pruned`, which asserts
+    four things -- and the fingerprint can observe one of them.
+
+    Measured against the previous revision, all three: the digest is
+    byte-identical after the damage, the fast path serves the mirror, and for
+    `alternates` the merged fix is then readable in the agent's own run tree
+    (28459dbfe8a3b533 both sides). Borrowed objects are not local packs and not
+    loose objects, so no term of the digest moves; `gc` cannot prune them either,
+    because they are not in this repository.
+
+    So the cheap half of `_verify_pruned` -- three `exists()` calls and one glob
+    -- runs on the fast path too, and anything short of usable rebuilds. The
+    expensive half (the object sweep) stays rebuild-only: running it per cell is
+    `cat-file --batch-all-objects` over the whole store ~3,200 times, which is
+    the cost the cache exists to avoid."""
+    from bakeoff.tasks import pruned_mirror_path
+
+    cache = tmp_path / "cache"
+    task = load_task(_write_task(tmp_path / "set", upstream))
+    first = materialize(task, tmp_path / "a" / "repo", cache)
+
+    pruned = pruned_mirror_path(str(upstream["path"]), upstream["base"], cache)
+    damage(pruned, upstream)
+
+    repo = tmp_path / "b" / "repo"
+    assert materialize(task, repo, cache) == first
+    # The leak assertion, which only `alternates` can actually violate -- a
+    # commit-graph over ancestor-only history is not itself an oracle.
+    assert subprocess.run(
+        ["git", "cat-file", "-e", f"{upstream['head']}^{{commit}}"],
+        cwd=repo, capture_output=True,
+    ).returncode != 0, "a cached mirror that stopped being pruned reached the agent"
+    # The assertion that carries the other two params: the mirror was REBUILT,
+    # not served. Without it they pass against a fast path that ignores them.
+    assert not (pruned / "objects" / "info" / "alternates").exists()
+    assert not (pruned / "objects" / "info" / "commit-graph").exists()
+    assert not any((pruned / "objects" / "pack").glob("*.keep"))
+
+
+def test_an_upstream_that_borrows_objects_materializes(tmp_path, upstream):
+    """A repository that legitimately borrows -- `git clone --shared`, a
+    `--reference` clone -- must work, and the obvious fix breaks it.
+
+    Unlinking `objects/info/alternates` before the gc was tried and measured:
+    on a true borrower (zero local objects) gc exits 128 with `fatal: bad object
+    refs/heads/main / failed to run repack` and `base_sha` stops resolving,
+    which is a harder wedge than the leak. `--dissociate` absorbs the borrowed
+    objects instead, which is why the file is in `_FORBIDDEN_PATHS` (assert its
+    absence) and NOT in `_DERIVED_PATHS` (never unlink it)."""
+    from bakeoff.tasks import pruned_mirror_path
+
+    borrower = tmp_path / "borrower"
+    _sh("git", "clone", "-q", "--shared", str(upstream["path"]), str(borrower),
+        cwd=tmp_path)
+    _sh("git", "checkout", "-q", "--detach", upstream["base"], cwd=borrower)
+    assert (borrower / ".git" / "objects" / "info" / "alternates").exists()
+
+    cache = tmp_path / "cache"
+    task = load_task(_write_task(tmp_path / "set", upstream, url=str(borrower)))
+    repo = tmp_path / "run" / "repo"
+
+    materialize(task, repo, cache)
+
+    pruned = pruned_mirror_path(str(borrower), upstream["base"], cache)
+    assert not (pruned / "objects" / "info" / "alternates").exists()
+    assert not (repo / ".git" / "objects" / "info" / "alternates").exists()
+    assert subprocess.run(
+        ["git", "cat-file", "-e", f"{upstream['base']}^{{commit}}"],
+        cwd=repo, capture_output=True,
+    ).returncode == 0, "--dissociate must absorb the history, not drop it"
+
+
+def test_the_pruned_clone_dissociates_too(tmp_path, upstream):
+    """`--dissociate` appears on BOTH clones, and only this test covers the
+    second one.
+
+    Measured: with a borrowing upstream, `ensure_mirror`'s clone absorbs the
+    alternates, so by the time `ensure_pruned_mirror` clones there is nothing
+    left to dissociate -- deleting the flag there passes the whole suite. The
+    channel that reaches it is a full mirror that GAINS alternates after it was
+    cached, which `ensure_mirror` cannot notice: it re-checks `base_sha` with
+    `cat-file -e` and nothing else."""
+    from bakeoff.tasks import ensure_mirror, pruned_mirror_path
+
+    cache = tmp_path / "cache"
+    task = load_task(_write_task(tmp_path / "set", upstream))
+    mirror = ensure_mirror(str(upstream["path"]), upstream["base"], cache)
+    (mirror / "objects" / "info").mkdir(parents=True, exist_ok=True)
+    (mirror / "objects" / "info" / "alternates").write_text(
+        f"{(upstream['path'] / '.git' / 'objects').resolve()}\n"
+    )
+
+    repo = tmp_path / "run" / "repo"
+    materialize(task, repo, cache)
+
+    pruned = pruned_mirror_path(str(upstream["path"]), upstream["base"], cache)
+    assert not (pruned / "objects" / "info" / "alternates").exists()
+    assert subprocess.run(
+        ["git", "cat-file", "-e", f"{upstream['head']}^{{commit}}"],
+        cwd=repo, capture_output=True,
+    ).returncode != 0, "the pruned mirror inherited a borrowed object store"
+
+
+def _dest_is_a_file(pruned: Path) -> None:
+    shutil.rmtree(pruned)
+    pruned.write_text("not a directory\n")
+
+
+def _marker_is_a_directory(pruned: Path) -> None:
+    marker = pruned / "bakeoff-prune-version"
+    marker.unlink()
+    marker.mkdir()
+
+
+@pytest.mark.parametrize(
+    "damage", [_dest_is_a_file, _marker_is_a_directory],
+    ids=("dest_is_a_file", "marker_is_a_directory"),
+)
+def test_an_unreadable_cache_rebuilds_instead_of_wedging(tmp_path, upstream, damage):
+    """Two states that were permanent, both measured, both the failure class the
+    previous revision set out to eliminate and reached one statement short of.
+
+    `dest` as a file: `shutil.rmtree(dest, ignore_errors=True)` silently removes
+    NOTHING from a file, and `os.replace` then raises `NotADirectoryError` on
+    this and every later invocation. Fixed by renaming the old mirror aside
+    rather than deleting it in place -- a rename is atomic and cannot
+    half-succeed.
+
+    The marker as a directory: `read_text()` raises `IsADirectoryError`, an
+    `OSError` and not the `ValueError` the guard caught, so it escaped ahead of
+    the rebuild block. (Invalid UTF-8 was already survivable, because
+    `UnicodeDecodeError` subclasses `ValueError` -- which is exactly why the
+    narrow catch looked sufficient.) Fixed by computing the whole cache
+    predicate inside the try and catching `OSError` beside `ValueError`."""
+    from bakeoff.tasks import pruned_mirror_path
+
+    cache = tmp_path / "cache"
+    task = load_task(_write_task(tmp_path / "set", upstream))
+    first = materialize(task, tmp_path / "a" / "repo", cache)
+
+    damage(pruned_mirror_path(str(upstream["path"]), upstream["base"], cache))
+
+    assert materialize(task, tmp_path / "b" / "repo", cache) == first
 
 
 def _gut_the_object_store(pruned: Path) -> None:

@@ -39,9 +39,11 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
+from uuid import uuid4
 
 MANIFEST_NAME = "task.yaml"
 REFERENCE_NAME = "reference.diff"
@@ -714,6 +716,14 @@ def ensure_mirror(repo_url: str, base_sha: str, cache_root: Path) -> Path:
     mirror = mirror_path(repo_url, cache_root)
     mirror.parent.mkdir(parents=True, exist_ok=True)
     if not (mirror / "HEAD").exists():
+        # Deliberately NOT `--dissociate` here, though a borrowing `repo_url`
+        # does propagate its alternates into this mirror. It is a no-op for a
+        # remote url (a clone with no `--reference` writes no alternates file),
+        # so it would be dead in production; the case it would cover is a local
+        # borrowing path, and `ensure_pruned_mirror`'s clone already dissociates
+        # -- measured, dropping the flag there fails a test while dropping it
+        # here fails nothing. An unanchored flag in this module is how the
+        # claims it cannot check accumulate.
         _git("clone", "--mirror", repo_url, str(mirror))
 
     if _git("cat-file", "-e", f"{base_sha}^{{commit}}", cwd=mirror,
@@ -742,11 +752,15 @@ def ensure_mirror(repo_url: str, base_sha: str, cache_root: Path) -> Path:
 # prune changes what it removes, or an older revision's output is served
 # forever -- which is the silent-wrong-cache failure `ensure_mirror` re-checks
 # on every call to avoid.
-_PRUNE_VERSION = "1"
+_PRUNE_VERSION = "2"
 _PRUNE_MARKER = "bakeoff-prune-version"
 
 # What `git clone --mirror --local` HARDLINKS from the source and `gc` does not
-# reliably rewrite. Measured: the commit-graph carries future commit OIDs
+# reliably rewrite, and what is therefore safe to UNLINK -- every entry here is
+# derived and regenerable. (`objects/info/alternates` is neither hardlinked nor
+# safe to unlink; it is rewritten and absolutized by clone's `copy_alternates`,
+# and it lives in `_FORBIDDEN_PATHS` below.)
+# Measured: the commit-graph carries future commit OIDs
 # verbatim, and under `gc.writeCommitGraph=false` gc exits 0 and leaves the
 # inherited copy -- the object sweep below still passes, and `git fsck` in the
 # run tree then prints the reference fix's SHA at the agent.
@@ -758,6 +772,31 @@ _DERIVED_PATHS = (
     "objects/info/commit-graphs",
     "objects/pack/multi-pack-index",
 )
+
+# What a cached mirror must NOT contain, which is a SUPERSET of what is stripped.
+# `objects/info/alternates` is here and deliberately NOT in `_DERIVED_PATHS`,
+# because the two sets answer different questions and unlinking this one is
+# destructive: measured on a true borrower (`git clone --shared --bare`, which
+# has ZERO local objects), deleting the file and running the gc below exits 128
+# with `fatal: bad object refs/heads/main / failed to run repack` and leaves
+# `base_sha` unresolvable -- a harder wedge than the leak. `--dissociate` on the
+# clone is what removes it safely, by absorbing the borrowed objects first.
+#
+# It has to be checked at all because borrowed objects are reachable, survive
+# `gc` (they are not in this repository to prune), and are invisible to
+# `_pack_fingerprint`, which counts only local packs and loose objects.
+# Measured: writing this file into a cached pruned mirror leaves the digest
+# byte-identical, the fast path serves it, and `git cat-file -p <the merged
+# fix>` then works in the run tree.
+#
+# Dead on the build path once `--dissociate` is in place, live on the fast path,
+# where the mirror is whatever an earlier invocation or an operator left behind.
+_FORBIDDEN_PATHS = _DERIVED_PATHS + ("objects/info/alternates",)
+
+# How long an abandoned build directory must sit before the sweep reclaims it.
+# Generous on purpose: the sweep only reclaims disk, and an age floor that fires
+# early would delete a slow prune out from under the process still running it.
+_STALE_TMP_AGE_S = 6 * 60 * 60
 
 # The operator's ~/.gitconfig decides whether a prune prunes, so none of this
 # is left to it. TWO of these are load-bearing, measured leave-one-out against
@@ -842,10 +881,22 @@ def _pack_fingerprint(repo: Path) -> str:
     The safety property is not "the count is zero" but that the count cannot
     return to its recorded value without also moving the `.idx` set: packing
     those objects rewrites an index. It does not reintroduce the freshening
-    problem above -- a run tree has its own `.git/objects` and no
+    problem above -- the mirror's digest is unchanged across a run tree's
+    `git add -A`, `commit`, `gc --prune=now` and `repack -adq`, because a run
+    tree writes into its own `.git/objects`.
+
+    WHAT THIS CANNOT SEE, and the reason it is not the fast path's only check.
+    An earlier revision of this docstring said a run tree has "no
     `objects/info/alternates` (`clone --local` hardlinks, so there is no write
-    channel back), and the mirror's digest is unchanged across a run tree's
-    `git add -A`, `commit`, `gc --prune=now` and `repack -adq`.
+    channel back)". The parenthetical is false: `clone` calls
+    `copy_alternates`, which REWRITES the file with absolutized entries rather
+    than hardlinking it. That sentence is why a borrowed object store went
+    unconsidered for two revisions. Borrowed objects are not local packs and
+    not loose objects, so they move nothing here; neither does a commit-graph,
+    a multi-pack-index, or a `pack-<hash>.keep`. Measured: each leaves the
+    digest byte-identical. This function detects changes to the LOCAL PACK SET
+    and nothing else, which is why `ensure_pruned_mirror` checks
+    `_FORBIDDEN_PATHS` and `*.keep` beside it rather than trusting it alone.
     """
     packs = sorted(
         (p.name, p.stat().st_size) for p in (repo / "objects" / "pack").glob("*.idx")
@@ -899,14 +950,17 @@ def _verify_pruned(repo: Path, base_sha: str) -> None:
             "Without this the object check below passes vacuously on an empty "
             "or truncated mirror."
         )
-    leftover = [rel for rel in _DERIVED_PATHS if (repo / rel).exists()]
+    leftover = [rel for rel in _FORBIDDEN_PATHS if (repo / rel).exists()]
     leftover += [p.name for p in (repo / "objects" / "pack").glob("*.keep")]
     if leftover:
         raise TaskError(
             f"{repo}: inherited {', '.join(leftover)} survived the prune. A "
-            "commit-graph carries future commit ids verbatim and a .keep makes "
-            "gc refuse the pack, so the run tree would still hand the agent the "
-            "reference fix."
+            "commit-graph carries future commit ids verbatim, a "
+            "pack-<hash>.keep matching an existing pack makes gc refuse that "
+            "pack, and an alternates file borrows an object store gc cannot "
+            "prune at all -- so the run tree would still hand the agent the "
+            "reference fix. An alternates hit means the clone needs "
+            "--dissociate; do not unlink it, which leaves base_sha unresolvable."
         )
     outside = _commits_outside(repo, _ancestors(repo, base_sha))
     if outside:
@@ -943,44 +997,106 @@ def ensure_pruned_mirror(repo_url: str, base_sha: str, cache_root: Path) -> Path
 
     marker = dest / _PRUNE_MARKER
     if marker.exists():
+        # The WHOLE predicate goes inside the try, not just the unpack. An
+        # earlier revision caught only `ValueError` around `.split()`, which
+        # left `_pack_fingerprint` and the `cat-file` fork outside it: measured,
+        # a marker that is a DIRECTORY raises `IsADirectoryError` -- an
+        # `OSError`, not a `ValueError` -- before the rebuild block below is
+        # reached, so the task was unmaterializable forever. (Invalid UTF-8 was
+        # already survivable, because `UnicodeDecodeError` subclasses
+        # `ValueError`.) Any unreadable cache state must mean "rebuild", never
+        # "raise": the rebuild is always available and a cache defect must not
+        # be terminal.
+        #
+        # `OSError` and not `Exception`: swallowing a `NameError` from a future
+        # edit would turn a code defect into a silent rebuild-every-time loop,
+        # which is the plausible-looking zero this module refuses.
         try:
             version, marked_sha, fingerprint = marker.read_text().split()
-        except ValueError:
-            version = marked_sha = fingerprint = ""
-        # ONE condition, and everything else falls through to the rebuild.
-        # An earlier revision re-verified the mirror on a fingerprint mismatch
-        # and RAISED when that failed -- before the rebuild block, so the bad
-        # entry stayed on disk and the task was unmaterializable on every future
-        # invocation until an operator rm -rf'd it. Measured: three identical
-        # TaskErrors in a row. That is the same failure class the stale-tmp
-        # sweep below refuses, handled the opposite way.
+            # Ordered by cost. The structural checks are `exists()` calls and
+            # one directory glob; `_pack_fingerprint` scans `objects/pack` AND
+            # every `objects/xx/`; `cat-file` forks. They are also the three
+            # `_verify_pruned` assertions the fingerprint cannot make -- it
+            # detects changes to the local pack set, and a commit-graph, a
+            # `.keep` and an alternates file all leave it byte-identical
+            # (measured). A cached mirror is trusted only when it still
+            # satisfies what the rebuild proved about it.
+            usable = (
+                version == _PRUNE_VERSION
+                and marked_sha == base_sha
+                and not any((dest / rel).exists() for rel in _FORBIDDEN_PATHS)
+                and not any((dest / "objects" / "pack").glob("*.keep"))
+                and fingerprint == _pack_fingerprint(dest)
+                and _git("cat-file", "-e", f"{base_sha}^{{commit}}", cwd=dest,
+                         check=False).returncode == 0
+            )
+        except (ValueError, OSError):
+            usable = False
+        # Anything short of usable falls through to the rebuild. An earlier
+        # revision re-verified the mirror on a fingerprint mismatch and RAISED
+        # when that failed -- before the rebuild block, so the bad entry stayed
+        # on disk and the task was unmaterializable on every future invocation
+        # until an operator rm -rf'd it. Measured: three identical TaskErrors in
+        # a row.
         #
-        # Nothing is lost by rebuilding instead. The re-verify limb existed to
-        # skip a rebuild when a mismatch is benign, but the only benign trigger
-        # is an operator repack -- and a repack leaves the digest identical
-        # (measured), so it does not reach here at all. Every mismatch that does
-        # fire is one that should be rebuilt. The rebuild ends in
+        # Nothing is lost by rebuilding. The re-verify limb existed to skip a
+        # rebuild when a mismatch is benign, but the only benign trigger is an
+        # IDEMPOTENT repack of an already-fully-packed store with no loose
+        # objects, which leaves the digest identical and so never reaches here.
+        # (With loose objects present -- the state a fetch produces -- gc packs
+        # them and the digest moves, correctly.) The rebuild ends in
         # `_verify_pruned(tmp, ...)`, which still raises: refusing a prune this
         # function just built is a code defect, refusing one it found on disk is
         # a cache defect, and only the second is recoverable.
-        if (version == _PRUNE_VERSION and marked_sha == base_sha
-                and fingerprint == _pack_fingerprint(dest)
-                and _git("cat-file", "-e", f"{base_sha}^{{commit}}", cwd=dest,
-                         check=False).returncode == 0):
+        if usable:
             return dest
 
-    # Rebuild. Sweep first: a tmp left behind by a killed process would make
-    # `git clone --mirror --local` exit 128 ("destination path already exists
-    # and is not an empty directory") for this task forever.
-    for stale in dest.parent.glob("prune-*.tmp"):
-        shutil.rmtree(stale, ignore_errors=True)
+    # Rebuild. Sweep is DISK RECLAIM, not wedge prevention -- an earlier comment
+    # here claimed a leftover tmp made the task "unmaterializable forever", and
+    # that was wrong: `tmp` comes from `mkdtemp`, so its name is unique on every
+    # call (measured: 200 calls, 200 distinct names, never colliding with a
+    # planted leftover) and `git clone` can never fail into one. What a leftover
+    # does cost is a whole pruned mirror of disk, per abandoned build.
+    #
+    # Two patterns on purpose. The new name carries `dest.name`, which already
+    # contains both the repo slug and `base_sha`, so a sweep is scoped to THIS
+    # task instead of deleting every in-flight prune in a cache directory shared
+    # by every repo. The legacy `prune-*.tmp` pattern is swept as well because
+    # the new glob matches none of the names the deployed code left behind
+    # (measured: 0 of 201) and each of those is a full mirror stranded forever.
+    #
+    # Age floor, not pid liveness: this only reclaims disk, the cache may be on
+    # a shared filesystem where a pid means nothing, and after the scoping above
+    # the sole remaining hazard is two processes on the SAME key -- which needs
+    # the lock this module still does not have, tracked as its own change.
     dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = Path(tempfile.mkdtemp(dir=dest.parent, prefix="prune-", suffix=".tmp"))
+    scoped = f"prune-{dest.name}-"
+    cutoff = time.time() - _STALE_TMP_AGE_S
+    for pattern in (f"{scoped}*", "prune-*.tmp"):
+        for stale in dest.parent.glob(pattern):
+            try:
+                if stale.stat().st_mtime > cutoff:
+                    continue
+            except OSError:
+                continue
+            shutil.rmtree(stale, ignore_errors=True)
+            if stale.exists():
+                stale.unlink(missing_ok=True)
+    tmp = Path(tempfile.mkdtemp(
+        dir=dest.parent, prefix=f"{scoped}{os.getpid()}-", suffix=".tmp"
+    ))
     try:
         # mkdtemp created it; clone refuses a non-empty target and tolerates an
         # empty one only if it does not exist.
         shutil.rmtree(tmp)
-        _git("clone", "--mirror", "--local", str(source), str(tmp))
+        # `--dissociate` absorbs any borrowed object store instead of inheriting
+        # the pointer to it. Measured, git 2.50.1: accepted without
+        # `--reference`; 0.02 s and the pack still hardlinked (nlink 2) when
+        # there is nothing to absorb; a full `repack -a -d` when there is, which
+        # also breaks the hardlink to that source. Without it a borrowing
+        # upstream raises here on every invocation forever, because every
+        # rebuild re-inherits from the same place.
+        _git("clone", "--mirror", "--local", "--dissociate", str(source), str(tmp))
         # `--mirror` leaves remote.origin.fetch=+refs/*:refs/* and
         # remote.origin.mirror=true behind. One `git fetch` in this directory
         # would restore the entire future and nothing downstream would notice.
@@ -1028,11 +1144,34 @@ def ensure_pruned_mirror(repo_url: str, base_sha: str, cache_root: Path) -> Path
         (tmp / _PRUNE_MARKER).write_text(
             f"{_PRUNE_VERSION} {base_sha} {_pack_fingerprint(tmp)}\n"
         )
-        # rmtree first: os.replace onto a non-empty directory raises
-        # ENOTEMPTY, and the marker-mismatch path arrives here with the old
-        # mirror still in place -- which is the very case the marker exists for.
-        shutil.rmtree(dest, ignore_errors=True)
-        os.replace(tmp, dest)
+        # Rename the old mirror ASIDE, never delete in place. `os.replace` onto
+        # a non-empty directory raises ENOTEMPTY, so something has to clear
+        # `dest` first -- but `shutil.rmtree(dest, ignore_errors=True)` was the
+        # wrong something twice over. It silently removes NOTHING when `dest` is
+        # a file (measured), after which `os.replace` raises NotADirectoryError
+        # on this and every later invocation; and `ignore_errors=True` discards
+        # a partial failure, leaving half a repository that ENOTEMPTYs forever.
+        # A rename is atomic, fails loudly, and cannot half-succeed.
+        #
+        # `doomed` is named into the sweep's own namespace so an interrupted
+        # publish is reclaimed rather than stranded -- it is not a `mkdtemp`
+        # name, so it carries its own randomness.
+        try:
+            if dest.exists() or dest.is_symlink():
+                doomed = dest.parent / f"{scoped}{os.getpid()}-{uuid4().hex}.tmp"
+                os.replace(dest, doomed)
+                shutil.rmtree(doomed, ignore_errors=True)
+                # rmtree does nothing to a file; `dest` being one is exactly
+                # the case that used to wedge.
+                if doomed.exists():
+                    doomed.unlink(missing_ok=True)
+            os.replace(tmp, dest)
+        except OSError as exc:
+            raise TaskError(
+                f"{dest}: could not publish the pruned mirror ({exc}). The "
+                f"build itself succeeded and is at {tmp}; delete {dest} by hand "
+                "and re-run."
+            ) from exc
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return dest
@@ -1067,6 +1206,32 @@ def materialize(task: TaskManifest, dest: Path, cache_root: Path) -> str:
     _git("checkout", "--detach", task.base_sha, cwd=dest)
     _git("remote", "remove", "origin", cwd=dest, check=False)
     _git("reflog", "expire", "--expire=now", "--all", cwd=dest, check=False)
+
+    # Every other check in the object-leak path is a check on the CACHE. This
+    # one is on the artifact the agent actually receives, and it is the only
+    # one that is. `git clone --local` does not hardlink an alternates file --
+    # it calls `copy_alternates`, which rewrites each entry as an ABSOLUTE path
+    # into the clone, so the run tree would both reach objects outside
+    # `base_sha`'s history and carry a host cache path that does not resolve
+    # inside the container.
+    #
+    # Raise, do not unlink: unlinking trades a loud stop for a silently
+    # incomplete tree. Raising is affordable because `materialize` runs before
+    # the container -- it costs setup time and zero tokens, and `run_matrix`
+    # catches per cell.
+    #
+    # DELIBERATELY UNANCHORED. Measured: deleting this check fails no test,
+    # because reaching it requires the clone's `--dissociate` and the fast
+    # path's `_FORBIDDEN_PATHS` check to fail at the same time. That is the
+    # definition of belt-and-braces, and it is kept rather than dropped because
+    # "expected unreachable" is what every defect in this subsystem has been.
+    borrowed = dest / ".git" / "objects" / "info" / "alternates"
+    if borrowed.exists():
+        raise TaskError(
+            f"{dest}: the run tree borrows objects via {borrowed}, which points "
+            "outside base_sha's history and at a host path the container cannot "
+            "resolve. The pruned mirror it was cloned from needs --dissociate."
+        )
 
     staged = False
     if task.test_diff.strip():

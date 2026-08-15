@@ -1157,6 +1157,72 @@ MUTATIONS = [
         "not integration",
     ),
     (
+        # `_pack_fingerprint` detects changes to the LOCAL PACK SET, and the
+        # fast path used it as proof the mirror still satisfied
+        # `_verify_pruned`, which asserts four things. Measured: writing
+        # `objects/info/alternates` into a cached mirror leaves the digest
+        # byte-identical (28459dbfe8a3b533 both sides), the fast path serves it,
+        # and the merged fix is then readable in the agent's own run tree.
+        # A commit-graph and a pack-<hash>.keep are invisible to it too.
+        "tasks: trust a cached mirror the fingerprint cannot see into",
+        "src/bakeoff/tasks.py",
+        '                and not any((dest / rel).exists() for rel in _FORBIDDEN_PATHS)\n'
+        '                and not any((dest / "objects" / "pack").glob("*.keep"))\n',
+        "",
+        "tests/test_tasks.py -k stopped_being_pruned",
+        "not integration",
+    ),
+    (
+        # A cache defect must never be terminal. Catching only ValueError left
+        # every OSError raised while INSPECTING the cache -- a marker that is a
+        # directory raises IsADirectoryError -- escaping ahead of the rebuild
+        # block, so the task was unmaterializable on every later invocation.
+        # Not `Exception`: swallowing a NameError from a future edit would turn
+        # a code defect into a silent rebuild-every-time loop.
+        "tasks: let an unreadable cache raise instead of rebuilding",
+        "src/bakeoff/tasks.py",
+        "        except (ValueError, OSError):",
+        "        except ValueError:",
+        "tests/test_tasks.py -k unreadable_cache_rebuilds",
+        "not integration",
+    ),
+    (
+        # Deleting `dest` in place was wrong twice over: rmtree(ignore_errors)
+        # removes NOTHING from a file (measured), after which os.replace raises
+        # NotADirectoryError on this and every later invocation; and a partial
+        # failure is discarded, leaving half a repository that ENOTEMPTYs
+        # forever. A rename is atomic and cannot half-succeed.
+        "tasks: tear the old mirror down in place instead of renaming it aside",
+        "src/bakeoff/tasks.py",
+        "            if dest.exists() or dest.is_symlink():",
+        "            if False:",
+        "tests/test_tasks.py -k unreadable_cache_rebuilds",
+        "not integration",
+    ),
+    (
+        # A borrowing upstream inherits its alternates into the pruned mirror,
+        # where gc cannot prune the borrowed objects and the fingerprint cannot
+        # see them. Unlinking the file instead is measurably worse: on a true
+        # borrower gc exits 128 and base_sha stops resolving.
+        "tasks: inherit a borrowed object store instead of absorbing it",
+        "src/bakeoff/tasks.py",
+        '        _git("clone", "--mirror", "--local", "--dissociate", str(source), str(tmp))',
+        '        _git("clone", "--mirror", "--local", str(source), str(tmp))',
+        "tests/test_tasks.py -k dissociates_too",
+        "not integration",
+    ),
+    (
+        # The scoped `prune-<dest>-*` pattern matches none of the names the
+        # previous revision wrote (measured: 0 of 201), so sweeping only the new
+        # one strands every existing leftover -- a full pruned mirror each.
+        "tasks: stop sweeping the legacy temporary-prune name",
+        "src/bakeoff/tasks.py",
+        '    for pattern in (f"{scoped}*", "prune-*.tmp"):',
+        '    for pattern in (f"{scoped}*",):',
+        "tests/test_tasks.py -k abandoned_build",
+        "not integration",
+    ),
+    (
         # `_commits_outside` over an empty object store returns [], which is
         # byte-identical to a correct prune -- so without this the check passes
         # VACUOUSLY on a truncated mirror and the failure surfaces later, out
