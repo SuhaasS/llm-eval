@@ -857,52 +857,37 @@ def test_an_unreadable_cache_rebuilds_instead_of_wedging(tmp_path, upstream, dam
     assert materialize(task, tmp_path / "b" / "repo", cache) == first
 
 
-def _gut_the_object_store(pruned: Path) -> None:
-    for path in (pruned / "objects" / "pack").glob("*"):
-        path.unlink()
-
-
-def _grow_a_commit_graph(pruned: Path) -> None:
-    _sh("git", "commit-graph", "write", "--reachable", cwd=pruned)
-
-
-@pytest.mark.parametrize(
-    "damage",
-    [_gut_the_object_store, _grow_a_commit_graph],
-    ids=("objects_gone", "commit_graph_grew"),
-)
-def test_a_damaged_prune_cache_heals_itself(tmp_path, upstream, damage):
+def test_a_damaged_prune_cache_heals_itself(tmp_path, upstream):
     """A pruned mirror that cannot be shown to be pruned must be REBUILT, not
     refused. An earlier revision re-verified it and raised -- before the
     rebuild block, so the damaged entry stayed on disk and every cell of every
     task on that (repo, base_sha) died on every re-invocation, with a message
     that reads like a prune bug and no instruction to delete anything.
-    Measured: three identical TaskErrors in a row. The stale-`prune-*.tmp`
-    sweep in the same function refuses that failure class explicitly.
+    Measured: three identical TaskErrors in a row.
 
-    Only `objects_gone` is an unforced reproduction: emptying the pack empties
-    the `.idx` set, so the fingerprint mismatches on its own. A stray
-    commit-graph leaves the fingerprint identical and would take the fast path,
-    so the marker below is rewritten as a deliberate ROUTING DEVICE -- correct
-    version and base_sha so it parses and matches, a fingerprint that cannot
-    match because `_pack_fingerprint` returns hex -- to reach the guard at all.
+    Emptying `objects/pack` empties the `.idx` set, so the marker's recorded
+    fingerprint mismatches the recomputed one on its own -- the genuine
+    stale-but-parseable shape. An earlier revision rewrote the marker "to
+    reach the guard at all", which was wrong twice over: `_verify_pruned` has
+    one call site, on the freshly built tmp, so there is no guard on the
+    cache path to reach; and the fast path's own structural checks catch the
+    fingerprint-invisible shapes whatever the marker says (pinned in
+    test_a_cache_that_stopped_being_pruned_is_not_served).
 
     Unlinking `objects/pack/*` rather than `objects/` on purpose: the first
     leaves a valid bare repository with an empty object store (`cat-file -e`
-    exits 128 "Not a valid object name", `rev-parse --is-bare-repository` still
-    true), which is the truncated-mirror shape the guard names. Removing
-    `objects/` outright stops git recognising the directory at all."""
-    from bakeoff.tasks import _PRUNE_VERSION, pruned_mirror_path
+    exits 128 "Not a valid object name", `rev-parse --is-bare-repository`
+    still true), which is the truncated-mirror shape. Removing `objects/`
+    outright stops git recognising the directory at all."""
+    from bakeoff.tasks import pruned_mirror_path
 
     cache = tmp_path / "cache"
     task = load_task(_write_task(tmp_path / "set", upstream))
     first = materialize(task, tmp_path / "a" / "repo", cache)
 
     pruned = pruned_mirror_path(str(upstream["path"]), upstream["base"], cache)
-    damage(pruned)
-    (pruned / "bakeoff-prune-version").write_text(
-        f"{_PRUNE_VERSION} {upstream['base']} {'x' * 16}\n"
-    )
+    for path in (pruned / "objects" / "pack").glob("*"):
+        path.unlink()
 
     repo = tmp_path / "b" / "repo"
 
@@ -919,10 +904,12 @@ def test_a_pruned_mirror_missing_its_base_sha_is_refused(tmp_path):
     resolved `base_sha` in, so on any passing path the commit is present by
     construction.
 
-    Kept anyway because without it `_commits_outside` over an empty store
-    returns `[]`, which is byte-identical to a correct prune -- the object
-    check would pass VACUOUSLY, and the failure would surface later out of
-    `git checkout --detach`, from the wrong place, naming nothing."""
+    Kept for the MESSAGE, not to stop a vacuous pass -- an earlier revision of
+    this docstring claimed `_commits_outside` over an empty store would return
+    `[]` and pass, but `_ancestors` raises out of `rev-list base_sha`'s own
+    check=True before the sweep runs. What the guard buys is a failure that
+    names the mirror and calls it a cache defect, instead of _git's generic
+    exit-128 line from the wrong depth."""
     from bakeoff.tasks import _verify_pruned
 
     repo = tmp_path / "empty.git"

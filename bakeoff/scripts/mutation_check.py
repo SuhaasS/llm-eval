@@ -1145,10 +1145,13 @@ MUTATIONS = [
     (
         # A .keep makes gc refuse the pack wholesale, so the future survives
         # with rc=0 -- and `repack.packKeptObjects=true` does NOT save it
-        # (measured). The unlink is the only thing that does. Note the fixture
-        # has to be a `pack-<hash>.keep`: a name matching no existing pack is
-        # ignored by git entirely, which is what made an earlier `stale.keep`
-        # fixture vacuous.
+        # (measured). The unlink is load-bearing for AVAILABILITY, not leak
+        # prevention: `_verify_pruned` refuses a surviving .keep either way,
+        # but without the unlink a repo carrying an inherited pack-<hash>.keep
+        # can never build -- every rebuild re-inherits the file and re-fails.
+        # Note the fixture has to be a `pack-<hash>.keep`: a name matching no
+        # existing pack is ignored by git entirely, which is what made an
+        # earlier `stale.keep` fixture vacuous.
         "tasks: stop unlinking an inherited pack .keep",
         "src/bakeoff/tasks.py",
         '    for keep in (repo / "objects" / "pack").glob("*.keep"):',
@@ -1223,12 +1226,16 @@ MUTATIONS = [
         "not integration",
     ),
     (
-        # `_commits_outside` over an empty object store returns [], which is
-        # byte-identical to a correct prune -- so without this the check passes
-        # VACUOUSLY on a truncated mirror and the failure surfaces later, out
-        # of `git checkout --detach`, naming nothing. Anchored by a direct call
-        # because the one production call site passes a mirror it just cloned
-        # from a source `ensure_mirror` already resolved base_sha in.
+        # The guard exists for a NAMED failure, not to stop a vacuous pass:
+        # with it gone, `_ancestors` raises first -- `rev-list base_sha` runs
+        # under check=True -- so `_commits_outside` never sees the empty
+        # store. What the caller loses is the message: _git's generic
+        # "git rev-list ... failed (exit 128)" names neither the mirror nor
+        # the fact that this is a cache defect. The mutation is caught
+        # because that generic message fails the test's match=.
+        # Anchored by a direct call because the one production call site
+        # passes a mirror it just cloned from a source `ensure_mirror`
+        # already resolved base_sha in.
         "tasks: accept a pruned mirror whose base_sha is gone",
         "src/bakeoff/tasks.py",
         '    if _git("cat-file", "-e", f"{base_sha}^{{commit}}", cwd=repo,\n'

@@ -871,7 +871,7 @@ def _pack_fingerprint(repo: Path) -> str:
 
     LOOSE OBJECTS ARE COUNTED BESIDE THE PACKS, and an earlier revision's
     docstring claiming nothing writes to a cached mirror was wrong. Measured
-    against git 2.50.1: `git fetch <upstream> +refs/*:refs/future/*` in a cached
+    against git 2.50.1: `git fetch <upstream> +refs/heads/*:refs/future/*` in a cached
     pruned mirror lands 5 objects LOOSE -- under `transfer.unpackLimit` no pack
     is written -- so no `.idx` moves, the digest is byte-identical, the fast
     path returns, and `git cat-file -p <the merged fix>` works in the next run
@@ -899,7 +899,13 @@ def _pack_fingerprint(repo: Path) -> str:
     `_FORBIDDEN_PATHS` and `*.keep` beside it rather than trusting it alone.
     """
     packs = sorted(
-        (p.name, p.stat().st_size) for p in (repo / "objects" / "pack").glob("*.idx")
+        # `pack-*.idx`, not `*.idx`: Path.glob matches dotfiles (measured:
+        # `glob("*.idx")` returns an in-flight `.tmp-1-pack-abc.idx`;
+        # `glob("pack-*.idx")` does not). Safe direction -- a spurious full
+        # re-prune, never staleness -- but a fingerprint that can flap under
+        # a concurrent repack is noise this module can avoid.
+        (p.name, p.stat().st_size)
+        for p in (repo / "objects" / "pack").glob("pack-*.idx")
     )
     # Two hex characters exactly, so `objects/info` and `objects/pack` -- four
     # characters each -- are not matched.
@@ -947,8 +953,9 @@ def _verify_pruned(repo: Path, base_sha: str) -> None:
             check=False).returncode != 0:
         raise TaskError(
             f"{repo}: pruned mirror does not contain base_sha {base_sha}. "
-            "Without this the object check below passes vacuously on an empty "
-            "or truncated mirror."
+            "Checked first for the message: with this guard gone, _ancestors "
+            "raises out of rev-list's own check=True before the object sweep "
+            "runs, naming neither the mirror nor that this is a cache defect."
         )
     leftover = [rel for rel in _FORBIDDEN_PATHS if (repo / rel).exists()]
     leftover += [p.name for p in (repo / "objects" / "pack").glob("*.keep")]
