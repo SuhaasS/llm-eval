@@ -5,8 +5,11 @@ A test that passes proves nothing on its own -- it may be asserting
 something that was always true. The only evidence a test is load-bearing is
 that it FAILS when the behaviour it guards is removed.
 """
+import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -1318,6 +1321,21 @@ MUTATIONS = [
         "not integration",
     ),
     (
+        # Reintroducing the rmtree hands the directory back to the umask:
+        # the clone recreates it 0755 (or 0777 under umask 0) and os.replace
+        # publishes that as the permanent cache -- the whole cached
+        # repository readable by every local user, which matters the moment
+        # the task repos are private. The test pins umask(0) so the verdict
+        # is the repository's, not the laptop's.
+        "tasks: hand the published mirror's mode back to the umask",
+        "src/bakeoff/tasks.py",
+        '        _git("clone", "--mirror", "--local", "--dissociate", str(source), str(tmp))',
+        '        shutil.rmtree(tmp)\n'
+        '        _git("clone", "--mirror", "--local", "--dissociate", str(source), str(tmp))',
+        "tests/test_tasks.py -k world_readable",
+        "not integration",
+    ),
+    (
         # Schema 3.8.0. Every one of the next six used to destroy the record
         # outright or, worse, publish something false in its place.
         "finalize: let a failing finalize step take the record with it",
@@ -1438,12 +1456,27 @@ def run(label, rel, find, replace, selector, marker):
         print(f"  STALE ANCHOR  {label}\n                no longer present in {rel}")
         return False
     path.write_text(original.replace(find, replace, 1))
+    # A fresh pyc cache per entry, because CPython validates bytecode on
+    # (source mtime in whole seconds, source size) and BOTH collide here:
+    # consecutive entries mutate the same file within one second, and two
+    # mutations can shrink it by the same byte count. Measured 2026-08-14:
+    # the utf-8 and the streaming-sweep entries both remove exactly 25
+    # bytes from tasks.py, so the second pytest run loaded the first run's
+    # pyc -- mutated _git, ORIGINAL _commits_outside -- and reported the
+    # streaming mutation MISSED on a test that fails against its own
+    # source. Same failure mode the eval image closes with
+    # PYTHONDONTWRITEBYTECODE=1; that variable does not help here because
+    # it stops writing pycs, not reading a stale one already present --
+    # redirecting the cache is what keeps the repo's own __pycache__ free
+    # of mutated bytecode entirely.
+    pyc_cache = tempfile.mkdtemp(prefix="bakeoff-mut-pyc-")
     try:
         result = subprocess.run(
             [PY, "-m", "pytest", *selector.split(" -k ")[0].split(),
              "-k", selector.split(" -k ")[1].strip("'\""),
              "-q", "-m", marker, "--basetemp=" + str(Path.home() / ".cache/bakeoff-mut")],
             cwd=REPO, capture_output=True, text=True, timeout=900,
+            env={**os.environ, "PYTHONPYCACHEPREFIX": pyc_cache},
         )
         # Exit 5 is 'no tests collected' -- that is an empty selector, not
         # a caught mutation. Counting it as a catch is how a mutation
@@ -1458,6 +1491,7 @@ def run(label, rel, find, replace, selector, marker):
         return caught
     finally:
         path.write_text(original)
+        shutil.rmtree(pyc_cache, ignore_errors=True)
 
 
 if __name__ == "__main__":
