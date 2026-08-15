@@ -805,6 +805,12 @@ _FORBIDDEN_PATHS = _DERIVED_PATHS + ("objects/info/alternates",)
 # early would delete a slow prune out from under the process still running it.
 _STALE_TMP_AGE_S = 6 * 60 * 60
 
+# How many outside commits the object sweep names before it stops reading.
+# It reads ONE PAST this: the message can then distinguish "exactly N" from
+# "more than N", instead of rendering a ref-sweep miss (a handful) and a gc
+# that did nothing (tens of thousands) identically.
+_OUTSIDE_SAMPLE = 3
+
 # The operator's ~/.gitconfig decides whether a prune prunes, so none of this
 # is left to it. TWO of these are load-bearing, measured leave-one-out against
 # a hostile global config on a packed repository:
@@ -921,7 +927,10 @@ def _pack_fingerprint(repo: Path) -> str:
 
 
 def _commits_outside(repo: Path, ancestors: set[str]) -> list[str]:
-    """Commit objects present in `repo` that `ancestors` does not contain.
+    """Commit objects present in `repo` that `ancestors` does not contain --
+    at most `_OUTSIDE_SAMPLE + 1` of them, because the error message this
+    feeds prints `_OUTSIDE_SAMPLE` names plus whether there were more, and
+    the caller branches on emptiness alone.
 
     THE post-condition, and it is stated over objects rather than refs because
     the leak is an object-level one: `clone --local` hardlinks the whole store,
@@ -932,16 +941,48 @@ def _commits_outside(repo: Path, ancestors: set[str]) -> list[str]:
     `--batch-all-objects` lists cruft-pack objects too, which is what makes
     this catch the `gc.cruftPacks` and `gc.bigPackThreshold` bypasses rather
     than merely surviving them. `--unordered` because the sort is pure cost.
+
+    STREAMED, not buffered: the listing is one line per object, 659 KB on
+    pruned click and ~229 MB extrapolated to a 5M-object monorepo, and
+    `.splitlines()` plus the comprehension held three copies of it at once.
+    stderr is not drained while stdout streams, so a git that filled the
+    stderr pipe (64 KB -- measured to the byte on darwin 25.5.0, and the
+    linux default) mid-listing would deadlock -- accepted rather than paid
+    for with a drain thread, and recorded here. That git stays under it is
+    inference from the command's shape (`--batch-check` has nothing to
+    narrate), not a measurement.
     """
-    listing = _git(
-        "cat-file", "--batch-all-objects", "--unordered",
-        "--batch-check=%(objecttype) %(objectname)", cwd=repo,
-    ).stdout
-    return [
-        name
-        for kind, _, name in (line.partition(" ") for line in listing.splitlines())
-        if kind == "commit" and name not in ancestors
-    ]
+    with subprocess.Popen(
+        ["git", "cat-file", "--batch-all-objects", "--unordered",
+         "--batch-check=%(objecttype) %(objectname)"],
+        cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        encoding="utf-8", errors="replace",
+    ) as proc:
+        assert proc.stdout is not None and proc.stderr is not None
+        outside: list[str] = []
+        try:
+            for line in proc.stdout:
+                kind, _, name = line.rstrip("\n").partition(" ")
+                if kind == "commit" and name not in ancestors:
+                    outside.append(name)
+                    if len(outside) > _OUTSIDE_SAMPLE:
+                        # Enough evidence; stop paying for the rest of the
+                        # listing. The kill makes the exit code meaningless,
+                        # which is fine -- the hits are already a harder
+                        # failure than any exit code.
+                        proc.kill()
+                        break
+            else:
+                stderr_text = proc.stderr.read()
+                if proc.wait() != 0:
+                    raise TaskError(
+                        f"git cat-file --batch-all-objects failed "
+                        f"(exit {proc.returncode}) in {repo}: "
+                        f"{stderr_text.strip()}"
+                    )
+        finally:
+            proc.kill()
+    return outside
 
 
 def _ancestors(repo: Path, base_sha: str) -> set[str]:
@@ -978,10 +1019,13 @@ def _verify_pruned(repo: Path, base_sha: str) -> None:
         )
     outside = _commits_outside(repo, _ancestors(repo, base_sha))
     if outside:
+        count = (str(len(outside)) if len(outside) <= _OUTSIDE_SAMPLE
+                 else f"more than {_OUTSIDE_SAMPLE}")
         raise TaskError(
-            f"{repo}: {len(outside)} commit(s) outside {base_sha}'s history "
-            f"survived the prune, e.g. {', '.join(sorted(outside)[:3])}. The "
-            "run tree would contain the merged fix the task was cut from."
+            f"{repo}: {count} commit(s) outside {base_sha}'s history "
+            f"survived the prune, e.g. "
+            f"{', '.join(sorted(outside)[:_OUTSIDE_SAMPLE])}. The run tree "
+            "would contain the merged fix the task was cut from."
         )
 
 

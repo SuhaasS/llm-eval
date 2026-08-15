@@ -1288,6 +1288,24 @@ MUTATIONS = [
         "not integration",
     ),
     (
+        # A MEMORY anchor -- the test docstring declares the memory half
+        # unanchored (a buffer-and-slice passes it), and this is the other
+        # half: the test pins the cap, this pins that the cap is enforced.
+        # Neutralising the break changes nothing on a correctly pruned
+        # mirror (the list is empty either way) and nothing in the message
+        # ("more than 3" still renders); what it removes is the bound on
+        # `outside`, which on the failure this post-condition exists to
+        # catch -- a gc that did nothing over a monorepo -- accumulates
+        # every outside commit, the exact unbounded peak the streaming
+        # rewrite was for. The test catches it by counting the return.
+        "tasks: read the whole listing instead of stopping past the sample",
+        "src/bakeoff/tasks.py",
+        "                    if len(outside) > _OUTSIDE_SAMPLE:\n",
+        "                    if False:\n",
+        "tests/test_tasks.py -k stops_reading",
+        "not integration",
+    ),
+    (
         # Schema 3.8.0. Every one of the next six used to destroy the record
         # outright or, worse, publish something false in its place.
         "finalize: let a failing finalize step take the record with it",

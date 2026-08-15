@@ -740,6 +740,31 @@ def test_a_ref_the_decode_mangled_is_refused_not_leaked(tmp_path, upstream):
         materialize(task, tmp_path / "run" / "repo", tmp_path / "cache")
 
 
+def test_the_object_sweep_stops_reading_after_the_evidence(tmp_path, upstream):
+    """`_commits_outside` buffered the entire `--batch-all-objects` listing --
+    659 KB on pruned click, ~229 MB extrapolated to a 5M-object monorepo --
+    then split it, for an error message that only ever prints three names.
+    Pinned by counting what it returns: one past the sample, on a repo with
+    more than that outside, so the message can say "more than 3" without
+    claiming a count it never took.
+
+    The MEMORY half is deliberately unanchored: a rewrite that buffers the
+    listing and slices it passes this test. What the test pins is the
+    contract the message depends on -- the cap and the one-past read."""
+    from bakeoff.tasks import _OUTSIDE_SAMPLE, _ancestors, _commits_outside
+
+    repo_path = upstream["path"]
+    for i in range(5):
+        (repo_path / f"extra{i}.txt").write_text(f"{i}\n")
+        _sh("git", "add", "-A", cwd=repo_path)
+        _sh("git", "commit", "-q", "-m", f"extra {i}", cwd=repo_path)
+
+    outside = _commits_outside(
+        repo_path / ".git", _ancestors(repo_path / ".git", upstream["base"])
+    )
+    assert len(outside) == _OUTSIDE_SAMPLE + 1
+
+
 def test_a_base_sha_off_the_default_branch_materializes(tmp_path, upstream):
     """`base_sha` is often not on the default branch -- a release branch, a
     merge parent. Retargeting `main` at it anyway would show the agent history
