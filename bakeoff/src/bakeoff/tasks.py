@@ -1176,8 +1176,9 @@ def ensure_pruned_mirror(repo_url: str, base_sha: str, cache_root: Path) -> Path
         except OSError as exc:
             raise TaskError(
                 f"{dest}: could not publish the pruned mirror ({exc}). The "
-                f"build itself succeeded and is at {tmp}; delete {dest} by hand "
-                "and re-run."
+                "build was verified and is discarded on the way out; whatever "
+                f"this failure left under {dest.parent} is swept or rebuilt "
+                "on the next invocation."
             ) from exc
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

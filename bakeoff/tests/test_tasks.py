@@ -627,6 +627,72 @@ def test_an_abandoned_build_is_reclaimed_but_a_live_one_is_not(tmp_path, upstrea
     assert live.exists(), "the sweep deleted a build that may still be running"
 
 
+def test_a_stale_entry_that_vanishes_mid_sweep_is_skipped(tmp_path, upstream, monkeypatch):
+    """The sweep stats entries it did not create, in a cache directory shared
+    by every repo -- so an entry can vanish (or become unstatable) between the
+    glob and the stat when another invocation reclaims it first. That OSError
+    must mean "skip this entry", never "fail the build": the sweep only
+    reclaims disk, and a build that dies on someone else's leftover turns a
+    janitor into a single point of failure."""
+    from bakeoff.tasks import _STALE_TMP_AGE_S, pruned_mirror_path
+
+    cache = tmp_path / "cache"
+    task = load_task(_write_task(tmp_path / "set", upstream))
+    pruned = pruned_mirror_path(str(upstream["path"]), upstream["base"], cache)
+
+    ghost = pruned.parent / "prune-vanishing.tmp"
+    ghost.mkdir(parents=True)
+    old = time.time() - _STALE_TMP_AGE_S - 60
+    os.utime(ghost, (old, old))
+
+    real_stat = Path.stat
+
+    def stat_that_loses_the_race(self, **kwargs):
+        if self.name == "prune-vanishing.tmp":
+            raise OSError("stale file handle")
+        return real_stat(self, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat_that_loses_the_race)
+
+    materialize(task, tmp_path / "run" / "repo", cache)  # must not raise
+    # os.listdir, not ghost.exists(): Path.exists() routes through the
+    # patched stat, and an OSError with errno=None is outside pathlib's
+    # _ignore_error set, so exists() re-raises it instead of returning False.
+    assert "prune-vanishing.tmp" in os.listdir(ghost.parent), \
+        "an unstatable entry must be skipped, not deleted"
+
+
+def test_a_failed_publish_raises_a_named_taskerror(tmp_path, upstream, monkeypatch):
+    """The publish rename is the one step allowed to fail after a verified
+    build, and its TaskError must not point the operator at a path that is
+    already gone: the finally-block rmtree reclaims `tmp` while the exception
+    propagates, and on the second os.replace `dest` has itself been renamed
+    aside -- so an earlier message saying the build "is at {tmp}" named a
+    directory the caller could never find."""
+    import bakeoff.tasks as tasks_mod
+    from bakeoff.tasks import pruned_mirror_path
+
+    cache = tmp_path / "cache"
+    task = load_task(_write_task(tmp_path / "set", upstream))
+    pruned = pruned_mirror_path(str(upstream["path"]), upstream["base"], cache)
+
+    real_replace = os.replace
+
+    def replace_that_hits_a_full_disk(src, dst):
+        if Path(dst) == pruned:
+            raise OSError(28, "No space left on device")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(tasks_mod.os, "replace", replace_that_hits_a_full_disk)
+
+    with pytest.raises(TaskError, match="could not publish the pruned mirror") as exc:
+        materialize(task, tmp_path / "run" / "repo", cache)
+    assert "prune-" not in str(exc.value), \
+        "the message names a build directory the finally block already reclaimed"
+    assert not list(pruned.parent.glob("prune-*")), \
+        "a failed publish stranded a build the finally block should reclaim"
+
+
 def test_a_base_sha_off_the_default_branch_materializes(tmp_path, upstream):
     """`base_sha` is often not on the default branch -- a release branch, a
     merge parent. Retargeting `main` at it anyway would show the agent history
