@@ -108,12 +108,15 @@ Candidate cache pricing — gemma and kimi both priced `null` again on
 
 ### The pruned-mirror cache has its own open list
 
-Six comments and docstrings that misdescribe the code, plus six deferred items
-(no lock in `src/`, unbounded memory in the object sweep, locale-strict git
-decoding, cache directory mode, two uncovered IO paths, one unanchored
-assertion). None can hand the agent the answer; all are in
-[HANDOFF.md](HANDOFF.md) with file:line, because that subsystem has been wrong
-three times in the same way and the traps are worth not re-deriving.
+Shrunk to the remainder on 2026-08-14: the deliberately unanchored
+`materialize` alternates assertion (kept — deleting it fails no test, by
+design); `ensure_mirror`'s full mirror still at the umask's mercy while the
+pruned one is now 0700; and `images.py`'s `git archive` reading the full
+mirror outside the new repo lock (harmless while a fetch never removes
+`base_sha`, recorded so "the mirror race is closed" stays qualified). The
+six prose defects, the lock, the streaming sweep, the utf-8 decode, the
+cache mode and the two uncovered IO paths all closed — the ledger and the
+traps are in [HANDOFF.md](HANDOFF.md).
 
 ### Read every pre-2026-08-13 figure with the pyc caveat
 

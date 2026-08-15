@@ -2080,3 +2080,38 @@ at a written file with every measured bypass set. Not for a silent leak
 gitconfig making every task refuse to materialize. It asserts the hostile file
 is actually being read, because otherwise it would pass vacuously and take two
 mutation entries down with it.
+
+## The pruned-mirror handoff closeout — 2026-08-14
+
+Everything HANDOFF.md listed as mine-and-cheap or deferred-on-purpose, in
+seven commits, plan iterated to convergence by two independent reviewers
+before any code moved (docs/superpowers/plans/2026-08-14-pruned-mirror-handoff.md).
+
+- [x] The six prose defects — including the "vacuous pass" story that was
+      false in three places at once, corrected everywhere it appeared.
+- [x] The two uncovered IO paths — and the publish message they exposed,
+      which named a path the finally-block had already reclaimed.
+- [x] `_git` decodes pinned utf-8 with replacement. The old "mangled ref
+      gets deleted" claim measured false; the object sweep is the backstop,
+      pinned end-to-end with a packed-refs latin-1 fixture (APFS refuses the
+      loose-ref spelling).
+- [x] `_commits_outside` streams, stops one past `_OUTSIDE_SAMPLE`, and the
+      message says "more than 3" instead of a count nobody bounded.
+- [x] One flock per repo slug over three readers — the two HANDOFF named
+      plus materialize's run-tree clone. Body extracted verbatim to
+      `_build_pruned_mirror` so six mutation anchors kept their indentation.
+- [x] The pruned mirror publishes at mkdtemp's 0700; the fix was deleting
+      the rmtree whose justifying comment was measurably false.
+- [x] Found on the way: the mutation harness intermittently read its own
+      stale pyc — two entries shrink tasks.py by the same 25 bytes inside
+      one second, colliding CPython's (mtime, size) key. Fresh
+      PYTHONPYCACHEPREFIX per entry; batch stable 5/5 after.
+
+Review: gates all green on a clean tree — 543 tests, 125/125 mutations
+(26 under tasks:), tasks.py 93%, verify_logger GATE PASSED, preflight PASS
+with start_sha still 33575cc0. One operational lesson recorded in
+HANDOFF.md: never run mutation_check concurrently with another gate — it
+mutates tasks.py in place, and the neighbouring suite fails against source
+it never shipped. Remainder (unanchored materialize assertion, full-mirror
+umask mode, images.py's unlocked git archive) recorded in HANDOFF.md and
+TASKS.md, not silently closed.
