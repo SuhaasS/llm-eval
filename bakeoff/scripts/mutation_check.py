@@ -1306,6 +1306,18 @@ MUTATIONS = [
         "not integration",
     ),
     (
+        # An unheld lock is indistinguishable from a held one at every call
+        # site -- the with-block enters, the build runs, nothing raises. The
+        # probe tests take LOCK_EX|LOCK_NB from a second fd and expect to be
+        # refused, which only a real LOCK_EX can do.
+        "tasks: open the lock file without taking the lock",
+        "src/bakeoff/tasks.py",
+        "        fcntl.flock(fd, fcntl.LOCK_EX)\n",
+        "        pass\n",
+        "tests/test_tasks.py -k repo_lock",
+        "not integration",
+    ),
+    (
         # Schema 3.8.0. Every one of the next six used to destroy the record
         # outright or, worse, publish something false in its place.
         "finalize: let a failing finalize step take the record with it",

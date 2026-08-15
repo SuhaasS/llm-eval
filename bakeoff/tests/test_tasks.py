@@ -765,6 +765,80 @@ def test_the_object_sweep_stops_reading_after_the_evidence(tmp_path, upstream):
     assert len(outside) == _OUTSIDE_SAMPLE + 1
 
 
+def _assert_flock_held(lock_path: Path) -> None:
+    import fcntl
+    with open(lock_path) as probe:
+        try:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        fcntl.flock(probe, fcntl.LOCK_UN)
+    raise AssertionError(f"{lock_path} was not held")
+
+
+def test_the_prune_and_the_run_tree_clone_run_under_the_repo_lock(
+    tmp_path, upstream, monkeypatch
+):
+    """Two invocations on the same (repo, base_sha) race twice: both prune
+    at once, and one publishes -- rename aside, rmtree -- while the other's
+    materialize is cloning from the mirror being reclaimed. The lock is
+    asserted from INSIDE each critical section, with a probe fd taking
+    LOCK_EX|LOCK_NB and expecting to be refused, because a lock tested only
+    by its file existing is a lock nothing proves is taken."""
+    import bakeoff.tasks as tasks_mod
+    from bakeoff.tasks import mirror_path
+
+    cache = tmp_path / "cache"
+    task = load_task(_write_task(tmp_path / "set", upstream))
+    lock_path = mirror_path(str(upstream["path"]), cache).with_suffix(".lock")
+
+    real_strip = tasks_mod._strip_derived
+    real_git = tasks_mod._git
+    probed = []
+
+    def strip_while_probing(repo):
+        _assert_flock_held(lock_path)
+        probed.append("prune")
+        return real_strip(repo)
+
+    def git_while_probing(*args, **kwargs):
+        if args and args[0] == "clone" and "--local" in args and "--mirror" not in args:
+            _assert_flock_held(lock_path)
+            probed.append("run-tree clone")
+        return real_git(*args, **kwargs)
+
+    monkeypatch.setattr(tasks_mod, "_strip_derived", strip_while_probing)
+    monkeypatch.setattr(tasks_mod, "_git", git_while_probing)
+    materialize(task, tmp_path / "run" / "repo", cache)
+    assert probed == ["prune", "run-tree clone"], \
+        f"a probe never fired: {probed}"
+
+
+def test_the_mirror_fetch_path_runs_under_the_repo_lock(tmp_path, upstream, monkeypatch):
+    """`ensure_mirror`'s `HEAD`-exists check is the same race one level up:
+    `git clone` writes HEAD early, so a second process can `fetch --prune`
+    into a half-populated clone. The probe rides the mirror clone itself."""
+    import bakeoff.tasks as tasks_mod
+    from bakeoff.tasks import ensure_mirror, mirror_path
+
+    cache = tmp_path / "cache"
+    lock_path = mirror_path(str(upstream["path"]), cache).with_suffix(".lock")
+
+    real_git = tasks_mod._git
+    probed = []
+
+    def git_while_probing(*args, **kwargs):
+        if args and args[0] == "clone" and "--mirror" in args and "--local" not in args:
+            _assert_flock_held(lock_path)
+            probed.append("mirror clone")
+        return real_git(*args, **kwargs)
+
+    monkeypatch.setattr(tasks_mod, "_git", git_while_probing)
+    ensure_mirror(str(upstream["path"]), upstream["base"], cache)
+    assert probed == ["mirror clone"], \
+        "the probe never fired; the clone path was not exercised"
+
+
 def test_a_base_sha_off_the_default_branch_materializes(tmp_path, upstream):
     """`base_sha` is often not on the default branch -- a release branch, a
     merge parent. Retargeting `main` at it anyway would show the agent history

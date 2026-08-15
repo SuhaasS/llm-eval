@@ -33,6 +33,8 @@ Three things are load-bearing and are argued where they happen:
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import os
 import re
@@ -708,6 +710,46 @@ def mirror_path(repo_url: str, cache_root: Path) -> Path:
     return Path(cache_root) / "repos" / f"{slug}.git"
 
 
+@contextlib.contextmanager
+def _repo_lock(repo_url: str, cache_root: Path):
+    """One exclusive flock per repo slug, held across every cache build and
+    every read that a concurrent build could tear.
+
+    Three critical sections take it: `ensure_mirror` (git clone writes HEAD
+    early, so a second process's HEAD-exists check passes on a half-populated
+    clone and `fetch --prune`s into it), the prune build-and-publish (two
+    processes pruning one (repo, base_sha) -- the second's publish renames
+    the first's live mirror aside), and `materialize`'s run-tree clone (the
+    publish rmtree's the directory that clone is reading). Neither race was
+    ever observed as corruption; both were derived from the code -- at
+    f67ccc2, `grep -rE 'flock|fcntl|O_EXCL'` over src/ found zero hits, and
+    this function is the first.
+
+    Per SLUG, not per (repo, base_sha): both keys share one source mirror
+    that `ensure_mirror` may fetch into, and one dest.parent sweep namespace,
+    so a per-key lock would let a fetch run during another key's prune.
+
+    The acquisitions MUST NOT nest: flock self-conflicts across two fds in
+    one process (measured: LOCK_EX|LOCK_NB on a fresh fd raises
+    BlockingIOError while the first is held), so `ensure_pruned_mirror`
+    calls `ensure_mirror` -- which locks and releases -- BEFORE taking the
+    lock itself.
+
+    The lock file is separate from the mirror because the publish
+    `os.replace`s the mirror away -- a lock on a renamed path guards nothing
+    -- and it is never unlinked: removing a lock file another process holds
+    open silently breaks the exclusion for every later acquirer.
+    """
+    lock_path = mirror_path(repo_url, cache_root).with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as fd:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+
+
 def ensure_mirror(repo_url: str, base_sha: str, cache_root: Path) -> Path:
     """A bare mirror holding `base_sha`, fetched at most once per matrix.
 
@@ -722,37 +764,40 @@ def ensure_mirror(repo_url: str, base_sha: str, cache_root: Path) -> Path:
     """
     mirror = mirror_path(repo_url, cache_root)
     mirror.parent.mkdir(parents=True, exist_ok=True)
-    if not (mirror / "HEAD").exists():
-        # Deliberately NOT `--dissociate` here, though a borrowing `repo_url`
-        # does propagate its alternates into this mirror. It is a no-op for a
-        # remote url (a clone with no `--reference` writes no alternates file),
-        # so it would be dead in production; the case it would cover is a local
-        # borrowing path, and `ensure_pruned_mirror`'s clone already dissociates
-        # -- measured, dropping the flag there fails a test while dropping it
-        # here fails nothing. An unanchored flag in this module is how the
-        # claims it cannot check accumulate.
-        _git("clone", "--mirror", repo_url, str(mirror))
+    with _repo_lock(repo_url, cache_root):
+        if not (mirror / "HEAD").exists():
+            # Deliberately NOT `--dissociate` here, though a borrowing
+            # `repo_url` does propagate its alternates into this mirror. It is
+            # a no-op for a remote url (a clone with no `--reference` writes no
+            # alternates file), so it would be dead in production; the case it
+            # would cover is a local borrowing path, and
+            # `ensure_pruned_mirror`'s clone already dissociates -- measured,
+            # dropping the flag there fails a test while dropping it here fails
+            # nothing. An unanchored flag in this module is how the claims it
+            # cannot check accumulate.
+            _git("clone", "--mirror", repo_url, str(mirror))
 
-    if _git("cat-file", "-e", f"{base_sha}^{{commit}}", cwd=mirror,
-            check=False).returncode == 0:
+        if _git("cat-file", "-e", f"{base_sha}^{{commit}}", cwd=mirror,
+                check=False).returncode == 0:
+            return mirror
+
+        _git("fetch", "--prune", "origin", cwd=mirror, check=False)
+        if _git("cat-file", "-e", f"{base_sha}^{{commit}}", cwd=mirror,
+                check=False).returncode == 0:
+            return mirror
+
+        # Last resort: a commit that no ref reaches (a PR head, a rewritten
+        # branch). Servers may refuse; the point is to have tried before
+        # failing.
+        _git("fetch", "origin", base_sha, cwd=mirror, check=False)
+        if _git("cat-file", "-e", f"{base_sha}^{{commit}}", cwd=mirror,
+                check=False).returncode != 0:
+            raise TaskError(
+                f"{repo_url} does not contain base_sha {base_sha}. The task "
+                "cannot be materialized; running anyway would detach onto "
+                "nothing and record the result as an ordinary run."
+            )
         return mirror
-
-    _git("fetch", "--prune", "origin", cwd=mirror, check=False)
-    if _git("cat-file", "-e", f"{base_sha}^{{commit}}", cwd=mirror,
-            check=False).returncode == 0:
-        return mirror
-
-    # Last resort: a commit that no ref reaches (a PR head, a rewritten
-    # branch). Servers may refuse; the point is to have tried before failing.
-    _git("fetch", "origin", base_sha, cwd=mirror, check=False)
-    if _git("cat-file", "-e", f"{base_sha}^{{commit}}", cwd=mirror,
-            check=False).returncode != 0:
-        raise TaskError(
-            f"{repo_url} does not contain base_sha {base_sha}. The task cannot "
-            "be materialized; running anyway would detach onto nothing and "
-            "record the result as an ordinary run."
-        )
-    return mirror
 
 
 # Bumping this invalidates every cached pruned mirror. Bump it whenever the
@@ -1029,30 +1074,14 @@ def _verify_pruned(repo: Path, base_sha: str) -> None:
         )
 
 
-def ensure_pruned_mirror(repo_url: str, base_sha: str, cache_root: Path) -> Path:
-    """A bare mirror holding `base_sha`'s history and NOTHING after it.
-
-    Run trees clone from this rather than from the full mirror, because
-    `git clone --local` hardlinks the entire object store: measured on
-    `pallets/click`, the run tree carried all 30,766 objects of the mirror,
-    including the merge commit of the very PR the task was cut from, reachable
-    as `refs/heads/main` 181 commits ahead of the start state. `git log --all`
-    or `git show main` hands the model the answer it is being scored on, and it
-    does so unevenly across arms -- a section 6.4 confound recorded as
-    capability. `git remote remove origin` did not cover it: that deletes
-    `refs/remotes/origin/*`, not the local branch a clone creates, and not tags.
-
-    ONCE PER (repo, base_sha), cached across invocations, because the prune
-    ends in a `gc` that repacks the whole store. Doing it per run tree would
-    cost that on every one of ~3,200 cells and break the hardlink sharing
-    `materialize` depends on.
-
-    `ensure_mirror` FIRST: an unresolvable `base_sha` has to fail there, with
-    the message that names it, rather than deeper in here.
-    """
-    source = ensure_mirror(repo_url, base_sha, cache_root)
-    dest = pruned_mirror_path(repo_url, base_sha, cache_root)
-
+def _build_pruned_mirror(source: Path, dest: Path, base_sha: str) -> Path:
+    """The body of `ensure_pruned_mirror`, split out as a SEAM, not a
+    decomposition: the lock had to wrap this whole region, and wrapping it
+    in-place would re-indent every line -- six of which are exact-substring
+    mutation anchors in `mutation_check.py`, indentation included. Inlining
+    this back "for tidiness" stales all six. Runs entirely under the caller's
+    `_repo_lock`; see `ensure_pruned_mirror` for why the fast path is inside
+    it too."""
     marker = dest / _PRUNE_MARKER
     if marker.exists():
         # The WHOLE predicate goes inside the try, not just the unpack. An
@@ -1236,6 +1265,40 @@ def ensure_pruned_mirror(repo_url: str, base_sha: str, cache_root: Path) -> Path
     return dest
 
 
+def ensure_pruned_mirror(repo_url: str, base_sha: str, cache_root: Path) -> Path:
+    """A bare mirror holding `base_sha`'s history and NOTHING after it.
+
+    Run trees clone from this rather than from the full mirror, because
+    `git clone --local` hardlinks the entire object store: measured on
+    `pallets/click`, the run tree carried all 30,766 objects of the mirror,
+    including the merge commit of the very PR the task was cut from, reachable
+    as `refs/heads/main` 181 commits ahead of the start state. `git log --all`
+    or `git show main` hands the model the answer it is being scored on, and it
+    does so unevenly across arms -- a section 6.4 confound recorded as
+    capability. `git remote remove origin` did not cover it: that deletes
+    `refs/remotes/origin/*`, not the local branch a clone creates, and not tags.
+
+    ONCE PER (repo, base_sha), cached across invocations, because the prune
+    ends in a `gc` that repacks the whole store. Doing it per run tree would
+    cost that on every one of ~3,200 cells and break the hardlink sharing
+    `materialize` depends on.
+
+    `ensure_mirror` FIRST: an unresolvable `base_sha` has to fail there, with
+    the message that names it, rather than deeper in here.
+    """
+    # `ensure_mirror` locks and releases inside itself; taking the lock only
+    # after it returns is what keeps the two acquisitions from nesting, which
+    # flock punishes with a same-process deadlock (see _repo_lock). The whole
+    # fast path sits inside the lock because the publish has a window where
+    # `dest` does not exist, and an unlocked reader there starts a redundant
+    # rebuild. The body lives in _build_pruned_mirror so this wrapper could
+    # be added without re-indenting the six mutation anchors inside it.
+    source = ensure_mirror(repo_url, base_sha, cache_root)
+    dest = pruned_mirror_path(repo_url, base_sha, cache_root)
+    with _repo_lock(repo_url, cache_root):
+        return _build_pruned_mirror(source, dest, base_sha)
+
+
 def materialize(task: TaskManifest, dest: Path, cache_root: Path) -> str:
     """Build the run's start state on disk and return its commit SHA.
 
@@ -1261,7 +1324,12 @@ def materialize(task: TaskManifest, dest: Path, cache_root: Path) -> str:
     mirror = ensure_pruned_mirror(task.repo_url, task.base_sha, cache_root)
 
     dest.parent.mkdir(parents=True, exist_ok=True)
-    _git("clone", "--local", "--no-checkout", str(mirror), str(dest))
+    # Under the repo lock: a concurrent invocation's publish renames the
+    # mirror aside and rmtree's it, and a clone reading it at that moment
+    # survives only until the rmtree wins. The clone is the last reader of
+    # shared state; everything after it touches only this run's tree.
+    with _repo_lock(task.repo_url, cache_root):
+        _git("clone", "--local", "--no-checkout", str(mirror), str(dest))
     _git("checkout", "--detach", task.base_sha, cwd=dest)
     _git("remote", "remove", "origin", cwd=dest, check=False)
     _git("reflog", "expire", "--expire=now", "--all", cwd=dest, check=False)
