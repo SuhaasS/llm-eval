@@ -839,6 +839,36 @@ def test_the_mirror_fetch_path_runs_under_the_repo_lock(tmp_path, upstream, monk
         "the probe never fired; the clone path was not exercised"
 
 
+def test_the_published_prune_is_not_world_readable(tmp_path, upstream):
+    """`mkdtemp` gives 0700, but the build rmtree'd that directory so `git
+    clone` could create it fresh -- under the umask -- and `os.replace`
+    published THAT as the permanent cache. The exposure is the whole cached
+    repository, forever, not the build window; it matters the moment the
+    task repos are private.
+
+    The umask is pinned to 0 so the verdict is a property of this repository
+    rather than of the laptop -- under a 077 umask the defect is invisible.
+    os.umask is process-global, so this test is not xdist-safe; the suite
+    runs serially today, and this line is the notice if that changes.
+
+    WHAT THIS DOES NOT COVER: `ensure_mirror`'s full mirror sits in the same
+    cache directory at the umask's mercy and holds a superset of these
+    objects, including the merged fix. That exposure is recorded in
+    HANDOFF.md's open list, not silently closed here."""
+    from bakeoff.tasks import pruned_mirror_path
+
+    cache = tmp_path / "cache"
+    task = load_task(_write_task(tmp_path / "set", upstream))
+    old_umask = os.umask(0)
+    try:
+        materialize(task, tmp_path / "run" / "repo", cache)
+    finally:
+        os.umask(old_umask)
+
+    pruned = pruned_mirror_path(str(upstream["path"]), upstream["base"], cache)
+    assert (pruned.stat().st_mode & 0o777) == 0o700
+
+
 def test_a_base_sha_off_the_default_branch_materializes(tmp_path, upstream):
     """`base_sha` is often not on the default branch -- a release branch, a
     merge parent. Retargeting `main` at it anyway would show the agent history

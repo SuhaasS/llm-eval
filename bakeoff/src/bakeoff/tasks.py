@@ -1173,9 +1173,13 @@ def _build_pruned_mirror(source: Path, dest: Path, base_sha: str) -> Path:
         dir=dest.parent, prefix=f"{scoped}{os.getpid()}-", suffix=".tmp"
     ))
     try:
-        # mkdtemp created it; clone refuses a non-empty target and tolerates an
-        # empty one only if it does not exist.
-        shutil.rmtree(tmp)
+        # The clone goes INTO mkdtemp's directory, keeping its 0700: an
+        # earlier revision rmtree'd it first on the claim that clone
+        # "tolerates an empty target only if it does not exist" -- measured
+        # false (git 2.50.1 clones into an existing empty directory, rc=0,
+        # mode kept) -- so the clone recreated it under the umask and
+        # os.replace published a world-readable cache, permanently.
+        #
         # `--dissociate` absorbs any borrowed object store instead of inheriting
         # the pointer to it. Measured, git 2.50.1: accepted without
         # `--reference`; 0.02 s and the pack still hardlinked (nlink 2) when
