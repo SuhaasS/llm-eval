@@ -1272,6 +1272,22 @@ MUTATIONS = [
         "not integration",
     ),
     (
+        # text=True decodes with the harness locale and errors='strict', so
+        # one latin-1 byte in git output -- or LC_ALL=C on the CI runner --
+        # crashed every git call with a UnicodeDecodeError naming neither
+        # the repo nor the task. The pinned encoding is one keyword pair; a
+        # refactor that "simplifies" it back to text=True is byte-for-byte
+        # this mutation.
+        "tasks: decode git output with the locale instead of pinned utf-8",
+        "src/bakeoff/tasks.py",
+        '        ["git", *args], cwd=cwd, capture_output=True,\n'
+        '        encoding="utf-8", errors="replace", env=full_env, input=input,',
+        '        ["git", *args], cwd=cwd, capture_output=True, text=True,\n'
+        '        env=full_env, input=input,',
+        "tests/test_tasks.py -k locale_cannot_decode",
+        "not integration",
+    ),
+    (
         # Schema 3.8.0. Every one of the next six used to destroy the record
         # outright or, worse, publish something false in its place.
         "finalize: let a failing finalize step take the record with it",

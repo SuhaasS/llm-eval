@@ -693,6 +693,53 @@ def test_a_failed_publish_raises_a_named_taskerror(tmp_path, upstream, monkeypat
         "a failed publish stranded a build the finally block should reclaim"
 
 
+def _pack_a_latin1_ref(repo: Path, sha: str) -> None:
+    # packed-refs is a plain file, so it takes ref-name bytes APFS refuses
+    # as a loose-ref filename (measured: `git tag caf\xe9` exits 128
+    # "Illegal byte sequence" on APFS, while this file round-trips).
+    with (repo / ".git" / "packed-refs").open("ab") as refs:
+        refs.write(f"{sha} refs/tags/caf".encode() + b"\xe9\n")
+
+
+def test_git_output_survives_bytes_the_locale_cannot_decode(tmp_path, upstream):
+    """`text=True` decodes with the harness process's locale encoding and
+    errors='strict', so one non-UTF-8 byte in git output -- a latin-1 ref
+    name here -- turned any git call into a raw UnicodeDecodeError naming
+    neither the repo nor the task. (A CI runner whose own LC_ALL=C makes the
+    same crash out of plain UTF-8 output; pinning the encoding closes both.)
+    """
+    from bakeoff.tasks import _git
+
+    _pack_a_latin1_ref(upstream["path"], upstream["base"])
+
+    out = _git("for-each-ref", "--format=%(refname)", cwd=upstream["path"])
+    assert "caf�" in out.stdout
+
+
+def test_a_ref_the_decode_mangled_is_refused_not_leaked(tmp_path, upstream):
+    """Replacement is survivable only because the object sweep backstops it,
+    and this pins the chain. The ref sweep deletes by DECODED name, and
+    `git update-ref --stdin` exits 0 deleting a ref that does not exist
+    (measured, git 2.50.1) -- so a latin-1 ref pointing outside base_sha's
+    history survives the sweep, keeps the future alive through the gc, and
+    `_verify_pruned` refuses the mirror. An earlier claim that the mangled
+    ref "gets deleted, which is the safe direction" was measured false; the
+    safe direction is this loud refusal.
+
+    Verified end-to-end 2026-08-14, darwin/APFS, git 2.50.1: `git clone
+    --mirror` writes the refs PACKED -- zero loose ref files, so the latin-1
+    name never touches an APFS filename -- the pruned clone inherits the
+    ref, the decoded-name delete exits 0 touching nothing, the gc keeps the
+    head commit, and `_verify_pruned` raises `1 commit(s) outside ...
+    survived the prune`."""
+    _pack_a_latin1_ref(upstream["path"], upstream["head"])
+
+    task = load_task(_write_task(tmp_path / "set", upstream))
+
+    with pytest.raises(TaskError, match="survived the prune"):
+        materialize(task, tmp_path / "run" / "repo", tmp_path / "cache")
+
+
 def test_a_base_sha_off_the_default_branch_materializes(tmp_path, upstream):
     """`base_sha` is often not on the default branch -- a release branch, a
     merge parent. Retargeting `main` at it anyway would show the agent history

@@ -685,8 +685,15 @@ def _git(*args: str, cwd: Path | None = None, env: dict[str, str] | None = None,
          input: str | None = None) -> subprocess.CompletedProcess:
     full_env = {**os.environ, **(env or {})}
     result = subprocess.run(
-        ["git", *args], cwd=cwd, capture_output=True, text=True, env=full_env,
-        input=input,
+        # utf-8 with replacement, never the locale: text=True made one
+        # non-UTF-8 byte in git output -- or LC_ALL=C in the harness's own
+        # environment -- raise UnicodeDecodeError out of any git call,
+        # naming neither the repo nor the task. A replaced ref name is NOT
+        # deleted by the ref sweep (update-ref --stdin exits 0 on a
+        # nonexistent name, measured); it survives to _verify_pruned's
+        # object sweep, which refuses the mirror -- loud, not leaked.
+        ["git", *args], cwd=cwd, capture_output=True,
+        encoding="utf-8", errors="replace", env=full_env, input=input,
     )
     if check and result.returncode != 0:
         raise TaskError(
