@@ -106,6 +106,15 @@ event log is append-only, the *directory* of event logs is not.
 Candidate cache pricing — gemma and kimi both priced `null` again on
 2026-08-13. Every P3 decision. The repricing of the pre-3.0.0 archive.
 
+### The pruned-mirror cache has its own open list
+
+Six comments and docstrings that misdescribe the code, plus six deferred items
+(no lock in `src/`, unbounded memory in the object sweep, locale-strict git
+decoding, cache directory mode, two uncovered IO paths, one unanchored
+assertion). None can hand the agent the answer; all are in
+[HANDOFF.md](HANDOFF.md) with file:line, because that subsystem has been wrong
+three times in the same way and the traps are worth not re-deriving.
+
 ### Read every pre-2026-08-13 figure with the pyc caveat
 
 Keyed on `versions.container_image_digest`, which is what `--allow-mixed-images`

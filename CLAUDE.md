@@ -157,6 +157,7 @@ These are enforced in code and asserted by tests. Breaking one is usually silent
 | File | Role |
 |---|---|
 | [TASKS.md](TASKS.md) | **The backlog.** Open work only, P0–P3. |
+| [HANDOFF.md](HANDOFF.md) | The pruned-mirror cache: what is still wrong in it, what was deferred, and the five fixes already tried and measured to be worse than the bug. Read before touching `ensure_pruned_mirror`. |
 | [tasks/todo.md](tasks/todo.md) | Completed-work review log, one section per finished task. Not a backlog. |
 | [specs/2026-08-03-llm-bakeoff-eval-design.md](docs/superpowers/specs/2026-08-03-llm-bakeoff-eval-design.md) | The spec every `section N.N` reference in the code points at. |
 | [plans/2026-08-04-bakeoff-harness-logging.md](docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md) | Implementation plan, Tasks 1–12. |
