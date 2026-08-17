@@ -191,6 +191,15 @@ Closeout verification, 2026-08-14, all four gates in sequence on a clean tree:
   second fd, expected refused); the published pruned mirror is 0700 under a
   pinned umask; a latin-1 ref pointing outside `base_sha`'s history is refused
   loudly by the object sweep, end-to-end.
+- A live 4-arm run (2026-08-17, event log `eventlog-closeout-20260817`,
+  credentials from env keys, mantle token derived from the SigV4 session):
+  4/4 records, no exclusions, `wire_unattributed: 0` and `isolated: true` on
+  every arm, provider finish reasons captured, and the pruned mirror's object
+  sweep clean — `rev-list --all` == `rev-list base_sha` == the store's commit
+  count, so the fix is unreachable in every run tree. The run also caught the
+  closeout's own gap: the cached mirror predated the 0700 fix and was served
+  at 755, because mode is not a fast-path check — hence `_PRUNE_VERSION` 3,
+  which rebuilt it at 0700, marker `3`, still pruned.
 
 **What that does not establish.** Nothing here says a model can solve the task —
 `outcome` never becomes `RESOLVED` at harness time by design, and the offline

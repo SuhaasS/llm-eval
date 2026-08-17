@@ -168,3 +168,13 @@ These are enforced in code and asserted by tests. Breaking one is usually silent
 Current state: Tasks 1–11 complete, Task 12's offline half done, Gate 0 (every CAPTURE-class observability gap) closed at schema 3.3.0, Gate 1's harness half at 3.5.0, the credential-expiry blind spot at 3.6.0, and the provider finish reason, the `host` block and collection identity at 3.7.0. See `TASKS.md` for the live half — it is the current record, and it moves faster than this line.
 
 **Read every Phase 0c capability figure with this caveat: none of them were taken in an environment where the agent could run tests.** The eval image shipped no `pytest` and the fixture was not importable, so the only verification command available raised `ModuleNotFoundError` with the bug fixed and unfixed alike. Fixed 2026-08-12; every arm should be re-measured before a number is published. Four of the "model failures" found so far turned out to be adapter or environment defects with one-line causes — weigh that before reading the next one as capability.
+
+## graphify
+
+This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
+
+Rules:
+- For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
+- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
+- Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
+- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).

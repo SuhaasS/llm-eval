@@ -804,7 +804,12 @@ def ensure_mirror(repo_url: str, base_sha: str, cache_root: Path) -> Path:
 # prune changes what it removes, or an older revision's output is served
 # forever -- which is the silent-wrong-cache failure `ensure_mirror` re-checks
 # on every call to avoid.
-_PRUNE_VERSION = "2"
+#
+# 3: the 0700 publish. Mode is not something the fast path checks, so without
+# the bump every mirror built before the rmtree fix stays at the umask
+# forever -- found live: the first post-fix collection served a cached 755
+# mirror while every new build came out 0700.
+_PRUNE_VERSION = "3"
 _PRUNE_MARKER = "bakeoff-prune-version"
 
 # What `git clone --mirror --local` HARDLINKS from the source and `gc` does not

@@ -2115,3 +2115,19 @@ mutates tasks.py in place, and the neighbouring suite fails against source
 it never shipped. Remainder (unanchored materialize assertion, full-mirror
 umask mode, images.py's unlocked git archive) recorded in HANDOFF.md and
 TASKS.md, not silently closed.
+
+## Live run of the closeout — 2026-08-17
+
+- [x] `run_matrix --mode live --repeats 1` into a fresh event log
+      (`eventlog-closeout-20260817`), credentials from env keys in
+      bakeoff/.env (AWS_PROFILE commented out so botocore does not prefer
+      the SSO profile over the static pair; mantle token derived from the
+      SigV4 session, len 1984). 4/4 records, exit 0, ~$0.53 priced spend.
+- [x] Every record: no exclusion, wire_unattributed 0, isolated true,
+      terminal_finish_reason captured, collection_id stamped.
+- [x] Object sweep on the served mirror: rev-list --all == rev-list base
+      == commit count (3130) — the fix unreachable.
+- [x] Found live: the cached pre-fix mirror was served at 755 — mode is
+      not a fast-path check, so the 0700 fix never reached existing
+      caches. _PRUNE_VERSION bumped to 3; rebuild verified 0700, marker 3,
+      still pruned. 543 tests, 26/26 tasks: mutations after the bump.
