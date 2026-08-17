@@ -290,22 +290,67 @@ def test_a_declared_grading_section_parses_as_argv(tmp_path, upstream):
     [
         ('grading:\n  lint: "ruff check ."', r"grading\.lint"),
         ("grading:\n  build: {make: all}", r"grading\.build"),
-        # The whole section as a scalar, which no key-level check reaches.
-        ("grading: ruff", "grading must be a mapping"),
     ],
 )
 def test_a_grading_key_that_is_not_argv_is_refused_at_load(
     tmp_path, upstream, block, match
 ):
     """A shell string is the shape an author reaches for, and it is the one
-    that survives quietly: `"ruff check ."` is iterable, so a loader that only
-    stored it hands the grader a three-element argv of `r`, `u`, `f` -- an
-    exec failure recorded as a lint verdict against the submission, in a
-    per-record grade nobody re-derives."""
+    that survives quietly: `"ruff check ."` is iterable, so a loader that
+    only stored it hands the grader `tuple("ruff check .")` -- one argv
+    element per CHARACTER. That is an exec failure recorded as a lint verdict
+    against the submission, in a per-record grade nobody re-derives."""
     task_dir = _write_task(tmp_path / "set", upstream, extra_yaml=block)
 
     with pytest.raises(TaskError, match=match):
         load_task(task_dir)
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        "grading: ruff",
+        # Falsy non-mappings, and the reason `or {}` is not good enough: each
+        # of these is a section the author wrote and the loader would read as
+        # one they never wrote.
+        "grading: []",
+        "grading: ''",
+        "grading: 0",
+    ],
+)
+def test_a_grading_section_that_is_not_a_mapping_is_refused_at_load(
+    tmp_path, upstream, block
+):
+    """No key-level check reaches these -- there are no keys. `data.get(k) or
+    {}` cannot tell them from absent, so `grading: []` (the shape an author
+    who started a list and never wrote the keys leaves behind) would load as
+    a task declaring nothing and grade `not_configured` on all three checks,
+    forever, in an append-only store."""
+    task_dir = _write_task(tmp_path / "set", upstream, extra_yaml=block)
+
+    with pytest.raises(TaskError, match="grading must be a mapping"):
+        load_task(task_dir)
+
+
+def test_a_misspelled_grading_key_is_refused_rather_than_dropped(
+    tmp_path, upstream
+):
+    """The one failure preflight structurally cannot catch. Preflight asserts
+    the DECLARED argvs run in the image, and a key typo declares nothing --
+    `linter:` yields `TaskGrading((), (), ())`, which is byte-identical to a
+    task with no linter. So the check goes NOT_CONFIGURED on every arm, every
+    sample, and the manifest says otherwise in plain sight. A manifest asking
+    for something the loader does not know is a load error, not a silent
+    skip, and the message has to name the allowed set or the author's next
+    guess is another typo."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream, extra_yaml='grading:\n  linter: ["ruff"]'
+    )
+
+    with pytest.raises(TaskError, match="unknown grading key") as excinfo:
+        load_task(task_dir)
+    assert "linter" in str(excinfo.value)
+    assert "typecheck" in str(excinfo.value), "the message must name the allowed set"
 
 
 # --- provenance --------------------------------------------------------------

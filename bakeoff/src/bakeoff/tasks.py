@@ -43,6 +43,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
+from dataclasses import fields as dataclass_fields
 from pathlib import Path, PurePosixPath
 from typing import Any
 from uuid import uuid4
@@ -150,6 +151,13 @@ class TaskGrading:
     build: tuple[str, ...] = ()
     typecheck: tuple[str, ...] = ()
     lint: tuple[str, ...] = ()
+
+
+#: The keys `grading:` accepts, derived from the dataclass so the two cannot
+#: drift. A hand-listed copy would go stale the first time a check is added,
+#: and the failure of a stale list is the silent one: the new key is refused
+#: on a manifest that is correct.
+_GRADING_KEYS = tuple(f.name for f in dataclass_fields(TaskGrading))
 
 
 @dataclass(frozen=True)
@@ -613,15 +621,32 @@ def load_task(task_dir: Path, set_commit: str = "") -> TaskManifest:
     budget_raw = data.get("budget") or {}
     if not isinstance(budget_raw, dict):
         raise TaskError(f"{where}: budget must be a mapping")
-    # Optional: absent is `not_configured`, not an error. The per-key argv
-    # check is `_strs` below and it is the whole validation here -- whether
-    # the declared commands RUN is preflight's question, asked inside the
-    # image rather than on the host. `manifest_digest` needs no change: it
-    # hashes the raw manifest bytes, so declaring or editing this section
-    # already invalidates the task's preflight cache entry.
-    grading_raw = data.get("grading") or {}
+    # Optional: absent is `not_configured`, not an error. Whether the declared
+    # commands RUN is preflight's question, asked inside the image rather than
+    # on the host. `manifest_digest` needs no change: it hashes the raw
+    # manifest bytes, so declaring or editing this section already invalidates
+    # the task's preflight cache entry.
+    #
+    # `is None`, NOT `or {}`: `grading: []` is what an author who started a
+    # list and never wrote the keys leaves behind, and `or {}` reads it as a
+    # section they never wrote -- three checks recorded `not_configured`
+    # against a manifest that plainly asks for them.
+    grading_raw = data.get("grading")
+    if grading_raw is None:
+        grading_raw = {}
     if not isinstance(grading_raw, dict):
         raise TaskError(f"{where}: grading must be a mapping")
+    # A misspelled key is the one shape preflight cannot catch: its assertion
+    # covers the DECLARED argvs, and `linter:` declares nothing, so the task
+    # grades `not_configured` on every arm and every sample while the manifest
+    # says otherwise. `str(k)` because a YAML key need not be a string and
+    # sorting a mixed set raises TypeError from inside the error path.
+    unknown = sorted(str(k) for k in set(grading_raw) - set(_GRADING_KEYS))
+    if unknown:
+        raise TaskError(
+            f"{where}: unknown grading key(s) {unknown}; allowed: "
+            f"{list(_GRADING_KEYS)}"
+        )
 
     if not reference_path.exists():
         raise TaskError(f"{reference_path}: no reference diff")
