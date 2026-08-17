@@ -1595,6 +1595,23 @@ MUTATIONS = [
         "not integration",
     ),
     (
+        # `materialize` writes the index on the HOST and the ladder applies
+        # inside the container. `git apply --index` compares CACHED STAT DATA
+        # (`ce_match_stat`), not content, and virtiofs reports `st_dev`,
+        # `st_ino`, `st_uid` and `st_gid` differently on the two sides --
+        # measured against the real click task, EVERY submission including the
+        # reference fix came back `does not match index` on a clean tree while
+        # plain `git apply` succeeded in the same container. `APPLY_FAILED` is
+        # a GradeFailure, so that is a permanent `resolved: False` accusing the
+        # model over an environment difference it never saw.
+        "grader: grade with the stat cache lying about the tree",
+        "src/bakeoff/grader.py",
+        "            _refresh_index(container)",
+        "            pass",
+        "tests/test_grader.py -k stat_cache_is_refreshed",
+        "not integration",
+    ),
+    (
         # gitleaks' DEFAULT leak code is 1 and 1 is also its ERROR code, which
         # is the whole reason `--exit-code 42` is passed. Reading 1 as a
         # finding files a scanner that could not read its input as a section 7

@@ -408,6 +408,16 @@ def preflight(
         patch = Path(repo_path) / ".bakeoff-solution.patch"
         patch.write_text(task.solution_diff)
         try:
+            # NO `--index`, and its ABSENCE is load-bearing. `materialize`
+            # writes this tree's index on the HOST; `git apply --index`
+            # compares the index's CACHED STAT DATA rather than content
+            # (`ce_match_stat`), and virtiofs reports `st_dev`, `st_ino`,
+            # `st_uid` and `st_gid` differently inside the container -- so
+            # `--index` refuses a patch that applies, on a clean tree, and
+            # preflight would NO-GO every task on a Docker Desktop host.
+            # Nothing here needs the patch staged, so nothing here needs the
+            # refresh `grader._refresh_index` performs for the one call site
+            # that does.
             applied = container.exec(["git", "apply", ".bakeoff-solution.patch"])
         finally:
             patch.unlink(missing_ok=True)

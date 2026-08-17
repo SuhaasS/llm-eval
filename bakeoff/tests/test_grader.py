@@ -1279,7 +1279,7 @@ def test_the_scan_dir_is_allocated_under_cache_root_not_the_system_temp_dir(
             # ladder applies anything: `materialize` writes that index on the
             # HOST, and `git apply --index` compares CACHED STAT DATA, which
             # virtiofs reports differently on the two sides. See
-            # `grader._refresh_index`.
+            # `grader._refresh_index`, and the test below for the pin.
             return SimpleNamespace(exit_code=0, stdout="", stderr="")
 
     monkeypatch.setattr(grader, "materialize", lambda *a, **kw: START_SHA)
@@ -1296,6 +1296,117 @@ def test_the_scan_dir_is_allocated_under_cache_root_not_the_system_temp_dir(
               cache_root, tmp_path / "art")
 
     assert seen["scan_root"] == cache_root / "grade-scan"
+
+
+def test_the_stat_cache_is_refreshed_before_the_ladder_applies(
+    monkeypatch, tmp_path
+):
+    """`materialize` writes the index on the HOST; the ladder applies inside
+    the container.
+
+    `git apply --index` does NOT compare content -- `apply.c`'s
+    `verify_index_match` calls `ce_match_stat`, which compares the index's
+    cached `st_dev`, `st_ino`, `st_uid`, `st_gid`, `st_size` and `st_mtime`
+    against the file. Through Docker Desktop's virtiofs the first four differ
+    between the two sides, so measured 2026-08-17 against the real click task
+    EVERY graded submission -- including `task.solution_diff` verbatim -- came
+    back `error: <path>: does not match index` on a clean tree, while plain
+    `git apply` succeeded in the same container on the same tree.
+
+    That grades as `APPLY_FAILED`, which is a `GradeFailure`: a permanent
+    `resolved: False` accusing the model over an environment difference it
+    never saw, in an append-only store, on every arm.
+
+    ORDER IS THE ASSERTION, not presence. A refresh after `run_ladder` is a
+    refresh the apply never saw, and a test that only checked the argv was in
+    the list would pass against it. `tests/test_integration_grader.py` proves
+    the same thing against a real container, but that file is `task_image` and
+    the section 6.6 gate does not run it -- so without this the fix has no
+    offline pin at all, and deleting `_refresh_index` left the whole offline
+    suite green (measured).
+    """
+    import bakeoff.grader as grader
+
+    events: list = []
+
+    class RecordingContainer:
+        def __init__(self, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def exec(self, argv, env=None):
+            events.append(list(argv))
+            return SimpleNamespace(exit_code=0, stdout="", stderr="")
+
+    monkeypatch.setattr(grader, "materialize", lambda *a, **kw: START_SHA)
+    monkeypatch.setattr(grader, "RunContainer", RecordingContainer)
+    monkeypatch.setattr(
+        grader, "run_ladder",
+        lambda record, task, oracle, env, start_sha: (
+            events.append("run_ladder"), _ladder()
+        )[1],
+    )
+
+    grade_run(_record(), _task(), "sha256:image", _oracle(),
+              tmp_path / "cache", tmp_path / "art")
+
+    refresh = ["git", "update-index", "--refresh"]
+    assert refresh in events, (
+        "the graded tree's index was never re-stat'd inside the container, so "
+        "`git apply --index` compares the host's stat data and refuses a patch "
+        f"that applies: {events}"
+    )
+    assert events.index(refresh) < events.index("run_ladder")
+
+
+def test_an_index_that_cannot_be_refreshed_stops_the_grade(monkeypatch,
+                                                           tmp_path):
+    """A failed refresh RAISES rather than falling through to the ladder.
+
+    The fallback for swallowing it is the accusation itself: an unrefreshed
+    index is exactly the stale stat cache the refresh exists to clear, so the
+    apply fails and `APPLY_FAILED` blames the model for the grader's
+    environment. `grade.py` contains the raise per record -- `grade_event_log`
+    puts the run in the `errors` bucket and exits 1 -- so the cost of refusing
+    is one named, counted, re-runnable row.
+
+    Unreachability is the argument FOR raising: on a tree `materialize` just
+    built and `git clean -xfd`'d nothing can differ, and a condition that
+    cannot occur has no honest verdict waiting behind it if it does.
+    """
+    import bakeoff.grader as grader
+    from bakeoff.container import ContainerError
+
+    class BrokenContainer:
+        def __init__(self, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def exec(self, argv, env=None):
+            return SimpleNamespace(
+                exit_code=1, stdout="", stderr="src/calc.py: needs update")
+
+    monkeypatch.setattr(grader, "materialize", lambda *a, **kw: START_SHA)
+    monkeypatch.setattr(grader, "RunContainer", BrokenContainer)
+    monkeypatch.setattr(
+        grader, "run_ladder",
+        lambda *a, **kw: pytest.fail("the ladder ran on an unrefreshed index"),
+    )
+
+    with pytest.raises(ContainerError) as caught:
+        grade_run(_record(), _task(), "sha256:image", _oracle(),
+                  tmp_path / "cache", tmp_path / "art")
+    assert "needs update" in str(caught.value)
 
 
 def test_the_gitleaks_mounts_come_from_the_scan_root(monkeypatch, tmp_path):

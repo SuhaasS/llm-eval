@@ -310,9 +310,18 @@ def _output(grade, name: str) -> str:
 
 
 def _passed(text: str) -> int:
-    found = _PASSED.search(text)
+    """How many items pytest reported passing, from the LAST match.
+
+    `findall()[-1]`, not `search()`. The captured output is a whole suite's
+    stdout, and click's own tests drive `CliRunner`, which echoes program
+    output into it -- a fixture whose expected text contains `N passed` would
+    be matched by `search` in preference to the summary line pytest prints at
+    the end. The summary is always last, so the last match is the only one
+    that is reliably the summary.
+    """
+    found = _PASSED.findall(text)
     assert found, f"no pytest summary line to count in:\n{text[-2000:]}"
-    return int(found.group(1))
+    return int(found[-1])
 
 
 # ---------------------------------------------------------------------------
@@ -454,8 +463,15 @@ def test_a_weakened_test_is_restored_and_fails_f2p(click_task, click_image,
                       derived_oracle.oracle, grader_cache, tmp_path)
 
     assert grade.resolved is False
-    assert grade.grade_failure == GradeFailure.F2P_FAILED.value
-    assert grade.environment_error is None, grade.environment_error
+    # `environment_error` rides in the MESSAGE, not in an assert of its own: a
+    # `grade_failure` and an environment refusal are mutually exclusive by
+    # construction (`_State.environment` sets `not_graded_reason` and leaves
+    # `grade_failure` `None`), so a separate `is None` line below this one
+    # could never fail and would read as a check that had been made.
+    assert grade.grade_failure == GradeFailure.F2P_FAILED.value, (
+        f"environment_error={grade.environment_error}, "
+        f"not_graded_reason={grade.not_graded_reason}"
+    )
     assert grade.agent_modified_tests is True
 
     restore = _check(grade, "test_restore")
@@ -555,8 +571,13 @@ def test_a_planted_secret_is_found_by_a_scanner_that_saw_the_input(
         "scanner was handed nothing and every section 7 pass in this suite is "
         f"manufactured. detail: {_check(grade, 'secret_scan').detail}"
     )
-    assert grade.grade_failure == GradeFailure.SECRET_FOUND.value
-    assert grade.environment_error is None, grade.environment_error
+    # Same fold as the weakened case: a `grade_failure` and an environment
+    # refusal cannot both be set, so `environment_error is None` on its own
+    # line is an assert that cannot fail.
+    assert grade.grade_failure == GradeFailure.SECRET_FOUND.value, (
+        f"environment_error={grade.environment_error}, "
+        f"not_graded_reason={grade.not_graded_reason}"
+    )
 
     # It got there by passing the rungs below, which is what makes the verdict
     # a statement about the secret rather than about a broken submission.

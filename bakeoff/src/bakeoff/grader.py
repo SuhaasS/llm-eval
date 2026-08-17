@@ -48,7 +48,10 @@ And three measurement absences that are not failures at all:
 * `p2p_deselected is None` -- no pytest summary line was found. `0` is an
   OBSERVATION: pytest prints no `deselected` token at zero (measured), and a
   wholly stale quarantine on the explicit branch would otherwise render as
-  "not measured" when it is the total loss worth seeing.
+  "not measured" when it is the total loss worth seeing. It counts EVERY
+  deselection pytest performed, including the ones the task's own config asked
+  for, so comparing it against `p2p_deselect_requested` detects staleness only
+  while the grader is the sole source of deselections -- see `_check_p2p`.
 
 WHAT IS NOT DECIDED HERE
 ------------------------
@@ -72,7 +75,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from bakeoff.container import RunContainer
+from bakeoff.container import ContainerError, RunContainer
 from bakeoff.grade_schema import (
     CHECK_ORDER,
     CheckResult,
@@ -104,7 +107,15 @@ from bakeoff.tasks import (
 #: graded under the current grader is skipped -- so it must move with any
 #: change to what a check means. `grader_commit` on every record is the
 #: evidence that the gate was honest.
-GRADER_VERSION: str = "1"
+#:
+#: 1 -> 2: `_refresh_index`. Check 5's verdict changed on every host whose
+#: container sees different stat data than the process that wrote the index --
+#: which is every Docker Desktop host -- from `APPLY_FAILED` to whatever the
+#: submission actually deserves. That is a change to what a check MEANS, so
+#: the version moves whether or not anything was graded under 1: a stored
+#: grade the resume gate skipped for agreeing with "the current grader" would
+#: otherwise be one this grader disagrees with.
+GRADER_VERSION: str = "2"
 
 #: Wall clock for one graded command, applied by coreutils `timeout` INSIDE
 #: the container. `RunContainer.exec` blocks with no timeout of its own and
@@ -927,6 +938,18 @@ def _check_p2p(state: _State, task, env, oracle: Oracle | None) -> None:
     # ITEMS, and they coincide only because preflight's `missing` check forces
     # the f2p ids to be leaves. A shortfall is staleness; equality is not
     # freshness.
+    #
+    # AND THE DETECTOR IS VACUOUS ON A TASK THAT DESELECTS ITSELF. The measured
+    # number is every deselection pytest made, the grader's `--deselect` flags
+    # and the task's own config alike -- measured on `pallets/click`, whose
+    # `addopts = "-m 'not stress'"` reports 30,007 against 7 requested, so no
+    # stale id can ever drag the total under the floor. The floor claim stays
+    # honest (a shortfall IS staleness, whatever produced the surplus); what
+    # goes away is its power to fire. `p2p_deselect_requested` is recorded
+    # beside it rather than subtracted from it, because the split between the
+    # two sources is not observable from the summary line -- and the offline
+    # view, which can see one task's numbers across every arm, is where a
+    # constant surplus is readable as configuration rather than as drift.
     state.p2p_deselected = parse_deselected(result.stdout)
 
     if code == EXIT_ALL_PASSED:
@@ -1448,18 +1471,39 @@ def _refresh_index(container: RunContainer) -> None:
     patch did not work -- lands on every submission of every arm, in an
     append-only store, from an environment difference the model never saw.
 
-    The refresh is silent about its exit code on purpose. Non-zero means some
-    file's CONTENT genuinely differs from the index, which cannot happen on a
-    tree `materialize` just built and `git clean -xfd`'d; if it somehow does,
-    the entry stays unrefreshed and the apply below reports it, which is the
-    right answer rather than a second opinion about it.
+    WHICH IS WHY A FAILED REFRESH RAISES. The exit code was discarded in the
+    first version of this function, on the argument that non-zero means some
+    file's CONTENT genuinely differs from the index and that cannot happen on
+    a tree `materialize` just built and `git clean -xfd`'d. The argument is
+    sound and it points the other way: the fallback for a silent failure is
+    the accusation above. A refresh that did not happen leaves exactly the
+    stale stat cache this function exists to clear, so the apply fails, and
+    `APPLY_FAILED` blames the model for the grader's own environment -- the
+    one outcome every other environment-caused apply failure in this module is
+    deliberately routed away from (`_apply_submission` sends a parse failure
+    down the environment path for precisely this reason).
+
+    Unreachability is the argument FOR raising, not for swallowing: a
+    condition that cannot occur costs nothing to refuse and, if it ever does
+    occur, has no honest verdict behind it. `grade.py` contains this per
+    record -- `grade_event_log`'s `except Exception` puts the run in the
+    `errors` bucket and exits 1 -- so the cost of being wrong here is one
+    named, counted, re-runnable row, against a permanent false accusation.
 
     Not folded into `_apply`: the stale stat cache is a property of the
     host-written index, true for the whole life of this tree, and `_apply` is
     reached through the `env` seam that exists so `run_ladder` needs no
     container.
     """
-    container.exec(["git", "update-index", "--refresh"])
+    result = container.exec(["git", "update-index", "--refresh"])
+    if result.exit_code != 0:
+        raise ContainerError(
+            "could not refresh the graded tree's index inside the container "
+            f"(exit {result.exit_code}): {_head(result)}. The index was "
+            "written on the host, so `git apply --index` would compare stat "
+            "data the container reports differently and refuse a patch that "
+            "applies -- which grades as APPLY_FAILED, against the model."
+        )
 
 
 def _gated_result(gate: tuple[NotGradedReason, str]) -> LadderResult:

@@ -246,6 +246,17 @@ def _derive(task, image: str, cache_root: Path, timeout_s: int) -> tuple[str, ..
             patch = tree / "repo" / ".bakeoff-solution.patch"
             patch.write_text(task.solution_diff)
             try:
+                # NO `--index`, deliberately. The index under this tree was
+                # written by `materialize` on the HOST, and `git apply
+                # --index` compares the index's cached STAT DATA rather than
+                # content (`ce_match_stat`) -- `st_dev`, `st_ino`, `st_uid`
+                # and `st_gid` all read differently through virtiofs, so it
+                # refuses a patch that applies and the derivation would raise
+                # "the reference fix does not apply" on every task. The
+                # quarantine needs the fix in the WORKING TREE and never in
+                # the index, so the absence costs nothing; `grade_run`, whose
+                # restore does need `--index`, pays for it with
+                # `grader._refresh_index`.
                 applied = container.exec(
                     ["git", "apply", ".bakeoff-solution.patch"])
             finally:
