@@ -5,7 +5,9 @@ Nothing here touches Docker: `derive_quarantine` takes a runner, and the
 materializes a tree and starts a container.
 """
 
+import dataclasses
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +16,7 @@ from bakeoff.oracle import (
     ORACLE_VERSION,
     Oracle,
     OracleError,
+    _derive,
     derive_quarantine,
     ensure_oracle,
     oracle_fingerprint,
@@ -73,8 +76,29 @@ def test_a_run_that_did_not_run_is_refused_rather_than_quarantining_nothing(code
 
 
 def test_the_refusal_names_the_exit_code():
-    with pytest.raises(OracleError, match="2"):
+    # `\b`-anchored: a bare "2" also matches the word "p2p", which appears in
+    # nearly every message this module raises.
+    with pytest.raises(OracleError, match=r"exited 2\b"):
         derive_quarantine(FakeRunner([(2, "")]), TESTS)
+
+
+def test_the_quarantine_is_sorted():
+    """The verdict is stored, so its ORDER has to be a property of the input.
+
+    `first ^ second` is a set, and a set of strings iterates in an order that
+    depends on PYTHONHASHSEED -- so without `sorted()` two derivations of the
+    identical quarantine write two different JSON files, and a reviewer
+    diffing the oracle cache across a rebuild sees churn that means nothing.
+
+    Six ids rather than two on purpose: this test's power against an unsorted
+    implementation is the chance that hash order is not already sorted order,
+    and with two ids that is a coin flip -- measured, a `tuple(first ^ second)`
+    mutant survived 3 of 8 seeds. With six it does not survive any.
+    """
+    ids = [f"t{n}.py::test_{c}" for n, c in enumerate("fbeadc")]
+    out = "\n".join(f"FAILED {node} - AssertionError" for node in ids)
+    got = derive_quarantine(FakeRunner([(1, out), (0, "")]), TESTS)
+    assert got == tuple(sorted(ids))
 
 
 def test_a_quarantine_that_swallows_the_whole_p2p_list_is_refused():
@@ -221,7 +245,154 @@ def test_ensure_oracle_refuses_a_tag_before_deriving(tmp_path, monkeypatch):
     assert deriver.calls == 0
 
 
+def test_a_stored_quarantine_of_the_wrong_type_re_derives(tmp_path, monkeypatch):
+    # A JSON string would become a per-character tuple, every character a
+    # --deselect argument pytest ignores, and the Oracle would be well-formed.
+    entry = tmp_path / "oracle" / "click-3360.json"
+    entry.parent.mkdir(parents=True)
+    entry.write_text(json.dumps({
+        "fingerprint": oracle_fingerprint(_task(), "sha256:img"),
+        "quarantined": "t.py::test_a",
+        "oracle_version": ORACLE_VERSION,
+    }))
+
+    deriver = _Deriver()
+    monkeypatch.setattr("bakeoff.oracle._derive", deriver)
+    got = ensure_oracle(_task(), "sha256:img", tmp_path)
+
+    assert deriver.calls == 1
+    assert got.quarantined == ("tests/test_y.py::test_flaky",)
+
+
+def test_an_empty_stored_quarantine_is_still_a_cache_hit(tmp_path, monkeypatch):
+    # `[]` is a real verdict -- two green reference runs -- and the commonest
+    # one. A truthiness check here would re-derive it on every grading pass.
+    monkeypatch.setattr("bakeoff.oracle._derive", _Deriver(()))
+    ensure_oracle(_task(), "sha256:img", tmp_path)
+
+    def _refuse(*args, **kwargs):
+        raise AssertionError("re-derived an empty verdict")
+
+    monkeypatch.setattr("bakeoff.oracle._derive", _refuse)
+    assert ensure_oracle(_task(), "sha256:img", tmp_path).quarantined == ()
+
+
 def test_oracle_is_frozen():
     oracle = Oracle(fingerprint="f", quarantined=())
-    with pytest.raises(Exception):
+    with pytest.raises(dataclasses.FrozenInstanceError):
         oracle.fingerprint = "g"
+
+
+# --- the scope _derive actually hands the runner -----------------------------
+#
+# `_derive` is one non-mechanical line: it filters tests.paths through
+# preflight's existence check instead of passing them raw, because that is the
+# filter the grader's check 6 applies and because an unfiltered absent prefix
+# makes pytest exit 4 on an input preflight deliberately tolerates. Nothing
+# else pins it -- reverting to `scope=task.tests.paths` passes every other
+# test here and would pass a click integration test too, since all of click's
+# declared prefixes exist. This is the test that fails.
+#
+# `_existing_prefixes` is left UNPATCHED on purpose: it is the code under
+# test. Only Docker and the tree are stubbed.
+
+
+class _FakeContainer:
+    """Answers `test -e` from a set of paths that exist; everything else 0."""
+
+    def __init__(self, existing):
+        self.existing = set(existing)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def exec(self, argv):
+        if argv[:2] == ["test", "-e"]:
+            code = 0 if argv[2] in self.existing else 1
+            return SimpleNamespace(exit_code=code, stdout="", stderr="")
+        return SimpleNamespace(exit_code=0, stdout="", stderr="")
+
+
+def _stub_derive_environment(monkeypatch, tmp_path, existing, results):
+    """Stub out Docker and the tree; return the runner `_derive` will use."""
+    runner = FakeRunner(results)
+    monkeypatch.setattr(
+        "bakeoff.oracle.RunContainer",
+        lambda image, repo_path, base_sha: _FakeContainer(existing),
+    )
+    monkeypatch.setattr(
+        "bakeoff.oracle._Runner", lambda container, argv, timeout_s: runner
+    )
+
+    def _fake_materialize(task, dest, cache_root):
+        Path(dest).mkdir(parents=True)
+        return "start" * 8
+
+    monkeypatch.setattr("bakeoff.oracle.materialize", _fake_materialize)
+    return runner
+
+
+def _derive_task(paths, p2p=()):
+    return SimpleNamespace(
+        task_id="click-3360",
+        solution_diff="diff --git a/x b/x\n",
+        tests=SimpleNamespace(
+            f2p=("tests/test_x.py::test_a",),
+            p2p=p2p,
+            paths=paths,
+            runner=("python", "-m", "pytest", "-q"),
+        ),
+    )
+
+
+def test_the_quarantine_is_derived_only_over_prefixes_that_exist(
+    tmp_path, monkeypatch
+):
+    runner = _stub_derive_environment(
+        monkeypatch, tmp_path, existing={"tests/"}, results=[(0, ""), (0, "")]
+    )
+    task = _derive_task(paths=("tests/", "docs/"))
+
+    assert _derive(task, "sha256:img", tmp_path, 600) == ()
+    # "docs/" does not exist at the reference state. Passed raw it is a
+    # positional argument pytest cannot collect -- exit 4, which `_classify`
+    # refuses, so a task preflight passed on purpose becomes ungradable.
+    assert [c["scope"] for c in runner.calls] == [("tests/",), ("tests/",)]
+
+
+def test_an_explicit_p2p_list_derives_with_no_scope(tmp_path, monkeypatch):
+    # `pass_to_pass` ignores `scope` on the explicit branch, so computing one
+    # there pays a `test -e` per prefix to build a value nothing reads.
+    runner = _stub_derive_environment(
+        monkeypatch, tmp_path, existing={"tests/"}, results=[(0, ""), (0, "")]
+    )
+    task = _derive_task(paths=("tests/",), p2p=("tests/test_x.py::test_b",))
+
+    assert _derive(task, "sha256:img", tmp_path, 600) == ()
+    assert [c["scope"] for c in runner.calls] == [(), ()]
+
+
+def test_the_derivation_tree_does_not_outlive_the_derivation(
+    tmp_path, monkeypatch
+):
+    # The tree holds the reference fix applied. preflight restores its own on
+    # the same ground; here the whole tree is disposable, so it is removed.
+    _stub_derive_environment(
+        monkeypatch, tmp_path, existing={"tests/"}, results=[(0, ""), (0, "")]
+    )
+    _derive(_derive_task(paths=("tests/",)), "sha256:img", tmp_path, 600)
+    assert not (tmp_path / "oracle-tree" / "click-3360").exists()
+
+
+def test_the_tree_is_removed_even_when_the_derivation_refuses(
+    tmp_path, monkeypatch
+):
+    _stub_derive_environment(
+        monkeypatch, tmp_path, existing={"tests/"}, results=[(2, "")]
+    )
+    with pytest.raises(OracleError):
+        _derive(_derive_task(paths=("tests/",)), "sha256:img", tmp_path, 600)
+    assert not (tmp_path / "oracle-tree" / "click-3360").exists()

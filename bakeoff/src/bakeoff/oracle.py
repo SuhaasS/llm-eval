@@ -201,6 +201,14 @@ def derive_quarantine(runner, tests, scope: tuple[str, ...] = ()) -> tuple[str, 
     quarantine = tuple(sorted(first ^ second))
 
     if tests.p2p and set(tests.p2p) <= set(quarantine):
+        # Ids against ids, which is exact only while every declared p2p entry
+        # is a LEAF node id. A declared non-leaf (a module or a class) selects
+        # many items that quarantined leaf ids can never be a superset of, so
+        # this predicate fails OPEN there -- a selection deselected down to
+        # nothing gets past it. Accepted rather than papered over: the
+        # grade-time surface is a NAMED scope_collected_nothing / exit-5
+        # record, not silence, and the leaf-shape requirement on `tests.p2p`
+        # goes into HARVESTING.md (Task 7) where the set is authored.
         raise OracleError(
             "the quarantine covers the entire declared p2p list ("
             + ", ".join(sorted(tests.p2p))
@@ -221,38 +229,54 @@ def _derive(task, image: str, cache_root: Path, timeout_s: int) -> tuple[str, ..
 
     The tree is rebuilt rather than reused: `materialize` refuses an existing
     destination on purpose (a shared tree lets one derivation start from
-    another's dirty state), and this function applies the solution diff, so a
-    left-behind tree is a tree holding the answer.
+    another's dirty state), and this function applies the solution diff. It is
+    also removed on the way OUT, on the ground preflight restores its own tree
+    on: a tree left holding the reference fix is a trap for the next caller
+    and for anyone who inspects the cache by hand. In a `finally`, because the
+    paths that leave it behind are exactly the failure paths -- a diff that
+    does not apply, a refused exit code, a red-in-both refusal.
     """
     tree = Path(cache_root) / "oracle-tree" / task.task_id
     shutil.rmtree(tree, ignore_errors=True)
     start_sha = materialize(task, tree / "repo", cache_root)
 
-    with RunContainer(image=image, repo_path=str(tree / "repo"),
-                      base_sha=start_sha) as container:
-        patch = tree / "repo" / ".bakeoff-solution.patch"
-        patch.write_text(task.solution_diff)
-        try:
-            applied = container.exec(["git", "apply", ".bakeoff-solution.patch"])
-        finally:
-            patch.unlink(missing_ok=True)
-        if applied.exit_code != 0:
-            raise OracleError(
-                "the reference fix does not apply, so there is no reference "
-                "state to derive a quarantine at: "
-                + (applied.stderr or applied.stdout).strip()[:1000]
-            )
+    try:
+        with RunContainer(image=image, repo_path=str(tree / "repo"),
+                          base_sha=start_sha) as container:
+            patch = tree / "repo" / ".bakeoff-solution.patch"
+            patch.write_text(task.solution_diff)
+            try:
+                applied = container.exec(
+                    ["git", "apply", ".bakeoff-solution.patch"])
+            finally:
+                patch.unlink(missing_ok=True)
+            if applied.exit_code != 0:
+                raise OracleError(
+                    "the reference fix does not apply, so there is no "
+                    "reference state to derive a quarantine at: "
+                    + (applied.stderr or applied.stdout).strip()[:1000]
+                )
 
-        runner = _Runner(container, task.tests.runner, timeout_s)
-        # Filtered through preflight's own existence check rather than passed
-        # raw, because that is the filter the grader's check 6 applies. A
-        # declared prefix absent at the post-fix state is an input preflight
-        # tolerates (SCOPE_PREFIX_MISSING is evidence, not a problem), and an
-        # unfiltered positional prefix makes pytest exit 4 -- which `_classify`
-        # would, correctly, refuse, turning a gradable task into an ungradable
-        # one over a path the gate deliberately let through.
-        scope = _existing_prefixes(container, task.tests.paths)
-        return derive_quarantine(runner, task.tests, scope=scope)
+            runner = _Runner(container, task.tests.runner, timeout_s)
+            # Filtered through preflight's own existence check rather than
+            # passed raw, because that is the filter the grader's check 6
+            # applies. A declared prefix absent at the post-fix state is an
+            # input preflight tolerates (SCOPE_PREFIX_MISSING is evidence, not
+            # a problem), and an unfiltered positional prefix makes pytest
+            # exit 4 -- which `_classify` would, correctly, refuse, turning a
+            # gradable task into an ungradable one over a path the gate
+            # deliberately let through.
+            #
+            # Guarded like preflight's, and for the same reason: an explicit
+            # `tests.p2p` makes `pass_to_pass` ignore `scope` entirely, so
+            # computing it there pays one `test -e` per declared prefix to
+            # build a value nothing reads.
+            scope: tuple[str, ...] = ()
+            if not task.tests.p2p:
+                scope = _existing_prefixes(container, task.tests.paths)
+            return derive_quarantine(runner, task.tests, scope=scope)
+    finally:
+        shutil.rmtree(tree, ignore_errors=True)
 
 
 def ensure_oracle(task, image: str, cache_root: Path,
@@ -273,10 +297,20 @@ def ensure_oracle(task, image: str, cache_root: Path,
             stored = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError, ValueError):
             stored = {}
-        if isinstance(stored, dict) and stored.get("fingerprint") == fingerprint:
+        quarantined = stored.get("quarantined") if isinstance(stored, dict) else None
+        # `isinstance(..., list)`, not truthiness: `tuple("t.py::test_a")` is a
+        # 13-element tuple of characters, every one of them a --deselect
+        # argument pytest ignores, and the resulting Oracle is well-formed. An
+        # empty list is a real verdict and must stay a hit, so the type is the
+        # test and `or ()` cannot be.
+        if (
+            isinstance(stored, dict)
+            and stored.get("fingerprint") == fingerprint
+            and isinstance(quarantined, list)
+        ):
             return Oracle(
                 fingerprint=fingerprint,
-                quarantined=tuple(stored.get("quarantined") or ()),
+                quarantined=tuple(quarantined),
                 # Not read back from the file: the fingerprint already pins
                 # ORACLE_VERSION, so a stored value that disagreed with it
                 # would be describing a derivation this entry is not.
@@ -286,6 +320,10 @@ def ensure_oracle(task, image: str, cache_root: Path,
     oracle = Oracle(
         fingerprint=fingerprint,
         quarantined=tuple(_derive(task, image, cache_root, timeout_s)),
+        # Explicit on this path too, so the two constructions are the same
+        # statement. Leaning on the default here and naming it there makes the
+        # cache-miss version look like it could differ from the cache-hit one.
+        oracle_version=ORACLE_VERSION,
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     # Plain write_text, not the atomic-rename dance the event log uses: this is
