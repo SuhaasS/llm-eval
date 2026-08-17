@@ -2191,3 +2191,167 @@ bytes — and `start_sha` stayed `33575cc0`, which is the useful half: a
 comment does not move the start state. Not verified: nothing here exercises
 the grader against a real image; that is Task 8's `task_image` suite, whose
 marker this task registered.
+
+## Offline grader — blocker 5 closed, the log has verdicts — 2026-08-17
+
+What was built, across Tasks 1–9 (17 commits, +7918 lines under `bakeoff/`):
+
+- [x] `grade_schema.py` — `GradeRecord`, the grader's own append-only derived
+      view, written to `<event-log>/grades/grades.jsonl` and never into the
+      log. Nulls that say which null they are: `not_graded_reason` /
+      `not_graded_detail`, `assembly_error`, `environment_error` with its
+      `environment_error_check`, and `crash_error` — four absences, four
+      fields, because `resolved: False` is an accusation against the model and
+      every way the GRADER can fail has to land somewhere that is not it.
+- [x] `oracle.py` — the manifest IS the oracle. The grader consumes the
+      declared `f2p`/`p2p` and derives only the flake quarantine, scoped by
+      `_existing_prefixes` so a quarantine derived outside the graded scope
+      cannot silently deselect nothing.
+- [x] `grader.py` — the nine-check ladder: `patch_non_empty`, `test_restore`,
+      `build`, `typecheck`, `f2p`, `p2p`, `lint`, `secret_scan`,
+      `destructive_scan`. `run_ladder` is pure over an `env` protocol, so the
+      whole ladder is unit-tested against a fake that never starts a
+      container; `grade_run` builds the production env.
+- [x] `tasks.py` — optional `grading:` section in `task.yaml`; an undeclared
+      command is `not_configured`, never a silent pass. Unknown keys and a
+      non-mapping section are refused at load.
+- [x] `preflight.py` — validates what the grader will actually run (scoped
+      p2p, the graded argvs) rather than something adjacent to it, behind a
+      versioned cache key: `PREFLIGHT_VERSION` is a key component precisely
+      so a verdict written by an older gate misses instead of being served
+      forever.
+- [x] `scripts/grade.py` — the offline batch, resumable, beside the log it
+      never touches. Restarts skip on `run_id` already present.
+- [x] Gates: 143 mutation anchors, `task_image` registered in
+      `pyproject.toml` and excluded from `verify_logger.py`'s integration leg
+      (`-m "integration and not task_image"`), so the §6.6 gate stays offline
+      and image-free.
+
+Three defects the project caught by running rather than by reasoning — each
+one would have produced a plausible, permanent, wrong verdict:
+
+- [x] **virtiofs stat cache.** `materialize` writes the index on the HOST;
+      `git apply --index` does not compare content, it compares cached stat
+      data through `ce_match_stat`, and virtiofs reports `st_dev`/`st_ino`/
+      `st_uid`/`st_gid` differently on the two sides. Every graded submission
+      failed `does not match index` on a clean tree with an appliable patch,
+      while plain `git apply` succeeded in the same container on the same
+      tree. `APPLY_FAILED` is a `GradeFailure`, so this stamped
+      `resolved: False` — the model's patch did not work — on every
+      submission of every arm, in an append-only store, over an environment
+      difference the model never saw. `_refresh_index` re-stats inside the
+      container before the ladder applies anything, and it RAISES on a
+      non-zero refresh: unreachability is the argument for refusing, since a
+      condition that cannot occur costs nothing to refuse and has no honest
+      verdict waiting.
+- [x] **gitleaks blind on `/var/folders`.** `scan_secrets` allocated its scan
+      and report dirs with a bare `tempfile.TemporaryDirectory()`. Reproduced
+      before fixing, same live-shaped AKIA key and the same pinned digest:
+      from `/var/folders/…` Docker Desktop mounts a silently EMPTY directory
+      and gitleaks reports `scanned ~0 bytes (0)` / `no leaks found` / exit 0
+      with no report reaching the host; from `$HOME/.cache` the same input
+      gives exit 42 and a report. Byte-identical to a genuine clean scan, so
+      it would have stamped `secret_scan: pass` on every record, permanently
+      — the same trap `conftest.py` already documents for repo bind mounts.
+      Fixed by mounting where Docker can see it AND by `_scan_saw_input`,
+      which refuses a clean exit without positive evidence the scanner read
+      anything: a finding needs no evidence, it IS evidence.
+- [x] **pytest 9.1.1, not the 8.3.5 the brief assumed.** The `-q` summary
+      discriminator was pinned against the eval image's real pytest. Six
+      shapes checked plus the `(0:01:01)` suffix pytest appends past 60
+      seconds, produced by running a 61-second test: anchoring at `s$` would
+      read every p2p run over a minute as "no summary line" — as NOT
+      MEASURED — on most real suites. gitleaks v8.30.1 was pinned the same
+      way: `detect --no-git --source` is GONE at that digest, `dir` is the
+      subcommand, and `--exit-code 42` collides with gitleaks' own default
+      leak code of 1, which is why a `1` is refused rather than read as a
+      finding.
+
+The live proof — `grade.py --event-log ~/.cache/bakeoff/eventlog-closeout-20260817`,
+four stored records from the 2026-08-17 live run, verbatim:
+
+```
+event log /Users/suhaassurapaneni/.cache/bakeoff/eventlog-closeout-20260817
+grades    /Users/suhaassurapaneni/.cache/bakeoff/eventlog-closeout-20260817/grades/grades.jsonl
+task set  /Users/suhaassurapaneni/Pindrop/Pindrop-llm-eval/bakeoff/taskset  (1 task(s))
+grader    version 2, commit a44f5f471c465eb515b52111807792fbe422be9c-dirty
+
+4 graded, 0 not graded, 0 errored, 0 already graded
+
+claude-sonnet-5-runtime
+  graded          1
+  resolved        1
+  not_configured  1
+  image_mismatch  0
+
+gemma-4-31b
+  graded          1
+  resolved        0
+  not_configured  1
+  image_mismatch  0
+  failed          f2p_failed: 1
+
+kimi-k2-5
+  graded          1
+  resolved        1
+  not_configured  1
+  image_mismatch  0
+
+nemotron-3-super-120b
+  graded          1
+  resolved        0
+  not_configured  1
+  image_mismatch  0
+  failed          f2p_failed: 1
+```
+
+Per record, `click-3360-write-usage-empty-args`, all four graded in image
+`sha256:8942bd4824b8…` with `image_matches_run: true`, oracle fingerprint
+`2d3031db243d…`, 7 f2p declared, `exclusion_class: None`, no
+`assembly_error`, no `crash_error`, no `environment_error`:
+
+- [x] `claude-sonnet-5-runtime` (7abb8b2a25abc2df) — **resolved true**,
+      `grade_failure: None`. 0/7 f2p failed, 0 p2p failed, 0 quarantined,
+      `agent_modified_tests: false`. The 547-byte diff was expected to fail
+      f2p and did not: it is a correct minimal fix.
+- [x] `kimi-k2-5` (960aa0e97cc82488) — **resolved true**,
+      `grade_failure: None`. 0/7 f2p failed, 0 p2p failed, 0 quarantined,
+      `agent_modified_tests: false`.
+- [x] `gemma-4-31b` (11ab9cf6527a188f) — **resolved false**,
+      `grade_failure: f2p_failed`, 1/7 f2p failed
+      (`test_help_formatter_write_usage[empty-args-long-prog]`) — and
+      `agent_modified_tests: true`. Check 2 restored the test half and the
+      f2p check then failed on the restored oracle, which is the whole point
+      of ordering `test_restore` above `f2p`.
+- [x] `nemotron-3-super-120b` (3fbe890adfa040cb) — **resolved false**,
+      `grade_failure: f2p_failed`, 7/7 f2p failed. The run hit max turns; the
+      submission does not fix the bug.
+- [x] Both resolved-true records: `p2p_deselect_requested: 7` against
+      `p2p_deselected: 30007`. Not drift — click's own
+      `addopts = "-m 'not stress'"` deselects its stress matrix, the exact
+      surplus `_check_p2p`'s comment records as measured. The floor claim
+      (`p2p_deselected < p2p_deselect_requested` is staleness) stays honest;
+      on this task it is vacuous, and the offline view is where a constant
+      surplus reads as configuration.
+- [x] The log is untouched. `index.jsonl` and all four `runs/*.json` are
+      byte-identical to their pre-grade sha256s, mtimes still Aug 16 23:xx;
+      only `grades/` is new. Re-invocation: `0 graded, 0 not graded, 0
+      errored, 4 already graded`, zero new lines, exit 0.
+
+Review: `run_matrix --preflight-only` PASS (forced past the cache: *f2p red at
+start, green after the reference; p2p green both ways; tree clean*), **744
+unit tests**, **43 integration** (the 37-selected set plus Task 8's six
+`task_image` cases), **143/143 mutations caught, 0 stale, 0 missed** on a solo
+run, `verify_logger.py` **GATE PASSED**. A leftover `wire.py` mutation from an
+interrupted earlier `mutation_check` was found dirty in the tree and reverted
+before any gate ran — the anchor list is only as good as the restore, and a
+run that dies between edit and restore leaves a source that still compiles.
+
+Not verified, and the reason to say so: **a clean four-line run is not
+evidence the gate set is right.** None of the refusal gates — crashed,
+no-turns, excluded, image mismatch, scope-collected-nothing — can fire on this
+log, because all four records are well-formed. Their witnesses are the unit
+tests and the mutation anchors, not this run. What this run proves is
+narrower and is the thing that was missing: the store now holds derived
+verdicts about models, produced offline, from stored diffs, in the pinned
+image, beside a log that was not modified to hold them.
