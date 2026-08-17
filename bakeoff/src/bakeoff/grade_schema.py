@@ -402,6 +402,9 @@ def load_grades(
 
     records: list[GradeRecord] = []
     malformed = 0
+    # errors="replace" so a torn multibyte sequence becomes U+FFFD and fails
+    # json.loads -- one COUNTED line -- rather than raising UnicodeDecodeError
+    # out of the iterator and losing every grade after it in the file.
     with open(path, encoding="utf-8", errors="replace") as handle:
         for line in handle:
             line = line.strip()

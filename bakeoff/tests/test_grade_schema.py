@@ -73,3 +73,87 @@ def test_a_malformed_line_is_counted_not_fatal(tmp_path: Path):
 def test_schema_3_10_0_is_not_below_3_9_0():
     assert schema_at_least("3.10.0", "3.9.0")
     assert not schema_at_least("2.9.0", "3.0.0")
+
+
+def test_an_unparsable_version_raises_rather_than_reading_as_old():
+    """A version that is not dotted integers is not evidence about age.
+
+    Returning False would file RECORD_SCHEMA_TOO_OLD against a record whose
+    version is merely unfamiliar -- a confident wrong reason, which is the
+    defect `not_graded_detail` exists to prevent one layer up. The caller
+    decides what to do with the raise.
+    """
+    with pytest.raises(ValueError):
+        schema_at_least("3.8.0-rc1", "3.0.0")
+
+
+def test_a_blank_line_is_damage_not_padding(tmp_path: Path):
+    """A trailing newline does not produce a blank line; a bare one is damage.
+
+    Iterating a file that ends in "\\n" yields no empty final element, so a
+    line that strips to nothing means something wrote into the grade file that
+    was not a grade. Counting it is what keeps the driver's resume gate honest:
+    a silent `continue` here turns a torn batch into a smaller-looking
+    collection that resumes cleanly and re-grades nothing.
+    """
+    p = tmp_path / "grades.jsonl"
+    p.write_text(json.dumps(_record("a").to_dict()) + "\n\n"
+                 + json.dumps(_record("b").to_dict()) + "\n")
+    records, malformed = load_grades(p)
+    assert [g.run_id for g in records] == ["a", "b"]
+    assert malformed == 1
+
+
+def test_a_json_line_that_is_not_an_object_is_counted(tmp_path: Path):
+    """`json.loads` succeeds on a scalar and on an array, so the decode-error
+    branch never sees them.
+
+    The `isinstance(data, dict)` guard is belt-and-braces and this test says so
+    rather than overclaiming: measured, `dict(123)` and `dict([1, 2])` raise
+    TypeError and `dict("a string")` raises ValueError, all of which the last
+    branch already catches, so the COUNT is the same with the guard removed.
+    What the guard buys is rejecting a shape error where the shape is known
+    instead of three exception types deep inside `from_dict`. The count is what
+    the driver's resume gate reads, and the count is what is pinned here.
+    """
+    p = tmp_path / "grades.jsonl"
+    p.write_text("123\n[1, 2]\n\"a string\"\n"
+                 + json.dumps(_record("a").to_dict()) + "\n")
+    records, malformed = load_grades(p)
+    assert [g.run_id for g in records] == ["a"]
+    assert malformed == 3
+
+
+def test_an_object_missing_required_fields_is_counted(tmp_path: Path):
+    """A hand-edited or half-written object parses as JSON and still cannot
+    become a GradeRecord. Same treatment as unparsable bytes: countable damage,
+    never a reason to lose the good grades around it."""
+    p = tmp_path / "grades.jsonl"
+    p.write_text(json.dumps({"run_id": "orphan"}) + "\n"
+                 + json.dumps(_record("a").to_dict()) + "\n")
+    records, malformed = load_grades(p)
+    assert [g.run_id for g in records] == ["a"]
+    assert malformed == 1
+
+
+def test_check_order_is_the_ladder():
+    """Pinned because the order is load-bearing twice: a later check's result
+    is meaningless once an earlier one failed, and `grade_failure` names the
+    FIRST rung that failed -- so reordering silently changes what every stored
+    grade means."""
+    assert CHECK_ORDER == (
+        "patch_non_empty", "test_restore", "build", "typecheck", "f2p",
+        "p2p", "lint", "secret_scan", "destructive_scan",
+    )
+
+
+def test_an_enum_survives_the_round_trip_as_its_plain_value():
+    """`grade_failure` is typed `str | None`, and a caller holding the enum is
+    the expected case. `to_dict` must emit the VALUE, or a reader without this
+    module sees "GradeFailure.F2P_FAILED" where the schema promises
+    "f2p_failed"."""
+    rec = _record(resolved=False, grade_failure=GradeFailure.F2P_FAILED)
+    data = rec.to_dict()
+    assert data["grade_failure"] == "f2p_failed"
+    assert json.loads(json.dumps(data))["grade_failure"] == "f2p_failed"
+    assert GradeRecord.from_dict(data).grade_failure == "f2p_failed"
