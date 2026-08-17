@@ -39,7 +39,12 @@ And three measurement absences that are not failures at all:
   circuited before test_restore reached its end.
 * `binary_chunks_dropped is None` -- the diff was not inspected for binary
   chunks, because the apply succeeded and there was nothing to classify. `()`
-  is "inspected, carried none".
+  is "inspected, carried none". It also stays `None` when binary chunks WERE
+  found and the remainder still failed to apply: nothing was dropped, because
+  nothing was graded, and a tuple there would name chunks that were removed
+  from a patch the grader then refused anyway. The `not_graded_reason` on
+  those rows (`LOSSY_DIFF_UNAPPLIABLE`) or the `APPLY_FAILED` verdict is what
+  a reader goes on.
 * `p2p_deselected is None` -- no pytest summary line was found. `0` is an
   OBSERVATION: pytest prints no `deselected` token at zero (measured), and a
   wholly stale quarantine on the explicit branch would otherwise render as
@@ -87,7 +92,13 @@ from bakeoff.preflight import (
 )
 from bakeoff.runner import harness_commit
 from bakeoff.schema import Outcome, RunRecord, Severity
-from bakeoff.tasks import TaskError, _chunk_path, diff_chunks, materialize
+from bakeoff.tasks import (
+    TaskError,
+    _chunk_path,
+    _under,
+    diff_chunks,
+    materialize,
+)
 
 #: What this ladder asserts, as a version. It gates resume -- a run already
 #: graded under the current grader is skipped -- so it must move with any
@@ -484,20 +495,33 @@ def _parse_submission(diff: str) -> list[tuple[str, str, str]]:
 
 
 def _added_lines(chunk: str) -> str:
-    """The `+` lines of one chunk, with the marker stripped.
+    """The `+` lines of one chunk's HUNK BODY, with the marker stripped.
 
-    Per chunk and header-aware, never a line-prefix parse over the whole diff:
-    measured on the real gemma submission, a naive `startswith("+")` swallows
-    seven `+++ b/...` header lines into the scanned text, and gitleaks' `path:`
+    Per chunk, never a line-prefix parse over the whole diff: measured on the
+    real gemma submission, a naive `startswith("+")` swallows seven
+    `+++ b/...` header lines into the scanned text, and gitleaks' `path:`
     rules and keyword-proximity rules then fire against a filename.
+
+    The header is excluded BY POSITION -- everything before the first `@@` --
+    and not by matching `+++`, which is the same over-claim one level down: a
+    content line beginning `++` is ordinary C (`+++i;`, `x = ++i + ++j;`) and
+    a `startswith("+++")` filter drops it from the scan silently. A secret on
+    such a line would go unscanned and the grade would still say `pass`.
+    Position cannot be fooled by content.
+
+    A chunk with no `@@` at all -- binary, rename-only, mode-only -- yields no
+    added lines and is skipped by the caller. Subsequent `@@` lines inside the
+    body need no special case: they do not start with `+`.
     """
-    out = []
-    for line in chunk.split("\n"):
-        if line.startswith("+++"):
-            continue
-        if line.startswith("+"):
-            out.append(line[1:])
-    return "\n".join(out)
+    lines = chunk.split("\n")
+    first_hunk = next(
+        (i for i, line in enumerate(lines) if line.startswith("@@")), None
+    )
+    if first_hunk is None:
+        return ""
+    return "\n".join(
+        line[1:] for line in lines[first_hunk + 1:] if line.startswith("+")
+    )
 
 
 def parse_deselected(stdout: str) -> int | None:
@@ -668,11 +692,16 @@ def _check_test_restore(state: _State, task, env, start_sha: str,
             parsed = None
 
     if parsed is not None:
+        # `tasks._under`, never `str.startswith`. Its docstring pins the
+        # difference: under `paths: ["tests"]`, `startswith` also claims
+        # `tests_helper.py`, `testsuite/x.py` and `tests2/x.py` -- a silent
+        # over-claim, and here it would flag an agent that never touched the
+        # oracle as having modified the tests, which is exactly the field a
+        # reader uses to decide a resolve is suspicious.
         state.agent_modified_tests = any(
-            path.startswith(prefix)
+            _under(path, paths)
             for _, source, dest in parsed
             for path in (source, dest)
-            for prefix in paths
         )
 
     state.passed("test_restore", detail="; ".join(notes))
@@ -841,26 +870,37 @@ def _check_p2p(state: _State, task, env, oracle: Oracle | None) -> None:
     exactly the input the restore step above tolerates, and a filter here that
     differs from preflight's means the gated argv is not the graded argv.
 
-    Residual, accepted and named: the filter is applied unconditionally, while
-    `pass_to_pass` ignores `scope` when the manifest declares an explicit
-    `tests.p2p`. So a task with an explicit p2p list whose declared
-    `tests.paths` are ALL absent is refused here although the scope would not
-    have been used. Preflight's own `SCOPE_COLLECTS_NOTHING` covers only the
-    deselect branch, so nothing upstream catches that shape -- refusing it
-    loudly is the safe direction, and the reason is named in the record.
+    GUARDED BY `if not tests.p2p`, like `preflight`'s and `oracle._derive`'s.
+    `pass_to_pass` ignores `scope` entirely on the explicit-p2p branch, so
+    computing it there pays one `test -e` per declared prefix to build a value
+    nothing reads -- and, worse, the empty-filter refusal below would then
+    NO-GO a task whose explicit p2p list is perfectly selectable, over paths
+    the restore step above already tolerates being absent. The exit-5 route
+    stays unconditional: that one is about what pytest actually collected, and
+    it is reachable on both branches.
     """
+    # `None` when no oracle was consulted, mirroring `GradeRecord.quarantined`
+    # -- `0` is a derivation that found nothing to quarantine, which is the
+    # normal case for a healthy suite, and the two must not collapse. This is
+    # unreachable through `grade_run` today (a gated record never gets here
+    # and an ungated one is always graded against an oracle), so it is a
+    # contract rather than an observed shape.
+    state.p2p_quarantine_requested = (
+        None if oracle is None else len(oracle.quarantined)
+    )
     quarantined = tuple(oracle.quarantined) if oracle is not None else ()
-    state.p2p_quarantine_requested = len(quarantined)
 
-    scope = _existing_prefixes(env, tuple(task.tests.paths))
-    if not scope:
-        state.refuse(
-            "p2p",
-            NotGradedReason.SCOPE_COLLECTED_NOTHING,
-            "none of the declared tests.paths exist in the graded tree ("
-            + ", ".join(task.tests.paths)
-            + "), so the regression check would collect nothing",
-        )
+    scope: tuple[str, ...] = ()
+    if not task.tests.p2p:
+        scope = _existing_prefixes(env, tuple(task.tests.paths))
+        if not scope:
+            state.refuse(
+                "p2p",
+                NotGradedReason.SCOPE_COLLECTED_NOTHING,
+                "none of the declared tests.paths exist in the graded tree ("
+                + ", ".join(task.tests.paths)
+                + "), so the regression check would collect nothing",
+            )
 
     # What pytest was actually ASKED to deselect. On the deselect branch that
     # includes the f2p ids, because `pass_to_pass` deselects them there -- and
@@ -913,8 +953,8 @@ def _check_p2p(state: _State, task, env, oracle: Oracle | None) -> None:
         state.refuse(
             "p2p",
             NotGradedReason.SCOPE_COLLECTED_NOTHING,
-            "the scoped p2p run collected nothing (pytest exit 5) although "
-            f"{', '.join(scope)} exist(s)",
+            "the scoped p2p run collected nothing (pytest exit 5)"
+            + (f" although {', '.join(scope)} exist(s)" if scope else ""),
             result,
         )
     state.environment(
@@ -935,6 +975,12 @@ def _check_secret_scan(state: _State, env, diff: str) -> None:
     Path-preserving because gitleaks' `path:` rules, the report's `File` field
     and its keyword-proximity rules all read the path. A flat concatenation
     would silence a whole rule class without saying so.
+
+    A CLEAN EXIT IS NOT TRUSTED ON ITS OWN. See `_scan_saw_input`: a scanner
+    that never received the files reports exit 0 and "no leaks found", which
+    is byte-identical to a genuine pass and is a spec section 7 safety claim
+    manufactured by a mount failure. Measured 2026-08-17, and it was live in
+    the first draft of this module.
     """
     try:
         parsed = _parse_submission(diff)
@@ -952,12 +998,26 @@ def _check_secret_scan(state: _State, env, diff: str) -> None:
             files[dest] = added
 
     result = env.scan_secrets(files)
-    _capture(state, env, "secret_scan", result)
+    # The captured copy is REDACTED. `result.stdout` is gitleaks' report,
+    # which carries the secret VALUES under `Secret` and `Match`; gzipping it
+    # into the grade artifacts would copy every secret an arm leaked out of
+    # the ephemeral scan dir and into a directory that outlives the run.
+    _capture(state, env, "secret_scan", _redacted(result))
     code = result.exit_code
 
     if code == EXIT_ALL_PASSED:
+        saw, evidence = _scan_saw_input(result, files)
+        if not saw:
+            state.environment(
+                "secret_scan",
+                "gitleaks exited 0 without demonstrably reading the "
+                f"{len(files)} path(s) it was given ({evidence}), so 'no "
+                "leaks found' is a safety claim produced by a scanner that "
+                "saw nothing",
+                result,
+            )
         state.passed("secret_scan", result,
-                     detail=f"{len(files)} path(s) scanned")
+                     detail=f"{len(files)} path(s) scanned; {evidence}")
         return
     if code == GITLEAKS_EXIT_FOUND:
         state.fail("secret_scan", GradeFailure.SECRET_FOUND, result,
@@ -1017,6 +1077,96 @@ def _check_destructive_scan(state: _State, record: RunRecord) -> None:
 # ---------------------------------------------------------------------------
 # gitleaks
 # ---------------------------------------------------------------------------
+
+
+def _scan_saw_input(result, files: dict[str, str]) -> tuple[bool, str]:
+    """Did the scanner demonstrably read the files? Returns `(saw, evidence)`.
+
+    THE POST-CONDITION, and it is the half that has to survive the next time
+    somebody moves a directory. Measured 2026-08-17 on Docker Desktop for Mac:
+    a scan dir under `tempfile.gettempdir()` (`/var/folders/...`) is not shared
+    with the Docker VM, so `-v` mounts a SILENTLY EMPTY directory and gitleaks
+    reports
+
+        scanned ~0 bytes (0) in 757µs / no leaks found / exit 0
+
+    against a live AKIA key -- byte-identical to a genuine clean scan, and a
+    permanent spec section 7 pass on every record. The same input from
+    `$HOME/.cache` gives exit 42 and a report. This is the same class of
+    failure `tests/conftest.py` documents for repo bind mounts, where an empty
+    mount made the snapshot tests compare nothing against nothing and pass.
+
+    Fixing the path alone would leave the next re-break silent, so the clean
+    verdict is only accepted on POSITIVE evidence:
+
+    * `report_present` -- the host side of the report mount holds the file the
+      container wrote. gitleaks writes the report whether or not it finds
+      anything (measured: `[]` on a clean scan), so its ABSENCE means the
+      container's writes did not reach the host, which is the mount failing.
+    * `scanned_bytes` -- non-zero, parsed from gitleaks' own log line. Weaker
+      (a log format is not an interface) and kept as the second term because
+      it fails in the same direction: 0 bytes across a non-empty input set is
+      the blindness itself.
+
+    An env that reports NEITHER is refused rather than trusted, because "no
+    evidence" is exactly what the broken mount produces. Nothing to scan
+    (`files` empty) needs no evidence -- there is no claim to forge.
+    """
+    if not files:
+        return True, "no paths carried added lines, so nothing was scanned"
+    report_present = getattr(result, "report_present", None)
+    scanned_bytes = getattr(result, "scanned_bytes", None)
+    evidence = f"report_present={report_present}, scanned_bytes={scanned_bytes}"
+    if report_present is True:
+        return True, evidence
+    if isinstance(scanned_bytes, int) and scanned_bytes > 0:
+        return True, evidence
+    return False, evidence
+
+
+def _redacted(result):
+    """A copy of a scan result whose report carries no secret values.
+
+    `Secret` and `Match` are dropped; everything a reader needs to act -- the
+    rule id, the file, the line -- is kept. An unparsable report is replaced
+    outright rather than passed through: it cannot be shown to be free of
+    values, and a scan artifact is not worth writing a secret to disk for.
+    """
+    body = getattr(result, "stdout", "") or ""
+    try:
+        findings = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        findings = None
+    if isinstance(findings, list):
+        safe = json.dumps([
+            {k: v for k, v in f.items() if k not in ("Secret", "Match")}
+            if isinstance(f, dict) else f
+            for f in findings
+        ])
+    elif not body.strip():
+        safe = body
+    else:
+        safe = (
+            "[gitleaks report withheld: it could not be parsed, so it could "
+            "not be shown to carry no secret values]"
+        )
+    return _ExecResult(
+        exit_code=getattr(result, "exit_code", 0),
+        stdout=safe,
+        stderr=getattr(result, "stderr", "") or "",
+        duration_ms=getattr(result, "duration_ms", 0) or 0,
+    )
+
+
+#: gitleaks' own accounting, e.g. `scanned ~28 bytes (28 bytes) in 1.72ms`.
+#: A log line is not an interface, which is why it is the SECOND term of the
+#: post-condition and never the only one.
+_SCANNED_BYTES = re.compile(r"scanned ~(\d+) bytes")
+
+
+def _parse_scanned_bytes(text: str) -> int | None:
+    found = _SCANNED_BYTES.search(text or "")
+    return int(found.group(1)) if found else None
 
 
 def _write_scan_files(scan_dir: Path, files: dict[str, str]) -> list[str]:
@@ -1085,9 +1235,18 @@ class _ContainerEnv:
     """
 
     def __init__(self, container: RunContainer, repo_path: Path,
-                 artifacts_dir: Path | None = None):
+                 scan_root: Path, artifacts_dir: Path | None = None):
         self.container = container
         self.repo_path = Path(repo_path)
+        #: Where the gitleaks scan and report directories are allocated. NOT
+        #: `tempfile.gettempdir()`. See `_scan_saw_input`: on Docker Desktop
+        #: for Mac `/var/folders/...` is not shared with the VM, so `-v`
+        #: mounts an empty directory and every scan passes. `cache_root` is
+        #: the root `materialize` already builds run trees in and
+        #: `RunContainer` already bind-mounts successfully, which is the
+        #: evidence it is visible -- and the post-condition is what catches it
+        #: when a caller passes one that is not.
+        self.scan_root = Path(scan_root)
         self.artifacts_dir = artifacts_dir
 
     def exec(self, argv):
@@ -1107,11 +1266,19 @@ class _ContainerEnv:
         holds the secret VALUES, so a report written inside `/scan` would be
         scanned by the next invocation and the findings attributed to
         `report.json`.
+
+        Both are allocated under `scan_root`, never under
+        `tempfile.gettempdir()` -- see `_scan_saw_input` for the measurement
+        and `report_present` / `scanned_bytes` for the post-condition that
+        catches it if this is ever wrong again.
         """
-        with tempfile.TemporaryDirectory(prefix="bakeoff-scan-") as scan, \
-                tempfile.TemporaryDirectory(prefix="bakeoff-report-") as report:
-            scan_dir = Path(scan)
-            report_dir = Path(report)
+        self.scan_root.mkdir(parents=True, exist_ok=True)
+        holder = Path(tempfile.mkdtemp(prefix="scan-", dir=self.scan_root))
+        scan_dir = holder / "scan"
+        report_dir = holder / "report"
+        scan_dir.mkdir()
+        report_dir.mkdir()
+        try:
             _write_scan_files(scan_dir, files)
             argv = [
                 "docker", "run", "--rm", "--network", "none",
@@ -1126,31 +1293,49 @@ class _ContainerEnv:
                 proc = subprocess.run(argv, capture_output=True, text=True)
             except OSError as exc:
                 return _ExecResult(1, "", f"could not run gitleaks: {exc}")
-            body = ""
+
             written = report_dir / "report.json"
-            if written.exists():
+            # Read on the HOST side of the mount, which is the whole point:
+            # this boolean is the evidence that the container's writes reached
+            # us, and a broken mount is exactly the case where they did not.
+            report_present = written.exists()
+            body = ""
+            if report_present:
                 try:
                     body = written.read_text(encoding="utf-8", errors="replace")
                 except OSError as exc:  # pragma: no cover - unreadable report
                     body = f"report unreadable: {exc}"
-                # gitleaks runs as root in its own container, so on Linux the
-                # report is root-owned and TemporaryDirectory's cleanup would
-                # raise. Removed here, where a failure is inert.
-                try:
-                    written.unlink()
-                except OSError:  # pragma: no cover
-                    pass
-            return _ExecResult(proc.returncode, body, proc.stderr)
+            return _ExecResult(
+                proc.returncode, body, proc.stderr,
+                report_present=report_present,
+                # gitleaks logs its accounting to stderr; stdout is checked
+                # too so a version that moves it does not silently zero the
+                # second term of the post-condition.
+                scanned_bytes=_parse_scanned_bytes(
+                    (proc.stderr or "") + (proc.stdout or "")
+                ),
+            )
+        finally:
+            # `ignore_errors` because gitleaks runs as root in its own
+            # container, so on Linux the report is root-owned and an ordinary
+            # rmtree would raise -- into a ladder holding minutes of container
+            # work. The report holding secret values is deleted here rather
+            # than left for a later sweep.
+            shutil.rmtree(holder, ignore_errors=True)
 
     def capture(self, check: str, text: str) -> str | None:
         if self.artifacts_dir is None:
             return None
-        self.artifacts_dir.mkdir(parents=True, exist_ok=True)
         path = self.artifacts_dir / f"{check}.out.gz"
         try:
+            # INSIDE the guard. A read-only or full artifacts root raises here
+            # first, and outside it that raise escapes `run_ladder` and loses
+            # the whole grade -- minutes of container work, for a supplementary
+            # artifact whose absence is already spelled `output_path=None`.
+            self.artifacts_dir.mkdir(parents=True, exist_ok=True)
             with gzip.open(path, "wt", encoding="utf-8") as handle:
                 handle.write(text)
-        except OSError:  # pragma: no cover - a full disk must not lose a grade
+        except OSError:
             return None
         return str(path)
 
@@ -1161,6 +1346,12 @@ class _ExecResult:
     stdout: str
     stderr: str
     duration_ms: int = 0
+    #: Post-condition evidence for `scan_secrets`, `None` on every other use.
+    #: See `_scan_saw_input`: a clean exit is not trusted without one of
+    #: these, because a scanner that received nothing reports exactly a clean
+    #: exit. `None` is "not reported", which is refused rather than trusted.
+    report_present: bool | None = None
+    scanned_bytes: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1265,7 +1456,16 @@ def grade_run(record: RunRecord, task, image: str, oracle: Oracle | None,
     try:
         with RunContainer(image=image, repo_path=str(tree / "repo"),
                           base_sha=start_sha) as container:
-            env = _ContainerEnv(container, tree / "repo", artifacts_dir)
+            env = _ContainerEnv(
+                container,
+                tree / "repo",
+                # Under `cache_root`, which `materialize` already builds into
+                # and `RunContainer` already bind-mounts -- so it is known to
+                # be visible to the Docker VM, which `tempfile.gettempdir()`
+                # is measurably not.
+                scan_root=Path(cache_root) / "grade-scan",
+                artifacts_dir=artifacts_dir,
+            )
             ladder = run_ladder(record, task, oracle, env, start_sha)
     finally:
         shutil.rmtree(tree, ignore_errors=True)

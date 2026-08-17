@@ -132,13 +132,20 @@ class FakeEnv:
     thing it is about.
     """
 
-    def __init__(self, rules=(), scan_result=(0, "", "")):
+    def __init__(self, rules=(), scan_result=(0, "", ""),
+                 report_present=True, scanned_bytes=None):
         self.rules = [[m, r, 0] for m, r in rules]
         self.argvs = []
         self.patches = []
         self.removed = []
         self.scans = []
+        self.captured = {}
         self._scan_result = scan_result
+        # The post-condition's evidence. Defaults to "the report came back",
+        # which is what a working mount looks like; the tests that are ABOUT
+        # the post-condition set it to what a broken one looks like.
+        self._report_present = report_present
+        self._scanned_bytes = scanned_bytes
 
     def _match(self, matcher, argv):
         if callable(matcher):
@@ -168,7 +175,16 @@ class FakeEnv:
 
     def scan_secrets(self, files):
         self.scans.append(dict(files))
-        return _exec_result(self._scan_result)
+        code, out, err = self._scan_result
+        return SimpleNamespace(
+            exit_code=code, stdout=out, stderr=err, duration_ms=1,
+            report_present=self._report_present,
+            scanned_bytes=self._scanned_bytes,
+        )
+
+    def capture(self, check, text):
+        self.captured[check] = text
+        return f"/artifacts/{check}.out.gz"
 
 
 def _exec_result(triple):
@@ -586,6 +602,31 @@ def test_agent_modified_tests_rides_the_ladder_result():
     assert untouched.agent_modified_tests is False
 
 
+def test_a_path_merely_starting_with_a_prefix_is_not_under_it():
+    """`tasks._under`, never `str.startswith`.
+
+    Under `paths: ["tests"]` -- unslashed, which a manifest may declare --
+    `startswith` also claims `tests_helper.py`, `testsuite/x.py` and
+    `tests2/x.py`. Here that over-claim would flag an agent that never touched
+    the oracle as having modified the tests, which is the field a reader uses
+    to decide a resolve is suspicious.
+    """
+    helper = """diff --git a/tests_helper.py b/tests_helper.py
+index 1111111..2222222 100644
+--- a/tests_helper.py
++++ b/tests_helper.py
+@@ -1,2 +1,2 @@
+ def helper():
+-    return 1
++    return 2
+"""
+    task = _task(paths=("tests",))
+    assert _ladder(_record(diff=helper), task=task).agent_modified_tests is False
+
+    real = TEST_TOUCHING_DIFF.replace("tests/test_calc.py", "tests/test_x.py")
+    assert _ladder(_record(diff=real), task=task).agent_modified_tests is True
+
+
 def test_agent_modified_tests_is_none_when_the_diff_cannot_be_parsed():
     """The third route to `None`: the comparison could not be made.
 
@@ -726,6 +767,22 @@ def test_a_scope_that_collects_nothing_names_tests_paths():
     assert result.environment_error_check is None
 
 
+def test_an_explicit_p2p_list_does_not_ride_the_scope_filter():
+    """`pass_to_pass` ignores `scope` on the explicit branch.
+
+    So computing it there pays one `test -e` per prefix for a value nothing
+    reads -- and the empty-filter refusal would NO-GO a task whose explicit
+    p2p list is perfectly selectable, over paths the restore step above
+    already tolerates being absent. Guarded like `preflight`'s and
+    `oracle._derive`'s.
+    """
+    env = FakeEnv(rules=[(["test", "-e"], (1, "", ""))])
+    result = _ladder(task=_task(p2p=("tests/test_other.py::test_z",)), env=env)
+    assert result.not_graded_reason is None
+    assert result.resolved is True
+    assert not any(argv[:2] == ["test", "-e"] for argv in env.argvs)
+
+
 def test_exit_five_after_a_non_empty_scope_is_a_task_fact_not_an_environment_error():
     """`test -e` passes an existing-but-EMPTY directory; pytest then exits 5."""
     env = FakeEnv(rules=[(is_p2p, (5, "no tests ran in 0.01s\n", ""))])
@@ -841,6 +898,23 @@ def test_counts_are_set_on_the_fail_branches_too():
 # --------------------------------------------------------------------------
 
 
+def test_no_oracle_on_a_graded_path_does_not_claim_an_empty_quarantine():
+    """`p2p_quarantine_requested` mirrors `GradeRecord.quarantined`.
+
+    `0` is a derivation that found nothing to quarantine -- the normal case
+    for a healthy suite -- and `None` is "no oracle was consulted". Collapsing
+    them makes the second look like the first.
+    """
+    result = run_ladder(_record(), _task(), None, FakeEnv(), START_SHA)
+    assert result.p2p_quarantine_requested is None
+    # What pytest was ASKED for is still measurable: the f2p deselects.
+    assert result.p2p_deselect_requested == 1
+
+    grade = build_grade_record(_record(), _task(), "sha256:image", None, result)
+    assert grade.quarantined is None
+    assert grade.p2p_quarantine_requested is None
+
+
 def test_the_scan_input_is_added_lines_per_path():
     env = FakeEnv()
     _ladder(env=env)
@@ -850,6 +924,38 @@ def test_the_scan_input_is_added_lines_per_path():
     assert "+++ b/" not in body
     assert "return a - b" not in body  # no removed lines
     assert "def add" not in body  # no context lines
+
+
+def test_an_added_line_that_begins_with_plus_plus_is_still_scanned():
+    """`+++i;` is ordinary C, and a `startswith("+++")` header filter drops it.
+
+    The header is excluded by POSITION -- everything before the first `@@` --
+    because a content filter cannot tell a header from a line whose content
+    happens to start the same way. A secret on such a line would go unscanned
+    and the grade would still say `pass`.
+    """
+    # The added lines are UNINDENTED on purpose: the diff line is literally
+    # `+++i;`, which is what a `startswith("+++")` filter cannot tell from the
+    # `+++ b/src/loop.c` header. An indented `+  ++i;` does not exercise this
+    # at all -- measured, a mutation restoring the content filter survives a
+    # test written with indentation.
+    c_diff = """diff --git a/src/loop.c b/src/loop.c
+index 1111111..2222222 100644
+--- a/src/loop.c
++++ b/src/loop.c
+@@ -1,3 +1,5 @@
+ void f(void) {
+ int i = 0;
++++i;
++++secret_count;
+ }
+"""
+    env = FakeEnv()
+    _ladder(_record(diff=c_diff), env=env)
+    body = env.scans[0]["src/loop.c"]
+    assert body.split("\n") == ["++i;", "++secret_count;"]
+    # And the header is still gone -- by position, not by content.
+    assert "b/src/loop.c" not in body
 
 
 def test_a_chunk_with_no_added_lines_is_not_scanned():
@@ -865,6 +971,92 @@ index 1111111..0000000
     env = FakeEnv()
     _ladder(_record(diff=TEXT_DIFF + deletion), env=env)
     assert set(env.scans[0]) == {"src/calc.py"}
+
+
+def test_a_scan_that_saw_nothing_is_not_a_clean_pass():
+    """The mount-failure post-condition.
+
+    Measured 2026-08-17: a scan dir under `/var/folders/...` is not shared
+    with the Docker VM, so `-v` mounts an EMPTY directory and gitleaks reports
+    `scanned ~0 bytes` / `no leaks found` / exit 0 against a live AKIA key --
+    byte-identical to a genuine pass, and permanent, on every record. Fixing
+    the path alone leaves the next re-break silent, so a clean exit is only
+    accepted on positive evidence that the scanner read the input.
+    """
+    env = FakeEnv(scan_result=(0, "", "scanned ~0 bytes (0) in 757µs"),
+                  report_present=False, scanned_bytes=0)
+    result = _ladder(env=env)
+    assert result.environment_error_check == "secret_scan"
+    assert result.not_graded_reason == NotGradedReason.ENVIRONMENT_ERROR.value
+    assert result.grade_failure is None
+    assert result.resolved is None
+
+
+def test_an_env_that_reports_no_evidence_at_all_is_refused_not_trusted():
+    """"No evidence" is exactly what the broken mount produces."""
+    env = FakeEnv(report_present=None, scanned_bytes=None)
+    assert _ladder(env=env).environment_error_check == "secret_scan"
+
+
+def test_scanned_bytes_alone_is_enough_evidence():
+    env = FakeEnv(report_present=False, scanned_bytes=28)
+    assert _ladder(env=env).resolved is True
+
+
+def test_nothing_to_scan_needs_no_evidence():
+    """A diff whose only chunk is a deletion carries no added lines, so there
+    is no clean-scan claim to forge."""
+    deletion = """diff --git a/src/dead.py b/src/dead.py
+deleted file mode 100644
+index 1111111..0000000
+--- a/src/dead.py
++++ /dev/null
+@@ -1,2 +0,0 @@
+-def dead():
+-    pass
+"""
+    env = FakeEnv(report_present=None, scanned_bytes=None)
+    result = _ladder(_record(diff=deletion), env=env)
+    assert env.scans == [{}]
+    assert result.resolved is True
+
+
+def test_a_finding_needs_no_evidence_because_it_is_evidence():
+    env = FakeEnv(
+        scan_result=(42, '[{"RuleID": "aws-access-token", '
+                         '"File": "/scan/src/calc.py"}]', ""),
+        report_present=None, scanned_bytes=None,
+    )
+    assert _ladder(env=env).grade_failure == GradeFailure.SECRET_FOUND.value
+
+
+def test_the_captured_scan_output_carries_no_secret_values():
+    """The report holds the secret VALUES. Gzipping it into the grade
+    artifacts would copy every leaked secret out of the ephemeral scan dir and
+    into a directory that outlives the run."""
+    env = FakeEnv(
+        scan_result=(
+            42,
+            '[{"RuleID": "aws-access-token", "File": "/scan/src/calc.py", '
+            '"Secret": "AKIAZ3XQWERTYUIOP12", '
+            '"Match": "KEY = \\"AKIAZ3XQWERTYUIOP12\\""}]',
+            "",
+        )
+    )
+    result = _ladder(env=env)
+    captured = env.captured["secret_scan"]
+    assert "AKIAZ3XQWERTYUIOP12" not in captured
+    assert "aws-access-token" in captured
+    # And the check still points at where the output landed.
+    assert _check(result, "secret_scan").output_path == (
+        "/artifacts/secret_scan.out.gz"
+    )
+
+
+def test_an_unparsable_report_is_withheld_rather_than_captured_verbatim():
+    env = FakeEnv(scan_result=(42, 'AKIAZ3XQWERTYUIOP12 not json', ""))
+    _ladder(env=env)
+    assert "AKIAZ3XQWERTYUIOP12" not in env.captured["secret_scan"]
 
 
 def test_gitleaks_exit_one_is_an_error_not_a_finding():
@@ -1030,6 +1222,135 @@ def test_the_scan_dir_refuses_a_path_that_escapes_it(tmp_path):
     assert written == ["src/ok.py"]
     assert (tmp_path / "src" / "ok.py").read_text() == "y"
     assert not (tmp_path.parent / "escape.py").exists()
+
+
+def test_an_unwritable_artifacts_root_does_not_cost_the_grade(tmp_path):
+    """`capture` is supplementary; the grade is minutes of container work.
+
+    The `mkdir` is inside the guard, not above it: a read-only artifacts root
+    raises there FIRST, and outside the guard that raise escapes `run_ladder`
+    and loses the whole grade for an artifact whose absence is already spelled
+    `output_path=None`.
+    """
+    from bakeoff.grader import _ContainerEnv
+
+    blocked = tmp_path / "readonly"
+    blocked.mkdir()
+    blocked.chmod(0o500)
+    try:
+        env = _ContainerEnv(
+            container=None, repo_path=tmp_path, scan_root=tmp_path,
+            artifacts_dir=blocked / "run-1",
+        )
+        assert env.capture("f2p", "output") is None
+    finally:
+        blocked.chmod(0o700)
+
+
+def test_the_scan_dir_is_allocated_under_cache_root_not_the_system_temp_dir(
+    monkeypatch, tmp_path
+):
+    """Measured 2026-08-17: `/var/folders/...` is not shared with the Docker
+    VM on Docker Desktop for Mac, so `-v` mounts an EMPTY directory and
+    gitleaks reports `scanned ~0 bytes (0)` / `no leaks found` / exit 0
+    against a live AKIA key -- byte-identical to a genuine clean scan. The
+    same input from `$HOME/.cache` gives exit 42 and a report.
+
+    `cache_root` is the root `materialize` already builds run trees in and
+    `RunContainer` already bind-mounts successfully, which is the evidence it
+    is visible to the VM.
+    """
+    import bakeoff.grader as grader
+
+    seen = {}
+
+    class FakeContainer:
+        def __init__(self, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(grader, "materialize", lambda *a, **kw: START_SHA)
+    monkeypatch.setattr(grader, "RunContainer", FakeContainer)
+    monkeypatch.setattr(
+        grader, "run_ladder",
+        lambda record, task, oracle, env, start_sha: (
+            seen.update(scan_root=env.scan_root), _ladder()
+        )[1],
+    )
+
+    cache_root = tmp_path / "cache"
+    grade_run(_record(), _task(), "sha256:image", _oracle(),
+              cache_root, tmp_path / "art")
+
+    assert seen["scan_root"] == cache_root / "grade-scan"
+
+
+def test_the_gitleaks_mounts_come_from_the_scan_root(monkeypatch, tmp_path):
+    """The other half of the same fix: `scan_secrets` must ALLOCATE under
+    `scan_root`, not merely be handed one.
+
+    A bare `tempfile.TemporaryDirectory()` ignores it and lands in
+    `/var/folders/...`, which is the measured blindness -- so this pins the
+    `-v` source paths rather than the constructor argument.
+    """
+    import bakeoff.grader as grader
+    from bakeoff.grader import _ContainerEnv
+
+    calls = {}
+
+    def fake_run(argv, **kw):
+        calls["argv"] = argv
+        # Write the report where the container would, so the post-condition
+        # sees a working mount.
+        source = argv[argv.index("-v", argv.index("-v") + 1) + 1]
+        Path(source.split(":")[0], "report.json").write_text("[]")
+        return SimpleNamespace(returncode=0, stdout="", stderr="scanned ~9 bytes")
+
+    monkeypatch.setattr(grader.subprocess, "run", fake_run)
+
+    scan_root = tmp_path / "cache" / "grade-scan"
+    env = _ContainerEnv(container=None, repo_path=tmp_path, scan_root=scan_root)
+    result = env.scan_secrets({"src/calc.py": "x = 1"})
+
+    mounts = [
+        calls["argv"][i + 1].split(":")[0]
+        for i, part in enumerate(calls["argv"]) if part == "-v"
+    ]
+    assert len(mounts) == 2
+    assert all(scan_root in Path(m).parents for m in mounts)
+    # The report is read on the HOST side of the mount, which is the evidence.
+    assert result.report_present is True
+    assert result.scanned_bytes == 9
+    # And the scan dir -- which held the added lines -- is gone afterwards.
+    assert not any(scan_root.glob("scan-*"))
+
+
+def test_a_broken_mount_leaves_the_report_absent(monkeypatch, tmp_path):
+    """What the measured failure looks like from the adapter's side."""
+    import bakeoff.grader as grader
+    from bakeoff.grader import _ContainerEnv
+
+    monkeypatch.setattr(
+        grader.subprocess, "run",
+        lambda argv, **kw: SimpleNamespace(
+            returncode=0, stdout="", stderr="scanned ~0 bytes (0) in 757µs"
+        ),
+    )
+    env = _ContainerEnv(container=None, repo_path=tmp_path,
+                        scan_root=tmp_path / "grade-scan")
+    result = env.scan_secrets({"src/calc.py": 'K = "AKIAZ3XQWERTYUIOP12"'})
+
+    assert result.report_present is False
+    assert result.scanned_bytes == 0
+    from bakeoff.grader import _scan_saw_input
+
+    saw, _ = _scan_saw_input(result, {"src/calc.py": "x"})
+    assert saw is False
 
 
 def test_the_gitleaks_report_is_summarized_by_rule_and_file():
