@@ -1274,6 +1274,14 @@ def test_the_scan_dir_is_allocated_under_cache_root_not_the_system_temp_dir(
         def __exit__(self, *a):
             return False
 
+        def exec(self, argv, env=None):
+            # `grade_run` refreshes the index inside the container before the
+            # ladder applies anything: `materialize` writes that index on the
+            # HOST, and `git apply --index` compares CACHED STAT DATA, which
+            # virtiofs reports differently on the two sides. See
+            # `grader._refresh_index`.
+            return SimpleNamespace(exit_code=0, stdout="", stderr="")
+
     monkeypatch.setattr(grader, "materialize", lambda *a, **kw: START_SHA)
     monkeypatch.setattr(grader, "RunContainer", FakeContainer)
     monkeypatch.setattr(

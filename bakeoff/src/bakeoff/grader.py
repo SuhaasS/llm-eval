@@ -1426,6 +1426,42 @@ def build_grade_record(record: RunRecord, task, image: str,
     )
 
 
+def _refresh_index(container: RunContainer) -> None:
+    """Re-stat the index with the CONTAINER's view of the tree.
+
+    `materialize` writes the index on the HOST, and `git apply --index` does
+    not compare content -- `apply.c`'s `verify_index_match` calls
+    `ce_match_stat`, which compares the cached `st_dev`, `st_ino`, `st_uid`,
+    `st_gid`, `st_size` and `st_mtime` against the file. Through Docker
+    Desktop's virtiofs the first four are all different from the host's, so
+    every graded submission failed with
+
+        error: src/click/formatting.py: does not match index
+
+    on a tree that was clean and a patch that applies. Measured 2026-08-17
+    against the real click task: `git apply` WITHOUT `--index` succeeded on the
+    identical tree in the identical container, which is what places the cause
+    in the stat cache and not in the diff.
+
+    That is the worst shape a grader defect can take. `APPLY_FAILED` is a
+    `GradeFailure`, so a `resolved: False` -- an accusation that the model's
+    patch did not work -- lands on every submission of every arm, in an
+    append-only store, from an environment difference the model never saw.
+
+    The refresh is silent about its exit code on purpose. Non-zero means some
+    file's CONTENT genuinely differs from the index, which cannot happen on a
+    tree `materialize` just built and `git clean -xfd`'d; if it somehow does,
+    the entry stays unrefreshed and the apply below reports it, which is the
+    right answer rather than a second opinion about it.
+
+    Not folded into `_apply`: the stale stat cache is a property of the
+    host-written index, true for the whole life of this tree, and `_apply` is
+    reached through the `env` seam that exists so `run_ladder` needs no
+    container.
+    """
+    container.exec(["git", "update-index", "--refresh"])
+
+
 def _gated_result(gate: tuple[NotGradedReason, str]) -> LadderResult:
     reason, detail = gate
     return LadderResult(
@@ -1475,6 +1511,7 @@ def grade_run(record: RunRecord, task, image: str, oracle: Oracle | None,
                 scan_root=Path(cache_root) / "grade-scan",
                 artifacts_dir=artifacts_dir,
             )
+            _refresh_index(container)
             ladder = run_ladder(record, task, oracle, env, start_sha)
     finally:
         shutil.rmtree(tree, ignore_errors=True)
