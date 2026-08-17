@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from dataclasses import fields as dataclass_fields
 from pathlib import Path
 
 from bakeoff.container import RunContainer
@@ -40,6 +41,11 @@ from bakeoff.container import RunContainer
 # Phase 0c failure. See https://docs.pytest.org/en/stable/reference/exit-codes
 EXIT_ALL_PASSED = 0
 EXIT_TESTS_FAILED = 1
+#: The scoped run's failure mode, and the whole of its detection. No "collected
+#: 0 items" summary matching: the pinned runners carry `-q`, which suppresses
+#: that line (measured), so a guard on the string could not fire under the
+#: configuration actually used -- the dead-guard shape a mutation cannot catch.
+EXIT_NOTHING_COLLECTED = 5
 _EXIT_MEANING = {
     2: "collection was interrupted (an import error in a test module, most "
        "often a dependency the image does not ship)",
@@ -50,6 +56,28 @@ _EXIT_MEANING = {
 }
 
 _FAILED_LINE = re.compile(r"^(?:FAILED|ERROR)\s+(\S+)", re.MULTILINE)
+
+#: What this gate asserts, as a version. It joins `run_matrix`'s preflight
+#: cache key and the grader's, because none of the other three components
+#: (manifest digest, image id, start sha) moves when THIS file changes -- so
+#: without it every warm cache serves a verdict written by the old gate and a
+#: newly added assertion is inert on exactly the tasks about to be run. Bump
+#: it with any change to what preflight asserts. 1 is the implicit version of
+#: every verdict cached before the scoped-p2p and grading assertions landed.
+PREFLIGHT_VERSION: str = "2"
+
+#: A declared `tests.paths` prefix that does not exist at the post-fix state.
+#: NOT a problem: `PreflightResult.ok` is `not problems`, and the grader's
+#: restore step tolerates exactly this input, so a problem here would NO-GO a
+#: task the ladder was built to grade. The code and the evidence keep the
+#: author error loud without making it fatal.
+SCOPE_PREFIX_MISSING = "scope_prefix_missing"
+
+#: The scoped p2p run collected nothing -- pytest exit 5, or no declared
+#: prefix survived the existence filter. This one IS a NO-GO, and the driver
+#: branches on the code rather than on a prose prefix: closed sets, not
+#: composite strings, applies to this repo's own dataclass first.
+SCOPE_COLLECTS_NOTHING = "scope_collects_nothing"
 
 # Files that would give one task a different agent context from another, and
 # would do it invisibly: section 5.2 pins the session config precisely because
@@ -66,6 +94,16 @@ class PreflightResult:
     manifest_digest: str
     problems: tuple[str, ...] = ()
     evidence: dict = field(default_factory=dict)
+    #: Which gate produced this verdict. A stored verdict outlives the code
+    #: that wrote it, and every grade copies this as
+    #: `graded_under_preflight_version` -- discrimination is preflight's
+    #: claim, so a grade that requires it has to name the gate that made it.
+    preflight_version: str = ""
+    #: A typed channel beside the prose `problems`, for the outcomes a caller
+    #: has to BRANCH on. Nothing machine-reads `problems`; the grade driver
+    #: would have been the first, through a string-prefix match no test can
+    #: really guard. Not every code is a problem -- see SCOPE_PREFIX_MISSING.
+    problem_codes: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -79,13 +117,49 @@ class PreflightResult:
             "image": self.image,
             "manifest_digest": self.manifest_digest,
             "problems": list(self.problems),
+            "problem_codes": list(self.problem_codes),
             "evidence": self.evidence,
+            "preflight_version": self.preflight_version,
             "ok": self.ok,
         }
 
 
 def _explain(code: int) -> str:
     return _EXIT_MEANING.get(code, f"exit code {code}")
+
+
+def _existing_prefixes(container, prefixes: tuple[str, ...]) -> tuple[str, ...]:
+    """The declared prefixes that exist in the tree, in declared order.
+
+    The same filter the grader's check 6 applies, and it has to be the same
+    one: an unfiltered positional prefix makes pytest exit 4 (usage error) on
+    exactly the input the grader's restore step already tolerates -- a
+    declared path absent at the start state, which `_validate_prefixes`
+    accepts on purpose. Filtered here and unfiltered there, or the reverse,
+    and the gated argv is not the graded argv.
+    """
+    return tuple(
+        prefix for prefix in prefixes
+        if container.exec(["test", "-e", prefix]).exit_code == 0
+    )
+
+
+def _declared_grading(task) -> list[tuple[str, tuple[str, ...]]]:
+    """The non-empty `grading.*` argvs, keyed by check name.
+
+    The keys come off the dataclass rather than a hand-written list here, for
+    the reason `tasks._GRADING_KEYS` gives: a copy goes stale the first time a
+    check is added, and its failure is the silent one -- the new key is
+    accepted by the loader and never validated by the gate.
+    """
+    grading = getattr(task, "grading", None)
+    if grading is None:
+        return []
+    return [
+        (spec.name, tuple(getattr(grading, spec.name)))
+        for spec in dataclass_fields(grading)
+        if getattr(grading, spec.name)
+    ]
 
 
 def failed_node_ids(output: str) -> set[str]:
@@ -115,22 +189,21 @@ class _Runner:
         self.container = container
         self.runner = list(runner)
         self.timeout_s = timeout_s
+        #: The argv of the most recent invocation, so a problem can name what
+        #: was actually run rather than a reconstruction of it -- a second
+        #: copy of the branch logic is a second thing that can be wrong about
+        #: what happened, inside the check that exists to be right about it.
+        self.last_argv: list[str] = []
 
     def run(self, extra: list[str]):
-        return self.container.exec(
-            ["timeout", str(self.timeout_s), *self.runner, *extra]
-        )
+        self.last_argv = ["timeout", str(self.timeout_s), *self.runner, *extra]
+        return self.container.exec(self.last_argv)
 
     def select(self, node_ids: tuple[str, ...]):
         return self.run(list(node_ids))
 
-    def deselect(self, node_ids: tuple[str, ...]):
-        args: list[str] = []
-        for node_id in node_ids:
-            args += ["--deselect", node_id]
-        return self.run(args)
-
-    def pass_to_pass(self, tests):
+    def pass_to_pass(self, tests, extra_deselect: tuple[str, ...] = (),
+                     scope: tuple[str, ...] = ()):
         """The p2p set: whatever the manifest declared, or everything else.
 
         Both branches are real. An explicit list is what a task needs when
@@ -139,10 +212,24 @@ class _Runner:
         because an enumerated copy of a pinned suite goes stale for no
         benefit. Reading the field only when it is non-empty is what keeps it
         from being a manifest key that looks like a measurement and is not.
+
+        The two keyword parameters exist for the offline grader and default to
+        inert: `extra_deselect` appends --deselect for the flake quarantine, and
+        `scope` prepends path prefixes to the deselect branch so check 6 grades
+        the repo's declared suite rather than whatever scratch files an agent
+        left at the rootdir (measured: eight of them in one stored record). With
+        both empty, the argv is byte-identical to what preflight validated --
+        a test pins that, because the moment the graded command and the gated
+        command drift apart, the oracle stops describing the thing being graded.
         """
+        extra = [arg for node_id in extra_deselect
+                 for arg in ("--deselect", node_id)]
         if tests.p2p:
-            return self.select(tests.p2p)
-        return self.deselect(tests.f2p)
+            return self.run([*tests.p2p, *extra])
+        args: list[str] = [*scope]
+        for node_id in tests.f2p:
+            args += ["--deselect", node_id]
+        return self.run([*args, *extra])
 
 
 def preflight(
@@ -161,6 +248,7 @@ def preflight(
     one cause.
     """
     problems: list[str] = []
+    problem_codes: list[str] = []
     evidence: dict = {}
     tests = task.tests
 
@@ -179,6 +267,8 @@ def preflight(
             start_sha=start_sha, image=image,
             manifest_digest=task.manifest_digest,
             problems=tuple(problems), evidence=evidence,
+            preflight_version=PREFLIGHT_VERSION,
+            problem_codes=tuple(problem_codes),
         )
 
     with RunContainer(image=image, repo_path=str(repo_path),
@@ -328,6 +418,72 @@ def preflight(
                     + (after_p2p.stdout or after_p2p.stderr)[-2000:]
                 )
 
+            # --- the SCOPED p2p is green, which is what the grader runs
+            #
+            # Check 6 scopes p2p to tests.paths, because an agent's scratch
+            # files at the rootdir get collected and counted otherwise. The
+            # first draft of that design claimed rootdir-wide green "strictly
+            # implies" scoped green; it does not, since scoping changes
+            # fixture setup and ordering. So it is measured here instead.
+            #
+            # Deselect branch only: pass_to_pass ignores `scope` when an
+            # explicit p2p list is declared, so running this there pays a full
+            # suite invocation to re-assert the selection already validated
+            # ten lines up.
+            if not tests.p2p:
+                scope = _existing_prefixes(container, tests.paths)
+                evidence["scope_prefixes"] = list(scope)
+                absent = [p for p in tests.paths if p not in scope]
+                if absent:
+                    # Recorded, never a problem: `ok` is `not problems`, and
+                    # the grader's restore step tolerates exactly this input.
+                    # A problem here re-arms the NO-GO the filter prevents.
+                    evidence["scope_prefixes_absent"] = absent
+                    problem_codes.append(SCOPE_PREFIX_MISSING)
+                if not scope:
+                    problem_codes.append(SCOPE_COLLECTS_NOTHING)
+                    problems.append(
+                        "none of the declared tests.paths "
+                        f"({', '.join(tests.paths)}) exist after the reference "
+                        "fix, so the grader's scoped p2p run would collect "
+                        "nothing and every submission would be graded against "
+                        "an empty regression check"
+                    )
+                else:
+                    scoped = runner.pass_to_pass(tests, scope=scope)
+                    evidence["p2p_scoped_after_exit"] = scoped.exit_code
+                    if scoped.exit_code != EXIT_ALL_PASSED:
+                        if scoped.exit_code == EXIT_NOTHING_COLLECTED:
+                            problem_codes.append(SCOPE_COLLECTS_NOTHING)
+                        problems.append(
+                            "the p2p run the GRADER will make is not green "
+                            f"after the reference fix -- "
+                            f"{_explain(scoped.exit_code)}. Scoping to "
+                            "tests.paths changes what is collected, so a green "
+                            "rootdir run does not settle this one.\n"
+                            f"  {' '.join(runner.last_argv)}\n"
+                            + (scoped.stdout or scoped.stderr)[-2000:]
+                        )
+
+            # --- each declared grading argv runs clean on the reference
+            #
+            # A typo'd `typecheck:`, or a tool the image does not ship, is
+            # otherwise stamped as typecheck_failed on every record of this
+            # task, permanently, in an append-only store -- an accusation
+            # against every arm for the task author's error.
+            for key, argv in _declared_grading(task):
+                checked = container.exec(["timeout", str(timeout_s), *argv])
+                evidence[f"grading_{key}_exit"] = checked.exit_code
+                if checked.exit_code != EXIT_ALL_PASSED:
+                    problems.append(
+                        f"the declared grading.{key} command exits "
+                        f"{checked.exit_code} at the post-fix state: "
+                        f"{' '.join(argv)}. The reference is the oracle; a "
+                        f"command it cannot satisfy would record "
+                        f"{key}_failed against every submission.\n"
+                        + (checked.stdout or checked.stderr)[-2000:]
+                    )
+
         # Leave the tree exactly as it was found.
         #
         # Not load-bearing today and deliberately kept anyway: the matrix
@@ -347,4 +503,6 @@ def preflight(
         manifest_digest=task.manifest_digest,
         problems=tuple(problems),
         evidence=evidence,
+        preflight_version=PREFLIGHT_VERSION,
+        problem_codes=tuple(problem_codes),
     )

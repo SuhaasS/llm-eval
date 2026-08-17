@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
@@ -26,7 +27,7 @@ from bakeoff.preflight import (
     failed_node_ids,
     preflight,
 )
-from bakeoff.tasks import load_task, materialize
+from bakeoff.tasks import TaskGrading, load_task, materialize
 
 FIXTURE = Path(__file__).resolve().parent.parent / "fixtures" / "smoke_task"
 
@@ -414,3 +415,268 @@ def test_a_declared_p2p_set_is_actually_used():
 
     assert recorder.commands[0][-1] == "tests/b.py::test_two"
     assert "--deselect" not in recorder.commands[0]
+
+
+# --- the seams the offline grader rides --------------------------------------
+
+
+def test_grading_p2p_with_no_extras_is_the_argv_preflight_validated():
+    """The whole reason the grader goes through this method rather than
+    hand-building the branch: with both keyword arguments left at their
+    defaults the argv is byte-identical to the one the gate validated. The
+    moment the graded command and the gated command drift apart, the oracle
+    stops describing the thing being graded."""
+    from bakeoff.preflight import _Runner
+
+    plain, kwargs = _Recorder(), _Recorder()
+    _Runner(plain, _Tests().runner, 60).pass_to_pass(_Tests())
+    _Runner(kwargs, _Tests().runner, 60).pass_to_pass(
+        _Tests(), extra_deselect=(), scope=()
+    )
+
+    assert plain.commands == kwargs.commands
+
+
+def test_the_quarantine_rides_as_deselect_flags():
+    """The flake quarantine is a set of node ids the grader subtracts from
+    check 6, and it has to reach pytest the same way the f2p deselects do --
+    a second hand-built copy of the flag loop is a second thing that can be
+    wrong about what was actually run."""
+    from bakeoff.preflight import _Runner
+
+    recorder = _Recorder()
+    _Runner(recorder, _Tests().runner, 60).pass_to_pass(
+        _Tests(), extra_deselect=("tests/t.py::flaky",)
+    )
+
+    argv = recorder.commands[0]
+    assert argv[-2:] == ["--deselect", "tests/t.py::flaky"]
+    # after the f2p deselects, not instead of them
+    assert argv.index("tests/a.py::test_one") < argv.index("tests/t.py::flaky")
+
+
+def test_scope_prefixes_lead_the_extra_segment():
+    """`scope` is positional collection scoping, so it has to lead the
+    arguments pytest is given -- but the argv still opens with the timeout and
+    the pinned runner. The explicit-p2p branch ignores it by design: node ids
+    already scope that selection."""
+    from bakeoff.preflight import _Runner
+
+    recorder = _Recorder()
+    runner_argv = _Tests().runner
+    _Runner(recorder, runner_argv, 60).pass_to_pass(_Tests(), scope=("tests/",))
+
+    argv = recorder.commands[0]
+    head = ["timeout", "60", *runner_argv]
+    assert argv[: len(head)] == head
+    assert argv[len(head)] == "tests/"
+
+    explicit = _Recorder()
+    tests = _Tests(p2p=("tests/b.py::test_two",))
+    _Runner(explicit, runner_argv, 60).pass_to_pass(tests, scope=("tests/",))
+    assert "tests/" not in explicit.commands[0]
+
+
+# --- the two new gate assertions ---------------------------------------------
+
+
+class _Exec:
+    def __init__(self, exit_code=0, stdout="", stderr=""):
+        self.exit_code = exit_code
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class _ScriptedContainer:
+    """Preflight's container, answered by command shape.
+
+    Every environment check gets the healthy answer by default so a test
+    states only the one thing it is about. The suite invocations are the
+    interesting ones and are told apart by content rather than by position:
+    a run carrying a scope prefix is the scoped assertion, a run carrying
+    `--deselect` or an explicit p2p list is a p2p run, and anything else is
+    an f2p selection.
+    """
+
+    def __init__(self, *, start_sha, tests, present=(), scoped_exit=0,
+                 grading_exits=None):
+        self.commands = []
+        self.start_sha = start_sha
+        self.tests = tests
+        self.present = set(present)
+        self.scoped_exit = scoped_exit
+        self.grading_exits = dict(grading_exits or {})
+        self.f2p_runs = 0
+        self.scoped_runs = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def exec(self, cmd, env=None):
+        self.commands.append(list(cmd))
+        if cmd[:2] == ["id", "-u"]:
+            return _Exec(stdout="1000\n")
+        if cmd[0] == "claude":
+            return _Exec(stdout="2.1.220\n")
+        if cmd[0] == "sh":
+            return _Exec()
+        if cmd[:2] == ["test", "-e"]:
+            return _Exec(exit_code=0 if cmd[2] in self.present else 1)
+        if cmd[:2] == ["git", "rev-parse"]:
+            return _Exec(stdout=self.start_sha + "\n")
+        if cmd[:2] == ["git", "status"]:
+            return _Exec(stdout="")
+        if cmd[0] == "git":
+            return _Exec()
+        if cmd[0] == "timeout":
+            return self._timeout(cmd[2:])
+        raise AssertionError(f"unscripted exec: {cmd!r}")
+
+    def _timeout(self, argv):
+        runner = list(self.tests.runner)
+        if argv[: len(runner)] != runner:
+            return _Exec(exit_code=self.grading_exits.get(tuple(argv), 0))
+        rest = argv[len(runner):]
+        if rest == list(self.tests.f2p):
+            self.f2p_runs += 1
+            if self.f2p_runs == 1:  # red before the reference fix
+                return _Exec(
+                    exit_code=EXIT_TESTS_FAILED,
+                    stdout="".join(f"FAILED {n}\n" for n in self.tests.f2p),
+                )
+            return _Exec()
+        if any(arg in self.tests.paths for arg in rest):
+            self.scoped_runs += 1
+            return _Exec(exit_code=self.scoped_exit)
+        return _Exec()
+
+
+@dataclass(frozen=True)
+class _FakeTests:
+    paths: tuple = ("tests/",)
+    runner: tuple = ("python", "-m", "pytest", "-q")
+    f2p: tuple = ("tests/a.py::test_one",)
+    p2p: tuple = ()
+
+
+@dataclass(frozen=True)
+class _FakeTask:
+    tests: _FakeTests = field(default_factory=_FakeTests)
+    grading: TaskGrading = field(default_factory=TaskGrading)
+    task_id: str = "t"
+    task_version: int = 1
+    manifest_digest: str = "d"
+    solution_diff: str = "diff --git a/x b/x\n"
+
+
+def _run_preflight(monkeypatch, tmp_path, task, container):
+    monkeypatch.setattr(
+        "bakeoff.preflight.RunContainer",
+        lambda **kwargs: container,
+    )
+    return preflight(task, image="sha256:x", repo_path=tmp_path,
+                     start_sha="s" * 40)
+
+
+def test_a_scope_that_collects_nothing_is_a_named_problem_code(monkeypatch, tmp_path):
+    """Exit 5 is the whole detection. The pinned runner carries `-q`, which
+    suppresses the "collected 0 items" summary line (measured), so a guard
+    that matched that string could not fire under the configuration actually
+    used. The driver branches on the code, not on a prose prefix."""
+    from bakeoff.preflight import SCOPE_COLLECTS_NOTHING
+
+    task = _FakeTask()
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=("tests/",), scoped_exit=5)
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert SCOPE_COLLECTS_NOTHING in result.problem_codes
+    assert not result.ok
+    assert result.evidence["p2p_scoped_after_exit"] == 5
+
+    # The other route to the same code: nothing declared survives the filter,
+    # so there is no scoped run to exit 5 in the first place.
+    empty = _ScriptedContainer(start_sha="s" * 40, tests=task.tests, present=())
+    result = _run_preflight(monkeypatch, tmp_path, task, empty)
+    assert SCOPE_COLLECTS_NOTHING in result.problem_codes
+    assert empty.scoped_runs == 0
+
+
+def test_a_declared_prefix_missing_at_the_postfix_state_is_noted_not_fatal(
+    monkeypatch, tmp_path
+):
+    """`ok` is `not problems`, so appending a problem here would re-arm the
+    NO-GO the filter exists to prevent -- on exactly the input the grader's
+    restore step already tolerates. The author error stays loud through the
+    typed channel and the evidence, and stays non-fatal."""
+    from bakeoff.preflight import SCOPE_PREFIX_MISSING
+
+    tests = _FakeTests(paths=("tests/", "docs/tests/"))
+    task = _FakeTask(tests=tests)
+    container = _ScriptedContainer(start_sha="s" * 40, tests=tests,
+                                   present=("tests/",))
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert result.ok, result.problems
+    assert SCOPE_PREFIX_MISSING in result.problem_codes
+    assert result.evidence["scope_prefixes_absent"] == ["docs/tests/"]
+    assert result.evidence["scope_prefixes"] == ["tests/"]
+    assert not any("docs/tests/" in problem for problem in result.problems)
+
+
+def test_the_scoped_assertion_is_skipped_on_an_explicit_p2p_list(monkeypatch, tmp_path):
+    """`pass_to_pass` ignores `scope` on that branch, so running the
+    assertion there would pay a full suite invocation to re-assert a
+    selection preflight already validated."""
+    tests = _FakeTests(p2p=("tests/b.py::test_two",))
+    task = _FakeTask(tests=tests)
+    container = _ScriptedContainer(start_sha="s" * 40, tests=tests,
+                                   present=("tests/",))
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert result.ok, result.problems
+    assert container.scoped_runs == 0
+    assert "p2p_scoped_after_exit" not in result.evidence
+    assert result.problem_codes == ()
+
+
+def test_preflight_fails_a_broken_grading_declaration(monkeypatch, tmp_path):
+    """A typo'd `typecheck:` against an image without mypy is otherwise
+    stamped as `typecheck_failed` on every record of the task, permanently,
+    instead of stopping the matrix before anything is spent."""
+    task = _FakeTask(grading=TaskGrading(typecheck=("mypy", "src")))
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=task.tests, present=("tests/",),
+        grading_exits={("mypy", "src"): 127},
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert not result.ok
+    assert any("typecheck" in p and "127" in p for p in result.problems)
+    assert result.evidence["grading_typecheck_exit"] == 127
+
+
+def test_a_healthy_task_declares_the_gate_that_produced_its_verdict(
+    monkeypatch, tmp_path
+):
+    """A cached verdict outlives the gate that wrote it, so it has to say
+    which gate that was."""
+    from bakeoff.preflight import PREFLIGHT_VERSION
+
+    task = _FakeTask()
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=("tests/",))
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert result.ok, result.problems
+    assert result.preflight_version == PREFLIGHT_VERSION
+    assert result.to_dict()["preflight_version"] == PREFLIGHT_VERSION
+    assert result.to_dict()["problem_codes"] == []
