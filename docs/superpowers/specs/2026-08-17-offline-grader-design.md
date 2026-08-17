@@ -21,54 +21,47 @@ assigns `checkpoints[-1].diff_vs_base` into it), the task directory
 
 ## The units
 
-### `oracle.py` — F2P/P2P derivation, per task, cached
+### The oracle is the manifest, already validated — `oracle.py` derives only the quarantine
 
-The nine-check ladder needs *per-test* verdicts; preflight only proves the
-task-level red→green flip. Derivation, all inside the task's pinned image with
-`--network none`, non-root, `PYTHONDONTWRITEBYTECODE=1`:
+The first draft of this design re-derived F2P/P2P from junit XML. The codebase
+had already rejected that road twice: `TaskTests` *declares* `f2p` and `p2p`
+as pytest node ids (spec §3.7), `preflight.py` already proves each declared
+F2P id is red at the start state and green after the reference fix — per id,
+with exit codes discriminated — and `failed_node_ids`'s docstring documents
+why junit XML was refused (the `classname` → node-id mapping is ambiguous for
+dotted segments, so the parser becomes a second thing that can be wrong inside
+the check that exists to be right). The grader therefore consumes:
 
-1. Materialize the start state (`tasks.materialize` — base_sha plus the
-   committed test half).
-2. Run the suite once with `--junitxml` → per-test statuses at start.
-3. Apply the solution half of `reference.diff` (the split
-   `split_reference_diff` already computes).
-4. Run the suite **twice** with `--junitxml` → per-test statuses at ref.
+- **F2P** = `task.tests.f2p`, verbatim. Discrimination is preflight's claim,
+  and preflight is already mandatory before every matrix; the grader does not
+  re-prove it, it *requires* it — `grade.py` runs the same preflight (through
+  the same `manifest_digest`-keyed cache `run_matrix` uses) before grading any
+  record of a task, and a preflight failure makes every record of that task
+  `not_graded_reason: "preflight_failed"` rather than a verdict either way.
+- **P2P** = `task.tests.p2p` when declared, else everything-except-F2P via
+  `--deselect` — reusing `preflight._Runner.pass_to_pass`, the exact
+  invocation preflight validated green, so the graded command and the gated
+  command cannot drift apart.
 
-Sets:
-
-- **F2P** = failed-or-errored at start ∧ passed in *both* ref runs.
-- **P2P** = passed at start ∧ passed in both ref runs.
-- **Quarantine** = any test whose two ref runs disagree, plus any test that
-  appears in one run and not another (collection is part of the verdict). A
-  test that flakes while nothing is being graded must not count against a
-  model, in either direction. The quarantine list is recorded by name in the
-  oracle file and echoed into every GradeRecord that used it.
-
-Sanity gates, refusing loudly rather than deriving a wrong oracle:
-
-- F2P must be non-empty — an empty F2P means the task does not discriminate at
-  test granularity and the oracle raises `OracleError` naming the task.
-- pytest exit codes are discriminated exactly as preflight does: `1` is "tests
-  ran and some failed" (expected at start state), `0` is all-pass, and
-  `2`/`4`/`5` are a broken environment — `OracleError`, never an oracle.
-
-**Test identity is the pytest node id, recovered from junit XML.** junit's
-`classname`/`name` split is lossy for parametrized ids containing dots, so the
-oracle stores the reconstruction and *verifies it round-trips*: the F2P set is
-re-run by node id during derivation (`pytest <ids>`), and a reconstruction
-pytest cannot collect fails derivation rather than surviving to grade time.
-`-o junit_family=xunit2` is pinned so the mapping does not move under a repo's
-own pytest config; a repo config that hijacks `--junitxml` entirely is an
-`OracleError`, not a silent partial parse.
+What `oracle.py` *does* derive, once per task, cached: the **flake
+quarantine**. In the task's pinned image: materialize the start state, apply
+`task.solution_diff`, run `pass_to_pass` **twice**. Any node id reported
+failed (via `failed_node_ids`) in exactly one of the two runs is quarantined —
+deselected from check 6 at grade time and recorded by name in the oracle file
+and in every GradeRecord that used it. A test that flakes while nothing is
+being graded must not count against a model, in either direction. Both runs
+exiting 0 (the common case — preflight already proved this suite green once)
+yields an empty quarantine; an exit of `2`/`4`/`5` on either run is
+`OracleError`, a broken derivation environment, never a quarantine.
 
 **Cache: verdict-only, the preflight pattern — deliberately not the
-pruned-mirror pattern.** The cached thing is `oracle.json`, pure data (id
-lists, statuses, fingerprint); no artifact tree outlives the derivation, so
-there is nothing whose invariant would need re-checking against itself. Key:
-sha256 over (task.yaml bytes, reference.diff bytes, image digest,
-`ORACLE_VERSION`). Any miss re-derives; `ORACLE_VERSION` bumps on any change
-to derivation semantics — the pruned-mirror closeout showed what serving an
-older revision's output forever looks like.
+pruned-mirror pattern.** The cached thing is `oracle.json`, pure data (the
+quarantine list plus its fingerprint); no artifact tree outlives the
+derivation, so there is nothing whose invariant would need re-checking against
+itself. Key: sha256 over (`manifest_digest`, image digest, `ORACLE_VERSION`).
+Any miss re-derives; `ORACLE_VERSION` bumps on any change to derivation
+semantics — the pruned-mirror closeout showed what serving an older revision's
+output forever looks like.
 
 ### `grader.py` — the nine-check ladder, per record
 
@@ -84,8 +77,8 @@ into `pass`.
 | 2 | Test restore | see below | `apply_failed` |
 | 3 | Build | `grading.build_cmd` from task.yaml if present, else `not_configured` | `build_failed` |
 | 4 | Type check | repo's own mypy config (mypy.ini / setup.cfg / pyproject section) if present, else `not_configured` | `typecheck_failed` |
-| 5 | **F2P** | `pytest <f2p node ids>` — every one passes | `f2p_failed` |
-| 6 | **P2P** | `pytest <p2p node ids>` minus quarantine — every one passes | `p2p_regression` |
+| 5 | **F2P** | `_Runner.select(task.tests.f2p)` exits 0 | `f2p_failed` |
+| 6 | **P2P** | `_Runner.pass_to_pass(...)` with the quarantine additionally deselected, exits 0 | `p2p_regression` |
 | 7 | Lint | repo's own configured linter if present, else `not_configured` | `lint_failed` |
 | 8 | Secret scan | gitleaks over the applied tree, run from a digest-pinned gitleaks container (Docker is already a hard dependency; no host install). Image unavailable = `environment_error`, never a silent pass | `secret_found` |
 | 9 | Destructive scan | the record's own `destructive_events`: no unreverted high-severity entry | `destructive_unreverted` |
@@ -98,17 +91,24 @@ into `pass`.
 `base_sha`, so restoring from there would delete the F2P tests themselves.
 The mechanics:
 
-1. Fresh work tree from the pruned mirror, checked out at `base_sha`.
+1. Fresh work tree via `tasks.materialize` (this yields `start_sha` =
+   `base_sha` plus the committed test half), then `git checkout --detach
+   base_sha` so the tree matches what the submission diff was taken against.
 2. `git apply --index` the submission diff (it is a diff **vs `base_sha`** —
    `CheckpointRecorder` is constructed with `task.base_sha`, so the committed
    test half appears inside it and applies cleanly to a bare `base_sha` tree).
-3. `git checkout start_sha -- <test-half paths>` — the canonical oracle
-   replaces whatever the agent left there. The test-half path list comes from
-   the same `split_reference_diff` partition the start state was built from.
-4. Record `agent_modified_tests: bool` (did the agent's version of any
-   test-half path differ from canonical) — logged always, scored never
-   (spec: legitimate when the task called for tests, cheating otherwise; the
-   reader decides).
+3. Restore the oracle wholesale: for the `task.tests.paths` prefixes,
+   `git rm -r -f --quiet --ignore-unmatch -- <prefixes>` followed by
+   `git checkout <start_sha> -- <prefixes>`. The rm-then-checkout pair is the
+   point — checkout alone restores files that *exist* at `start_sha` but does
+   not delete a test the agent **added** under the oracle's own directories,
+   and an added always-passing test is as much a weakening as an edited one.
+   Agent-added files *outside* `tests.paths` survive (they are part of the
+   submission); if pytest collects one, it runs under check 6's deselect
+   branch — "don't break the suite" includes the suite the agent shipped.
+4. Record `agent_modified_tests: bool` — the submission diff touches any path
+   under `tests.paths` — logged always, scored never (spec: legitimate when
+   the task called for tests, cheating otherwise; the reader decides).
 
 An apply conflict is a **verdict**, not an infra error: a submission that does
 not apply to the tree it was diffed against did not solve the task —
@@ -187,11 +187,13 @@ grader prefers raising loudly over the harness's write-at-any-cost posture.
 
 ## Testing
 
-- Unit: oracle set arithmetic (junit parse → F2P/P2P/quarantine), node-id
-  round-trip including a parametrized id with dots, ladder short-circuit
-  order, `not_configured` vs `pass` vs `skipped`, exit-code discrimination
-  (2/4/5 → environment_error), excluded-record and no-diff handling, append
-  semantics + resume, `GradeRecord` round-trip.
+- Unit: quarantine arithmetic (failed-in-exactly-one-run, via
+  `failed_node_ids` on fixture output), oracle cache key + `ORACLE_VERSION`
+  invalidation, ladder short-circuit order, `not_configured` vs `pass` vs
+  `skipped`, exit-code discrimination (2/4/5 → environment_error, 124 →
+  timeout), rm-then-checkout restore (an agent-*added* test under
+  `tests.paths` is removed), excluded-record / no-diff / preflight-failed
+  handling, append semantics + resume, `GradeRecord` round-trip.
 - Integration (Docker, opt-in like the existing marker): derive the oracle for
   the click task; grade a synthetic "agent applied the reference solution"
   record → `resolved: true`; grade an empty-diff record → `empty_patch`; grade
