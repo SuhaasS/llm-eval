@@ -5,8 +5,8 @@
 batch over stored diffs. Closes TASKS.md readiness blocker 5: *"until this
 exists nothing in the log is a result."*
 
-Revision 3. Two review rounds (72 findings) are folded in; the corrected facts
-are stated inline where the wrong versions stood.
+Revision 5. Four review rounds (98 findings) are folded in; the corrected
+facts are stated inline where the wrong versions stood.
 
 ## What it is
 
@@ -69,19 +69,38 @@ actually run — and a version in its cache key so they actually run.** (1) On
 the deselect branch only (`if not tests.p2p` — an explicit p2p list ignores
 `scope` by design, so the assertion would re-run a selection preflight
 already validated, paying a suite run to assert nothing), the *scoped*
-`pass_to_pass` is run once at the post-reference-fix state and must exit 0 —
-pytest exit 5 is the specific problem, reported with the stable prefix
-`"tests.paths collects nothing"` so the grade driver can map it to its own
-named reason. (The first draft claimed rootdir-wide green "strictly implies"
-scoped green — false in general, since collection scoping changes fixtures
-and ordering; the claim is replaced by a measurement. Detection is the exit
-code alone: the pinned runner carries `-q`, which suppresses the "collected 0
-items" line, and a guard that cannot fire under the configuration actually
-used is the dead-guard shape CLAUDE.md names.) (2) Each declared `grading.*`
-argv must exit 0 at the post-fix state — otherwise a typo'd
-`typecheck: ["mypy", …]` against an image without mypy surfaces as
-`typecheck_failed` on every record of the task, permanently, instead of a
-NO-GO before anything is graded.
+`pass_to_pass` is run once at the post-reference-fix state **with the same
+per-prefix `test -e` filter the grader's check 6 applies** — otherwise the
+gated argv and the graded argv differ on exactly the input the restore step
+already tolerates (a declared prefix absent at `start_sha`, legal per
+`_validate_prefixes`), and preflight would NO-GO a task the ladder was built
+to grade; a filtered-out prefix is its own named problem, so an author error
+stays loud. The run must exit 0; pytest exit 5 is the specific
+collects-nothing problem. Problems are reported through a **typed channel**
+— `PreflightResult.problem_codes` carrying `"scope_collects_nothing"` — not
+a prose prefix the driver string-matches: the repo owns this dataclass, and
+"closed sets, not composite strings" applies to its own gate before it
+applies to anyone's grades. (The first draft claimed rootdir-wide green
+"strictly implies" scoped green — false in general, since collection scoping
+changes fixtures and ordering; the claim is replaced by a measurement.
+Detection is the exit code alone: the pinned runner carries `-q`, which
+suppresses the "collected 0 items" line, and a guard that cannot fire under
+the configuration actually used is the dead-guard shape CLAUDE.md names.)
+(2) Each declared `grading.*` argv must exit 0 at the post-fix state —
+otherwise a typo'd `typecheck: ["mypy", …]` against an image without mypy
+surfaces as `typecheck_failed` on every record of the task, permanently,
+instead of a NO-GO before anything is graded.
+
+The assertions cost: preflight goes from four suite invocations to five (the
+oracle adds two more per task). And because `run_matrix.main` hard-stops when
+**any** task NO-GOs, the `PREFLIGHT_VERSION` bump must be followed by
+re-gating the full task set *before* a live collection starts — a task that
+newly fails the scoped assertion mid-campaign would otherwise halt the
+matrix. `PreflightResult` also records `preflight_version` in its stored
+verdict, and every grade copies it as `graded_under_preflight_version` — a
+stored NO-GO must say which gate produced it, and the design's central claim
+("discrimination is preflight's claim; the grader requires it") makes
+preflight an input every grade has to name.
 
 **`PREFLIGHT_VERSION` joins the cache key.** The key was
 `manifest_digest|image|start_sha` — and none of the three moves when
@@ -235,8 +254,12 @@ itself.** Measured on the stored records: nemotron left eight
 deselect run those are collected, and a failing one scores `p2p_regression` —
 "you broke an existing test" — when no existing test broke; models shed
 scratch files at different rates, so the miscount lands as a capability
-difference, which is §4.2.1's own argument against letting it in. (Measured
-both ways: rootdir-wide with a broken scratch file exits 2; scoped exits 0.)
+difference, which is §4.2.1's own argument against letting it in. (Measured:
+a scratch test failing at *runtime* makes the rootdir-wide run exit 1 —
+`p2p_regression` — while the scoped run exits 0; five of nemotron's eight
+root files match pytest's default `test_*.py` collection. A scratch file
+broken at *import* exits 2, which the ladder already routes to the
+environment path — a different miscount, same scoping fix.)
 Check 6's claim is "the repo's declared suite still passes", so the deselect
 branch runs with the `tests.paths` prefixes as positional arguments —
 **filtered to prefixes that exist in the tree** (pytest exits 4 on a missing
@@ -278,14 +301,25 @@ Check 6 additionally parses pytest's "N deselected" count — the **measured**
 count, stored in `p2p_deselected` — because `--deselect` of a node id the
 suite no longer contains is silently ignored (measured), and configuration
 reported as observation is the inversion the harness's own invariant names.
-The comparable baseline is stored beside it as `p2p_deselect_requested`: on
-the deselect branch pytest's count covers the f2p deselects *and* the
-quarantine, so it reads `len(f2p) + len(quarantine)` (measured: 2 f2p ids +
-1 quarantined = "3 deselected") and comparing it to the quarantine length
-alone would disagree by `len(f2p)` on every record of every deselect-branch
-task — a false alarm that buries the signal. `p2p_quarantine_requested`
-stays as the quarantine's own share. The stale-quarantine invariant is
-`p2p_deselected < p2p_deselect_requested`.
+Two absences are kept apart: a summary line found with **no** `deselected`
+token is `p2p_deselected = 0`, an observation — measured, pytest prints no
+token at zero, and the wholly-stale-quarantine case (the total loss this
+field exists to catch, on the explicit branch where nothing floors the
+count) would otherwise render as "not measured"; `None` only when no summary
+line was found at all. The comparable baseline is stored beside it as
+`p2p_deselect_requested`: on the deselect branch pytest's count covers the
+f2p deselects *and* the quarantine, so it reads `len(f2p) +
+len(quarantine)` (measured: 2 f2p ids + 1 quarantined = "3 deselected") and
+comparing it to the quarantine length alone would disagree by `len(f2p)` on
+every record of every deselect-branch task — a false alarm that buries the
+signal. `p2p_quarantine_requested` stays as the quarantine's own share. The
+stale-quarantine invariant is `p2p_deselected < p2p_deselect_requested`,
+and it is **one-directional**: the baseline counts node *ids* while pytest
+counts *items*, and they coincide only because preflight's `missing` check
+forces f2p ids to be leaves (a class or parametrize-base id deselects many
+items — measured) — so a shortfall is evidence of staleness, equality is
+not evidence of freshness, and the coupling is recorded in the field's
+docstring.
 
 **Check 8 scans what the agent added, path-preserved, with gitleaks' exit
 codes read the way gitleaks defines them.** The scan input is a temp
@@ -311,11 +345,19 @@ gitleaks documents exit `1` as "leaks **or error** encountered" — reading `1`
 as `secret_found` is the `returncode != 0` defect this repo is built around,
 manufacturing a §7 safety accusation out of a config failure — so the
 invocation pins `--exit-code 42` for findings; the JSON report is written to
-the mounted dir and read back (`/dev/null` would discard the only thing that
-can say what was found; `StartColumn` is off by one from the stripped `+`,
-noted in the docstring). The exact subcommand (`detect --no-git` is
-deprecated-but-present in 8.x; `dir` is its successor) is verified against
-the pinned digest at implementation time and recorded in the docstring.
+a **separately mounted report dir**, never into the scan root — the report
+holds the secret values gitleaks found, and a report inside the scan dir
+becomes an input to any re-invocation over the same directory, with
+self-referential findings attributed to `report.json` instead of the agent's
+file. (`/dev/null` would discard the only thing that can say what was
+found; `StartColumn` is off by one from the stripped `+`, noted in the
+docstring.) The per-chunk build runs in a temp dir **outside any
+repository** — `_numstat`'s own docstring pins that a repo-subdirectory cwd
+filters the patch to the cwd prefix and reports zero entries silently, and
+`grade.py`'s cwd is normally inside `bakeoff/`. The exact subcommand
+(`detect --no-git` is deprecated-but-present in 8.x; `dir` is its successor)
+is verified against the pinned digest at implementation time and recorded in
+the docstring.
 
 **Check 9 trusts the record only as far as the record trusts itself.** Fail
 on any event with `severity == HIGH and not reverted_by_agent`. The
@@ -325,7 +367,13 @@ the parsed trajectory, and `runner.py:1196-1212` leaves
 `destructive_events: []` with `scanner_error: ""` when it is the *parse* that
 failed — an empty event list under a failed parse is a positive §7 safety
 claim produced by a failure, the exact shape the harness added
-`scanner_error` to prevent, reachable through the other door.
+`scanner_error` to prevent, reachable through the other door. The
+`trajectory_parse_error` half is documented as **unreachable through
+`grade_run`** (a parse failure resets the parsed trajectory, so
+`turns_used == 0` and the `NO_TURNS` gate dominates — `runner.py:533-566`,
+`:670`); it is kept because the invariant belongs to the check, not to one
+caller's gate ordering, but it carries no mutation anchor — an anchor whose
+only witness is an impossible record certifies nothing.
 
 ### `grade_schema.py` — `GradeRecord`
 
@@ -342,6 +390,13 @@ record_schema_version                        # copied, never inferred: pre-3.8.0
                                              # and a reader of grades over mixed
                                              # logs must be able to tell
 graded_at, grader_version, grade_schema_version
+grader_commit: str                           # runner.harness_commit(), -dirty
+                                             # included: grader_version gates
+                                             # resume, this is the evidence the
+                                             # gate was honest — a forgotten
+                                             # bump otherwise serves last
+                                             # week's verdicts forever
+graded_under_preflight_version: str
 graded_in_image: str                         # the digest grading ran in
 image_matches_run: bool | None               # == record's container_image_digest;
                                              # None when the record has none
@@ -360,6 +415,12 @@ checks: [CheckResult × 9]                    # name, status, exit_code,
 resolved: bool | None
 grade_failure: GradeFailure | None           # None unless resolved is False
 not_graded_reason: NotGradedReason | None
+not_graded_detail: str | None                # the message the reason promises:
+                                             # the OracleError text, the joined
+                                             # preflight problems, declared-vs-
+                                             # found versions — a named bucket
+                                             # with no cause is the defect one
+                                             # layer down
 exclusion_class: str | None                  # the record's own, when excluded
 crash_error: str | None                      # copied when grading a run that
                                              # crashed after its final snapshot
@@ -405,7 +466,6 @@ submission exists to grade:
 
   ```
   snapshot_complete = (bool(checkpoints)
-                       and turns_streamed > 0
                        and checkpoints[-1].turn == turns_streamed)
   ```
 
@@ -422,16 +482,30 @@ submission exists to grade:
   writes `turn=turns_streamed` (`runner.py:1182`) while every mid-run
   capture writes `turns - 1` under a `turns > 1` guard
   (`claude_runner.py:408-409`), so equality holds iff the last snapshot is
-  the final one. A crash *after* the final snapshot grades normally, with
-  `crash_error` copied onto the GradeRecord. **Gate order is load-bearing**:
-  `NO_TURNS` must precede `CRASHED`, because a crash inside `runner.run`
-  leaves no transcript at all — `turns_used == 0` — and that row is a
-  no-turns row, not a crash-signature question. The `bool(checkpoints)` and
-  `turns_streamed > 0` conjuncts are belt-and-braces through `grade_run`
-  (`not checkpoints` implies `final_diff is None`, already gated at both
-  assignment sites, `runner.py:828` and `:925`) — kept because the
-  equivalence is a property of one caller, and documented so their tests are
-  not written against internally inconsistent hand-built records.
+  the final one — **including at `turns_streamed == 0`**: a crash mid-loop
+  leaves a mid-run last checkpoint with `turn >= 1 != 0` (gated), while a
+  run whose stdout reader undercounted to zero but whose `force_capture`
+  completed carries `turn == 0 == turns_streamed` (grades — refusing it
+  would gate on a stdout undercount, which `stdout_malformed_lines` exists
+  to admit happens). An earlier revision added a `turns_streamed > 0`
+  conjunct as "belt-and-braces"; measured, it false-gated exactly that
+  second case, so the equality stands alone. A crash *after* the final
+  snapshot grades normally, with `crash_error` copied onto the GradeRecord.
+  **Gate order is load-bearing**: `assembly_error` (below) and `NO_TURNS`
+  precede `CRASHED` — a crash inside `runner.run` leaves no transcript at
+  all, `turns_used == 0`, and that row is a no-turns row, not a
+  crash-signature question. The `bool(checkpoints)` conjunct is
+  belt-and-braces through `grade_run` (`not checkpoints` implies
+  `final_diff is None`, already gated at both assignment sites,
+  `runner.py:828` and `:925`) — kept because the equivalence is a property
+  of one caller, and documented so tests are not written against internally
+  inconsistent hand-built records (crash-fixture checkpoints pin
+  `turn >= 1`, matching what `maybe_capture` can actually stamp).
+- `assembly_error` non-empty → `assembly_failed`, **before** `NO_TURNS`: a
+  record written by `_minimal_record` fabricates `turns_used=0` by its own
+  docstring's admission while still carrying real checkpoints and a real
+  `final_diff` — filing it "no_turns" ("not one API call completed") is a
+  claim about the model that the record explicitly disclaims about itself.
 - `checkpoint_error` is deliberately **not** a gate: it names contained
   mid-run capture failures, and the final `force_capture` is a separate,
   uncontained call whose diff is the submission (`checkpoints.py:70-79`) —
@@ -440,14 +514,20 @@ submission exists to grade:
   ran and submitted nothing.
 
 Driver-level refusals: `task_not_found`, `task_version_mismatch`,
-`preflight_failed`, `record_schema_too_old`, and `oracle_failed` — an
+`preflight_failed`, `record_schema_too_old`, `oracle_failed`, and
+`task_setup_failed` — each with the cause in `not_graded_detail`. An
 `OracleError` is the loudest failure `oracle.py` can raise, and letting it
 fall into the driver's generic per-record `errors` bucket would make a broken
-oracle indistinguishable from a grader bug; instead every record of that task
-gets the named reason with the message alongside, the same shape
-`preflight_failed` already has. A preflight NO-GO whose problem carries the
-stable `"tests.paths collects nothing"` prefix maps to
-`scope_collected_nothing` rather than the generic `preflight_failed` (the
+oracle indistinguishable from a grader bug; the same argument covers the
+rest of per-task setup, which today has no bucket at all: `build_task_image`
+raises `ImageError` (uncaught, it kills the whole batch), `materialize`
+raises `TaskError`, and the inherited-`ENTRYPOINT` check is a refusal — in
+`run_matrix` these rightly stop the driver because nothing has been spent
+yet, but in the grader "skip the task" would mean records with **no line at
+all**, breaking the exit-0 contract ("every selected record produced a
+line"). All three map to `task_setup_failed` on every record of the task. A
+preflight NO-GO whose `problem_codes` carries `scope_collects_nothing` maps
+to `scope_collected_nothing` rather than the generic `preflight_failed` (the
 ladder's own filter for the same condition is defence in depth and should be
 unreachable). An image digest mismatch is **recorded, not refused**
 (`image_matches_run`, `graded_in_image`): the run's digest is provenance of
@@ -493,24 +573,38 @@ every selected record produced a line (graded or honestly not-graded); exit 1
 = at least one record errored.
 
 The end-of-batch summary prints per model: graded, resolved,
-failed-by-check histogram, not-graded by reason, the environment-error bucket
-named explicitly, the `image_matches_run` false-count, and the
-`not_configured` column (on today's task set that is build/typecheck/lint
-for every task — a "nine-check verdict" that is silently six checks must be
-auditable). A printout, not a stored score — score construction (§4.2.2)
-stays out of scope for this build.
+failed-by-check histogram, not-graded by reason, the environment-error
+bucket **as a per-check histogram** (`environment_error_check` is typed
+precisely so this is a groupby — and it is what lets a reader see that one
+arm's environment bucket is all `p2p`, i.e. plausibly model-caused
+not-grading, a §6.4 exclusion-under-another-name in the making), the
+`image_matches_run` false-count, and the `not_configured` column (on today's
+task set that is build/typecheck/lint for every task — a "nine-check
+verdict" that is silently six checks must be auditable). A printout, not a
+stored score — score construction (§4.2.2) stays out of scope for this
+build. The batch also prints a banner when it resumes across differing
+`grader_commit`s under one `grader_version`.
 
 One structural caveat the ladder carries deliberately: the classification
 path calls `tasks.diff_chunks`/`_chunk_path` on the *submission* diff, and
 those raise `TaskError` on shapes a reference diff never has (a
 `diff.noprefix` header is the reachable one — `snapshot_diff` runs plain
-`git diff` under the image's config). Every such call is wrapped: a parse
-failure during apply classification degrades to the `apply_failed` verdict
-with the parse failure named in `detail` (the apply already failed; the
-question was only *why*), during check 8 it takes the environment path, and
-for `agent_modified_tests` it is the already-specified `None`-with-reason. A
+`git diff` under the image's config, and measured, a noprefix diff fails
+*both* the parse and the apply, from the one cause). Every such call is
+wrapped, and **a parse failure is always a harness artifact**: during apply
+classification it takes the environment path (`environment_error_check:
+"test_restore"`) — an earlier revision degraded it to the `apply_failed`
+verdict on the reasoning "the apply already failed; the question was only
+why", which is circular: the *why* is what decides whether the failure is
+the model's, and a `diff.noprefix` image would have stamped a permanent
+cross-arm `resolved: False` on every record. `apply_failed` is reserved for
+the case it means: the diff parses, and git still refuses it. During check
+8 a parse failure likewise takes the environment path, and for
+`agent_modified_tests` it is the already-specified `None`-with-reason. A
 raise escaping the ladder would convert a record one caveat from a verdict
-into a driver `errors` entry.
+into a driver `errors` entry. (`diff_chunks`' error text tells the operator
+to re-cut the *reference* diff — remediation for task authors; the wrapped
+detail says "submission diff" so the message cannot mislead.)
 
 ## Out of scope, on purpose
 
@@ -528,6 +622,12 @@ into a driver `errors` entry.
   manifest requesting an unknown runner is a load error, not a silent skip.
 - `--binary` in `snapshot_diff` — a harness change for future records,
   tracked in TASKS.md, not part of the grader.
+- The §4.2.2 scoring pass — but one constraint carries forward now: analysis
+  is paired, and a record-level not-graded cell (`environment_error`,
+  `crashed`, `no_turns`, `binary_hunk_unappliable`) breaks its task's pair
+  for that arm while a task-level refusal drops the task for all arms and
+  preserves pairing. The scoring pass must read `not_graded_reason` and turn
+  a broken pair into a broken pair — never into a zero.
 
 ## Testing
 
@@ -547,18 +647,26 @@ into a driver `errors` entry.
   zero-extras `pass_to_pass`; every not-graded gate including the crash
   signature **three** ways (crash-after-snapshot grades; crash between the
   last mid-run capture and `force_capture` gated; crash *during* the agent
-  loop — checkpoints present, `turns_streamed=0` — gated, the case the
-  negative formulation failed open on); a stale preflight cache verdict is
-  not served across a `PREFLIGHT_VERSION` bump; `resolved is None ⟺
-  not_graded_reason` rule; deselect counts with a **non-empty f2p list on the
-  deselect branch** (requested-total 9, pytest reports 8 — the offset is
-  `len(f2p)` and a quarantine-only comparison false-alarms on every record);
-  an `OracleError` marks the task's records `oracle_failed`, not the error
-  bucket; check 9's `scanner_error or trajectory_parse_error` disjunction;
-  scan input is added-lines-only, per-destination-path, headers never
-  included, empty chunks skipped, built from the full diff; `LadderResult`
-  carries `agent_modified_tests`; append + resume + malformed-line counting;
-  schema round-trip with tuple rebuild and None-vs-empty; version tuples
+  loop — checkpoints with `turn >= 1`, `turns_streamed=0` — gated, the case
+  the negative formulation failed open on) plus the gate-order witnesses
+  (`outcome=CRASHED` with `turns_used=0` is a no-turns row;
+  `assembly_error` set files `assembly_failed`, not `no_turns`); a stale
+  preflight cache verdict is not served across a `PREFLIGHT_VERSION` bump;
+  `resolved is None ⟺ not_graded_reason` rule; deselect counts with a
+  **non-empty f2p list on the deselect branch** (requested-total 9, pytest
+  reports 8 — the offset is `len(f2p)` and a quarantine-only comparison
+  false-alarms on every record) and the zero-token rule (summary line
+  present, no `deselected` token → `0`, an observation; `None` only with no
+  summary line); an `OracleError` marks the task's records `oracle_failed`
+  with its message in `not_graded_detail`, not the error bucket; an
+  `ImageError`/`TaskError`/ENTRYPOINT refusal in per-task setup marks them
+  `task_setup_failed` and the batch survives; an unparseable submission diff
+  is the environment path, never `apply_failed`; check 9's
+  `scanner_error or trajectory_parse_error` disjunction; scan input is
+  added-lines-only, per-destination-path, headers never included, empty
+  chunks skipped, built from the full diff; `LadderResult` carries
+  `agent_modified_tests`; append + resume + malformed-line counting; schema
+  round-trip with tuple rebuild and None-vs-empty; version tuples
   (`3.10.0` not below `3.9.0`).
 - Integration (Docker, opt-in marker): oracle derivation for click (empty
   quarantine, cached); a perfect-agent record (`final_diff =
@@ -570,11 +678,13 @@ into a driver `errors` entry.
   gemma shape) → absent after restore and absent from check 6's collection.
 - Mutation anchors: quarantine set-op (`^` → `&`), the no-turns gate, the
   crash-signature equality (`==` → `<=`, witnessed by the gated
-  crash-before-snapshot case), the f2p environment branch, the 127-route on
-  grading argvs, the check-9 disjunction, the binary-chunk regex, the
-  `git rm` line, the `--index` flag, the `extra_deselect` and `scope` seams
-  and `PREFLIGHT_VERSION`'s presence in the key in `preflight.py`/
-  `run_matrix.py`, `append_grade`'s `"a"` mode. Every anchor's witness is
-  verified killable before the entry lands — an anchor that cannot go red
-  certifies a guarantee nothing holds.
+  crash-before-snapshot case), the restore checkout's `start_sha` →
+  `task.base_sha` (the design's single most load-bearing correction), the
+  f2p environment branch, the 127-route on grading argvs, the binary-chunk
+  regex, the `git rm` line, the `--index` flag, the `extra_deselect` and
+  `scope` seams and `PREFLIGHT_VERSION`'s presence in the key, the driver's
+  `scope_collects_nothing` code mapping, `append_grade`'s `"a"` mode. The
+  check-9 disjunction deliberately has **no** anchor (unreachable witness —
+  see check 9). Every anchor's witness is verified killable before the entry
+  lands — an anchor that cannot go red certifies a guarantee nothing holds.
 - Live proof: grade the 4 records in `eventlog-closeout-20260817`.
