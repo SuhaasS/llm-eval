@@ -337,6 +337,71 @@ def test_a_damaged_grades_file_refuses_to_resume(tmp_path):
     assert str(path) in str(exc.value)
 
 
+def test_the_summary_covers_the_campaign_not_the_invocation(tmp_path):
+    """A batch is minutes of container work per row, so it gets interrupted and
+    resumed -- and the LAST invocation of a campaign routinely grades a handful
+    of rows.
+
+    Computed over `graded + not_graded` the summary described that handful, so
+    an eighty-row collection ended by printing a resolve rate over three. The
+    audit is the grade file, deduped to the last line per
+    `(run_id, grader_version)`, and it says how much of itself this invocation
+    did not produce.
+    """
+    root = _log(tmp_path, _record("run-a"), _record("run-b"), _record("run-c"))
+
+    first = _run(root, [_task()], tmp_path, only=["run-a", "run-b"])
+    assert first["summary"]["claude-sonnet-5"]["graded"] == 2
+    assert first["from_prior_invocations"] == 0
+
+    second = _run(root, [_task()], tmp_path)
+
+    # This invocation graded one row; the summary is over all three.
+    assert [g.run_id for g in second["graded"]] == ["run-c"]
+    assert second["summary"]["claude-sonnet-5"]["graded"] == 3
+    assert second["audited"] == 3
+    assert second["from_prior_invocations"] == 2
+
+
+def test_a_mismatch_graded_in_an_earlier_invocation_still_banners(tmp_path):
+    """The cross-image banner is a claim about a COLLECTION.
+
+    Computed over this invocation's rows it fired only while the mismatched
+    record happened to be in the slice being graded -- so a campaign whose
+    every row ran in a rebuilt image resumed once and went silent, with the
+    mismatches sitting in the file unmentioned.
+    """
+    root = _log(tmp_path, _record("run-a", image="sha256:elsewhere"),
+                _record("run-b"))
+
+    first = _run(root, [_task()], tmp_path, only=["run-a"])
+    assert any("differs from the one the run used" in w
+               for w in first["warnings"])
+
+    second = _run(root, [_task()], tmp_path)
+
+    assert [g.run_id for g in second["graded"]] == ["run-b"]
+    assert second["summary"]["claude-sonnet-5"]["image_mismatch"] == 1
+    assert any("differs from the one the run used" in w
+               for w in second["warnings"])
+
+
+def test_the_audit_counts_a_regraded_run_once(tmp_path):
+    """`--re-grade` appends, so one run holds several lines under one version.
+    Summing over all of them counts the run twice and inflates the denominator
+    of every rate a reader computes from the summary. The last line is the
+    current verdict, on the same reasoning the resume uses to skip."""
+    root = _log(tmp_path, _record("run-a"))
+    _run(root, [_task()], tmp_path)
+
+    second = _run(root, [_task()], tmp_path, re_grade=True)
+
+    assert len(_lines(root)) == 2
+    assert second["audited"] == 1
+    assert second["summary"]["claude-sonnet-5"]["graded"] == 1
+    assert second["from_prior_invocations"] == 0
+
+
 def test_a_resume_spanning_two_grader_commits_is_bannered(tmp_path):
     """`grader_version` gates the resume; `grader_commit` is the evidence the
     gate was honest. One version string over two working trees is exactly the

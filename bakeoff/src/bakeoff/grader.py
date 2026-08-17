@@ -1047,9 +1047,16 @@ def _check_secret_scan(state: _State, env, diff: str) -> None:
                    detail=_summarize_gitleaks(result.stdout))
     # Including gitleaks' own `1`, which means "leaks OR error" -- unusable as
     # a verdict, which is the whole reason `--exit-code 42` is passed.
+    #
+    # `_redacted` FIRST. `_head` falls back to stdout when stderr is empty, and
+    # on this path stdout is the gitleaks report -- the one carrying `Secret`
+    # and `Match`. The captured copy above is already redacted; without this
+    # the same values went out again through `environment_error`, which lands
+    # in the grade FILE rather than in a gzip beside it.
     state.environment(
         "secret_scan",
-        f"gitleaks exited {code}, which is not a verdict: {_head(result)}",
+        f"gitleaks exited {code}, which is not a verdict: "
+        f"{_head(_redacted(result))}",
         result,
     )
 
@@ -1154,6 +1161,14 @@ def _redacted(result):
     rule id, the file, the line -- is kept. An unparsable report is replaced
     outright rather than passed through: it cannot be shown to be free of
     values, and a scan artifact is not worth writing a secret to disk for.
+
+    STDERR IS PASSED THROUGH RAW, and that is only safe while gitleaks is
+    invoked WITHOUT `--verbose`: the verbose logger prints each finding --
+    secret value included -- to stderr as it goes, so adding that flag to
+    `scan_secrets`' argv silently turns this function into a no-op for the
+    values it exists to strip. Pinned here beside the other flag this depends
+    on: `--exit-code 42`, which is what makes gitleaks' own `1` readable as an
+    error rather than as a finding.
     """
     body = getattr(result, "stdout", "") or ""
     try:
@@ -1313,9 +1328,22 @@ class _ContainerEnv:
                 "/scan",
             ]
             try:
-                proc = subprocess.run(argv, capture_output=True, text=True)
+                # `timeout`, like every other graded command. This one runs on
+                # the HOST -- `docker run`, not `env.exec` -- so it is the one
+                # graded command the container's own `timeout` prefix does not
+                # cover, and without this a wedged daemon hangs the batch
+                # forever rather than costing one named row. Exit 1 is not a
+                # gitleaks verdict (`--exit-code 42` is), so both failures fall
+                # through to the environment branch in `_check_secret_scan`.
+                proc = subprocess.run(argv, capture_output=True, text=True,
+                                      timeout=GRADE_TIMEOUT_S)
             except OSError as exc:
                 return _ExecResult(1, "", f"could not run gitleaks: {exc}")
+            except subprocess.TimeoutExpired:
+                return _ExecResult(
+                    1, "",
+                    f"gitleaks hit the {GRADE_TIMEOUT_S}s grading timeout",
+                )
 
             written = report_dir / "report.json"
             # Read on the HOST side of the mount, which is the whole point:
@@ -1532,13 +1560,35 @@ def grade_run(record: RunRecord, task, image: str, oracle: Oracle | None,
     The tree is removed on the way out, including on the failure paths: it
     holds the submission applied on top of the start state, which is a trap
     for anyone who inspects the cache by hand.
+
+    THE ARTIFACTS DIRECTORY IS PER GRADER VERSION AND IS EMPTIED FIRST, and
+    both halves close the same defect the record's `wire_log_gz` was fixed for:
+    a path that resolves is worse than a null, because it publishes another
+    pass's files under this pass's line.
+
+    * Per version, because the grade file is append-only and a re-grade under
+      a new `GRADER_VERSION` leaves BOTH lines alive. Sharing
+      `artifacts_root/<run_id>` means the v2 pass overwrites the outputs the
+      v1 line still points at, and the disagreement between two lines -- the
+      whole reason the file keeps both -- is then read against evidence only
+      one of them produced.
+    * Emptied first, because `capture` writes one file per check and a ladder
+      that stops early writes fewer. Without the wipe, `--re-grade` under the
+      SAME version leaves the prior pass's `lint.out.gz` beside this pass's
+      `f2p.out.gz`, and a reader cannot tell which pass wrote which.
+
+    The `exists()` test below is the ownership check that follows from the
+    wipe: after it, a directory that exists is one THIS pass wrote into. Before
+    it, a short-circuited ladder that captured nothing still found the prior
+    pass's directory sitting there and named it as its own.
     """
     gate = not_graded_gate(record)
     if gate is not None:
         return build_grade_record(record, task, image, oracle,
                                   _gated_result(gate))
 
-    artifacts_dir = Path(artifacts_root) / record.run_id
+    artifacts_dir = Path(artifacts_root) / record.run_id / f"v{GRADER_VERSION}"
+    shutil.rmtree(artifacts_dir, ignore_errors=True)
     tree = Path(cache_root) / "grade-tree" / record.run_id
     shutil.rmtree(tree, ignore_errors=True)
     start_sha = materialize(task, tree / "repo", Path(cache_root))

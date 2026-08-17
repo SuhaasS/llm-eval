@@ -551,8 +551,9 @@ def grade_event_log(event_log_root, tasks, cache, grade_one=grade_run,
         warnings.append(
             f"{malformed} unreadable line(s) in {path} were skipped. "
             "--re-grade makes them harmless to the resume, but the "
-            "grader_commit check below reads the same list, so it is reported "
-            "over an incomplete view of what has already been graded."
+            "grader_commit check, the summary and the cross-image banner below "
+            "all read the same list, so each is reported over an incomplete "
+            "view of what has already been graded."
         )
     prior = {
         g.grader_commit for g in existing
@@ -608,17 +609,33 @@ def grade_event_log(event_log_root, tasks, cache, grade_one=grade_run,
             continue
         (not_graded if grade.not_graded_reason else graded).append(grade)
 
-    mismatches = sum(
-        1 for g in graded + not_graded if g.image_matches_run is False
+    # THE AUDIT IS OVER THE CAMPAIGN, NOT OVER THIS INVOCATION. Both of the
+    # things below are answers about a COLLECTION -- how it resolved, and
+    # whether any of it was graded somewhere else -- and computing them from
+    # `graded + not_graded` made them answers about a slice instead. A resume
+    # is the normal way this driver is used (a batch is minutes of container
+    # work per row and gets interrupted), so the last invocation of a campaign
+    # is routinely the one that grades three rows, prints a summary over three
+    # rows, and lets every mismatch accumulated across the first eighty go
+    # unbannered. `existing` is already loaded for the resume; it is the same
+    # list the `grader_commit` banner above reads.
+    audited = _last_line_per_grade(existing + graded + not_graded)
+    fresh = {(g.run_id, g.grader_version) for g in graded + not_graded}
+    from_prior = sum(
+        1 for g in audited if (g.run_id, g.grader_version) not in fresh
     )
+
+    mismatches = sum(1 for g in audited if g.image_matches_run is False)
     if mismatches:
         warnings.append(
-            f"{mismatches} grade(s) ran in an image whose digest differs from "
-            "the one the run used. Recorded rather than refused -- the task "
-            "image build is not hermetic, so a rebuilt digest differs almost "
-            "surely off the collecting machine -- but a cross-image comparison "
-            "is a different measurement and `image_matches_run` is how a "
-            "reader tells."
+            f"{mismatches} grade(s) in {path} ran in an image whose digest "
+            "differs from the one the run used. Recorded rather than refused "
+            "-- the task image build is not hermetic, so a rebuilt digest "
+            "differs almost surely off the collecting machine -- but a "
+            "cross-image comparison is a different measurement and "
+            "`image_matches_run` is how a reader tells. Counted over the whole "
+            "grade file, so a resumed campaign does not lose the ones an "
+            "earlier invocation wrote."
         )
 
     return {
@@ -627,8 +644,34 @@ def grade_event_log(event_log_root, tasks, cache, grade_one=grade_run,
         "errors": errors,
         "skipped": skipped,
         "warnings": warnings,
-        "summary": summarize(graded + not_graded),
+        "summary": summarize(audited),
+        # How much of the summary this invocation did NOT produce. Printed, so
+        # a reader of a three-row resume cannot mistake a campaign-wide summary
+        # for one this invocation earned.
+        "audited": len(audited),
+        "from_prior_invocations": from_prior,
     }
+
+
+def _last_line_per_grade(grades: list[GradeRecord]) -> list[GradeRecord]:
+    """One row per `(run_id, grader_version)` -- the LAST line, in file order.
+
+    The grade file is append-only and a re-grade appends rather than replaces,
+    so a run can hold several lines under one version; summing over all of them
+    counts one run two or three times and inflates the denominator of every
+    rate computed from the summary. The last line is the current verdict, on
+    the same reasoning `done` uses to skip: it is the one a later reader of the
+    file would land on.
+
+    Keyed on the VERSION too, never on `run_id` alone. Two grader versions
+    disagreeing about one run is a finding the file exists to keep, and
+    collapsing them would silently discard the older ladder's verdict from the
+    audit while its line stays on disk.
+    """
+    last: dict[tuple[str, str], GradeRecord] = {}
+    for grade in grades:
+        last[(grade.run_id, grade.grader_version)] = grade
+    return list(last.values())
 
 
 # ---------------------------------------------------------------------------
@@ -683,6 +726,15 @@ def print_summary(result: dict) -> None:
         f"{len(result['not_graded'])} not graded, "
         f"{len(result['errors'])} errored, "
         f"{len(result['skipped'])} already graded"
+    )
+    # Said before the per-model rows, because the rows are the whole campaign
+    # and the line above is this invocation. A resume's last slice grades three
+    # rows and prints a summary over eighty; a reader who took the second for
+    # the first would read a finished collection off a batch that graded three.
+    print(
+        f"\nsummary over {result['audited']} grade(s) in the grade file "
+        f"({result['from_prior_invocations']} from prior invocation(s)), "
+        "deduped to the last line per (run_id, grader_version)"
     )
     for model, row in result["summary"].items():
         print(f"\n{model}")

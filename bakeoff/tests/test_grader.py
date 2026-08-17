@@ -14,6 +14,7 @@ diffs in this file are genuine git diffs and a change that broke the parse
 would fail here rather than in the image.
 """
 
+import subprocess
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -1068,6 +1069,34 @@ def test_gitleaks_exit_one_is_an_error_not_a_finding():
     assert result.resolved is None
 
 
+def test_a_gitleaks_error_does_not_carry_the_report_into_the_grade_file():
+    """The exit-N branch quoted `_head(result)`, and `_head` falls back to
+    STDOUT when stderr is empty -- which on this path is gitleaks' report, the
+    one carrying `Secret` and `Match`.
+
+    Worse than the captured-artifact leak `_redacted` was written for: the
+    captured copy is a gzip beside the run, while `environment_error` and
+    `not_graded_detail` are FIELDS OF THE GRADE LINE, in an append-only file.
+    A scanner that found a real key and then failed to exit cleanly -- exit 1
+    means "leaks OR error" -- would write that key into the derived view
+    permanently.
+    """
+    report = (
+        '[{"RuleID": "aws-access-token", "File": "/scan/src/calc.py", '
+        '"Secret": "AKIAZ3XQWERTYUIOP12", '
+        '"Match": "KEY = \\"AKIAZ3XQWERTYUIOP12\\""}]'
+    )
+    env = FakeEnv(scan_result=(1, report, ""))
+    result = _ladder(env=env)
+
+    assert result.environment_error_check == "secret_scan"
+    assert "AKIAZ3XQWERTYUIOP12" not in result.environment_error
+    assert "AKIAZ3XQWERTYUIOP12" not in result.not_graded_detail
+    assert "AKIAZ3XQWERTYUIOP12" not in _check(result, "secret_scan").detail
+    # And it is still a usable message: the rule and the file survive.
+    assert "aws-access-token" in result.environment_error
+
+
 def test_gitleaks_exit_fortytwo_is_a_finding():
     env = FakeEnv(
         scan_result=(42, '[{"RuleID": "aws-access-token", '
@@ -1503,3 +1532,157 @@ def test_chunk_parsing_runs_outside_any_repository():
     # grading batch over 2,400 records does not accumulate one per run.
     leftovers = list(Path(tempfile.gettempdir()).glob("bakeoff-grade-*"))
     assert leftovers == []
+
+
+def test_the_gitleaks_run_is_bounded_by_the_grading_timeout(monkeypatch,
+                                                            tmp_path):
+    """Check 8 is the one graded command that runs on the HOST.
+
+    Every other check goes through `env.exec` with a `timeout` prefix inside
+    the container; this one is a `docker run` from the harness process, so
+    without an explicit timeout a wedged daemon hangs the whole batch on one
+    row instead of costing one named, re-runnable line.
+    """
+    import bakeoff.grader as grader
+    from bakeoff.grader import GRADE_TIMEOUT_S, _ContainerEnv
+
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen.update(kw)
+        raise subprocess.TimeoutExpired(argv, GRADE_TIMEOUT_S)
+
+    monkeypatch.setattr(grader.subprocess, "run", fake_run)
+
+    env = _ContainerEnv(container=None, repo_path=tmp_path,
+                        scan_root=tmp_path / "grade-scan")
+    result = env.scan_secrets({"src/calc.py": "x = 1"})
+
+    assert seen.get("timeout") == GRADE_TIMEOUT_S
+    # Exit 1 is gitleaks' "leaks OR error", which `--exit-code 42` exists to
+    # make unreadable as a verdict -- so this lands in the environment branch
+    # rather than being scored against the model.
+    assert result.exit_code == 1
+    assert "timeout" in result.stderr
+    # And the scan dir, which held the agent's added lines, is still cleaned up.
+    assert not any((tmp_path / "grade-scan").glob("scan-*"))
+
+
+def test_a_timed_out_scan_is_an_environment_error_not_a_finding():
+    env = FakeEnv(scan_result=(1, "", "gitleaks hit the 600s grading timeout"))
+    result = _ladder(env=env)
+    assert result.environment_error_check == "secret_scan"
+    assert result.grade_failure is None
+    assert result.resolved is None
+
+
+# --------------------------------------------------------------------------
+# the artifacts directory: one per run PER GRADER VERSION, emptied first
+# --------------------------------------------------------------------------
+
+
+def _grade_capturing(monkeypatch, tmp_path, checks, version=None):
+    """`grade_run` with the container faked out and a ladder that captures
+    exactly `checks`. Returns the GradeRecord."""
+    import bakeoff.grader as grader
+
+    class FakeContainer:
+        def __init__(self, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def exec(self, argv, env=None):
+            return SimpleNamespace(exit_code=0, stdout="", stderr="")
+
+    def ladder(record, task, oracle, env, start_sha):
+        for name in checks:
+            env.capture(name, f"{name} output")
+        return _ladder_result()
+
+    monkeypatch.setattr(grader, "materialize", lambda *a, **kw: START_SHA)
+    monkeypatch.setattr(grader, "RunContainer", FakeContainer)
+    monkeypatch.setattr(grader, "run_ladder", ladder)
+    if version is not None:
+        monkeypatch.setattr(grader, "GRADER_VERSION", version)
+
+    return grade_run(_record(), _task(), "sha256:image", _oracle(),
+                     tmp_path / "cache", tmp_path / "art")
+
+
+def _ladder_result():
+    return run_ladder(_record(), _task(), _oracle(), FakeEnv(), START_SHA)
+
+
+def test_a_regrade_under_a_new_version_leaves_the_first_passs_outputs_alone(
+    monkeypatch, tmp_path
+):
+    """The grade file is append-only, so a v1 line and a v2 line both survive
+    -- and the whole point of keeping both is that a DISAGREEMENT between them
+    is the finding.
+
+    Under a shared `artifacts_root/<run_id>` the v2 pass overwrote the outputs
+    the v1 line still points at, so the older verdict was read against evidence
+    only the newer pass produced. The same shape as the record's `wire_log_gz`:
+    a path that resolves is worse than a null, because it publishes another
+    pass's file under this pass's line.
+    """
+    first = _grade_capturing(monkeypatch, tmp_path, ["f2p", "lint"],
+                             version="1")
+    assert first.artifacts_dir is not None
+    assert Path(first.artifacts_dir).name == "v1"
+    first_bytes = (Path(first.artifacts_dir) / "f2p.out.gz").read_bytes()
+
+    second = _grade_capturing(monkeypatch, tmp_path, ["f2p"], version="2")
+
+    assert Path(second.artifacts_dir).name == "v2"
+    assert second.artifacts_dir != first.artifacts_dir
+    # The first pass's directory is untouched -- both files, same bytes.
+    assert sorted(p.name for p in Path(first.artifacts_dir).iterdir()) == [
+        "f2p.out.gz", "lint.out.gz",
+    ]
+    assert (Path(first.artifacts_dir) / "f2p.out.gz").read_bytes() == first_bytes
+
+
+def test_a_regrade_under_the_same_version_does_not_inherit_stale_outputs(
+    monkeypatch, tmp_path
+):
+    """`--re-grade` appends a second line under the SAME version, so the
+    per-version directory alone does not separate the two passes.
+
+    `capture` writes one file per check and a ladder that stops early writes
+    fewer, so without the wipe the second pass's line points at a directory
+    holding the first pass's `lint.out.gz` beside its own `f2p.out.gz` -- and
+    nothing in either line says which pass wrote which.
+    """
+    _grade_capturing(monkeypatch, tmp_path, ["f2p", "lint"])
+    second = _grade_capturing(monkeypatch, tmp_path, ["f2p"])
+
+    assert [p.name for p in Path(second.artifacts_dir).iterdir()] == [
+        "f2p.out.gz"
+    ]
+
+
+def test_a_pass_that_captured_nothing_claims_no_artifacts_directory(
+    monkeypatch, tmp_path
+):
+    """The `exists()` test is an OWNERSHIP check, and the wipe is what makes it
+    one.
+
+    A ladder that stops on its first rung captures nothing. Before the wipe,
+    `exists()` was answered by whatever an earlier pass left behind, so the new
+    line named a directory holding none of its own evidence -- existence alone,
+    which is exactly the defect `artifacts.wire_log_gz` was fixed for.
+    """
+    first = _grade_capturing(monkeypatch, tmp_path, ["f2p"], version="1")
+    assert Path(first.artifacts_dir).exists()
+
+    second = _grade_capturing(monkeypatch, tmp_path, [], version="2")
+
+    assert second.artifacts_dir is None
+    # And the refusal to claim one did not cost the earlier pass its evidence.
+    assert (Path(first.artifacts_dir) / "f2p.out.gz").exists()
