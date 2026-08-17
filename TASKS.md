@@ -949,6 +949,13 @@ size. Two exceptions are marked CAPTURE and should ride along with Gate 1.
 
 ## P3 — Decisions to settle before numbers are published
 
+- **Grade summary can double-count across grader versions.** `grade.py`'s
+  end-of-batch summary audits the last line per `(run_id, grader_version)`,
+  so after a `GRADER_VERSION` bump the same run appears once per version in
+  the per-model rows (printout only — nothing stored is wrong). Filter rows
+  to the current version and warn with the other-version count, or key rows
+  by `(model, grader_version)`. Found at final branch review, parked.
+
 These need a call, not code. Most are cheap to make and expensive to make late.
 
 - [ ] **`NotGradedReason` may want a `RECORD_SCHEMA_UNREADABLE` member.** The

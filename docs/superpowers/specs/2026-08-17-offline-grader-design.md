@@ -462,7 +462,12 @@ p2p_deselect_requested: int | None           # what pytest was actually asked:
                                              # explicit branch
 p2p_deselected: int | None                   # pytest's own count: observation
 p2p_failed_node_ids: tuple | None
-artifacts_dir: str | None                    # per-check gzipped output
+artifacts_dir: str | None                    # per-check gzipped output, at
+                                             # artifacts_root/<run_id>/v<GRADER_VERSION>,
+                                             # emptied before the ladder so the
+                                             # path is an ownership claim; pre-
+                                             # layout lines point at the v-less
+                                             # dir, orphaned rather than clobbered
 ```
 
 The nulls are load-bearing, same as the harness's: **`resolved is None` iff
