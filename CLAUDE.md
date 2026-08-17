@@ -28,7 +28,7 @@ Integration tests are opt-in (`addopts = "-m 'not integration'"`) and need a Doc
 cd bakeoff && .venv/bin/python -m pytest -v -m integration --basetemp="$HOME/.cache/bakeoff-pytest"
 ```
 
-The §6.6 gate — run before collecting any data. Offline, no credentials, no spend. Runs the unit suite, the integration suite, the dry run, and the offline smoke test. Reports `GATE INCOMPLETE` and exits 1 without a Docker daemon rather than passing a weaker gate under the same name:
+The §6.6 gate — run before collecting any data. Offline, no credentials, no spend. Runs the unit suite, the integration suite, the dry run, and the offline smoke test. Reports `GATE INCOMPLETE` and exits 1 without a Docker daemon rather than passing a weaker gate under the same name. Its integration leg selects `-m "integration and not task_image"`: the grader's integration tests build a task image and hit the repo mirror, and folding those into a gate documented as offline would change what it needs without changing what it is called:
 
 ```bash
 cd bakeoff && .venv/bin/python scripts/verify_logger.py
@@ -46,7 +46,13 @@ The collection driver. Runs task × model × sample, round-major with a recorded
 cd bakeoff && .venv/bin/python scripts/run_matrix.py --mode live --repeats 1
 ```
 
-Mutation check — reverts each guarantee and confirms a test goes red. Fails loudly on a stale anchor:
+The offline grader. Runs *after* a collection, over the stored diffs, and writes one `GradeRecord` line per record to `<event-log>/grades/grades.jsonl`. The event log itself is never opened for writing. Resumable — a run already graded under this `GRADER_VERSION` is skipped unless `--re-grade`. Needs a Docker daemon and, per task, the repo mirror; no credentials, no spend:
+
+```bash
+cd bakeoff && .venv/bin/python scripts/grade.py --event-log ~/.cache/bakeoff/<log>
+```
+
+Mutation check — reverts each guarantee and confirms a test goes red. Fails loudly on a stale anchor. Run it **solo**: it edits sources in place, so anything else touching the tree concurrently reads a mutated file:
 
 ```bash
 cd bakeoff && .venv/bin/python scripts/mutation_check.py
@@ -94,7 +100,7 @@ These are enforced in code and asserted by tests. Breaking one is usually silent
 
 - **A run always produces a record.** Nothing between run start and write may raise past `execute_run`. The tokens are already paid for; a lost record cannot be re-derived at any price. A crash yields a partial-but-valid record, and checkpoints captured so far survive (the recorder is held outside the `try`). The write is the one thing allowed to raise, and `_write_or_strand` makes it survivable: the record lands in `artifacts/record.unwritten.json` **before** the exception escapes, so the failure is loud and the data is not gone. A caller that quietly continued would compute means over a matrix with a hole in it.
 - **The event log is append-only.** No update, no delete API. Records open with mode `"x"`; the index is appended only after the record is durably fsynced and atomically renamed. Excluded runs keep their records.
-- **The harness does not grade.** `tests_passed` and `Checkpoint.tests_pass` stay `None`; `outcome` never becomes `RESOLVED` at harness time. Grading is an offline batch over stored diffs (~96k suite executions inline otherwise). Passing `False` instead of `None` would stamp `FALSE_SUCCESS` — an accusation of dishonesty — onto every well-behaved run, permanently.
+- **The harness does not grade, and the grader does not write into the log.** `FailureSignals.tests_passed` and `Checkpoint.tests_pass` stay `None` — there is no `RunRecord.tests_passed` — and `outcome` never becomes `RESOLVED` at harness time. Grading is an offline batch over stored diffs (~96k suite executions inline otherwise): [grader.py](bakeoff/src/bakeoff/grader.py) runs the nine-check ladder, [scripts/grade.py](bakeoff/scripts/grade.py) drives it over an event log, and [grade_schema.py](bakeoff/src/bakeoff/grade_schema.py) appends one `GradeRecord` per run to `<event-log>/grades/grades.jsonl`. That file is *beside* the log, never inside it: a record is immutable once written, so a verdict is a derived view and a re-grade under a different oracle, image or grader version is a **new line** whose disagreement with the old one is the finding. Passing `False` instead of `None` at harness time would stamp `FALSE_SUCCESS` — an accusation of dishonesty — onto every well-behaved run, permanently.
 - **Configuration is never reported as observation.** `sampling`, prompt and tool hashes, and `bedrock_model_id` come from the wire log (what was sent / what answered), not from the config file (what was asked for). `isolated` is measured from the networks the container actually joined — `bool(network)` would have gone on saying `True` through both ways it can be wrong, a routable network and a container that also joined `bridge`.
 - **The wire log separates what the client asked for from what the provider got.** `request` is Claude Code's body with no fallback; `resolved` is the params that went out, or `null`. They differ on every candidate arm, because `openai_max_completion_tokens_rename` and `openai_reasoning_effort_pinned_none` run inside a nested `acompletion` that fires no callback of its own — measured, the callback sees `call_type: anthropic_messages` and `optional_params` carrying the *pre-rename* `max_tokens`. Preferring `optional_params` was therefore worse than ignoring it: it reported a parameter the wire did not carry, with the provenance of a resolved one. `RunRecord.sampling_source` says which side answered.
 - **Absence is recorded, never implied.** `harness_commit` carries `-dirty`, `task_set_commit` stays `""` by design, `trajectory_parse_error` is non-empty when derived fields are zero because the transcript could not be read — *including when there was no transcript at all*, which used to leave the field empty and made total loss read as a quiet run. `_sha256` returns `""` for an absent field rather than the digest of the four bytes `"null"`. Zeros in a record do not mean a quiet run.
@@ -162,6 +168,8 @@ These are enforced in code and asserted by tests. Breaking one is usually silent
 | [specs/2026-08-03-llm-bakeoff-eval-design.md](docs/superpowers/specs/2026-08-03-llm-bakeoff-eval-design.md) | The spec every `section N.N` reference in the code points at. |
 | [plans/2026-08-04-bakeoff-harness-logging.md](docs/superpowers/plans/2026-08-04-bakeoff-harness-logging.md) | Implementation plan, Tasks 1–12. |
 | [plans/2026-08-12-gate-1-real-task-path.md](docs/superpowers/plans/2026-08-12-gate-1-real-task-path.md) | Gate 1's design, its two root causes, and the review log of what the plan got wrong before any code was written. |
+| [specs/2026-08-17-offline-grader-design.md](docs/superpowers/specs/2026-08-17-offline-grader-design.md) | The offline grader: the nine-check ladder, why the oracle is the manifest and only the quarantine is derived, and the `GradeRecord` field-by-field. Read before touching `grader.py` or `oracle.py`. |
+| [plans/2026-08-17-offline-grader.md](docs/superpowers/plans/2026-08-17-offline-grader.md) | The grader's implementation plan, Tasks 1–8, with the three revision rounds folded in. |
 | [bakeoff/taskset/](bakeoff/taskset/) | The task set. One directory per task: `task.yaml` (§3.7) + `reference.diff`. `task_set_commit` on every record names this directory's git revision. |
 | [bakeoff/taskset/HARVESTING.md](bakeoff/taskset/HARVESTING.md) | What a candidate task has to satisfy, in three layers: refused by code, required-but-unchecked, and properties of the set. Carries the screened repository list and the measured reason each excluded repo is out. |
 

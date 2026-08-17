@@ -40,7 +40,7 @@ is the strongest argument in this file for why N=1 cannot ship.
 The task *can* discriminate. Whether it does on any given run is a coin flip,
 which is a different problem from a ceiling task and needs the same fix: repeats.
 
-### Can I start the large-scale eval? — **No. Five things, in dependency order.**
+### Can I start the large-scale eval? — **No. Four things, in dependency order.**
 
 | # | blocker | why it blocks | where |
 |---|---|---|---|
@@ -48,9 +48,26 @@ which is a different problem from a ceiling task and needs the same fix: repeats
 | 2 | **Caps are unset.** 40 turns is a placeholder and is already binding — nemotron used 40/40 on 2026-08-13, mid-verification, and its diff resolved anyway | §5.4 derives caps from the pilot at ~p95×2; a cap tuned to the incumbent scores a style difference as capability | P3 |
 | 3 | **Credential refresh.** Measured 1 h ⇒ **~20 cells per login**; 3,200 cells ⇒ ~160 re-logins | the matrix runs, but never unattended | P1 |
 | 4 | **No run-level retry.** `attempt_number` has no caller | every infra hiccup leaves a permanent hole; today's work bounds it to ~3 cells/arm and names them, but cannot fill them | P1 |
-| 5 | **The offline grader.** | the harness never grades, by design — until this exists nothing in the log is a result | Out of scope §2 |
+| ~~5~~ | ~~**The offline grader.**~~ **Closed 2026-08-17.** | — | `bakeoff/src/bakeoff/grader.py`, `oracle.py`, `grade_schema.py`, `scripts/grade.py` |
 
 1 and 2 are one project: harvest the set, run the pilot, read the caps off it.
+
+**Blocker 5 closed 2026-08-17.** `scripts/grade.py` grades a stored event log
+offline and appends one `GradeRecord` per run to `<event-log>/grades/grades.jsonl`,
+beside the log and never into it. The nine-check ladder is `grader.py`; the oracle
+is the manifest's declared `f2p`/`p2p` and only the flake quarantine is derived
+(`oracle.py`, two identical p2p runs at the reference state, symmetric difference).
+Design: [specs/2026-08-17-offline-grader-design.md](docs/superpowers/specs/2026-08-17-offline-grader-design.md).
+What it does **not** yet have is a §10.3 reporting view over `grades.jsonl` —
+that is still to write, and it is publication work rather than collection work.
+
+**A verdict set graded off the collection machine carries the `image_matches_run`
+caveat.** `GradeRecord.image_matches_run` is `True` only when the task image the
+grade ran in is the image the run itself used. Grading later, elsewhere, or after
+a base-image rebuild sets it `False` (or `None` when it could not be determined),
+and a §10.3 report that aggregates such grades is reporting "this submission
+passes in *an* image built from this manifest", not "in the image that produced
+it". Filter on the field or state the caveat; do not silently mix the two.
 
 ### Sizing, measured 2026-08-13 rather than assumed
 
@@ -64,8 +81,8 @@ Mean cell wall clock across the four arms was **150 s** (89.6 / 147.5 / 109.2 /
 | 30 tasks × 4 arms × N=3 | 360 | **18 hours** | ~18 |
 
 The last row is the smallest shape that yields a defensible scorecard. It needs
-blockers 1, 2 and 5, and makes 3 tolerable. It will not support pass^k or tight
-intervals.
+blockers 1 and 2 (5 is now closed), and makes 3 tolerable. It will not support
+pass^k or tight intervals.
 
 ### Do before collection, cheap, not blocking
 
@@ -799,6 +816,20 @@ Every item here is recoverable from stored artifacts at any time, including afte
 Phase 4 — that is what makes them lower priority than everything above, not their
 size. Two exceptions are marked CAPTURE and should ride along with Gate 1.
 
+- [ ] **`snapshot_diff` takes no `--binary`, so a binary change is unappliable.**
+  A submission that touched a binary file is recorded as `Binary files a/x and
+  b/x differ` with no payload, and `git apply` refuses the whole patch. The
+  grader contains this — it drops the binary chunks, names them in
+  `GradeRecord.binary_chunks_dropped`, grades the text remainder, and refuses
+  outright (`BINARY_HUNK_UNAPPLIABLE`) when *every* chunk is binary — so no run
+  is lost. But the containment is a caveat on a verdict, not a fix: the stored
+  diff is not a faithful record of what the agent did, and a task whose fix
+  legitimately touches a binary fixture cannot be graded at all. Adding
+  `--binary` makes the diff self-contained; it also grows every stored
+  checkpoint, so measure the size cost on a real collection before flipping it.
+  Note that a diff cut with `--binary` re-applies without any of this, which
+  means the grader's binary branch stays as defence for records already written.
+
 - [ ] **DERIVATION. Fields that are permanently zero and read as measurements.**
   `retry_backoff_ms`, `ToolCallStats.malformed` (so `malformation_rate` is always
   0.0 and `TOOL_MALFORMATION`/`ADAPTER_FAILURE` can never fire),
@@ -919,6 +950,17 @@ size. Two exceptions are marked CAPTURE and should ride along with Gate 1.
 ## P3 — Decisions to settle before numbers are published
 
 These need a call, not code. Most are cheap to make and expensive to make late.
+
+- [ ] **`NotGradedReason` may want a `RECORD_SCHEMA_UNREADABLE` member.** The
+  closed set has `RECORD_SCHEMA_TOO_OLD` and nothing for "the version string
+  could not be parsed at all", so `grade.py:_schema_refusal` files an
+  unparsable `schema_version` under TOO_OLD and says in the *detail* that the
+  comparison could not be made. That is the honest half of the claim, but a
+  reader counting reasons counts it as age. `_schema_refusal` is the **single
+  call site** — adding the member is one enum entry plus the `except ValueError`
+  branch there, and nothing else moves. Deliberately not done now: a new member
+  changes a closed set that stored grades are already written against, and the
+  right time to widen it is before the first collection is graded, not during.
 
 - [ ] **Sonnet 5 pricing.** `PRICE_BOOK` carries Anthropic's introductory $2/$10,
   which runs through 2026-08-31. Whether Bedrock mirrors it is unverified, and
@@ -1062,10 +1104,13 @@ started.
 1. **Dataset construction (Gate 1)** — transcript/PR/Jira join, task harvesting,
    container builds, stratification (§3). The P0 section is the *harness* half of
    this; the dataset itself is the other half.
-2. **Scoring (Gate 3)** — deterministic checks, offline checkpoint grading, judge
-   protocol, κ calibration (§4). The harness deliberately does not grade, so
-   nothing in the log becomes a result until this exists. Three P2 items name
-   specific offline passes it should carry.
+2. **Scoring (Gate 3)** — **the §4.2.1 deterministic checks are done as of
+   2026-08-17** (`grader.py`, `oracle.py`, `grade_schema.py`, `scripts/grade.py`);
+   what remains here is offline *checkpoint* grading (the §5.5 cost/quality curve
+   — the ladder currently grades the final diff, not each checkpoint), the judge
+   protocol and κ calibration (§4.2.3, §4.3). The harness still deliberately does
+   not grade; a verdict now exists in `grades.jsonl`, beside the log. Three P2
+   items name specific offline passes this should carry.
 3. **Analysis and reporting (Gate 3)** — paired cluster bootstrap, pass@1/pass^k,
    Elo, scorecard (§10). Every P3 decision has to be stated on the scorecard, not
    just settled.

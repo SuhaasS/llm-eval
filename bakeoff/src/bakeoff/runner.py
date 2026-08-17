@@ -15,9 +15,16 @@ first and re-raises second, so the failure is loud and the data survives it.
 Two things this module is careful NOT to do:
 
   It does not decide whether the agent succeeded. Grading is offline
-  (section 5.5), so `tests_passed` stays None and failure_class is left
-  open for the grader. Passing False instead would stamp FALSE_SUCCESS --
-  "claimed a success it did not achieve" -- onto every well-behaved run.
+  (section 5.5), so `FailureSignals.tests_passed` stays None and
+  failure_class is left open for the grader. Passing False instead would
+  stamp FALSE_SUCCESS -- "claimed a success it did not achieve" -- onto
+  every well-behaved run. The grader is `grader.py`, driven by
+  `scripts/grade.py`, and it writes GradeRecords to `grades.jsonl`
+  (`grade_schema.py`) BESIDE this log -- never into it. There is no
+  `RunRecord.tests_passed` for it to fill in and no update API if there
+  were: a verdict is a derived view over the stored diffs, and a re-grade
+  under a different oracle or image is a new line whose disagreement with
+  the old one is the finding.
 
   It does not report configuration as observation. Sampling, prompt and
   tool hashes come from the wire log, which records what was actually
@@ -645,7 +652,10 @@ def assemble_record(
         turns_used=len(parsed.turns),
         agent_claimed_success=terminated_by == TerminationReason.AGENT_FINISH,
         # None, not False. Grading is offline (section 5.5), so at this point
-        # the test outcome is unknown rather than negative.
+        # the test outcome is unknown rather than negative. It stays None
+        # forever: `grader.py` answers this question over the stored diffs
+        # and records the answer in `grades.jsonl`, a separate append-only
+        # file, so nothing ever comes back to overwrite this field.
         tests_passed=None,
         p2p_regressions=[],
         container_crashed=container_crashed,

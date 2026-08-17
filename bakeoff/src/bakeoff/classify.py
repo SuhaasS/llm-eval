@@ -7,14 +7,17 @@ Adding a code later is a visible diff, not a judgement call at analysis time.
 Model failures are NEVER excluded. They are the measurement.
 
 Grading is offline by design (spec section 5.5), so at harness time the test
-outcome is genuinely unknown rather than negative. `tests_passed` is
-tri-state for that reason: the classes that need the oracle (FALSE_SUCCESS,
+outcome is genuinely unknown rather than negative. `FailureSignals.tests_passed`
+is tri-state for that reason: the classes that need the oracle (FALSE_SUCCESS,
 and the WRONG_BUT_CONFIDENT catch-all) only fire on an explicit result,
 while the classes readable from the transcript alone — malformation,
 truncation, loops, repetition, giving up early — classify immediately.
 Treating "not graded yet" as "the tests failed" would stamp FALSE_SUCCESS,
 an accusation of dishonesty, onto every well-behaved run, permanently,
-since the event log has no update API.
+since the event log has no update API. The oracle arrives later and
+elsewhere: `grader.py` computes it offline over the stored diffs and
+`grade_schema.append_grade` writes it to `grades.jsonl`, so this field is
+never filled in retrospectively -- there is no `RunRecord.tests_passed`.
 """
 
 from __future__ import annotations

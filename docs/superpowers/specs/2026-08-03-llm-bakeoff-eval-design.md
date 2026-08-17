@@ -172,19 +172,25 @@ Run in order; first failure short-circuits and sets `failure_class`.
 
 | # | Check | Pass condition |
 |---|---|---|
-| 1 | Patch non-empty | diff vs `base_sha` has content |
-| 2 | **Test files restored from `base_sha`** | mandatory pre-step, see below |
-| 3 | Build / compile | exit 0 |
-| 4 | Type check | repo's own `mypy` / `tsc` config, exit 0 |
+| 1 | Patch non-empty | the stored diff has content |
+| 2 | **Test files restored from `start_sha`** | mandatory pre-step, see below |
+| 3 | Build / compile | manifest-declared `grading.build`, exit 0 |
+| 4 | Type check | manifest-declared `grading.typecheck`, exit 0 |
 | 5 | **F2P** | every fail-to-pass test now passes |
 | 6 | **P2P** | every pass-to-pass test still passes |
-| 7 | Lint | repo's own config, exit 0 |
+| 7 | Lint | manifest-declared `grading.lint`, exit 0 |
 | 8 | Secret scan | gitleaks clean on the diff |
 | 9 | Destructive scan | no unreverted high-severity event |
 
-`resolved` = all nine pass. Binary, all-or-nothing, no partial credit.
+Check 1 reads the diff the harness stored, and that diff is **`start_sha`-relative**, not `base_sha`-relative: `snapshot_diff` runs against the state the container was detached at, which is `base_sha` **plus the committed test half**. Nothing in the pipeline ever produces a `base_sha`-relative diff of a submission.
 
-**Check 2 is the primary anti-cheat.** Before grading, `git checkout <base_sha> -- <test paths>`, discarding whatever the agent did to test files. Without it, "make the tests pass" is trivially satisfied by deleting or weakening them, and models do this at different rates — so it would register as a capability difference. SWE-bench takes the same approach.
+Checks 3, 4 and 7 run **manifest-declared argv**, never an auto-detected toolchain. Auto-detection has to guess, and a wrong guess is a permanent `build_failed` against every arm of a task whose build command was simply somewhere else. A task that declares no command for a check records `not_configured` for it — see below.
+
+`resolved` = all nine either pass **or record `not_configured`**. The caveat is not a loophole: `not_configured` is reachable only for checks 3, 4 and 7, only from an absent `grading:` key, and it is a *named* absence in the stored `GradeRecord` rather than a silent pass, so a §10.3 reader can count how many tasks answered each check. Binary, all-or-nothing, no partial credit within what was configured.
+
+The implemented spelling of `failure_class` for a graded run is **`grade_failure`**. The two are deliberately different names for different things: `failure_class` is the harness's transcript-derived classification, written into the `RunRecord` at run time and defined over what the *agent* did; `grade_failure` names the first rung of this ladder that a submission failed, and lives in the `GradeRecord` beside it. Collapsing them onto one name would put two claims with different evidence, different producers and different times of writing behind one field.
+
+**Check 2 is the primary anti-cheat.** Before grading, `git checkout <start_sha> -- <test paths>`, discarding whatever the agent did to test files. **From `start_sha`, and this matters:** the oracle tests do not exist at `base_sha` — a real bug-fix PR carries the test that proves the fix, so the harness commits the test half on top of `base_sha` to build the start state, and a checkout from `base_sha` would restore a tree in which the F2P tests have never existed. Without the restore, "make the tests pass" is trivially satisfied by deleting or weakening them, and models do this at different rates — so it would register as a capability difference. SWE-bench takes the same approach.
 
 Separately, **record** whether the agent modified test files. Legitimate when the task called for new tests, cheating otherwise. Always logged, never silently dropped.
 
@@ -350,7 +356,7 @@ Cap on **turns and tokens together**, generous wall-clock as backstop only. Each
 
 Snapshot repo state each turn. One generous-cap run then yields the pass rate at **any** budget K, computed post-hoc. Strictly dominates running separate capped and uncapped configurations: same information, half the compute, full curve instead of two points.
 
-Store checkpoints as **incremental diffs against `base_sha`**, never worktree copies. 2,400 runs × ~50 turns of full trees is unmanageable; as diffs it is a few GB.
+Store checkpoints as **incremental diffs against the start state** — `base_sha` plus the committed test half, i.e. `start_sha`, which is what the container is detached at — never worktree copies. 2,400 runs × ~50 turns of full trees is unmanageable; as diffs it is a few GB.
 
 **Checkpoint grading is offline and decoupled from the run.** The agent run only writes diffs; a separate batch job grades them afterwards. Naive inline grading is not feasible — 2,400 runs × ~40 turns ≈ 96,000 evaluations, which at a 5-minute full suite would be ~8,000 compute-hours.
 

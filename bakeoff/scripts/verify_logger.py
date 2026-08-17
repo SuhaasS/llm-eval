@@ -52,7 +52,14 @@ CHECKS: list[tuple[str, list[str], bool]] = [
     ),
     (
         "container + proxy integration (live capture, wire log, fault injection)",
-        _pytest("tests/", "-q", "-m", "integration", f"--basetemp={BASETEMP}"),
+        # `and not task_image` on purpose. The grader's integration tests
+        # build a task image and hit the repo mirror; this gate is documented
+        # as offline, no credentials, no spend, and a marker that widened it
+        # would change what the section 6.6 gate NEEDS without changing what
+        # it is called -- an operator who ran it before a collection would
+        # find it failing for want of a network it was promised not to use.
+        _pytest("tests/", "-q", "-m", "integration and not task_image",
+                f"--basetemp={BASETEMP}"),
         True,
     ),
     (

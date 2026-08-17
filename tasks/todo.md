@@ -2131,3 +2131,63 @@ TASKS.md, not silently closed.
       not a fast-path check, so the 0700 fix never reached existing
       caches. _PRUNE_VERSION bumped to 3; rebuild verified 0700, marker 3,
       still pruned. 543 tests, 26/26 tasks: mutations after the bump.
+
+## Offline grader — Task 7: mutation anchors + docs — 2026-08-17
+
+- [x] Seventeen anchors added to `scripts/mutation_check.py`, one per
+      guarantee, each restoring a branch that turns something which is NOT
+      the model's doing — a flake, a broken image, a missing tool, a mid-run
+      snapshot, the harness's own start state — into a stored verdict about
+      the model. None pre-existed; nothing was deduplicated.
+- [x] Two of them were earned in the review rounds rather than planned:
+      oracle's `_existing_prefixes` filter (a quarantine derived outside the
+      graded scope deselects nothing, silently) and grader's restore
+      checkout (`start_sha`, not `base_sha` — the single most load-bearing
+      correction in the design now has its own anchor).
+- [x] Two anchors the brief placed elsewhere moved with the code:
+      `preflight_cache_key` is public in `preflight.py` now, so the
+      "serve a verdict from an older preflight forever" mutation lives there
+      while its witness stays `tests/test_run_matrix.py`; the p2p seam is
+      `preflight.pass_to_pass`.
+- [x] Step 0 run per new anchor before the batch — all 17 CAUGHT
+      individually. `mutation_check` isolates its own pyc cache, which is
+      what makes a by-hand run reproducible here: a byte-count-preserving
+      edit plus a same-second write feeds pytest the stale bytecode on the
+      HOST, not just in the eval image.
+- [x] The check-9 disjunction still has no anchor, on purpose:
+      `trajectory_parse_error` non-empty implies `turns_used == 0` through
+      every real path, so the only witness would be an internally
+      inconsistent hand-built record.
+- [x] Docs: §4.2.1's four stale statements (check-1's diff basis, check-2's
+      `start_sha`, checks 3/4/7 as manifest-declared argv, the `resolved`
+      sentence's `not_configured` caveat) plus §5.5's "against `base_sha`",
+      plus a paragraph naming `grade_failure` as a different claim from
+      `failure_class` rather than a rename of it.
+- [x] `CLAUDE.md`: the grader command, the "harness does not grade" bullet
+      naming `grader.py`/`grades.jsonl` and that the grader never writes into
+      the log, the two grader docs in the table, and the §6.6 paragraph
+      noting the `task_image` exclusion.
+- [x] `task_image` registered in `pyproject.toml` and excluded from
+      `verify_logger.py`'s integration leg — registered BEFORE Task 8 writes
+      the tests that carry it, so the gate never briefly means something
+      other than what CLAUDE.md says it means.
+- [x] `checkpoints.py`'s "filled by the offline grader" was wrong about the
+      direction, not merely stale: a record is immutable once written and the
+      grader appends beside it. Same correction at `runner.py:18`, the
+      `tests_passed=None` site, and `classify.py`'s header.
+- [x] `HARVESTING.md` gained the grading layer (declare `grading:` or record
+      why each key is waived; a declared command is pinned in the image) and
+      the leaf-node-id requirement on an explicit `tests.p2p` — the oracle's
+      swallow-refusal fails OPEN on a non-leaf id, and the set is authored
+      there.
+- [x] click's `task.yaml` carries the waiver the same commit requires, so
+      the shipped task is not in violation of the document.
+
+Review: 742 unit tests, **142/142 mutations caught, 0 stale, 0 missed** on a
+solo run. `verify_logger.py` GATE PASSED with the narrowed integration
+selector. `run_matrix --preflight-only` re-earned PASS after the task.yaml
+comment moved `manifest_digest` — expected, since the digest hashes raw
+bytes — and `start_sha` stayed `33575cc0`, which is the useful half: a
+comment does not move the start state. Not verified: nothing here exercises
+the grader against a real image; that is Task 8's `task_image` suite, whose
+marker this task registered.

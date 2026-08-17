@@ -122,6 +122,27 @@ image:
   # arm fails identically -- preflight's green-after check is what catches it.
   build: ["pip install -e ."]
 
+# grading: WAIVED -- all three keys, deliberately, and recorded here because
+# HARVESTING.md requires a task to declare a `grading:` block or to say why
+# each key is not there. An absent key grades as `not_configured`, which is a
+# named absence rather than a pass, so the waiver costs nothing but has to be
+# visible.
+#
+#   build     -- `image.build` already runs `pip install -e .` and preflight
+#                proves the suite runs after it. A grading build would
+#                re-assert that once per submission and answer nothing new.
+#   typecheck -- this repository's checker is not installed in the image
+#                (`image.pip` pins pytest and nothing else), so adding the
+#                key means pinning a version first. An unpinned checker is a
+#                moving oracle: the same submission grades differently on two
+#                passes and the log cannot say which tool answered.
+#   lint      -- same reason, same remedy. The upstream lint config lives in
+#                pre-commit hooks pinned to revisions the image does not
+#                install.
+#
+# Either key can be added later, but only together with an `image.pip` pin
+# for the tool it runs.
+
 budget:
   # Section 5.4 placeholders. Real caps come from the section 3.5 calibration
   # pilot's slowest-converging model, not from the incumbent.

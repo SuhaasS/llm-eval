@@ -85,7 +85,13 @@ class CheckpointRecorder:
             diff_vs_base=diff,
             files_touched=files,
             elapsed_ms=elapsed_ms,
-            tests_pass=None,  # filled by the offline grader
+            # Stays None. "Filled by the offline grader" was wrong about the
+            # direction: `grader.py` writes a GradeRecord to `grades.jsonl`
+            # (`grade_schema.py`) beside the event log and never back into it.
+            # A record is immutable once written, so nothing can fill this in
+            # afterwards, and a reader who expects it to be filled reads the
+            # permanent None as a grader that did not run.
+            tests_pass=None,
             per_test=[],
         )
         self.captured.append(checkpoint)

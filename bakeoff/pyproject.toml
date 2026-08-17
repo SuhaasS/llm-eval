@@ -34,7 +34,16 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.pytest.ini_options]
-markers = ["integration: requires Docker or network"]
+markers = [
+    "integration: requires Docker or network",
+    # A SUBSET of `integration`, always carried beside it, never alone. These
+    # build a task image and hit the repo mirror, which the section 6.6 logger
+    # gate must not do -- CLAUDE.md pins that gate as offline, no credentials,
+    # no spend, and folding these in would silently change what it needs.
+    # `verify_logger.py` selects `-m "integration and not task_image"`; the
+    # default `addopts` keeps them out of the unit run through `integration`.
+    "task_image: builds a task image and needs the repo mirror",
+]
 testpaths = ["tests"]
 # The repo root, so tests can import scripts/ the way an operator runs it.
 # scripts/smoke_test.py holds the Phase 0c go/no-go criteria, and criteria

@@ -84,6 +84,31 @@ that passes Layer 1 and measures the wrong thing.
   are out for this reason.
 - **The suite is deterministic.** Preflight runs p2p twice; a flake makes the
   gate a coin flip and the eval unreproducible.
+- **An explicit `tests.p2p` lists LEAF node ids only** — `path::test_name`,
+  never a bare module or a class. The oracle's swallow-refusal
+  (`oracle.derive_quarantine`) compares declared ids against quarantined ids,
+  which is exact only while every declared entry names one item. A declared
+  non-leaf selects many items that leaf ids can never be a superset of, so the
+  refusal **fails open** there: a selection deselected down to nothing gets
+  past it and the graded run exits 5. That surfaces as a named
+  `scope_collected_nothing` record rather than as silence, which is why the
+  shape is a requirement here instead of a check in code — the set is authored
+  here, and the predicate cannot be made exact from ids alone.
+
+### Grading
+
+- **Every task declares a `grading:` block, or records why each key is
+  waived.** `build`, `typecheck` and `lint` are checks 3, 7 and 8 of the
+  grader's ladder. An absent key grades as `not_configured`, which is a named
+  absence and not a pass — but an *unrecorded* absence is indistinguishable
+  from an oversight, and a §10.3 reader has no way to tell a task that
+  deliberately has no lint gate from one whose author forgot. A comment in
+  `task.yaml` naming each waived key and its reason is the whole requirement;
+  see `click-3360-write-usage-empty-args/task.yaml`.
+- **A declared command is pinned in the image.** A checker installed by
+  version range is a moving oracle: the same submission grades differently on
+  two passes and the grade cannot say which tool answered. Pin it in
+  `image.pip`/`image.apt` in the same edit that adds the key, or waive it.
 
 ### Provenance
 
