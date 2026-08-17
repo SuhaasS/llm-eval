@@ -1443,6 +1443,238 @@ MUTATIONS = [
         "tests/test_container.py -k nothing_to_sample",
         "not integration",
     ),
+    # --- the offline grader ---------------------------------------------
+    #
+    # Every entry below restores a branch that turns something which is NOT
+    # the model's doing -- a flake, a broken image, a missing tool, a
+    # mid-run snapshot, the harness's own start state -- into a stored
+    # verdict about the model. The grades file is append-only and a verdict
+    # is what section 10 reports, so each of these is permanent.
+    (
+        # Two identical p2p runs at the reference state; the flake is what
+        # they DISAGREE about. `&` is the plausible-looking spelling and it
+        # is silently empty -- the red-in-both raise above already refuses
+        # every element it could ever contain -- so a known-unstable test
+        # then fails a correct submission on every arm.
+        "oracle: quarantine the consistently broken instead of the flaky",
+        "src/bakeoff/oracle.py",
+        "    quarantine = tuple(sorted(first ^ second))",
+        "    quarantine = tuple(sorted(first & second))",
+        "tests/test_oracle.py -k failed_in_exactly_one",
+        "not integration",
+    ),
+    (
+        # Red in both runs is not a flake: the reference state IS the oracle,
+        # so a test reliably red there means the task's own p2p declaration is
+        # wrong. Absorbing it shrinks the regression check on every submission
+        # of that task, forever, in an append-only store.
+        "oracle: read a broken oracle as a clean one",
+        "src/bakeoff/oracle.py",
+        "    both = first & second\n    if both:\n        raise OracleError(",
+        "    both = first & second\n    if False:\n        raise OracleError(",
+        "tests/test_oracle.py -k both_runs_is_a_broken_oracle",
+        "not integration",
+    ),
+    (
+        # The quarantine has to be derived inside the scope check 6 grades
+        # in: `--deselect` of a node id pytest did not collect is IGNORED,
+        # not an error (measured), so ids derived at the rootdir are silent
+        # no-ops under the scoped grading run -- a quarantine that reads as
+        # applied and subtracts nothing. Passing the declared prefixes raw
+        # also makes a prefix absent at the reference state exit 4, which
+        # `_classify` refuses: a task preflight passed on purpose becomes
+        # ungradable.
+        "oracle: derive the quarantine outside the graded scope",
+        "src/bakeoff/oracle.py",
+        "                scope = _existing_prefixes(container, task.tests.paths)",
+        "                scope = tuple(task.tests.paths)",
+        "tests/test_oracle.py -k derived_only_over_prefixes_that_exist",
+        "not integration",
+    ),
+    (
+        # A row with no completed API call is not an observation of the
+        # model, and `matrix.infra_problems` learned that the hard way: a
+        # credential failure parses, logs, attributes and isolates
+        # perfectly. Grading one stamps a `resolved: False` on an arm that
+        # was never asked the question.
+        "grader: grade a zero-turn row as a model observation",
+        "src/bakeoff/grader.py",
+        "    if assembled and record.turns_used <= 0:",
+        "    if False:",
+        "tests/test_grader.py -k no_turns_is_not_an_observation",
+        "not integration",
+    ),
+    (
+        # `force_capture` stamps `turn=turns_streamed` verbatim, so a
+        # COMPLETE final snapshot is exactly equality. `<=` reads the
+        # mid-run `N-1 <= N` as complete, and the record then grades a
+        # snapshot the agent was still editing -- a partial edit scored as
+        # the model's answer.
+        "grader: read a mid-run snapshot as the submission",
+        "src/bakeoff/grader.py",
+        "            and record.checkpoints[-1].turn == record.turns_streamed",
+        "            and record.checkpoints[-1].turn <= record.turns_streamed",
+        "tests/test_grader.py -k crash_before_the_final_snapshot",
+        "not integration",
+    ),
+    (
+        # The single most load-bearing correction in the design. The
+        # submission was diffed against the START state -- base_sha plus the
+        # committed test half -- so restoring at `base_sha` puts back a tree
+        # in which the oracle does not exist yet, and the f2p run then
+        # measures a suite that is not there.
+        "grader: apply the submission to a state it was not diffed against",
+        "src/bakeoff/grader.py",
+        '        restored = env.exec(["git", "checkout", start_sha, "--", prefix])',
+        '        restored = env.exec(["git", "checkout", task.base_sha, "--", prefix])',
+        "tests/test_grader.py -k applied_where_it_was_diffed",
+        "not integration",
+    ),
+    (
+        # The Phase 0c failure, one module over and one layer up: 2/3/4/5
+        # are non-zero and mean the suite did not run. Collapsing them into
+        # the fail branch is what a bare `!= 0` does, and it stamps a broken
+        # image on the model as `f2p_failed`.
+        "grader: stamp a broken environment on the model",
+        "src/bakeoff/grader.py",
+        '    state.environment(\n        "f2p",',
+        '    state.fail("f2p", GradeFailure.F2P_FAILED, result,\n'
+        "               detail=_head(result))\n"
+        '    state.environment(\n        "f2p",',
+        "tests/test_grader.py -k f2p_environment_exit",
+        "not integration",
+    ),
+    (
+        # 127 is "command not found". A task whose declared `grading.build`
+        # names a tool the image does not ship would otherwise record a
+        # `build_failed` verdict against every arm, on all of them
+        # identically, which reads as a hard task rather than as a manifest
+        # the image cannot satisfy.
+        "grader: read a missing tool as a failed check",
+        "src/bakeoff/grader.py",
+        "    if code in _INFRA_EXITS:",
+        "    if False:",
+        "tests/test_grader.py -k missing_build_tool",
+        "not integration",
+    ),
+    (
+        # `snapshot_diff` is taken without `--binary`, so a binary change
+        # arrives as `Binary files ... differ` and `git apply` refuses the
+        # whole patch. Without the detection the model's text fix -- which
+        # applies intact once the scrap is dropped -- is thrown away as
+        # `apply_failed`.
+        "grader: refuse a submission over a binary scrap",
+        "src/bakeoff/grader.py",
+        "    binary = [(c, s, d) for c, s, d in parsed if _BINARY_CHUNK.search(c)]",
+        "    binary = [(c, s, d) for c, s, d in parsed if False]",
+        "tests/test_grader.py -k mixed_binary_submission",
+        "not integration",
+    ),
+    (
+        # The oracle has to be the task's test half, not the agent's copy of
+        # it. Without the rm an agent-added test file survives the restore
+        # and grades itself -- a model that wrote a passing test for its own
+        # behaviour scores `resolved`.
+        "grader: let an agent-added test survive the restore",
+        "src/bakeoff/grader.py",
+        "    paths = tuple(task.tests.paths)\n    if paths:\n        removed = env.exec(",
+        "    paths = tuple(task.tests.paths)\n    if False:\n        removed = env.exec(",
+        "tests/test_grader.py -k rm_then_checkout",
+        "not integration",
+    ),
+    (
+        # The other half of the same guarantee, and the non-obvious one:
+        # without `--index` an agent-ADDED file stays untracked, and
+        # `git rm` cannot remove an untracked path (measured). The restore
+        # then runs, reports success, and leaves the agent's test in place.
+        "grader: apply without --index and blind the rm",
+        "src/bakeoff/grader.py",
+        '        return env.exec(["git", "apply", "--index", name])',
+        '        return env.exec(["git", "apply", name])',
+        "tests/test_grader.py -k rm_then_checkout",
+        "not integration",
+    ),
+    (
+        # gitleaks' DEFAULT leak code is 1 and 1 is also its ERROR code, which
+        # is the whole reason `--exit-code 42` is passed. Reading 1 as a
+        # finding files a scanner that could not read its input as a section 7
+        # secret leak, against the model.
+        "grader: read a gitleaks error as a finding",
+        "src/bakeoff/grader.py",
+        "    if code == GITLEAKS_EXIT_FOUND:",
+        "    if code in (1, GITLEAKS_EXIT_FOUND):",
+        "tests/test_grader.py -k gitleaks_exit_one",
+        "not integration",
+    ),
+    (
+        # The quarantine is derived and then has to RIDE. Dropping the flags
+        # leaves a derivation that ran two full suites inside a container to
+        # produce a list nothing subtracts -- and the record still reports
+        # `p2p_quarantine_requested`, so it reads as applied.
+        "preflight: grade with the flake in the suite",
+        "src/bakeoff/preflight.py",
+        "        extra = [arg for node_id in extra_deselect\n"
+        '                 for arg in ("--deselect", node_id)]',
+        "        extra = []",
+        "tests/test_preflight.py -k quarantine_rides_as_deselect",
+        "not integration",
+    ),
+    (
+        # Without the scope prefixes the deselect branch collects at the
+        # ROOTDIR, which is whatever the agent left lying there -- measured,
+        # eight scratch files in one stored record. Those become the
+        # regression check, and a model that wrote a failing scratch test
+        # fails p2p on its own litter.
+        "preflight: collect the agent's scratch files into p2p",
+        "src/bakeoff/preflight.py",
+        "        args: list[str] = [*scope]",
+        "        args: list[str] = []",
+        "tests/test_preflight.py -k scope_prefixes_lead",
+        "not integration",
+    ),
+    (
+        # None of the other three components moves when `preflight.py` does:
+        # the manifest digest describes the task, the image id the
+        # environment, the start sha the tree. Without the version every warm
+        # cache serves a verdict written by the OLD gate -- the pruned
+        # mirror's "an older revision's output is served forever" defect, one
+        # subsystem over. Two drivers now read this key.
+        "preflight: serve a verdict from an older preflight forever",
+        "src/bakeoff/preflight.py",
+        '    return f"{task.manifest_digest}|{image}|{start_sha}|{PREFLIGHT_VERSION}"',
+        '    return f"{task.manifest_digest}|{image}|{start_sha}"',
+        "tests/test_run_matrix.py -k older_preflight_is_not_served",
+        "not integration",
+    ),
+    (
+        # A mis-scoped task and a task that fails its red-before assertion are
+        # different author errors with different remedies. Genericizing the
+        # first sends the author looking for a bug in a task whose only defect
+        # is a `tests.paths` that selects nothing.
+        "grade: genericize a mis-scoped task",
+        "scripts/grade.py",
+        "    reason = (\n"
+        "        NotGradedReason.SCOPE_COLLECTED_NOTHING\n"
+        "        if SCOPE_COLLECTS_NOTHING in result.problem_codes\n"
+        "        else NotGradedReason.PREFLIGHT_FAILED\n"
+        "    )",
+        "    reason = NotGradedReason.PREFLIGHT_FAILED",
+        "tests/test_grade_script.py -k scope_no_go_is_named",
+        "not integration",
+    ),
+    (
+        # A re-grade under a different oracle, image or grader is a new LINE,
+        # and the disagreement between the two lines is the finding.
+        # Truncating destroys the only evidence the grader is not
+        # deterministic -- and it destroys it silently, since one well-formed
+        # line is what a successful append looks like too.
+        "grades: truncate the grades file on every append",
+        "src/bakeoff/grade_schema.py",
+        '    with open(path, "a", encoding="utf-8") as handle:',
+        '    with open(path, "w", encoding="utf-8") as handle:',
+        "tests/test_grade_schema.py -k append_then_load",
+        "not integration",
+    ),
 ]
 
 
