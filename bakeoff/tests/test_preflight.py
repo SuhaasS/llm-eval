@@ -425,16 +425,40 @@ def test_grading_p2p_with_no_extras_is_the_argv_preflight_validated():
     hand-building the branch: with both keyword arguments left at their
     defaults the argv is byte-identical to the one the gate validated. The
     moment the graded command and the gated command drift apart, the oracle
-    stops describing the thing being graded."""
+    stops describing the thing being graded.
+
+    Written against the LITERAL argv rather than against a second call of the
+    same method: `pass_to_pass(t) == pass_to_pass(t, extra_deselect=(),
+    scope=())` is symmetric and holds no matter what the body emits, so it
+    would stay green through an inserted flag or a reordered segment -- the
+    two changes the property exists to catch. Both branches are spelled out
+    because the explicit-p2p branch has its own `*extra` splice.
+    """
     from bakeoff.preflight import _Runner
 
-    plain, kwargs = _Recorder(), _Recorder()
-    _Runner(plain, _Tests().runner, 60).pass_to_pass(_Tests())
-    _Runner(kwargs, _Tests().runner, 60).pass_to_pass(
+    deselect_branch = _Recorder()
+    _Runner(deselect_branch, _Tests().runner, 60).pass_to_pass(_Tests())
+    assert deselect_branch.commands == [
+        ["timeout", "60", "python", "-m", "pytest", "-q",
+         "--deselect", "tests/a.py::test_one"]
+    ]
+
+    explicit_branch = _Recorder()
+    tests = _Tests(p2p=("tests/b.py::test_two",))
+    _Runner(explicit_branch, tests.runner, 60).pass_to_pass(tests)
+    assert explicit_branch.commands == [
+        ["timeout", "60", "python", "-m", "pytest", "-q",
+         "tests/b.py::test_two"]
+    ]
+
+    # Passing the new keywords empty is the same thing as omitting them --
+    # checked against the same literal, never against the other call, so the
+    # comparison cannot pass by symmetry.
+    supplied = _Recorder()
+    _Runner(supplied, _Tests().runner, 60).pass_to_pass(
         _Tests(), extra_deselect=(), scope=()
     )
-
-    assert plain.commands == kwargs.commands
+    assert supplied.commands == deselect_branch.commands
 
 
 def test_the_quarantine_rides_as_deselect_flags():
@@ -661,6 +685,30 @@ def test_preflight_fails_a_broken_grading_declaration(monkeypatch, tmp_path):
     assert not result.ok
     assert any("typecheck" in p and "127" in p for p in result.problems)
     assert result.evidence["grading_typecheck_exit"] == 127
+
+
+def test_the_grading_argvs_run_before_the_scoped_p2p_like_the_ladder_does(
+    monkeypatch, tmp_path
+):
+    """The grader's ladder runs build/typecheck (checks 3-4) before p2p
+    (check 6). Preflight has to agree, or the scoped run it validates is
+    measured on a tree the grading commands have not touched -- and a build
+    artifact or a mypy cache is exactly the kind of thing that changes what
+    the next collection sees. Pinned as an order rather than left to the
+    comment, because nothing else makes the two ladders stay in step."""
+    task = _FakeTask(grading=TaskGrading(build=("make", "build")))
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=task.tests, present=("tests/",),
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert result.ok, result.problems
+    grading_at = next(i for i, cmd in enumerate(container.commands)
+                      if cmd[2:] == ["make", "build"])
+    scoped_at = next(i for i, cmd in enumerate(container.commands)
+                     if "tests/" in cmd and cmd[0] == "timeout")
+    assert grading_at < scoped_at
 
 
 def test_a_healthy_task_declares_the_gate_that_produced_its_verdict(

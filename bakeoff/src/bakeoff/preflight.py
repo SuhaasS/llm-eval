@@ -418,6 +418,31 @@ def preflight(
                     + (after_p2p.stdout or after_p2p.stderr)[-2000:]
                 )
 
+            # --- each declared grading argv runs clean on the reference
+            #
+            # A typo'd `typecheck:`, or a tool the image does not ship, is
+            # otherwise stamped as typecheck_failed on every record of this
+            # task, permanently, in an append-only store -- an accusation
+            # against every arm for the task author's error.
+            #
+            # BEFORE the scoped p2p, because the grader's ladder runs
+            # build/typecheck (checks 3-4) before p2p (check 6): a grading
+            # command can write into the tree -- a build artifact, a mypy or
+            # ruff cache -- and the scoped run has to be measured on the tree
+            # the graded one will actually see, not on a cleaner one.
+            for key, argv in _declared_grading(task):
+                checked = container.exec(["timeout", str(timeout_s), *argv])
+                evidence[f"grading_{key}_exit"] = checked.exit_code
+                if checked.exit_code != EXIT_ALL_PASSED:
+                    problems.append(
+                        f"the declared grading.{key} command exits "
+                        f"{checked.exit_code} at the post-fix state: "
+                        f"{' '.join(argv)}. The reference is the oracle; a "
+                        f"command it cannot satisfy would record "
+                        f"{key}_failed against every submission.\n"
+                        + (checked.stdout or checked.stderr)[-2000:]
+                    )
+
             # --- the SCOPED p2p is green, which is what the grader runs
             #
             # Check 6 scopes p2p to tests.paths, because an agent's scratch
@@ -464,25 +489,6 @@ def preflight(
                             f"  {' '.join(runner.last_argv)}\n"
                             + (scoped.stdout or scoped.stderr)[-2000:]
                         )
-
-            # --- each declared grading argv runs clean on the reference
-            #
-            # A typo'd `typecheck:`, or a tool the image does not ship, is
-            # otherwise stamped as typecheck_failed on every record of this
-            # task, permanently, in an append-only store -- an accusation
-            # against every arm for the task author's error.
-            for key, argv in _declared_grading(task):
-                checked = container.exec(["timeout", str(timeout_s), *argv])
-                evidence[f"grading_{key}_exit"] = checked.exit_code
-                if checked.exit_code != EXIT_ALL_PASSED:
-                    problems.append(
-                        f"the declared grading.{key} command exits "
-                        f"{checked.exit_code} at the post-fix state: "
-                        f"{' '.join(argv)}. The reference is the oracle; a "
-                        f"command it cannot satisfy would record "
-                        f"{key}_failed against every submission.\n"
-                        + (checked.stdout or checked.stderr)[-2000:]
-                    )
 
         # Leave the tree exactly as it was found.
         #
