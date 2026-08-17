@@ -48,6 +48,7 @@ from bakeoff.preflight import (
     PREFLIGHT_VERSION,
     SCOPE_COLLECTS_NOTHING,
     PreflightResult,
+    preflight_cache_key,
 )
 from bakeoff.eventlog import EventLog
 from bakeoff.schema import (
@@ -71,6 +72,7 @@ from scripts.grade import (
     grades_path,
     preflight_cached,
     record_preflight_pass,
+    resolve_task,
 )
 
 IMAGE = "sha256:image"
@@ -372,6 +374,23 @@ def test_a_record_whose_task_is_gone_is_named_task_not_found(tmp_path):
     assert line.graded_under_preflight_version == ""
 
 
+def test_a_line_that_ran_in_no_image_claims_no_image_comparison(tmp_path):
+    """`image_matches_run is False` says the grade ran somewhere else. A
+    driver-level refusal ran NOWHERE -- no image was ever resolved -- and
+    `stored_digest == ""` is `False`, so every one of these lines used to
+    claim a mismatch: the summary counted them and the cross-image banner
+    fired over zero real mismatches. `None` is "the comparison could not be
+    made", and it has two causes, not one."""
+    root = _log(tmp_path, _record("run-a", task_id="vanished"),
+                _record("run-b", task_version=99))
+
+    result = _run(root, [_task()], tmp_path)
+
+    assert [g.image_matches_run for g in result["not_graded"]] == [None, None]
+    assert result["summary"]["claude-sonnet-5"]["image_mismatch"] == 0
+    assert result["warnings"] == []
+
+
 def test_a_task_edited_since_the_run_is_named_task_version_mismatch(tmp_path):
     root = _log(tmp_path, _record("run-a", task_version=3))
 
@@ -410,16 +429,21 @@ def test_an_unparsable_record_schema_version_does_not_kill_the_batch(tmp_path):
     assert "could not be" in line.not_graded_detail
 
 
-def test_an_excluded_run_is_not_graded_and_no_oracle_is_consulted(tmp_path):
-    """The gate is the ladder's, re-asked by the driver for one reason: a
-    gated record must carry `quarantined is None`. Handing it the task's real
-    oracle would claim a quarantine was consulted on a run nobody graded."""
-    excluded = _record(
-        "run-a",
+def _excluded(run_id="run-a", **kw):
+    return _record(
+        run_id,
         exclusion=Exclusion(cls=ExclusionClass.INFRA_FAILURE,
                             reason_code="api_5xx", pre_registered=True),
+        **kw,
     )
-    root = _log(tmp_path, excluded)
+
+
+def test_an_excluded_run_is_not_graded_and_no_oracle_is_consulted(tmp_path):
+    """The gate is the ladder's, asked by the driver so a gated record costs
+    no container -- and so its line carries `quarantined is None`. An oracle
+    on that row would claim a quarantine was consulted on a run nobody graded,
+    and `()` is the healthy-suite derivation."""
+    root = _log(tmp_path, _excluded())
     grader = FakeGrader()
 
     result = _run(root, [_task()], tmp_path, grade_one=grader)
@@ -427,7 +451,47 @@ def test_an_excluded_run_is_not_graded_and_no_oracle_is_consulted(tmp_path):
     line = result["not_graded"][0]
     assert line.not_graded_reason == NotGradedReason.EXCLUDED.value
     assert line.quarantined is None
-    assert grader.calls[0].oracle is None
+    assert line.oracle_fingerprint is None
+    assert grader.calls == []
+
+
+def test_a_gated_task_never_pays_for_a_setup_it_cannot_use(tmp_path):
+    """An image build, a preflight and TWO full suite runs for the oracle, to
+    produce refusals that look at none of it. The gate is above the setup."""
+    resolved = []
+
+    def resolve(task):
+        resolved.append(task.task_id)
+        return _setup()
+
+    root = _log(tmp_path, _excluded("run-a"), _excluded("run-b"))
+
+    result = _run(root, [_task()], tmp_path, resolve_env=resolve)
+
+    assert len(result["not_graded"]) == 2
+    assert resolved == []
+
+
+def test_an_excluded_record_keeps_its_reason_when_the_task_setup_also_failed(
+    tmp_path
+):
+    """`EXCLUDED` is a RECORD-level refusal; `TASK_SETUP_FAILED` is a
+    TASK-level one, and the design's section 4.2.2 pairing constraint branches
+    on exactly that distinction -- a record-level refusal breaks one arm's
+    pair, a task-level one drops the task for every arm. Resolving the setup
+    first wrote the excluded row as `task_setup_failed`, which is the wrong
+    authority AND the wrong blast radius."""
+    def resolve(task):
+        raise ImageError("the base image build failed")
+
+    root = _log(tmp_path, _excluded("run-a"), _record("run-b"))
+
+    result = _run(root, [_task()], tmp_path, resolve_env=resolve)
+
+    by_run = {g.run_id: g for g in result["not_graded"]}
+    assert by_run["run-a"].not_graded_reason == NotGradedReason.EXCLUDED.value
+    assert (by_run["run-b"].not_graded_reason
+            == NotGradedReason.TASK_SETUP_FAILED.value)
 
 
 # --------------------------------------------------------------------------
@@ -754,11 +818,10 @@ def test_a_verdict_from_the_drivers_cache_is_served(tmp_path):
     time the collection driver is forced."""
     cache = tmp_path / "cache"
     task, start_sha = _task(), "a" * 40
-    from scripts.run_matrix import _preflight_cache_key
 
     cache.mkdir(parents=True)
     (cache / "preflight.json").write_text(json.dumps(
-        {task.task_id: {"key": _preflight_cache_key(task, IMAGE, start_sha)}}
+        {task.task_id: {"key": preflight_cache_key(task, IMAGE, start_sha)}}
     ))
 
     assert preflight_cached(task, IMAGE, start_sha, cache) is True
@@ -800,3 +863,148 @@ def test_an_unreadable_grader_cache_is_a_miss_not_a_crash(tmp_path):
     (cache / "preflight-grade.json").write_text("{not json")
 
     assert preflight_cached(_task(), IMAGE, "a" * 40, cache) is False
+
+
+def test_the_grader_cache_write_leaves_no_half_written_file(tmp_path):
+    """Whole-file rewrite plus `os.replace`. The file holds EVERY task's
+    verdict, so a torn write does not lose one entry -- it loses the file, and
+    the next pass re-preflights the whole collection."""
+    cache = tmp_path / "cache"
+    cache.mkdir(parents=True)
+
+    record_preflight_pass(_task("a"), IMAGE, "a" * 40, cache)
+    record_preflight_pass(_task("b"), IMAGE, "b" * 40, cache)
+
+    stored = json.loads((cache / "preflight-grade.json").read_text())
+    assert sorted(stored) == ["a", "b"]
+    assert list((cache).glob("*.tmp")) == []
+
+
+# --------------------------------------------------------------------------
+# 9. resolve_task, without a daemon
+# --------------------------------------------------------------------------
+
+
+def _stub_setup(monkeypatch, calls):
+    """Everything `resolve_task` shells out to, replaced.
+
+    The four are the whole Docker surface of the per-task setup: the image
+    build, the ENTRYPOINT probe, the tree, and the two container-running
+    gates. Stubbed together so the CACHE branch -- which is the only logic
+    `resolve_task` has of its own -- is reachable offline.
+    """
+    import scripts.grade as grade
+
+    monkeypatch.setattr(grade, "build_task_image",
+                        lambda *a, **k: IMAGE)
+    monkeypatch.setattr(grade, "image_entrypoint", lambda image: [])
+    monkeypatch.setattr(grade, "materialize", lambda *a, **k: "a" * 40)
+    monkeypatch.setattr(grade, "ensure_oracle",
+                        lambda *a, **k: _oracle())
+
+    def fake_preflight(task, **kw):
+        calls.append(task.task_id)
+        return PreflightResult(
+            task_id=task.task_id, task_version=task.task_version,
+            start_sha=kw["start_sha"], image=kw["image"],
+            manifest_digest=task.manifest_digest,
+            preflight_version=PREFLIGHT_VERSION,
+        )
+
+    monkeypatch.setattr(grade, "preflight", fake_preflight)
+
+
+def test_a_cached_pass_spares_the_task_a_second_preflight(monkeypatch,
+                                                          tmp_path):
+    calls = []
+    _stub_setup(monkeypatch, calls)
+    cache, task = tmp_path / "cache", _task()
+    cache.mkdir(parents=True)
+    (cache / "preflight.json").write_text(json.dumps(
+        {task.task_id: {"key": preflight_cache_key(task, IMAGE, "a" * 40)}}
+    ))
+
+    setup = resolve_task(task, cache, base_image="sha256:base")
+
+    assert calls == []
+    assert setup.refusal is None
+    # The module constant, and it is sound because the version is IN the key:
+    # a hit can only have been written by this gate.
+    assert setup.preflight_version == PREFLIGHT_VERSION
+
+
+def test_force_preflight_re_earns_a_verdict_the_cache_already_holds(
+    monkeypatch, tmp_path
+):
+    """The escape hatch for a gate that is warm and wrong -- an image rebuilt
+    under the same digest, a task edited without a digest bump. Without it the
+    only way to re-run the gate is to delete a file by hand."""
+    calls = []
+    _stub_setup(monkeypatch, calls)
+    cache, task = tmp_path / "cache", _task()
+    cache.mkdir(parents=True)
+    (cache / "preflight.json").write_text(json.dumps(
+        {task.task_id: {"key": preflight_cache_key(task, IMAGE, "a" * 40)}}
+    ))
+
+    setup = resolve_task(task, cache, base_image="sha256:base",
+                         force_preflight=True)
+
+    assert calls == [task.task_id]
+    assert setup.refusal is None
+
+
+def test_an_inherited_entrypoint_is_refused_before_anything_is_materialized(
+    monkeypatch, tmp_path
+):
+    """`RunContainer`'s `sleep infinity` would become an argument to it and the
+    container would exit immediately. Raised, so it joins the setup bucket
+    rather than being a special case with its own reason."""
+    import scripts.grade as grade
+
+    calls = []
+    _stub_setup(monkeypatch, calls)
+    monkeypatch.setattr(grade, "image_entrypoint", lambda image: ["/entry.sh"])
+    monkeypatch.setattr(grade, "materialize", lambda *a, **k: pytest.fail(
+        "materialized a task whose image cannot host a container"
+    ))
+
+    with pytest.raises(TaskError) as exc:
+        resolve_task(_task(), tmp_path / "cache", base_image="sha256:base")
+
+    assert "ENTRYPOINT" in str(exc.value)
+
+
+# --------------------------------------------------------------------------
+# 10. saying what the batch could not do
+# --------------------------------------------------------------------------
+
+
+def test_only_naming_a_run_this_log_does_not_hold_is_said_out_loud(tmp_path):
+    """Not an error -- the exit contract is about records that were selected
+    AND exist. But silence reads as "graded, nothing to report", and the usual
+    cause is an operator pointing at the wrong event log, where every id is
+    missing and the batch reports a clean zero."""
+    root = _log(tmp_path, _record("run-a"))
+
+    result = _run(root, [_task()], tmp_path, only=["run-a", "run-typo"])
+
+    assert [g.run_id for g in result["graded"]] == ["run-a"]
+    assert result["errors"] == []
+    assert any("run-typo" in w for w in result["warnings"])
+
+
+def test_re_grade_over_a_damaged_file_says_what_it_could_not_read(tmp_path):
+    """`--re-grade` skips nothing, so the damage cannot cause a wrong skip --
+    which is why it is a warning here and a refusal otherwise. Said out loud
+    because the grader_commit banner is computed off the same list, so a
+    damaged file can silently stop THAT banner from firing."""
+    root = _log(tmp_path, _record("run-a"))
+    path = grades_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{not json\n", encoding="utf-8")
+
+    result = _run(root, [_task()], tmp_path, re_grade=True)
+
+    assert len(result["graded"]) == 1
+    assert any("unreadable" in w for w in result["warnings"])

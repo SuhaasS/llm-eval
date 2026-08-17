@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 from collections import Counter
@@ -104,13 +105,12 @@ from bakeoff.preflight import (  # noqa: E402
     SCOPE_COLLECTS_NOTHING,
     PreflightResult,
     preflight,
+    # Imported, never restated: two copies of a cache key is how a verdict
+    # written under one gate gets served to another.
+    preflight_cache_key,
 )
 from bakeoff.runner import harness_commit  # noqa: E402
 from bakeoff.tasks import TaskError, load_task_set, materialize  # noqa: E402
-
-# The cache key, imported rather than restated. Two copies of a cache key is
-# how a verdict written by one gate gets served to another.
-from scripts.run_matrix import _preflight_cache_key  # noqa: E402
 
 # Under $HOME for the reason `run_matrix` documents: the Docker VM on macOS
 # mounts $HOME only, and a directory bind-mounted from elsewhere appears inside
@@ -205,11 +205,12 @@ def preflight_cached(task, image: str, start_sha: str, cache: Path) -> bool:
     re-validating 80 tasks per grading pass is how a gate becomes one nobody
     runs. Only the grader's is written.
 
-    The key is `_preflight_cache_key`, imported: it carries `PREFLIGHT_VERSION`,
-    so a verdict written by an older gate misses and the assertions added since
-    are not inert on exactly the tasks about to be graded.
+    The key is `preflight.preflight_cache_key`, imported: it carries
+    `PREFLIGHT_VERSION`, so a verdict written by an older gate misses and the
+    assertions added since are not inert on exactly the tasks about to be
+    graded.
     """
-    key = _preflight_cache_key(task, image, start_sha)
+    key = preflight_cache_key(task, image, start_sha)
     return any(
         _cache_file(cache, name).get(task.task_id, {}).get("key") == key
         for name in (DRIVER_PREFLIGHT_CACHE, GRADE_PREFLIGHT_CACHE)
@@ -218,12 +219,22 @@ def preflight_cached(task, image: str, start_sha: str, cache: Path) -> bool:
 
 def record_preflight_pass(task, image: str, start_sha: str,
                           cache: Path) -> None:
-    """Store a PASS in the grader's own cache. Never the driver's."""
+    """Store a PASS in the grader's own cache. Never the driver's.
+
+    Written to a temp file and `os.replace`d, which is atomic on POSIX. The
+    file holds EVERY task's verdict and is rewritten whole on each pass, so a
+    batch killed mid-write does not lose one entry -- it loses the file, and
+    `_cache_file` then reads the truncation as a miss and every task in the
+    collection re-preflights. That is a real cost (a preflight per task) paid
+    for a signal that was never damaged.
+    """
     path = Path(cache) / GRADE_PREFLIGHT_CACHE
     stored = _cache_file(cache, GRADE_PREFLIGHT_CACHE)
-    stored[task.task_id] = {"key": _preflight_cache_key(task, image, start_sha)}
+    stored[task.task_id] = {"key": preflight_cache_key(task, image, start_sha)}
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(stored, indent=2, sort_keys=True) + "\n")
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(stored, indent=2, sort_keys=True) + "\n")
+    os.replace(tmp, path)
 
 
 def preflight_refusal(result: PreflightResult) -> tuple[NotGradedReason, str]:
@@ -405,7 +416,25 @@ def _schema_refusal(record) -> str | None:
 
 def _grade_one(record, task, setups: dict, resolve_env: Callable, cache: Path,
                artifacts: Path, grade_one: Callable) -> GradeRecord:
-    """One record, from the driver's own gates through to the ladder."""
+    """One record, from the driver's own gates through to the ladder.
+
+    THE ORDER IS THE CONTENT. Input problems first (is there a task, is it the
+    same task, can the record be read at all), then `not_graded_gate` -- is
+    there a submission -- and only then the per-task setup.
+
+    The gate sits ABOVE the setup for two reasons, and the first is not an
+    optimisation. `EXCLUDED` is a RECORD-level refusal and `TASK_SETUP_FAILED`
+    is a TASK-level one, and the design's section 4.2.2 pairing constraint
+    branches on exactly that distinction: a record-level refusal breaks one
+    arm's pair, a task-level one drops the task for every arm. Resolving the
+    setup first meant an excluded record in a task whose image would not build
+    was written `task_setup_failed` -- the wrong authority, and the row would
+    be dropped from every arm instead of one.
+
+    The second is cost: a task whose records are all gated used to pay an image
+    build, a preflight and two full suite runs for the oracle, to produce
+    refusals that never look at any of it.
+    """
     if task is None:
         return _refused(
             record, None, "", NotGradedReason.TASK_NOT_FOUND,
@@ -424,6 +453,22 @@ def _grade_one(record, task, setups: dict, resolve_env: Callable, cache: Path,
         return _refused(record, task, "",
                         NotGradedReason.RECORD_SCHEMA_TOO_OLD, schema_problem)
 
+    # Is there a submission at all? `grade_run` asks this again and is complete
+    # on its own -- one function, three call sites, because the ORDER is what
+    # is load-bearing and a second copy of it is a second thing that can be
+    # wrong. Asked here so the answer is not masked by a setup that fails after
+    # it, and so a gated record costs no container.
+    #
+    # `image=""`: nothing was resolved, so `graded_in_image` names nothing and
+    # `image_matches_run` is `None` rather than a mismatch against the empty
+    # string. `oracle=None` follows from never reaching the setup, which is
+    # what makes the line carry `quarantined: null` -- `()` is the
+    # healthy-suite derivation and the two must not collapse.
+    gate = not_graded_gate(record)
+    if gate is not None:
+        reason, detail = gate
+        return _refused(record, task, "", reason, detail)
+
     if task.task_id not in setups:
         setups[task.task_id] = _resolve(task, resolve_env)
     setup = setups[task.task_id]
@@ -432,12 +477,7 @@ def _grade_one(record, task, setups: dict, resolve_env: Callable, cache: Path,
         return _refused(record, task, setup.image, reason, detail,
                         setup.preflight_version)
 
-    # `oracle=None` for a gated record, so its line carries `quarantined:
-    # null`. Handing it the task's real oracle would claim a quarantine was
-    # consulted on a run nobody graded -- and `()` is the healthy-suite case,
-    # so the two must not collapse.
-    oracle = None if not_graded_gate(record) is not None else setup.oracle
-    grade = grade_one(record, task, setup.image, oracle, cache, artifacts)
+    grade = grade_one(record, task, setup.image, setup.oracle, cache, artifacts)
     return replace(grade, graded_under_preflight_version=setup.preflight_version)
 
 
@@ -464,13 +504,19 @@ def _resolve(task, resolve_env: Callable) -> TaskSetup:
 def grade_event_log(event_log_root, tasks, cache, grade_one=grade_run,
                     resolve_env: Callable | None = None,
                     only: Iterable[str] | None = None,
-                    re_grade: bool = False,
-                    force_preflight: bool = False) -> dict:
+                    re_grade: bool = False) -> dict:
     """Grade every selected record in one event log. Returns the batch.
 
     `grade_one` and `resolve_env` are the two seams that keep this testable
     without a daemon: the first is the ladder over one run, the second is the
     per-task setup. Both defaults are the real thing.
+
+    There is deliberately NO `force_preflight` parameter. Forcing is the
+    RESOLVER's business -- `task_resolver(cache, force_preflight)` closes over
+    it -- and a flag here would be silently dead whenever `resolve_env` is
+    supplied, which is every test and any caller with its own setup. A
+    parameter that is ignored on the path most callers take is worse than one
+    that does not exist.
 
     Runs are walked in `sorted(list_runs())`. `list_runs` globs and glob order
     is nondeterministic; sorted-by-run_id is arbitrary but deterministic, which
@@ -480,7 +526,7 @@ def grade_event_log(event_log_root, tasks, cache, grade_one=grade_run,
     event_log_root = Path(event_log_root)
     cache = Path(cache)
     if resolve_env is None:
-        resolve_env = task_resolver(cache, force_preflight)
+        resolve_env = task_resolver(cache)
 
     path = grades_path(event_log_root)
     artifacts = artifacts_root(event_log_root)
@@ -497,6 +543,17 @@ def grade_event_log(event_log_root, tasks, cache, grade_one=grade_run,
     done = {(g.run_id, g.grader_version) for g in existing}
     commit = harness_commit()
     warnings: list[str] = []
+    if malformed:
+        # Reached only under `--re-grade`, which skips nothing and so cannot
+        # mistake an unreadable grade for an absent one. Said out loud anyway:
+        # `existing` is also what the grader_commit banner below is computed
+        # from, so a damaged file can silently stop that banner from firing.
+        warnings.append(
+            f"{malformed} unreadable line(s) in {path} were skipped. "
+            "--re-grade makes them harmless to the resume, but the "
+            "grader_commit check below reads the same list, so it is reported "
+            "over an incomplete view of what has already been graded."
+        )
     prior = {
         g.grader_commit for g in existing
         if g.grader_version == GRADER_VERSION and g.grader_commit
@@ -518,7 +575,20 @@ def grade_event_log(event_log_root, tasks, cache, grade_one=grade_run,
     setups: dict[str, TaskSetup] = {}
     selected = None if only is None else set(only)
 
-    for run_id in sorted(log.list_runs()):
+    stored = sorted(log.list_runs())
+    if selected is not None and selected - set(stored):
+        # A `--only` id that names no record in this log. Not an error -- the
+        # exit contract is about records that were SELECTED and exist -- but
+        # silence here reads as "graded, nothing to report", and the usual
+        # cause is an operator pointing at the wrong event log, where every id
+        # is missing and the batch reports a clean zero.
+        warnings.append(
+            "--only named "
+            f"{len(selected - set(stored))} run_id(s) that this event log "
+            f"does not hold: {', '.join(sorted(selected - set(stored)))}"
+        )
+
+    for run_id in stored:
         if selected is not None and run_id not in selected:
             continue
         if not re_grade and (run_id, GRADER_VERSION) in done:
@@ -677,8 +747,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = grade_event_log(
             event_log_root, tasks, Path(args.cache),
+            # Built here rather than passed as a flag: forcing is the
+            # resolver's business, and `grade_event_log` takes no parameter it
+            # would ignore whenever a caller supplies its own setup.
+            resolve_env=task_resolver(Path(args.cache), args.force_preflight),
             only=args.only, re_grade=args.re_grade,
-            force_preflight=args.force_preflight,
         )
     except ResumeRefused as exc:
         print(f"\nRESUME REFUSED: {exc}")

@@ -66,6 +66,28 @@ _FAILED_LINE = re.compile(r"^(?:FAILED|ERROR)\s+(\S+)", re.MULTILINE)
 #: every verdict cached before the scoped-p2p and grading assertions landed.
 PREFLIGHT_VERSION: str = "2"
 
+
+def preflight_cache_key(task, image: str, start_sha: str) -> str:
+    """What a cached PASS is keyed on -- including the gate that produced it.
+
+    `PREFLIGHT_VERSION` is in here because none of the other three components
+    moves when `preflight.py` changes: a manifest digest describes the task, an
+    image id describes the environment, a start sha describes the tree, and a
+    new assertion touches none of them. Without the version every warm cache
+    serves a verdict written by the OLD gate, and an assertion added to catch a
+    defect is inert on exactly the tasks about to be run -- the pruned mirror's
+    "an older revision's output is served forever" defect, one subsystem over.
+
+    It lives HERE, beside the constant it depends on, and not in either driver.
+    Two consumers now read the same caches -- `run_matrix` writes
+    `preflight.json`, `grade.py` reads it and writes `preflight-grade.json` --
+    and a key defined in one of them and imported by the other makes the
+    collection driver a dependency of the offline grader for one f-string. Two
+    COPIES would be worse still: that is how a verdict written under one gate
+    gets served to another.
+    """
+    return f"{task.manifest_digest}|{image}|{start_sha}|{PREFLIGHT_VERSION}"
+
 #: A declared `tests.paths` prefix that does not exist at the post-fix state.
 #: NOT a problem: `PreflightResult.ok` is `not problems`, and the grader's
 #: restore step tolerates exactly this input, so a problem here would NO-GO a

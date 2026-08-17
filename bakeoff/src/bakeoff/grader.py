@@ -1382,11 +1382,20 @@ def build_grade_record(record: RunRecord, task, image: str,
         grader_commit=harness_commit(),
         graded_under_preflight_version=PREFLIGHT_VERSION,
         graded_in_image=image,
-        # `None` when the comparison could not be made -- the record names no
-        # image. `False` is a real mismatch worth seeing, so it must not be
-        # what "we did not check" looks like.
+        # `None` when the comparison could not be made, and there are TWO ways
+        # for that: the record names no image, or the grade ran in none. The
+        # second arrived with the driver, which assembles its input-level
+        # refusals (`TASK_NOT_FOUND`, `TASK_VERSION_MISMATCH`,
+        # `RECORD_SCHEMA_TOO_OLD`, a failed per-task setup) through this same
+        # function with `image=""` -- no image was ever resolved, so there is
+        # nothing to compare. Measured: without the second term every one of
+        # those lines carries `image_matches_run: False`, which is a claim that
+        # the grade ran somewhere else, and it pollutes the mismatch count and
+        # fires the driver's cross-image banner over zero real mismatches.
+        # `False` is a real mismatch worth seeing, so it must not be what
+        # "we did not check" looks like -- on either side.
         image_matches_run=(
-            None if not stored_digest else stored_digest == image
+            None if not stored_digest or not image else stored_digest == image
         ),
         graded_against_manifest_digest=getattr(task, "manifest_digest", ""),
         graded_against_task_set_commit=getattr(task, "task_set_commit", ""),

@@ -57,7 +57,7 @@ from bakeoff.matrix import (  # noqa: E402
     to_task_spec,
     write_json,
 )
-from bakeoff.preflight import PREFLIGHT_VERSION, preflight  # noqa: E402
+from bakeoff.preflight import preflight, preflight_cache_key  # noqa: E402
 from bakeoff.proxy import (  # noqa: E402
     EVAL_ARMS,
     SSO_LOGIN_HINT,
@@ -98,21 +98,6 @@ def base_claude_version(image: str) -> str:
     return probe.stdout.strip().split()[0] if probe.returncode == 0 else ""
 
 
-def _preflight_cache_key(task, image: str, start_sha: str) -> str:
-    """What a cached PASS is keyed on -- including the gate that produced it.
-
-    PREFLIGHT_VERSION is in here because none of the other three components
-    moves when `preflight.py` changes: a manifest digest describes the task,
-    an image id describes the environment, a start sha describes the tree, and
-    a new assertion touches none of them. Without the version every warm cache
-    serves a verdict written by the OLD gate, and an assertion added to catch
-    a defect is inert on exactly the tasks about to be run -- the pruned
-    mirror's "an older revision's output is served forever" defect, one
-    subsystem over.
-    """
-    return f"{task.manifest_digest}|{image}|{start_sha}|{PREFLIGHT_VERSION}"
-
-
 def resolve_tasks(tasks, base_image, expected_version, cache, force):
     """Build each task's image, materialize its start state, and preflight.
 
@@ -120,8 +105,8 @@ def resolve_tasks(tasks, base_image, expected_version, cache, force):
     the image id and the start sha -- everything a run needs that is not in
     the manifest.
 
-    The preflight cache is keyed by `_preflight_cache_key` -- (manifest
-    digest, image id, start sha, PREFLIGHT_VERSION).
+    The preflight cache is keyed by `preflight.preflight_cache_key` --
+    (manifest digest, image id, start sha, PREFLIGHT_VERSION).
     Re-validating 80 tasks on every resume would turn a 30-second restart
     into half an hour, and a gate that is expensive to run is a gate that
     gets skipped -- the same argument verify_logger.py makes for staying
@@ -157,7 +142,7 @@ def resolve_tasks(tasks, base_image, expected_version, cache, force):
         if not task.declared_start_sha:
             print(f"          pin it: repo.start_sha: {start_sha}")
 
-        key = _preflight_cache_key(task, image, start_sha)
+        key = preflight_cache_key(task, image, start_sha)
         if cached.get(task.task_id, {}).get("key") == key:
             print("preflight cached PASS (--force-preflight to re-run)")
             resolved[task.task_id] = {"image": image, "start_sha": start_sha,
