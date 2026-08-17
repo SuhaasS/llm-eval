@@ -173,6 +173,7 @@ These are enforced in code and asserted by tests. Breaking one is usually silent
 | [plans/2026-08-17-offline-grader.md](docs/superpowers/plans/2026-08-17-offline-grader.md) | The grader's implementation plan, Tasks 1–8, with the three revision rounds folded in. |
 | [bakeoff/taskset/](bakeoff/taskset/) | The task set. One directory per task: `task.yaml` (§3.7) + `reference.diff`. `task_set_commit` on every record names this directory's git revision. |
 | [bakeoff/taskset/HARVESTING.md](bakeoff/taskset/HARVESTING.md) | What a candidate task has to satisfy, in three layers: refused by code, required-but-unchecked, and properties of the set. Carries the screened repository list and the measured reason each excluded repo is out. |
+| [docs/BUILDING-A-TASK-SET.md](docs/BUILDING-A-TASK-SET.md) | The procedural companion to `HARVESTING.md`: standing the harness up on a fresh machine, screening a corpus, cutting one task to a green preflight, then collecting and grading against a task set that lives outside this repo. Order of operations; `HARVESTING.md` remains the specification. |
 
 Current state: Tasks 1–11 complete, Task 12's offline half done, Gate 0 (every CAPTURE-class observability gap) closed at schema 3.3.0, Gate 1's harness half at 3.5.0, the credential-expiry blind spot at 3.6.0, and the provider finish reason, the `host` block and collection identity at 3.7.0. See `TASKS.md` for the live half — it is the current record, and it moves faster than this line.
 
