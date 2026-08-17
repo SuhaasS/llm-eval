@@ -98,8 +98,9 @@ that passes Layer 1 and measures the wrong thing.
 ### Grading
 
 - **Every task declares a `grading:` block, or records why each key is
-  waived.** `build`, `typecheck` and `lint` are checks 3, 7 and 8 of the
-  grader's ladder. An absent key grades as `not_configured`, which is a named
+  waived.** `build`, `typecheck` and `lint` are checks 3, 4 and 7 of the
+  grader's ladder. (Check 8 is the secret scan and is **not** waivable — it
+  has no manifest key and runs on every submission.) An absent key grades as `not_configured`, which is a named
   absence and not a pass — but an *unrecorded* absence is indistinguishable
   from an oversight, and a §10.3 reader has no way to tell a task that
   deliberately has no lint gate from one whose author forgot. A comment in

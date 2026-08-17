@@ -168,7 +168,7 @@ Tier B may additionally be made executable (acceptance tests per task) — see �
 
 #### 4.2.1 Deterministic checks
 
-Run in order; first failure short-circuits and sets `failure_class`.
+Run in order; first failure short-circuits and sets **`grade_failure`** — the `GradeRecord`'s field, not the `RunRecord`'s `failure_class`. See below for why the two are separate claims.
 
 | # | Check | Pass condition |
 |---|---|---|
@@ -320,7 +320,7 @@ Full scorecard in §10.1. Three definitions that are easy to get wrong:
 Every run begins from a byte-identical world:
 
 - Container pinned **by digest**, not tag
-- `git checkout --detach <base_sha>` then `git clean -xfd`
+- `git checkout --detach <start_sha>` then `git clean -xfd` — the **start state**, which is `base_sha` plus the committed test half, because the oracle tests do not exist at `base_sha` (see §4.2.1). `TaskSpec.base_sha` is the field that carries it: `matrix.py` passes `start_sha` into that name, so the field is start-state-accurate and its *name* is the stale thing
 - Dependencies from lockfile, pre-installed into the image
 - **Network off** during the run, or through a recording proxy — a flaky registry must not become a model difference
 - Fresh container per sample; no reuse across the N=10. State bleed would correlate repeats and silently shrink effective N
@@ -375,8 +375,10 @@ Never trust the agent's self-report — agents claim false success, at different
 Mechanically, in the container after termination:
 
 ```bash
-git add -A && git diff --cached <base_sha>
+git add -A && git diff --cached <start_sha>
 ```
+
+Against `start_sha`, not `base_sha` — the same fact as §5.1 and §4.2.1's check 2. The container is detached at the start state, so this is the only basis a diff of the tree can honestly have; a `base_sha`-relative diff would carry the harness's own test-half commit as though the agent had written it.
 
 Staging first captures untracked files and normalizes over whether the agent committed, left the tree dirty, or created new files. That diff is the submission; tests, judge, and reference comparison all run on it.
 
@@ -707,7 +709,7 @@ Everything an implementer must have answered before or during the phase named. O
 
 | ID | Decision | Blocks | Owner | Notes |
 |---|---|---|---|---|
-| **OPEN-2** | **Repo and language scope** | Phase 2 | Suhaas | Which Pindrop repos, mono or multi, which languages. Determines container build effort and whether type-check (check 4) and lint (check 7) apply at all. §4.2.1 assumes `mypy`/`tsc` as placeholders until answered. Deferred to post-handoff. |
+| **OPEN-2** | **Repo and language scope** | Phase 2 | Suhaas | Which Pindrop repos, mono or multi, which languages. Determines container build effort and whether type-check (check 4) and lint (check 7) apply at all. **The placeholder half is resolved:** §4.2.1 no longer assumes `mypy`/`tsc` — checks 3, 4 and 7 run manifest-declared `grading.*` argv, and a task that declares none records `not_configured` for that check. So a language answer is no longer a precondition for grading; it now only decides what each task's manifest declares. Deferred to post-handoff. |
 | **OPEN-3** | **Compute environment and parallelism** | Phase 4 | Suhaas + infra | Where 2,400 containerized agent runs execute, at what concurrency, against which Bedrock quotas. Sized from the Phase 0c smoke test. **Must be resolved before the full run**, not after handoff. |
 | **OPEN-5** | **Human grading capacity** | Phase 2 | Eng manager | ~20% of Tier B comparisons need blind human grading for κ calibration (§4.3). Who, how many, hours allocated. Without it κ is unmeasurable and every judge-derived number is labeled directional by default. |
 | **OPEN-6** | **Test-suite runtime → `every_k_turns`** | Phase 2 | implementer | Measure per-task F2P+P2P subset runtime; set checkpoint interval from it (§5.5). Hard feasibility input, not tuning. |
