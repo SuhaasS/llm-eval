@@ -20,6 +20,7 @@ import pytest
 
 from bakeoff.tasks import (
     TaskError,
+    TaskGrading,
     diff_chunks,
     load_task,
     load_task_set,
@@ -88,6 +89,10 @@ def _manifest(**overrides) -> str:
         "runner": '["python", "-m", "pytest", "-q"]',
         "f2p": '["tests/test_calc.py::test_new"]',
         "start_sha": "",
+        # A raw YAML block appended verbatim, so a test can write a `grading:`
+        # section -- including the malformed shapes a keyword-per-key helper
+        # could not express.
+        "extra_yaml": "",
     }
     data.update(overrides)
     lines = [
@@ -106,8 +111,10 @@ def _manifest(**overrides) -> str:
         f"  paths: {data['paths']}",
         f"  runner: {data['runner']}",
         f"  f2p: {data['f2p']}",
-        "",
     ]
+    if data["extra_yaml"]:
+        lines.append(data["extra_yaml"])
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -236,6 +243,69 @@ def test_an_unknown_task_id_is_refused_rather_than_silently_dropped(
     _write_task(root, upstream)
     with pytest.raises(TaskError, match="no such task"):
         load_task_set(root, only=["t-002"])
+
+
+def test_an_undeclared_grading_section_is_not_configured_not_an_error(
+    tmp_path, upstream
+):
+    """Most tasks declare no build, no typecheck and no linter, and that is
+    not a defect in the task. The empty tuple is what the grader records as
+    `not_configured`; a loader that raised would make the section mandatory
+    on 80 harvested tasks that have nothing to put in it."""
+    task_dir = _write_task(tmp_path / "set", upstream)
+
+    task = load_task(task_dir)
+
+    assert task.grading == TaskGrading()
+    assert (task.grading.build, task.grading.typecheck, task.grading.lint) == (
+        (), (), (),
+    )
+
+
+def test_a_declared_grading_section_parses_as_argv(tmp_path, upstream):
+    """argv everywhere, matching `tests.runner`. A shell string would be run
+    through a shell inside the image or split by the grader on whitespace --
+    and a path with a space then becomes two arguments, so the check fails for
+    a reason that has nothing to do with the submission."""
+    task_dir = _write_task(
+        tmp_path / "set",
+        upstream,
+        extra_yaml=(
+            "grading:\n"
+            '  build: ["python", "-m", "build"]\n'
+            '  typecheck: ["mypy", "src"]\n'
+            '  lint: ["ruff", "check", "."]\n'
+        ),
+    )
+
+    task = load_task(task_dir)
+
+    assert task.grading.build == ("python", "-m", "build")
+    assert task.grading.typecheck == ("mypy", "src")
+    assert task.grading.lint == ("ruff", "check", ".")
+
+
+@pytest.mark.parametrize(
+    ("block", "match"),
+    [
+        ('grading:\n  lint: "ruff check ."', r"grading\.lint"),
+        ("grading:\n  build: {make: all}", r"grading\.build"),
+        # The whole section as a scalar, which no key-level check reaches.
+        ("grading: ruff", "grading must be a mapping"),
+    ],
+)
+def test_a_grading_key_that_is_not_argv_is_refused_at_load(
+    tmp_path, upstream, block, match
+):
+    """A shell string is the shape an author reaches for, and it is the one
+    that survives quietly: `"ruff check ."` is iterable, so a loader that only
+    stored it hands the grader a three-element argv of `r`, `u`, `f` -- an
+    exec failure recorded as a lint verdict against the submission, in a
+    per-record grade nobody re-derives."""
+    task_dir = _write_task(tmp_path / "set", upstream, extra_yaml=block)
+
+    with pytest.raises(TaskError, match=match):
+        load_task(task_dir)
 
 
 # --- provenance --------------------------------------------------------------

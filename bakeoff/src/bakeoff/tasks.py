@@ -124,6 +124,35 @@ class TaskTests:
 
 
 @dataclass(frozen=True)
+class TaskGrading:
+    """What the offline grader runs beside the suite, argv-style and DECLARED.
+
+    Declared rather than detected, because "the repo's own mypy config if
+    present" asks the loader to divine tool presence and config precedence,
+    and that detection fails silently in BOTH directions: an absent tool
+    reads as a clean typecheck, and a config the repo does not actually use
+    reads as a dirty one. Either way the guess is stamped into a per-record
+    verdict that outlives the run and that nobody re-derives.
+
+    Every key is optional and most tasks declare none of them. An empty tuple
+    is recorded by the grader as `not_configured`, never as a pass -- "this
+    task has no linter" and "the linter found nothing" are different claims,
+    and collapsing them is the same defect one layer down.
+
+    argv, like `tests.runner`, so nothing is split on whitespace by the
+    grader or handed to a shell inside the image. Whether a declared command
+    exists is not asked here and cannot be: this loader runs on the host,
+    where the answer describes the operator's laptop. Preflight asks it in
+    the pinned image, so a typo is a NO-GO before the proxy starts rather
+    than a permanent verdict against every submission.
+    """
+
+    build: tuple[str, ...] = ()
+    typecheck: tuple[str, ...] = ()
+    lint: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class TaskImage:
     apt: tuple[str, ...] = ()
     pip: tuple[str, ...] = ()
@@ -179,6 +208,11 @@ class TaskManifest:
     #: -- it keys the preflight cache, so an edited task re-validates and an
     #: untouched one does not pay for the check on every resume.
     manifest_digest: str = ""
+    #: The offline grader's build/typecheck/lint commands, empty by default.
+    #: Defaulted so a manifest written before this section existed keeps
+    #: loading, and so the absent case is one value rather than a `None` every
+    #: caller has to re-decide.
+    grading: TaskGrading = field(default_factory=TaskGrading)
 
 
 # --- the reference diff ------------------------------------------------------
@@ -579,6 +613,15 @@ def load_task(task_dir: Path, set_commit: str = "") -> TaskManifest:
     budget_raw = data.get("budget") or {}
     if not isinstance(budget_raw, dict):
         raise TaskError(f"{where}: budget must be a mapping")
+    # Optional: absent is `not_configured`, not an error. The per-key argv
+    # check is `_strs` below and it is the whole validation here -- whether
+    # the declared commands RUN is preflight's question, asked inside the
+    # image rather than on the host. `manifest_digest` needs no change: it
+    # hashes the raw manifest bytes, so declaring or editing this section
+    # already invalidates the task's preflight cache entry.
+    grading_raw = data.get("grading") or {}
+    if not isinstance(grading_raw, dict):
+        raise TaskError(f"{where}: grading must be a mapping")
 
     if not reference_path.exists():
         raise TaskError(f"{reference_path}: no reference diff")
@@ -621,6 +664,13 @@ def load_task(task_dir: Path, set_commit: str = "") -> TaskManifest:
             apt=_strs(image_raw.get("apt"), f"{where}:image.apt"),
             pip=_strs(image_raw.get("pip"), f"{where}:image.pip"),
             build=_strs(image_raw.get("build"), f"{where}:image.build"),
+        ),
+        grading=TaskGrading(
+            build=_strs(grading_raw.get("build"), f"{where}:grading.build"),
+            typecheck=_strs(
+                grading_raw.get("typecheck"), f"{where}:grading.typecheck"
+            ),
+            lint=_strs(grading_raw.get("lint"), f"{where}:grading.lint"),
         ),
         budget=TaskBudget(
             max_turns=int(budget_raw.get("max_turns", TaskBudget.max_turns)),
