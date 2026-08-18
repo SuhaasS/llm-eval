@@ -133,15 +133,35 @@ Nothing until step 7 needs these. When you get there:
 cp .env.example .env
 ```
 
-Then read `.env.example` end to end. Two traps are called out in the file
-itself and both have already cost debugging sessions:
+Then read `.env.example` end to end. Three things to know, each of which has
+cost a debugging session:
 
-- The bearer token variable **must** be `BAKEOFF_MANTLE_TOKEN`, never
-  `AWS_BEARER_TOKEN_BEDROCK`. One proxy serves both transports and the variable
-  name is the only thing keeping them apart; the AWS-named variable makes the
-  proxy bearer-authenticate the SigV4 arms and fail them with
-  `bedrock:CallWithBearerToken`, which reads as a bedrock-runtime problem and is
-  not one.
+- **You probably do not need a mantle bearer token at all.** `proxy_environment`
+  mints one from the SigV4 session with `derive_mantle_token` when
+  `BAKEOFF_MANTLE_TOKEN` is unset, in memory, never written to disk. So filling
+  only the SigV4 half of `.env` is a complete live setup — measured 2026-08-18,
+  a 2,016-character token derived from an ordinary SSO-backed session and all
+  six arms answered.
+- **`smoke_bedrock.py` does not derive it unless you ask.** Its default reads
+  the env var only, so it reports `MISSING BAKEOFF_MANTLE_TOKEN` and `SKIP` for
+  four arms that `run_matrix.py` would serve without complaint — a gate more
+  pessimistic than the driver it gates, which reads as a credential problem and
+  is not one. Pass the flag:
+
+  ```bash
+  cd bakeoff && .venv/bin/python scripts/smoke_bedrock.py --live --derive-mantle-token
+  ```
+
+- **The name inside the container is load-bearing; the name in `.env` is not.**
+  The proxy must receive `BAKEOFF_MANTLE_TOKEN` and never
+  `AWS_BEARER_TOKEN_BEDROCK` — LiteLLM's `bedrock/` handler falls back to the
+  AWS-named variable when a deployment has no `api_key`, so setting that one
+  bearer-authenticates every SigV4 arm and fails it with
+  `bedrock:CallWithBearerToken`. But a token *pasted into `.env`* under the AWS
+  name is fine: `normalize_mantle_token` adopts it onto the harness name and the
+  post-construction scrub removes the AWS-named copy. Reporting those arms
+  MISSING while the value sat right there in the file is the failure that
+  function exists to prevent.
 - Pick a named profile **or** static keys, not both. botocore prefers the
   profile, so an `AWS_PROFILE` naming a profile that does not exist fails with
   `ProfileNotFound` even when the keys beside it are valid.
@@ -159,6 +179,28 @@ matrix invocation and Docker cannot change env on a running container, so
 re-logging in mid-run changes nothing until the driver is re-invoked. Plan your
 cells to fit inside the hour; the driver refuses a cell that will not and exits
 2 so a re-invocation resumes.
+
+**With static keys in `.env`, that refusal does not happen — and the hour still
+applies.** `credential_window` reads botocore's private `_expiry_time`, which
+only exists on the refreshable credentials a *profile* produces. Literal
+`AWS_ACCESS_KEY_ID`/`AWS_SESSION_TOKEN` values give a plain `Credentials`
+object with no expiry, so the window falls back to `mantle-ttl` — the mantle
+token's nominal **12 h** — and the driver believes it has all day. Measured
+2026-08-18: the driver printed `creds usable until <+12 h> (mantle-ttl) / no STS
+expiry available`, and the session died about 50 minutes later, at cell 15 of
+24.
+
+Nothing was lost, and it is worth knowing why: the **per-arm and global abort
+streaks** are the real backstop. Five consecutive uninterpretable cells tripped
+the global counter, the driver printed *"that is the shape of an expired session
+or a dead proxy"*, stopped, and exited 2. The five dead cells are recorded and
+excluded as `infra_failure/api_auth` — not silently averaged into anyone's
+score — and a re-invocation after refreshing resumes the remaining four.
+
+So with static keys: size the invocation to fit in an hour yourself, because
+`credential_stop` will not do it for you. Prefer the `AWS_PROFILE` path for
+long runs — a profile re-reads credentials per call, which is what makes the
+window measurable in the first place.
 
 ---
 
@@ -581,6 +623,8 @@ raise.
 | a fix is applied, the source is correct on disk, pytest is still red | stale `.pyc`. CPython invalidates on (mtime in whole seconds, size) and both halves are ordinary — an operator swap preserves byte count, and an agent edits and re-runs inside one second. The image sets `PYTHONDONTWRITEBYTECODE=1`; do not remove it |
 | a task passes preflight, then the dry run reports a huge `diff=` for an agent that edited nothing | a committed venv, build output or vendored tree tracked at `base_sha`. §5.6 stages everything, so it lands in every submission and diff size measures that tree. Preflight's tree-clean check only covers what the *suite* writes — screen with `git ls-tree -r --name-only <base_sha> \| wc -l` before cutting |
 | a candidate PR's f2p exits 2 at the start state with `error during collection` | the test half imports a symbol the fix introduces. Not repairable — pick a PR that changes an existing symbol instead (§3.1) |
+| `smoke_bedrock.py` reports `MISSING BAKEOFF_MANTLE_TOKEN` / `SKIP` on four arms | the gate reads the env var and does not mint a token; `run_matrix.py` derives one itself. Re-run with `--derive-mantle-token` before concluding anything about credentials (§1.6) |
+| the driver says creds are good for 12 h and they die in under one | static keys in `.env` expose no `_expiry_time`, so the window falls back to the mantle token's nominal TTL. The abort streaks are the real backstop; size the invocation yourself or use `AWS_PROFILE` (§1.6) |
 | turns, tokens and cost all zero in an otherwise fine record | a model name the price book does not know. `model_name` in `litellm_config.yaml` doubles as the `PRICE_BOOK` key |
 | a run reads *"No deployments available"* at status `None` | expired credentials. litellm does not classify an expired AWS token as an auth error; it surfaces as 500, cools the deployment down, and the cooldown then hides the cause |
 | every arm's submission fails to apply during grading | index staleness across the host/container boundary. Fixed in `grader._refresh_index`; if you see it again, that is a regression, not a model result |
