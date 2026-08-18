@@ -218,6 +218,21 @@ test that pins an arbitrary internal storage name scores a
 different-but-correct fix as a failure — which is not a measurement of the
 model. This project rejected `click` #3678 for exactly that.
 
+While that diff is open, check its **import block** too — it costs one glance
+and rejects a whole class of candidate:
+
+> **Every name the test half imports must already exist at `merge_commit^1`.**
+
+A PR that *adds* a function and tests for it puts that symbol in the solution
+half, so the test module raises `ImportError` during collection and pytest
+exits **2** — which preflight reads as a broken environment, not as a present
+bug. There is no way to rescue such a task; the exit-1 requirement is exactly
+the check that stops a broken environment counting as evidence the bug is
+there. Measured on `trucking-doc-extraction` #3.
+
+The heuristic that follows: **prefer a PR that changes the behaviour of an
+existing symbol over one that adds a symbol.**
+
 Also reject: tests that are flaky, tests that depend on wall-clock time or
 network, and PRs whose "fix" is a version bump or a pure refactor.
 
@@ -462,6 +477,16 @@ This exercises container start, the agent subprocess, checkpoint capture,
 trajectory parsing and the record write against a stand-in agent. Free. Do it
 before spending anything.
 
+**Read the `diff=` column, not just the exit code.** The stand-in agent edits
+nothing, so every task should report `diff=0b`. Anything else means the tree
+changed without an agent touching it, and preflight cannot catch that — its
+tree-clean assertion covers what the *suite* writes, and this happens during
+the container lifecycle instead. Measured on `trucking-doc-extraction` #2: a
+committed virtualenv at `base_sha` (2,902 of 3,010 tracked files) turned a
+no-op run into a **19 MB submission diff**, so diff size would have measured
+`site-packages` rather than the model. That task passed preflight; this step is
+what rejected it.
+
 ---
 
 ## 7. One live cell
@@ -554,6 +579,8 @@ raise.
 | every arm fails identically on one task | `image.build` is not an editable install; the agent's edits never load |
 | the agent cannot verify its own work | no test runner in the image, or the fixture is not importable. The eval measures a loop ending in "runs tests, sees failures, self-corrects"; without a runner it scores one unverified guess |
 | a fix is applied, the source is correct on disk, pytest is still red | stale `.pyc`. CPython invalidates on (mtime in whole seconds, size) and both halves are ordinary — an operator swap preserves byte count, and an agent edits and re-runs inside one second. The image sets `PYTHONDONTWRITEBYTECODE=1`; do not remove it |
+| a task passes preflight, then the dry run reports a huge `diff=` for an agent that edited nothing | a committed venv, build output or vendored tree tracked at `base_sha`. §5.6 stages everything, so it lands in every submission and diff size measures that tree. Preflight's tree-clean check only covers what the *suite* writes — screen with `git ls-tree -r --name-only <base_sha> \| wc -l` before cutting |
+| a candidate PR's f2p exits 2 at the start state with `error during collection` | the test half imports a symbol the fix introduces. Not repairable — pick a PR that changes an existing symbol instead (§3.1) |
 | turns, tokens and cost all zero in an otherwise fine record | a model name the price book does not know. `model_name` in `litellm_config.yaml` doubles as the `PRICE_BOOK` key |
 | a run reads *"No deployments available"* at status `None` | expired credentials. litellm does not classify an expired AWS token as an auth error; it surfaces as 500, cools the deployment down, and the cooldown then hides the cause |
 | every arm's submission fails to apply during grading | index staleness across the host/container boundary. Fixed in `grader._refresh_index`; if you see it again, that is a regression, not a model result |

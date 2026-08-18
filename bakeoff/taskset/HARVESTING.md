@@ -94,6 +94,22 @@ that passes Layer 1 and measures the wrong thing.
   `scope_collected_nothing` record rather than as silence, which is why the
   shape is a requirement here instead of a check in code — the set is authored
   here, and the predicate cannot be made exact from ids alone.
+- **The test half must IMPORT cleanly at the start state.** A PR that adds a
+  new function and tests for it puts that symbol in the solution half, so the
+  test module raises `ImportError` during collection and pytest exits **2** —
+  the code Layer 1 reads as a broken environment, not as a present bug. The
+  task is then unusable however good it looks: preflight requires exit 1, and
+  relaxing that to `!= 0` is the Phase 0c failure it exists to prevent.
+  Measured on `trucking-doc-extraction` #3, whose `test_redact_db_url.py`
+  imports a redaction helper the fix introduces — `1 error during collection`,
+  nothing else red.
+
+  The rule this hands you at screening time: **prefer a PR that CHANGES the
+  behaviour of an existing symbol over one that ADDS a symbol.** The first
+  fails at exit 1 with named assertions; the second cannot fail any other way
+  than at collection. Read the test half's import block before anything else —
+  if every name it imports already exists at `merge_commit^1`, the candidate
+  can still work; if any does not, it cannot.
 
 ### Grading
 
@@ -122,6 +138,57 @@ that passes Layer 1 and measures the wrong thing.
   (κ ≈ 0.32, below the 0.6 acceptability bar) into reference-anchored "does this
   accomplish what the reference accomplished?"
 - **The licence permits redistributing the diff and the prompt.**
+
+### The start state
+
+Preflight validates what the suite does to the tree. It does not validate what
+is *already in* the tree, and the difference is where this section lives.
+
+- **No committed build output, virtualenv, or vendored dependency tree at
+  `base_sha`.** §5.6 stages everything, so anything tracked is eligible to land
+  in a submission diff — and unlike suite droppings, this needs no test run to
+  get there. Measured on `trucking-doc-extraction` #2: **2,902 of 3,010 tracked
+  files at that `base_sha` were a committed `lib/python3.12/site-packages/`**,
+  and a stub agent that edited nothing produced a **19 MB submission diff**.
+  Diff size then measures the venv rather than the agent, and every
+  judge-scored or diff-similarity view over that task is answering a question
+  about `site-packages`.
+
+  **Preflight passes this**, which is the reason it is written down here rather
+  than added as a check. Its tree-clean assertion is about what the *suite*
+  writes, and the suite writes nothing; the venv only surfaces once a container
+  runs a full agent lifecycle and `git add -A` sweeps it. **The dry run
+  (`--mode offline`) is what catches it** — one more argument for never
+  skipping that step, since it costs nothing and this defect is invisible until
+  a record exists.
+
+  Screen it directly, before cutting anything:
+
+  ```bash
+  git ls-tree -r --name-only <base_sha> | wc -l
+  git ls-tree -r --name-only <base_sha> | grep -cE 'site-packages/|node_modules/|(^|/)vendor/'
+  ```
+
+- **A repository that later untracked such a tree carries a date floor**,
+  exactly like the agent-file cutoff above it. `trucking-doc-extraction`
+  untracked its venv in #4 (2026-07-02), so every candidate whose `base_sha`
+  predates that is out — which removed two of its five candidate PRs. Establish
+  both floors *once per repository* (agent files, vendored trees) and screen
+  candidates against the later of the two before reading a single diff.
+
+- **Removing an offending path from `base_sha` is legitimate, and it is a
+  modification that has to be recorded.** A one-commit strip with a fixed
+  author, email and date keeps the sha reproducible, and a reference cut
+  against the true `merge_commit^1` still applies as long as the strip touches
+  nothing the PR touches — check with `git apply --check`. Where the PR *does*
+  touch a stripped path, `allow_extra_paths` excludes it from both halves so
+  nothing tries to apply it. Record it under `provenance` (`base_modified`), or
+  a reader diffing `base_sha` against the upstream repository will not find it
+  there.
+
+  Judge the strip by size. Six agent-file paths is bookkeeping; 2,902 venv
+  files is a different repository from the one the PR was merged into, and the
+  cheaper answer is a later `base_sha`.
 
 ### The prompt
 
@@ -249,6 +316,43 @@ assert rendered strings rather than internal names.
 | python-attrs/attrs, python-attrs/cattrs | hypothesis property-based suites; the editable install also collides with a site-packages `attr` |
 | un33k/python-slugify | no harvestable PRs |
 
+### Internal repositories
+
+Not part of the public corpus and not interchangeable with it — an internal
+repository is a *stratum*, since five candidate PRs cannot carry a set that
+needs ~60 tasks. Recorded because both start-state rules above were measured
+here, and because the per-candidate yield is the number to plan against.
+
+`SuhaasS/trucking-doc-extraction` — 122 commits, 7 merged PRs, 1 closed issue.
+34-file pytest suite whose `conftest.py` fixtures are in-memory SQLite and
+`MagicMock`, so it is hermetic despite a dependency list naming Postgres and
+three Google Cloud services. No `pyproject.toml`/`setup.py`: flat modules under
+`src/` with `sys.path` manipulation in `conftest.py`, so `image.build` is empty
+and the agent's edits are still what the next import reads — preflight's
+green-after check is what proves that, per task.
+
+**Two date floors, both measured, and `base_sha` must clear the later one:**
+
+| floor | cause | effect |
+|---|---|---|
+| 2026-03-31 | `.claude/` added (6 files) | every candidate needs a one-commit strip; no test+fix commit predates it |
+| **2026-07-02** | `#4` untracked a committed venv | anything earlier carries 2,902 `site-packages` files |
+
+**Five candidate PRs, two tasks.** The rejections are each a different rule and
+are worth reading as a worked example of Layer 2:
+
+| PR | outcome |
+|---|---|
+| #6 | **cut** — `trucking-6-zero-amounts-absent`, 6 f2p |
+| #8 | **cut** — `trucking-8-sort-order-org-scope`, 2 f2p; prompt names two functions, a §6.4 caveat recorded in the manifest |
+| #2 | rejected — `base_sha` predates the venv untracking; stub agent produced a 19 MB diff |
+| #3 | rejected — test imports a symbol the fix introduces; exits 2, not 1 |
+| #5 | rejected — 14 f2p across 6 files and ~6 unrelated concerns; a model fixing 5 of 6 scores zero |
+
+A 40 % yield is the planning number, and it is *after* the repository already
+passed the mechanical screen. Neither task can ship in a published set: the
+repository carries no licence, so `provenance.license` is `null` on both.
+
 ---
 
 ## Cutting one
@@ -256,8 +360,12 @@ assert rendered strings rather than internal names.
 1. Find a merged PR that closes an issue and carries both a test and a fix.
    Read the tests first — Layer 2's behaviour-not-internals rule is what
    disqualifies most candidates, and it is cheapest to check before anything
-   else.
-2. `base_sha` is `git rev-parse <merge_commit>^1`.
+   else. Read the test half's **import block** in the same pass: every name it
+   imports has to exist at `merge_commit^1`, or collection fails and the task
+   exits 2 instead of 1.
+2. `base_sha` is `git rev-parse <merge_commit>^1`. Check what is tracked there
+   before going further — a committed venv or vendored tree makes every
+   submission diff a diff of that tree, and preflight will not tell you.
 3. Cut the reference with the flags pinned, and store it verbatim:
 
    ```bash
