@@ -744,14 +744,25 @@ def _now() -> str:
 def _print_ascii_safe(line: str) -> None:
     """`print`, surviving a stdout the environment pinned to ASCII.
 
-    ONE implementation for three lines that each carry text `str.encode`
-    can refuse: the per-unit progress line (collection-derived -- a task id,
-    model names, run ids), the neutral-judge warning and the refusal path in
-    `main` (both carry a `§`). On an ASCII stdout -- `LC_ALL=C`, or a pipe into
-    a tool that pinned it -- `print` raises `UnicodeEncodeError`, which is not
-    an `Exception` any per-unit handler catches: it goes past the breaker, past
-    `except KeyboardInterrupt` and out of `main`, taking a batch that had been
-    running for hours down on a traceback with no summary and no usage totals.
+    ONE implementation for the four lines that carry text `str.encode` can
+    refuse. Two are collection-derived -- the per-unit progress line (a task
+    id, model names, run ids) and `print_summary`'s WARNING loop (run ids in
+    the excluded and ungraded warnings, task ids and model names in the abort)
+    -- and two carry a `§`: the neutral-judge warning, which the WARNING loop
+    then re-emits, and the refusal path in `main`. On an ASCII stdout --
+    `LC_ALL=C`, or a pipe into a tool that pinned it -- `print` raises
+    `UnicodeEncodeError`, which is not an `Exception` any per-unit handler
+    catches: it goes past the breaker, past `except KeyboardInterrupt` and out
+    of `main`, taking a batch that had been running for hours down on a
+    traceback with no summary and no usage totals.
+
+    `_print_reading` is NOT among them and that is a known gap rather than a
+    judgement: it prints two `§` legends of its own through bare `print`s and
+    still propagates, which is T5's recorded OPEN. It fires after every line is
+    written and fsynced, so money and data are safe -- but it fires BEFORE the
+    WARNING loop, so on an ASCII stdout the guard below does not yet get the
+    non-neutral banner onto the terminal. Closing that needs its own pass over
+    ~40 print sites and is not a fix-round change.
 
     `backslashreplace` rather than a dropped line: an id an operator has to
     grep for is worth more mangled than absent, and the escape is reversible.
@@ -3307,8 +3318,15 @@ def print_summary(result: dict) -> None:
         # had something to say about a token count.
         _print_usage(result["judge_usage"])
 
+    # Guarded, because this loop prints text from two sources that can carry
+    # characters an ASCII stdout refuses. The neutral-judge banner carries a
+    # `§`, and a raise here would take the WARNING section down along with the
+    # error section below it -- leaving an operator a complete, caveated
+    # reading of a biased pass with the one line naming the bias removed. The
+    # rest of the loop is collection-derived: the excluded and ungraded
+    # warnings name run ids, the abort names task ids and model names.
     for warning in result["warnings"]:
-        print(f"\nWARNING: {warning}")
+        _print_ascii_safe(f"\nWARNING: {warning}")
     if result["errors"]:
         print(f"\n{len(result['errors'])} unit(s) produced NO line:")
         for line in result["errors"]:

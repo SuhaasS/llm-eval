@@ -415,6 +415,14 @@ def test_a_non_neutral_judge_is_refused_before_the_collection_is_even_read(
     with pytest.raises(SystemExit):
         main(["--help"])
     help_text = capsys.readouterr().out.lower()
+    # The sweep's own tripwire, for the reason the caveat's sweep has one: four
+    # `not in` assertions pass perfectly on an EMPTY string, so anything that
+    # stopped the help text reaching this capture -- argparse writing to
+    # stderr, a `SystemExit` raised before it formats anything -- would leave
+    # them asserting nothing while staying green. `--judge-model` is the flag
+    # this test is about, so its presence is what proves the sweep was read
+    # against a help text that arrived.
+    assert "--judge-model" in help_text
     for banned in ("--allow-non-neutral", "--non-neutral", "--any-judge",
                    "--no-judge-check"):
         assert banned not in help_text
@@ -448,6 +456,58 @@ def test_the_override_warning_reaches_the_result_and_the_terminal_both(
     assert len(_lines(root)) == 2
     assert {j.judge_model_id for j in _lines(root)} == {CLAUDE_JUDGE}
     assert result["errors"] == []
+
+
+def test_the_override_banner_survives_a_terminal_that_cannot_encode_it(
+    tmp_path, monkeypatch
+):
+    """`print_summary`'s WARNING loop re-emits the banner, `§` and all.
+
+    The loop sits BELOW the `try/finally` that protects the caveat and the
+    spend line, so an unguarded `print` there raises `UnicodeEncodeError` on a
+    stdout the environment pinned to ASCII (`LC_ALL=C`, or a pipe into a tool
+    that did) and the WARNING section -- and the error section under it --
+    never appear at all. The section that goes missing is the one saying the
+    numbers above it came from a judge inside the compared families: the
+    operator is left reading a complete, clean, caveated report of a biased
+    pass, with the one line that would have told them otherwise removed by the
+    crash that was supposed to be about encoding.
+
+    The loop carries collection-derived text besides the banner -- the excluded
+    and ungraded warnings name run ids, the abort names task ids and model
+    names -- so the guard covers more than the warning that exposed it.
+
+    `_print_reading` IS STUBBED, and that is a statement about this repository
+    rather than a convenience. It prints two `§` legends of its own
+    (`scripts/judge.py:3567`, `:3588`) through bare `print`s and raises before
+    the walk's own output is reached -- T5's recorded OPEN, deliberately not
+    closed in a fix round. Left in, it would mask this loop entirely and the
+    test would be pinning T5's defect under this one's name. See the fix
+    report: guarding this loop does not by itself make an ASCII-pinned
+    override pass print its WARNING section end to end.
+
+    Escaped rather than dropped, and asserted as such: `\\xa7` is greppable
+    back to the sentence, and a guard that swallowed the line would leave the
+    pass alive and the warning invisible -- this failure wearing a different
+    hat.
+    """
+    monkeypatch.setenv(ALLOW_NON_NEUTRAL_JUDGE_ENV, "1")
+    root = _two_arms(tmp_path)
+    monkeypatch.setattr("scripts.judge._print_reading", lambda result: None)
+    stream = io.TextIOWrapper(io.BytesIO(), encoding="ascii", errors="strict")
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    result = _run(root, rubric=False, judge_model_id=CLAUDE_JUDGE)
+    print_summary(result)
+    stream.flush()
+
+    text = stream.buffer.getvalue().decode("ascii")
+    assert len(_lines(root)) == 2, "the batch died on a printout"
+    assert "kappa unmeasured" in text
+    # The section that used to be missing, and the sentence inside it.
+    assert "WARNING: NON-NEUTRAL JUDGE ADMITTED" in text
+    assert CLAUDE_JUDGE in text
+    assert "\\xa74.3" in text
 
 
 # --------------------------------------------------------------------------

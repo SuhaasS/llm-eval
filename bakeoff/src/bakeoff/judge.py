@@ -235,9 +235,16 @@ NON_NEUTRAL_VENDOR_PREFIXES: tuple[str, ...] = (
 #: with none of the prefix signal.
 #:
 #: Two Google entries because Google ships two compared-family lines under one
-#: vendor. Substring rather than word-boundary matching, deliberately over-wide:
-#: a false positive costs one operator one confused minute and is answered by
-#: the message, while a false negative costs a whole pass and answers nothing.
+#: vendor. Substring rather than word-boundary matching, deliberately over-wide
+#: -- and the cost of a false positive is worse than a confused minute, so it
+#: is worth naming honestly. A genuinely neutral judge whose id happens to
+#: carry one of these tokens can be run ONLY through the env override, which
+#: stamps `NON-NEUTRAL JUDGE ADMITTED` into `warnings` and onto the terminal:
+#: a false record attached to honest numbers, and one a later reader cannot
+#: tell from a real self-preference probe. The direction is still right -- a
+#: false negative publishes a biased table nothing downstream can detect and
+#: tells nobody -- but "answered by the message" is not what the escape does,
+#: and pretending otherwise is how the width stops being reviewed.
 NON_NEUTRAL_FAMILY_TOKENS: tuple[str, ...] = (
     "claude",
     "gemma",
