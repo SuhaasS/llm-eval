@@ -1,11 +1,13 @@
 """The judging batch driver: which units get a line, and which never do.
 
-Nothing here opens a socket. `judge_event_log` composes two seams -- `complete`
-(the `CompleteFn`, one rendered prompt in, raw text out) and `rng` (the position
-draw) -- and every test injects both. The EVENT LOG and the GRADE FILE are real,
-built in `tmp_path` with real `RunRecord`s and real `append_grade` lines, because
-the thing being pinned is which runs get paired and in what order, and a fake log
-would let the driver read the wrong ones and still pass.
+Nothing here opens a socket. `judge_event_log` has ONE seam -- `complete`, the
+`CompleteFn`, one rendered prompt in and raw text out -- and every test injects
+it. There is no second seam for position: at temperature 0 the two positions are
+walked in a fixed order rather than drawn, so what used to need a seeded
+generator is now a constant the tests read. The EVENT LOG and the GRADE FILE are
+real, built in `tmp_path` with real `RunRecord`s and real `append_grade` lines,
+because the thing being pinned is which runs get paired and in what order, and a
+fake log would let the driver read the wrong ones and still pass.
 
 Four properties most of these tests are really about, in the order they are
 easiest to break silently:
@@ -53,6 +55,7 @@ from bakeoff.judge import (
     RUBRIC_DIMENSIONS,
     RUBRIC_FLAGS,
     RUBRIC_VERSION,
+    VOTE_POSITIONS,
     _CANONICAL_VERDICTS,
     prompt_sha,
 )
@@ -136,6 +139,16 @@ index 1111111..5555555 100644
  def add(a, b):
 -    return a - b
 +    return sum((a, b))
+"""
+
+DIFF_D = """diff --git a/src/calc.py b/src/calc.py
+index 1111111..7777777 100644
+--- a/src/calc.py
++++ b/src/calc.py
+@@ -1,2 +1,2 @@
+ def add(a, b):
+-    return a - b
++    return operator.add(a, b)
 """
 
 
@@ -285,12 +298,11 @@ class FakeComplete:
         return RUBRIC_REPLY
 
 
-def _run(root, tasks=None, *, complete=None, rng=None, **kw):
+def _run(root, tasks=None, *, complete=None, **kw):
     complete = FakeComplete() if complete is None else complete
-    rng = random.Random(1234) if rng is None else rng
     return judge_event_log(
         root, tasks if tasks is not None else [_task()],
-        complete=complete, rng=rng, **kw
+        complete=complete, **kw
     )
 
 
@@ -446,7 +458,7 @@ def test_a_gate_that_flips_mid_unit_is_an_error_and_no_rubric_line(
     )
 
     result = judge_event_log(
-        root, [_task()], complete=fake, rng=random.Random(7), rubric=True
+        root, [_task()], complete=fake, rubric=True
     )
 
     assert _lines(root) == []
@@ -477,7 +489,7 @@ def test_an_excluded_run_is_dropped_before_pairing(tmp_path):
         ],
     )
 
-    _run(root, rubric=True, votes=1)
+    _run(root, rubric=True)
 
     named = set()
     for line in _lines(root):
@@ -504,7 +516,7 @@ def test_a_run_without_a_grade_line_is_warned_and_never_judged(tmp_path):
         ],
     )
 
-    result = _run(root, rubric=True, votes=1)
+    result = _run(root, rubric=True)
 
     assert any("run-c" in w for w in result["warnings"])
     for line in _lines(root):
@@ -558,10 +570,12 @@ def test_a_cell_keeps_the_max_attempt_number_run_per_model(tmp_path):
         ],
     )
 
-    _run(root, rubric=False, votes=1)
+    _run(root, rubric=False)
 
-    (line,) = _lines(root)
-    assert (line.run_id_a, line.run_id_b) == ("run-a2", "run-b")
+    # One comparison, which is two vote lines over the same two runs.
+    assert {(j.run_id_a, j.run_id_b) for j in _lines(root)} == {
+        ("run-a2", "run-b")
+    }
 
 
 def test_samples_are_subsampled_and_pairs_never_are(tmp_path):
@@ -586,11 +600,11 @@ def test_samples_are_subsampled_and_pairs_never_are(tmp_path):
         ],
     )
 
-    _run(root, rubric=False, votes=1, sample_indices=[1])
+    _run(root, rubric=False, sample_indices=[1])
 
-    (line,) = _lines(root)
-    assert line.sample_index == 1
-    assert (line.run_id_a, line.run_id_b) == ("run-a1", "run-b1")
+    assert {
+        (j.sample_index, j.run_id_a, j.run_id_b) for j in _lines(root)
+    } == {(1, "run-a1", "run-b1")}
 
 
 def test_only_tasks_selects_the_named_tasks(tmp_path):
@@ -612,11 +626,10 @@ def test_only_tasks_selects_the_named_tasks(tmp_path):
         ],
     )
 
-    _run(root, [_task("calc-1"), _task("calc-2")], rubric=False, votes=1,
+    _run(root, [_task("calc-1"), _task("calc-2")], rubric=False,
          only_tasks=["calc-2"])
 
-    (line,) = _lines(root)
-    assert line.task_id == "calc-2"
+    assert {j.task_id for j in _lines(root)} == {"calc-2"}
 
 
 # --------------------------------------------------------------------------
@@ -624,38 +637,58 @@ def test_only_tasks_selects_the_named_tasks(tmp_path):
 # --------------------------------------------------------------------------
 
 
-def test_three_votes_are_three_independent_calls_with_three_prompts_recorded(
-    tmp_path,
-):
-    """A single call asked to produce three opinions is one vote wearing three
-    hats."""
+def test_a_comparison_is_exactly_two_votes_one_per_forced_position(tmp_path):
+    """Two calls, two prompts, two lines -- and no third.
+
+    At temperature 0 the judge is fully described by its answer under each of
+    the two orders, so a third call re-asks a question already answered: the
+    old majority-of-three over RANDOM positions was measured distributionally
+    identical to a single vote, at three times the price. Two forced positions
+    extract the whole of the signal, and they do it reproducibly -- the same
+    collection judged twice buys the same two prompts.
+
+    A single call asked to produce both opinions is still one vote wearing two
+    hats, so the two are separate calls with no shared context.
+    """
     root = _two_arms(tmp_path)
     fake = FakeComplete()
 
-    _run(root, complete=fake, rubric=False, votes=3)
+    _run(root, complete=fake, rubric=False)
 
-    assert fake.calls == 3
-    votes = sorted(j.vote_index for j in _lines(root))
-    assert votes == [0, 1, 2]
+    assert fake.calls == 2
     lines = _lines(root)
-    assert len({j.judgment_id for j in lines}) == 3
-    assert len({j.input_payload_path for j in lines}) == 3
+    assert sorted(j.vote_index for j in lines) == [0, 1]
+    assert len({j.judgment_id for j in lines}) == 2
+    assert len({j.input_payload_path for j in lines}) == 2
+    # The two prompts differ, because position changes the text. One prompt
+    # sent twice would be the shape of a driver that forced no position at all.
+    assert len(set(fake.prompts)) == 2
     by_index = {j.vote_index: j for j in lines}
     for index, prompt in enumerate(fake.prompts):
         assert by_index[index].judge_prompt_sha == prompt_sha(prompt)
 
 
-def test_position_assignment_stored_matches_the_payload_shown_order(tmp_path):
-    """Stored, not derived. A stored assignment that disagrees with what was
-    sent makes the position-swap probe report a bias figure it did not
-    measure."""
+def test_vote_index_zero_is_shown_a_first_and_vote_index_one_is_shown_b_first(
+    tmp_path,
+):
+    """The index and the position move together, and the position is STORED.
+
+    Derivable from the index today, and stored anyway: the moment a line is
+    read back to compute position consistency, a derived position is a claim
+    about what the driver does now rather than a record of what this call was
+    shown. A stored assignment that disagreed with the payload would make that
+    figure describe pairs of votes nobody sent in those orders.
+    """
     root = _two_arms(tmp_path)
     diffs = {"run-a": DIFF_A, "run-b": DIFF_B}
 
-    _run(root, rng=random.Random(20260818), rubric=False, votes=8)
+    _run(root, rubric=False)
 
     lines = _lines(root)
-    assert {j.position_assignment for j in lines} == {"a_first", "b_first"}
+    by_index = {j.vote_index: j for j in lines}
+    assert by_index[0].position_assignment == "a_first"
+    assert by_index[1].position_assignment == "b_first"
+
     for line in lines:
         payload = read_payload(line.input_payload_path)
         shown_first = payload["submission_first"]["diff"]
@@ -669,10 +702,15 @@ def test_position_assignment_stored_matches_the_payload_shown_order(tmp_path):
 
 def test_the_stored_verdict_is_canonical_not_presentation_order(tmp_path):
     """The model always answers "A" here, so a driver that skipped the
-    inversion would record every verdict as "a"."""
+    inversion would record every verdict as "a".
+
+    Under forced positions that bug is no longer half-invisible: both orders
+    occur on every comparison, so a missing inversion flips exactly one of the
+    two votes and every comparison in the file splits 1-1.
+    """
     root = _two_arms(tmp_path)
 
-    _run(root, rng=random.Random(20260818), rubric=False, votes=8,
+    _run(root, rubric=False,
          complete=FakeComplete(pairwise_verdict="A"))
 
     verdicts = {
@@ -689,18 +727,19 @@ def test_a_malformed_verdict_after_retries_is_an_error_not_a_line_and_exits_nonz
     root = _two_arms(tmp_path)
     fake = FakeComplete(replies=[])
 
-    result = _run(root, complete=fake, rubric=False, votes=1)
+    result = _run(root, complete=fake, rubric=False)
 
+    # One error per unit, and the comparison is two units now.
     assert _lines(root) == []
-    assert len(result["errors"]) == 1
-    assert "MalformedVerdict" in result["errors"][0]
+    assert len(result["errors"]) == 2
+    assert all("MalformedVerdict" in error for error in result["errors"])
 
     monkeypatch.setattr("scripts.judge.load_task_set", lambda *a, **k: [_task()])
     monkeypatch.setattr(
         "scripts.judge.live_completion",
         lambda *a, **k: FakeComplete(replies=[]),
     )
-    assert main(["--event-log", str(root), "--no-rubric", "--votes", "1"]) == 1
+    assert main(["--event-log", str(root), "--no-rubric"]) == 1
     assert "produced NO line" in capsys.readouterr().out
 
 
@@ -721,11 +760,13 @@ def test_every_vote_line_names_both_grade_generations_it_was_gated_on(tmp_path):
         ],
     )
 
-    _run(root, rubric=True, votes=1)
+    _run(root, rubric=True)
 
     lines = _lines(root)
-    (pairwise,) = [j for j in lines if j.kind == "pairwise"]
-    assert pairwise.grade_version_seen == {"run-a": "2", "run-b": "3"}
+    pairwise = [j for j in lines if j.kind == "pairwise"]
+    assert len(pairwise) == 2
+    for vote in pairwise:
+        assert vote.grade_version_seen == {"run-a": "2", "run-b": "3"}
     for line in lines:
         assert line.graded_against_task_set_commit == "taskset-def"
         assert line.judge_model_id == JUDGE_MODEL_ID_DEFAULT
@@ -810,11 +851,12 @@ def test_a_vote_payload_that_cannot_be_written_leaves_no_line_behind(tmp_path):
         ],
     )
 
-    result = _run(root, rubric=False, votes=1)
+    result = _run(root, rubric=False)
 
     assert _lines(root) == []
-    assert len(result["errors"]) == 1
-    assert "PayloadSecretsFound" in result["errors"][0]
+    # Both forced positions carry the same secret, so both units fail.
+    assert len(result["errors"]) == 2
+    assert all("PayloadSecretsFound" in error for error in result["errors"])
 
 
 def test_payload_sits_beside_the_jsonl_and_its_sha_matches_the_record(tmp_path):
@@ -823,7 +865,7 @@ def test_payload_sits_beside_the_jsonl_and_its_sha_matches_the_record(tmp_path):
     indistinguishable from a tampered one."""
     root = _two_arms(tmp_path)
 
-    _run(root, rubric=True, votes=1)
+    _run(root, rubric=True)
 
     lines = _lines(root)
     assert lines
@@ -844,11 +886,11 @@ def test_resume_skips_comparisons_already_judged_under_the_same_versions(
     tmp_path,
 ):
     root = _two_arms(tmp_path)
-    first = _run(root, rubric=True, votes=3)
+    first = _run(root, rubric=True)
     written = len(_lines(root))
     fake = FakeComplete()
 
-    second = _run(root, complete=fake, rubric=True, votes=3)
+    second = _run(root, complete=fake, rubric=True)
 
     assert fake.calls == 0
     assert second["judged"] == [] and second["gate_decided"] == []
@@ -873,17 +915,75 @@ def test_a_changed_judge_model_id_re_judges_everything(tmp_path):
     """The verdict is only reproducible against the model that gave it, so a
     different pin is a different generation of verdict rather than a resume."""
     root = _two_arms(tmp_path)
-    _run(root, rubric=False, votes=1)
+    _run(root, rubric=False)
 
-    second = _run(root, rubric=False, votes=1,
+    second = _run(root, rubric=False,
                   judge_model_id="openai.gpt-5.6-luna")
 
     lines = _lines(root)
-    assert len(lines) == 2
+    assert len(lines) == 4
     assert {j.judge_model_id for j in lines} == {
         JUDGE_MODEL_ID_DEFAULT, "openai.gpt-5.6-luna"
     }
     assert second["skipped"] == []
+
+
+def test_a_v1_line_with_the_same_vote_index_does_not_satisfy_the_v2_resume_key(
+    tmp_path,
+):
+    """Why `JUDGE_PROMPT_VERSION` HAD to move from 1 to 2.
+
+    The old protocol wrote `vote_index` 0, 1 and 2 under positions drawn at
+    random; the new one writes 0 and 1 under forced positions. The resume key
+    holds the index and the generation and NOT the position, so under an
+    unbumped version a v1 line at index 0 -- a random-position vote that may
+    well have been `b_first` -- would answer the v2 unit for index 0 and the
+    driver would skip it.
+
+    The batch would then report a clean resume over a comparison holding one
+    random-position vote where the protocol says two forced ones, and every
+    position-consistency figure taken off that file would be computed over
+    pairs that were never both bought. The bump is what makes the two
+    protocols two generations, which is the one thing every aggregation in
+    this file already knows how to keep apart.
+    """
+    root = _two_arms(tmp_path)
+    append_judgment(judgments_path(root), JudgeRecord(
+        judgment_id=uuid.uuid4().hex,
+        judged_at="2026-08-18T00:00:00Z",
+        judge_model_id=JUDGE_MODEL_ID_DEFAULT,
+        # The old generation, and the only field that differs from a unit this
+        # batch is about to buy.
+        judge_prompt_version=1,
+        judge_prompt_sha="0" * 64,
+        judge_sampling=dict(JUDGE_SAMPLING),
+        rubric_version=RUBRIC_VERSION,
+        kind="pairwise",
+        task_id="calc-1",
+        run_id_a="run-a",
+        run_id_b="run-b",
+        sample_index=0,
+        position_assignment="b_first",
+        verdict="a",
+        vote_index=0,
+        full_reasoning_text="judged under the three-vote protocol",
+        input_payload_path=str(root / "judgments" / "payloads" / "old.json.gz"),
+        input_payload_sha="1" * 64,
+        grade_version_seen={"run-a": GRADER, "run-b": GRADER},
+        graded_against_task_set_commit="taskset-def",
+    ))
+
+    result = _run(root, rubric=False)
+
+    assert result["skipped"] == []
+    fresh = [j for j in _lines(root) if j.judge_prompt_version == 2]
+    assert sorted(j.vote_index for j in fresh) == [0, 1]
+    assert [j.position_assignment for j in sorted(
+        fresh, key=lambda j: j.vote_index
+    )] == ["a_first", "b_first"]
+    # The old line is still on disk -- judgments are append-only, and the two
+    # protocols are two readings of this collection rather than one.
+    assert len(_lines(root)) == 3
 
 
 def test_re_judge_appends_new_lines_rather_than_replacing(tmp_path):
@@ -891,10 +991,10 @@ def test_re_judge_appends_new_lines_rather_than_replacing(tmp_path):
     finding; an update API would delete the only evidence that the judge is not
     deterministic."""
     root = _two_arms(tmp_path)
-    _run(root, rubric=True, votes=1)
+    _run(root, rubric=True)
     first = _lines(root)
 
-    _run(root, rubric=True, votes=1, re_judge=True)
+    _run(root, rubric=True, re_judge=True)
 
     second = _lines(root)
     assert len(second) == 2 * len(first)
@@ -912,10 +1012,10 @@ def test_malformed_judgments_refuse_resume_without_re_judge(tmp_path):
     path.write_text("{not json\n")
 
     with pytest.raises(ResumeRefused) as exc:
-        _run(root, rubric=False, votes=1)
+        _run(root, rubric=False)
     assert str(path) in str(exc.value)
 
-    result = _run(root, rubric=False, votes=1, re_judge=True)
+    result = _run(root, rubric=False, re_judge=True)
     assert result["errors"] == []
     assert any("unreadable" in w for w in result["warnings"])
 
@@ -929,7 +1029,7 @@ def test_malformed_grades_refuse_judging_outright_even_with_re_judge(tmp_path):
 
     for re_judge in (False, True):
         with pytest.raises(ResumeRefused) as exc:
-            _run(root, rubric=False, votes=1, re_judge=re_judge)
+            _run(root, rubric=False, re_judge=re_judge)
         assert "grades" in str(exc.value)
 
 
@@ -952,9 +1052,9 @@ def test_the_audit_covers_the_campaign_not_the_invocation(tmp_path):
     """A resume's last slice judges two units and would otherwise report a
     campaign as two units wide."""
     root = _two_arms(tmp_path)
-    _run(root, rubric=False, votes=2)
+    _run(root, rubric=False)
 
-    second = _run(root, rubric=True, votes=2)
+    second = _run(root, rubric=True)
 
     assert second["audited"] == 4
     assert second["from_prior_invocations"] == 2
@@ -977,7 +1077,7 @@ def test_the_event_log_and_grades_file_bytes_are_unchanged_after_a_batch(
         "grades.jsonl": grades_path(root).read_bytes(),
     }
 
-    _run(root, rubric=True, votes=3)
+    _run(root, rubric=True)
 
     after = {
         **_bytes_under(root / "runs"),
@@ -1002,7 +1102,7 @@ def test_a_fully_gate_decided_batch_never_builds_the_live_judge(
     monkeypatch.setattr("scripts.judge.live_completion", explode)
 
     result = judge_event_log(
-        root, [_task()], rng=random.Random(3), rubric=False
+        root, [_task()], rubric=False
     )
 
     assert len(result["gate_decided"]) == 1
@@ -1023,7 +1123,7 @@ def test_the_live_judge_is_built_once_on_the_first_call_that_needs_it(
 
     monkeypatch.setattr("scripts.judge.live_completion", factory)
 
-    judge_event_log(root, [_task()], rng=random.Random(3), rubric=True, votes=3)
+    judge_event_log(root, [_task()], rubric=True)
 
     assert len(built) == 1
 
@@ -1051,14 +1151,20 @@ def test_the_batch_walks_cells_and_pairs_in_sorted_order(tmp_path):
         ],
     )
 
-    result = _run(root, rubric=False, votes=1)
+    result = _run(root, rubric=False)
 
+    # Two vote lines per pair, and the two positions stay adjacent: the walk is
+    # cell, then pair, then position, so a resume that stops mid-comparison
+    # leaves the missing position as the next unit rather than a hole a cell
+    # away.
     assert [
-        (j.task_id, j.sample_index, j.run_id_a, j.run_id_b)
+        (j.task_id, j.sample_index, j.run_id_a, j.run_id_b, j.vote_index)
         for j in result["judged"]
     ] == [
-        ("calc-1", 0, "run-a", "run-b"),
-        ("calc-1", 1, "run-c", "run-d"),
+        ("calc-1", 0, "run-a", "run-b", 0),
+        ("calc-1", 0, "run-a", "run-b", 1),
+        ("calc-1", 1, "run-c", "run-d", 0),
+        ("calc-1", 1, "run-c", "run-d", 1),
     ]
 
 
@@ -1093,9 +1199,7 @@ def test_main_exits_one_when_the_resume_is_refused(
     assert "REFUSED" in capsys.readouterr().out
 
 
-def test_main_passes_the_judge_model_and_vote_count_through(
-    tmp_path, monkeypatch
-):
+def test_main_passes_the_judge_model_through(tmp_path, monkeypatch):
     root = _two_arms(tmp_path)
     monkeypatch.setattr("scripts.judge.load_task_set", lambda *a, **k: [_task()])
     monkeypatch.setattr(
@@ -1104,12 +1208,32 @@ def test_main_passes_the_judge_model_and_vote_count_through(
 
     assert main([
         "--event-log", str(root), "--no-rubric",
-        "--judge-model", "openai.gpt-5.6-terra", "--votes", "2",
+        "--judge-model", "openai.gpt-5.6-terra",
     ]) == 0
 
     lines = _lines(root)
     assert len(lines) == 2
     assert {j.judge_model_id for j in lines} == {"openai.gpt-5.6-terra"}
+
+
+def test_there_is_no_vote_count_flag_to_set(tmp_path, monkeypatch, capsys):
+    """The vote count is not a knob any more, so the flag that offered it is
+    gone rather than clamped.
+
+    Under forced positions there is exactly one legal value -- one vote per
+    position -- and a `--votes 3` that silently meant 2, or worse honoured the
+    3, would write a third line whose position no protocol assigns. A flag
+    argparse refuses is the only version of this that cannot be misread.
+    """
+    monkeypatch.setattr("scripts.judge.load_task_set", lambda *a, **k: [_task()])
+
+    with pytest.raises(SystemExit):
+        main(["--event-log", str(_two_arms(tmp_path)), "--votes", "3"])
+    assert "--votes" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit):
+        main(["--help"])
+    assert "--votes" not in capsys.readouterr().out
 
 
 # --------------------------------------------------------------------------
@@ -1118,7 +1242,8 @@ def test_main_passes_the_judge_model_and_vote_count_through(
 #
 # The failure mode these are placed against: the mantle token's real window is
 # about an hour (Identity Center caps the session well below the token's own
-# TTL) and a 60-task pass is ~10,800 calls over many more hours than that. When
+# TTL) and a 60-task pass is ~9,600 calls -- 7,200 pairwise at two forced
+# positions per comparison, plus 2,400 rubric -- over many more hours. When
 # the credential dies mid-batch and `live_completion`'s own refresh cannot
 # recover it, the per-unit `except` records an error and continues -- so the
 # driver grinds through every remaining unit on a dead credential and prints
@@ -1154,8 +1279,9 @@ class _DiesAfter(FakeComplete):
 
 
 def _three_arms(tmp_path, resolved_three=True) -> Path:
-    """One cell, three models: 3 rubric units and 3 pairs, so a batch here has
-    more units than the breaker's limit and can prove where it stopped."""
+    """One cell, three models: 3 rubric units and 3 pairs at two votes each,
+    so a batch here has nine units -- more than the breaker's limit, which is
+    what lets these tests prove where it stopped."""
     return _collection(
         tmp_path,
         [
@@ -1171,16 +1297,47 @@ def _three_arms(tmp_path, resolved_three=True) -> Path:
     )
 
 
+def _four_arms(tmp_path, resolved_four=True) -> Path:
+    """One cell, four models -- the round-robin the spec actually runs.
+
+    Sixteen units when every arm passes (4 rubric, 6 pairs at two votes each),
+    which is what the reset test needs: a run of failures, a success, and then
+    a FULL fresh run of `MAX_CONSECUTIVE_ERRORS` after it, none of which fits
+    inside a three-arm cell now that a comparison costs two calls instead of
+    three.
+
+    With the fourth arm gate-failed it is 3 rubric units, then three
+    gate-decided pairs making no call at all, then three judgeable pairs --
+    which puts the gate-decided pairs in the middle of a run of failures,
+    where a breaker that counted them as successes would reset.
+    """
+    return _collection(
+        tmp_path,
+        [
+            _record("run-a", model="model-one", final_diff=DIFF_A),
+            _record("run-b", model="model-two", final_diff=DIFF_B),
+            _record("run-c", model="model-three", final_diff=DIFF_C),
+            _record("run-d", model="model-four", final_diff=DIFF_D),
+        ],
+        [
+            _grade("run-a", model="model-one", resolved=True),
+            _grade("run-b", model="model-two", resolved=True),
+            _grade("run-c", model="model-three", resolved=True),
+            _grade("run-d", model="model-four", resolved=resolved_four),
+        ],
+    )
+
+
 def test_a_run_of_consecutive_unit_failures_aborts_the_batch(tmp_path):
-    """The breaker, at exactly the limit. Twelve units are available and five
+    """The breaker, at exactly the limit. Nine units are available and five
     are attempted: a dead credential fails every unit it touches, so the sixth
-    error carries no information the first five did not, and the other seven
+    error carries no information the first five did not, and the other four
     would each cost a call, a line of noise, and a place in a list the operator
     has to read past to find the one message that matters."""
     root = _three_arms(tmp_path)
     fake = _DiesAfter()
 
-    result = _run(root, complete=fake, rubric=True, votes=3)
+    result = _run(root, complete=fake, rubric=True)
 
     assert fake.calls == MAX_CONSECUTIVE_ERRORS
     assert len(result["errors"]) == MAX_CONSECUTIVE_ERRORS
@@ -1200,12 +1357,16 @@ def test_one_successful_unit_resets_the_consecutive_failure_count(tmp_path):
     healthy batch that had simply been running for long enough. The credential
     failure this breaker is for looks nothing like that: it fails every unit
     from the moment it starts.
+
+    Four arms, because the run after the reset has to be a FULL
+    `MAX_CONSECUTIVE_ERRORS` and 4 + 1 + 5 units do not fit in a three-arm
+    cell at two votes per comparison.
     """
-    root = _three_arms(tmp_path)
+    root = _four_arms(tmp_path)
     # Four failures, one success, then the run that trips it.
     fake = _DiesAfter(succeed_at={5})
 
-    result = _run(root, complete=fake, rubric=True, votes=3)
+    result = _run(root, complete=fake, rubric=True)
 
     assert fake.calls == 5 + MAX_CONSECUTIVE_ERRORS
     assert len(result["errors"]) == 4 + MAX_CONSECUTIVE_ERRORS
@@ -1219,19 +1380,21 @@ def test_a_gate_decided_pair_neither_trips_the_breaker_nor_resets_it(tmp_path):
     the strength of nothing having been asked -- and in a collection with many
     failed-gate arms, that is a breaker that never trips.
 
-    The cell here interleaves one deliberately: two rubric units, then the
-    gate-decided pair, then the three votes that carry the count to the limit.
+    The cell here interleaves them deliberately: three rubric units, then the
+    three gate-decided pairs the failed arm produces, then the votes that carry
+    the count to the limit. If a gate-decided pair reset the counter, the run
+    would restart at the fourth unit and the batch would never abort.
     """
-    root = _three_arms(tmp_path, resolved_three=False)
+    root = _four_arms(tmp_path, resolved_four=False)
     fake = _DiesAfter()
 
-    result = _run(root, complete=fake, rubric=True, votes=3)
+    result = _run(root, complete=fake, rubric=True)
 
     assert fake.calls == MAX_CONSECUTIVE_ERRORS
     assert any("consecutive" in w for w in result["warnings"])
-    # The gate-decided line was still written, and is not an error.
-    assert len(result["gate_decided"]) == 1
-    assert [j.verdict for j in _lines(root)] == ["gate_decided"]
+    # The gate-decided lines were still written, and are not errors.
+    assert len(result["gate_decided"]) == 3
+    assert [j.verdict for j in _lines(root)] == ["gate_decided"] * 3
 
 
 def test_the_abort_is_reported_on_the_terminal_and_exits_one(
@@ -1266,10 +1429,10 @@ def test_a_batch_whose_failures_stay_below_the_limit_runs_to_the_end(tmp_path):
     # Every other unit fails: the count never reaches two in a row.
     fake = _DiesAfter(succeed_at=set(range(2, 25, 2)))
 
-    result = _run(root, complete=fake, rubric=True, votes=3)
+    result = _run(root, complete=fake, rubric=True)
 
-    assert fake.calls == 12, "the batch stopped short of its twelve units"
-    assert len(result["errors"]) == 6
+    assert fake.calls == 9, "the batch stopped short of its nine units"
+    assert len(result["errors"]) == 5
     assert not any("consecutive" in w for w in result["warnings"])
 
 
@@ -1280,9 +1443,11 @@ def test_a_batch_whose_failures_stay_below_the_limit_runs_to_the_end(tmp_path):
 # These drive `summarize`/`elo_from_outcomes` over hand-built `JudgeRecord`s
 # rather than through a batch. The aggregation rules being pinned are about
 # lines that a REAL batch cannot produce in one invocation -- a stale
-# gate-decided line sitting beside three votes for the same pair is what a
-# re-grade leaves behind two passes apart -- and reaching them through the
-# driver would mean staging two collections to assert one arithmetic rule.
+# gate-decided line sitting beside the votes for the same pair is what a
+# re-grade leaves behind two passes apart, and a three-vote v1 line beside a
+# two-vote v2 one is what the protocol change leaves behind -- and reaching
+# them through the driver would mean staging two collections to assert one
+# arithmetic rule.
 
 
 MODEL_OF = {
@@ -1310,10 +1475,21 @@ def _judgment(**kw) -> JudgeRecord:
 
 
 def _vote(run_id_a, run_id_b, verdict, *, vote_index=0, sample_index=0, **kw):
+    """One pairwise vote line.
+
+    `position_assignment` FOLLOWS `vote_index` through `VOTE_POSITIONS` unless
+    a test overrides it. A v2 line whose index and position disagree is a
+    record the driver cannot write, and a fixture modelling an impossible
+    record teaches the next reader the wrong shape. The v1 lines below --
+    three votes at random positions -- are the case that overrides it, and
+    they say so where they do.
+    """
+    kw.setdefault(
+        "position_assignment", VOTE_POSITIONS[vote_index % len(VOTE_POSITIONS)]
+    )
     return _judgment(
         kind="pairwise", run_id_a=run_id_a, run_id_b=run_id_b,
         sample_index=sample_index, verdict=verdict, vote_index=vote_index,
-        position_assignment="a_first",
         input_payload_path="/payloads/x.json.gz", input_payload_sha="s" * 64,
         **kw,
     )
@@ -1373,22 +1549,20 @@ def _empty_result() -> dict:
 
 
 def test_majority_over_vote_lines_with_gate_decided_wins_and_half_point_ties():
-    """The whole outcome rule in one collection: three votes collapse to one
-    comparison through `majority`, a gate-decided pair is a win for the side the
-    ladder already picked, and a tie is half a point to each.
+    """The whole outcome rule in one collection: the votes for a pair collapse
+    to one comparison through `majority`, a gate-decided pair is a win for the
+    side the ladder already picked, and a tie is half a point to each.
 
     Deliberately ASYMMETRIC -- 2.5 points against 1.5 -- because a matrix that
     reported x's rate under y's name is invisible against a balanced fixture.
     """
     judgments = [
-        # settled by votes, a wins 2-1
+        # settled by votes, both positions agree
         _vote("run-a", "run-b", "a", vote_index=0, sample_index=0),
-        _vote("run-a", "run-b", "b", vote_index=1, sample_index=0),
-        _vote("run-a", "run-b", "a", vote_index=2, sample_index=0),
-        # settled by votes, no strict majority -> tie
+        _vote("run-a", "run-b", "a", vote_index=1, sample_index=0),
+        # settled by votes, the two positions disagree -> tie
         _vote("run-a1", "run-b1", "a", vote_index=0, sample_index=1),
         _vote("run-a1", "run-b1", "b", vote_index=1, sample_index=1),
-        _vote("run-a1", "run-b1", "tie", vote_index=2, sample_index=1),
         # settled by the ladder, one each way
         _gate("run-a2", "run-b2", "a", sample_index=2),
         _gate("run-a3", "run-b3", "b", sample_index=3),
@@ -1407,7 +1581,12 @@ def test_majority_over_vote_lines_with_gate_decided_wins_and_half_point_ties():
 
 def test_a_comparison_short_of_a_strict_majority_is_a_tie_not_a_plurality_win():
     """`majority` is strict, and the summary must not launder a split decision
-    into a win by counting votes itself."""
+    into a win by counting votes itself.
+
+    Under forced positions a 1-1 split is the judge preferring whichever
+    submission it was shown first, which is a POSITION effect and not a
+    preference between the two submissions. Breaking that tie by taking the
+    `a_first` vote would publish the position effect as a win."""
     judgments = [
         _vote("run-a", "run-b", "a", vote_index=0),
         _vote("run-a", "run-b", "b", vote_index=1),
@@ -1423,7 +1602,7 @@ def test_a_comparison_short_of_a_strict_majority_is_a_tie_not_a_plurality_win():
 def test_vote_lines_supersede_a_stale_gate_decided_line_for_the_same_pair():
     """A re-grade that flips the losing side turns a gate-decided pair into a
     judgeable one, and the judgment file is APPEND-ONLY -- so the old
-    gate-decided line stays on disk beside the three votes that came later.
+    gate-decided line stays on disk beside the votes that came later.
 
     Counting both would enter one comparison twice, once for each side. The
     votes win, and the disagreement is TALLIED rather than hidden: it is a
@@ -1433,7 +1612,6 @@ def test_vote_lines_supersede_a_stale_gate_decided_line_for_the_same_pair():
         _gate("run-a", "run-b", "b"),
         _vote("run-a", "run-b", "a", vote_index=0),
         _vote("run-a", "run-b", "a", vote_index=1),
-        _vote("run-a", "run-b", "b", vote_index=2),
     ]
 
     summary = summarize(judgments, MODEL_OF)
@@ -1467,15 +1645,16 @@ def test_gate_decided_is_counted_apart_from_the_vote_verdict_distribution():
     judgments = [
         _vote("run-a", "run-b", "a", vote_index=0),
         _vote("run-a", "run-b", "a", vote_index=1),
-        _vote("run-a", "run-b", "tie", vote_index=2),
+        _vote("run-a1", "run-b1", "tie", vote_index=0, sample_index=1),
+        _vote("run-a1", "run-b1", "tie", vote_index=1, sample_index=1),
         _gate("run-a2", "run-b2", "a", sample_index=2),
     ]
 
     summary = summarize(judgments, MODEL_OF)
 
-    assert summary["vote_verdicts"] == {"a": 2, "tie": 1}
+    assert summary["vote_verdicts"] == {"a": 2, "tie": 2}
     assert "gate_decided" not in summary["vote_verdicts"]
-    assert summary["lines"]["pairwise_votes"] == 3
+    assert summary["lines"]["pairwise_votes"] == 4
     assert summary["lines"]["gate_decided"] == 1
 
 
@@ -1564,6 +1743,49 @@ def test_a_bumped_prompt_or_rubric_version_also_opens_its_own_matrix_block():
     assert set(summary["elo"]) == set(summary["comparisons"])
     for block in summary["comparisons"].values():
         assert block[("model-one", "model-two")]["comparisons"] == 1
+
+
+def test_old_three_vote_lines_aggregate_and_never_pool_with_two_vote_ones():
+    """A judgment file outlives a protocol change, and this one holds both.
+
+    v1 lines are three votes drawn at RANDOM positions; v2 lines are two votes
+    at forced ones. `majority` reads either -- it counts canonical verdicts and
+    has no opinion about how many there are -- so the old comparison still
+    resolves, and `_comparison_key` carries the prompt version, so the two
+    protocols land in two blocks.
+
+    Pooled, they would be one pair entered twice: the comparison count doubles
+    and the printed rate is the mean of two protocols nobody ran together. The
+    verdicts here are OPPOSITE for that reason -- two generations that agreed
+    would pool into a number that happens to be right.
+    """
+    judgments = [
+        # v1: three votes, random positions, a takes it 2-1.
+        _vote("run-a", "run-b", "a", vote_index=0, judge_prompt_version=1,
+              position_assignment="b_first"),
+        _vote("run-a", "run-b", "b", vote_index=1, judge_prompt_version=1,
+              position_assignment="b_first"),
+        _vote("run-a", "run-b", "a", vote_index=2, judge_prompt_version=1,
+              position_assignment="a_first"),
+        # v2: two votes, one per forced position, and b takes it.
+        _vote("run-a", "run-b", "b", vote_index=0),
+        _vote("run-a", "run-b", "b", vote_index=1),
+    ]
+
+    summary = summarize(judgments, MODEL_OF)
+
+    old, new = _judge_gen(prompt_version=1), _judge_gen()
+    assert set(summary["comparisons"]) == {old, new}
+    pair = ("model-one", "model-two")
+    assert summary["comparisons"][old][pair]["comparisons"] == 1
+    assert summary["comparisons"][new][pair]["comparisons"] == 1
+    # The old protocol's majority-of-three still resolves, in its own block.
+    assert summary["comparisons"][old][pair]["wins_x"] == 1
+    assert summary["comparisons"][new][pair]["wins_y"] == 1
+    # Every line is still counted in the census, whichever protocol wrote it.
+    assert summary["lines"]["pairwise_votes"] == 5
+    assert summary["vote_verdicts"] == {"a": 2, "b": 3}
+    assert set(summary["elo"]) == {old, new}
 
 
 def test_the_comparison_key_carries_the_generation_the_matrix_partitions_on():
@@ -2094,7 +2316,7 @@ def test_a_judgment_naming_a_run_this_log_never_held_does_not_stop_the_batch(
         _vote("run-ghost-a", "run-ghost-b", "a", vote_index=0, sample_index=9),
     )
 
-    result = _run(root, rubric=False, votes=1)
+    result = _run(root, rubric=False)
 
     assert result["errors"] == []
     assert result["summary"]["dropped"]["unknown_model_comparison"] == 1
@@ -2139,7 +2361,8 @@ def test_the_kappa_caveat_line_is_always_printed(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(
         "scripts.judge.live_completion", lambda *a, **k: FakeComplete()
     )
-    for flags in ([], ["--no-rubric"], ["--re-judge"], ["--votes", "1"],
+    for flags in ([], ["--no-rubric"], ["--re-judge"],
+                  ["--judge-model", "openai.gpt-5.6-terra"],
                   ["--no-rubric", "--re-judge", "--samples", "0"]):
         main(["--event-log", str(tmp_path / "fresh"), *flags])
         assert KAPPA_CAVEAT in capsys.readouterr().out
@@ -2230,7 +2453,7 @@ def test_the_summary_prints_the_matrix_the_profile_and_the_elo_table(
         ],
     )
 
-    print_summary(_run(root, rubric=True, votes=1))
+    print_summary(_run(root, rubric=True))
 
     out = capsys.readouterr().out
     assert "model-one vs model-two" in out
@@ -2342,18 +2565,19 @@ def test_summary_covers_the_campaign_not_the_invocation(tmp_path, capsys):
     than it finishes, so the last invocation routinely writes two lines. A
     summary computed from those two describes a campaign of two."""
     root = _two_arms(tmp_path)
-    _run(root, rubric=False, votes=1)
+    _run(root, rubric=False)
 
-    second = _run(root, rubric=True, votes=1)
+    second = _run(root, rubric=True)
 
-    # One vote line from the first invocation, two rubric lines from this one.
-    assert second["audited"] == 3
-    assert second["from_prior_invocations"] == 1
+    # Two vote lines from the first invocation, two rubric lines from this one.
+    assert second["audited"] == 4
+    assert second["from_prior_invocations"] == 2
     summary = second["summary"]
     assert summary["lines"] == {
-        "rubric": 2, "pairwise_votes": 1, "gate_decided": 0,
+        "rubric": 2, "pairwise_votes": 2, "gate_decided": 0,
     }
-    # The comparison the FIRST invocation judged is still in the matrix.
+    # The comparison the FIRST invocation judged is still in the matrix -- and
+    # it is ONE comparison, because the two forced positions are one.
     assert summary["comparisons"][_judge_gen()][("model-one", "model-two")][
         "comparisons"
     ] == 1
@@ -2363,8 +2587,8 @@ def test_summary_covers_the_campaign_not_the_invocation(tmp_path, capsys):
 
     print_summary(second)
     out = capsys.readouterr().out
-    assert "3 judgment(s)" in out
-    assert "1 from prior invocation(s)" in out
+    assert "4 judgment(s)" in out
+    assert "2 from prior invocation(s)" in out
 
 
 def test_the_summary_names_arms_for_runs_this_invocation_never_read(tmp_path):
@@ -2375,14 +2599,14 @@ def test_the_summary_names_arms_for_runs_this_invocation_never_read(tmp_path):
     has to be recovered from the event log rather than from this pass's records.
     """
     root = _two_arms(tmp_path)
-    _run(root, rubric=False, votes=1)
+    _run(root, rubric=False)
 
     # The re-grade that excludes one side, appended after the judgment.
     append_grade(
         grades_path(root),
         _grade("run-b", model="model-two", resolved=None, grader_version="3"),
     )
-    second = _run(root, rubric=False, votes=1)
+    second = _run(root, rubric=False)
 
     row = second["summary"]["comparisons"][_judge_gen()][
         ("model-one", "model-two")
@@ -2396,7 +2620,7 @@ def test_the_summary_is_a_printout_and_stores_nothing(tmp_path):
     stored Elo is a published number, and §4.3 forbids publishing one without
     the κ that was in force. Nothing on disk moves when the summary is taken."""
     root = _two_arms(tmp_path)
-    result = _run(root, rubric=True, votes=1)
+    result = _run(root, rubric=True)
     before = _bytes_under(root)
 
     summarize(_lines(root), {"run-a": "model-one", "run-b": "model-two"})

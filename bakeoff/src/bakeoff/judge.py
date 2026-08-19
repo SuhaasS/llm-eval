@@ -26,9 +26,9 @@ test in `tests/test_judge.py`:
 3. **Timing.** `time.*`, `started_at`/`finished_at`, and every `duration_s` on
    a `CheckResult`. Same reasoning.
 4. **Any prior verdict.** `GradeRecord.resolved`, `grade_failure`, another
-   judge's `JudgeRecord` -- a prior verdict in the payload turns three
-   independent votes into one vote and two confirmations, which is the failure
-   that makes the vote count look like agreement.
+   judge's `JudgeRecord` -- a prior verdict in the payload turns the two
+   independent votes into one vote and one confirmation, which is the failure
+   that makes position consistency look like agreement.
 
 **The guard is a whitelist, never a redactor.** The payload is assembled field
 by field from named sources, so a `RunRecord` field added tomorrow is absent by
@@ -55,12 +55,24 @@ gzips and hashes exactly what is returned, so the payload the record proves is
 the payload that was sent -- a builder that returned dataclasses would let
 serialization differ between the sent copy and the stored one.
 
-**The second half: prompts, parsing, votes.** Three facts shape it.
+**The second half: prompts, parsing, votes.** Four facts shape it.
+
+*A comparison is TWO votes, one per forced position, at temperature 0.* Not
+three at randomly drawn positions, which is what this file did through
+`JUDGE_PROMPT_VERSION` 1. At temperature 0 a judge is fully described by its
+answer under each of the two orders, so a third call re-asks a question already
+answered: majority-of-three over random positions was measured distributionally
+identical to ONE vote, at three times the price. Two forced positions extract
+the whole of that signal, they extract it reproducibly -- the same collection
+judged twice buys the same two prompts -- and they make position consistency a
+DIRECT measurement rather than an inference, because every comparison now holds
+one vote in each order. `VOTE_POSITIONS` is that pair, in the order the driver
+walks it.
 
 *The seam is `CompleteFn`, a stateless `str -> str`.* Not a client object and
-not a wrapper around "judge this pair", because the Invariants section
-requires three votes to be three independent calls with no shared context, and
-a raw-completion seam makes shared context structurally impossible rather than
+not a wrapper around "judge this pair", because the Invariants section requires
+the two votes to be two independent calls with no shared context, and a
+raw-completion seam makes shared context structurally impossible rather than
 merely discouraged. `live_completion` at the bottom of this file is the one
 implementation that opens a socket, and it opens none until it is CALLED --
 everything else here is pure, and every test above the seam drives a fake.
@@ -71,15 +83,19 @@ model answers `A`/`B`/`TIE` -- that is the WIRE vocabulary and it means
 presentation order. `JudgeRecord.verdict` is `"a"`/`"b"`/`"tie"` and means the
 caller's own pair, which is a different claim entirely. `parse_pairwise_
 response` therefore returns `"first"`/`"second"`/`"tie"` and never `"a"`/`"b"`:
-only `judge_pair_vote` knows the position draw, so only it can map back. A
-parser that returned `"a"` would be guessing, and it would be right half the
-time -- which is the shape of bug that yields a complete, confident, inverted
-Elo table.
+only `judge_pair_vote` is told the position, so only it can map back. A parser
+that returned `"a"` would be guessing, and it would be right half the time --
+which is the shape of bug that yields a complete, confident, inverted Elo
+table.
 
 *Parsing is strict and a malformed verdict is a retry, never a repair turn.*
 The retry re-sends the identical rendered prompt as a fresh independent call.
 Handing the model back its own bad output makes attempt two a correction of
-attempt one, which is the same defect as asking one call for three opinions.
+attempt one, which is the same defect as asking one call for both positions.
+The retry survives the move to temperature 0 because what it is against is
+TRANSPORT nondeterminism -- a truncated reply, an empty completion -- which a
+fresh identical call still fixes, and it costs nothing whenever parsing
+succeeds the first time.
 """
 
 from __future__ import annotations
@@ -87,7 +103,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import random
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -106,10 +121,35 @@ from bakeoff.tasks import TaskManifest
 #: configuration" section requires: a Claude judge inflates Sonnet 5.
 JUDGE_MODEL_ID_DEFAULT = "openai.gpt-5.6-sol"
 
-#: Moves on ANY change to the prompt text, including one that reads as
-#: cosmetic. Whitespace and ordering move model output, so a prompt edit under
-#: an unchanged version silently mixes two generations of verdict in one file.
-JUDGE_PROMPT_VERSION = 1
+#: Moves on ANY change to the prompt text OR to the vote protocol, including
+#: one that reads as cosmetic. Whitespace and ordering move model output, so a
+#: prompt edit under an unchanged version silently mixes two generations of
+#: verdict in one file.
+#:
+#: 1 -> 2 is the move from three votes at randomly drawn positions to two votes
+#: at forced ones, and the bump is REQUIRED rather than tidy. A v1 line carries
+#: `vote_index` 0 or 1 too -- drawn under a RANDOM position -- and the driver's
+#: resume key holds the index and this version and NOT the position. Left at 1,
+#: a v1 line at index 0 would answer the v2 unit for index 0 and the driver
+#: would skip it: a clean-looking resume over a comparison holding one
+#: random-position vote where the protocol says two forced ones, and every
+#: position-consistency figure taken off that file computed over pairs of votes
+#: nobody bought together. The bump is what makes the two protocols two
+#: generations, which every aggregation downstream already keeps apart.
+JUDGE_PROMPT_VERSION = 2
+
+#: The two orders every comparison is shown in, one vote each, INDEXED: the
+#: driver walks this tuple with `enumerate`, so `vote_index` 0 is `a_first` and
+#: 1 is `b_first`. One tuple rather than two literals in two files, because the
+#: index-to-position mapping is read back off stored lines to measure position
+#: consistency, and a second copy is how the reader and the writer come to
+#: disagree about which order index 1 meant.
+#:
+#: Two and not three: at temperature 0 these two answers ARE the judge, and a
+#: third call re-asks one of them. Not randomized either -- a drawn position
+#: makes the protocol unreproducible and leaves position consistency
+#: unmeasurable on any single comparison, which is the whole defect v1 had.
+VOTE_POSITIONS: tuple[str, str] = ("a_first", "b_first")
 
 #: Moves when the dimensions, the flags or their anchors change -- a score of
 #: 1 does not mean the same thing across a rubric edit, so the two generations
@@ -146,8 +186,9 @@ RUBRIC_FLAGS: tuple[str, ...] = (
 )
 
 #: THE seam: rendered prompt in, raw model text out. See the module docstring
-#: -- it is stateless so that three votes cannot share context even by
-#: accident, and it is what Task 5's live client and every test fake satisfy.
+#: -- it is stateless so that the two votes over one comparison cannot share
+#: context even by accident, and it is what Task 5's live client and every test
+#: fake satisfy.
 CompleteFn = Callable[[str], str]
 
 _Parsed = TypeVar("_Parsed")
@@ -257,11 +298,11 @@ def build_pairwise_payload(
     """The blind pairwise payload: two submissions, in SHOWN order.
 
     `first` and `second` are presentation order and the position assignment is
-    already applied by the caller. Randomizing here would put the assignment
+    already applied by the caller. Ordering here would put the assignment
     somewhere `JudgeRecord.position_assignment` could not observe it, and a
-    stored assignment that does not match what was sent makes the position-swap
-    probe measure nothing -- which is worse than not running the probe, because
-    it reports a bias figure.
+    stored assignment that does not match what was sent makes position
+    consistency measure nothing -- which is worse than not measuring it,
+    because it reports a figure.
 
     Blind: neither slot carries a run id, a model, or anything a judge could
     map back to an arm.
@@ -318,7 +359,7 @@ def _submission(inputs: PayloadInputs) -> dict[str, Any]:
 def _checks(inputs: PayloadInputs) -> list[dict[str, str]]:
     """Fresh dicts, so a caller mutating the payload cannot reach back into
     `PayloadInputs` -- which is shared between the two payload kinds and
-    between the three votes over one comparison."""
+    between the two votes over one comparison."""
     return [dict(check) for check in inputs.checks]
 
 
@@ -345,9 +386,9 @@ reference is not by that fact better or worse.
 _PAIRWISE_INSTRUCTIONS = """\
 You are comparing two submitted code changes for the same task against a
 reference change that a human wrote, reviewed and shipped. Both submissions
-are anonymous, nothing below identifies either one, and they are shown in a
-RANDOM order that carries no information -- do not prefer a submission for
-appearing first or second.
+are anonymous, nothing below identifies either one, and they are shown in an
+order chosen by the harness that carries no information about the submissions
+-- do not prefer a submission for appearing first or second.
 
 Decide which submission better accomplishes what the reference accomplished.
 Judge the result, explicitly NOT "is the same code": a different design that
@@ -491,11 +532,11 @@ def render_pairwise_prompt(payload: dict[str, Any]) -> str:
 
     The labels are the WIRE vocabulary and mean presentation order only. The
     payload arrives already in shown order (`build_pairwise_payload` applies
-    the caller's position draw), so this function does no ordering of its own
+    the caller's forced position), so this function does no ordering of its own
     -- a renderer that re-ordered would put the assignment somewhere
     `JudgeRecord.position_assignment` could not observe it, and a stored
-    assignment that disagrees with what was sent makes the position-swap probe
-    report a bias figure it did not measure.
+    assignment that disagrees with what was sent makes position consistency a
+    figure computed over votes nobody sent in those orders.
     """
     return "\n".join(
         [
@@ -514,11 +555,12 @@ def render_pairwise_prompt(payload: dict[str, Any]) -> str:
 def prompt_sha(rendered: str) -> str:
     """sha256 of the EXACT rendered text, task text and all.
 
-    Per call rather than per comparison: position changes the text, so three
-    votes over one pair legitimately carry up to two distinct shas. This is
-    the evidence that the declared `judge_prompt_version` was honest -- a
-    prompt edited without a version bump shows up as a sha nothing else in the
-    file shares.
+    Per call rather than per comparison: position changes the text, so the two
+    votes over one pair carry two distinct shas -- exactly two now, where the
+    random-position protocol could produce one order twice. This is the
+    evidence that the declared `judge_prompt_version` was honest, and a prompt
+    edited without a version bump shows up as a sha nothing else in the file
+    shares.
     """
     return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
 
@@ -634,9 +676,13 @@ class VoteOutcome:
     which is precisely what the stored sha exists to rule out.
     """
 
-    #: "a_first" | "b_first" -- the draw this vote was shown under.
+    #: "a_first" | "b_first" -- the position this vote was shown under.
+    #: STORED rather than left to be derived from `vote_index` downstream: a
+    #: derived position is a claim about what the driver does now, not a record
+    #: of what this call was shown.
     position_assignment: str
-    #: "a" | "b" | "tie", canonical and already mapped back through the draw.
+    #: "a" | "b" | "tie", canonical and already mapped back through the
+    #: position above.
     verdict: str
     #: SHOWN order, as sent.
     payload: dict[str, Any]
@@ -649,10 +695,16 @@ _SHOWN_BY_WIRE: dict[str, str] = {"A": "first", "B": "second", "TIE": "tie"}
 
 #: (position assignment, shown-order verdict) -> canonical verdict. Written
 #: out as six entries rather than computed, because the inversion is the one
-#: piece of arithmetic in this module that fails silently: a vote protocol
-#: that randomizes position and forgets to invert records the loser as the
-#: winner on half the comparisons, and every Elo number downstream is computed
-#: from it with nothing looking wrong.
+#: piece of arithmetic in this module that fails silently.
+#:
+#: UNCHANGED by the move to forced positions, and its failure mode is now
+#: louder rather than quieter. Under random positions a missing inversion
+#: recorded the loser as the winner on about half the comparisons and nothing
+#: looked wrong. Under forced positions both orders occur on EVERY comparison,
+#: so the same bug flips exactly one of the two votes: every comparison in the
+#: file splits 1-1, `majority` reports every one of them a tie, and position
+#: consistency reads 0%. A catastrophic number is a finding; half a table
+#: quietly inverted is not.
 _CANONICAL_VERDICT: dict[tuple[str, str], str] = {
     ("a_first", "first"): "a",
     ("a_first", "second"): "b",
@@ -715,10 +767,10 @@ def parse_pairwise_response(text: str) -> str:
 
     Never "a"/"b". The reply's `A`/`B` is presentation order, and canonical
     a/b is the caller's own pair -- a different claim, and one this function
-    has no way to evaluate because it never sees the position draw. Returning
+    has no way to evaluate because it is never told the position. Returning
     "a" here would be a guess that is right half the time, which is how a
     complete and confident Elo table ends up inverted. `judge_pair_vote` owns
-    the mapping because it owns the draw.
+    the mapping because it is the one that was told.
 
     Case-insensitive and whitespace-tolerant on the verdict itself; anything
     outside A/B/TIE is malformed rather than coerced.
@@ -861,21 +913,30 @@ def judge_rubric(
 def judge_pair_vote(
     a: PayloadInputs,
     b: PayloadInputs,
-    rng: random.Random,
+    position_assignment: str,
     complete: CompleteFn,
     retries: int = 2,
 ) -> VoteOutcome:
-    """One blind, position-randomized pairwise vote.
+    """One blind pairwise vote, in the position the CALLER forces.
+
+    The position is an argument rather than a draw, which is the whole of the
+    protocol change: at temperature 0 the judge's answer under each of the two
+    orders is the entire signal, so the driver asks for both (`VOTE_POSITIONS`)
+    and this function answers exactly one of them. A drawn position would make
+    the pass unreproducible and leave position consistency unmeasurable on any
+    single comparison, which is what `JUDGE_PROMPT_VERSION` 1 did.
 
     The order of operations is the content, and it is not interchangeable:
 
-    1. Draw the position BEFORE building anything. Building an `a_first`
-       payload and swapping it afterwards produces the same bytes today and
-       is the shape that lets `position_assignment` and the payload disagree
-       tomorrow -- at which point the position-swap probe reports a bias
-       figure it did not measure.
+    1. Validate the position BEFORE building anything, and raise on one this
+       function does not know. Defaulting to `a_first` would judge in one order
+       while the record claimed another; letting the string through to
+       `_CANONICAL_VERDICT` would raise a `KeyError` AFTER the paid call,
+       naming a dict rather than the argument.
     2. Build in shown order, so the payload that is stored is the payload that
-       was seen.
+       was seen. Building `a_first` and swapping afterwards produces the same
+       bytes today and is the shape that lets `position_assignment` and the
+       payload disagree tomorrow.
     3. Render, and hand the rendered text back on the outcome. The caller
        shas it with `prompt_sha` -- per CALL rather than per comparison,
        since position changes the text -- and it is carried out rather than
@@ -883,16 +944,20 @@ def judge_pair_vote(
     4. Complete and parse. A `MalformedVerdict` re-sends the IDENTICAL prompt
        as a fresh independent call; the model is never shown its own bad
        output, because a repair turn makes attempt two a correction of
-       attempt one rather than a new opinion.
-    5. Map the shown-order verdict back through the draw. This is the step
-       whose failure is silent and total (see `_CANONICAL_VERDICT`).
+       attempt one rather than a new opinion. Kept at temperature 0 because
+       what it answers is transport nondeterminism -- truncation, an empty
+       completion -- and it is unpaid whenever parsing succeeds.
+    5. Map the shown-order verdict back through the position. This is the step
+       whose failure is total (see `_CANONICAL_VERDICT`).
 
-    `rng` is passed in rather than drawn from module state so a driver can
-    seed one generator for a whole batch and replay it. Three votes over one
-    comparison are three calls with three independent draws -- a single call
-    asked for three opinions is one vote wearing three hats.
+    The two votes over one comparison are two calls with no shared context -- a
+    single call asked for both orders is one vote wearing two hats.
     """
-    position_assignment = "a_first" if rng.random() < 0.5 else "b_first"
+    if position_assignment not in VOTE_POSITIONS:
+        raise ValueError(
+            f"position must be one of {list(VOTE_POSITIONS)}, got "
+            f"{position_assignment!r}"
+        )
     first, second = (a, b) if position_assignment == "a_first" else (b, a)
 
     payload = build_pairwise_payload(first, second)
@@ -916,11 +981,22 @@ def majority(verdicts: Sequence[str]) -> str:
     Strict, not plurality: 2 of 4 is not a majority, and calling it one would
     let a split decision be published as a win. Ties are permitted at the vote
     level and at this level both -- the spec asks for that explicitly, and a
-    tie-breaking rule invented here would manufacture a preference the three
-    votes did not express.
+    tie-breaking rule invented here would manufacture a preference the votes
+    did not express.
+
+    UNCHANGED by the move to two forced positions, deliberately. Over n=2 the
+    strict rule already says the right thing -- the two votes agree and that
+    verdict stands, or they disagree and the comparison is a tie -- so a rule
+    written specially for two would be the same arithmetic with a second way to
+    be wrong. A 1-1 split is the judge preferring whichever submission it saw
+    first, which is a POSITION effect rather than a preference between the two
+    submissions, so breaking that tie towards either vote would publish the
+    position effect as a win. This function also still reads the three-vote v1
+    generations sitting in the same file: it counts canonical verdicts and has
+    no opinion about how many there are.
 
     Refuses "first"/"second" loudly. They are presentation terms and mean
-    nothing without the position draw, so a caller that passed raw parser
+    nothing without the position assignment, so a caller that passed raw parser
     output would otherwise get a confident answer in a vocabulary no
     `JudgeRecord.verdict` accepts -- stored as a verdict rather than raised as
     a bug. Refuses an empty sequence for the same reason: no votes is not a
@@ -951,8 +1027,12 @@ def _ask_and_parse(
 ) -> _Parsed:
     """Complete, parse, and on a malformed verdict re-ask the SAME prompt.
 
-    `retries` counts re-asks, so `retries=2` is three calls in total. It is a
-    separate counter from the transport retries Task 5's router carries, and
+    `retries` counts re-asks, so `retries=2` is three calls in total. Kept at
+    temperature 0: what it is against is TRANSPORT nondeterminism -- a
+    truncated reply, an empty completion, a reply the router mangled -- which a
+    fresh identical call still fixes, and it costs nothing on the calls that
+    parse. It is a separate counter from the transport retries Task 5's router
+    carries, and
     conflating them hides which of the two a batch is burning: a model that
     cannot produce JSON and a model that cannot be reached fail the same
     number of times and need opposite responses.
@@ -1068,22 +1148,23 @@ def live_completion(
     below `MANTLE_TOKEN_TTL`), so a long grading pass that built its judge up
     front would reach the first vote holding a dead token.
 
-    Stateless per call, which is the `CompleteFn` contract: three votes over
-    one comparison are three independent calls carrying no shared context. The
+    Stateless per call, which is the `CompleteFn` contract: the two votes over
+    one comparison are two independent calls carrying no shared context. The
     router is shared; the conversation is not, because there is no
     conversation -- each call is one user turn holding the whole rendered
     prompt.
 
     ONE AUTH FAILURE PER CALL BUYS ONE FRESH CREDENTIAL, and that is the whole
     of the retry policy here. The window is about an hour and a real 60-task
-    pass is ~10,800 calls over many more hours than that, so the token does not
-    merely *risk* expiring mid-batch -- it expires in the middle of every real
-    one. Left to propagate, the driver's per-unit `except` records an error and
-    moves on, so the operator gets about an hour of judged units per invocation
-    and then thousands of error lines from units that were never going to
-    succeed. On a 401/403 (`_is_auth_failure`) the cached router is therefore
-    dropped, a NEW token is minted, one router is rebuilt around it, and the
-    same call is made once more.
+    pass is ~9,600 calls -- 7,200 pairwise at two forced positions per
+    comparison, plus 2,400 rubric -- over many more hours than that, so the
+    token does not merely *risk* expiring mid-batch: it expires in the middle
+    of every real one. Left to propagate, the driver's per-unit `except`
+    records an error and moves on, so the operator gets about an hour of judged
+    units per invocation and then thousands of error lines from units that were
+    never going to succeed. On a 401/403 (`_is_auth_failure`) the cached
+    router is therefore dropped, a NEW token is minted, one router is rebuilt
+    around it, and the same call is made once more.
 
     The mint deliberately bypasses `_mantle_token`'s environment-first read:
     the copy in `MANTLE_ENV` is the one that just expired, and a router

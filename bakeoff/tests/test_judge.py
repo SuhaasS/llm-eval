@@ -40,7 +40,6 @@ import ast
 import hashlib
 import json
 import os
-import random
 import sys
 import tomllib
 from dataclasses import dataclass
@@ -59,6 +58,7 @@ from bakeoff.judge import (
     RUBRIC_DIMENSIONS,
     RUBRIC_FLAGS,
     RUBRIC_VERSION,
+    VOTE_POSITIONS,
     MalformedVerdict,
     PayloadInputs,
     build_pairwise_payload,
@@ -273,8 +273,8 @@ LEAK_SURFACE: dict[str, str] = {
     "task_version": "787878",
 }
 
-#: The same, for the grade. A prior verdict turns three independent votes into
-#: one vote and two confirmations, and the check output paths embed the arm.
+#: The same, for the grade. A prior verdict turns two independent votes into
+#: one vote and one confirmation, and the check output paths embed the arm.
 GRADE_LEAK_SURFACE: dict[str, str] = {
     "grade.model": "SENTINEL_GRADE_MODEL",
     "grade.run_id": "SENTINEL_GRADE_RUN_ID",
@@ -1182,6 +1182,31 @@ def test_the_rubric_prompt_anchors_every_dimension_and_flag():
     assert "same code" in rendered.lower()
 
 
+def test_the_pairwise_prompt_no_longer_claims_the_order_is_random():
+    """The prompt may not tell the model something the harness stopped doing.
+
+    Every comparison is now shown in BOTH orders, one forced vote each, so
+    "a RANDOM order" is false about the text in front of the model -- and a
+    false statement in the instructions is not a harmless leftover: the claim
+    that order is random is itself an argument for ignoring order, and a model
+    that catches the harness being wrong about its own procedure has been
+    handed a reason to discount the rest of it.
+
+    The replacement still has to carry the instruction the sentence existed
+    for, so both halves are asserted: no randomness claim, and the do-not-
+    prefer-by-position instruction intact.
+    """
+    rendered = render_pairwise_prompt(
+        build_pairwise_payload(_inputs(), _other_inputs())
+    )
+
+    lowered = rendered.lower()
+    assert "random" not in lowered
+    assert "chosen by the harness" in lowered
+    assert "carries no information" in lowered
+    assert "do not prefer a submission for appearing first or second" in lowered
+
+
 def test_prompt_sha_is_the_sha256_of_the_exact_rendered_text():
     rendered = render_rubric_prompt(build_rubric_payload(_inputs()))
     expected = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
@@ -1211,10 +1236,15 @@ def test_retry_on_malformed_re_sends_the_same_prompt_and_counts_calls():
     """A retry is a fresh independent call, never a repair turn.
 
     Handing the model back its own bad output would make attempt two a
-    continuation of attempt one -- and the same reasoning that makes three
-    votes three separate calls (a single call asked for three opinions is one
-    vote wearing three hats) makes a repair turn a correction of a vote rather
-    than a new one.
+    continuation of attempt one -- and the same reasoning that makes the two
+    forced positions two separate calls (a single call asked for both orders
+    is one vote wearing two hats) makes a repair turn a correction of a vote
+    rather than a new one.
+
+    Kept at temperature 0 for a reason the protocol change does not remove:
+    the retry is against TRANSPORT nondeterminism -- a truncated reply, an
+    empty completion -- which a fresh identical call still fixes, and it costs
+    nothing whenever parsing succeeds the first time.
     """
     complete = _FakeComplete("I refuse.", '{"scores": "great"}', _rubric_json())
     inputs = _inputs()
@@ -1242,9 +1272,7 @@ def test_exhausted_retries_raise_malformed_verdict():
 
     voting = _FakeComplete("no", "no", "no")
     with pytest.raises(MalformedVerdict):
-        judge_pair_vote(
-            _inputs(), _other_inputs(), random.Random(0), voting
-        )
+        judge_pair_vote(_inputs(), _other_inputs(), "a_first", voting)
     assert len(voting.prompts) == 3
     assert len(set(voting.prompts)) == 1
 
@@ -1281,47 +1309,84 @@ def test_majority_refuses_the_shown_order_vocabulary():
         majority([])
 
 
-def test_seeded_rng_produces_both_position_assignments_and_maps_verdicts_back_correctly():  # noqa: E501
-    """Position is drawn per vote, and the verdict is mapped back through it.
+def test_two_agreeing_votes_aggregate_as_that_verdict_and_a_split_as_a_tie():
+    """n=2 is the size every comparison now has, and `majority` already
+    handles it: strict majority over two votes IS agreement-else-tie.
 
-    The failure this guards is silent and total: a vote protocol that
-    randomizes position but forgets to invert the mapping records the loser as
-    the winner on half the comparisons, and every Elo number downstream is
-    computed from it without anything looking wrong.
+    Pinned separately from the arithmetic above because it is the arithmetic
+    the forced-position protocol actually runs on. A rule invented for two --
+    "on a split, take the a_first vote" -- would manufacture a preference from
+    the very position effect the second vote exists to expose.
+    """
+    assert majority(["a", "a"]) == "a"
+    assert majority(["b", "b"]) == "b"
+    assert majority(["tie", "tie"]) == "tie"
+    # A split is a position-inconsistent judge, and that is a tie rather than
+    # a coin flip between the two orders.
+    assert majority(["a", "b"]) == "tie"
+    assert majority(["b", "a"]) == "tie"
+    assert majority(["a", "tie"]) == "tie"
+    assert majority(["tie", "b"]) == "tie"
+
+
+def test_both_forced_positions_map_the_shown_verdict_back_to_canonical_terms():
+    """Each position is asked for, and the verdict is mapped back through it.
+
+    The failure this guards is silent and total: a vote protocol that shows
+    both orders and forgets to invert records the loser as the winner on
+    exactly one of the two votes, and every Elo number downstream is computed
+    from it without anything looking wrong. Under forced positions that bug is
+    no longer half-invisible -- it makes every comparison split 1-1, which
+    reads as a judge with zero position consistency.
+
+    Driven directly through `judge_pair_vote` rather than through a seeded
+    generator: at temperature 0 the position is an ARGUMENT, so there is no
+    draw to replay and the map-back is a total function of it.
     """
     a, b = _inputs(), _other_inputs()
-    seen: set[str] = set()
 
-    for seed in range(24):
-        for wire, first_wins, second_wins in (
-            ("A", "a", "b"),
-            ("B", "b", "a"),
-        ):
-            complete = _FakeComplete(_pairwise_json(wire))
-            outcome = judge_pair_vote(a, b, random.Random(seed), complete)
-            seen.add(outcome.position_assignment)
-
-            if outcome.position_assignment == "a_first":
-                assert outcome.payload["submission_first"]["diff"] == (
-                    CANDIDATE_DIFF
-                )
-                assert outcome.verdict == first_wins
-            else:
-                assert outcome.position_assignment == "b_first"
-                assert outcome.payload["submission_first"]["diff"] == (
-                    OTHER_CANDIDATE_DIFF
-                )
-                assert outcome.verdict == second_wins
-
-    assert seen == {"a_first", "b_first"}, "position was not randomized"
-
-    # A tie is a tie under either assignment -- the one verdict the mapping
-    # must leave alone.
-    for seed in range(8):
-        complete = _FakeComplete(_pairwise_json("TIE"))
-        assert judge_pair_vote(a, b, random.Random(seed), complete).verdict == (
-            "tie"
+    for wire, first_wins, second_wins in (("A", "a", "b"), ("B", "b", "a")):
+        a_first = judge_pair_vote(
+            a, b, "a_first", _FakeComplete(_pairwise_json(wire))
         )
+        assert a_first.position_assignment == "a_first"
+        assert a_first.payload["submission_first"]["diff"] == CANDIDATE_DIFF
+        assert a_first.verdict == first_wins
+
+        b_first = judge_pair_vote(
+            a, b, "b_first", _FakeComplete(_pairwise_json(wire))
+        )
+        assert b_first.position_assignment == "b_first"
+        assert b_first.payload["submission_first"]["diff"] == (
+            OTHER_CANDIDATE_DIFF
+        )
+        assert b_first.verdict == second_wins
+
+    # A tie is a tie under either position -- the one verdict the mapping must
+    # leave alone.
+    for position in VOTE_POSITIONS:
+        outcome = judge_pair_vote(
+            a, b, position, _FakeComplete(_pairwise_json("TIE"))
+        )
+        assert outcome.verdict == "tie"
+
+
+def test_judge_pair_vote_refuses_a_position_outside_the_two_it_knows():
+    """A position this function does not know is a caller bug, and the only
+    alternatives are worse.
+
+    Defaulting to `a_first` would judge the comparison in one order while the
+    record claimed another; passing the string through to `_CANONICAL_VERDICT`
+    would raise a `KeyError` AFTER the paid call, naming a dict rather than the
+    argument. Raised BEFORE anything is built, so the model is never asked.
+    """
+    a, b = _inputs(), _other_inputs()
+
+    for bad in ("A_FIRST", "a-first", "first", "random", "", None):
+        complete = _FakeComplete(_pairwise_json("A"))
+        with pytest.raises(ValueError, match="position"):
+            judge_pair_vote(a, b, bad, complete)
+        assert complete.prompts == []
 
 
 def test_the_vote_outcome_carries_the_payload_and_prompt_that_were_sent():
@@ -1330,44 +1395,34 @@ def test_the_vote_outcome_carries_the_payload_and_prompt_that_were_sent():
     either would attest to something other than what the model saw."""
     a, b = _inputs(), _other_inputs()
     complete = _FakeComplete(_pairwise_json("A"))
-    outcome = judge_pair_vote(a, b, random.Random(1), complete)
+    outcome = judge_pair_vote(a, b, "a_first", complete)
 
     assert complete.prompts == [outcome.rendered_prompt]
     assert outcome.rendered_prompt == render_pairwise_prompt(outcome.payload)
     assert outcome.reasoning == GOOD_REASONING
     assert outcome.payload["kind"] == "pairwise"
-
-    shown = (a, b) if outcome.position_assignment == "a_first" else (b, a)
-    assert outcome.payload == build_pairwise_payload(*shown)
+    assert outcome.payload == build_pairwise_payload(a, b)
 
 
-def test_the_position_is_drawn_before_the_payload_is_built():
-    """Draw first, then build in shown order -- never build then swap.
+def test_the_payload_is_built_in_shown_order_rather_than_built_then_swapped():
+    """Build in the position's order -- never build `a_first` and reorder.
 
-    Building an `a_first` payload and reordering it afterwards is the same
-    output today and the shape that lets `position_assignment` and the payload
-    disagree tomorrow. Pinned by consuming exactly one draw from an rng whose
-    stream is known.
+    Same bytes today, and the shape that lets `position_assignment` and the
+    payload disagree tomorrow, at which point the position-consistency figure
+    is computed over pairs of votes that were not shown what they claim.
+    Pinned by comparing the stored payload against the builder called in the
+    order the position names.
     """
     a, b = _inputs(), _other_inputs()
 
-    class _OneDraw(random.Random):
-        def __init__(self, value: float) -> None:
-            super().__init__(0)
-            self.value = value
-            self.draws = 0
-
-        def random(self) -> float:
-            self.draws += 1
-            return self.value
-
-    for value, expected in ((0.0, "a_first"), (0.5, "b_first")):
-        rng = _OneDraw(value)
+    for position, shown in (("a_first", (a, b)), ("b_first", (b, a))):
         outcome = judge_pair_vote(
-            a, b, rng, _FakeComplete(_pairwise_json("A"))
+            a, b, position, _FakeComplete(_pairwise_json("A"))
         )
-        assert outcome.position_assignment == expected
-        assert rng.draws == 1, "one draw per vote, taken before the build"
+        assert outcome.payload == build_pairwise_payload(*shown)
+        assert outcome.rendered_prompt == render_pairwise_prompt(
+            build_pairwise_payload(*shown)
+        )
 
 
 def test_a_pairwise_vote_across_two_tasks_never_reaches_the_model():
@@ -1378,8 +1433,26 @@ def test_a_pairwise_vote_across_two_tasks_never_reaches_the_model():
     for pair in ((_inputs(), other_task), (other_task, _inputs())):
         complete = _FakeComplete(_pairwise_json("A"))
         with pytest.raises(ValueError, match="same task"):
-            judge_pair_vote(*pair, random.Random(0), complete)
+            judge_pair_vote(*pair, "a_first", complete)
         assert complete.prompts == []
+
+
+def test_the_protocol_change_bumped_the_prompt_version():
+    """v2 is the forced-position protocol, and the bump is REQUIRED rather
+    than tidy.
+
+    A v1 line carries `vote_index` 0 or 1 too -- drawn under a random position
+    -- so the resume key, which holds the index and the version and not the
+    position, would match a v1 line against a v2 unit and skip it. The batch
+    would report a clean resume while half the forced-position votes it was
+    asked for were never bought, and the file would hold one random-position
+    vote where the protocol says two forced ones.
+    """
+    assert JUDGE_PROMPT_VERSION == 2
+    # Two positions, in the order the driver walks them: `vote_index` 0 is
+    # `a_first` and 1 is `b_first`, which is what makes the index readable
+    # off an old line without re-deriving anything.
+    assert VOTE_POSITIONS == ("a_first", "b_first")
 
 
 def test_the_pinned_judge_identity_constants():
@@ -1392,7 +1465,6 @@ def test_the_pinned_judge_identity_constants():
     old name would be silently uncapped.
     """
     assert JUDGE_MODEL_ID_DEFAULT == "openai.gpt-5.6-sol"
-    assert JUDGE_PROMPT_VERSION == 1
     assert RUBRIC_VERSION == "1.0.0"
     assert JUDGE_SAMPLING["temperature"] == 0.0
     assert "max_completion_tokens" in JUDGE_SAMPLING
@@ -1789,7 +1861,7 @@ def test_the_router_is_built_once_and_carries_transport_retries(
 ):
     """One router across every vote, and `num_retries` is the TRANSPORT count.
 
-    Built once because three votes over one comparison are three calls, and a
+    Built once because the two votes over one comparison are two calls, and a
     router per call would re-mint the token and re-resolve the deployment on
     every vote of a 2,400-run batch.
 
@@ -1840,7 +1912,8 @@ def test_a_token_that_died_mid_batch_is_re_minted_once_and_the_call_retried(
     """The ~1h window against a multi-hour pass, at the layer that can fix it.
 
     The Identity Center session policy caps the mantle token at about an hour,
-    a real 60-task pass is ~10,800 calls and runs for many more than that, and
+    a real 60-task pass is ~7,200 pairwise calls (two forced positions per
+    comparison) plus ~2,400 rubric and runs for many more hours than that, and
     the router is built once on the first vote. So the token dies in the middle
     of every real batch. Left to propagate, every remaining unit fails on its
     own dead credential and the operator gets one hour of judged units per
@@ -1903,7 +1976,8 @@ def test_each_call_carries_its_own_rebuild_so_a_long_batch_survives_two(
     mantle_token, minted, scripted_routers
 ):
     """The budget is per CALL, not per closure. A pass long enough to outlive
-    two tokens is the ordinary case at ~10,800 calls, so a one-shot rebuild
+    two tokens is the ordinary case at ~9,600 calls (7,200 pairwise plus
+    2,400 rubric), so a one-shot rebuild
     would buy the second hour and no more."""
     built = scripted_routers([
         _StatusOnlyAuthError(401), None, _StatusOnlyAuthError(401),

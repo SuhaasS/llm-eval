@@ -99,7 +99,7 @@ is itself lazy about its router; this closure is lazy about `live_completion`.
 Usage:
     python scripts/judge.py --event-log ~/.cache/bakeoff/eventlog
     python scripts/judge.py --event-log PATH --only-task calc-1 --samples 0 1
-    python scripts/judge.py --event-log PATH --no-rubric --votes 3
+    python scripts/judge.py --event-log PATH --no-rubric
 
 Exit codes:
     0  every selected unit produced its lines
@@ -111,7 +111,6 @@ from __future__ import annotations
 import argparse
 import itertools
 import math
-import random
 import sys
 import uuid
 from collections import Counter
@@ -130,6 +129,7 @@ from bakeoff.judge import (  # noqa: E402
     JUDGE_PROMPT_VERSION,
     JUDGE_SAMPLING,
     RUBRIC_VERSION,
+    VOTE_POSITIONS,
     CompleteFn,
     PayloadInputs,
     judge_pair_vote,
@@ -175,8 +175,10 @@ _VOTE_VERDICTS: tuple[str, ...] = ("a", "b", "tie")
 #:
 #: The failure this is placed against: the mantle bearer token's real window is
 #: about an hour -- the Identity Center session policy caps it well below the
-#: token's own TTL -- and a real 60-task pass is ~10,800 calls over many more
-#: hours than that. `live_completion` re-mints once per call when the
+#: token's own TTL -- and a real 60-task pass is ~9,600 calls over many more
+#: hours than that: 60 tasks x 10 samples x 6 pairs x 2 forced positions is
+#: 7,200 pairwise, plus 2,400 rubric at full N. `live_completion` re-mints
+#: once per call when the
 #: credential dies, which covers an expiry; it cannot cover a revoked role, a
 #: dead `aws sso` session or an endpoint that has stopped accepting this
 #: principal at all. In those cases the auth error propagates past
@@ -408,8 +410,9 @@ def lazy_live_completion(judge_model_id: str) -> CompleteFn:
     call should not require the credential module to be importable at all.
 
     A one-slot dict rather than `nonlocal`, so there is no rebind to get wrong.
-    Not thread-safe (check-then-set), which is fine while votes are sequential
-    and is the same shape `live_completion`'s own cache has.
+    Not thread-safe (check-then-set), which is fine while the two votes of a
+    comparison are sequential and is the same shape `live_completion`'s own
+    cache has.
     """
     built: dict[str, CompleteFn] = {}
 
@@ -435,10 +438,11 @@ def _rubric_line(record, grade: GradeRecord, task, inputs: PayloadInputs,
                  judge_model_id: str) -> JudgeRecord:
     """One absolute-rubric profile: one call, `vote_index=0`.
 
-    Three votes are pairwise-only. The rubric is diagnostic rather than
-    decisive, it is reported per model as a profile and never summed into a
-    rank, and one call per run is what the spec's cost math assumes (4 rubric
-    calls per task-sample).
+    The forced positions are pairwise-only: there is no second submission to
+    order, so `VOTE_POSITIONS` has nothing to say here. The rubric is
+    diagnostic rather than decisive, it is reported per model as a profile and
+    never summed into a rank, and one call per run is what the spec's cost math
+    assumes (4 rubric calls per task-sample).
 
     `write_payload` first, then the gate assert, then the append. The payload is
     required, not optional (§4.3), and the assert sits in the last position
@@ -483,21 +487,30 @@ def _rubric_line(record, grade: GradeRecord, task, inputs: PayloadInputs,
 
 def _vote_line(task, sample_index: int, run_id_a: str, run_id_b: str,
                inputs_a: PayloadInputs, inputs_b: PayloadInputs,
-               vote_index: int, grade_a: GradeRecord, grade_b: GradeRecord,
-               rng: random.Random, payloads: Path, path: Path,
+               vote_index: int, position_assignment: str,
+               grade_a: GradeRecord, grade_b: GradeRecord,
+               payloads: Path, path: Path,
                complete: CompleteFn, judge_model_id: str) -> JudgeRecord:
-    """One blind, position-randomized pairwise vote.
+    """One blind pairwise vote, in the position the caller forces.
 
     `inputs_a`/`inputs_b` are CANONICAL a and b -- the two run ids
-    lexicographically sorted -- and `judge_pair_vote` owns the position draw and
+    lexicographically sorted -- and `judge_pair_vote` applies the position and
     the inversion back out of it, so nothing here reorders anything. A driver
     that swapped the sides on the way in would produce a `position_assignment`
-    that no longer describes the stored payload, and the position-swap probe
-    would then report a bias figure it did not measure.
+    that no longer describes the stored payload, and every position-consistency
+    figure taken off the file would be computed over votes nobody sent in those
+    orders.
+
+    `position_assignment` is passed down AND stored, rather than stored and
+    re-derived from `vote_index` by a reader: the record is evidence about what
+    this call was shown, and a derived value is a claim about what the driver
+    does now.
 
     `write_payload` BEFORE `append_judgment`: see the module docstring, step 7.
     """
-    outcome = judge_pair_vote(inputs_a, inputs_b, rng, complete)
+    outcome = judge_pair_vote(
+        inputs_a, inputs_b, position_assignment, complete
+    )
     judgment_id = uuid.uuid4().hex
     payload_path, payload_sha = write_payload(
         payloads, judgment_id, outcome.payload
@@ -508,8 +521,8 @@ def _vote_line(task, sample_index: int, run_id_a: str, run_id_b: str,
         judged_at=_now(),
         judge_model_id=judge_model_id,
         judge_prompt_version=JUDGE_PROMPT_VERSION,
-        # Per CALL, not per comparison: position changes the text, so three
-        # votes over one pair legitimately carry up to two distinct shas.
+        # Per CALL, not per comparison: position changes the text, so the two
+        # votes over one pair carry two distinct shas.
         judge_prompt_sha=prompt_sha(outcome.rendered_prompt),
         judge_sampling=dict(JUDGE_SAMPLING),
         rubric_version=RUBRIC_VERSION,
@@ -595,18 +608,23 @@ def _gate_decided_line(task, sample_index: int, run_id_a: str, run_id_b: str,
 
 def judge_event_log(event_log_root, tasks, *,
                     complete: CompleteFn | None = None,
-                    rng: random.Random | None = None,
                     judge_model_id: str = JUDGE_MODEL_ID_DEFAULT,
                     only_tasks: Iterable[str] | None = None,
                     sample_indices: Iterable[int] | None = None,
-                    votes: int = 3, rubric: bool = True,
+                    rubric: bool = True,
                     re_judge: bool = False) -> dict:
     """Judge every selected unit in one event log. Returns the batch.
 
-    `complete` and `rng` are the two seams that keep this testable without a
-    socket: the first is one rendered prompt in, raw model text out; the second
-    is the position draw. Both defaults are the real thing, and `complete`'s is
-    LAZY -- see `lazy_live_completion`.
+    `complete` is the ONE seam that keeps this testable without a socket: one
+    rendered prompt in, raw model text out. Its default is the real thing and
+    it is LAZY -- see `lazy_live_completion`. There is no second seam for
+    position, because there is no draw: every comparison is shown in both
+    orders, `VOTE_POSITIONS` in that order, one vote each.
+
+    There is no vote-count parameter for the same reason. Under forced
+    positions exactly one count is legal, and a knob offering others would let
+    a typo drop half of every comparison (or add a third vote whose position no
+    protocol assigns) while the batch reported a clean pass.
 
     A UNIT is one rubric call, one pairwise vote, or one gate-decided pair. That
     is the granularity of the resume key, of the `try/except`, of the
@@ -631,12 +649,6 @@ def judge_event_log(event_log_root, tasks, *,
     is the class of drift the payload sha exists to rule out.
     """
     event_log_root = Path(event_log_root)
-    if votes < 1:
-        # A silent zero would drop every judgeable pair while reporting a clean
-        # batch, which is exactly the "dropping pairs breaks the Elo graph"
-        # failure the spec forbids -- arrived at by a typo instead of a choice.
-        raise ValueError(f"votes must be >= 1, got {votes}")
-
     path = judgments_path(event_log_root)
     payloads = payloads_root(event_log_root)
     warnings: list[str] = []
@@ -752,7 +764,6 @@ def judge_event_log(event_log_root, tasks, *,
     complete = complete if complete is not None else lazy_live_completion(
         judge_model_id
     )
-    rng = rng if rng is not None else random.Random()
 
     judged: list[JudgeRecord] = []
     gate_decided: list[JudgeRecord] = []
@@ -805,11 +816,10 @@ def judge_event_log(event_log_root, tasks, *,
                 continue
 
             cell = cells[(task_id, sample_index)]
-            # Per CELL, and shared across the rubric call and all three
-            # votes of every pair the cell produces -- `similarity_context`
-            # walks two diffs and the payload builders take `PayloadInputs` by
-            # value, so rebuilding per unit would pay for the same walk six
-            # times over.
+            # Per CELL, and shared across the rubric call and both votes of
+            # every pair the cell produces -- `similarity_context` walks two
+            # diffs and the payload builders take `PayloadInputs` by value, so
+            # rebuilding per unit would pay for the same walk four times over.
             inputs: dict[str, PayloadInputs] = {}
 
             if rubric:
@@ -878,7 +888,11 @@ def judge_event_log(event_log_root, tasks, *,
                         )
                     continue
 
-                for vote_index in range(votes):
+                # One vote per forced position, and `enumerate` is what ties
+                # `vote_index` to `VOTE_POSITIONS` -- 0 is `a_first`, 1 is
+                # `b_first`. Adjacent, so a batch killed mid-comparison leaves
+                # the missing position as the very next unit a resume buys.
+                for vote_index, position in enumerate(VOTE_POSITIONS):
                     key = _pairwise_key(task_id, sample_index, run_id_a,
                                         run_id_b, vote_index, judge_model_id)
                     if not re_judge and key in done:
@@ -898,13 +912,14 @@ def judge_event_log(event_log_root, tasks, *,
                         judged.append(_vote_line(
                             task, sample_index, run_id_a, run_id_b,
                             inputs_a, inputs_b,
-                            vote_index, grade_a, grade_b, rng, payloads, path,
-                            complete, judge_model_id,
+                            vote_index, position, grade_a, grade_b,
+                            payloads, path, complete, judge_model_id,
                         ))
                         _unit_succeeded()
                     except Exception as exc:  # noqa: BLE001 - one unit
                         _unit_failed(
-                            f"vote {vote_index} {run_id_a} vs {run_id_b}: "
+                            f"vote {vote_index} ({position}) "
+                            f"{run_id_a} vs {run_id_b}: "
                             f"{type(exc).__name__}: {exc}"
                         )
 
@@ -1049,11 +1064,11 @@ def _comparison_key(judgment: JudgeRecord) -> tuple:
     """One COMPARISON: this pair, at this sample, under one judge generation.
 
     `vote_index` is deliberately absent, which is the whole point of having a
-    second key at all. It is what makes the three votes for a pair -- and any
-    gate-decided line for the same pair -- land in one bucket, and a bucket is
-    where "if votes exist, they win" can be applied. `_resume_key` keeps
-    `vote_index` because it answers a different question: which unit of WORK is
-    already bought.
+    second key at all. It is what makes the votes for a pair -- both forced
+    positions on a v2 line, all three on a v1 one, and any gate-decided line
+    for the same pair -- land in one bucket, and a bucket is where "if votes
+    exist, they win" can be applied. `_resume_key` keeps `vote_index` because
+    it answers a different question: which unit of WORK is already bought.
 
     The three version fields stay, for `_resume_key`'s reason. A re-judge under
     a new prompt is a new generation of verdict, and pooling two generations
@@ -1273,7 +1288,7 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
     2. **Within one comparison, vote lines supersede a gate-decided line.** A
        re-grade that flips the losing side turns a gate-decided pair into a
        judgeable one, and the old gate-decided line stays on disk beside the
-       three votes that came later. Counting both enters one comparison twice,
+       votes that came later. Counting both enters one comparison twice,
        once for each side. The votes win -- they are the later, richer verdict
        -- and the disagreement is TALLIED in `superseded_gate_decided` rather
        than quietly resolved: the file is append-only, so the disagreement is
@@ -1654,11 +1669,13 @@ def _print_reading(result: dict) -> None:
         print(f"  vote verdict    {verdict}: {count}")
 
     print(
-        "\npairwise win rates over COMPARISONS, not votes -- three votes are "
-        "one comparison, a tie is half a point, and a gate-decided pair is a "
-        "win for the side the ladder picked. ONE BLOCK PER JUDGE "
-        "GENERATION: a re-judge under a second oracle is a second reading "
-        "of this collection, never more comparisons of it"
+        "\npairwise win rates over COMPARISONS, not votes -- the two forced "
+        "positions are one comparison, a split between them is a tie, a tie "
+        "is half a point, and a gate-decided pair is a win for the side the "
+        "ladder picked. ONE BLOCK PER JUDGE GENERATION: a re-judge under a "
+        "second oracle is a second reading of this collection, never more "
+        "comparisons of it, and prompt v1 (three votes at random positions) "
+        "is its own block for the same reason"
     )
     for generation, block in sorted(summary["comparisons"].items()):
         # The generation is named above every block for `_rubric_profile`'s
@@ -1777,7 +1794,10 @@ def main(argv: list[str] | None = None) -> int:
         help="PINNED model id, never an alias -- a floating alias is a moving "
              f"oracle (default: {JUDGE_MODEL_ID_DEFAULT})",
     )
-    parser.add_argument("--votes", type=int, default=3)
+    # No `--votes`. Under forced positions a comparison is exactly one vote per
+    # entry in `VOTE_POSITIONS`, so the only thing a count could express is a
+    # mistake -- and argparse refusing the flag outright is the one version of
+    # that refusal an operator cannot misread.
     parser.add_argument(
         "--no-rubric", action="store_true",
         help="pairwise only. The rubric is diagnostic, so it is the first "
@@ -1807,7 +1827,6 @@ def main(argv: list[str] | None = None) -> int:
             judge_model_id=args.judge_model,
             only_tasks=args.only_task,
             sample_indices=args.samples,
-            votes=args.votes,
             rubric=not args.no_rubric,
             re_judge=args.re_judge,
         )

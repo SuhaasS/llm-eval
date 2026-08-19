@@ -148,8 +148,8 @@ class JudgeRecord:
     """One judge verdict: one rubric profile, or one vote in one comparison.
 
     Identity is `judgment_id`, minted by the caller. Not derived from the
-    comparison, because three votes over the same pair are three records that
-    must not collide, and a re-judge under a new prompt version is a fourth.
+    comparison, because the votes over one pair are several records that must
+    not collide, and a re-judge under a new prompt version is another.
     """
 
     judgment_id: str
@@ -203,8 +203,12 @@ class JudgeRecord:
     # "a" | "b", the winner the deterministic ladder already picked. `None`
     # unless `verdict == "gate_decided"`.
     gate_decided_by: str | None = None
-    # 0..2 -- three votes per comparison, three independent calls. `None` on a
-    # gate-decided pair, where no call was made.
+    # Which vote of the comparison this is, one independent call each. Under
+    # judge prompt v2 that is 0..1 -- `bakeoff.judge.VOTE_POSITIONS`, so 0 is
+    # `a_first` and 1 is `b_first`. UNCONSTRAINED here on purpose: v1 lines in
+    # the same file carry 0..2 from the three-vote protocol and must go on
+    # loading, so the range is the writing protocol's business rather than the
+    # schema's. `None` on a gate-decided pair, where no call was made.
     vote_index: int | None = None
 
     # --- both ---
