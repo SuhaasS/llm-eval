@@ -78,6 +78,7 @@ import gzip
 import hashlib
 import json
 import os
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
@@ -105,6 +106,30 @@ def _build(klass: type, data: dict[str, Any]) -> Any:
     """
     known = {f.name for f in fields(klass)}
     return klass(**{k: v for k, v in data.items() if k in known})
+
+
+def _payload_strings(value: Any) -> Iterator[str]:
+    """Every string inside a payload, RAW, keys included.
+
+    Keys as well as values because a payload is assembled from records, and a
+    dict keyed by an environment variable name is a shape the builder is free
+    to produce -- a secret does not stop being one for sitting on the left of
+    the colon.
+
+    Ints, floats, bools and `None` are not recursed into because they cannot
+    carry a string. Everything else `json.dumps` accepts by default is a str,
+    dict or list, so this walk sees every character the payload contributes.
+    """
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str):
+                yield key
+            yield from _payload_strings(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _payload_strings(item)
 
 
 class PayloadSecretsFound(RuntimeError):
@@ -294,9 +319,22 @@ def write_payload(
     1. Canonicalise with `sort_keys=True`. The same payload assembled in a
        different dict order must produce the same bytes, or the sha stops
        identifying the payload and starts identifying the assembly.
-    2. Scan the canonical text for secrets and raise `PayloadSecretsFound`
-       BEFORE anything is created. The payload carries the repository source
-       shown to a third-party model.
+    2. Scan for secrets TWICE -- once over each raw string in the payload, once
+       over the canonical text -- and raise `PayloadSecretsFound` BEFORE
+       anything is created. The payload carries the repository source shown to
+       a third-party model.
+
+       Two scans because JSON escaping disarms the quote-anchored patterns.
+       `scanners._SECRET_PATTERNS["generic_api_key"]` requires the value to
+       follow ``[:=]\\s*['"]?`` immediately, and serialising puts a backslash in
+       between: measured, a candidate diff line reading
+       ``+api_key = "sk-live-…"`` -- the commonest shape there is -- scans clean
+       as canonical JSON and dirty as the raw string it came from. Scanning the
+       raw strings is therefore the primary check, not a refinement of the
+       canonical one. The canonical scan is kept as a backstop against
+       `_payload_strings` drifting out of step with what is actually
+       serialised, which is a silent divergence in the failing-open direction,
+       and it costs one pass over bytes already in hand.
     3. sha256 the UNCOMPRESSED canonical bytes, never the archive. A digest over
        the compressed form would move with the zlib level or a gzip header
        change, and a verdict whose recorded input digest no longer matches its
@@ -318,7 +356,10 @@ def write_payload(
     """
     canonical = json.dumps(payload, sort_keys=True).encode()
 
-    found = scan_secrets(canonical.decode())
+    found: set[str] = set()
+    for text in _payload_strings(payload):
+        found.update(scan_secrets(text))
+    found.update(scan_secrets(canonical.decode()))
     if found:
         raise PayloadSecretsFound(
             f"judge payload for {judgment_id} matched {', '.join(sorted(found))}; "

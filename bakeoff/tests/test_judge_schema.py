@@ -10,7 +10,10 @@ pairwise made no model call, so it carries no payload, no position assignment
 and no vote index -- and `None` there has to survive the round trip, because a
 `0` vote index on a comparison nobody voted on is a fabricated observation.
 
-The third is the payload store, which is where the interesting failure lives.
+The third is the payload store, which is where the interesting failures live.
+The secret scan reads the payload's STRINGS rather than its serialization,
+because JSON escaping disarms the quote-anchored patterns -- pinned below
+against the real scanner, both directions.
 `write_payload` promises a sha OF THE UNCOMPRESSED canonical JSON and a
 byte-stable `.gz`, and both are pinned here: the sha is recomputed
 independently, and the same payload written under two judgment ids must produce
@@ -38,11 +41,17 @@ from bakeoff.judge_schema import (
     read_payload,
     write_payload,
 )
+from bakeoff.scanners import scan_secrets
 
 # The canonical AWS documentation example. `scanners._SECRET_PATTERNS` matches
 # `AKIA` + 16 uppercase alphanumerics, so this is a string the scanner really
 # flags rather than one this test hopes it flags.
 FAKE_AWS_KEY = "AKIAIOSFODNN7EXAMPLE"
+
+# A double-quoted assignment, which is the commonest shape in JS, JSON and
+# Python source and the one JSON escaping hides. `generic_api_key` anchors on
+# the quote immediately after `=`, and serialising puts a backslash there.
+DOUBLE_QUOTED_SECRET_LINE = '+api_key = "sk-live-abcdefghijklmnopqrstuv"\n'
 
 
 def _common(**kw) -> dict:
@@ -250,6 +259,38 @@ def test_a_secret_in_the_payload_refuses_the_write_and_leaves_no_file(tmp_path: 
         write_payload(payloads, "j-secret", payload)
 
     assert "aws_access_key_id" in str(excinfo.value)
+    assert list(payloads.iterdir()) == []
+
+
+def test_a_double_quoted_secret_is_refused_though_json_escaping_hides_it(
+    tmp_path: Path,
+):
+    """The scan reads the payload's strings, not its serialization.
+
+    The first two assertions are the whole reason `write_payload` scans twice,
+    and they are asserted against the real scanner rather than described: the
+    same diff line is CLEAN as canonical JSON and DIRTY as the string it came
+    from, because `generic_api_key` anchors on the quote that `json.dumps`
+    escapes. A payload scanned only after serialization would write
+    `+api_key = "sk-live-..."` to disk unflagged while the identical bytes in a
+    wire log were caught (spec section 6.2) -- the scanner disarmed by the
+    storage format, which is silent in the direction of keeping the secret.
+
+    Nested one list and one dict deep, because the payload builder assembles
+    per-run structures and a walk that only looked at top-level values would
+    pass this test for the wrong reason.
+    """
+    payloads = tmp_path / "payloads"
+    payloads.mkdir()
+    payload = {"runs": [{"candidate_diff": DOUBLE_QUOTED_SECRET_LINE}]}
+
+    assert scan_secrets(DOUBLE_QUOTED_SECRET_LINE) == ["generic_api_key"]
+    assert scan_secrets(json.dumps(payload, sort_keys=True)) == []
+
+    with pytest.raises(PayloadSecretsFound) as excinfo:
+        write_payload(payloads, "j-quoted", payload)
+
+    assert "generic_api_key" in str(excinfo.value)
     assert list(payloads.iterdir()) == []
 
 
