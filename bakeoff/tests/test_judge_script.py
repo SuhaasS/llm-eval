@@ -1936,13 +1936,21 @@ def test_elo_is_a_function_of_the_outcome_multiset_not_its_order():
 
 
 def test_a_sixty_forty_split_between_two_arms_reads_as_about_seventy_elo():
-    """The scale has to MEAN something. Under Bradley-Terry a 60/40 split is a
-    strength ratio of 1.5, and 400*log10(1.5) is 69.7 rating points -- the same
+    """The scale has to MEAN something. Unregularised, a 60/40 split is a
+    strength ratio of 1.5 and 400*log10(1.5) = 70.44 rating points -- the
     number an Elo reader would quote for that split, which is the entire reason
     the ratings are reported on this scale rather than as raw strengths.
 
-    Tolerance is +-10 for the virtual tie, which pulls the pair very slightly
-    together (here to 60.5/40.5, worth about a third of a point).
+    The function returns 69.72, and the gap is the virtual tie, not an error in
+    the scale: the fit sees 60.5/40.5, and 400*log10(60.5/40.5) = 69.72. Both
+    formulas are written out because a reader who re-derives 70.44, finds 69.72
+    and has only the first one to compare against concludes the implementation
+    is 0.7 points off. The prior costs 0.72 points here, which is its whole
+    visible effect on a two-arm collection.
+
+    Tolerance is +-10: this test pins the SCALE -- that a 60/40 split reads as
+    tens of points and not as 494, which is what the sequential K-update
+    returned -- and it should not fail over a change to the prior.
     """
     outcomes = [("winner", "loser", 1.0)] * 60 + [("winner", "loser", 0.0)] * 40
 

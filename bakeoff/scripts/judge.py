@@ -1112,9 +1112,26 @@ def elo_from_outcomes(
     Half a point each way per played pair is the lightest prior that bounds
     both, and it is deliberately weak: at this bakeoff's size (~120-180
     comparisons per pair) it moves arms within ~50 rating points of each other
-    by under half a point, and about 1.5 points at a 100-point spread. It never
-    reorders, because it pulls every arm toward the anchor, not past a
-    neighbour.
+    by under a point, and about 1.5 points at a 100-point spread.
+
+    It can, however, REORDER, and the reason is worth stating exactly because
+    the obvious intuition -- that a pull toward the anchor compresses the table
+    without crossing anything -- is wrong. The prior is one tie per PAIR, not
+    per arm, so the shrinkage is UNEVEN across arms: an arm whose comparisons
+    sit in sparse pairs is pulled harder than one whose comparisons sit in
+    dense pairs, and uneven shrinkage can cross two arms rather than merely
+    compress them. Equal per-pair counts are not a property this function may
+    assume -- a resumed batch, an arm added partway through a collection, and
+    dropped comparisons all skew them.
+
+    Two independent sweeps against the unregularised fit agree on the shape: at
+    comparable per-pair counts, no reorder in thousands of trials; at a large
+    per-pair imbalance (~18x), single-digit-per-thousand flips. The exact rate
+    depends on the comparison schedule and the true spread, so it is not a
+    constant worth quoting. What held across both sweeps is the bound that
+    matters: every flip observed was between arms the unregularised fit
+    separates by a fraction of a point (~0.2), which is far inside the
+    resolution the kappa caveat above already says these numbers do not have.
 
     Ties are half a win each way, matching the matrix's `win_rate_x`. If the
     two scored a draw differently they would rank differently off one
