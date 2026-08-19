@@ -81,6 +81,8 @@ from bakeoff.schema import (
 
 from scripts.grade import grades_path
 from scripts.judge import (
+    BOOTSTRAP_RESAMPLES,
+    BOOTSTRAP_SEED,
     ELO_ANCHOR,
     ELO_SCALE,
     KAPPA_CAVEAT,
@@ -2649,6 +2651,387 @@ def test_old_three_vote_lines_aggregate_and_never_pool_with_two_vote_ones():
     assert set(summary["elo"]) == {old, new}
 
 
+# --------------------------------------------------------------------------
+# 7a. what the numbers are WORTH: intervals, the voted-only decomposition,
+#     and the position-swap probe
+# --------------------------------------------------------------------------
+#
+# §10.3: "any metric reported without a confidence interval is not reported",
+# and §4.4 says which interval -- a cluster bootstrap over TASKS, because
+# comparisons inside one task are correlated and a naive binomial band is
+# several times too narrow. The other two sections here are about what a rate
+# is made of: how much of it the deterministic ladder decided rather than the
+# judge (§10.1's 40% reference is a TIER B number, and gate-decided
+# comparisons carry Tier A's pass rate into it), and whether the judge said the
+# same thing in both forced positions (§4.2.3's position-swap probe, free now
+# that every v2 comparison is judged in both orders).
+
+
+def _voted_pair(run_id_a, run_id_b, verdict, **kw):
+    """One complete v2 comparison: both forced positions, agreeing."""
+    return [
+        _vote(run_id_a, run_id_b, verdict, vote_index=0, **kw),
+        _vote(run_id_a, run_id_b, verdict, vote_index=1, **kw),
+    ]
+
+
+def test_voted_only_win_rates_are_reported_beside_combined_and_never_divide_by_zero():
+    """A gate-decided comparison is a TIER A result standing in a Tier B
+    number, so a combined win rate is part pass rate and part judgment -- and
+    nothing on the printout said which part. §10.1 reports Tier B pairwise win
+    rates against a 40% reference; read off the combined rate alone, two arms
+    the judge cannot separate at all land either side of it purely on their
+    gate results.
+
+    The fixture is exactly that collection: the judge preferred `model-one` in
+    both comparisons it was asked about, the ladder settled the other two the
+    other way, and the combined rate is a dead heat that neither channel
+    reported. The voted-only rate and the voted-only rating are what make the
+    decomposition visible.
+
+    `None` and never `0.0` when a pair holds no judged comparison: 0/0 is a
+    `ZeroDivisionError` out of the middle of a summary a 40-hour batch already
+    paid for, and a `0.0` printed in its place is a win rate of zero -- the
+    judge's worst possible verdict -- reported for a judge that was never
+    asked.
+    """
+    judgments = [
+        *_voted_pair("run-a", "run-b", "a", sample_index=0),
+        *_voted_pair("run-a", "run-b", "a", sample_index=1),
+        _gate("run-a", "run-b", "b", sample_index=2),
+        _gate("run-a", "run-b", "b", sample_index=3),
+    ]
+
+    summary = summarize(judgments, MODEL_OF)
+
+    row = summary["comparisons"][_judge_gen()][("model-one", "model-two")]
+    assert row["win_rate_x"] == pytest.approx(0.5)
+    assert row["win_rate_x_voted"] == pytest.approx(1.0)
+    # The same split in the ratings: pooled, the two channels cancel to the
+    # anchor and the table prints a dead heat the judge never reported.
+    combined = summary["elo"][_judge_gen()]
+    voted = summary["elo_voted"][_judge_gen()]
+    assert combined["model-one"] == pytest.approx(combined["model-two"])
+    assert voted["model-one"] > voted["model-two"]
+
+    settled = summarize([_gate("run-a", "run-b", "a")], MODEL_OF)
+    only_gate = settled["comparisons"][_judge_gen()][("model-one", "model-two")]
+    assert only_gate["win_rate_x"] == pytest.approx(1.0)
+    assert only_gate["win_rate_x_voted"] is None
+    # And no rating either: an empty table says "nothing was voted on here",
+    # where a table of anchors would say "the judge called it a dead heat".
+    assert settled["elo_voted"][_judge_gen()] == {}
+
+
+def test_gate_decided_share_is_reported_per_arm_per_generation():
+    """How much of an arm's block the judge never saw, said out loud.
+
+    The voted-only rate says what the judge thought; this says how much weight
+    it carries. An arm whose comparisons are three-quarters gate-decided has a
+    Tier B row that is mostly Tier A's pass rate re-derived, and that is a fact
+    about THAT arm -- a shared block-level count would average a heavily gated
+    arm together with one the ladder never touched.
+    """
+    other = "openai.gpt-5.6-luna"
+    judgments = [
+        *_voted_pair("run-a", "run-b", "a", sample_index=0),
+        _gate("run-a", "run-b", "a", sample_index=1),
+        _gate("run-a", "run-c", "a", sample_index=2),
+        _gate("run-a", "run-b", "a", sample_index=3, judge_model_id=other),
+    ]
+
+    share = summarize(judgments, MODEL_OF)["gate_decided_share"]
+
+    assert share[_judge_gen()] == {
+        "model-one": {"comparisons": 3, "gate_decided": 2},
+        "model-three": {"comparisons": 1, "gate_decided": 1},
+        "model-two": {"comparisons": 2, "gate_decided": 1},
+    }
+    # Per generation, for the matrix's reason: the second oracle read one
+    # comparison of this collection, not a fourth of the first oracle's three.
+    assert share[_judge_gen(other)] == {
+        "model-one": {"comparisons": 1, "gate_decided": 1},
+        "model-two": {"comparisons": 1, "gate_decided": 1},
+    }
+
+
+def test_position_consistency_counts_agreement_across_the_two_forced_positions():
+    """§4.2.3 asks for a position-swap probe on a subset. Under two forced
+    positions every complete comparison IS the probe, so it is computed over
+    the whole collection and costs nothing extra.
+
+    MEASURABLE means the comparison's votes cover both positions; CONSISTENT
+    means every canonical verdict in it is the same word. A comparison whose
+    two positions disagree is the judge preferring whichever submission it saw
+    first -- `majority` already scores it a tie, and this is the count that
+    says how often that happened rather than leaving a reader to infer it from
+    the tie column, which also holds honest ties.
+
+    A gate-decided comparison has no votes and therefore no positions: it is
+    neither measurable nor inconsistent, and counting it either way would put
+    the ladder's arithmetic inside a rate about the judge's.
+    """
+    judgments = [
+        *_voted_pair("run-a", "run-b", "a", sample_index=0),
+        _vote("run-a", "run-b", "a", vote_index=0, sample_index=1),
+        _vote("run-a", "run-b", "b", vote_index=1, sample_index=1),
+        _gate("run-a", "run-b", "a", sample_index=2),
+    ]
+
+    summary = summarize(judgments, MODEL_OF)
+
+    assert summary["position_consistency"][_judge_gen()] == {
+        "measurable": 2, "consistent": 1, "rate": 0.5, "single_position": 0,
+    }
+
+
+def test_a_v2_comparison_decided_on_one_position_is_counted_and_not_measurable():
+    """One position's vote errored and the other's is on disk, so the verdict
+    rests on a single order -- exactly the position bias forced positions exist
+    to cancel, and the aggregation cannot see it: the comparison resolves
+    through `majority` like any other and enters the matrix as one comparison.
+
+    It is NOT measurable -- there is nothing to compare it against -- and it is
+    counted, because "the judge agreed with itself on 100% of 4 measurable
+    comparisons" over a block where 30 more verdicts each rest on one position
+    is a consistency rate reported over a denominator nobody can see.
+    """
+    judgments = [
+        _vote("run-a", "run-b", "a", vote_index=0, sample_index=0),
+        *_voted_pair("run-a", "run-b", "a", sample_index=1),
+    ]
+
+    summary = summarize(judgments, MODEL_OF)
+
+    assert summary["position_consistency"][_judge_gen()] == {
+        "measurable": 1, "consistent": 1, "rate": 1.0, "single_position": 1,
+    }
+    # Still one comparison each in the matrix: visible, not dropped.
+    assert summary["comparisons"][_judge_gen()][
+        ("model-one", "model-two")
+    ]["comparisons"] == 2
+
+
+def test_an_old_three_vote_comparison_is_measurable_only_when_both_positions_appear():
+    """ONE rule for both protocols, which is why it is written about positions
+    rather than about vote counts.
+
+    v1 drew its three positions at random, so a v1 comparison is a position
+    probe only when the draw happened to split -- and the draw that landed on
+    one order three times is the case the rule has to refuse, because all three
+    of its verdicts share whatever bias that order carries. Written as "a v1
+    comparison is measurable" it would report agreement between three views of
+    the same position as agreement across positions.
+    """
+    judgments = [
+        # The draw landed a_first three times: no swap in it to probe.
+        *[_vote("run-a", "run-b", verdict, vote_index=index, sample_index=0,
+                judge_prompt_version=1, position_assignment="a_first")
+          for index, verdict in enumerate(("a", "a", "b"))],
+        # A draw that split, and agreed everywhere it landed.
+        *[_vote("run-a", "run-b", "a", vote_index=index, sample_index=1,
+                judge_prompt_version=1, position_assignment=position)
+          for index, position in enumerate(("a_first", "a_first", "b_first"))],
+        # A draw that split and disagreed across the two orders.
+        *[_vote("run-a", "run-b", verdict, vote_index=index, sample_index=2,
+                judge_prompt_version=1, position_assignment=position)
+          for index, (verdict, position) in enumerate(
+              (("a", "a_first"), ("a", "b_first"), ("b", "b_first")))],
+    ]
+
+    summary = summarize(judgments, MODEL_OF)
+
+    assert summary["position_consistency"][_judge_gen(prompt_version=1)] == {
+        "measurable": 2, "consistent": 1, "rate": 0.5, "single_position": 1,
+    }
+
+
+def test_win_rate_intervals_are_task_clustered_so_one_task_collections_collapse_to_the_point():
+    """§4.4, and the reason it is stated in the spec at all: attempts inside
+    one task are correlated, so effective sample size tracks the TASK count and
+    not the comparison count. Ten comparisons on one task are ten reads of one
+    task's difficulty; resampling them independently would print a +-15-point
+    band off a collection whose real uncertainty about the population of tasks
+    is unbounded.
+
+    The degenerate interval is the honest one here and it is what pins the
+    clustering: a comparison-level bootstrap cannot produce it, and the same
+    ten comparisons spread over ten tasks give the wide band underneath.
+    """
+    pair = ("model-one", "model-two")
+    one_task = [
+        vote
+        for sample in range(10)
+        for vote in _voted_pair(
+            "run-a", "run-b", "a" if sample < 7 else "b",
+            sample_index=sample, task_id="one-task",
+        )
+    ]
+
+    row = summarize(one_task, MODEL_OF)["comparisons"][_judge_gen()][pair]
+
+    assert row["win_rate_x"] == pytest.approx(0.7)
+    assert row["win_rate_x_ci95"] == (row["win_rate_x"], row["win_rate_x"])
+
+    spread = [
+        vote
+        for sample in range(10)
+        for vote in _voted_pair(
+            "run-a", "run-b", "a" if sample < 7 else "b",
+            sample_index=sample, task_id=f"task-{sample}",
+        )
+    ]
+
+    wide = summarize(spread, MODEL_OF)["comparisons"][_judge_gen()][pair]
+
+    low, high = wide["win_rate_x_ci95"]
+    assert wide["win_rate_x"] == pytest.approx(0.7)
+    assert low < wide["win_rate_x"] < high
+    # Ten tasks is a small collection and the band says so, rather than
+    # reporting the 0.7 as though it were resolved.
+    assert high - low > 0.3
+
+
+def test_elo_intervals_follow_task_resamples():
+    """The rating table is descriptive of the win rates, so its interval is
+    taken the same way: refit Bradley-Terry on every task resample and read the
+    percentiles off the refits. A rating printed without one invites exactly
+    the reading §4.3 forbids -- a 40-point gap taken for a result when the
+    collection cannot resolve 200.
+
+    Two tasks that disagree completely are the sharp case: a quarter of the
+    resamples draw only the task `model-one` swept, a quarter only the task it
+    lost, and the interval has to span both rather than concentrate around the
+    dead heat the pooled fit reports.
+    """
+    one_task = [
+        vote
+        for sample in range(4)
+        for vote in _voted_pair("run-a", "run-b", "a", sample_index=sample,
+                                task_id="one-task")
+    ]
+
+    settled = summarize(one_task, MODEL_OF)
+
+    rating = settled["elo"][_judge_gen()]["model-one"]
+    assert settled["elo_ci95"][_judge_gen()]["model-one"] == (rating, rating)
+
+    split = [
+        vote
+        for task, verdict in (("task-1", "a"), ("task-2", "b"))
+        for sample in range(4)
+        for vote in _voted_pair("run-a", "run-b", verdict,
+                                sample_index=sample, task_id=task)
+    ]
+
+    summary = summarize(split, MODEL_OF)
+
+    point = summary["elo"][_judge_gen()]["model-one"]
+    low, high = summary["elo_ci95"][_judge_gen()]["model-one"]
+    assert point == pytest.approx(ELO_ANCHOR)
+    assert low < point < high
+    assert high - low > 100.0
+
+
+def test_the_bootstrap_is_seeded_and_two_summaries_of_one_file_agree_exactly():
+    """A resampled interval that moves between two readings of one unchanged
+    file is an interval a reader cannot diff, cite or reproduce -- and it moves
+    in the last digit, which is where it looks like a real change in the
+    collection rather than like noise the summary invented.
+
+    `random.Random(BOOTSTRAP_SEED)` per call, not a module-level generator:
+    module state would make the numbers depend on how many summaries this
+    process had already taken.
+
+    The constants are pinned to their literals for `test_ratings_are_mean_
+    anchored`'s reason -- an interval whose resample count nobody recorded is
+    a number nobody can reproduce -- and the band is asserted non-degenerate so
+    the equality above has something to be equal about.
+    """
+    assert (BOOTSTRAP_RESAMPLES, BOOTSTRAP_SEED) == (1000, 0)
+
+    judgments = [
+        vote
+        for sample in range(8)
+        for vote in _voted_pair(
+            "run-a", "run-b", "a" if sample % 3 else "b",
+            sample_index=sample, task_id=f"task-{sample}",
+        )
+    ]
+
+    first = summarize(judgments, MODEL_OF)
+    second = summarize(judgments, MODEL_OF)
+
+    assert first == second
+    low, high = first["comparisons"][_judge_gen()][
+        ("model-one", "model-two")
+    ]["win_rate_x_ci95"]
+    assert low < high
+    ratings = first["elo_ci95"][_judge_gen()]
+    assert all(low < high for low, high in ratings.values())
+
+
+def test_a_three_vote_generation_and_a_two_vote_generation_report_side_by_side_never_pooled():
+    """Every number added here partitions the way the matrix does. A judgment
+    file outlives a protocol change and holds both, so a consistency rate, a
+    gate-decided share, a voted-only rate or an interval computed across the
+    two would describe a collection nobody ran.
+
+    One task throughout, so every interval collapses to its point estimate and
+    the expected numbers can be read straight off the fixture rather than off
+    a resample.
+    """
+    judgments = [
+        # v1: three votes, the draw split, and the two orders disagreed.
+        *[_vote("run-a", "run-b", verdict, vote_index=index, sample_index=0,
+                judge_prompt_version=1, position_assignment=position)
+          for index, (verdict, position) in enumerate(
+              (("a", "a_first"), ("b", "b_first"), ("a", "b_first")))],
+        # v2: one judged comparison, both positions agreeing on b ...
+        *_voted_pair("run-a", "run-b", "b", sample_index=0),
+        # ... and one the ladder settled the other way.
+        _gate("run-a", "run-b", "a", sample_index=1),
+    ]
+
+    summary = summarize(judgments, MODEL_OF)
+
+    old, new = _judge_gen(prompt_version=1), _judge_gen()
+    pair = ("model-one", "model-two")
+    for key in ("position_consistency", "gate_decided_share", "elo_voted",
+                "elo_ci95"):
+        assert set(summary[key]) == {old, new}, key
+
+    assert summary["position_consistency"][old] == {
+        "measurable": 1, "consistent": 0, "rate": 0.0, "single_position": 0,
+    }
+    assert summary["position_consistency"][new] == {
+        "measurable": 1, "consistent": 1, "rate": 1.0, "single_position": 0,
+    }
+    # The v1 generation holds no gate-decided comparison and the v2 one is half
+    # gate-decided. Pooled, both arms would read 1 of 3.
+    assert summary["gate_decided_share"][old]["model-one"] == {
+        "comparisons": 1, "gate_decided": 0,
+    }
+    assert summary["gate_decided_share"][new]["model-one"] == {
+        "comparisons": 2, "gate_decided": 1,
+    }
+    # The decomposition is the same arithmetic on a three-vote comparison as on
+    # a two-vote one: majority first, then voted-only over what the judge saw.
+    assert summary["comparisons"][old][pair]["win_rate_x_voted"] == (
+        pytest.approx(1.0)
+    )
+    assert summary["comparisons"][new][pair]["win_rate_x"] == (
+        pytest.approx(0.5)
+    )
+    assert summary["comparisons"][new][pair]["win_rate_x_voted"] == (
+        pytest.approx(0.0)
+    )
+    # One task per block, so each interval is that block's point estimate --
+    # and the two points differ, which a pooled bootstrap could not report.
+    assert summary["comparisons"][old][pair]["win_rate_x_ci95"] == (1.0, 1.0)
+    assert summary["comparisons"][new][pair]["win_rate_x_ci95"] == (0.5, 0.5)
+
+
 def test_the_comparison_key_carries_the_generation_the_matrix_partitions_on():
     """The matrix reads the generation back off the tail of a
     `_comparison_key`. Two independent derivations of "which oracle is this"
@@ -3433,6 +3816,41 @@ def test_the_printed_matrix_and_elo_table_name_the_generation_over_each_block(
     # The pooled shape this partition exists to prevent: one row saying 1-1
     # over two comparisons, which reads as a dead heat neither judge reported.
     assert "over 2 comparison(s)" not in out
+
+
+def test_every_number_the_summary_gained_prints_above_the_kappa_caveat(capsys):
+    """The caveat qualifies "every number above", so a number printed after it
+    is a number reported without it -- and these four are the ones a reader is
+    most likely to carry into a decision: an interval, the rate with the
+    ladder's comparisons taken out, how much of the block the ladder decided,
+    and whether the judge said the same thing in both positions.
+
+    Asserted by POSITION, not by presence. `_print_reading` is one function and
+    the caveat is in `print_summary`'s `finally`, so a section appended in the
+    wrong place still prints -- just underneath the line that qualifies it.
+    """
+    result = _empty_result()
+    result["summary"] = summarize(
+        [
+            *_voted_pair("run-a", "run-b", "a", sample_index=0,
+                         task_id="task-1"),
+            *_voted_pair("run-a", "run-b", "b", sample_index=1,
+                         task_id="task-2"),
+            _gate("run-a", "run-b", "a", sample_index=2, task_id="task-2"),
+        ],
+        MODEL_OF,
+    )
+
+    print_summary(result)
+
+    out = capsys.readouterr().out
+    for marker in ("95%", "judge-voted only", "position consistency",
+                   "gate-decided share"):
+        assert marker in out, marker
+        assert out.index(marker) < out.index(KAPPA_CAVEAT), marker
+    # The interval itself, beside the rate and beside the rating.
+    assert re.search(r"model-one \d+\.\d% \[\d+\.\d%, \d+\.\d%\]", out)
+    assert re.search(r"model-one\s+\d+\.\d\s+\[\s*\d+\.\d,\s+\d+\.\d\]", out)
 
 
 def test_the_summary_mentions_a_superseded_gate_decided_line_when_there_is_one(

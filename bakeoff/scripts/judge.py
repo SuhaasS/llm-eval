@@ -165,6 +165,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import math
+import random
 import sys
 import time
 import uuid
@@ -294,6 +295,28 @@ ELO_ANCHOR = 1000.0
 #: worse than an imprecise rating.
 _BT_TOLERANCE = 1e-10
 _BT_MAX_ITERATIONS = 10_000
+
+#: The cluster bootstrap behind every interval on the printout. §10.3: "any
+#: metric reported without a confidence interval is not reported", and §4.4
+#: says which interval -- resampled over TASKS, because comparisons inside one
+#: task are correlated and effective sample size tracks the task count rather
+#: than the comparison count. Resampling comparisons independently would print
+#: a band several times too narrow, which is worse than printing none: a naive
+#: +-4 points reads as a resolved result where the honest figure is nearer +-12
+#: and the spec says in as many words that the optimistic figures "must not be
+#: quoted".
+#:
+#: 1,000 resamples: the 2.5/97.5 percentiles are stable to well under the
+#: tenth of a point the printout shows, and the cost is bounded by the refit --
+#: measured at ~0.1s per thousand fits on a four-arm, 60-comparison block, and
+#: a few seconds on a full 60-task collection, at the end of a pass that took
+#: hours. A SEED rather than fresh entropy, and a fresh generator per
+#: `summarize` call rather than module state: two readings of one unchanged
+#: file must print one interval, or the band appears to move while nothing
+#: about the collection did -- and it moves in the last digit, where it looks
+#: like a change in the numbers rather than like noise the summary invented.
+BOOTSTRAP_RESAMPLES = 1000
+BOOTSTRAP_SEED = 0
 
 #: §4.3: at κ below 0.6 a judge-derived number is directional only, and an
 #: UNMEASURED κ is below 0.6 by construction -- OPEN-5 is blocked on people, not
@@ -1981,6 +2004,19 @@ def _generation_of(key: tuple) -> tuple:
     return key[-_GENERATION_FIELDS:]
 
 
+def _task_of(key: tuple) -> str:
+    """The task a `_comparison_key` belongs to -- its first element.
+
+    `_generation_of`'s counterpart at the other end of the key, and here for
+    the same reason: the bootstrap clusters on this field, and a hand-counted
+    index beside a key whose layout moved would resample the wrong column --
+    `sample_index` would cluster on the repeat rather than the task, which is
+    precisely the correlation §4.4 says the interval must not ignore, and it
+    would fail by printing a NARROWER band rather than by raising.
+    """
+    return key[0]
+
+
 def _comparison_key(judgment: JudgeRecord) -> tuple:
     """One COMPARISON: this pair, at this sample, under one judge generation.
 
@@ -2185,6 +2221,135 @@ def elo_from_outcomes(
     )
 
 
+def _task_blocks(
+    task_ids: list[str],
+    outcomes: list[tuple[str, str, float]],
+    cells: list[tuple[tuple[str, str], float]],
+) -> list[tuple[tuple, tuple]]:
+    """The three PARALLEL lists, regrouped into one block per task.
+
+    `task_ids[i]`, `outcomes[i]` and `cells[i]` are three views of comparison
+    `i`: which task it came from, its `elo_from_outcomes` triple, and its
+    (sorted pair, x's score) cell for the matrix. They are parallel rather than
+    one list of wide records because `elo_from_outcomes` takes triples and
+    nothing else: widening its input to carry a `task_id` would put a field it
+    must never read into the contract every caller and every test writes
+    against, and the fit is defined over win counts -- a rating that varied
+    with the task labels attached to identical counts would be a bug that only
+    this function could cause.
+
+    A BLOCK IS THE RESAMPLING UNIT (§4.4). Comparisons inside one task share
+    that task's difficulty, so they travel together or the interval measures a
+    sample size the collection does not have.
+
+    Blocks come back in `_deterministic` order, and the comparisons inside each
+    keep the order they were walked in, so a one-task collection resamples to
+    the identical triple list every time and its interval collapses onto the
+    point estimate exactly rather than to within a float wobble of it.
+    """
+    blocks: dict[str, tuple[list, list]] = {}
+    for task_id, outcome, cell in zip(task_ids, outcomes, cells):
+        block = blocks.get(task_id)
+        if block is None:
+            block = blocks[task_id] = ([], [])
+        block[0].append(outcome)
+        block[1].append(cell)
+    return [
+        (tuple(blocks[task_id][0]), tuple(blocks[task_id][1]))
+        for task_id in _deterministic(blocks)
+    ]
+
+
+def _cluster_bootstrap(
+    blocks: list[tuple[tuple, tuple]], rng: random.Random,
+) -> tuple[dict[tuple[str, str], list[float]], dict[str, list[float]]]:
+    """`BOOTSTRAP_RESAMPLES` draws of the task set, with replacement.
+
+    Returns the resampled win rates per pair and the resampled ratings per
+    model -- the samples themselves rather than percentiles, because a caller
+    that finds a pair or an arm missing from every resample has to fall back to
+    the point estimate, and that decision belongs where the point estimate is.
+
+    THE WHOLE COLLECTION IS RESAMPLED ONCE PER DRAW, not once per pair: the
+    pairs in a block are the same tasks seen from different sides, and drawing
+    independently per pair would produce a set of intervals no single
+    collection could have produced.
+
+    The rating is REFIT on every draw rather than perturbed, which is what
+    `elo_from_outcomes` being a maximum-likelihood fit over win counts buys:
+    the fit is a function of the resampled counts alone, with no walk order to
+    carry over from the original stream.
+
+    Allocation-light on purpose -- this runs 1,000 times inside every summary,
+    including the ones in the test suite. The triples inside a block are stored
+    once and REFERENCED by each draw (they are never mutated), the pair tally
+    is a two-slot list updated in place, and the only per-draw allocations are
+    the draw itself and the triple list the fit needs.
+    """
+    rate_samples: dict[tuple[str, str], list[float]] = {}
+    rating_samples: dict[str, list[float]] = {}
+    if not blocks:
+        return rate_samples, rating_samples
+
+    for _ in range(BOOTSTRAP_RESAMPLES):
+        outcomes: list[tuple[str, str, float]] = []
+        tally: dict[tuple[str, str], list] = {}
+        for block_outcomes, block_cells in rng.choices(blocks, k=len(blocks)):
+            outcomes.extend(block_outcomes)
+            for pair, score_x in block_cells:
+                counted = tally.get(pair)
+                if counted is None:
+                    tally[pair] = [score_x, 1]
+                else:
+                    counted[0] += score_x
+                    counted[1] += 1
+        for pair, (points_x, comparisons) in tally.items():
+            rate_samples.setdefault(pair, []).append(points_x / comparisons)
+        for model, rating in elo_from_outcomes(outcomes).items():
+            rating_samples.setdefault(model, []).append(rating)
+    return rate_samples, rating_samples
+
+
+def _interval(
+    samples: list[float] | None, point: float,
+) -> tuple[float, float]:
+    """The 95% interval over one quantity's resamples: 2.5th to 97.5th.
+
+    A pair or an arm can be ABSENT from a resample -- the tasks that hold it
+    were not drawn -- and the percentiles are then taken over the resamples
+    where it appears. That is a conditional interval and it is the honest one
+    available: the alternative readings are to score the missing draws as some
+    number the collection never produced, or to widen the interval by the
+    probability of the arm being drawn at all, which measures the sampler
+    rather than the arms. An arm that is missing from EVERY resample cannot
+    have been in the collection either, so the fallback there is the point
+    estimate rather than a band around nothing.
+    """
+    if not samples:
+        return (point, point)
+    ordered = sorted(samples)
+    return (_percentile(ordered, 0.025), _percentile(ordered, 0.975))
+
+
+def _percentile(ordered: list[float], fraction: float) -> float:
+    """Linear-interpolated percentile over an ALREADY SORTED list.
+
+    Interpolated rather than nearest-rank so the two ends of the interval move
+    smoothly with the collection: at 1,000 resamples the difference is far
+    inside the tenth of a point the printout shows, but nearest-rank makes the
+    printed band jump by a whole resample's width when one comparison is added,
+    which reads as a change in the collection.
+    """
+    position = (len(ordered) - 1) * fraction
+    below = math.floor(position)
+    above = math.ceil(position)
+    if below == above:
+        return ordered[below]
+    return ordered[below] + (ordered[above] - ordered[below]) * (
+        position - below
+    )
+
+
 def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
     """Win rates, a rubric profile and an Elo table over the judgment file.
 
@@ -2199,7 +2364,7 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
     never does, which is the whitelist chokepoint's business, not this
     function's.
 
-    Three aggregation rules, each placed against a specific way an append-only
+    Six aggregation rules, each placed against a specific way an append-only
     file produces a confident, wrong number:
 
     1. **Dedupe to the last line per resume identity, before anything else.** A
@@ -2228,11 +2393,41 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
        two oracles nobody asked for a joint opinion -- silently, and with the
        right shape. This is `_comparison_key`'s partition and
        `_rubric_profile`'s, carried into the report they feed.
+    5. **Every rate is decomposed into what the judge said and what the ladder
+       decided.** A gate-decided comparison is a TIER A result, and counting it
+       in a Tier B win rate -- which is correct, see below -- means a row with
+       a large gate-decided share is partly Tier A's pass rate re-derived. Two
+       arms a judge cannot separate at all can sit either side of §10.1's 40%
+       pairwise reference on their gate results alone. So `win_rate_x_voted`
+       and `elo_voted` are reported beside the combined figures, and
+       `gate_decided_share` says per ARM how much of its block the judge never
+       saw. Nothing is subtracted from the primary numbers; the reader is given
+       both halves instead of one blend.
+    6. **Position consistency is counted, not assumed.** §4.2.3 asks for a
+       position-swap probe; under two forced positions every complete
+       comparison is one, so `position_consistency` reports it over the whole
+       collection. A comparison is MEASURABLE when its votes cover both
+       positions and CONSISTENT when every canonical verdict in it is the same
+       word -- one rule for both protocols, which is why it is written about
+       positions rather than vote counts: a v1 comparison whose random draw
+       landed on one order three times is three views of one position, and
+       `single_position` counts it (with the v2 comparisons whose other vote
+       errored) rather than letting a rate be reported over a denominator
+       nobody can see.
 
     A gate-decided comparison IS a win for `gate_decided_by`'s side in the win
     rates and in Elo -- the objective result settled it, which is a result about
     the arm. Rule 3 is about the vote census, which is a different question:
-    what did the judge say when asked.
+    what did the judge say when asked. Rule 5 is a third: how much of this
+    number is the judge's opinion at all.
+
+    EVERY RATE AND EVERY RATING CARRIES A 95% INTERVAL (§10.3: "any metric
+    reported without a confidence interval is not reported"), taken as a
+    cluster bootstrap over TASKS -- see `BOOTSTRAP_RESAMPLES` and
+    `_cluster_bootstrap`. The clustering is the whole content: comparisons
+    inside one task are correlated, so an interval that resamples comparisons
+    independently is several times too narrow and fails by printing precision
+    the collection does not have.
 
     `dropped` counts what could not be aggregated, per reason, rather than
     letting any of it disappear: a line whose arm cannot be named, a comparison
@@ -2280,17 +2475,35 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
         vote_verdicts[judgment.verdict] += 1
         # `-1` for a vote line carrying no index -- only a hand-edited line can.
         # It sorts first and is stable, which is all the ordering has to be.
+        #
+        # The POSITION travels with the verdict, and is read only by the
+        # consistency count below. It is deliberately not part of the sort key:
+        # `position_assignment` is nullable, and `sorted` over a tuple mixing
+        # `None` with a string raises `TypeError`, which would take down the
+        # summary of a paid batch over a field the ordering does not use.
         votes_by.setdefault(key, []).append(
             (judgment.vote_index if judgment.vote_index is not None else -1,
-             judgment.verdict)
+             judgment.verdict, judgment.position_assignment)
         )
 
     superseded = 0
     # Rule 4: keyed on the generation FIRST. Both walks below stay inside one
     # oracle's verdicts, so neither a comparison count nor a rating fit can
-    # cross from one generation into another's numbers.
+    # cross from one generation into another's numbers. Every structure filled
+    # in this walk is keyed that way, the four added ones included: a
+    # consistency rate, a gate-decided share, a voted-only rate and an interval
+    # each describe ONE oracle's reading of this collection.
     outcomes: dict[tuple, list[tuple[str, str, float]]] = {}
+    # PARALLEL to `outcomes`, index for index: which task each triple came from
+    # (the bootstrap's cluster) and which matrix cell it lands in. Kept beside
+    # the triples rather than inside them -- see `_task_blocks`.
+    clusters: dict[tuple, list[str]] = {}
+    cells: dict[tuple, list[tuple[tuple[str, str], float]]] = {}
+    voted_outcomes: dict[tuple, list[tuple[str, str, float]]] = {}
+    voted_points: dict[tuple, dict[tuple[str, str], float]] = {}
     pairs: dict[tuple, dict[tuple[str, str], dict[str, int]]] = {}
+    gate_share: dict[tuple, dict[str, dict[str, int]]] = {}
+    consistency: dict[tuple, dict[str, int]] = {}
 
     for key in _deterministic(set(votes_by) | set(gate_by)):
         vote_lines = votes_by.get(key)
@@ -2300,7 +2513,10 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
                 superseded += 1
             # `majority` cannot see an empty sequence here: the bucket exists
             # only because a vote line landed in it.
-            winner = majority([verdict for _, verdict in sorted(vote_lines)])
+            winner = majority([
+                verdict for _, verdict, _ in
+                sorted(vote_lines, key=lambda line: line[:2])
+            ])
             settled = "voted"
         else:
             winner = gate
@@ -2320,17 +2536,72 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
 
         generation = _generation_of(key)
         score_a = {"a": 1.0, "b": 0.0}.get(winner, 0.5)
-        outcomes.setdefault(generation, []).append(
-            (model_a, model_b, score_a)
-        )
+        outcome = (model_a, model_b, score_a)
+        outcomes.setdefault(generation, []).append(outcome)
+        clusters.setdefault(generation, []).append(_task_of(key))
 
         # The matrix is keyed on the two model names SORTED, so `(x, y)` and
         # `(y, x)` are one row -- the same reason `run_id_a`/`run_id_b` are
         # canonical on the record. Inside ONE generation's block: see rule 4.
         model_x, model_y = sorted((model_a, model_b))
         score_x = score_a if model_x == model_a else 1.0 - score_a
+        pair = (model_x, model_y)
+        cells.setdefault(generation, []).append((pair, score_x))
+
+        # Rule 5, and the reason the decomposition is taken here rather than
+        # subtracted from the totals later: a gate-decided comparison is a
+        # TIER A result standing in a Tier B number. Kept apart, the two
+        # channels can be read against each other; blended, a §10.1 pairwise
+        # figure is part pass rate and nothing on the printout says how much.
+        if settled == "voted":
+            voted_outcomes.setdefault(generation, []).append(outcome)
+            points = voted_points.setdefault(generation, {})
+            points[pair] = points.get(pair, 0.0) + score_x
+        share = gate_share.setdefault(generation, {})
+        for model in (model_a, model_b):
+            # PER ARM, not per block: an arm the ladder settled three
+            # comparisons in four is carrying a Tier A pass rate into its Tier
+            # B row, and a block-level count would average it together with an
+            # arm the ladder never touched.
+            arm = share.setdefault(
+                model, {"comparisons": 0, "gate_decided": 0}
+            )
+            arm["comparisons"] += 1
+            if settled == "gate_decided":
+                arm["gate_decided"] += 1
+
+        # Rule 6: §4.2.3's position-swap probe, one rule for both protocols.
+        # MEASURABLE is about the POSITIONS a comparison's votes covered and
+        # never about how many votes it has -- v1 drew its three positions at
+        # random, so a v1 comparison probes the swap only when the draw
+        # happened to split, and three views of one position agreeing says
+        # nothing about position at all. A gate-decided comparison has no
+        # votes and so no positions, and is counted in neither column.
+        counts = consistency.setdefault(
+            generation,
+            {"measurable": 0, "consistent": 0, "single_position": 0},
+        )
+        if vote_lines:
+            positions = {
+                position for _, _, position in vote_lines
+                if position in VOTE_POSITIONS
+            }
+            if len(positions) == len(VOTE_POSITIONS):
+                counts["measurable"] += 1
+                if len({verdict for _, verdict, _ in vote_lines}) == 1:
+                    counts["consistent"] += 1
+            elif positions:
+                # One position only: a v2 comparison whose other vote errored,
+                # or a v1 draw that never split. The verdict carries whatever
+                # bias that order has and there is nothing to cancel it
+                # against, which is invisible in every other number here -- it
+                # resolves through `majority` and enters the matrix like any
+                # other comparison. Counted so a consistency rate is read
+                # beside how many verdicts it could not cover.
+                counts["single_position"] += 1
+
         row = pairs.setdefault(generation, {}).setdefault(
-            (model_x, model_y),
+            pair,
             {"voted": 0, "gate_decided": 0, "wins_x": 0, "wins_y": 0,
              "ties": 0},
         )
@@ -2342,20 +2613,66 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
         else:
             row["ties"] += 1
 
+    # One generator per call, seeded -- see `BOOTSTRAP_SEED`. Generations are
+    # walked in sorted order so the draws a block gets are a function of the
+    # file and not of dict iteration.
+    rng = random.Random(BOOTSTRAP_SEED)
     comparisons: dict[tuple, dict[tuple[str, str], dict]] = {}
+    elo: dict[tuple, dict[str, float]] = {}
+    elo_voted: dict[tuple, dict[str, float]] = {}
+    elo_ci95: dict[tuple, dict[str, tuple[float, float]]] = {}
     for generation in sorted(pairs):
+        # One table per generation, for rule 4's reason. Pooling two oracles
+        # fits one set of strengths to two different opinions about the same
+        # pair, printing a consensus neither of them gave.
+        ratings = elo_from_outcomes(outcomes[generation])
+        rate_samples, rating_samples = _cluster_bootstrap(
+            _task_blocks(
+                clusters[generation], outcomes[generation], cells[generation],
+            ),
+            rng,
+        )
+        elo[generation] = ratings
+        elo_voted[generation] = elo_from_outcomes(
+            voted_outcomes.get(generation, [])
+        )
+        elo_ci95[generation] = {
+            model: _interval(rating_samples.get(model), rating)
+            for model, rating in ratings.items()
+        }
+
+        voted_x = voted_points.get(generation, {})
         block: dict[tuple[str, str], dict] = {}
         for pair in sorted(pairs[generation]):
             row = pairs[generation][pair]
             total = row["voted"] + row["gate_decided"]
+            # A tie is half a point to each, exactly as it is to Elo. The two
+            # have to agree or the table and the matrix rank differently.
+            win_rate_x = (row["wins_x"] + 0.5 * row["ties"]) / total
+            # Written out field by field rather than spread from `row`: what a
+            # printout row holds is an interface two printers and a dozen tests
+            # read, and spreading an accumulator publishes whatever the walk
+            # above happened to keep in it.
             block[pair] = {
-                **row,
+                "voted": row["voted"],
+                "gate_decided": row["gate_decided"],
+                "wins_x": row["wins_x"],
+                "wins_y": row["wins_y"],
+                "ties": row["ties"],
                 "comparisons": total,
-                # A tie is half a point to each, exactly as it is to Elo. The
-                # two have to agree or the table and the matrix rank
-                # differently.
-                "win_rate_x": (row["wins_x"] + 0.5 * row["ties"]) / total,
+                "win_rate_x": win_rate_x,
                 "win_rate_y": (row["wins_y"] + 0.5 * row["ties"]) / total,
+                # `None`, never `0.0`, on a row the judge was never asked
+                # about: 0/0 raises out of the middle of a paid batch's
+                # summary, and a `0.0` in its place is the judge's worst
+                # possible verdict printed for a judge that never voted.
+                "win_rate_x_voted": (
+                    voted_x.get(pair, 0.0) / row["voted"]
+                    if row["voted"] else None
+                ),
+                "win_rate_x_ci95": _interval(
+                    rate_samples.get(pair), win_rate_x
+                ),
             }
         comparisons[generation] = block
 
@@ -2368,12 +2685,25 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
         "vote_verdicts": dict(sorted(vote_verdicts.items())),
         "comparisons": comparisons,
         "rubric_profile": _rubric_profile(rubric_lines, model_of, dropped),
-        # One table per generation, for rule 4's reason. Pooling two oracles
-        # fits one set of strengths to two different opinions about the same
-        # pair, printing a consensus neither of them gave.
-        "elo": {
-            generation: elo_from_outcomes(rows)
-            for generation, rows in sorted(outcomes.items())
+        "elo": elo,
+        "elo_voted": elo_voted,
+        "elo_ci95": elo_ci95,
+        "gate_decided_share": {
+            generation: {model: arms[model] for model in sorted(arms)}
+            for generation, arms in sorted(gate_share.items())
+        },
+        "position_consistency": {
+            generation: {
+                **counts,
+                # `None` on a block with nothing to probe, for
+                # `win_rate_x_voted`'s reason: a 0.0 here would read as a judge
+                # that contradicted itself every time.
+                "rate": (
+                    counts["consistent"] / counts["measurable"]
+                    if counts["measurable"] else None
+                ),
+            }
+            for generation, counts in sorted(consistency.items())
         },
         "superseded_gate_decided": superseded,
         "dropped": dropped,
@@ -2631,6 +2961,56 @@ def _generation_label(generation: tuple) -> str:
     )
 
 
+def _print_block_provenance(summary: dict, generation: tuple) -> None:
+    """Where one block's verdicts came from: which positions, which channel.
+
+    Both numbers qualify the rates printed directly above them, so they are
+    printed INSIDE the block rather than gathered into a section of their own.
+    A consistency rate and a gate-decided share collected at the bottom of the
+    report would be read against whichever block the reader last looked at,
+    and the whole point of the partition is that two generations disagree.
+
+    §4.2.3's position-swap probe, said as a rate over the comparisons that can
+    carry it. The `single_position` count beside it is the denominator's
+    other half -- verdicts that rest on ONE order, so nothing in them cancels
+    the judge's preference for whatever it was shown first -- and it is printed
+    only when there are some, because a zero is the shape a complete v2 block
+    has and a line saying so every time is a line nobody reads.
+    """
+    counts = summary["position_consistency"][generation]
+    if counts["rate"] is None:
+        print(
+            "    position consistency: no comparison in this block carries "
+            "both forced positions, so §4.2.3's swap probe has nothing to "
+            "read here"
+        )
+    else:
+        print(
+            f"    position consistency: {counts['consistent']} of "
+            f"{counts['measurable']} measurable comparison(s) "
+            f"({counts['rate']:.1%}) gave the same verdict in both forced "
+            "positions"
+        )
+    if counts["single_position"]:
+        print(
+            f"      {counts['single_position']} further comparison(s) rest on "
+            "ONE position -- the other position's vote is not in the file, so "
+            "the verdict carries that order's bias with nothing to cancel it"
+        )
+    print(
+        "    gate-decided share -- how much of each arm's block the judge "
+        "never saw:"
+    )
+    for model, arm in sorted(
+        summary["gate_decided_share"][generation].items()
+    ):
+        print(
+            f"      {model:24} {arm['gate_decided']:>4} of "
+            f"{arm['comparisons']:>4} comparison(s)  "
+            f"{arm['gate_decided'] / arm['comparisons']:.1%}"
+        )
+
+
 def _print_reading(result: dict) -> None:
     """Every number, in the report's order of authority.
 
@@ -2639,6 +3019,19 @@ def _print_reading(result: dict) -> None:
     when it is empty makes two passes over one collection print two different
     shapes, and a reader diffing them cannot tell an absent section from an
     absent feature.
+
+    EVERY NUMBER HERE IS QUALIFIED WHERE IT IS PRINTED, never in a section of
+    its own further down: the interval sits in the same line as the rate it
+    belongs to, the judge-voted rate under the combined one it decomposes, and
+    the consistency rate and gate-decided share inside the block they describe
+    -- see `_print_block_provenance`. A qualifier a reader has to scroll to
+    find is one they read against the wrong block, and this whole function is
+    a printout whose blocks deliberately disagree.
+
+    All of it runs inside `print_summary`'s `try`, which is what puts it above
+    the κ caveat. Nothing that reports a number may be appended after that
+    block: §4.3's caveat qualifies "every number above", so a number printed
+    below it is one published without it.
     """
     print(
         f"\n{len(result['judged'])} judged, "
@@ -2671,6 +3064,23 @@ def _print_reading(result: dict) -> None:
         "comparisons of it, and prompt v1 (three votes at random positions) "
         "is its own block for the same reason"
     )
+    print(
+        f"  [in brackets] 95% interval, cluster bootstrap over TASKS "
+        f"({BOOTSTRAP_RESAMPLES} resamples, seed {BOOTSTRAP_SEED}, so two "
+        "readings of one file print one interval). §4.4: comparisons inside "
+        "one task are correlated, so resampling them independently would "
+        "print a band several times too narrow -- precision this collection "
+        "does not have. A collection on ONE task has no spread to report and "
+        "its interval is the point estimate"
+    )
+    print(
+        "  JUDGE-VOTED ONLY is the same rate with the gate-decided "
+        "comparisons taken out. A gate-decided comparison is a Tier A result "
+        "standing in a Tier B number, so a row with a large gate-decided "
+        "share is partly Tier A's pass rate re-derived -- two arms this judge "
+        "cannot separate can still sit either side of §10.1's 40% pairwise "
+        "reference on their gate results alone. Read the two together"
+    )
     for generation, block in sorted(summary["comparisons"].items()):
         # The generation is named above every block for `_rubric_profile`'s
         # reason. A block that does not name its oracle is one the reader
@@ -2679,16 +3089,38 @@ def _print_reading(result: dict) -> None:
         print(f"  {_generation_label(generation)}")
         for (model_x, model_y), row in sorted(block.items()):
             print(f"    {model_x} vs {model_y}")
+            low, high = row["win_rate_x_ci95"]
+            # y's interval is x's mirrored, and exactly so rather than
+            # approximately: the two rates sum to 1 in every resample, so the
+            # 2.5th percentile of one IS one minus the 97.5th of the other. It
+            # is printed rather than left to the reader because a rate with no
+            # band beside it reads as the one number on the row that was
+            # measured precisely.
             print(
                 f"      {row['wins_x']}-{row['wins_y']}-{row['ties']} "
                 f"(W-L-T for {model_x}) over {row['comparisons']} "
-                f"comparison(s): {model_x} {row['win_rate_x']:.1%} / "
-                f"{model_y} {row['win_rate_y']:.1%}"
+                f"comparison(s): {model_x} {row['win_rate_x']:.1%} "
+                f"[{low:.1%}, {high:.1%}] / "
+                f"{model_y} {row['win_rate_y']:.1%} "
+                f"[{1.0 - high:.1%}, {1.0 - low:.1%}]"
             )
-            print(
-                f"      {row['voted']} judged, "
-                f"{row['gate_decided']} gate-decided"
-            )
+            voted_rate = row["win_rate_x_voted"]
+            if voted_rate is None:
+                print(
+                    f"      {row['voted']} judged, "
+                    f"{row['gate_decided']} gate-decided -- judge-voted only: "
+                    "NOTHING, every comparison in this row was settled by the "
+                    "ladder, so the rate above is a Tier A result"
+                )
+            else:
+                print(
+                    f"      {row['voted']} judged, "
+                    f"{row['gate_decided']} gate-decided; judge-voted only: "
+                    f"{model_x} {voted_rate:.1%} / "
+                    f"{model_y} {1.0 - voted_rate:.1%} over {row['voted']} "
+                    "comparison(s)"
+                )
+        _print_block_provenance(summary, generation)
 
     print(
         "\nrubric profile per model and judge generation -- diagnostic, never "
@@ -2719,12 +3151,38 @@ def _print_reading(result: dict) -> None:
         "verdicts about one pair are two opinions, and pooling them prints a "
         "fit to a joint opinion neither of them gave"
     )
+    print(
+        "  The interval is the matrix's -- the same task resamples, refit -- "
+        "and it is the number to read first: a gap narrower than the band is "
+        "a gap this collection did not measure. JUDGE-VOTED ONLY refits over "
+        "the judged comparisons alone; where it disagrees with the combined "
+        "rating, the difference is the ladder's"
+    )
     for generation, ratings in sorted(summary["elo"].items()):
         print(f"  {_generation_label(generation)}")
+        intervals = summary["elo_ci95"][generation]
+        voted = summary["elo_voted"][generation]
         for model, rating in sorted(
             ratings.items(), key=lambda item: (-item[1], item[0])
         ):
-            print(f"    {model:24} {rating:8.1f}")
+            low, high = intervals[model]
+            voted_rating = voted.get(model)
+            # An arm can be missing from the voted-only fit entirely -- every
+            # comparison it played was gate-decided. Said with a dash rather
+            # than a number, because any number here would be a rating for an
+            # arm no judge ever voted on.
+            said = (
+                f"{voted_rating:8.1f}" if voted_rating is not None
+                else "      --"
+            )
+            # Padded inside the brackets so the two ends of every band line up
+            # under each other: an unpadded column makes a wide interval and a
+            # narrow one the same length on the terminal, which is the one
+            # comparison this table exists to make easy.
+            print(
+                f"    {model:24} {rating:8.1f}  [{low:7.1f}, {high:7.1f}]  "
+                f"judge-voted only {said}"
+            )
 
     if summary["superseded_gate_decided"]:
         print(
