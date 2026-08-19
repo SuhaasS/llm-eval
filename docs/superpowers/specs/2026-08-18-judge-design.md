@@ -363,6 +363,7 @@ and a spec that silently rewrites itself teaches the next reader nothing.
 ### A comparison is two forced positions, not three random ones
 
 *Supersedes step 3 and step 4 of "Order of operations per task-sample", the
+"position-randomized" clause of **Output (b), pairwise preference**, the
 invariant **Three votes are three independent calls**, and the invariant
 **Position is randomized per comparison and recorded**.*
 
@@ -391,7 +392,7 @@ positions, position consistency was an inference across comparisons and was
 unmeasurable on any single one — a comparison could easily hold two votes in
 the same order, which says nothing about position at all. Under forced
 positions every comparison holds one vote in each order, so consistency is read
-directly off the file: a 1–1 split is the judge preferring what it saw first,
+directly off the file: a 1–1 split is a position effect in either direction,
 and `majority` reports it as the tie it is rather than breaking it toward
 whichever vote was drawn twice.
 
@@ -441,7 +442,9 @@ strengths and nothing else, so the overall level is free and would otherwise
 wander with the arm set.
 
 One prior, and it is recorded because it can reorder: **one virtual tie per
-unordered pair that has at least one real comparison** (§D8). Without it an arm
+unordered pair that has at least one real comparison** (decision D8 of
+`docs/superpowers/plans/2026-08-19-judge-fix-wave.md`; every bare § in this
+document points into the eval spec instead). Without it an arm
 that never lost has an MLE of +∞ and a winless arm −∞, and the iteration either
 burns its cap chasing one or prints an `inf` formatted as a rating. Half a
 point each way per *played pair* is the lightest thing that bounds both, and at

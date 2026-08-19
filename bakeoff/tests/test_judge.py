@@ -1793,17 +1793,30 @@ GOLDEN_PAIRWISE_PROMPT_SHA = (
     "de8592286d7489bef3c8204d58cf1c6651c57540195552ae481aabdc36adc87e"
 )
 
-#: Said once, and both shas plus the version assert it. Split out because the
-#: instruction is the entire value of this test -- a golden failure with no
-#: instruction attached is answered by deleting the test.
+#: The message on the two sha assertions, and the whole value of them -- a
+#: golden failure with no instruction attached is answered by deleting the
+#: test. It ASKS for the bump; nothing here can require one, which is why the
+#: version is asserted separately below rather than folded in.
 _RE_RECORD = (
     "the prompt text changed: bump JUDGE_PROMPT_VERSION and re-record both "
     "constants"
 )
 
+#: The message on the version assertion, which fires under the OPPOSITE
+#: condition and must not borrow the one above. `JUDGE_PROMPT_VERSION` moves on
+#: protocol changes as well as text changes, so this assertion's realistic
+#: cause is a protocol bump with the templates untouched -- and `_RE_RECORD`
+#: would answer that with three wrong instructions: the text did not change,
+#: the bump has already happened, and re-recording is not what is being asked
+#: for.
+_VERSION_MOVED = (
+    "JUDGE_PROMPT_VERSION moved: re-record both shas from the current "
+    "templates and update this assertion"
+)
+
 
 def test_the_prompt_version_is_coupled_to_the_rendered_template_text():
-    """A prompt edit and a version bump are one change, enforced here.
+    """The rendered templates are pinned byte for byte, and named as v2's.
 
     `judge_prompt_version` is what keeps two generations of verdict from being
     averaged, and it is declared by hand: nothing else in this repo notices
@@ -1813,10 +1826,18 @@ def test_the_prompt_version_is_coupled_to_the_rendered_template_text():
     file looks like one clean generation and the disagreement between the two
     halves reads as judge noise.
 
-    ONE test over both templates and the version, deliberately. Three separate
-    tests would let a re-record land without the bump, which is the exact
-    half-done edit this exists to catch: whoever re-records a sha has to walk
-    past the assertion that the version moved too.
+    WHAT THIS CANNOT DO is make the bump mandatory. Re-record both constants
+    and leave the version at 2 and this test passes, because the shas describe
+    the text and the version is a separate declaration: what stands between a
+    silent prompt edit and a mixed file is `_RE_RECORD`, read by whoever is
+    re-recording. That is attention, not enforcement, and the difference
+    matters to anyone deciding how much this test is worth.
+
+    The version is asserted here anyway, and beside the shas rather than
+    elsewhere, because these three constants are one statement -- *this text is
+    what v2 means* -- and a reader who lands on a failure needs all three in
+    front of them. It carries its own message: it fires when the version moved
+    off 2, which is the reverse of what the shas are complaining about.
 
     A failure here is not a bug report. It says the prompt is not the prompt
     these constants were recorded from, and the answer is to look at the diff:
@@ -1828,7 +1849,7 @@ def test_the_prompt_version_is_coupled_to_the_rendered_template_text():
 
     assert prompt_sha(rubric) == GOLDEN_RUBRIC_PROMPT_SHA, _RE_RECORD
     assert prompt_sha(pairwise) == GOLDEN_PAIRWISE_PROMPT_SHA, _RE_RECORD
-    assert JUDGE_PROMPT_VERSION == 2, _RE_RECORD
+    assert JUDGE_PROMPT_VERSION == 2, _VERSION_MOVED
 
 
 # --- the vote protocol -------------------------------------------------------
