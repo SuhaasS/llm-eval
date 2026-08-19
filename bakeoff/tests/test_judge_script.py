@@ -2946,6 +2946,189 @@ def test_a_swept_pair_does_not_print_a_zero_width_interval_at_sixty_tasks():
     assert scarce["win_rate_x_ci95"][0] == pytest.approx(0.34, abs=0.01)
 
 
+def test_a_sparse_pairs_band_rests_on_its_own_tasks_and_never_on_the_blocks():
+    """The boundary band's n is the number of tasks THAT RATE rests on. Handed
+    the block's count instead, a rate borrows precision from tasks it was never
+    measured on -- §4.4's error again, arriving through the correction that
+    was placed against it.
+
+    The sequence below is the version that gives it away. A pair playing
+    exactly ONE task slips past the one-task exception the moment a second,
+    unrelated task exists, and its band then NARROWS as more unrelated tasks
+    arrive: measured on the block count, [100.0%, 100.0%] alone, [34.2%, ...]
+    at 2 tasks, [61.0%, ...] at 6, [83.9%, ...] at 20 and [94.0%, ...] at 60,
+    with that pair's own evidence untouched throughout. A collection growing
+    around a pair cannot sharpen what is known about the pair.
+
+    The 2-of-40 case underneath is the same defect at a size a real collection
+    reaches: two tasks' worth of evidence must read like two tasks.
+    """
+    pair = ("model-one", "model-two")
+    for foreign in (0, 1, 5, 19, 59):
+        judgments = _voted_pair("run-a", "run-b", "a", task_id="own-task")
+        judgments += [
+            vote
+            for task in range(foreign)
+            for vote in _voted_pair("run-a", "run-c",
+                                    "a" if task % 2 else "b",
+                                    task_id=f"foreign-{task}")
+        ]
+
+        row = summarize(judgments, MODEL_OF)["comparisons"][_judge_gen()][pair]
+
+        assert row["win_rate_x_ci95"] == (1.0, 1.0), foreign
+
+    sparse = [
+        vote
+        for task in range(2)
+        for vote in _voted_pair("run-a", "run-b", "a", task_id=f"task-{task}")
+    ]
+    sparse += [
+        vote
+        for task in range(38)
+        for vote in _voted_pair("run-a", "run-c", "a" if task % 2 else "b",
+                                task_id=f"task-{task + 2}")
+    ]
+
+    row = summarize(sparse, MODEL_OF)["comparisons"][_judge_gen()][pair]
+
+    # Two tasks, read as two tasks -- 91.2% is what the block's 40 would say.
+    assert row["win_rate_x_ci95"][0] == pytest.approx(0.342, abs=0.001)
+
+
+def test_the_voted_only_band_rests_on_the_tasks_the_judge_actually_voted_on():
+    """The most reachable form of the same defect, and the one the pilot
+    collection already has: an arm the ladder settled nearly everywhere has a
+    judge-voted rate resting on a couple of tasks inside a collection of forty.
+    Its band has to say a couple of tasks.
+
+    The two rates on this row are deliberately EQUAL -- both 100% -- so the
+    only thing separating their bands is the evidence each rests on: 40 tasks
+    for the combined rate, 2 for the judge-voted one.
+    """
+    judgments = [
+        vote
+        for task in range(2)
+        for vote in _voted_pair("run-a", "run-b", "a", task_id=f"task-{task}")
+    ]
+    judgments += [
+        _gate("run-a", "run-b", "a", task_id=f"task-{task + 2}")
+        for task in range(38)
+    ]
+
+    row = summarize(judgments, MODEL_OF)["comparisons"][_judge_gen()][
+        ("model-one", "model-two")
+    ]
+
+    assert row["win_rate_x"] == row["win_rate_x_voted"] == 1.0
+    assert row["win_rate_x_ci95"][0] == pytest.approx(0.912, abs=0.001)
+    assert row["win_rate_x_voted_ci95"][0] == pytest.approx(0.342, abs=0.001)
+
+
+def test_the_consistency_band_rests_on_the_tasks_a_probe_could_read():
+    """Third call site, same rule. A block where the position probe can read
+    two tasks out of forty knows what two tasks know; the other thirty-eight
+    hold verdicts that rest on one position and say nothing about position at
+    all, so they cannot be in the denominator of the band."""
+    judgments = [
+        vote
+        for task in range(2)
+        for vote in _voted_pair("run-a", "run-b", "a", task_id=f"task-{task}")
+    ]
+    judgments += [
+        _vote("run-a", "run-b", "a", vote_index=0, task_id=f"task-{task + 2}")
+        for task in range(38)
+    ]
+
+    consistency = summarize(judgments, MODEL_OF)["position_consistency"][
+        _judge_gen()
+    ]
+
+    assert (consistency["measurable"], consistency["single_position"]) == (
+        2, 38,
+    )
+    assert consistency["rate"] == 1.0
+    assert consistency["rate_ci95"][0] == pytest.approx(0.342, abs=0.001)
+
+
+def test_a_one_task_rate_is_marked_where_it_is_printed(capsys):
+    """After the boundary rule the only rate that can still print a zero-width
+    band is one resting on a single task -- and a reader who meets
+    `[100.0%, 100.0%]` a few rows below a widened band has no way to tell which
+    rule produced it. The header explains both; the row says which one it is.
+    """
+    result = _empty_result()
+    result["summary"] = summarize(
+        [
+            *_voted_pair("run-a", "run-b", "a", task_id="lonely"),
+            *[
+                vote
+                for task in range(4)
+                for vote in _voted_pair("run-a", "run-c",
+                                        "a" if task % 2 else "b",
+                                        task_id=f"task-{task}")
+            ],
+        ],
+        MODEL_OF,
+    )
+
+    print_summary(result)
+
+    lines = capsys.readouterr().out.splitlines()
+    (lonely,) = [
+        line for line in lines
+        if line.strip().startswith("combined") and "model-two" in line
+    ]
+    (spread,) = [
+        line for line in lines
+        if line.strip().startswith("combined") and "model-three" in line
+    ]
+    assert "one task" in lonely
+    assert "one task" not in spread
+
+
+def test_a_rating_band_of_zero_width_prints_as_a_refusal_not_a_number(capsys):
+    """A swept pair's rating is identical in every task resample, and unlike a
+    rate it cannot be widened -- past two arms a rating is a function of the
+    whole comparison graph, so a rate's Wilson bound does not map onto one.
+
+    What is left is a choice between printing `[1381.7, 1381.7]`, which says
+    the collection resolved this arm exactly, and printing a dash, which says
+    it did not. The rating is not even stable in the way that band claims: the
+    same sweep fits a different number at a different task count, because what
+    bounds it is the half-game prior rather than the evidence. The table
+    already prints `--` for an arm the judge never voted on; the same dash
+    carries the same meaning here.
+    """
+    result = _empty_result()
+    result["summary"] = summarize(
+        [
+            vote
+            for task in range(2)
+            for vote in _voted_pair("run-a", "run-b", "a",
+                                    task_id=f"task-{task}")
+        ],
+        MODEL_OF,
+    )
+
+    low, high = result["summary"]["elo_ci95"][_judge_gen()]["model-one"]
+    assert low == high
+
+    print_summary(result)
+
+    # The ratings row specifically -- `model-one` also opens a matrix row.
+    (rating_line,) = [
+        line for line in capsys.readouterr().out.splitlines()
+        if re.match(r"\s+model-one\s+\d+\.\d", line)
+    ]
+    assert "--" in rating_line
+    assert f"{low:.1f}, " not in rating_line
+    # The win rate above it IS widened, and the printout says to read it there.
+    assert result["summary"]["comparisons"][_judge_gen()][
+        ("model-one", "model-two")
+    ]["win_rate_x_ci95"][0] == pytest.approx(0.342, abs=0.001)
+
+
 def test_every_rating_resample_is_recentred_on_the_arms_it_shares_with_the_full_fit():
     """Bradley-Terry identifies DIFFERENCES between strengths and nothing else,
     so `elo_from_outcomes` anchors the mean of whatever arms it was handed at
