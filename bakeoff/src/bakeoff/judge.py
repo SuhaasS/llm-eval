@@ -1165,7 +1165,81 @@ def is_auth_failure(exc: BaseException) -> bool:
     return any(cls.__name__ in _AUTH_ERROR_NAMES for cls in type(exc).__mro__)
 
 
-def _completion(router: Any, judge_model_id: str, prompt: str) -> str:
+#: The three counts a completion response reports about itself, spelled as
+#: LiteLLM spells them. Read off `response.usage` by name rather than summed
+#: from the two halves, because a route that reports a `total_tokens` its own
+#: parts do not add up to is reporting something (reasoning tokens, a cached
+#: prefix) that a driver-side addition would silently discard.
+_USAGE_FIELDS: tuple[str, ...] = (
+    "prompt_tokens", "completion_tokens", "total_tokens",
+)
+
+
+def new_usage_totals() -> dict[str, int]:
+    """A fresh accumulator for `live_completion`, with every key at zero.
+
+    A FACTORY rather than a literal at each call site, because the printout
+    that reads this dict indexes every key: a caller that built its own and
+    forgot `calls_without_usage` would take the summary down at the end of a
+    batch that already paid for thousands of calls -- the one moment a
+    `KeyError` costs the most.
+
+    Zeros rather than absences, for the same reason `GradeRecord` distinguishes
+    them: "no call reported usage" and "usage was never counted" are different
+    facts, and the second is what `None` means at the driver's `judge_usage`.
+
+    `calls` counts COMPLETION REQUESTS the driver issued through the router,
+    which is deliberately not the same as the number of prompts it asked
+    about: one prompt that 401s and is retried on a fresh credential is two
+    requests, and `Router(num_retries=2)`'s own transport retries are invisible
+    from here and counted in neither. It is the number an operator can
+    reconcile against a bill, not the number of verdicts bought.
+    """
+    return {
+        "calls": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "calls_without_usage": 0,
+        "auth_refreshes": 0,
+    }
+
+
+def _add_usage(usage_totals: dict[str, int] | None, response: Any) -> None:
+    """Fold one response's token counts into the running totals.
+
+    Defensive about the shape on purpose. This is the ONLY place in the harness
+    that ever sees a judge response's usage block -- `costs.PRICE_BOOK` has no
+    entry for the judge models, so nothing downstream recomputes it -- and the
+    failure mode of a strict read is an `AttributeError` raised from inside a
+    successful call, which would cost the unit its verdict over a number that
+    is only ever printed. A response whose usage cannot be read is COUNTED as
+    unreadable instead: `calls_without_usage` is what tells an operator their
+    token total is an under-count rather than a measurement.
+
+    `isinstance(value, bool)` is refused alongside non-ints because `bool` is a
+    subclass of `int`, and a `True` in a token slot would add 1 and read as a
+    measurement.
+    """
+    if usage_totals is None:
+        return
+    usage = getattr(response, "usage", None)
+    seen = False
+    for field in _USAGE_FIELDS:
+        value = (
+            usage.get(field) if isinstance(usage, dict)
+            else getattr(usage, field, None)
+        )
+        if isinstance(value, bool) or not isinstance(value, int):
+            continue
+        usage_totals[field] += value
+        seen = True
+    if not seen:
+        usage_totals["calls_without_usage"] += 1
+
+
+def _completion(router: Any, judge_model_id: str, prompt: str,
+                usage_totals: dict[str, int] | None = None) -> str:
     """One call: one user turn in, the reply text out.
 
     Its own function because `live_completion` makes this call TWICE -- once,
@@ -1173,7 +1247,22 @@ def _completion(router: Any, judge_model_id: str, prompt: str) -> str:
     of the request are two places for the sampling block or the message shape
     to drift apart, and a retry that sent different text would make the
     record's `judge_prompt_sha` attest to a prompt the second call never sent.
+
+    That double call is also why `calls` is incremented HERE rather than in the
+    closure: a count taken per `complete(prompt)` would report one request for
+    a prompt that 401'd and was retried on a fresh credential, which
+    under-reports spend -- the one direction a spend figure must never fail in.
+    It is incremented BEFORE the request, so a call that raised inside the
+    endpoint still counts: an attempt that reached the wire may well have been
+    billed, and a total that drops it is wrong in the same direction again.
+
+    The tokens are folded in BEFORE the content is extracted, for the mirror
+    reason. `response.choices[0].message.content` is two attribute hops and an
+    index into a list a malformed response can leave empty, so an extraction
+    that raised would discard usage for a call that was already paid for.
     """
+    if usage_totals is not None:
+        usage_totals["calls"] += 1
     response = router.completion(
         model=judge_model_id,
         messages=[{"role": "user", "content": prompt}],
@@ -1185,6 +1274,7 @@ def _completion(router: Any, judge_model_id: str, prompt: str) -> str:
         # (line 379) for exactly this reason.
         **JUDGE_SAMPLING,
     )
+    _add_usage(usage_totals, response)
     # `content` is None on an empty completion. Returned as "" rather than
     # passed on, so the strict parser reports a malformed verdict and re-asks
     # -- which is the right response to an empty reply, and is not what an
@@ -1195,6 +1285,7 @@ def _completion(router: Any, judge_model_id: str, prompt: str) -> str:
 def live_completion(
     judge_model_id: str = JUDGE_MODEL_ID_DEFAULT,
     region: str = "us-east-1",
+    usage_totals: dict[str, int] | None = None,
 ) -> CompleteFn:
     """The live `CompleteFn`: one rendered prompt in, the model's raw text out.
 
@@ -1251,6 +1342,17 @@ def live_completion(
 
     What is NOT deferred is the credential module's import. Lazy is for work
     that costs something, not for wiring that can simply be wrong.
+
+    `usage_totals` is the caller's own dict -- `new_usage_totals()` -- filled
+    in place, and `None` means "do not count". Filled in place rather than
+    returned because the closure outlives no call it could return from: it is
+    handed to a driver that makes thousands of calls through it and then wants
+    one total, and a return value would have to be threaded back through the
+    `CompleteFn` contract, which is one prompt in and one string out precisely
+    so that a test can inject a function. This is the ONLY place the counts
+    exist: the judgment file records no tokens, and `costs.PRICE_BOOK`
+    deliberately has no entry for the judge models, so a total not accumulated
+    here is a number nothing downstream can reconstruct.
     """
     # Resolved at CONSTRUCTION even though nothing in it is called until the
     # first vote. This module reaches out of the package into `scripts/`,
@@ -1275,7 +1377,9 @@ def live_completion(
             )
 
         try:
-            return _completion(built["router"], judge_model_id, prompt)
+            return _completion(
+                built["router"], judge_model_id, prompt, usage_totals
+            )
         except Exception as exc:  # noqa: BLE001 - re-raised unless it is auth
             if not is_auth_failure(exc):
                 raise
@@ -1284,6 +1388,12 @@ def live_completion(
             fresh = smoke_bedrock.derive_mantle_token(region)
             if not fresh:
                 raise
+            # Counted after the mint SUCCEEDED, so the number means "credentials
+            # this pass replaced" rather than "times the token looked dead". An
+            # auth failure with nothing to mint re-raises above and is a
+            # credential problem the operator has to fix, not a refresh.
+            if usage_totals is not None:
+                usage_totals["auth_refreshes"] += 1
             built["router"] = _judge_router(
                 judge_model_id, region, smoke_bedrock, token=fresh
             )
@@ -1291,7 +1401,9 @@ def live_completion(
         # ONE retry, on a router holding a credential minted seconds ago. A
         # second auth failure propagates from here, which is the loud failure
         # the design asks for.
-        return _completion(built["router"], judge_model_id, prompt)
+        return _completion(
+            built["router"], judge_model_id, prompt, usage_totals
+        )
 
     return complete
 

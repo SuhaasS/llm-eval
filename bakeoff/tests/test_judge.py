@@ -50,6 +50,7 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -73,6 +74,7 @@ from bakeoff.judge import (
     judge_rubric,
     live_completion,
     majority,
+    new_usage_totals,
     parse_pairwise_response,
     parse_rubric_response,
     payload_inputs_from,
@@ -1801,15 +1803,35 @@ class _SubclassedAuthError(AuthenticationError):
     whole fix off silently."""
 
 
-def _stub_response(text: str):
-    """The two attribute hops `live_completion` makes into a litellm response.
+#: The usage block a mantle completion comes back carrying. Three distinct
+#: numbers, none of them a multiple of another, so an accumulator that added
+#: the wrong field into the wrong total would not land on a plausible sum.
+STUB_PROMPT_TOKENS = 11
+STUB_COMPLETION_TOKENS = 7
+STUB_TOTAL_TOKENS = 18
+
+
+def _stub_response(text: str, usage: Any = "default"):
+    """The attribute hops `live_completion` makes into a litellm response.
 
     Deliberately not a real `ModelResponse`: building one would couple these
     tests to the pinned version's response model, and the contract under test
-    is only that the reply text is read out of `choices[0].message.content`.
+    is only that the reply text is read out of `choices[0].message.content`
+    and the token counts out of `usage`.
+
+    `usage=None` is the response a route that reports none sends back, which
+    is a real shape rather than a hypothetical: the totals have to say how
+    many calls they could not see rather than silently under-report.
     """
+    if usage == "default":
+        usage = SimpleNamespace(
+            prompt_tokens=STUB_PROMPT_TOKENS,
+            completion_tokens=STUB_COMPLETION_TOKENS,
+            total_tokens=STUB_TOTAL_TOKENS,
+        )
     return SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content=text))]
+        choices=[SimpleNamespace(message=SimpleNamespace(content=text))],
+        usage=usage,
     )
 
 
@@ -2264,6 +2286,71 @@ def test_an_auth_failure_with_no_replacement_token_raises_the_auth_error(
         live_completion()("RENDERED PROMPT")
 
     assert len(built) == 1
+
+
+def test_usage_totals_accumulate_across_calls_and_survive_the_auth_retry(
+    mantle_token, minted, scripted_routers
+):
+    """What a ~40-hour paid pass actually spent, counted where the wire is.
+
+    Nothing else in the harness can reconstruct it. The judgment file records
+    one line per unit and no token counts, `costs.PRICE_BOOK` deliberately has
+    no entry for the judge models (mantle pricing is unpublished), and the
+    router is the only object that sees a response at all -- so a total not
+    accumulated here is a number that does not exist anywhere afterwards.
+
+    THE AUTH RETRY IS THE CASE THAT DECIDES THE SHAPE. One logical call that
+    401s makes TWO completion requests, and a count taken per `complete()`
+    rather than per request would report the batch as having made half the
+    calls it made -- under-reporting spend, which is the one direction a spend
+    figure must never fail in. So: two prompts, three requests, and the token
+    totals over the two that came back with a response.
+    """
+    built = scripted_routers([_StatusOnlyAuthError(401)])
+    totals = new_usage_totals()
+
+    complete = live_completion(usage_totals=totals)
+    assert complete("first vote") == STUB_REPLY
+    assert complete("second vote") == STUB_REPLY
+
+    assert len(built) == 2 and minted == ["us-east-1"]
+    assert totals["calls"] == 3, "the auth-retried call counted as one request"
+    assert totals["auth_refreshes"] == 1
+    assert totals["prompt_tokens"] == 2 * STUB_PROMPT_TOKENS
+    assert totals["completion_tokens"] == 2 * STUB_COMPLETION_TOKENS
+    assert totals["total_tokens"] == 2 * STUB_TOTAL_TOKENS
+    assert totals["calls_without_usage"] == 0
+
+
+def test_a_response_carrying_no_usage_is_counted_rather_than_dropped(
+    mantle_token, monkeypatch, dotenv_settled
+):
+    """A route that reports no usage makes the totals an UNDER-count, and the
+    printout has to say so rather than quietly report the rest.
+
+    Silence here is the failure: an operator reading 1,200 calls and 400,000
+    tokens has no way to tell a batch where every call reported usage from one
+    where a third of them reported none, and the second is a far bigger bill
+    than the number says.
+    """
+    import litellm
+
+    class _NoUsageRouter:
+        def __init__(self, **kwargs):
+            pass
+
+        def completion(self, **kwargs):
+            return _stub_response(STUB_REPLY, usage=None)
+
+    monkeypatch.setattr(litellm, "Router", _NoUsageRouter)
+    totals = new_usage_totals()
+
+    live_completion(usage_totals=totals)("RENDERED PROMPT")
+
+    assert totals["calls"] == 1
+    assert totals["calls_without_usage"] == 1
+    assert totals["prompt_tokens"] == 0
+    assert totals["total_tokens"] == 0
 
 
 def test_the_auth_classifier_answers_both_callers_and_never_reads_the_message():

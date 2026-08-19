@@ -38,8 +38,11 @@ import hashlib
 import io
 import json
 import math
+import os
 import random
+import re
 import shutil
+import subprocess
 import sys
 import uuid
 from pathlib import Path
@@ -82,10 +85,12 @@ from scripts.judge import (
     ELO_SCALE,
     KAPPA_CAVEAT,
     MAX_CONSECUTIVE_ERRORS,
+    CollectionNotFound,
     GateInvariantError,
     _KAPPA_CAVEAT_ASCII,
     _MAX_NAMED,
     ResumeRefused,
+    StorageFailure,
     _assert_rubric_gate,
     _comparison_key,
     _generation_of,
@@ -1637,6 +1642,15 @@ def test_the_breaker_trips_only_on_attempted_units_so_a_skip_heavy_resume_report
     The first pass here judges every other unit with the limit raised out of
     the way, so the second sees failures separated by skips -- and still stops
     at five, saying five.
+
+    Under the two-phase walk the separation is structural rather than
+    incidental: skips are resolved in phase 1 and never enter the worklist at
+    all, so the breaker cannot see one even in principle. `skipped` is
+    therefore the whole selection -- every unit this pass found already bought
+    -- rather than the prefix the walk got through before it aborted. That is
+    the honest number and the one the census prints: how much of the
+    collection is done does not depend on where an unrelated failure stopped
+    the pass.
     """
     root = _four_arms(tmp_path)
     first = _DiesAfter(succeed_at=set(range(2, 17, 2)))
@@ -1646,9 +1660,12 @@ def test_the_breaker_trips_only_on_attempted_units_so_a_skip_heavy_resume_report
     second = _DiesAfter()
     result = _run(root, complete=second, rubric=True)
 
-    # Units 1, 3, 5, 7, 9 are attempted and fail; 2, 4, 6, 8 are skipped.
+    # Sixteen units in the cell; the first pass bought eight, so eight are
+    # skipped and eight are selected. Five of those eight are attempted and
+    # fail, which is where the breaker stops the pass.
     assert second.calls == MAX_CONSECUTIVE_ERRORS
-    assert len(result["skipped"]) == 4, "the failures were not separated"
+    assert len(result["skipped"]) == 8, "the failures were not separated"
+    assert result["selected"]["units"] == 8
     assert len(result["errors"]) == MAX_CONSECUTIVE_ERRORS
     assert f"{MAX_CONSECUTIVE_ERRORS} consecutive" in _abort_of(result)
 
@@ -1874,6 +1891,362 @@ def test_a_run_that_cannot_be_read_is_reported_by_task_and_arm_not_by_digest(
 
 
 # --------------------------------------------------------------------------
+# 6c. what a forty-hour pass looks like from the terminal
+# --------------------------------------------------------------------------
+#
+# The failure these are placed against is not a wrong number: it is a pass that
+# is RIGHT and unusable. A full batch is ~9,600 paid calls over many more hours
+# than a credential lives, and before this section the driver printed five
+# header lines and then nothing at all until the summary -- so an operator
+# could not tell a working pass from a hung one, could not tell what the pass
+# had committed to spending before it started spending, and lost even the
+# summary to a Ctrl-C. Three of the five things below are about a batch that
+# must STOP: a typo that would otherwise be created empty and reported as a
+# clean pass over zero units, a disk that has stopped accepting writes while
+# the driver goes on buying verdicts, and an interrupt.
+
+#: One progress line, as an operator reads it. The durations are matched by
+#: SHAPE rather than by value: they are wall-clock over a real batch, so an
+#: exact assertion would either pin the machine this ran on or need a frozen
+#: clock threaded through the driver to say less than this does.
+_PROGRESS = re.compile(
+    r"^\[(?P<index>\d+)/(?P<total>\d+)\] (?P<label>.+?) "
+    r"(?P<status>ok|ERROR .+?) "
+    r"\(unit \d+\.\d+s, elapsed (?:\d+h)?(?:\d+m)?\d+s\)$"
+)
+
+#: `bakeoff/`, which is what `pythonpath = ["."]` puts on the path for this
+#: suite and therefore what the import probe below has to hand a subprocess.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _progress_lines(text: str) -> list[str]:
+    return [line for line in text.splitlines() if line.startswith("[")]
+
+
+def test_a_typoed_event_log_is_refused_before_anything_is_created_on_disk(
+    tmp_path, monkeypatch, capsys
+):
+    """A mistyped `--event-log` is a typo, not an empty collection.
+
+    `EventLog.__init__` mkdirs `runs/`, so the old driver CREATED the typo,
+    found no runs in it, judged nothing and printed a complete, triumphant
+    report with an exit status of 0. Every number in it was zero and none of
+    them was wrong, which is what made it unreadable as a failure -- and the
+    directory it left behind is a second collection root that looks real to
+    the next command that points at it.
+
+    Refused BEFORE any mkdir, so the check is on the absence of the directory
+    rather than on the message: a driver that reported the typo after creating
+    it would satisfy every assertion about the text.
+    """
+    _two_arms(tmp_path)  # the collection that was meant
+    typo = tmp_path / "evenlog"
+    monkeypatch.setattr("scripts.judge.load_task_set", lambda *a, **k: [_task()])
+    monkeypatch.setattr(
+        "scripts.judge.live_completion",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no call")),
+    )
+
+    assert main(["--event-log", str(typo)]) == 1
+
+    assert not typo.exists(), "the typo was created rather than refused"
+    out = capsys.readouterr().out
+    assert "REFUSED" in out
+    assert str(typo) in out
+    # What a collection root looks like, so the operator can compare.
+    assert "runs/" in out
+
+    with pytest.raises(CollectionNotFound):
+        judge_event_log(typo, [_task()], complete=FakeComplete())
+    assert not typo.exists()
+
+
+def test_the_census_is_printed_before_the_first_paid_call(tmp_path, capsys):
+    """What the pass has committed to spending, said before it spends any of it.
+
+    Ordering is the whole content of this test, so it is asserted from INSIDE
+    the seam: the completion records what was on the terminal at the moment it
+    was first asked for a verdict, and the census has to already be in it. A
+    census printed beside the summary would pass every assertion about its
+    text and answer none of the question it exists for, which is "may I let
+    this run".
+    """
+    root = _three_arms(tmp_path)
+    before: list[str] = []
+
+    def _note_the_terminal(prompt: str) -> None:
+        if not before:
+            before.append(capsys.readouterr().out)
+
+    result = _run(
+        root, complete=FakeComplete(on_call=_note_the_terminal), rubric=True
+    )
+
+    assert before, "no call was made, so the ordering was never exercised"
+    assert (
+        "selected: 3 rubric, 6 votes over 3 pairs, 0 gate-decided; "
+        "0 already judged (skipped)"
+    ) in before[0]
+    assert result["selected"] == {
+        "rubric": 3, "votes": 6, "pairs": 3, "gate_decided": 0,
+        "skipped": 0, "units": 9,
+    }
+
+
+def test_every_attempted_unit_prints_a_progress_line_naming_task_model_and_sample(
+    tmp_path, capsys
+):
+    """One line per attempted unit, in the fields the flags take.
+
+    `_unit_label`'s reasoning, at the one place it is read on a HEALTHY pass:
+    task and sample first because `--only-task` and `--samples` want them, the
+    arms next, the run ids last. A progress line naming only a counter would
+    say the pass is alive and nothing about where it is.
+    """
+    root = _two_arms(tmp_path)
+
+    _run(root, rubric=True)
+
+    lines = _progress_lines(capsys.readouterr().out)
+    assert len(lines) == 4, "two rubric units and one comparison's two votes"
+    parsed = [_PROGRESS.match(line) for line in lines]
+    assert all(parsed), lines
+    assert [m["index"] for m in parsed] == ["1", "2", "3", "4"]
+    assert {m["total"] for m in parsed} == {"4"}
+    assert [m["status"] for m in parsed] == ["ok"] * 4
+    for match in parsed:
+        assert "task=calc-1" in match["label"]
+        assert "sample=0" in match["label"]
+    assert parsed[0]["label"].startswith("rubric ")
+    assert "model-one" in parsed[0]["label"]
+    assert "model-two" in parsed[1]["label"]
+    assert parsed[2]["label"].startswith("vote 0 (a_first) ")
+    assert "model-one vs model-two" in parsed[2]["label"]
+
+
+def test_skipped_units_print_one_census_line_not_five_thousand(
+    tmp_path, capsys
+):
+    """A resume is skip-heavy by construction, and a skip is not progress.
+
+    The pass that follows an abort or an interrupt re-selects everything and
+    skips almost all of it. One line per skip is thousands of lines saying
+    nothing happened, which buries the handful that say something did -- so a
+    skipped unit is a number in the census and never a line of its own.
+    """
+    root = _two_arms(tmp_path)
+    _run(root, rubric=True)
+    capsys.readouterr()
+
+    fake = FakeComplete()
+    result = _run(root, complete=fake, rubric=True)
+
+    out = capsys.readouterr().out
+    assert fake.calls == 0
+    assert _progress_lines(out) == []
+    assert (
+        "selected: 0 rubric, 0 votes over 0 pairs, 0 gate-decided; "
+        "4 already judged (skipped)"
+    ) in out
+    assert result["selected"]["skipped"] == 4
+
+
+def test_a_failed_append_aborts_the_batch_instead_of_buying_more_verdicts(
+    tmp_path, monkeypatch
+):
+    """A full disk is not a per-unit failure, and treating it as one is how a
+    pass spends thousands of dollars writing nothing.
+
+    ENOSPC fails EVERY write from the moment it starts, so the per-unit
+    `except` that makes one unreadable diff cheap makes this one catastrophic:
+    the driver goes on calling a paid model for every remaining unit and
+    records not one of the answers. Batch-fatal on the first one, and the
+    message is about the disk rather than about the unit.
+    """
+    root = _three_arms(tmp_path)
+
+    def _no_space(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("scripts.judge.append_judgment", _no_space)
+    fake = FakeComplete()
+
+    result = _run(root, complete=fake, rubric=True)
+
+    # A `RuntimeError` and deliberately NOT an `OSError`: the wrap is what
+    # tells a disk failure from a socket one, and a StorageFailure that was
+    # itself an OSError would be re-wrapped by the next `except OSError` it
+    # passed and lose the distinction on the way out.
+    assert issubclass(StorageFailure, RuntimeError)
+    assert not issubclass(StorageFailure, OSError)
+
+    assert fake.calls == 1, "the driver bought verdicts it could not record"
+    assert len(result["errors"]) == 1
+    assert "StorageFailure" in result["errors"][0]
+    assert "No space left on device" in result["errors"][0]
+    (abort,) = [w for w in result["warnings"] if "writes are failing" in w]
+    assert "cannot be recorded" in abort
+    assert "resume with the same command" in abort
+    assert _lines(root) == []
+
+
+def test_a_connection_shaped_oserror_from_the_seam_is_a_unit_error_not_a_batch_abort(
+    tmp_path,
+):
+    """`OSError` is the socket's base class as well as the disk's, so the WRAP
+    SCOPE is what makes the storage abort safe.
+
+    A `ConnectionResetError` is an `OSError`, and it arrives from the seam --
+    one flaky call in a nine-unit batch. Wrapping the unit rather than the two
+    store calls would turn every reset into a batch abort, which is the
+    opposite of the per-unit isolation the whole driver is arranged around.
+    """
+    root = _three_arms(tmp_path)
+    fake = _DiesAfter(succeed_at=set(range(2, 10)), error=ConnectionResetError)
+
+    result = _run(root, complete=fake, rubric=True)
+
+    assert fake.calls == 9, "a per-unit failure stopped the batch"
+    assert len(result["errors"]) == 1
+    assert "ConnectionResetError" in result["errors"][0]
+    assert not any("writes are failing" in w for w in result["warnings"])
+    assert len(_lines(root)) == 8
+
+
+def test_a_keyboard_interrupt_still_prints_the_summary_and_the_resume_hint_and_exits_130(
+    tmp_path, monkeypatch, capsys
+):
+    """Ctrl-C is how a long pass actually ends, so it is a path with a report.
+
+    An uncaught `KeyboardInterrupt` unwinds through `judge_event_log` and takes
+    the summary with it -- the operator loses the reading over everything the
+    pass DID buy, on the one exit that happens most often. The lines are on
+    disk either way; what the traceback destroys is the only place anybody
+    meets them.
+
+    130 rather than 1, because `128 + SIGINT` is what a shell reads as "the
+    operator stopped this" and 1 is what it reads as "the batch found
+    problems".
+    """
+    root = _three_arms(tmp_path)
+
+    class _CtrlC(FakeComplete):
+        """A judge the operator interrupts after two units."""
+
+        def __call__(self, prompt: str) -> str:
+            if len(self.prompts) >= 2:
+                raise KeyboardInterrupt
+            return super().__call__(prompt)
+
+    monkeypatch.setattr("scripts.judge.load_task_set", lambda *a, **k: [_task()])
+    monkeypatch.setattr("scripts.judge.live_completion", lambda *a, **k: _CtrlC())
+
+    assert main(["--event-log", str(root)]) == 130
+
+    out = capsys.readouterr().out
+    assert KAPPA_CAVEAT in out, "the interrupt took the summary with it"
+    assert "resume with the same command" in out
+    # The two units bought before the interrupt are on disk and READABLE: a
+    # resume is keyed on them, so a half-written tail would cost them twice.
+    assert len(_lines(root)) == 2
+
+
+def test_the_summary_reports_tokens_not_dollars_and_says_why(capsys):
+    """Spend, in the only unit this harness can honestly report it in.
+
+    The judge models are deliberately absent from `costs.PRICE_BOOK` --
+    mantle pricing is unpublished -- so a dollar figure here would be invented.
+    Printing nothing was the other failure: a ~40-hour paid pass left the call
+    count and the token totals unreconstructable from anything on disk, so
+    "what did that cost" had no answer at all.
+    """
+    result = _empty_result()
+    result["judge_usage"] = {
+        "calls": 3, "prompt_tokens": 41_000, "completion_tokens": 2_500,
+        "total_tokens": 43_500, "calls_without_usage": 1, "auth_refreshes": 2,
+    }
+
+    print_summary(result)
+
+    out = capsys.readouterr().out
+    assert "41,000" in out
+    assert "2,500" in out
+    assert "43,500" in out
+    assert "3 completion request(s)" in out
+    assert "2 credential refresh" in out
+    assert "1 of them reported no usage" in out
+    # The sentence that says why this is not a dollar figure, and names the
+    # place a reader would go looking for one.
+    assert "PRICE_BOOK" in out
+    assert "$" not in out
+
+
+def test_an_injected_seam_reports_no_usage_and_the_live_one_reports_zeros(
+    tmp_path, monkeypatch
+):
+    """`None` and a dict of zeros are different facts, and both are real.
+
+    A batch driven through an injected `complete` cannot be counted at all --
+    the seam's contract is one string in and one string out, so there is no
+    response to read tokens off -- and reporting zeros for it would be a
+    measurement of a batch nobody measured. A batch on the LIVE seam that
+    happens to make no call (every comparison settled by the ladder, or
+    everything already judged) genuinely spent nothing, and zero is the right
+    answer.
+
+    The second half also pins that the accumulator is created BESIDE the lazy
+    seam rather than inside it: the live judge is never built here, so a dict
+    made on first use would still be `None` at the end of the pass.
+    """
+    root = _two_arms(tmp_path, resolved_a=True, resolved_b=False)
+
+    assert _run(root, complete=FakeComplete(), rubric=False)["judge_usage"] is None
+
+    fresh = _two_arms(tmp_path / "second", resolved_a=True, resolved_b=False)
+    monkeypatch.setattr(
+        "scripts.judge.live_completion",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no call")),
+    )
+    usage = judge_event_log(fresh, [_task()], rubric=False)["judge_usage"]
+
+    assert usage == {
+        "calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
+        "total_tokens": 0, "calls_without_usage": 0, "auth_refreshes": 0,
+    }
+
+
+def test_importing_the_judge_driver_needs_neither_docker_nor_litellm():
+    """`python scripts/judge.py --help` on a box with no Docker daemon.
+
+    Two import edges made that fail before argparse ran. `scripts.grade` was
+    imported for `grades_path` alone and drags `bakeoff.images` -> `docker`
+    behind it, so an analysis box without the package could not read the usage
+    line; and litellm calls `load_dotenv()` on import, so merely importing the
+    driver poured `bakeoff/.env` into the process environment -- credentials
+    and all -- before the operator had asked for anything.
+
+    A SUBPROCESS, because `sys.modules` in this one is already full of both:
+    the suite imports litellm for the live-completion tests and docker for the
+    container ones, so an in-process assertion would be about pytest rather
+    than about the driver.
+    """
+    probe = (
+        "import sys; import scripts.judge; "
+        "print('docker' in sys.modules, 'litellm' in sys.modules)"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True, text=True, cwd=str(REPO_ROOT),
+        env={**os.environ, "PYTHONPATH": str(REPO_ROOT),
+             "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.split() == ["False", "False"], done.stdout
+
+
+# --------------------------------------------------------------------------
 # 7. the summary -- a printout, not a stored score
 # --------------------------------------------------------------------------
 #
@@ -1982,6 +2355,9 @@ def _empty_result() -> dict:
         "judged": [], "gate_decided": [], "skipped": [], "errors": [],
         "warnings": [], "summary": summarize([], {}),
         "audited": 0, "from_prior_invocations": 0,
+        "interrupted": False, "judge_usage": None,
+        "selected": {"rubric": 0, "votes": 0, "pairs": 0, "gate_decided": 0,
+                     "skipped": 0, "units": 0},
     }
 
 
@@ -2798,10 +3174,17 @@ def test_the_kappa_caveat_line_is_always_printed(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(
         "scripts.judge.live_completion", lambda *a, **k: FakeComplete()
     )
+    # A real, EMPTY collection root rather than a path that does not exist: an
+    # absent `runs/` is now a refusal (`CollectionNotFound`) that prints no
+    # numbers, so it would be asserting the caveat over a batch that never ran.
+    # An empty collection is the case this was reaching for -- zero units, one
+    # caveat.
+    fresh = tmp_path / "fresh"
+    (fresh / "runs").mkdir(parents=True)
     for flags in ([], ["--no-rubric"], ["--re-judge"],
                   ["--judge-model", "openai.gpt-5.6-terra"],
                   ["--no-rubric", "--re-judge", "--samples", "0"]):
-        main(["--event-log", str(tmp_path / "fresh"), *flags])
+        main(["--event-log", str(fresh), *flags])
         assert KAPPA_CAVEAT in capsys.readouterr().out
 
 

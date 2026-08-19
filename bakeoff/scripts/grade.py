@@ -84,6 +84,14 @@ from bakeoff.grade_schema import (  # noqa: E402
     GradeRecord,
     NotGradedReason,
     append_grade,
+    # Defined beside the record they name rather than here, and re-imported so
+    # `scripts.grade.grades_path` stays the name every existing caller reads.
+    # `scripts/judge.py` needs the first of these and nothing else in this
+    # module: importing this file for it dragged `bakeoff.images` -> `docker`
+    # into a driver that judges offline, which is a Docker package standing
+    # between an operator and `--help`.
+    artifacts_root,
+    grades_path,
     load_grades,
     schema_at_least,
 )
@@ -150,14 +158,11 @@ class VerdictInvariantError(RuntimeError):
 # ---------------------------------------------------------------------------
 # paths
 # ---------------------------------------------------------------------------
-
-
-def grades_path(event_log_root: Path | str) -> Path:
-    return Path(event_log_root) / "grades" / "grades.jsonl"
-
-
-def artifacts_root(event_log_root: Path | str) -> Path:
-    return Path(event_log_root) / "grades" / "artifacts"
+#
+# `grades_path` and `artifacts_root` live in `bakeoff.grade_schema` now and are
+# imported above. Moved rather than copied: two definitions of where the grade
+# file lives is how a moved grade file turns into a judging pass that reports
+# "nothing is graded" and judges nothing.
 
 
 # ---------------------------------------------------------------------------

@@ -78,6 +78,35 @@ GRADE_SCHEMA_VERSION = "1.0.0"
 MIN_GRADABLE_SCHEMA = "3.0.0"
 
 
+# ---------------------------------------------------------------------------
+# where a grading pass puts what it writes
+# ---------------------------------------------------------------------------
+#
+# HERE rather than in `scripts/grade.py`, where both of these were defined and
+# from where `scripts/judge.py` imported the first of them. That import is what
+# made reading the judge driver's `--help` require a Docker package: importing
+# `scripts.grade` for one path derivation drags `bakeoff.images` -> `docker`
+# and the rest of the grading module graph behind it, so on an analysis box
+# with no daemon the judge driver failed before argparse ran, over a function
+# that returns a two-component join.
+#
+# `grade.py` re-imports both names and goes on exporting them, so
+# `scripts.grade.grades_path` stays reachable for every caller that already
+# reads it -- the point is one definition in a module that costs nothing to
+# import, not a second copy in a lighter place. Two copies of where the grade
+# file lives is how a moved grade file turns into a judging pass that reports
+# "nothing is graded" and judges nothing: silent, and in the direction that
+# looks like success.
+
+
+def grades_path(event_log_root: Path | str) -> Path:
+    return Path(event_log_root) / "grades" / "grades.jsonl"
+
+
+def artifacts_root(event_log_root: Path | str) -> Path:
+    return Path(event_log_root) / "grades" / "artifacts"
+
+
 def _version_tuple(version: str) -> tuple[int, ...]:
     return tuple(int(part) for part in version.split("."))
 

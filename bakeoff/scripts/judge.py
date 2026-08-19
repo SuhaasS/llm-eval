@@ -96,6 +96,42 @@ gave together. Nothing it computes is written anywhere, on `grade.py
 summarize`'s precedent and for a sharper reason: a stored Elo is a published
 number, and §4.3 forbids publishing one without the κ that was in force.
 
+WHAT THE OPERATOR SEES, AND WHY ANY OF IT IS HERE
+-------------------------------------------------
+
+A full pass is ~9,600 paid calls over many more hours than a credential lives,
+and it used to print five header lines and then NOTHING until the summary. That
+is not a cosmetic gap: it made a working pass indistinguishable from a hung one,
+gave the operator no way to know what the pass had committed to spending before
+it started spending, and left the whole reading hostage to the one exit a long
+batch actually takes. Four things are placed against that, and each of them is
+about a decision somebody has to make while the batch is still running:
+
+1. **The census is printed before the first paid call.** Phase 1 of the walk is
+   pure selection -- no calls, no writes -- so the count of rubric calls, votes,
+   pairs, gate-decided pairs and skips is known before a credential is minted.
+   `--only-task` narrowed to nothing, a resume that has everything already, a
+   grade file from another collection: all of them read as one line at the top
+   rather than as a suspiciously short summary forty hours later.
+2. **One line per ATTEMPTED unit**, naming task, sample and arms -- `_unit_label`,
+   the same string the errors use. Skipped units are a number in the census and
+   never a line: a resume is skip-heavy by construction, and one line per skip
+   is thousands of lines saying nothing happened.
+3. **A batch that cannot record what it buys stops.** `StorageFailure` wraps
+   `write_payload` and `append_judgment` and NOTHING else, so a full disk is
+   batch-fatal while a `ConnectionResetError` from the seam -- also an `OSError`
+   -- stays the per-unit error it has always been. The wrap scope is the whole
+   of that distinction.
+4. **Ctrl-C is an exit with a report.** `KeyboardInterrupt` is caught around the
+   walk rather than allowed to unwind through it, so the reading over everything
+   the pass DID buy survives the way every long pass actually ends. Exit 130.
+
+And one refusal before any of it: `CollectionNotFound`. `EventLog.__init__`
+mkdirs `runs/`, so a mistyped `--event-log` used to be CREATED, found empty, and
+reported as a clean pass over zero units -- every number in it zero and none of
+them wrong. The check is the first statement of `judge_event_log`, before that
+constructor can run.
+
 Which is why `print_summary` ends every run with `KAPPA_CAVEAT`,
 unconditionally. OPEN-5 is blocked on people rather than on code, an unmeasured
 κ is below 0.6 by construction, and below 0.6 the number is directional only. A
@@ -117,8 +153,11 @@ Usage:
     python scripts/judge.py --event-log PATH --no-rubric
 
 Exit codes:
-    0  every selected unit produced its lines
-    1  at least one unit errored, or the batch was refused
+    0    every selected unit produced its lines
+    1    at least one unit errored, or the batch was refused
+    130  the operator interrupted the pass (128 + SIGINT). Distinct from 1 on
+         purpose: a shell reads 130 as "somebody stopped this" and 1 as "the
+         batch found problems", and a resume is the answer to only one of them
 """
 
 from __future__ import annotations
@@ -127,8 +166,10 @@ import argparse
 import itertools
 import math
 import sys
+import time
 import uuid
 from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -138,7 +179,20 @@ sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO))
 
 from bakeoff.eventlog import EventLog  # noqa: E402
-from bakeoff.grade_schema import GradeRecord, load_grades  # noqa: E402
+from bakeoff.grade_schema import (  # noqa: E402
+    GradeRecord,
+    # `grade.py` owns where the grade file lives and this driver's whole gate
+    # comes out of it, so a second copy of the path is how a moved grade file
+    # turns into a judging pass that reports "nothing is graded" and judges
+    # nothing -- silent, and in the direction that looks like success. Taken
+    # from `bakeoff.grade_schema` rather than from `scripts.grade`, which is
+    # where it used to live: that import cost this driver `scripts.grade`'s
+    # whole module graph, `bakeoff.images` -> `docker` included, so an analysis
+    # box with no Docker package could not read `--help`. Same one derivation,
+    # one import edge lighter.
+    grades_path,
+    load_grades,
+)
 from bakeoff.judge import (  # noqa: E402
     JUDGE_MODEL_ID_DEFAULT,
     JUDGE_PROMPT_VERSION,
@@ -152,6 +206,7 @@ from bakeoff.judge import (  # noqa: E402
     judge_rubric,
     live_completion,
     majority,
+    new_usage_totals,
     payload_inputs_from,
     prompt_sha,
 )
@@ -164,15 +219,6 @@ from bakeoff.judge_schema import (  # noqa: E402
     write_payload,
 )
 from bakeoff.tasks import TaskError, load_task_set  # noqa: E402
-
-# Imported, never restated. `grade.py` owns where the grade file lives and this
-# driver's whole gate comes out of it, so a second copy of the path is how a
-# moved grade file turns into a judging pass that reports "nothing is graded"
-# and judges nothing -- silent, and in the direction that looks like success.
-# The import costs `scripts.grade`'s module graph (which reaches `docker`, an
-# import with no side effects and a declared dependency) and buys one
-# derivation. Same reasoning as `grade.py` importing `preflight_cache_key`.
-from scripts.grade import grades_path  # noqa: E402
 
 DEFAULT_TASK_SET = REPO / "taskset"
 
@@ -280,6 +326,58 @@ class ResumeRefused(RuntimeError):
     """
 
 
+class CollectionNotFound(RuntimeError):
+    """`--event-log` names a directory that is not a collection root.
+
+    A TYPO, and the reason this needs its own refusal is that the old failure
+    mode was not a failure at all. `EventLog.__init__` mkdirs `runs/`, so a
+    mistyped path was CREATED, read as an empty collection, and reported
+    through a complete summary with an exit status of 0 -- every number in it
+    zero, none of them wrong, and nothing anywhere saying the pass had judged
+    a directory that did not exist a second earlier. The directory it left
+    behind is the second half of the damage: it looks like a real collection
+    root to the next command that points at it.
+
+    Raised as the FIRST statement of `judge_event_log`, which is the only place
+    it can be raised from and still be true to its own name -- one line later
+    the constructor has already made the thing this says is missing.
+
+    Its own class rather than `ResumeRefused`, on that class's own reasoning:
+    the two refuse over different things -- a file that cannot be read
+    completely against a collection that is not there -- and one `except` that
+    caught both would report a damaged judgment file as a typo.
+    """
+
+
+class StorageFailure(RuntimeError):
+    """`write_payload` or `append_judgment` raised `OSError`: the disk has
+    stopped accepting what this pass is buying.
+
+    BATCH-FATAL, and the only failure in this driver that is. Everything else
+    here is per-unit on purpose -- one unreadable diff, one model that cannot
+    produce JSON, one payload that tripped the scan costs its own line and not
+    the rest of the batch. A full disk is the opposite shape: it fails EVERY
+    write from the moment it starts, so the isolation that makes one bad unit
+    cheap makes this one catastrophic. Measured shape of the old behaviour: the
+    driver went on calling a paid model for every remaining unit and recorded
+    not one of the answers, at a cost per unit and nothing on disk to show for
+    any of it.
+
+    A DISTINCT CLASS BECAUSE THE WRAP SCOPE IS THE WHOLE CONTRACT. `OSError` is
+    the base class of `ConnectionResetError` as much as of `ENOSPC`, and a
+    reset arriving from the completion seam is an ordinary per-unit failure a
+    long batch must survive. So the wrap sits around the two STORE calls and
+    nothing else -- not around the unit, not around the model call -- and this
+    class is what carries "the disk said no" out past a per-unit `except
+    Exception` that would otherwise flatten it back into one more unit error.
+
+    Deliberately NOT an `OSError` itself: it passes through the builders and
+    the executor, and a `StorageFailure` that were an `OSError` would be caught
+    and re-wrapped by the next `except OSError` it met, losing on the way out
+    exactly the distinction it exists to carry.
+    """
+
+
 class _BatchAborted(RuntimeError):
     """`max_consecutive_errors` units failed in a row, so the loop stops.
 
@@ -312,6 +410,15 @@ class _BatchAborted(RuntimeError):
     The message is built from the failing run itself -- every unit named, and
     `is_auth_failure` asked about each -- so it diagnoses rather than guesses.
     See `_abort_message`.
+
+    ONE OTHER THING RAISES IT, and it is not a run of anything: a
+    `StorageFailure` aborts on the FIRST unit rather than the fifth, under
+    `_storage_abort_message`. Both end the walk the same way -- the warning,
+    the partial return, the summary over everything already bought -- because
+    the operator's next step is the same in both cases and it is not reading a
+    traceback. What differs is what the message tells them to fix, which is
+    why the two messages are built by two functions rather than parameterised
+    out of one.
     """
 
 
@@ -496,7 +603,9 @@ def _pairwise_key(task_id: str, sample_index: int, run_id_a: str,
 # ---------------------------------------------------------------------------
 
 
-def lazy_live_completion(judge_model_id: str) -> CompleteFn:
+def lazy_live_completion(judge_model_id: str,
+                         usage_totals: dict[str, int] | None = None
+                         ) -> CompleteFn:
     """`live_completion`, built on the first prompt that needs it.
 
     The `task_resolver` pattern (`scripts/grade.py:317`) one layer further out.
@@ -509,15 +618,66 @@ def lazy_live_completion(judge_model_id: str) -> CompleteFn:
     Not thread-safe (check-then-set), which is fine while the two votes of a
     comparison are sequential and is the same shape `live_completion`'s own
     cache has.
+
+    `usage_totals` is passed THROUGH rather than counted here, and the laziness
+    is why that matters: this wrapper sees a prompt and a reply, not a response,
+    so counting at this layer would report a call count and no tokens at all.
+    It is also the caller's dict rather than one made here, so a batch that
+    never builds the live judge -- fully gate-decided, or fully skipped --
+    still hands the driver a set of zeros to print rather than a `None` that
+    would read as "not counted".
     """
     built: dict[str, CompleteFn] = {}
 
     def complete(prompt: str) -> str:
         if "fn" not in built:
-            built["fn"] = live_completion(judge_model_id)
+            built["fn"] = live_completion(
+                judge_model_id, usage_totals=usage_totals
+            )
         return built["fn"](prompt)
 
     return complete
+
+
+def _write_payload_or_fail(payloads: Path, judgment_id: str,
+                           payload: dict) -> tuple[str, str]:
+    """`write_payload`, with an `OSError` promoted to `StorageFailure`.
+
+    THE WRAP IS EXACTLY THIS CALL, which is the whole of what makes the batch
+    abort safe -- see `StorageFailure`. A wrap one frame wider would take the
+    completion seam with it, and a `ConnectionResetError` from a flaky endpoint
+    is an `OSError` too: every reset in a nine-hour batch would end the pass.
+
+    `PayloadSecretsFound` is deliberately left to propagate. It is not an
+    `OSError`, it is not a disk problem, and it is per-unit by design -- that
+    payload is refused, that unit costs its line, and nothing else changes.
+    """
+    try:
+        return write_payload(payloads, judgment_id, payload)
+    except OSError as exc:
+        raise StorageFailure(
+            f"the payload for {judgment_id} could not be written under "
+            f"{payloads}: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def _append_or_fail(path: Path, judgment: JudgeRecord) -> None:
+    """`append_judgment`, with an `OSError` promoted to `StorageFailure`.
+
+    The second half of the same wrap, and the more expensive half: the payload
+    is already on disk by the time this runs, so a failure here leaves a
+    payload no line names. That is the documented safe direction (module
+    docstring, step 7) -- the unit is simply retried on the next pass -- but it
+    is debris, and it is another reason the batch stops here rather than
+    accumulating one orphan per remaining unit.
+    """
+    try:
+        append_judgment(path, judgment)
+    except OSError as exc:
+        raise StorageFailure(
+            f"the judgment line for {judgment.judgment_id} could not be "
+            f"appended to {path}: {type(exc).__name__}: {exc}"
+        ) from exc
 
 
 def _now() -> str:
@@ -546,10 +706,18 @@ def _rubric_line(record, grade: GradeRecord, task, inputs: PayloadInputs,
 
     What lands on the line is the RELATIVE path, checked against the absolute
     one `write_payload` returned -- see `_stored_payload_path`.
+
+    Both store calls go through `_write_payload_or_fail`/`_append_or_fail`,
+    which promote an `OSError` to `StorageFailure` and are wrapped around those
+    two calls and nothing else. `judge_rubric` above is deliberately OUTSIDE
+    the wrap: a socket error from the seam is an `OSError` as well, and it is a
+    per-unit failure rather than a reason to end the batch.
     """
     payload, rendered, result = judge_rubric(inputs, complete)
     judgment_id = uuid.uuid4().hex
-    written, payload_sha = write_payload(payloads, judgment_id, payload)
+    written, payload_sha = _write_payload_or_fail(
+        payloads, judgment_id, payload
+    )
     # `path.parent` is the judgments directory: the jsonl's own directory is
     # what a reader joins a stored payload path against.
     payload_path = _stored_payload_path(path.parent, judgment_id, written)
@@ -583,7 +751,7 @@ def _rubric_line(record, grade: GradeRecord, task, inputs: PayloadInputs,
     )
 
     _assert_rubric_gate(grade, record.run_id)
-    append_judgment(path, judgment)
+    _append_or_fail(path, judgment)
     return judgment
 
 
@@ -616,7 +784,7 @@ def _vote_line(task, sample_index: int, run_id_a: str, run_id_b: str,
         inputs_a, inputs_b, position_assignment, complete
     )
     judgment_id = uuid.uuid4().hex
-    written, payload_sha = write_payload(
+    written, payload_sha = _write_payload_or_fail(
         payloads, judgment_id, outcome.payload
     )
     payload_path = _stored_payload_path(path.parent, judgment_id, written)
@@ -651,7 +819,7 @@ def _vote_line(task, sample_index: int, run_id_a: str, run_id_b: str,
         graded_against_task_set_commit=task.task_set_commit,
     )
 
-    append_judgment(path, judgment)
+    _append_or_fail(path, judgment)
     return judgment
 
 
@@ -702,7 +870,11 @@ def _gate_decided_line(task, sample_index: int, run_id_a: str, run_id_b: str,
         },
         graded_against_task_set_commit=task.task_set_commit,
     )
-    append_judgment(path, judgment)
+    # Through the same wrap as the other two, even though this unit is free.
+    # A disk that has stopped accepting writes stops the batch whichever kind
+    # of line discovered it: the next unit is a paid one, and it would be
+    # bought against the same disk.
+    _append_or_fail(path, judgment)
     return judgment
 
 
@@ -828,6 +1000,165 @@ def _abort_message(failure_run: list[tuple[str, bool]]) -> str:
     return "\n\n".join(parts)
 
 
+def _storage_abort_message(label: str, exc: BaseException) -> str:
+    """The abort a disk causes, phrased as a disk problem.
+
+    ITS OWN MESSAGE rather than a case inside `_abort_message`, for that
+    function's own reason one step further along: the abort's whole job is to
+    send the operator to the thing that will fix it, and a full disk shares no
+    fix with either paragraph there. It is not a credential (a fresh token
+    writes no better), and it is not the data (raising the limit or narrowing
+    `--only-task` reaches more units against the same disk). The fix is space,
+    or a permission, and then the same command.
+
+    ONE unit, not a run of them, and the message says so by naming the unit
+    that discovered the problem rather than listing five. That is the point of
+    the whole decision: a batch aborting on the fifth ENOSPC would have bought
+    four verdicts it could not record, at a paid call each.
+    """
+    return (
+        f"{label} could not be recorded: writes are failing ({exc}). "
+        "Aborting the batch with units left unattempted -- continuing would "
+        "buy verdicts that cannot be recorded, which is a paid model call per "
+        "unit and nothing on disk to show for any of it. Free space (or fix "
+        "the permission on the judgments directory) and resume with the same "
+        "command: judgments are append-only and the resume is keyed on units "
+        "already bought, so everything written before this point is kept."
+    )
+
+
+def _interrupt_message(attempted: int, total: int) -> str:
+    """Ctrl-C, reported as an exit rather than as a crash.
+
+    An uncaught `KeyboardInterrupt` unwinds through `judge_event_log` and takes
+    the summary with it, which is the worst possible place to lose a report:
+    this is how a long pass USUALLY ends -- an operator stops a batch that has
+    been running for hours -- and the lines it bought are on disk either way.
+    What the traceback destroys is the only place anybody meets them.
+
+    The counts are attempted-of-selected rather than a percentage, because the
+    number an operator acts on is how much is left.
+    """
+    return (
+        f"interrupted by the operator (Ctrl-C) after {attempted} of {total} "
+        "selected unit(s). Nothing is lost -- judgments are append-only and "
+        "the resume is keyed on units already bought -- so resume with the "
+        "same command to pick up where this stopped. The reading below covers "
+        "everything the pass did buy."
+    )
+
+
+# ---------------------------------------------------------------------------
+# the worklist: what phase 1 selects and phase 2 executes
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Unit:
+    """One unit of work, chosen by phase 1 and executed by phase 2.
+
+    THE SPLIT EXISTS SO THE CENSUS CAN BE HONEST. Selection is a pure function
+    of what is on disk -- which runs are graded, which units the resume already
+    holds, what `--only-task` and `--samples` name -- and none of it needs a
+    credential or a call. Deciding all of it first is what lets the driver say
+    what the pass has committed to spending BEFORE it spends any of it, which
+    is the one moment an operator can still act on the number.
+
+    Selection also stays exactly where it was in the old single-pass walk:
+    cell, then rubric per model, then pair, then position, `sorted()` at every
+    level. That order is pinned by the resume-determinism tests and it is not
+    arbitrary decoration -- a killed pass that resumed in a different order
+    would redo different work, and the two positions of a comparison are
+    adjacent so a batch killed mid-comparison leaves the missing position as
+    the very next unit a resume buys.
+
+    FROZEN and carrying ids rather than records. `records` and `gating` are
+    both keyed on `run_id` and both live for the whole call, so holding the id
+    is one dict lookup at execution time against a second reference to a
+    mutable record here -- and a frozen descriptor cannot be edited between the
+    census that counted it and the executor that runs it.
+
+    `run_ids` is canonical order: one id for a rubric unit, and the two ids
+    SORTED for a pairwise one. Sorted-by-run-id is not the model order, which
+    is why `label` is built at selection time by the same code that knows both
+    -- a label naming each arm as the other is worse than no label at all
+    (`_unit_label`).
+    """
+
+    #: `"rubric"`, `"gate-decided"` or `"vote"`. What the census counts and
+    #: what the executor dispatches on.
+    kind: str
+    #: `_unit_label`'s string, built once at selection and used for the
+    #: progress line, the error line and the abort listing -- so the three
+    #: cannot describe the same unit three ways.
+    label: str
+    task: Any
+    sample_index: int
+    run_ids: tuple[str, ...]
+    #: Votes only. `None` on the other two kinds, which is the schema's own
+    #: contract for a gate-decided line.
+    vote_index: int | None = None
+    position: str | None = None
+
+
+def _census(worklist: list[_Unit], skipped: list) -> dict:
+    """What phase 1 selected, in the units an operator budgets in.
+
+    PAIRS BESIDE VOTES because they are the two different questions. Votes are
+    the paid calls; pairs are the comparisons those calls buy, at two forced
+    positions each. A census reporting only one of them makes the operator do
+    the arithmetic to reach the other, and getting it wrong by a factor of two
+    is how a pass gets started that nobody meant to pay for.
+
+    `skipped` is a count and never a list of lines -- see the progress printer.
+    """
+    votes = [unit for unit in worklist if unit.kind == "vote"]
+    return {
+        "rubric": sum(1 for unit in worklist if unit.kind == "rubric"),
+        "votes": len(votes),
+        # Run ids are unique within a collection, so the two of a pair identify
+        # the comparison without the task and sample riding along.
+        "pairs": len({unit.run_ids for unit in votes}),
+        "gate_decided": sum(
+            1 for unit in worklist if unit.kind == "gate-decided"
+        ),
+        "skipped": len(skipped),
+        "units": len(worklist),
+    }
+
+
+def _census_line(selected: dict) -> str:
+    return (
+        f"selected: {selected['rubric']} rubric, {selected['votes']} votes "
+        f"over {selected['pairs']} pairs, {selected['gate_decided']} "
+        f"gate-decided; {selected['skipped']} already judged (skipped)"
+    )
+
+
+def _seconds(value: float) -> str:
+    """One unit's duration. One decimal, because a judge call is seconds."""
+    return f"{value:.1f}s"
+
+
+def _elapsed(value: float) -> str:
+    """Wall clock since the walk began, in the largest units that fit.
+
+    `8m12s` and `3h07m40s` rather than `492.3` -- the number is read to answer
+    "how much longer", against a pass measured in tens of hours, and seconds
+    past the first minute is a number nobody converts in their head.
+
+    Truncated to whole seconds and zero-padded below the leading unit, so the
+    column does not jitter between lines.
+    """
+    hours, rest = divmod(int(value), 3600)
+    minutes, seconds = divmod(rest, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{seconds:02d}s"
+    if minutes:
+        return f"{minutes}m{seconds:02d}s"
+    return f"{seconds}s"
+
+
 # ---------------------------------------------------------------------------
 # the batch
 # ---------------------------------------------------------------------------
@@ -861,6 +1192,22 @@ def judge_event_log(event_log_root, tasks, *,
     aligned is what makes "exit 0 means every selected unit produced its lines"
     a statement about something.
 
+    TWO PHASES, and the split is what makes the census honest. Phase 1 selects
+    -- a pure function of what is on disk, making no call and writing nothing
+    -- and produces the worklist in exactly the order the single-pass walk used
+    to execute it in. The census is printed off that worklist, so it is on the
+    terminal before the first credential is minted, and phase 2 then walks the
+    list printing one line per attempted unit. A census computed anywhere else
+    would be a report rather than a decision an operator can still act on, and
+    a walk that decided as it went could not produce one at all.
+
+    `_judgeable_inputs` deliberately stays in PHASE 2, even though it is
+    selection-shaped. Building payload inputs walks two diffs per run
+    (`similarity_context`), it is exactly the work a skip-heavy resume must not
+    pay for, and its failures are per-unit error lines rather than selection
+    facts -- a run with no `final_diff` was still selected, and reporting it as
+    though it were never chosen would hide it.
+
     `max_consecutive_errors` units failing in a row stops the walk early -- see
     `MAX_CONSECUTIVE_ERRORS`, which is its default, and `_BatchAborted`. The
     batch still returns: everything already judged is on disk and in the
@@ -888,8 +1235,26 @@ def judge_event_log(event_log_root, tasks, *,
     CHECK instead of an identity: `_stored_payload_path` compares the two on
     every line. Lines written before this change stay absolute and go on
     resolving, through `judge_schema.resolve_payload_path`.
+
+    Raises `CollectionNotFound` before touching anything, `ResumeRefused` if
+    either input file cannot be read completely, and nothing else: a batch that
+    got as far as the walk returns its partial reading whatever happens in it.
     """
+    # FIRST, and before `EventLog(...)` below, which mkdirs `runs/` -- see
+    # `CollectionNotFound`. `Path()` creates nothing, so this is still the
+    # first statement that could.
     event_log_root = Path(event_log_root)
+    if not (event_log_root / "runs").is_dir():
+        raise CollectionNotFound(
+            f"{event_log_root} is not a collection: it holds no runs/ "
+            "directory. A collection root is the directory a harness run wrote "
+            "its event log into -- runs/ (one JSON per run) and index.jsonl, "
+            "with grades/ beside them once scripts/grade.py has run. Judging "
+            "only reads those, so a path that does not already hold them has "
+            "nothing to judge; the usual cause is a typo in --event-log, which "
+            "would otherwise be created empty and reported as a clean pass "
+            "over zero units."
+        )
     path = judgments_path(event_log_root)
     payloads = payloads_root(event_log_root)
     warnings: list[str] = []
@@ -1009,14 +1374,28 @@ def judge_event_log(event_log_root, tasks, *,
                 "where every id is missing and the batch reports a clean zero."
             )
 
-    complete = complete if complete is not None else lazy_live_completion(
-        judge_model_id
-    )
+    # The usage accumulator belongs to the LIVE seam and to nothing else. A
+    # caller that injected its own `complete` gets `judge_usage is None` --
+    # zeros would be a measurement of a batch that made no live call, and the
+    # driver has no way to count tokens through a function whose contract is
+    # one string in and one string out.
+    judge_usage: dict[str, int] | None = None
+    if complete is None:
+        judge_usage = new_usage_totals()
+        complete = lazy_live_completion(judge_model_id, judge_usage)
 
     judged: list[JudgeRecord] = []
     gate_decided: list[JudgeRecord] = []
     skipped: list[tuple] = []
     missing_tasks: set[str] = set()
+
+    # ONE cache for the whole walk, keyed on `run_id`, which is unique within a
+    # collection -- so the flat worklist can share it where the old per-cell
+    # dict could not. Still lazy and still filled by `_judgeable_inputs`, so a
+    # skip-heavy resume builds nothing: what changes is only that a run
+    # appearing in two cells is walked once instead of twice. It holds no diff
+    # text of its own beyond what `records` already holds.
+    inputs: dict[str, PayloadInputs] = {}
 
     # Runs this pass could not turn into a submission, and why. Filled by
     # `_judgeable_inputs` the first time one is asked for, so a run that fails
@@ -1038,16 +1417,54 @@ def judge_event_log(event_log_root, tasks, *,
     # the run", and the day they disagree the message describes a run other
     # than the one that fired.
     #
-    # Three closures rather than inline bookkeeping, so the per-unit handlers
-    # cannot each grow their own version of "does this one count" -- which is
-    # exactly where a gate-decided pair would quietly become a success.
+    # Closures rather than inline bookkeeping, so the per-unit handlers cannot
+    # each grow their own version of "does this one count" -- which is exactly
+    # where a gate-decided pair would quietly become a success.
     failure_run: list[tuple[str, bool]] = []
+
+    # The unit currently being attempted, and how many have been. Written by
+    # `_begin` and read by `_finish`, which is the ONE place a progress line is
+    # printed: every outcome a unit can have goes through one of the four
+    # closures below, and each of them ends in `_finish`, so "exactly one line
+    # per attempted unit" holds by construction rather than by four call sites
+    # remembering to print.
+    progress: dict[str, Any] = {
+        "index": 0, "label": "", "start": 0.0, "attempted": 0,
+        "total": 0, "batch_started": 0.0,
+    }
+
+    def _begin(index: int, unit: _Unit) -> None:
+        progress.update(
+            index=index, label=unit.label, start=time.monotonic()
+        )
+
+    def _finish(status: str) -> None:
+        """One progress line for the unit just attempted.
+
+        `ok` or `ERROR <what>`, then the two clocks. The unit duration is what
+        says whether the pass is moving; the elapsed total is what an operator
+        divides by the index to estimate the rest, which is the number they
+        actually want at hour nine of a forty-hour batch.
+
+        Printed AFTER the outcome is known and BEFORE any abort is raised, so
+        the unit that ended the batch is on the terminal like every other one.
+        A unit whose error line appears in the summary with no progress line
+        above it reads as a unit that never ran.
+        """
+        now = time.monotonic()
+        progress["attempted"] += 1
+        print(
+            f"[{progress['index']}/{progress['total']}] {progress['label']} "
+            f"{status} (unit {_seconds(now - progress['start'])}, "
+            f"elapsed {_elapsed(now - progress['batch_started'])})"
+        )
 
     def _unit_succeeded() -> None:
         """A unit produced its line, so whatever was failing is not systemic."""
         failure_run.clear()
+        _finish("ok")
 
-    def _unit_failed(label: str, exc: BaseException) -> None:
+    def _unit_failed(exc: BaseException) -> None:
         """Record one unit's error, and abort the batch on a run of them.
 
         See `MAX_CONSECUTIVE_ERRORS`. The EXCEPTION is taken rather than a
@@ -1056,12 +1473,41 @@ def judge_event_log(event_log_root, tasks, *,
         diagnosis -- and a caller that formatted the text itself would be the
         one place the classification could be skipped.
         """
+        label = progress["label"]
         errors.append(f"{label}: {type(exc).__name__}: {exc}")
         failure_run.append((label, is_auth_failure(exc)))
+        _finish(f"ERROR {type(exc).__name__}")
         if len(failure_run) >= max_consecutive_errors:
             raise _BatchAborted(_abort_message(failure_run))
 
-    def _unit_not_judged(label: str, run_ids: Sequence[str]) -> None:
+    def _unit_failed_fatally(exc: BaseException) -> None:
+        """A `StorageFailure`: the disk stopped, so the batch stops with it.
+
+        NOT a breaker event and deliberately not counted as one -- see
+        `StorageFailure`. The breaker is a heuristic about a run of failures
+        that might be systemic; this is a fact about the one that just
+        happened, and waiting for four more would mean four more paid calls
+        whose answers go nowhere.
+
+        The error line is recorded first so the unit that discovered the
+        problem is in the list beside the abort, then the progress line, then
+        the abort itself.
+        """
+        errors.append(f"{progress['label']}: {type(exc).__name__}: {exc}")
+        _finish(f"ERROR {type(exc).__name__}")
+        raise _BatchAborted(_storage_abort_message(progress["label"], exc))
+
+    def _gate_unit_failed(exc: BaseException) -> None:
+        """A gate-decided pair that could not be written, but not by the disk.
+
+        Straight into `errors` and past the breaker in both directions: that
+        unit makes no model call, so it is neither evidence that the credential
+        is dead nor evidence that it recovered. See `_BatchAborted`.
+        """
+        errors.append(f"{progress['label']}: {type(exc).__name__}: {exc}")
+        _finish(f"ERROR {type(exc).__name__}")
+
+    def _unit_not_judged(run_ids: Sequence[str]) -> None:
         """One line for a unit whose run yielded no payload. NOT a breaker
         event.
 
@@ -1088,10 +1534,15 @@ def judge_event_log(event_log_root, tasks, *,
             f"({unjudgeable[run_id]})"
             for run_id in run_ids if run_id in unjudgeable
         )
-        errors.append(f"{label}: not judged: {why}")
+        errors.append(f"{progress['label']}: not judged: {why}")
+        # It IS an attempted unit as far as the terminal is concerned -- it was
+        # selected, it was walked, and it produced no line -- so it prints
+        # like one. What it is not is evidence about the judge, which is the
+        # breaker's question and not this one.
+        _finish("ERROR no judgeable payload")
 
-    def _judgeable_inputs(cache: dict[str, PayloadInputs], run_id: str,
-                          grade: GradeRecord, task) -> PayloadInputs | None:
+    def _judgeable_inputs(run_id: str, grade: GradeRecord,
+                          task) -> PayloadInputs | None:
         """This run's payload inputs, or `None` if it has none to give.
 
         THE PRE-FILTER, and it is one function because the failure is a
@@ -1117,157 +1568,223 @@ def judge_event_log(event_log_root, tasks, *,
         if run_id in unjudgeable:
             return None
         try:
-            return _inputs_for(cache, records[run_id], grade, task)
+            return _inputs_for(inputs, records[run_id], grade, task)
         except Exception as exc:  # noqa: BLE001 - one run, not the batch
             unjudgeable[run_id] = f"{type(exc).__name__}: {exc}"
             return None
 
-    try:
-        for task_id, sample_index in sorted(cells):
-            if wanted_tasks is not None and task_id not in wanted_tasks:
-                continue
-            if (wanted_samples is not None
-                    and sample_index not in wanted_samples):
-                continue
-            task = by_task.get(task_id)
-            if task is None:
-                missing_tasks.add(task_id)
-                continue
+    # ----- phase 1: selection. No call, no write, no credential -----------
+    #
+    # The order below IS the old single-pass walk's order, statement for
+    # statement: cell, then rubric per model, then pair, then position,
+    # `sorted()` at every level. Resume determinism is pinned on it -- a killed
+    # pass that resumed in a different order would redo different work -- and
+    # the two positions of a comparison stay adjacent so a batch killed
+    # mid-comparison leaves the missing position as the very next unit a resume
+    # buys. What moved out of this loop is the paying and the writing, and
+    # nothing else.
+    worklist: list[_Unit] = []
 
-            cell = cells[(task_id, sample_index)]
-            # Per CELL, and shared across the rubric call and both votes of
-            # every pair the cell produces -- `similarity_context` walks two
-            # diffs and the payload builders take `PayloadInputs` by value, so
-            # rebuilding per unit would pay for the same walk four times over.
-            inputs: dict[str, PayloadInputs] = {}
+    for task_id, sample_index in sorted(cells):
+        if wanted_tasks is not None and task_id not in wanted_tasks:
+            continue
+        if (wanted_samples is not None
+                and sample_index not in wanted_samples):
+            continue
+        task = by_task.get(task_id)
+        if task is None:
+            missing_tasks.add(task_id)
+            continue
 
-            if rubric:
-                for model in sorted(cell):
-                    record = cell[model]
-                    grade = gating[record.run_id]
-                    # Selection-time gate. The assert before the append is
-                    # the one that is load-bearing; this is what keeps the
-                    # batch from paying for a call it must then refuse to
-                    # record.
-                    if grade.resolved is not True:
-                        continue
-                    key = _rubric_key(record.run_id, judge_model_id)
-                    if not re_judge and key in done:
-                        skipped.append(key)
-                        continue
-                    label = _unit_label(
+        cell = cells[(task_id, sample_index)]
+
+        if rubric:
+            for model in sorted(cell):
+                record = cell[model]
+                grade = gating[record.run_id]
+                # Selection-time gate. The assert before the append is the one
+                # that is load-bearing; this is what keeps the batch from
+                # paying for a call it must then refuse to record.
+                if grade.resolved is not True:
+                    continue
+                key = _rubric_key(record.run_id, judge_model_id)
+                if not re_judge and key in done:
+                    skipped.append(key)
+                    continue
+                worklist.append(_Unit(
+                    kind="rubric",
+                    label=_unit_label(
                         "rubric", task_id, sample_index,
                         (record.model,), (record.run_id,),
-                    )
-                    unit_inputs = _judgeable_inputs(
-                        inputs, record.run_id, grade, task
-                    )
-                    if unit_inputs is None:
-                        _unit_not_judged(label, (record.run_id,))
-                        continue
-                    try:
-                        judged.append(_rubric_line(
-                            record, grade, task, unit_inputs,
-                            payloads, path, complete, judge_model_id,
-                        ))
-                        _unit_succeeded()
-                    except Exception as exc:  # noqa: BLE001 - one unit
-                        _unit_failed(label, exc)
+                    ),
+                    task=task,
+                    sample_index=sample_index,
+                    run_ids=(record.run_id,),
+                ))
 
-            for model_x, model_y in itertools.combinations(sorted(cell), 2):
-                # Canonical a/b is the two run ids sorted, NOT the two
-                # models: the identity has to be stable under a model rename,
-                # and `(x, y)` and `(y, x)` must be one comparison or the
-                # position-swap probe can no longer find its own pairs.
-                run_id_a, run_id_b = sorted(
-                    (cell[model_x].run_id, cell[model_y].run_id)
-                )
-                grade_a, grade_b = gating[run_id_a], gating[run_id_b]
-                passed_a = grade_a.resolved is True
-                passed_b = grade_b.resolved is True
-                # Named off the RUN ids, not off `(model_x, model_y)`: a/b is
-                # the two run ids sorted, so the model order can be the other
-                # one, and a label naming each arm as the other is worse than
-                # no label at all.
-                arms = (records[run_id_a].model, records[run_id_b].model)
+        for model_x, model_y in itertools.combinations(sorted(cell), 2):
+            # Canonical a/b is the two run ids sorted, NOT the two models: the
+            # identity has to be stable under a model rename, and `(x, y)` and
+            # `(y, x)` must be one comparison or the position-swap probe can no
+            # longer find its own pairs.
+            run_id_a, run_id_b = sorted(
+                (cell[model_x].run_id, cell[model_y].run_id)
+            )
+            grade_a, grade_b = gating[run_id_a], gating[run_id_b]
+            passed_a = grade_a.resolved is True
+            passed_b = grade_b.resolved is True
+            # Named off the RUN ids, not off `(model_x, model_y)`: a/b is the
+            # two run ids sorted, so the model order can be the other one, and
+            # a label naming each arm as the other is worse than no label at
+            # all.
+            arms = (records[run_id_a].model, records[run_id_b].model)
 
-                if not passed_a and not passed_b:
-                    # Nothing. Neither side is a submission worth ranking,
-                    # and a "tie" here would be a verdict about two failures.
+            if not passed_a and not passed_b:
+                # Nothing. Neither side is a submission worth ranking, and a
+                # "tie" here would be a verdict about two failures.
+                continue
+
+            if passed_a != passed_b:
+                key = _pairwise_key(task_id, sample_index, run_id_a,
+                                    run_id_b, None, judge_model_id)
+                if not re_judge and key in done:
+                    skipped.append(key)
                     continue
-
-                if passed_a != passed_b:
-                    key = _pairwise_key(task_id, sample_index, run_id_a,
-                                        run_id_b, None, judge_model_id)
-                    if not re_judge and key in done:
-                        skipped.append(key)
-                        continue
-                    label = _unit_label(
+                worklist.append(_Unit(
+                    kind="gate-decided",
+                    label=_unit_label(
                         "gate-decided", task_id, sample_index, arms,
                         (run_id_a, run_id_b),
-                    )
-                    try:
-                        gate_decided.append(_gate_decided_line(
-                            task, sample_index, run_id_a, run_id_b,
-                            grade_a, grade_b, path, judge_model_id,
-                        ))
-                    except Exception as exc:  # noqa: BLE001 - one unit
-                        # Straight into `errors`, deliberately: a gate-decided
-                        # pair makes no call, so it is neither evidence that
-                        # the credential is dead nor evidence that it
-                        # recovered. See `_BatchAborted`.
-                        errors.append(
-                            f"{label}: {type(exc).__name__}: {exc}"
-                        )
-                    continue
+                    ),
+                    task=task,
+                    sample_index=sample_index,
+                    run_ids=(run_id_a, run_id_b),
+                ))
+                continue
 
-                # One vote per forced position, and `enumerate` is what ties
-                # `vote_index` to `VOTE_POSITIONS` -- 0 is `a_first`, 1 is
-                # `b_first`. Adjacent, so a batch killed mid-comparison leaves
-                # the missing position as the very next unit a resume buys.
-                for vote_index, position in enumerate(VOTE_POSITIONS):
-                    key = _pairwise_key(task_id, sample_index, run_id_a,
-                                        run_id_b, vote_index, judge_model_id)
-                    if not re_judge and key in done:
-                        skipped.append(key)
-                        continue
+            # One vote per forced position, and `enumerate` is what ties
+            # `vote_index` to `VOTE_POSITIONS` -- 0 is `a_first`, 1 is
+            # `b_first`.
+            for vote_index, position in enumerate(VOTE_POSITIONS):
+                key = _pairwise_key(task_id, sample_index, run_id_a,
+                                    run_id_b, vote_index, judge_model_id)
+                if not re_judge and key in done:
+                    skipped.append(key)
+                    continue
+                worklist.append(_Unit(
+                    kind="vote",
                     # The POSITION rides along with the index, as the string
                     # this replaced carried it. It is derivable -- `enumerate`
                     # over `VOTE_POSITIONS` ties the two -- but an error line
                     # is read by somebody who does not have that mapping in
                     # front of them, and `a_first`/`b_first` is what the stored
                     # `position_assignment` calls the same thing.
-                    label = _unit_label(
+                    label=_unit_label(
                         f"vote {vote_index} ({position})", task_id,
                         sample_index, arms, (run_id_a, run_id_b),
-                    )
-                    # Bound before the call rather than inline: two positional
-                    # `PayloadInputs` four lines apart is where an a/b
-                    # transposition hides, and a transposed pair produces a
-                    # complete, confident, inverted verdict. Both are bound
-                    # BEFORE the `try` as well, so a run that cannot produce
-                    # inputs is pre-filtered rather than counted -- see
-                    # `_judgeable_inputs`.
-                    inputs_a = _judgeable_inputs(
-                        inputs, run_id_a, grade_a, task
-                    )
-                    inputs_b = _judgeable_inputs(
-                        inputs, run_id_b, grade_b, task
-                    )
-                    if inputs_a is None or inputs_b is None:
-                        _unit_not_judged(label, (run_id_a, run_id_b))
-                        continue
-                    try:
-                        judged.append(_vote_line(
-                            task, sample_index, run_id_a, run_id_b,
-                            inputs_a, inputs_b,
-                            vote_index, position, grade_a, grade_b,
-                            payloads, path, complete, judge_model_id,
-                        ))
-                        _unit_succeeded()
-                    except Exception as exc:  # noqa: BLE001 - one unit
-                        _unit_failed(label, exc)
+                    ),
+                    task=task,
+                    sample_index=sample_index,
+                    run_ids=(run_id_a, run_id_b),
+                    vote_index=vote_index,
+                    position=position,
+                ))
 
+    # ----- the census, before the first paid call -------------------------
+    selected = _census(worklist, skipped)
+    print(f"\n{_census_line(selected)}")
+    print(
+        "  the rubric and vote units above are the paid calls this pass will "
+        "make; gate-decided pairs and skips cost nothing. Nothing has been "
+        "asked yet."
+    )
+
+    # ----- phase 2: execution ---------------------------------------------
+    progress["total"] = len(worklist)
+    progress["batch_started"] = time.monotonic()
+    interrupted = False
+
+    def _attempt(unit: _Unit) -> None:
+        """Execute one selected unit, and account for however it ends.
+
+        Every path out of this ends in exactly one of the outcome closures, and
+        every one of those ends in `_finish` -- which is what makes the
+        one-line-per-attempted-unit rule structural.
+
+        `StorageFailure` is caught BEFORE the bare `except Exception`, which is
+        the whole of what makes a full disk batch-fatal and a `ConnectionReset`
+        from the seam per-unit. Ordering the two the other way round would put
+        every disk failure back into the per-unit bucket, silently.
+        """
+        if unit.kind == "rubric":
+            (run_id,) = unit.run_ids
+            grade = gating[run_id]
+            unit_inputs = _judgeable_inputs(run_id, grade, unit.task)
+            if unit_inputs is None:
+                _unit_not_judged(unit.run_ids)
+                return
+            try:
+                judged.append(_rubric_line(
+                    records[run_id], grade, unit.task, unit_inputs,
+                    payloads, path, complete, judge_model_id,
+                ))
+            except StorageFailure as exc:
+                _unit_failed_fatally(exc)
+            except Exception as exc:  # noqa: BLE001 - one unit
+                _unit_failed(exc)
+            else:
+                _unit_succeeded()
+            return
+
+        run_id_a, run_id_b = unit.run_ids
+        grade_a, grade_b = gating[run_id_a], gating[run_id_b]
+
+        if unit.kind == "gate-decided":
+            try:
+                gate_decided.append(_gate_decided_line(
+                    unit.task, unit.sample_index, run_id_a, run_id_b,
+                    grade_a, grade_b, path, judge_model_id,
+                ))
+            except StorageFailure as exc:
+                _unit_failed_fatally(exc)
+            except Exception as exc:  # noqa: BLE001 - one unit
+                _gate_unit_failed(exc)
+            else:
+                # `_finish` and NOT `_unit_succeeded`: this unit made no call,
+                # so it is no evidence the credential recovered and must not
+                # reset the breaker. See `_BatchAborted`.
+                _finish("ok")
+            return
+
+        # Bound before the call rather than inline: two positional
+        # `PayloadInputs` four lines apart is where an a/b transposition hides,
+        # and a transposed pair produces a complete, confident, inverted
+        # verdict. Both are bound BEFORE the `try` as well, so a run that
+        # cannot produce inputs is pre-filtered rather than counted -- see
+        # `_judgeable_inputs`.
+        inputs_a = _judgeable_inputs(run_id_a, grade_a, unit.task)
+        inputs_b = _judgeable_inputs(run_id_b, grade_b, unit.task)
+        if inputs_a is None or inputs_b is None:
+            _unit_not_judged(unit.run_ids)
+            return
+        try:
+            judged.append(_vote_line(
+                unit.task, unit.sample_index, run_id_a, run_id_b,
+                inputs_a, inputs_b,
+                unit.vote_index, unit.position, grade_a, grade_b,
+                payloads, path, complete, judge_model_id,
+            ))
+        except StorageFailure as exc:
+            _unit_failed_fatally(exc)
+        except Exception as exc:  # noqa: BLE001 - one unit
+            _unit_failed(exc)
+        else:
+            _unit_succeeded()
+
+    try:
+        for index, unit in enumerate(worklist, 1):
+            _begin(index, unit)
+            _attempt(unit)
     except _BatchAborted as exc:
         # The abort is a WARNING and not an error, because it is not a unit:
         # the units that failed are already in `errors`, and the exit code
@@ -1275,6 +1792,16 @@ def judge_event_log(event_log_root, tasks, *,
         # than a traceback -- everything judged before the run of failures is
         # on disk and belongs in the summary.
         warnings.append(str(exc))
+    except KeyboardInterrupt:
+        # A `BaseException`, so the per-unit `except Exception` above never
+        # sees it and the unit in flight is simply unfinished -- no line, no
+        # progress line, and the resume buys it next time. Caught HERE rather
+        # than allowed to unwind, because unwinding takes the summary with it:
+        # see `_interrupt_message`.
+        interrupted = True
+        warnings.append(
+            _interrupt_message(progress["attempted"], len(worklist))
+        )
 
     if missing_tasks:
         warnings.append(
@@ -1307,6 +1834,15 @@ def judge_event_log(event_log_root, tasks, *,
             1 for judgment in audited
             if _resume_key(judgment) not in fresh_keys
         ),
+        # What phase 1 chose, so a caller can assert against the same numbers
+        # the census printed rather than re-deriving them from `judged` --
+        # which would be a count of what SUCCEEDED and is a different fact.
+        "selected": selected,
+        # Ctrl-C. A flag rather than an exception, because everything below it
+        # in this dict is a real partial reading the caller should print.
+        "interrupted": interrupted,
+        # `None` when a caller injected its own seam -- see where it is built.
+        "judge_usage": judge_usage,
     }
 
 
@@ -1962,6 +2498,11 @@ def print_summary(result: dict) -> None:
     finally:
         _print_kappa_caveat()
 
+    # BELOW the caveat, with the warnings and the errors, because it is a fact
+    # about the BATCH rather than one of the numbers the caveat qualifies.
+    # Above it would read as though κ had something to say about a token count.
+    _print_usage(result["judge_usage"])
+
     for warning in result["warnings"]:
         print(f"\nWARNING: {warning}")
     if result["errors"]:
@@ -1972,6 +2513,61 @@ def print_summary(result: dict) -> None:
             "\nThese are holes in the derived view, not verdicts. The runs and "
             "the grades are untouched and re-running this command judges them."
         )
+
+
+def _print_usage(usage: dict[str, int] | None) -> None:
+    """What this invocation spent, in tokens, and why that is not dollars.
+
+    THERE IS NO DOLLAR FIGURE AND THERE DELIBERATELY IS NOT GOING TO BE. The
+    judge models are absent from `costs.PRICE_BOOK` because mantle pricing is
+    unpublished, so any number here would be invented -- and an invented cost
+    on a printout beside real token counts is indistinguishable from a measured
+    one. The sentence names `PRICE_BOOK` so a reader who wants the conversion
+    knows exactly where the harness stopped and their own arithmetic starts.
+
+    Printing NOTHING was the failure this replaces. A ~40-hour pass left its
+    call count and token totals in no file and no variable that outlived the
+    process, so "what did that cost" had no answer at all -- not an
+    approximate one, none.
+
+    `calls` is completion REQUESTS, which is more than the number of verdicts
+    when a credential died mid-pass: the refresh count beside it is what
+    explains the difference, and both are printed rather than reconciled here.
+
+    `calls_without_usage` is printed only when it is nonzero, and it is the one
+    line that changes what the totals MEAN: above zero, the token counts are an
+    under-count rather than a measurement, and a reader has to be told that in
+    the same breath.
+    """
+    if usage is None:
+        # A batch driven through an injected seam. Said out loud rather than
+        # skipped: a silent absence reads as a batch that spent nothing.
+        print(
+            "\njudge usage was not counted: this batch ran on an injected "
+            "completion seam rather than the live judge."
+        )
+        return
+
+    refreshes = usage["auth_refreshes"]
+    minted = (
+        f" ({refreshes} credential refresh(es) mid-pass)" if refreshes else ""
+    )
+    print(f"\njudge spend: {usage['calls']} completion request(s){minted}")
+    print(f"  prompt tokens      {usage['prompt_tokens']:>12,}")
+    print(f"  completion tokens  {usage['completion_tokens']:>12,}")
+    print(f"  total tokens       {usage['total_tokens']:>12,}")
+    if usage["calls_without_usage"]:
+        print(
+            f"  {usage['calls_without_usage']} of them reported no usage "
+            "block, so the token totals above are an under-count rather than "
+            "a measurement."
+        )
+    print(
+        "  Tokens and not dollars: the judge models are deliberately absent "
+        "from costs.PRICE_BOOK because mantle pricing is unpublished, so a "
+        "cost here would be a number nobody could reconstruct. Multiply by "
+        "the rate you were quoted."
+    )
 
 
 def _generation_label(generation: tuple) -> str:
@@ -2203,11 +2799,28 @@ def main(argv: list[str] | None = None) -> int:
             re_judge=args.re_judge,
             max_consecutive_errors=args.max_consecutive_errors,
         )
-    except ResumeRefused as exc:
+    # `CollectionNotFound` beside `ResumeRefused`: two refusals, one exit path.
+    # Both mean the batch never ran, both print no numbers, and neither is
+    # something a flag can talk past -- so the operator gets the sentence and
+    # exit 1 rather than a traceback out of a driver they pointed at a typo.
+    except (ResumeRefused, CollectionNotFound) as exc:
         print(f"\nREFUSED: {exc}")
         return 1
 
     print_summary(result)
+    if result["interrupted"]:
+        # 130 = 128 + SIGINT, AFTER the summary. The shell distinction is the
+        # point: 1 says the batch found problems and 130 says somebody stopped
+        # it, and only one of the two is answered by running the same command
+        # again. Ahead of the error check because an interrupt is the reason
+        # the pass ended even when it had also recorded errors along the way.
+        print(
+            "\nINTERRUPTED: the pass stopped on Ctrl-C with units left "
+            "unattempted. Nothing already judged is lost -- judgments are "
+            "append-only and the resume is keyed on units already bought -- "
+            "so resume with the same command."
+        )
+        return 130
     return 1 if result["errors"] else 0
 
 
