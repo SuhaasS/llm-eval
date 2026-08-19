@@ -477,14 +477,18 @@ def test_the_override_banner_survives_a_terminal_that_cannot_encode_it(
     and ungraded warnings name run ids, the abort names task ids and model
     names -- so the guard covers more than the warning that exposed it.
 
-    `_print_reading` IS STUBBED, and that is a statement about this repository
-    rather than a convenience. It prints two `§` legends of its own
-    (`scripts/judge.py:3567`, `:3588`) through bare `print`s and raises before
-    the walk's own output is reached -- T5's recorded OPEN, deliberately not
-    closed in a fix round. Left in, it would mask this loop entirely and the
-    test would be pinning T5's defect under this one's name. See the fix
-    report: guarding this loop does not by itself make an ASCII-pinned
-    override pass print its WARNING section end to end.
+    `_print_reading` IS STUBBED so that this test is about THIS loop. It prints
+    two `§` legends of its own through bare `print`s and raises before the loop
+    is reached on a strict stream, which would mask it entirely and leave this
+    test pinning another defect under this one's name.
+
+    That stub is also the honest scope of the assertion: `print_summary` as a
+    LIBRARY entry point, where the caller owns the stream and today's semantics
+    are unchanged. The CLI no longer has the problem at all -- `main`
+    reconfigures stdout to `backslashreplace` before the summary, and
+    `test_an_ascii_terminal_gets_the_whole_report_of_an_override_pass` is the
+    end-to-end proof. This loop keeps its own per-line guard regardless,
+    because a library caller reaches it on a stream nobody here reconfigured.
 
     Escaped rather than dropped, and asserted as such: `\\xa7` is greppable
     back to the sentence, and a guard that swallowed the line would leave the
@@ -508,6 +512,95 @@ def test_the_override_banner_survives_a_terminal_that_cannot_encode_it(
     assert "WARNING: NON-NEUTRAL JUDGE ADMITTED" in text
     assert CLAUDE_JUDGE in text
     assert "\\xa74.3" in text
+
+
+def test_an_ascii_terminal_gets_the_whole_report_of_an_override_pass(
+    tmp_path, monkeypatch
+):
+    """END TO END, through `main`, on a stdout pinned to ASCII. Nothing raises.
+
+    This is the criterion the per-line guards could not meet on their own.
+    `_print_reading` prints two `§` legends through bare `print`s -- the
+    interval legend and the 40% pairwise threshold -- and on a strict ASCII
+    stream it died PARTWAY THROUGH the report, after the pass had spent its
+    money and fsynced every line. Guarding those sites one at a time was
+    rejected as too wide, so `main` sets the STREAM's error handler instead:
+    every report line, the ones written today and the ones added later,
+    degrades into readable escapes rather than raising.
+
+    The pass under test is the one where losing the report costs most. An
+    override run's WARNING section is the only thing saying the numbers above
+    it came from a judge inside the compared families, it prints LAST, and a
+    crash anywhere above it takes it out -- leaving a complete, clean, caveated
+    reading of a biased pass and nothing to say so.
+
+    Every section is asserted, in the order a reader meets them, because the
+    old failure was partial output and a test that checked only the last line
+    would pass against a report that lost its middle. One unit is deliberately
+    failed so the ERROR section is real rather than skipped, which also makes
+    the exit code 1 -- from the errors, and not from a traceback.
+
+    THE κ CAVEAT IS ASSERTED IN ITS ASCII TWIN, and that is the subtle half.
+    Under `backslashreplace` the caveat's own `print` no longer raises, so an
+    exception-keyed fallback would never fire and the one sentence in this file
+    that must be READ rather than grepped would arrive as
+    `\\u03ba unmeasured (OPEN-5) \\u2014 ...`. `_encodable` is what keeps the
+    twin reachable: escaping is right for an id and wrong for a claim.
+    """
+    monkeypatch.setenv(ALLOW_NON_NEUTRAL_JUDGE_ENV, "1")
+    root = _two_arms(tmp_path)
+    # One vote answered, the rest unparsable: a real ERROR section, and a
+    # second unit that leaves its hole in the derived view.
+    _cli(monkeypatch, complete=FakeComplete(replies=[_pairwise_reply("A")]))
+    stream = io.TextIOWrapper(io.BytesIO(), encoding="ascii", errors="strict")
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    code = main([
+        "--event-log", str(root), "--no-rubric",
+        "--judge-model", CLAUDE_JUDGE,
+    ])
+    stream.flush()
+
+    text = stream.buffer.getvalue().decode("ascii")
+    assert code == 1, "exit 1 from the errored unit, not from a traceback"
+    assert len(_lines(root)) == 1, "the pass died before writing its line"
+
+    # The whole report, in the order it prints.
+    assert "judged" in text and "errored" in text     # the invocation counts
+    assert "pairwise win rates" in text               # the matrix section
+    assert "\\xa74.4" in text                         # a legend that used to kill it
+    assert "\\xa710.1" in text                        # and the second one
+    assert "kappa unmeasured" in text                 # the twin, not the escapes
+    assert "\\u03ba" not in text
+    assert "WARNING: NON-NEUTRAL JUDGE ADMITTED" in text
+    assert "produced NO line" in text                 # the error section, last
+
+
+def test_main_reconfigures_only_a_stream_that_offers_it(tmp_path, monkeypatch):
+    """A stdout with no `reconfigure` is skipped, not crashed on.
+
+    `sys.stdout` is not always a `TextIOWrapper`: a `StringIO`, a capture
+    object, an embedding host's stream. Reaching for `reconfigure`
+    unconditionally would turn the fix for a printing failure into an
+    `AttributeError` on the line above the report -- the same failure it was
+    placed against, one line earlier and on every stream rather than only the
+    ASCII ones.
+
+    Skipping is safe because nothing depends on it: the reconfigure widens what
+    the report can print, and a stream that cannot be widened is one whose own
+    error handler already applies. The driver's own prints keep
+    `_print_ascii_safe` either way.
+    """
+    root = _two_arms(tmp_path, resolved_a=True, resolved_b=False)
+    _cli(monkeypatch)
+    stream = io.StringIO()
+    assert not hasattr(stream, "reconfigure"), "fixture no longer proves anything"
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    code = main(["--event-log", str(root), "--no-rubric"])
+
+    assert code == 0
+    assert "pairwise win rates" in stream.getvalue()
 
 
 # --------------------------------------------------------------------------

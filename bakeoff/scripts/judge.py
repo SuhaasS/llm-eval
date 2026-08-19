@@ -782,6 +782,33 @@ def _print_ascii_safe(line: str) -> None:
         print(line.encode("ascii", "backslashreplace").decode("ascii"))
 
 
+def _encodable(text: str) -> bool:
+    """Whether stdout can render `text` as itself, asked rather than attempted.
+
+    `main` reconfigures stdout to `errors="backslashreplace"` before the
+    summary, which means a `print` of un-renderable text no longer raises -- it
+    succeeds, silently, in escapes. Every fallback in this file keyed on
+    `except UnicodeEncodeError` therefore goes unreached under that policy, and
+    for `_print_kappa_caveat` that is a real loss: its hand-written ASCII twin
+    is a SENTENCE, and a sentence delivered as `\\u03ba ... \\u2014` is one a
+    reader skips. Asking first is what keeps the choice deliberate.
+
+    A stream with no `encoding` (a `StringIO`, a test double) is treated as
+    able to render anything, which is true of every such stream here.
+    `LookupError` is caught beside the encode error because a stream can carry
+    an encoding name Python has no codec for, and a summary must not die
+    deciding how to print a caveat.
+    """
+    encoding = getattr(sys.stdout, "encoding", None)
+    if not encoding:
+        return True
+    try:
+        text.encode(encoding)
+    except (UnicodeEncodeError, LookupError):
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # the three kinds of line
 # ---------------------------------------------------------------------------
@@ -3736,13 +3763,28 @@ def _print_reading(result: dict) -> None:
 def _print_kappa_caveat() -> None:
     """The one line in this file that no argument, flag or branch can suppress.
 
-    The `except` is not decoration: `KAPPA_CAVEAT` carries a κ and an em dash,
-    and a stdout the environment pinned to ASCII raises `UnicodeEncodeError` on
-    it -- which drops the caveat and takes the exit path down with it. That is
-    the failure this line exists to prevent, reached through an environment
-    variable rather than a flag, so the fallback says the same sentence in
-    letters every terminal has.
+    `KAPPA_CAVEAT` carries a κ and an em dash, and a stdout the environment
+    pinned to ASCII cannot render either -- which used to drop the caveat and
+    take the exit path down with it. That is the failure this line exists to
+    prevent, reached through an environment variable rather than a flag, so the
+    fallback says the same sentence in letters every terminal has.
+
+    ASKED, then caught, and the order matters since `main` reconfigures stdout
+    to `backslashreplace` before the summary. Under that policy the `print`
+    below no longer RAISES -- it succeeds and emits
+    `\\u03ba unmeasured (OPEN-5) \\u2014 ...`, so an exception-only fallback
+    would leave the twin unreachable and hand the ASCII terminal the one
+    sentence in this file that has to be read rather than grepped, in escapes.
+    Escaping is the right answer for an id and the wrong one for a claim (see
+    `_print_ascii_safe`), so the encodability of the stream is asked FIRST and
+    the twin is chosen deliberately.
+
+    The `except` stays as the backstop for every stream that is not
+    reconfigured -- a direct library caller, and the pre-summary prints.
     """
+    if not _encodable(KAPPA_CAVEAT):
+        print(f"\n{_KAPPA_CAVEAT_ASCII}")
+        return
     try:
         print(f"\n{KAPPA_CAVEAT}")
     except UnicodeEncodeError:
@@ -3844,6 +3886,32 @@ def main(argv: list[str] | None = None) -> int:
     except (ResumeRefused, CollectionNotFound, NonNeutralJudge) as exc:
         _print_ascii_safe(f"\nREFUSED: {exc}")
         return 1
+
+    # STREAM-LEVEL, AND AT THE CLI ENTRYPOINT ONLY. This supersedes the OPEN
+    # left at Task 5: `_print_reading` prints two `§` legends through bare
+    # `print`s (the interval legend and the 40% pairwise threshold), so on a
+    # stdout the environment pinned to ASCII -- `LC_ALL=C`, or a pipe into a
+    # tool that did -- the report died partway through, AFTER a pass that had
+    # already spent its money and fsynced every line. Guarding those sites one
+    # by one was rejected as too wide (~40 prints, and every future one would
+    # have to remember); setting the STREAM's error handler makes every report
+    # line, current and future, degrade into readable escapes instead of
+    # raising.
+    #
+    # `main` and not `print_summary`, because the two have different contracts:
+    # the CLI must never die on encoding, while a library caller of
+    # `print_summary` keeps today's semantics and its own choice about the
+    # stream it owns.
+    #
+    # Guarded with `getattr` -- pytest's capture object and other exotic
+    # streams need not expose `reconfigure`, and a missing one is skipped
+    # silently: the driver's own prints still carry `_print_ascii_safe`, which
+    # is also what covers everything printed BEFORE this line (the census, the
+    # per-unit progress lines, the non-neutral banner) since the walk has
+    # already run by the time we get here.
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if reconfigure is not None:
+        reconfigure(errors="backslashreplace")
 
     print_summary(result)
     if result["interrupted"]:
