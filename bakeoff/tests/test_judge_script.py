@@ -738,7 +738,9 @@ index 1111111..6666666 100644
 """
 
 
-def test_a_payload_that_cannot_be_written_leaves_no_line_behind(tmp_path):
+def test_a_rubric_payload_that_cannot_be_written_leaves_no_line_behind(
+    tmp_path,
+):
     """`write_payload` BEFORE `append_judgment`. A line pointing at a payload
     that failed to write is a verdict naming an input nobody can read, which
     breaks "a re-judge is a re-score, not a re-run" (§4.3) exactly as a missing
@@ -751,6 +753,35 @@ def test_a_payload_that_cannot_be_written_leaves_no_line_behind(tmp_path):
     )
 
     result = _run(root, rubric=True)
+
+    assert _lines(root) == []
+    assert len(result["errors"]) == 1
+    assert "PayloadSecretsFound" in result["errors"][0]
+
+
+def test_a_vote_payload_that_cannot_be_written_leaves_no_line_behind(tmp_path):
+    """The same ordering on the path that carries most of the units.
+
+    The rubric test above builds a single-run collection, so no pair forms and
+    only `_rubric_line` runs -- which leaves the vote path, the one `--no-rubric`
+    makes the ONLY path, unpinned. `_vote_line` has its own `write_payload` call
+    and its own append, and a reorder there is invisible to every other test in
+    this file: the verdict is well formed, the line looks complete, and the
+    payload it names is not on disk.
+    """
+    root = _collection(
+        tmp_path,
+        [
+            _record("run-a", model="model-one", final_diff=DIFF_A),
+            _record("run-b", model="model-two", final_diff=SECRET_DIFF),
+        ],
+        [
+            _grade("run-a", model="model-one"),
+            _grade("run-b", model="model-two"),
+        ],
+    )
+
+    result = _run(root, rubric=False, votes=1)
 
     assert _lines(root) == []
     assert len(result["errors"]) == 1
