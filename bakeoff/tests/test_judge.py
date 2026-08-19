@@ -2353,6 +2353,48 @@ def test_a_response_carrying_no_usage_is_counted_rather_than_dropped(
     assert totals["total_tokens"] == 0
 
 
+def test_a_half_readable_usage_block_is_both_counted_and_contributed(
+    mantle_token, monkeypatch, dotenv_settled
+):
+    """A partial block is the case where the two halves of this accounting pull
+    apart, and both have to happen.
+
+    A response carrying `prompt_tokens` and nothing else is real spend on the
+    prompt side and unmeasured spend on the completion side. Folding in only
+    what was readable and leaving `calls_without_usage` at zero reports a total
+    that is short by the whole completion half while claiming to be a
+    measurement -- which is precisely the silence the counter exists to break,
+    and it is worse than reporting nothing because it looks complete. Dropping
+    the readable number instead would throw away spend that WAS measured.
+
+    So: the prompt tokens land, and the call is counted as incomplete.
+    """
+    import litellm
+
+    class _PartialUsageRouter:
+        def __init__(self, **kwargs):
+            pass
+
+        def completion(self, **kwargs):
+            return _stub_response(
+                STUB_REPLY,
+                usage=SimpleNamespace(prompt_tokens=STUB_PROMPT_TOKENS),
+            )
+
+    monkeypatch.setattr(litellm, "Router", _PartialUsageRouter)
+    totals = new_usage_totals()
+
+    live_completion(usage_totals=totals)("RENDERED PROMPT")
+
+    assert totals["calls"] == 1
+    assert totals["prompt_tokens"] == STUB_PROMPT_TOKENS, "readable spend lost"
+    assert totals["completion_tokens"] == 0
+    assert totals["total_tokens"] == 0
+    assert totals["calls_without_usage"] == 1, (
+        "a total missing the completion half reported itself as a measurement"
+    )
+
+
 def test_the_auth_classifier_answers_both_callers_and_never_reads_the_message():
     """`is_auth_failure` is public because it has a second caller with a
     different stake, and one narrowness rule has to serve both.

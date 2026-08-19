@@ -1217,6 +1217,16 @@ def _add_usage(usage_totals: dict[str, int] | None, response: Any) -> None:
     unreadable instead: `calls_without_usage` is what tells an operator their
     token total is an under-count rather than a measurement.
 
+    A PARTIAL block counts too, and counts as WELL as contributing. Any of the
+    three fields missing raises `calls_without_usage`, and whatever WAS
+    readable is still folded in -- the two halves answer different questions
+    and neither substitutes for the other. Dropping the readable numbers would
+    throw away spend that was measured; leaving the count at zero would report
+    a total that is short by however much the missing field carried while
+    claiming to be a measurement, which is the exact silence this counter
+    exists to break. A response carrying only `prompt_tokens` is the case: the
+    completion side is real spend and it is not in the total.
+
     `isinstance(value, bool)` is refused alongside non-ints because `bool` is a
     subclass of `int`, and a `True` in a token slot would add 1 and read as a
     measurement.
@@ -1224,17 +1234,17 @@ def _add_usage(usage_totals: dict[str, int] | None, response: Any) -> None:
     if usage_totals is None:
         return
     usage = getattr(response, "usage", None)
-    seen = False
+    complete = True
     for field in _USAGE_FIELDS:
         value = (
             usage.get(field) if isinstance(usage, dict)
             else getattr(usage, field, None)
         )
         if isinstance(value, bool) or not isinstance(value, int):
+            complete = False
             continue
         usage_totals[field] += value
-        seen = True
-    if not seen:
+    if not complete:
         usage_totals["calls_without_usage"] += 1
 
 

@@ -2182,6 +2182,54 @@ def test_the_summary_reports_tokens_not_dollars_and_says_why(capsys):
     assert "$" not in out
 
 
+def test_a_progress_line_a_terminal_cannot_encode_never_takes_the_batch_down(
+    tmp_path, monkeypatch
+):
+    """The progress line is the only collection-derived text printed from
+    INSIDE the walk, which makes its encoding a batch-safety question rather
+    than a formatting one.
+
+    A label carries a task id, model names and run ids. On a stdout the
+    environment pinned to ASCII -- `LC_ALL=C`, or a pipe into a tool that did
+    -- one non-ASCII character in any of them raises `UnicodeEncodeError` from
+    `print`, and that is NOT an `Exception` the per-unit handler catches: it is
+    raised past it, past `except _BatchAborted`, past `except
+    KeyboardInterrupt` and out of `main`. A pass that had been running for
+    hours would end on a traceback with no summary, no usage totals and every
+    remaining unit unbought -- the failure class this section exists to remove,
+    arriving from the code added to remove it.
+
+    Unreachable from today's data (task ids are directory names, model ids come
+    from config, run ids are hex) and catastrophic if it is ever reached, which
+    is the same shape as the κ caveat's own ASCII fallback -- and it is reached
+    by an environment variable rather than by a flag, so no review of the
+    collection can rule it out.
+
+    The label is asserted to SURVIVE, escaped, rather than merely not to crash:
+    `backslashreplace` keeps it greppable, and a guard that dropped the line
+    would leave the batch alive but the unit invisible.
+    """
+    root = _collection(
+        tmp_path,
+        [_record("run-π", model="modèle-un", final_diff=DIFF_A)],
+        [_grade("run-π", model="modèle-un")],
+    )
+    stream = io.TextIOWrapper(io.BytesIO(), encoding="ascii", errors="strict")
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    result = _run(root, rubric=True)
+    stream.flush()
+
+    text = stream.buffer.getvalue().decode("ascii")
+    assert result["errors"] == [], "the batch died on a printout"
+    assert len(_lines(root)) == 1, "the unit was not judged"
+    # Escaped rather than dropped, and still greppable back to the run an
+    # operator would go looking for.
+    assert "run-\\u03c0" in text
+    assert "mod\\xe8le-un" in text
+    assert "[1/1]" in text and " ok " in text
+
+
 def test_an_injected_seam_reports_no_usage_and_the_live_one_reports_zeros(
     tmp_path, monkeypatch
 ):
@@ -3203,6 +3251,40 @@ def test_the_caveat_survives_a_summary_this_printer_cannot_read(capsys):
         print_summary(result)
 
     assert KAPPA_CAVEAT in capsys.readouterr().out
+
+
+def test_the_spend_line_survives_the_same_summary_the_caveat_does(capsys):
+    """Spend rides in the caveat's `finally`, for a related reason.
+
+    `_print_reading` prints collection-derived text -- model names in the
+    matrix, the profile and the Elo table -- so it raises PARTWAY through on a
+    summary shaped by another reader, and (measured) on an ASCII-pinned stdout
+    against a non-ASCII arm name. Everything sequenced after the block would be
+    skipped, and the token totals are the one thing on this printout the
+    operator cannot recover from anywhere else: the judgment file records no
+    tokens and `costs.PRICE_BOOK` has no entry for the judge models. The batch
+    has already been paid for by the time any of this runs, so losing the only
+    record of what it cost to a formatting failure is the same trade the caveat
+    already refuses.
+
+    The ORDER is asserted too, because the fix must not reshuffle the happy
+    path: the caveat still comes first, and spend still reads as a fact about
+    the batch rather than as one of the numbers κ qualifies.
+    """
+    result = _empty_result()
+    result["judge_usage"] = {
+        "calls": 7, "prompt_tokens": 100, "completion_tokens": 20,
+        "total_tokens": 120, "calls_without_usage": 0, "auth_refreshes": 0,
+    }
+    del result["summary"]["elo"]
+
+    with pytest.raises(KeyError):
+        print_summary(result)
+
+    out = capsys.readouterr().out
+    assert KAPPA_CAVEAT in out
+    assert "7 completion request(s)" in out
+    assert out.index(KAPPA_CAVEAT) < out.index("7 completion request(s)")
 
 
 def test_the_caveat_falls_back_to_ascii_on_a_terminal_that_cannot_encode_it(

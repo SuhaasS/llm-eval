@@ -1424,10 +1424,14 @@ def judge_event_log(event_log_root, tasks, *,
 
     # The unit currently being attempted, and how many have been. Written by
     # `_begin` and read by `_finish`, which is the ONE place a progress line is
-    # printed: every outcome a unit can have goes through one of the four
-    # closures below, and each of them ends in `_finish`, so "exactly one line
-    # per attempted unit" holds by construction rather than by four call sites
-    # remembering to print.
+    # printed. Every outcome a unit can have ends in a `_finish` call: four of
+    # the five go through an outcome closure below (`_unit_succeeded`,
+    # `_unit_failed`, `_unit_failed_fatally`, `_gate_unit_failed`,
+    # `_unit_not_judged`), and the fifth -- a gate-decided pair that WROTE its
+    # line -- calls `_finish("ok")` from `_attempt` directly, because it must
+    # not reset the breaker and so cannot use `_unit_succeeded`. That one
+    # deliberate exception is why the rule is "exactly one `_finish` per
+    # attempted unit" rather than "every path goes through a closure".
     progress: dict[str, Any] = {
         "index": 0, "label": "", "start": 0.0, "attempted": 0,
         "total": 0, "batch_started": 0.0,
@@ -1450,14 +1454,38 @@ def judge_event_log(event_log_root, tasks, *,
         the unit that ended the batch is on the terminal like every other one.
         A unit whose error line appears in the summary with no progress line
         above it reads as a unit that never ran.
+
+        THE ENCODING GUARD IS NOT DECORATION, and it is the one thing here that
+        is about the batch rather than about the report. This line is the only
+        collection-derived text printed from INSIDE the walk: the label carries
+        a task id, model names and run ids, and on a stdout the environment
+        pinned to ASCII (`LC_ALL=C`, or a pipe into a tool that did) a single
+        non-ASCII character in any of them raises `UnicodeEncodeError` from
+        `print`. That exception is not an `Exception` the per-unit handler
+        catches -- it is raised past it, past `except _BatchAborted`, past
+        `except KeyboardInterrupt` and out of `main` -- so a batch that had
+        been running for hours would die on a traceback with no summary, no
+        usage totals and every remaining unit unbought. Exactly the failure
+        class this whole section exists to remove, arriving from the code added
+        to remove it. `_print_kappa_caveat` carries the same guard for the same
+        reason, reached by an environment variable rather than by a flag.
+
+        `backslashreplace` rather than a dropped label: an id an operator has
+        to grep for is worth more mangled than absent, and the escape is
+        reversible. The fallback is pure ASCII by construction, so it cannot
+        raise the same error a second time.
         """
         now = time.monotonic()
         progress["attempted"] += 1
-        print(
+        line = (
             f"[{progress['index']}/{progress['total']}] {progress['label']} "
             f"{status} (unit {_seconds(now - progress['start'])}, "
             f"elapsed {_elapsed(now - progress['batch_started'])})"
         )
+        try:
+            print(line)
+        except UnicodeEncodeError:
+            print(line.encode("ascii", "backslashreplace").decode("ascii"))
 
     def _unit_succeeded() -> None:
         """A unit produced its line, so whatever was failing is not systemic."""
@@ -1707,9 +1735,13 @@ def judge_event_log(event_log_root, tasks, *,
     def _attempt(unit: _Unit) -> None:
         """Execute one selected unit, and account for however it ends.
 
-        Every path out of this ends in exactly one of the outcome closures, and
-        every one of those ends in `_finish` -- which is what makes the
-        one-line-per-attempted-unit rule structural.
+        Every path out of this ends in exactly one `_finish` call, which is
+        what makes the one-line-per-attempted-unit rule structural. Four of the
+        five reach it through an outcome closure; the fifth -- a gate-decided
+        pair whose line was written -- calls `_finish("ok")` here directly,
+        because `_unit_succeeded` would reset the breaker and that unit made no
+        call, so it is no evidence the credential recovered. The exception is
+        deliberate and commented at its call site.
 
         `StorageFailure` is caught BEFORE the bare `except Exception`, which is
         the whole of what makes a full disk batch-fatal and a `ConnectionReset`
@@ -2497,11 +2529,22 @@ def print_summary(result: dict) -> None:
         _print_reading(result)
     finally:
         _print_kappa_caveat()
-
-    # BELOW the caveat, with the warnings and the errors, because it is a fact
-    # about the BATCH rather than one of the numbers the caveat qualifies.
-    # Above it would read as though κ had something to say about a token count.
-    _print_usage(result["judge_usage"])
+        # In the `finally` WITH the caveat, and below it -- the position on
+        # stdout is unchanged on the happy path, and on the unhappy one it is
+        # the difference between an operator learning what the pass cost and
+        # not. `_print_reading` prints collection-derived text (model names in
+        # the matrix, the profile and the Elo table), so an ASCII-pinned stdout
+        # or a summary shaped by another reader raises PARTWAY through it and
+        # everything after the block would be skipped. The caveat is in a
+        # `finally` for exactly that reason; spend has the same claim on it,
+        # because the batch has already been paid for by the time anything here
+        # runs. Its own output is ASCII and integers by construction, so it
+        # cannot replace the propagating exception with one of its own.
+        #
+        # BELOW the caveat because it is a fact about the BATCH rather than one
+        # of the numbers the caveat qualifies: above it would read as though κ
+        # had something to say about a token count.
+        _print_usage(result["judge_usage"])
 
     for warning in result["warnings"]:
         print(f"\nWARNING: {warning}")
@@ -2537,7 +2580,9 @@ def _print_usage(usage: dict[str, int] | None) -> None:
     `calls_without_usage` is printed only when it is nonzero, and it is the one
     line that changes what the totals MEAN: above zero, the token counts are an
     under-count rather than a measurement, and a reader has to be told that in
-    the same breath.
+    the same breath. It counts a call whose usage block was absent OR only
+    partly readable, because both leave the same hole in the total -- see
+    `bakeoff.judge._add_usage`.
     """
     if usage is None:
         # A batch driven through an injected seam. Said out loud rather than
@@ -2559,8 +2604,8 @@ def _print_usage(usage: dict[str, int] | None) -> None:
     if usage["calls_without_usage"]:
         print(
             f"  {usage['calls_without_usage']} of them reported no usage "
-            "block, so the token totals above are an under-count rather than "
-            "a measurement."
+            "block, or only part of one, so the token totals above are an "
+            "under-count rather than a measurement."
         )
     print(
         "  Tokens and not dollars: the judge models are deliberately absent "
