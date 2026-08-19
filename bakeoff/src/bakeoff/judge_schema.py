@@ -156,9 +156,13 @@ class JudgeRecord:
     judged_at: str
     # PINNED, never an alias. See the module docstring.
     judge_model_id: str
-    # Moves on ANY change to the prompt text, including one that reads as
-    # cosmetic: whitespace and ordering move model output, so a prompt edit
-    # under an unchanged version silently mixes two generations of verdict.
+    # Moves on ANY change to the prompt text OR to the vote protocol, including
+    # one that reads as cosmetic: whitespace and ordering move model output, so
+    # a prompt edit under an unchanged version silently mixes two generations
+    # of verdict. The protocol half is why 1 -> 2 was required -- v1 is three
+    # votes at random positions and v2 is two at forced ones, which the resume
+    # key cannot tell apart on `vote_index` alone. See
+    # `bakeoff.judge.JUDGE_PROMPT_VERSION`, whose docstring is authoritative.
     judge_prompt_version: int
     # sha256 of the exact RENDERED prompt, task text and all -- the evidence
     # that the declared version was honest.

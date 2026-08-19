@@ -775,8 +775,8 @@ def test_every_vote_line_names_both_grade_generations_it_was_gated_on(tmp_path):
 
 
 def test_a_rubric_line_is_one_call_at_vote_index_zero(tmp_path):
-    """Three votes are pairwise-only. The rubric is diagnostic and one call, as
-    the spec's cost math assumes."""
+    """The forced positions are pairwise-only. The rubric is diagnostic and one
+    call, as the spec's cost math assumes."""
     root = _collection(
         tmp_path, [_record("run-a")], [_grade("run-a")]
     )
@@ -1377,13 +1377,23 @@ def test_one_successful_unit_resets_the_consecutive_failure_count(tmp_path):
 def test_a_gate_decided_pair_neither_trips_the_breaker_nor_resets_it(tmp_path):
     """A gate-decided pair makes no call, so it is not evidence that the
     credential recovered. Counting it as a success would reset the counter on
-    the strength of nothing having been asked -- and in a collection with many
-    failed-gate arms, that is a breaker that never trips.
+    the strength of nothing having been asked.
 
     The cell here interleaves them deliberately: three rubric units, then the
     three gate-decided pairs the failed arm produces, then the votes that carry
-    the count to the limit. If a gate-decided pair reset the counter, the run
-    would restart at the fourth unit and the batch would never abort.
+    the count to the limit. WHAT A RESET ACTUALLY COSTS HERE IS A DELAY, not an
+    abort that never comes: the three judgeable pairs supply six vote units, so
+    a counter restarted by the gate-decided block still reaches the limit --
+    but five vote units later, aborting on call 8 instead of call 5. Three more
+    paid calls on a credential already known to be dead, which is why the
+    assertion is on the exact count rather than on the warning alone.
+
+    The unbounded version of that is a collection, not this fixture: gate-
+    decided pairs interleaved BETWEEN the judgeable ones rather than blocked
+    ahead of them reset the counter between every failure, and a breaker whose
+    run is broken that way never fires at all. Which shape a real collection
+    has depends on how the ladder happened to fall, so the rule cannot depend
+    on it: a unit that made no call is neither evidence.
     """
     root = _four_arms(tmp_path, resolved_four=False)
     fake = _DiesAfter()
