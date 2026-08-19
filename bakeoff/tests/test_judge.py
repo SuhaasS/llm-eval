@@ -1327,26 +1327,312 @@ def test_the_rendered_prompt_contains_the_payload_diffs_verbatim():
     assert pairwise.index(SOLUTION_DIFF) < a_at
 
 
-def test_the_rubric_prompt_anchors_every_dimension_and_flag():
-    """Five dimensions on a 0/1/2 anchored scale, three unscored flags.
+# --- the pinned prompt text --------------------------------------------------
+#
+# The prompt IS the instrument. Everything below is pinned because a mutation
+# sweep deleted each of these pieces with the whole suite green, and the two
+# reasons it could are both fixed here rather than patched over:
+#
+# * **The fixture answered the assertion.** The old anchor test asked for
+#   `"0 "`, `"1 "` and `"2 "` anywhere in the rendered text -- and a unified
+#   diff hunk header (`@@ -1,2 +1,2 @@`) carries all three, so the entire
+#   0/1/2 anchored scale could be deleted from `_RUBRIC_DIMENSIONS_BLOCK` and
+#   the interpolated diff went on satisfying the test. The pins below are FULL
+#   LITERAL LINES, positioned inside the dimension block they belong to, and
+#   `test_no_pinned_prompt_text_can_be_supplied_by_the_fixture_payload` keeps a
+#   later fixture edit from re-opening the same door.
+# * **Three blocks answered each other.** Every dimension name appears in
+#   `_RUBRIC_DIMENSIONS_BLOCK` and again in `_RUBRIC_RESPONSE_FORMAT`, and
+#   every flag name in `_RUBRIC_FLAGS_BLOCK` and again in the response format,
+#   so `name in rendered` held after either block was deleted whole. The pin is
+#   therefore an occurrence COUNT, which no single surviving block satisfies.
+#
+# Sentence pins are asserted against WHITESPACE-NORMALISED text. Re-wrapping a
+# paragraph is caught by the golden sha below, which is the right owner for
+# "one character moved"; what these own is "this instruction is still in front
+# of the model", and a pin that also fails on a re-flow reports the wrong fact.
 
-    Short scales are deliberate -- 1-10 scales show poor inter-rater
-    agreement -- so a prompt that asks for the names without stating what 0,
-    1 and 2 mean has quietly reintroduced an unanchored scale.
+#: The 0/1/2 anchor lines, VERBATIM, keyed by the dimension whose numbered
+#: block they must sit inside. Triple-quoted so each line is a byte-for-byte
+#: copy of `_RUBRIC_DIMENSIONS_BLOCK` rather than a re-typed paraphrase -- a
+#: pin assembled out of fragments is a pin on the assembly.
+#:
+#: Short scales are deliberate (1-10 scales show poor inter-rater agreement),
+#: so a prompt that names the five dimensions without saying what 0, 1 and 2
+#: MEAN has quietly reintroduced an unanchored scale while still looking like a
+#: rubric.
+RUBRIC_ANCHOR_LINES: dict[str, str] = {
+    "functional_equivalence": """\
+   0 -- does not accomplish what the reference accomplished.
+   1 -- accomplishes part of it, or only on some inputs or code paths.
+   2 -- accomplishes what the reference accomplished.""",
+    "completeness": """\
+   0 -- most of the task is unaddressed, or the change is a stub.
+   1 -- the main part is addressed, with TODOs or unhandled cases left.
+   2 -- every part of the task is addressed, with no stubs and no TODOs.""",
+    "cross_file_consistency": """\
+   0 -- callers, signatures or imports are left inconsistent with the change.
+   1 -- mostly consistent, with a call site or a signature missed.
+   2 -- every caller updated and every signature aligned.""",
+    "scope_discipline": """\
+   0 -- substantial unrelated edits or a gratuitous refactor rides along.
+   1 -- mostly on target, with incidental churn.
+   2 -- only what the task required.""",
+    "convention_adherence": """\
+   0 -- ignores the surrounding idiom, naming and error handling.
+   1 -- broadly follows them, with local departures.
+   2 -- matches the surrounding idiom, naming and error handling.""",
+}
+
+#: The blindness instruction. The payload is blind by construction and this
+#: sentence is what tells the model not to go looking anyway.
+RUBRIC_BLINDNESS = (
+    "The submission is anonymous: nothing below says who or what produced it, "
+    "and there is nothing to infer."
+)
+
+#: The one anchor the spec spells out in words, because it is the one a judge
+#: gets wrong by default: equivalence is about the RESULT. Deleted, the rubric
+#: silently becomes a diff-similarity score wearing five dimension names.
+RUBRIC_RESULT_NOT_SAME_CODE = (
+    'Judge the RESULT. This is explicitly NOT "is the same code": a different '
+    "design, different names and a different structure that reach the same "
+    "behaviour score 2."
+)
+
+#: Identical in both prompts, and load-bearing in both: `SimilarityContext` has
+#: no total and no ordering precisely so nobody sums the three facts into a
+#: score, and this sentence is that same refusal aimed at the model.
+NOT_A_SIMILARITY_SCORE = (
+    "The overlap figures are three independent facts and deliberately not a "
+    "similarity score: a diff that is bigger or smaller than the reference is "
+    "not by that fact better or worse."
+)
+
+#: Task 2's replacement for the "shown in a random order" claim. Both halves
+#: matter: the harness stopped randomizing (every comparison is now shown in
+#: BOTH orders, one forced vote each), so the old sentence was false about the
+#: text in front of the model -- and a model that catches the harness being
+#: wrong about its own procedure has been handed a reason to discount the rest
+#: of it. The instruction the sentence exists for has to survive the rewrite.
+PAIRWISE_ORDER = (
+    "Both submissions are anonymous, nothing below identifies either one, and "
+    "they are shown in an order chosen by the harness that carries no "
+    "information about the submissions -- do not prefer a submission for "
+    "appearing first or second."
+)
+
+#: TIE is a permitted verdict at the vote level AND at the majority level, and
+#: `majority` invents no tie-break. A prompt that stops saying so pushes the
+#: model off ties, which shows up downstream as a Bradley-Terry table fit to
+#: preferences the judge did not have.
+PAIRWISE_TIE = (
+    "TIE is a real answer, not a way of declining the question. Use it when "
+    "the two are genuinely equivalent, not when one is slightly ahead."
+)
+
+#: The sentence that makes a reply parseable at all, in both prompts.
+ONE_JSON_OBJECT = "Reply with ONE JSON object and nothing else."
+
+#: `parse_rubric_response` rejects `true` for a dimension and `1` for a flag,
+#: by type and not by truthiness. This is the half of that contract the model
+#: is told, and dropping it turns a strict parser into a retry budget.
+RUBRIC_SCALE_RULE = (
+    "Scores are the integers 0, 1 or 2 -- never true, false or a decimal. "
+    "Flags are JSON true or false -- never 0 or 1."
+)
+
+#: The pairwise wire vocabulary, stated to the model. A/B/TIE is what
+#: `_SHOWN_BY_WIRE` accepts and nothing else is coerced.
+PAIRWISE_VERDICT_RULE = (
+    '`verdict` is exactly "A", "B" or "TIE"; `reasoning` names the specific '
+    "differences that decided it."
+)
+
+#: THE deletion that passed all 906 tests: strike this one line and every
+#: pairwise reply arrives in whatever shape the model felt like, every parse
+#: raises `MalformedVerdict`, and a forty-hour batch spends its whole retry
+#: budget on a prompt that never asked for JSON.
+PAIRWISE_VERDICT_SHAPE = (
+    '{"verdict": "<A, B or TIE>", "reasoning": "<what decided it>"}'
+)
+
+#: Without it a literal `<A, B or TIE>` comes back as the verdict.
+ANGLE_BRACKETS_ARE_SLOTS = (
+    "The angle brackets mark slots to fill and must not appear in your reply."
+)
+
+#: Every literal this file pins in a rendered prompt, for the one test whose
+#: job is to prove the FIXTURE supplies none of it. Membership assertions are
+#: only as strong as the text they are made against, and the collision this
+#: replaces was invisible for exactly that reason.
+PINNED_PROMPT_TEXT: tuple[str, ...] = (
+    *RUBRIC_DIMENSIONS,
+    *RUBRIC_FLAGS,
+    *(
+        line
+        for block in RUBRIC_ANCHOR_LINES.values()
+        for line in block.splitlines()
+    ),
+    RUBRIC_BLINDNESS,
+    RUBRIC_RESULT_NOT_SAME_CODE,
+    RUBRIC_SCALE_RULE,
+    NOT_A_SIMILARITY_SCORE,
+    PAIRWISE_ORDER,
+    PAIRWISE_TIE,
+    PAIRWISE_VERDICT_RULE,
+    PAIRWISE_VERDICT_SHAPE,
+    ONE_JSON_OBJECT,
+    ANGLE_BRACKETS_ARE_SLOTS,
+)
+
+
+def _normalised(text: str) -> str:
+    """One space between words, so a sentence pin survives a re-wrap.
+
+    The prompt templates are hard-wrapped source strings; a sentence spans two
+    or three lines and the wrap point moves whenever a word does. What the
+    sentence pins assert is presence, not layout -- layout is the golden sha's
+    job.
+    """
+    return " ".join(text.split())
+
+
+def _supplied_strings(payload: Any) -> list[str]:
+    """Every string a payload contributes to a rendered prompt.
+
+    Walked rather than `json.dumps`ed: the renderers interpolate these values
+    raw, and a dumped payload escapes the newlines a diff carries, which would
+    make a multi-line collision invisible to the very test that exists to find
+    collisions.
+    """
+    if isinstance(payload, str):
+        return [payload]
+    if isinstance(payload, dict):
+        values = payload.values()
+        return [s for value in values for s in _supplied_strings(value)]
+    if isinstance(payload, (list, tuple)):
+        return [s for value in payload for s in _supplied_strings(value)]
+    return []
+
+
+def test_the_rubric_prompt_anchors_every_dimension_inside_its_own_block():
+    """Each dimension's 0/1/2 anchors sit under THAT dimension's heading.
+
+    Positional, not membership. Membership is what let the entire anchored
+    scale be deleted while a hunk header (`@@ -1,2 +1,2 @@`) kept the old
+    `"0 "`/`"1 "`/`"2 "` assertions green -- and membership alone would also
+    hold for a prompt that listed all fifteen anchor lines under dimension one,
+    which is a rubric with four unanchored dimensions and no way to tell.
+
+    The failure this prevents is not a crash. An unanchored scale still returns
+    integers, the parser still accepts them, and the profile still prints: what
+    changes is that 1 stops meaning the same thing between two passes, which is
+    the exact reason `RUBRIC_VERSION` exists.
     """
     rendered = render_rubric_prompt(build_rubric_payload(_inputs()))
 
-    for name in RUBRIC_DIMENSIONS:
-        assert name in rendered, f"{name} is not named in the rubric prompt"
-    for flag in RUBRIC_FLAGS:
-        assert flag in rendered, f"{flag} is not named in the rubric prompt"
-    for anchor in ("0 ", "1 ", "2 "):
-        assert anchor in rendered
+    # Each numbered heading appears once, and they run in `RUBRIC_DIMENSIONS`
+    # order -- the order the scores are asked in and stored in.
+    starts = []
+    for number, name in enumerate(RUBRIC_DIMENSIONS, start=1):
+        heading = f"{number}. {name}"
+        assert rendered.count(heading) == 1, f"{heading!r} is not the one head"
+        starts.append(rendered.index(heading))
+    assert starts == sorted(starts), "the dimensions are out of asked order"
 
-    # The one anchor the spec spells out in words, because it is the one a
-    # judge gets wrong by default: equivalence is about the RESULT.
-    assert "not" in rendered.lower()
-    assert "same code" in rendered.lower()
+    # Each block runs to the next heading; the last runs to the Flags section.
+    flags_at = rendered.index("## Flags")
+    assert starts[-1] < flags_at
+    ends = starts[1:] + [flags_at]
+
+    for name, start, end in zip(RUBRIC_DIMENSIONS, starts, ends):
+        block = rendered[start:end]
+        seen = []
+        for anchor in RUBRIC_ANCHOR_LINES[name].splitlines():
+            assert anchor in block, (
+                f"{anchor!r} is missing from the {name} block: that dimension "
+                "is being scored on an unanchored scale"
+            )
+            seen.append(block.index(anchor))
+        assert seen == sorted(seen), f"{name}'s anchors are out of 0/1/2 order"
+
+    assert _normalised(RUBRIC_RESULT_NOT_SAME_CODE) in _normalised(rendered)
+
+
+def test_every_rubric_dimension_and_flag_name_is_carried_by_two_blocks():
+    """Names are counted, because three blocks answer each other's questions.
+
+    `_RUBRIC_DIMENSIONS_BLOCK` and `_RUBRIC_RESPONSE_FORMAT` both name all five
+    dimensions; `_RUBRIC_FLAGS_BLOCK` and the response format both name all
+    three flags. So `name in rendered` survives the deletion of ANY ONE of the
+    three blocks, and each deletion is a different silent failure: no
+    dimensions block is an unanchored scale, no flags block is three flags
+    invented at reply time, and no response format is a reply nothing can
+    parse.
+
+    An exact count of 2 fails on each of those alone -- and fails just as
+    loudly if a fourth mention appears, which would mean a name arrived
+    somewhere this test does not know about.
+    """
+    rendered = render_rubric_prompt(build_rubric_payload(_inputs()))
+
+    for name in RUBRIC_DIMENSIONS + RUBRIC_FLAGS:
+        assert rendered.count(name) == 2, (
+            f"{name!r} appears {rendered.count(name)} times, not twice: the "
+            "dimensions block, the flags block and the reply format each name "
+            "these, and one of those blocks has moved or gone"
+        )
+
+    normalised = _normalised(rendered)
+    assert normalised.count(_normalised(ONE_JSON_OBJECT)) == 1
+    assert _normalised(RUBRIC_SCALE_RULE) in normalised
+    assert _normalised(ANGLE_BRACKETS_ARE_SLOTS) in normalised
+    assert _normalised(RUBRIC_BLINDNESS) in normalised
+    assert _normalised(NOT_A_SIMILARITY_SCORE) in normalised
+
+
+def test_the_pairwise_prompt_carries_the_reply_shape_the_parser_requires():
+    """The response format is what makes a vote a vote, and it was deletable.
+
+    Deleting `_PAIRWISE_RESPONSE_FORMAT` from the render list passed all 906
+    tests that existed when the mutation sweep found it: nothing asserted that
+    the prompt asks for JSON at all. In production that is not a wrong number,
+    it is a batch where every reply is prose, every parse raises
+    `MalformedVerdict`, and both votes on every comparison burn three attempts
+    apiece on a question that was never asked properly.
+
+    Pinned by SHAPE and then round-tripped: the literal skeleton the prompt
+    shows, with its two slots filled, is fed to the real parser. A prompt and a
+    parser that drift apart is the failure a membership assertion on either one
+    alone cannot see.
+    """
+    rendered = render_pairwise_prompt(
+        build_pairwise_payload(_inputs(), _other_inputs())
+    )
+    normalised = _normalised(rendered)
+
+    assert PAIRWISE_VERDICT_SHAPE in rendered
+    assert normalised.count(_normalised(ONE_JSON_OBJECT)) == 1
+    assert _normalised(PAIRWISE_VERDICT_RULE) in normalised
+    assert _normalised(ANGLE_BRACKETS_ARE_SLOTS) in normalised
+    assert _normalised(PAIRWISE_TIE) in normalised
+    assert _normalised(NOT_A_SIMILARITY_SCORE) in normalised
+
+    # The reply format is the LAST thing the model reads, after both
+    # submissions -- an instruction above two full diffs is an instruction two
+    # diffs away from the answer.
+    assert rendered.index("## Submission B") < rendered.index(
+        PAIRWISE_VERDICT_SHAPE
+    )
+
+    # The shape the prompt shows is the shape the parser accepts. Filled in
+    # exactly as instructed: the angle-bracket slots go, nothing else moves.
+    for wire, shown in (("A", "first"), ("B", "second"), ("TIE", "tie")):
+        filled = PAIRWISE_VERDICT_SHAPE.replace(
+            "<A, B or TIE>", wire
+        ).replace("<what decided it>", GOOD_REASONING)
+        assert parse_pairwise_response(filled) == shown
 
 
 def test_the_pairwise_prompt_no_longer_claims_the_order_is_random():
@@ -1360,18 +1646,52 @@ def test_the_pairwise_prompt_no_longer_claims_the_order_is_random():
     handed a reason to discount the rest of it.
 
     The replacement still has to carry the instruction the sentence existed
-    for, so both halves are asserted: no randomness claim, and the do-not-
-    prefer-by-position instruction intact.
+    for, so the whole sentence is pinned rather than the two phrases that
+    changed: the do-not-prefer-by-position clause is the working half, and a
+    rewrite that kept "chosen by the harness" while dropping that clause would
+    have satisfied the phrase-level version of this test.
     """
     rendered = render_pairwise_prompt(
         build_pairwise_payload(_inputs(), _other_inputs())
     )
 
-    lowered = rendered.lower()
-    assert "random" not in lowered
-    assert "chosen by the harness" in lowered
-    assert "carries no information" in lowered
-    assert "do not prefer a submission for appearing first or second" in lowered
+    assert "random" not in rendered.lower()
+    assert _normalised(PAIRWISE_ORDER) in _normalised(rendered)
+
+
+def test_no_pinned_prompt_text_can_be_supplied_by_the_fixture_payload():
+    """The pins above are only as strong as the fixture they are read against.
+
+    This is the collision test, and it is the whole reason the anchor pins are
+    full literal lines. `"0 "`, `"1 "` and `"2 "` were all supplied by a
+    unified diff's hunk header, so the assertions that were supposed to prove
+    the prompt anchors its scale were being answered by the submission being
+    judged -- and every one of them stayed green while the anchored scale was
+    deleted.
+
+    Asserted over the payload's own strings rather than over the rendered
+    prompt, because those are exactly the bytes the renderers interpolate. Both
+    the raw and the whitespace-normalised forms, since the sentence pins read a
+    normalised prompt and a diff line could otherwise smuggle a match across a
+    wrap.
+    """
+    payloads = [
+        build_rubric_payload(_inputs()),
+        build_pairwise_payload(_inputs(), _other_inputs()),
+        GOLDEN_RUBRIC_PAYLOAD,
+        GOLDEN_PAIRWISE_PAYLOAD,
+    ]
+    for payload in payloads:
+        supplied = "\n".join(_supplied_strings(payload))
+        haystacks = (supplied, _normalised(supplied))
+        for pinned in PINNED_PROMPT_TEXT:
+            for needle in {pinned, _normalised(pinned)}:
+                for haystack in haystacks:
+                    assert needle not in haystack, (
+                        f"the {payload['kind']} fixture supplies {needle!r}, "
+                        "which this file pins in the prompt: every assertion "
+                        "about that text is now answered by the payload"
+                    )
 
 
 def test_prompt_sha_is_the_sha256_of_the_exact_rendered_text():
@@ -1394,6 +1714,121 @@ def test_prompt_sha_changes_when_position_changes():
 
     assert a_first != b_first
     assert prompt_sha(a_first) != prompt_sha(b_first)
+
+
+# --- the golden shas ---------------------------------------------------------
+#
+# The pins above catch a piece of the prompt going MISSING. These catch a piece
+# of it CHANGING -- a reworded anchor, a re-wrapped paragraph, a heading with a
+# different capital -- which the membership pins are deliberately blind to and
+# which moves model output all the same. `JUDGE_PROMPT_VERSION`'s docstring
+# says the version moves on any change "including one that reads as cosmetic";
+# this is the only thing in the repo that makes that sentence enforceable.
+
+#: A payload frozen HERE rather than built from `_record()`/`_grade()`/
+#: `_task()`, and that is the whole design of this fixture. A golden sha over a
+#: record-built payload moves whenever a sentinel is added to the record
+#: fixture, so the test would fire on an edit that changed no prompt text at
+#: all -- and a golden test that cries wolf gets re-recorded reflexively, which
+#: is the same as not having one. Nothing but the templates can move this sha.
+#:
+#: The values are inert markers, chosen to collide with nothing this file pins
+#: (`test_no_pinned_prompt_text_can_be_supplied_by_the_fixture_payload` checks
+#: these two payloads too). Both `_names` branches are exercised -- a populated
+#: list and an empty one rendering as `(none)` -- and a non-null
+#: `diff_size_ratio` renders through the `.2f` path, so the sha covers the
+#: renderer's own formatting and not just the static template text.
+GOLDEN_SIMILARITY: dict[str, Any] = {
+    "file_overlap": {
+        "common": ["GOLDEN_COMMON_FILE"],
+        "candidate_only": ["GOLDEN_CANDIDATE_FILE"],
+        "reference_only": [],
+    },
+    "symbol_overlap": {
+        "common": [],
+        "candidate_only": ["GOLDEN_CANDIDATE_SYMBOL"],
+        "reference_only": ["GOLDEN_REFERENCE_SYMBOL"],
+    },
+    "diff_size_ratio": 1.25,
+}
+
+GOLDEN_CHECKS: list[dict[str, str]] = [
+    {"name": "GOLDEN_CHECK", "status": "pass"},
+    {"name": "GOLDEN_OTHER_CHECK", "status": "not_configured"},
+]
+
+GOLDEN_RUBRIC_PAYLOAD: dict[str, Any] = {
+    "kind": "rubric",
+    "task_prompt": "GOLDEN_TASK_PROMPT",
+    "reference_diff": "GOLDEN_REFERENCE_DIFF",
+    "candidate_diff": "GOLDEN_CANDIDATE_DIFF",
+    "checks": GOLDEN_CHECKS,
+    "similarity": GOLDEN_SIMILARITY,
+}
+
+GOLDEN_PAIRWISE_PAYLOAD: dict[str, Any] = {
+    "kind": "pairwise",
+    "task_prompt": "GOLDEN_TASK_PROMPT",
+    "reference_diff": "GOLDEN_REFERENCE_DIFF",
+    "submission_first": {
+        "diff": "GOLDEN_FIRST_DIFF",
+        "checks": GOLDEN_CHECKS,
+        "similarity": GOLDEN_SIMILARITY,
+    },
+    "submission_second": {
+        "diff": "GOLDEN_SECOND_DIFF",
+        "checks": GOLDEN_CHECKS,
+        "similarity": GOLDEN_SIMILARITY,
+    },
+}
+
+#: Recorded from the templates as they stand at `JUDGE_PROMPT_VERSION` 2. These
+#: are DATA, not a claim about what the prompt should say: re-record them
+#: whenever the text is deliberately changed, in the same commit that bumps the
+#: version.
+GOLDEN_RUBRIC_PROMPT_SHA = (
+    "168aed666128bbe823070b2febfc4cd9b15b633878d22b2a4b27d369d251595f"
+)
+GOLDEN_PAIRWISE_PROMPT_SHA = (
+    "de8592286d7489bef3c8204d58cf1c6651c57540195552ae481aabdc36adc87e"
+)
+
+#: Said once, and both shas plus the version assert it. Split out because the
+#: instruction is the entire value of this test -- a golden failure with no
+#: instruction attached is answered by deleting the test.
+_RE_RECORD = (
+    "the prompt text changed: bump JUDGE_PROMPT_VERSION and re-record both "
+    "constants"
+)
+
+
+def test_the_prompt_version_is_coupled_to_the_rendered_template_text():
+    """A prompt edit and a version bump are one change, enforced here.
+
+    `judge_prompt_version` is what keeps two generations of verdict from being
+    averaged, and it is declared by hand: nothing else in this repo notices
+    that the text moved. Whitespace and ordering move model output, so an edit
+    that reads as cosmetic still produces verdicts that must not be pooled with
+    the old ones -- and the failure is silent in the worst way, because the
+    file looks like one clean generation and the disagreement between the two
+    halves reads as judge noise.
+
+    ONE test over both templates and the version, deliberately. Three separate
+    tests would let a re-record land without the bump, which is the exact
+    half-done edit this exists to catch: whoever re-records a sha has to walk
+    past the assertion that the version moved too.
+
+    A failure here is not a bug report. It says the prompt is not the prompt
+    these constants were recorded from, and the answer is to look at the diff:
+    if the change was intended, bump `JUDGE_PROMPT_VERSION` and re-record both
+    constants in the same commit; if it was not, the diff is the finding.
+    """
+    rubric = render_rubric_prompt(GOLDEN_RUBRIC_PAYLOAD)
+    pairwise = render_pairwise_prompt(GOLDEN_PAIRWISE_PAYLOAD)
+
+    assert prompt_sha(rubric) == GOLDEN_RUBRIC_PROMPT_SHA, _RE_RECORD
+    assert prompt_sha(pairwise) == GOLDEN_PAIRWISE_PROMPT_SHA, _RE_RECORD
+    assert JUDGE_PROMPT_VERSION == 2, _RE_RECORD
 
 
 # --- the vote protocol -------------------------------------------------------

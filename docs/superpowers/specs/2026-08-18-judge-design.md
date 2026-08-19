@@ -350,3 +350,177 @@ of the six pairs are free.
 - **Residency re-confirmation.** §4.3 accepted a third-party judge; the mantle
   endpoint is AWS-side. Confirm the accepted tradeoff still describes what is
   being built.
+
+---
+
+## Amendments (2026-08-19)
+
+Four things this document specified that the code now does differently, and
+each one was found by building it. The superseded passages are left standing
+above rather than edited in place: what changed and why is the useful record,
+and a spec that silently rewrites itself teaches the next reader nothing.
+
+### A comparison is two forced positions, not three random ones
+
+*Supersedes step 3 and step 4 of "Order of operations per task-sample", the
+invariant **Three votes are three independent calls**, and the invariant
+**Position is randomized per comparison and recorded**.*
+
+Three votes at independently drawn positions was written for a judge that
+varies. This one does not: it runs at temperature 0, and at temperature 0 a
+judge is completely described by its answer under each of the two orders.
+Everything a third call can return is a copy of one of the first two, so
+majority-of-three over drawn positions carries the statistical content of a
+single vote — measured, and distributionally identical — while costing three
+times as much and settling nothing.
+
+Every comparison is therefore shown in **both** orders, one vote each, with the
+position an argument the driver forces rather than a draw. Three properties
+follow, and the third is the one worth the change on its own:
+
+The pass becomes reproducible. The same collection judged twice buys the same
+two prompts, so a re-judge is a re-run of the same question rather than a
+second sample of a different one.
+
+The bill drops by a third. "Cost and scale" above computes 60 tasks × 10
+samples × 6 pairs × 3 votes = ~10,800 pairwise calls; the same collection is
+now ~7,200.
+
+And §4.2.3's position probe stops being a separate experiment. Under drawn
+positions, position consistency was an inference across comparisons and was
+unmeasurable on any single one — a comparison could easily hold two votes in
+the same order, which says nothing about position at all. Under forced
+positions every comparison holds one vote in each order, so consistency is read
+directly off the file: a 1–1 split is the judge preferring what it saw first,
+and `majority` reports it as the tie it is rather than breaking it toward
+whichever vote was drawn twice.
+
+`JUDGE_PROMPT_VERSION` now moves on **protocol** changes as well as prompt-text
+changes, and 1 → 2 is that move. The bump is required rather than tidy: a v1
+line carries `vote_index` 0 or 1 too, drawn under a random position, and the
+resume key holds the index and the version and not the position. Left at 1, a
+v1 line at index 0 answers the v2 unit for index 0 and the driver skips it —
+producing a clean-looking resume over a comparison holding one random-position
+vote where the protocol says two forced ones, and every position-consistency
+figure taken off that file computed over votes nobody bought together.
+
+**The bump also re-buys every rubric line, and an operator who is not told
+discovers it on the bill.** `_resume_key` keys a rubric line on
+`("rubric", run_id, judge_model_id, judge_prompt_version, rubric_version)`, so
+bumping the prompt version makes every rubric call in an already-judged
+collection a fresh unit. That is correct — a rubric profile answered under one
+prompt generation must not be pooled with one answered under another — but the
+protocol change is a *pairwise* change, and nothing about it suggests the
+rubric is about to be paid for a second time. Plan a re-judge accordingly, or
+pass `--no-rubric`.
+
+### "Win rates convert to Elo" means Bradley–Terry, fit and reported on the Elo scale
+
+*Amplifies "Output (b), pairwise preference".*
+
+The sentence above admits two readings, and the obvious one is wrong. Elo as
+ordinarily implemented is a sequential K-factor update: ratings walk as
+comparisons arrive, so the result depends on the order they arrive in. There is
+no natural order here — the comparisons are a set, not a stream — so whatever
+order the code happens to iterate in becomes an input to the published table.
+Measured on the ladder fixture at 150 comparisons per pair with the arm names
+sorted against strength, **40 of 40 seeds printed a wrong ranking**, and the
+fixture in the tests prints the order exactly backwards, weakest arm on top by
+740 points. Renaming the arms, which says nothing about any of them, moved
+ratings by more than 200 points.
+
+The implementation is the maximum-likelihood Bradley–Terry fit instead, by
+MM/Zermelo iteration. The likelihood is a function of the win counts alone, so
+a shuffle, a relabelling and a second pass over one collection all produce one
+table. Ratings are then printed on the Elo scale purely so a reader keeps the
+intuition they already have: `ELO_SCALE = 400`, applied to log10 of the fitted
+strength, so 400 points is a 10:1 strength ratio and ~70 points is 60/40 — and
+`ELO_ANCHOR` puts the mean of the table at 1000. The
+anchor is presentation only; Bradley–Terry identifies differences between
+strengths and nothing else, so the overall level is free and would otherwise
+wander with the arm set.
+
+One prior, and it is recorded because it can reorder: **one virtual tie per
+unordered pair that has at least one real comparison** (§D8). Without it an arm
+that never lost has an MLE of +∞ and a winless arm −∞, and the iteration either
+burns its cap chasing one or prints an `inf` formatted as a rating. Half a
+point each way per *played pair* is the lightest thing that bounds both, and at
+this bakeoff's size it moves arms within ~50 points of each other by under a
+point. It is not uniform shrinkage, though: the prior is per pair rather than
+per arm, so an arm whose comparisons sit in sparse pairs is pulled harder than
+one whose comparisons sit in dense pairs, and uneven shrinkage can cross two
+arms rather than merely compress them. Equal per-pair counts are not a property
+the fit may assume — a resumed batch, an arm added mid-collection and dropped
+comparisons all skew them.
+
+### What the summary actually prints
+
+*New. The document specified the record and the driver and left the reader
+undescribed.*
+
+`position_consistency` is six keys per generation, not a rate:
+`measurable`, `consistent`, `single_position`, `position_unrecorded`, `rate`
+and `rate_ci95`. The three counts beside the rate are the denominator's own
+story — comparisons the probe could read, comparisons that hold one vote and
+so say nothing about position, and lines that never recorded an assignment —
+and a rate printed without them invites a reader to divide by the wrong total.
+
+Every rate and every rating carries a **task-clustered bootstrap 95%
+interval**, per §10.3 ("any metric reported without a confidence interval is
+not reported") and §4.4, which says which interval: resampled over tasks,
+because comparisons inside one task are correlated and effective sample size
+tracks the task count rather than the comparison count. Resampling comparisons
+independently prints a band several times too narrow, which is worse than
+printing none.
+
+Two degenerate cases print rather than pretend. A rate swept to 0% or 100%
+gives every resample the same value, so the bootstrap returns zero width where
+the evidence is thinnest; those widen through a Wilson interval computed on the
+**task** count behind that rate, and a rate resting on a single task is left
+degenerate and marked, since a Wilson band on n=1 would dress one task up as a
+measurement of the population. A zero-width *rating* band has no such
+correction available and prints `--`, the same dash the table already uses for
+an arm the judge never voted on: a refusal, not a value.
+
+### §4.3's "mandatory" is enforced, and the enforcement has edges
+
+*Amplifies "Model configuration".*
+
+A neutral judge family is checked in code, at the driver, before the collection
+is read and ahead of the resume — so a re-judge cannot inherit a compared-family
+judge from the first pass. Two match rules, because each covers what the other
+cannot: a vendor-namespace prefix (`anthropic.`, `google.`, `nvidia.`,
+`moonshot.`) catches `anthropic.opus-6`, a compared family under a model name
+that never says "claude"; a family token (`claude`, `gemma`, `gemini`,
+`nemotron`, `kimi`) catches `bedrock.claude-sonnet-5`, Claude itself under a
+neutral vendor namespace, which is what a re-host looks like. A guard missing
+either half admits a biased judge whose table is indistinguishable from a clean
+one.
+
+The escape is an environment variable, `BAKEOFF_ALLOW_NON_NEUTRAL_JUDGE=1`, and
+not a flag — a flag beside the ordinary options is how a mandatory rule becomes
+a default, and can be added to a wrapper script by somebody who read the
+refusal as an obstacle. It exists because measuring how much a Claude judge
+inflates Sonnet 5 on this endpoint is a real experiment, and because a rule with
+no escape gets deleted rather than obeyed. Under the override the pass is
+admitted loudly: a `NON-NEUTRAL JUDGE ADMITTED` warning on the terminal while
+the run is still cheap to stop, and the same text recorded beside the numbers
+for whoever reads them later.
+
+Two limits, stated because an unstated limit stops being reviewed:
+
+The token list is substring-matched and deliberately over-wide. A genuinely
+neutral judge whose id happens to carry one of those tokens is refused, and its
+only route through is the override — which stamps a false non-neutral record
+onto honest numbers, and one a later reader cannot tell from a real
+self-preference probe. The direction is still right, since a false negative
+publishes a biased table nothing downstream can detect and tells nobody, but
+"the message answers it" is not true and pretending otherwise is how the width
+stops being examined. An exact-id allowlist is the obvious future fix.
+
+And `live_completion` is unguarded. The refusal lives at the driver, so the
+integration test — which calls the completion seam directly, passing its own
+model id — reaches the wire without passing through it. That is harmless there,
+since the id it passes is the pinned neutral default, but it is a hole in the
+claim that the guard is unconditional: anything that calls the seam directly is
+outside it, and the next caller to do so need not be a test.
