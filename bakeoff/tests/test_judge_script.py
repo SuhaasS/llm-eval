@@ -22,13 +22,22 @@ easiest to break silently:
    would pay twice for verdicts already bought.
 4. **The event log and `grades.jsonl` are inputs.** The driver never opens
    either for writing, and one test pins their bytes across a whole batch.
+5. **The summary is a printout, not a stored score**, and the κ caveat is
+   unconditional. Section 7 pins the three aggregation rules an append-only
+   file makes load-bearing -- dedupe to the last line per resume identity, vote
+   lines supersede a stale `gate_decided` line for the same pair, and
+   `gate_decided` never enters the vote verdict distribution -- plus the one
+   line no flag, branch or terminal encoding may drop.
 """
 
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import random
+import sys
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -43,9 +52,15 @@ from bakeoff.judge import (
     RUBRIC_DIMENSIONS,
     RUBRIC_FLAGS,
     RUBRIC_VERSION,
+    _CANONICAL_VERDICTS,
     prompt_sha,
 )
-from bakeoff.judge_schema import load_judgments, read_payload
+from bakeoff.judge_schema import (
+    JudgeRecord,
+    append_judgment,
+    load_judgments,
+    read_payload,
+)
 from bakeoff.schema import (
     SCHEMA_VERSION,
     Artifacts,
@@ -56,14 +71,23 @@ from bakeoff.schema import (
 
 from scripts.grade import grades_path
 from scripts.judge import (
+    ELO_BASE,
+    ELO_K,
+    KAPPA_CAVEAT,
     GateInvariantError,
+    _KAPPA_CAVEAT_ASCII,
     ResumeRefused,
     _assert_rubric_gate,
+    _print_kappa_caveat,
+    _VOTE_VERDICTS,
+    elo_from_outcomes,
     gating_view,
     judge_event_log,
     judgments_path,
     main,
     payloads_root,
+    print_summary,
+    summarize,
 )
 
 GRADER = "2"
@@ -1081,3 +1105,654 @@ def test_main_passes_the_judge_model_and_vote_count_through(
     lines = _lines(root)
     assert len(lines) == 2
     assert {j.judge_model_id for j in lines} == {"openai.gpt-5.6-terra"}
+
+
+# --------------------------------------------------------------------------
+# 7. the summary -- a printout, not a stored score
+# --------------------------------------------------------------------------
+#
+# These drive `summarize`/`elo_from_outcomes` over hand-built `JudgeRecord`s
+# rather than through a batch. The aggregation rules being pinned are about
+# lines that a REAL batch cannot produce in one invocation -- a stale
+# gate-decided line sitting beside three votes for the same pair is what a
+# re-grade leaves behind two passes apart -- and reaching them through the
+# driver would mean staging two collections to assert one arithmetic rule.
+
+
+MODEL_OF = {
+    "run-a": "model-one", "run-b": "model-two", "run-c": "model-three",
+    "run-a1": "model-one", "run-b1": "model-two",
+    "run-a2": "model-one", "run-b2": "model-two",
+    "run-a3": "model-one", "run-b3": "model-two",
+}
+
+
+def _judgment(**kw) -> JudgeRecord:
+    fields = dict(
+        judgment_id=uuid.uuid4().hex,
+        judged_at="2026-08-18T00:00:00Z",
+        judge_model_id=JUDGE_MODEL_ID_DEFAULT,
+        judge_prompt_version=JUDGE_PROMPT_VERSION,
+        judge_prompt_sha="0" * 64,
+        judge_sampling=dict(JUDGE_SAMPLING),
+        rubric_version=RUBRIC_VERSION,
+        kind="pairwise",
+        task_id="calc-1",
+    )
+    fields.update(kw)
+    return JudgeRecord(**fields)
+
+
+def _vote(run_id_a, run_id_b, verdict, *, vote_index=0, sample_index=0, **kw):
+    return _judgment(
+        kind="pairwise", run_id_a=run_id_a, run_id_b=run_id_b,
+        sample_index=sample_index, verdict=verdict, vote_index=vote_index,
+        position_assignment="a_first",
+        input_payload_path="/payloads/x.json.gz", input_payload_sha="s" * 64,
+        **kw,
+    )
+
+
+def _gate(run_id_a, run_id_b, by, *, sample_index=0, **kw):
+    return _judgment(
+        kind="pairwise", run_id_a=run_id_a, run_id_b=run_id_b,
+        sample_index=sample_index, verdict="gate_decided", gate_decided_by=by,
+        **kw,
+    )
+
+
+def _rubric(run_id, *, scores=2, flags=False, **kw):
+    """One rubric line. `scores`/`flags` take a scalar for "same on every
+    dimension" or a dict for a specific profile."""
+    if not isinstance(scores, dict):
+        scores = {name: scores for name in RUBRIC_DIMENSIONS}
+    if not isinstance(flags, dict):
+        flags = {name: flags for name in RUBRIC_FLAGS}
+    return _judgment(
+        kind="rubric", run_id=run_id, vote_index=0,
+        dimension_scores=dict(scores), flags=dict(flags),
+        input_payload_path="/payloads/y.json.gz", input_payload_sha="t" * 64,
+        **kw,
+    )
+
+
+def _empty_result() -> dict:
+    """A batch that judged nothing. The sharpest case for the caveat: an
+    implementation that emitted it alongside a number would skip it here."""
+    return {
+        "judged": [], "gate_decided": [], "skipped": [], "errors": [],
+        "warnings": [], "summary": summarize([], {}),
+        "audited": 0, "from_prior_invocations": 0,
+    }
+
+
+def test_majority_over_vote_lines_with_gate_decided_wins_and_half_point_ties():
+    """The whole outcome rule in one collection: three votes collapse to one
+    comparison through `majority`, a gate-decided pair is a win for the side the
+    ladder already picked, and a tie is half a point to each.
+
+    Deliberately ASYMMETRIC -- 2.5 points against 1.5 -- because a matrix that
+    reported x's rate under y's name is invisible against a balanced fixture.
+    """
+    judgments = [
+        # settled by votes, a wins 2-1
+        _vote("run-a", "run-b", "a", vote_index=0, sample_index=0),
+        _vote("run-a", "run-b", "b", vote_index=1, sample_index=0),
+        _vote("run-a", "run-b", "a", vote_index=2, sample_index=0),
+        # settled by votes, no strict majority -> tie
+        _vote("run-a1", "run-b1", "a", vote_index=0, sample_index=1),
+        _vote("run-a1", "run-b1", "b", vote_index=1, sample_index=1),
+        _vote("run-a1", "run-b1", "tie", vote_index=2, sample_index=1),
+        # settled by the ladder, one each way
+        _gate("run-a2", "run-b2", "a", sample_index=2),
+        _gate("run-a3", "run-b3", "b", sample_index=3),
+    ]
+
+    summary = summarize(judgments, MODEL_OF)
+
+    row = summary["comparisons"][("model-one", "model-two")]
+    assert row["voted"] == 2
+    assert row["gate_decided"] == 2
+    assert (row["wins_x"], row["wins_y"], row["ties"]) == (2, 1, 1)
+    assert row["comparisons"] == 4
+    assert row["win_rate_x"] == pytest.approx(2.5 / 4)
+    assert row["win_rate_y"] == pytest.approx(1.5 / 4)
+
+
+def test_a_comparison_short_of_a_strict_majority_is_a_tie_not_a_plurality_win():
+    """`majority` is strict, and the summary must not launder a split decision
+    into a win by counting votes itself."""
+    judgments = [
+        _vote("run-a", "run-b", "a", vote_index=0),
+        _vote("run-a", "run-b", "b", vote_index=1),
+    ]
+
+    row = summarize(judgments, MODEL_OF)["comparisons"][
+        ("model-one", "model-two")
+    ]
+
+    assert (row["wins_x"], row["wins_y"], row["ties"]) == (0, 0, 1)
+
+
+def test_vote_lines_supersede_a_stale_gate_decided_line_for_the_same_pair():
+    """A re-grade that flips the losing side turns a gate-decided pair into a
+    judgeable one, and the judgment file is APPEND-ONLY -- so the old
+    gate-decided line stays on disk beside the three votes that came later.
+
+    Counting both would enter one comparison twice, once for each side. The
+    votes win, and the disagreement is TALLIED rather than hidden: it is a
+    finding about the collection, not noise.
+    """
+    judgments = [
+        _gate("run-a", "run-b", "b"),
+        _vote("run-a", "run-b", "a", vote_index=0),
+        _vote("run-a", "run-b", "a", vote_index=1),
+        _vote("run-a", "run-b", "b", vote_index=2),
+    ]
+
+    summary = summarize(judgments, MODEL_OF)
+
+    row = summary["comparisons"][("model-one", "model-two")]
+    assert row["comparisons"] == 1
+    assert row["voted"] == 1
+    assert row["gate_decided"] == 0
+    assert (row["wins_x"], row["wins_y"], row["ties"]) == (1, 0, 0)
+    assert summary["superseded_gate_decided"] == 1
+    # The line is still a line in the file, and the census still counts it.
+    assert summary["lines"]["gate_decided"] == 1
+
+
+def test_a_superseded_gate_decided_line_is_reported_even_when_it_agrees():
+    """The tally is about the SHAPE of the file, not about who won. Counting
+    only the disagreements would make a file full of stale lines look clean
+    whenever the re-grade happened to keep the same winner."""
+    judgments = [
+        _gate("run-a", "run-b", "a"),
+        _vote("run-a", "run-b", "a", vote_index=0),
+    ]
+
+    assert summarize(judgments, MODEL_OF)["superseded_gate_decided"] == 1
+
+
+def test_gate_decided_is_counted_apart_from_the_vote_verdict_distribution():
+    """`gate_decided` is the one verdict no model produced. Inside the
+    distribution it is a fourth thing the judge said, and every rate computed
+    off that denominator is wrong by however many pairs the ladder settled."""
+    judgments = [
+        _vote("run-a", "run-b", "a", vote_index=0),
+        _vote("run-a", "run-b", "a", vote_index=1),
+        _vote("run-a", "run-b", "tie", vote_index=2),
+        _gate("run-a2", "run-b2", "a", sample_index=2),
+    ]
+
+    summary = summarize(judgments, MODEL_OF)
+
+    assert summary["vote_verdicts"] == {"a": 2, "tie": 1}
+    assert "gate_decided" not in summary["vote_verdicts"]
+    assert summary["lines"]["pairwise_votes"] == 3
+    assert summary["lines"]["gate_decided"] == 1
+
+
+def test_the_vote_verdict_vocabulary_matches_the_one_majority_accepts():
+    """The driver's vocabulary and `majority`'s are the same three words. Two
+    copies that drift make the summary drop a verdict `majority` would have
+    happily counted -- or hand it one it raises on."""
+    assert _VOTE_VERDICTS == _CANONICAL_VERDICTS
+
+
+def test_the_summary_dedupes_to_the_last_line_per_resume_identity():
+    """A re-judge appends. Aggregating both lines counts one vote twice, and
+    the later line is the one a reader of the file lands on."""
+    first = _vote("run-a", "run-b", "a", vote_index=0)
+    second = JudgeRecord(**{
+        **first.to_dict(), "judgment_id": uuid.uuid4().hex, "verdict": "b",
+    })
+
+    summary = summarize([first, second], MODEL_OF)
+
+    assert summary["lines"]["pairwise_votes"] == 1
+    assert summary["vote_verdicts"] == {"b": 1}
+
+
+def test_rubric_profile_reports_per_dimension_means_and_never_a_sum():
+    """The rubric is DIAGNOSTIC. Summing five dimensions into one number is the
+    absolute 1-10 score §4.2.3 rules out, wearing a rubric's clothes -- and
+    joining it to `resolved` is the other half of the same mistake, which is why
+    a `JudgeRecord` carries no `resolved` to join to."""
+    judgments = [
+        _rubric("run-a", scores=2, flags={
+            "introduced_stub": True, "left_debug_artifacts": False,
+            "wrote_tests": True,
+        }),
+        _rubric("run-a1", scores={
+            "functional_equivalence": 0,
+            "completeness": 1,
+            "cross_file_consistency": 2,
+            "scope_discipline": 2,
+            "convention_adherence": 0,
+        }, flags={
+            "introduced_stub": False, "left_debug_artifacts": False,
+            "wrote_tests": True,
+        }),
+    ]
+
+    row = summarize(judgments, MODEL_OF)["rubric_profile"]["model-one"]
+
+    assert set(row) == {"runs", "dimensions", "flags"}
+    assert row["runs"] == 2
+    assert row["dimensions"] == {
+        "functional_equivalence": pytest.approx(1.0),
+        "completeness": pytest.approx(1.5),
+        "cross_file_consistency": pytest.approx(2.0),
+        "scope_discipline": pytest.approx(2.0),
+        "convention_adherence": pytest.approx(1.0),
+    }
+    assert row["flags"] == {
+        "introduced_stub": pytest.approx(0.5),
+        "left_debug_artifacts": pytest.approx(0.0),
+        "wrote_tests": pytest.approx(1.0),
+    }
+    # No aggregate ANYWHERE in the profile -- not at the top, not per model.
+    banned = {"total", "sum", "score", "overall", "mean", "rank", "resolved"}
+    assert not banned & set(row)
+    assert not banned & set(row["dimensions"])
+    assert not banned & set(summarize(judgments, MODEL_OF))
+
+
+def test_the_rubric_profile_is_per_model_not_pooled(tmp_path):
+    """Pooling is how a profile stops being a profile: two arms averaged into
+    one row says nothing about either."""
+    judgments = [
+        _rubric("run-a", scores=2),
+        _rubric("run-b", scores=0),
+    ]
+
+    profile = summarize(judgments, MODEL_OF)["rubric_profile"]
+
+    assert set(profile) == {"model-one", "model-two"}
+    assert profile["model-one"]["dimensions"]["completeness"] == 2.0
+    assert profile["model-two"]["dimensions"]["completeness"] == 0.0
+
+
+def test_elo_is_deterministic_over_a_fixed_outcome_set():
+    """Elo is order-dependent, and the outcome list is assembled from a dict
+    walk. Sorted inside the function is what makes two passes over one
+    unchanged collection print the same table -- otherwise the ratings move
+    while nothing about the collection did."""
+    outcomes = [
+        ("model-one", "model-two", 1.0),
+        ("model-two", "model-three", 0.5),
+        ("model-one", "model-three", 0.0),
+        ("model-two", "model-one", 1.0),
+    ]
+
+    first = elo_from_outcomes(outcomes)
+    second = elo_from_outcomes(outcomes)
+    shuffled = elo_from_outcomes(list(reversed(outcomes)))
+
+    assert first == second
+    assert first == shuffled
+    assert list(first) == sorted(first)
+
+
+def test_elo_starts_at_the_base_and_moves_by_k_on_an_even_first_match():
+    """K=32 over a base of 1000, GDPval's parameters. Two unrated models are
+    even, so the expectation is 0.5 and the first win moves exactly K/2.
+
+    The LITERAL numbers, not `ELO_BASE ± ELO_K / 2`. Written against the
+    constants, this test follows them wherever they go and says nothing about
+    which parameters the table was computed at -- and a rating printed under an
+    unrecorded K is a number nobody can reproduce.
+    """
+    assert (ELO_K, ELO_BASE) == (32.0, 1000.0)
+
+    ratings = elo_from_outcomes([("model-one", "model-two", 1.0)])
+
+    assert ratings["model-one"] == pytest.approx(1016.0)
+    assert ratings["model-two"] == pytest.approx(984.0)
+    # Zero-sum: Elo redistributes, it does not create rating.
+    assert sum(ratings.values()) == pytest.approx(2000.0)
+
+
+def test_the_matrix_reports_each_arms_rate_under_its_own_name():
+    """`run_id_a`/`run_id_b` are canonical by RUN ID; a matrix row is keyed by
+    MODEL name, sorted. The two orders are independent, so a summary that
+    carried the a-side score straight into the x column would report one arm's
+    win rate under the other's name -- and stay invisible in every fixture where
+    the two orders happen to agree, which is most of them.
+    """
+    model_of = {"run-a": "zeta-model", "run-b": "alpha-model"}
+    judgments = [_vote("run-a", "run-b", "a", vote_index=0)]
+
+    summary = summarize(judgments, model_of)
+
+    row = summary["comparisons"][("alpha-model", "zeta-model")]
+    assert (row["wins_x"], row["wins_y"], row["ties"]) == (0, 1, 0)
+    assert row["win_rate_x"] == 0.0
+    assert row["win_rate_y"] == 1.0
+    assert summary["elo"]["zeta-model"] > summary["elo"]["alpha-model"]
+
+
+def test_elo_refuses_a_score_that_is_not_a_win_a_loss_or_a_tie():
+    """The only three outcomes a comparison has. A 3.0 slipped in from a vote
+    COUNT rather than a result would inflate the table silently and by an amount
+    nobody could reconstruct from the printout."""
+    with pytest.raises(ValueError) as exc:
+        elo_from_outcomes([("model-one", "model-two", 3.0)])
+    assert "model-one" in str(exc.value)
+
+
+def test_elo_follows_the_win_rates_rather_than_leading_them():
+    """Descriptive, not a second opinion. The arm that won more comparisons
+    outranks the one that won fewer."""
+    judgments = [
+        _vote("run-a", "run-b", "a", vote_index=0, sample_index=0),
+        _vote("run-a1", "run-b1", "a", vote_index=0, sample_index=1),
+        _vote("run-a2", "run-b2", "b", vote_index=0, sample_index=2),
+    ]
+
+    summary = summarize(judgments, MODEL_OF)
+
+    row = summary["comparisons"][("model-one", "model-two")]
+    assert row["win_rate_x"] > row["win_rate_y"]
+    assert summary["elo"]["model-one"] > summary["elo"]["model-two"]
+
+
+def test_a_comparison_whose_arms_cannot_be_named_is_dropped_and_counted():
+    """`model_of` comes from the event log, and a judgment from an earlier
+    invocation can name a run this collection no longer holds. Entering it under
+    a `None` arm would put a row called `None` in the matrix; dropping it
+    silently would shrink a denominator nobody could see move."""
+    judgments = [
+        _vote("run-a", "run-b", "a", vote_index=0),
+        _vote("run-a", "run-gone", "a", vote_index=0, sample_index=1),
+        _rubric("run-vanished"),
+    ]
+
+    summary = summarize(judgments, MODEL_OF)
+
+    assert set(summary["comparisons"]) == {("model-one", "model-two")}
+    assert summary["dropped"]["unknown_model_comparison"] == 1
+    assert summary["dropped"]["unknown_model_rubric"] == 1
+    assert "model-one" not in summary["rubric_profile"]
+
+
+def test_a_comparison_with_one_model_on_both_sides_is_dropped_and_counted():
+    """A cell keys on model, so the driver cannot produce this -- a judgment
+    file read beside the wrong collection can. "model-one beat model-one" is a
+    row that makes the matrix unreadable rather than visibly wrong."""
+    judgments = [_vote("run-a", "run-a1", "a", vote_index=0)]
+
+    summary = summarize(judgments, MODEL_OF)
+
+    assert summary["comparisons"] == {}
+    assert summary["dropped"]["same_model_comparison"] == 1
+
+
+def test_a_gate_decided_line_naming_no_winner_settles_nothing():
+    """`gate_decided_by` is the entire content of a gate-decided line. Without
+    it there is no verdict, and defaulting to "a" would hand the win to
+    whichever run id happened to sort first."""
+    judgments = [_gate("run-a", "run-b", None)]
+
+    summary = summarize(judgments, MODEL_OF)
+
+    assert summary["comparisons"] == {}
+    assert summary["dropped"]["unreadable_verdict"] == 1
+    # Not counted as a gate-decided comparison either: it settled nothing. The
+    # line is accounted for under `dropped`, which is where a reader looks for
+    # what the numbers above do not include.
+    assert summary["lines"]["gate_decided"] == 0
+
+
+def test_a_judgment_naming_a_run_this_log_never_held_does_not_stop_the_batch(
+    tmp_path,
+):
+    """Run ids are unique WITHIN a collection and not across one, so a judgment
+    file beside the wrong event log names runs that are simply not there. The
+    comparison cannot be entered under a name nobody has -- but the end of a
+    paid batch is not the place to discover it, and a `read_run` raising out of
+    the summary would lose every verdict the pass just bought."""
+    root = _two_arms(tmp_path)
+    append_judgment(
+        judgments_path(root),
+        _vote("run-ghost-a", "run-ghost-b", "a", vote_index=0, sample_index=9),
+    )
+
+    result = _run(root, rubric=False, votes=1)
+
+    assert result["errors"] == []
+    assert result["summary"]["dropped"]["unknown_model_comparison"] == 1
+    assert result["summary"]["comparisons"][("model-one", "model-two")][
+        "comparisons"
+    ] == 1
+
+
+def test_a_pairwise_line_with_an_unreadable_verdict_is_counted_not_raised():
+    """`majority` raises on a verdict outside its vocabulary. A hand-edited line
+    reaching it would take the whole summary down at the end of a batch that
+    already paid for thousands of calls."""
+    judgments = [
+        _vote("run-a", "run-b", "a", vote_index=0),
+        _vote("run-a", "run-b", "first", vote_index=1),
+        _judgment(kind="something-else", run_id="run-a"),
+    ]
+
+    summary = summarize(judgments, MODEL_OF)
+
+    assert summary["dropped"]["unreadable_verdict"] == 1
+    assert summary["dropped"]["unreadable_kind"] == 1
+    assert summary["comparisons"][("model-one", "model-two")][
+        "comparisons"
+    ] == 1
+
+
+def test_the_kappa_caveat_line_is_always_printed(tmp_path, monkeypatch, capsys):
+    """§4.3: below κ 0.6 the number is directional only, and an UNMEASURED κ is
+    below 0.6 by construction (OPEN-5). The caveat is hard-coded and
+    unconditional because a flag is how it gets dropped -- so it is printed for
+    an empty batch, for a fully gate-decided one, and under every flag the
+    parser has."""
+    print_summary(_empty_result())
+    assert KAPPA_CAVEAT in capsys.readouterr().out
+
+    root = _two_arms(tmp_path, resolved_a=True, resolved_b=False)
+    print_summary(_run(root, rubric=False))
+    assert KAPPA_CAVEAT in capsys.readouterr().out
+
+    monkeypatch.setattr("scripts.judge.load_task_set", lambda *a, **k: [_task()])
+    monkeypatch.setattr(
+        "scripts.judge.live_completion", lambda *a, **k: FakeComplete()
+    )
+    for flags in ([], ["--no-rubric"], ["--re-judge"], ["--votes", "1"],
+                  ["--no-rubric", "--re-judge", "--samples", "0"]):
+        main(["--event-log", str(tmp_path / "fresh"), *flags])
+        assert KAPPA_CAVEAT in capsys.readouterr().out
+
+
+def test_the_caveat_survives_a_summary_this_printer_cannot_read(capsys):
+    """The caveat sits in a `finally`, not at the end of a happy path.
+
+    A summary dict shaped by an older or a newer reader raises PARTWAY through
+    the sections -- after the matrix is already on the terminal. A reader who
+    got the numbers and not the caveat is worse off than one who got neither,
+    which is the whole reason the line is unconditional.
+    """
+    result = _empty_result()
+    del result["summary"]["elo"]
+
+    with pytest.raises(KeyError):
+        print_summary(result)
+
+    assert KAPPA_CAVEAT in capsys.readouterr().out
+
+
+def test_the_caveat_falls_back_to_ascii_on_a_terminal_that_cannot_encode_it(
+    monkeypatch,
+):
+    """`KAPPA_CAVEAT` carries a κ and an em dash. On a stdout the environment
+    pinned to ASCII -- `LC_ALL=C`, or a pipe into a tool that did -- `print`
+    raises `UnicodeEncodeError`, which drops the caveat AND takes the exit path
+    down with it. That is this line dying by environment variable instead of by
+    flag, and it is the same death."""
+    stream = io.TextIOWrapper(io.BytesIO(), encoding="ascii", errors="strict")
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    _print_kappa_caveat()
+    stream.flush()
+
+    text = stream.buffer.getvalue().decode("ascii")
+    assert "must not carry a decision" in text
+
+
+def test_the_kappa_caveat_says_exactly_what_it_has_to_say():
+    """The sentence itself, pinned literally. Every other test asserts
+    `KAPPA_CAVEAT in out`, which follows the constant wherever it goes -- so all
+    of them would pass against a caveat softened into agreement. That is how
+    this line actually dies: not deleted, reworded.
+
+    The ASCII fallback carries the same claim, because a terminal that cannot
+    encode a κ is not a terminal that may be told less.
+    """
+    assert KAPPA_CAVEAT == (
+        "κ unmeasured (OPEN-5) — every number above is directional only and "
+        "must not carry a decision."
+    )
+    for text in (KAPPA_CAVEAT, _KAPPA_CAVEAT_ASCII):
+        assert "unmeasured (OPEN-5)" in text
+        assert "directional only" in text
+        assert "must not carry a decision" in text
+    assert _KAPPA_CAVEAT_ASCII.isascii()
+
+
+def test_no_command_line_flag_offers_to_suppress_the_caveat(capsys):
+    """The tripwire for the way the caveat actually dies: somebody adds
+    `--quiet` or `--no-caveat` and the printout becomes conditional. There is no
+    such flag, and this fails the moment one appears."""
+    with pytest.raises(SystemExit):
+        main(["--help"])
+
+    text = capsys.readouterr().out.lower()
+    for banned in ("--quiet", "--no-caveat", "--no-kappa", "--brief",
+                   "--no-summary"):
+        assert banned not in text
+
+
+def test_the_summary_prints_the_matrix_the_profile_and_the_elo_table(
+    tmp_path, capsys,
+):
+    """The summary MAY name arms -- `model_of` comes from the event log. The
+    payload never does, which is `test_judge.py`'s business, not this file's."""
+    root = _collection(
+        tmp_path,
+        [
+            _record("run-a", model="model-one", final_diff=DIFF_A),
+            _record("run-b", model="model-two", final_diff=DIFF_B),
+        ],
+        [
+            _grade("run-a", model="model-one"),
+            _grade("run-b", model="model-two"),
+        ],
+    )
+
+    print_summary(_run(root, rubric=True, votes=1))
+
+    out = capsys.readouterr().out
+    assert "model-one vs model-two" in out
+    assert "win rate" in out.lower()
+    assert "rubric profile" in out.lower()
+    assert "elo" in out.lower()
+    assert "functional_equivalence" in out
+    assert "wrote_tests" in out
+    assert KAPPA_CAVEAT in out
+
+
+def test_the_summary_mentions_a_superseded_gate_decided_line_when_there_is_one(
+    capsys,
+):
+    """Append-only means the disagreement IS the finding, so it is surfaced
+    rather than quietly resolved in the aggregation."""
+    result = _empty_result()
+    result["summary"] = summarize(
+        [
+            _gate("run-a", "run-b", "b"),
+            _vote("run-a", "run-b", "a", vote_index=0),
+        ],
+        MODEL_OF,
+    )
+
+    print_summary(result)
+
+    out = capsys.readouterr().out
+    assert "superseded" in out.lower()
+    assert "1 gate-decided line" in out
+
+
+def test_the_summary_says_nothing_about_superseding_when_nothing_was(capsys):
+    print_summary(_empty_result())
+
+    assert "superseded" not in capsys.readouterr().out.lower()
+
+
+def test_summary_covers_the_campaign_not_the_invocation(tmp_path, capsys):
+    """A judging pass is thousands of paid calls and is killed far more often
+    than it finishes, so the last invocation routinely writes two lines. A
+    summary computed from those two describes a campaign of two."""
+    root = _two_arms(tmp_path)
+    _run(root, rubric=False, votes=1)
+
+    second = _run(root, rubric=True, votes=1)
+
+    # One vote line from the first invocation, two rubric lines from this one.
+    assert second["audited"] == 3
+    assert second["from_prior_invocations"] == 1
+    summary = second["summary"]
+    assert summary["lines"] == {
+        "rubric": 2, "pairwise_votes": 1, "gate_decided": 0,
+    }
+    # The comparison the FIRST invocation judged is still in the matrix.
+    assert summary["comparisons"][("model-one", "model-two")][
+        "comparisons"
+    ] == 1
+    assert set(summary["rubric_profile"]) == {"model-one", "model-two"}
+
+    print_summary(second)
+    out = capsys.readouterr().out
+    assert "3 judgment(s)" in out
+    assert "1 from prior invocation(s)" in out
+
+
+def test_the_summary_names_arms_for_runs_this_invocation_never_read(tmp_path):
+    """The campaign rule has a name problem the grade summary does not: a
+    judgment from an earlier pass can name a run that a later re-grade has since
+    excluded, and `judge_event_log` drops excluded runs BEFORE reading them. The
+    comparison is still in the file and still belongs in the matrix, so the name
+    has to be recovered from the event log rather than from this pass's records.
+    """
+    root = _two_arms(tmp_path)
+    _run(root, rubric=False, votes=1)
+
+    # The re-grade that excludes one side, appended after the judgment.
+    append_grade(
+        grades_path(root),
+        _grade("run-b", model="model-two", resolved=None, grader_version="3"),
+    )
+    second = _run(root, rubric=False, votes=1)
+
+    row = second["summary"]["comparisons"][("model-one", "model-two")]
+    assert row["comparisons"] == 1
+    assert second["summary"]["dropped"]["unknown_model_comparison"] == 0
+
+
+def test_the_summary_is_a_printout_and_stores_nothing(tmp_path):
+    """`grade.py summarize`'s precedent, and the reason it matters more here: a
+    stored Elo is a published number, and §4.3 forbids publishing one without
+    the κ that was in force. Nothing on disk moves when the summary is taken."""
+    root = _two_arms(tmp_path)
+    result = _run(root, rubric=True, votes=1)
+    before = _bytes_under(root)
+
+    summarize(_lines(root), {"run-a": "model-one", "run-b": "model-two"})
+    print_summary(result)
+
+    assert _bytes_under(root) == before

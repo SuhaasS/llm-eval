@@ -56,6 +56,22 @@ one model that cannot produce JSON, or one payload that tripped the secret scan
 costs its own line and not the rest of the batch. `MalformedVerdict` after
 exhausted retries lands here: an error, no line, exit 1.
 
+THE SUMMARY IS A PRINTOUT, NOT A STORED SCORE
+---------------------------------------------
+
+`summarize` reads the judgment file back and says what it holds: a pairwise
+win-rate matrix per model pair (primary), a rubric PROFILE per model
+(diagnostic -- per-dimension means and flag rates, never summed, never joined
+to `resolved`), and an Elo table that FOLLOWS the win rates rather than
+adjudicating them. Nothing it computes is written anywhere, on `grade.py
+summarize`'s precedent and for a sharper reason: a stored Elo is a published
+number, and §4.3 forbids publishing one without the κ that was in force.
+
+Which is why `print_summary` ends every run with `KAPPA_CAVEAT`,
+unconditionally. OPEN-5 is blocked on people rather than on code, an unmeasured
+κ is below 0.6 by construction, and below 0.6 the number is directional only. A
+flag is how that line gets dropped, so there is no flag.
+
 WHAT IS LAZY, AND WHY IT MATTERS
 --------------------------------
 
@@ -104,6 +120,7 @@ from bakeoff.judge import (  # noqa: E402
     judge_pair_vote,
     judge_rubric,
     live_completion,
+    majority,
     payload_inputs_from,
     prompt_sha,
 )
@@ -129,6 +146,40 @@ DEFAULT_TASK_SET = REPO / "taskset"
 #: How many ids a warning names before it stops listing them. A collection is
 #: ~800 runs and a warning that prints all of them is one nobody reads.
 _MAX_NAMED = 10
+
+#: The three verdicts a model may return, as `majority` accepts them.
+#: "gate_decided" is deliberately ABSENT: it is the one verdict no model
+#: produced, and inside this vocabulary it becomes a fourth thing the judge
+#: said -- which puts every pair the ladder settled into the denominator of a
+#: rate about what the judge preferred. `_CANONICAL_VERDICTS` in
+#: `bakeoff.judge` is the same three words; the test file pins them equal
+#: rather than this module importing another module's private name.
+_VOTE_VERDICTS: tuple[str, ...] = ("a", "b", "tie")
+
+#: Elo, at GDPval's parameters. CONSTANTS rather than flags: K and the base are
+#: not tuning knobs but part of what the number means, and a rating printed
+#: under an unrecorded K is a number nobody can reproduce.
+ELO_K = 32.0
+ELO_BASE = 1000.0
+
+#: §4.3: at κ below 0.6 a judge-derived number is directional only, and an
+#: UNMEASURED κ is below 0.6 by construction -- OPEN-5 is blocked on people, not
+#: on code, so nothing in this repository can raise it. Hard-coded and printed
+#: unconditionally: a flag is how this line gets dropped, and the printout it
+#: qualifies is the only place a reader meets these numbers.
+KAPPA_CAVEAT = (
+    "κ unmeasured (OPEN-5) — every number above is directional only and "
+    "must not carry a decision."
+)
+
+#: The same sentence for a stdout that cannot encode it. An ASCII terminal
+#: turns `print(KAPPA_CAVEAT)` into a `UnicodeEncodeError`, which drops the
+#: caveat and takes the exit path down with it -- the failure this line exists
+#: to prevent, arrived at by an environment variable instead of a flag.
+_KAPPA_CAVEAT_ASCII = (
+    "kappa unmeasured (OPEN-5) -- every number above is directional only and "
+    "must not carry a decision."
+)
 
 
 class ResumeRefused(RuntimeError):
@@ -751,9 +802,7 @@ def judge_event_log(event_log_root, tasks, *,
     # invocation routinely writes three lines -- and a census computed from
     # those three would describe a campaign of three.
     fresh = judged + gate_decided
-    last: dict[tuple, JudgeRecord] = {}
-    for judgment in existing + fresh:
-        last[_resume_key(judgment)] = judgment
+    audited = _last_line_per_judgment(existing + fresh)
     fresh_keys = {_resume_key(judgment) for judgment in fresh}
 
     return {
@@ -762,14 +811,48 @@ def judge_event_log(event_log_root, tasks, *,
         "skipped": skipped,
         "errors": errors,
         "warnings": warnings,
-        # A census of the judgment file, not a score. Win rates, the rubric
-        # profile and Elo are a separate reading pass over these same lines.
-        "summary": _census(list(last.values())),
-        "audited": len(last),
+        # A printout, not a stored score. Nothing here is written anywhere.
+        "summary": summarize(audited, _model_of(log, records, audited)),
+        "audited": len(audited),
         "from_prior_invocations": sum(
-            1 for key in last if key not in fresh_keys
+            1 for judgment in audited
+            if _resume_key(judgment) not in fresh_keys
         ),
     }
+
+
+def _model_of(log: EventLog, records: dict[str, Any],
+              audited: list[JudgeRecord]) -> dict[str, str]:
+    """`run_id -> model`, for every run the audited judgments name.
+
+    Mostly free: `records` already holds every run this pass judged. The gap it
+    fills is the one the campaign rule opens -- a judgment from an EARLIER
+    invocation can name a run this pass never read, because a later re-grade
+    excluded it (`resolved is None` drops the run before it is read), because
+    `--only-task` narrowed the selection, or because the run was already judged
+    and skipped. That comparison is still in the file and still belongs in the
+    matrix, so the name is recovered from the event log rather than from this
+    pass's records.
+
+    A run the log no longer holds stays unnamed rather than raising. Missing is
+    a real state -- a judgment file copied beside another collection -- and
+    `summarize` counts what it could not name instead of ranking a `None`.
+    """
+    model_of = {run_id: record.model for run_id, record in records.items()}
+    named: set[str] = set()
+    for judgment in audited:
+        named.update(
+            run_id
+            for run_id in (judgment.run_id, judgment.run_id_a,
+                           judgment.run_id_b)
+            if run_id
+        )
+    for run_id in sorted(named - set(model_of)):
+        try:
+            model_of[run_id] = log.read_run(run_id).model
+        except Exception:  # noqa: BLE001 - an unnameable arm, not a unit
+            continue
+    return model_of
 
 
 def _inputs_for(cache: dict[str, PayloadInputs], record, grade: GradeRecord,
@@ -793,46 +876,345 @@ def _named(values: list[str]) -> str:
     return ", ".join(values[:_MAX_NAMED]) + f", and {rest} more"
 
 
-def _census(judgments: list[JudgeRecord]) -> dict:
-    """How many lines of each kind the judgment file holds. A COUNT, not a
-    score: no win rate, no rubric mean, no Elo, and nothing joined to
-    `resolved`."""
+def _comparison_key(judgment: JudgeRecord) -> tuple:
+    """One COMPARISON: this pair, at this sample, under one judge generation.
+
+    `vote_index` is deliberately absent, which is the whole point of having a
+    second key at all. It is what makes the three votes for a pair -- and any
+    gate-decided line for the same pair -- land in one bucket, and a bucket is
+    where "if votes exist, they win" can be applied. `_resume_key` keeps
+    `vote_index` because it answers a different question: which unit of WORK is
+    already bought.
+
+    The three version fields stay, for `_resume_key`'s reason. A re-judge under
+    a new prompt is a new generation of verdict, and pooling two generations
+    into one comparison would average a disagreement the file exists to keep.
+    """
+    return (
+        judgment.task_id,
+        judgment.sample_index,
+        judgment.run_id_a,
+        judgment.run_id_b,
+        judgment.judge_model_id,
+        judgment.judge_prompt_version,
+        judgment.rubric_version,
+    )
+
+
+def _deterministic(keys) -> list:
+    """`sorted`, over keys that may hold a `None` beside an `int`.
+
+    A hand-edited or foreign-schema line can carry `sample_index=None`, and
+    `sorted` on a tuple mixing `None` with `int` raises `TypeError` -- which
+    would take the whole summary down at the end of a batch that already paid
+    for thousands of calls. `repr` is a total order over anything, arbitrary but
+    stable, and stable is the only property the walk needs.
+    """
+    return sorted(keys, key=repr)
+
+
+def elo_from_outcomes(
+    outcomes: list[tuple[str, str, float]],
+) -> dict[str, float]:
+    """Ratings from `(model_a, model_b, score_a)` triples. K=32, base 1000.
+
+    DESCRIPTIVE. Elo follows the win rates, it does not adjudicate them: it is
+    a reading of the same comparisons in a scale that composes across pairs, and
+    the matrix above it is the primary report. Following GDPval, which is where
+    the parameters come from.
+
+    SORTED before the walk, because Elo is order-dependent and the outcomes are
+    assembled from a dict walk. Unsorted, two passes over one unchanged
+    collection print two different tables, and the ratings appear to move while
+    nothing about the collection did.
+
+    Refuses a score outside `{0.0, 0.5, 1.0}` BEFORE any arithmetic. Those are
+    the only three results a comparison has, and a vote COUNT arriving here in
+    place of a result would inflate every rating by an amount no reader could
+    reconstruct from the printout. Validated in a first pass so the message
+    names the offending pair rather than surfacing as a `TypeError` inside
+    `sorted`.
+    """
+    for outcome in outcomes:
+        model_a, model_b, score_a = outcome
+        if score_a not in (0.0, 0.5, 1.0):
+            raise ValueError(
+                f"elo_from_outcomes takes a score in {{0.0, 0.5, 1.0}} -- a "
+                f"win, a tie or a loss for the first named model -- but got "
+                f"{score_a!r} for {model_a} vs {model_b}"
+            )
+
+    ratings: dict[str, float] = {}
+    for model_a, model_b, score_a in sorted(outcomes):
+        rating_a = ratings.setdefault(model_a, ELO_BASE)
+        rating_b = ratings.setdefault(model_b, ELO_BASE)
+        expected_a = 1.0 / (1.0 + 10.0 ** ((rating_b - rating_a) / 400.0))
+        # Zero-sum by construction: b's update is a's, negated. Written as one
+        # delta rather than two symmetric expressions so the two cannot drift.
+        delta = ELO_K * (score_a - expected_a)
+        ratings[model_a] = rating_a + delta
+        ratings[model_b] = rating_b - delta
+    return dict(sorted(ratings.items()))
+
+
+def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
+    """Win rates, a rubric profile and an Elo table over the judgment file.
+
+    A PRINTOUT, NOT A STORED SCORE, on `grade.py summarize`'s precedent -- and
+    it matters more here. A stored Elo is a published number, and §4.3 forbids
+    publishing one without the κ that was in force at judging time. Nothing this
+    returns is written anywhere; `print_summary` says it out loud, under the
+    caveat, and it is gone.
+
+    `model_of` maps `run_id -> model`, out of the event log. The SUMMARY may
+    name arms -- that is what makes a win-rate matrix readable. The PAYLOAD
+    never does, which is the whitelist chokepoint's business, not this
+    function's.
+
+    Three aggregation rules, each placed against a specific way an append-only
+    file produces a confident, wrong number:
+
+    1. **Dedupe to the last line per resume identity, before anything else.** A
+       re-judge appends rather than replaces, so one vote can hold two lines
+       under one identity. Aggregating both counts that vote twice, in whichever
+       direction the earlier generation happened to point.
+    2. **Within one comparison, vote lines supersede a gate-decided line.** A
+       re-grade that flips the losing side turns a gate-decided pair into a
+       judgeable one, and the old gate-decided line stays on disk beside the
+       three votes that came later. Counting both enters one comparison twice,
+       once for each side. The votes win -- they are the later, richer verdict
+       -- and the disagreement is TALLIED in `superseded_gate_decided` rather
+       than quietly resolved: the file is append-only, so the disagreement is
+       the finding.
+    3. **`gate_decided` never enters the vote verdict distribution.** It is the
+       one verdict no model produced. Inside the distribution it is a fourth
+       thing the judge said, and every rate off that denominator is wrong by
+       however many pairs the ladder settled. It gets its own count in `lines`,
+       and its own column in each matrix row.
+
+    A gate-decided comparison IS a win for `gate_decided_by`'s side in the win
+    rates and in Elo -- the objective result settled it, which is a result about
+    the arm. Rule 3 is about the vote census, which is a different question:
+    what did the judge say when asked.
+
+    `dropped` counts what could not be aggregated, per reason, rather than
+    letting any of it disappear: a line whose arm cannot be named, a comparison
+    with one model on both sides, a verdict outside the vocabulary `majority`
+    accepts, a `kind` this reader does not know. Every one of them shrinks a
+    denominator, and a denominator that moves invisibly is the failure this
+    whole file is arranged against.
+    """
+    deduped = _last_line_per_judgment(judgments)
+
+    dropped = {
+        "unreadable_kind": 0,
+        "unreadable_verdict": 0,
+        "unknown_model_rubric": 0,
+        "unknown_model_comparison": 0,
+        "same_model_comparison": 0,
+    }
+
+    rubric_lines: list[JudgeRecord] = []
+    votes_by: dict[tuple, list[tuple[int, str]]] = {}
+    gate_by: dict[tuple, str] = {}
+    vote_verdicts: Counter = Counter()
+
+    for judgment in deduped:
+        if judgment.kind == "rubric":
+            rubric_lines.append(judgment)
+            continue
+        if judgment.kind != "pairwise":
+            dropped["unreadable_kind"] += 1
+            continue
+
+        key = _comparison_key(judgment)
+        if judgment.verdict == "gate_decided":
+            if judgment.gate_decided_by in ("a", "b"):
+                gate_by[key] = judgment.gate_decided_by
+            else:
+                # A gate-decided line naming no winner settles nothing.
+                dropped["unreadable_verdict"] += 1
+            continue
+        if judgment.verdict not in _VOTE_VERDICTS:
+            dropped["unreadable_verdict"] += 1
+            continue
+
+        vote_verdicts[judgment.verdict] += 1
+        # `-1` for a vote line carrying no index -- only a hand-edited line can.
+        # It sorts first and is stable, which is all the ordering has to be.
+        votes_by.setdefault(key, []).append(
+            (judgment.vote_index if judgment.vote_index is not None else -1,
+             judgment.verdict)
+        )
+
+    superseded = 0
+    outcomes: list[tuple[str, str, float]] = []
+    pairs: dict[tuple[str, str], dict[str, int]] = {}
+
+    for key in _deterministic(set(votes_by) | set(gate_by)):
+        vote_lines = votes_by.get(key)
+        gate = gate_by.get(key)
+        if vote_lines:
+            if gate is not None:
+                superseded += 1
+            # `majority` cannot see an empty sequence here: the bucket exists
+            # only because a vote line landed in it.
+            winner = majority([verdict for _, verdict in sorted(vote_lines)])
+            settled = "voted"
+        else:
+            winner = gate
+            settled = "gate_decided"
+
+        run_id_a, run_id_b = key[2], key[3]
+        model_a = model_of.get(run_id_a)
+        model_b = model_of.get(run_id_b)
+        if model_a is None or model_b is None:
+            dropped["unknown_model_comparison"] += 1
+            continue
+        if model_a == model_b:
+            # One model on both sides is not a comparison. A cell keys on model
+            # so the driver cannot produce it; a cross-collection line can.
+            dropped["same_model_comparison"] += 1
+            continue
+
+        score_a = {"a": 1.0, "b": 0.0}.get(winner, 0.5)
+        outcomes.append((model_a, model_b, score_a))
+
+        # The matrix is keyed on the two model names SORTED, so `(x, y)` and
+        # `(y, x)` are one row -- the same reason `run_id_a`/`run_id_b` are
+        # canonical on the record.
+        model_x, model_y = sorted((model_a, model_b))
+        score_x = score_a if model_x == model_a else 1.0 - score_a
+        row = pairs.setdefault(
+            (model_x, model_y),
+            {"voted": 0, "gate_decided": 0, "wins_x": 0, "wins_y": 0,
+             "ties": 0},
+        )
+        row[settled] += 1
+        if score_x == 1.0:
+            row["wins_x"] += 1
+        elif score_x == 0.0:
+            row["wins_y"] += 1
+        else:
+            row["ties"] += 1
+
+    comparisons: dict[tuple[str, str], dict] = {}
+    for pair in sorted(pairs):
+        row = pairs[pair]
+        total = row["voted"] + row["gate_decided"]
+        comparisons[pair] = {
+            **row,
+            "comparisons": total,
+            # A tie is half a point to each, exactly as it is to Elo. The two
+            # have to agree or the table and the matrix rank differently.
+            "win_rate_x": (row["wins_x"] + 0.5 * row["ties"]) / total,
+            "win_rate_y": (row["wins_y"] + 0.5 * row["ties"]) / total,
+        }
+
     return {
-        "rubric": sum(1 for j in judgments if j.kind == "rubric"),
-        "pairwise_votes": sum(
-            1 for j in judgments
-            if j.kind == "pairwise" and j.verdict != "gate_decided"
-        ),
-        "gate_decided": sum(
-            1 for j in judgments if j.verdict == "gate_decided"
-        ),
-        "verdicts": dict(Counter(
-            j.verdict for j in judgments if j.kind == "pairwise" and j.verdict
-        )),
+        "lines": {
+            "rubric": len(rubric_lines),
+            "pairwise_votes": sum(vote_verdicts.values()),
+            "gate_decided": len(gate_by),
+        },
+        "vote_verdicts": dict(sorted(vote_verdicts.items())),
+        "comparisons": comparisons,
+        "rubric_profile": _rubric_profile(rubric_lines, model_of, dropped),
+        "elo": elo_from_outcomes(outcomes),
+        "superseded_gate_decided": superseded,
+        "dropped": dropped,
     }
 
 
+def _last_line_per_judgment(judgments: list[JudgeRecord]) -> list[JudgeRecord]:
+    """One record per resume identity -- the LAST, in file order.
+
+    Rule 1 of `summarize`, and its own function because `judge_event_log` needs
+    the same collapse to count `audited`. Idempotent, so the driver handing over
+    an already-deduped list costs nothing and a direct caller handing over a raw
+    file is still correct.
+    """
+    last: dict[tuple, JudgeRecord] = {}
+    for judgment in judgments:
+        last[_resume_key(judgment)] = judgment
+    return list(last.values())
+
+
+def _rubric_profile(rubric_lines: list[JudgeRecord],
+                    model_of: dict[str, str], dropped: dict) -> dict:
+    """Per model: the mean of each dimension, and the rate of each flag.
+
+    A PROFILE, never a score. Summing five dimensions into one number is the
+    absolute 1-10 rating §4.2.3 rules out, wearing a rubric's clothes -- it is
+    the open-ended question whose κ ≈ 0.32 motivated reference-anchoring in the
+    first place. So there is no total, no aggregate, and no rank here, and none
+    of it is joined to `resolved`: a `JudgeRecord` deliberately carries no
+    `resolved` to join to, and a rubric mean sitting in a resolve rate is
+    exactly the number §4.2.3 forbids.
+
+    Per model rather than pooled. Two arms averaged into one row says nothing
+    about either, which is the one thing a diagnostic output must not do.
+
+    The dimension and flag NAMES come from the records rather than from
+    `RUBRIC_DIMENSIONS`, and are sorted. A judgment written under a later
+    `rubric_version` can carry a sixth dimension, both generations coexist in
+    an append-only file, and iterating the constant would silently drop the one
+    the newer rubric added -- the schema reader's `_build` reasoning, one layer
+    up.
+    """
+    by_model: dict[str, list[JudgeRecord]] = {}
+    for judgment in rubric_lines:
+        model = model_of.get(judgment.run_id)
+        if model is None:
+            dropped["unknown_model_rubric"] += 1
+            continue
+        by_model.setdefault(model, []).append(judgment)
+
+    profile: dict[str, dict] = {}
+    for model in sorted(by_model):
+        rows = by_model[model]
+        profile[model] = {
+            "runs": len(rows),
+            "dimensions": _means(rows, "dimension_scores"),
+            "flags": _means(rows, "flags"),
+        }
+    return profile
+
+
+def _means(rows: list[JudgeRecord], attribute: str) -> dict[str, float]:
+    """Mean of one dict-valued field, per key, over the rows that carry it.
+
+    `bool` is a subclass of `int`, so the flag rates and the dimension means are
+    the same arithmetic and share this walk rather than drifting apart in two
+    copies.
+    """
+    blocks = [getattr(row, attribute) or {} for row in rows]
+    means: dict[str, float] = {}
+    for name in sorted({name for block in blocks for name in block}):
+        values = [block[name] for block in blocks if name in block]
+        means[name] = sum(values) / len(values)
+    return means
+
+
 def print_summary(result: dict) -> None:
-    print(
-        f"\n{len(result['judged'])} judged, "
-        f"{len(result['gate_decided'])} gate-decided, "
-        f"{len(result['errors'])} errored, "
-        f"{len(result['skipped'])} already judged"
-    )
-    census = result["summary"]
-    # Said after the invocation counts and labelled, because the census is the
-    # whole campaign: a reader who took it for this pass would read a finished
-    # collection off a resume that judged three units.
-    print(
-        f"\ncensus over {result['audited']} judgment(s) in the judgment file "
-        f"({result['from_prior_invocations']} from prior invocation(s)), "
-        "deduped to the last line per resume identity"
-    )
-    print(f"  rubric          {census['rubric']}")
-    print(f"  pairwise votes  {census['pairwise_votes']}")
-    print(f"  gate-decided    {census['gate_decided']}")
-    for verdict, count in sorted(census["verdicts"].items()):
-        print(f"  verdict         {verdict}: {count}")
+    """Say the whole reading out loud, and then say what it is worth.
+
+    Section order is the report's order of authority: the win-rate matrix is
+    primary, the rubric profile is diagnostic beside it, and the Elo table is
+    descriptive of the matrix. The κ caveat comes last of the number sections
+    and is UNCONDITIONAL -- see `KAPPA_CAVEAT`. Warnings and errors follow it
+    because they are about the batch, not about the numbers.
+
+    `finally`, not "at the end". Every number is already on the terminal by the
+    time the caveat is due, so a reader who gets the matrix and not the caveat
+    is worse off than one who gets neither -- and a `KeyError` from a summary
+    shaped by an older or newer reader would produce exactly that. The
+    exception still propagates; it just does not take the caveat with it.
+    """
+    try:
+        _print_reading(result)
+    finally:
+        _print_kappa_caveat()
 
     for warning in result["warnings"]:
         print(f"\nWARNING: {warning}")
@@ -844,6 +1226,110 @@ def print_summary(result: dict) -> None:
             "\nThese are holes in the derived view, not verdicts. The runs and "
             "the grades are untouched and re-running this command judges them."
         )
+
+
+def _print_reading(result: dict) -> None:
+    """Every number, in the report's order of authority.
+
+    Every header prints whether or not it has rows under it. A `--no-rubric`
+    pass showing an empty rubric section is honest; a section that vanishes
+    when it is empty makes two passes over one collection print two different
+    shapes, and a reader diffing them cannot tell an absent section from an
+    absent feature.
+    """
+    print(
+        f"\n{len(result['judged'])} judged, "
+        f"{len(result['gate_decided'])} gate-decided, "
+        f"{len(result['errors'])} errored, "
+        f"{len(result['skipped'])} already judged"
+    )
+    summary = result["summary"]
+    lines = summary["lines"]
+    # Said after the invocation counts and labelled, because everything below is
+    # the whole campaign: a reader who took it for this pass would read a
+    # finished collection off a resume that judged three units.
+    print(
+        f"\nsummary over {result['audited']} judgment(s) in the judgment file "
+        f"({result['from_prior_invocations']} from prior invocation(s)), "
+        "deduped to the last line per resume identity"
+    )
+    print(f"  rubric          {lines['rubric']}")
+    print(f"  pairwise votes  {lines['pairwise_votes']}")
+    print(f"  gate-decided    {lines['gate_decided']}")
+    for verdict, count in sorted(summary["vote_verdicts"].items()):
+        print(f"  vote verdict    {verdict}: {count}")
+
+    print(
+        "\npairwise win rates over COMPARISONS, not votes -- three votes are "
+        "one comparison, a tie is half a point, and a gate-decided pair is a "
+        "win for the side the ladder picked"
+    )
+    for (model_x, model_y), row in sorted(summary["comparisons"].items()):
+        print(f"  {model_x} vs {model_y}")
+        print(
+            f"    {row['wins_x']}-{row['wins_y']}-{row['ties']} "
+            f"(W-L-T for {model_x}) over {row['comparisons']} comparison(s): "
+            f"{model_x} {row['win_rate_x']:.1%} / "
+            f"{model_y} {row['win_rate_y']:.1%}"
+        )
+        print(
+            f"    {row['voted']} judged, {row['gate_decided']} gate-decided"
+        )
+
+    print(
+        "\nrubric profile per model -- diagnostic, never summed across "
+        "dimensions and never joined to resolved"
+    )
+    for model, row in sorted(summary["rubric_profile"].items()):
+        print(f"  {model}  ({row['runs']} run(s))")
+        # One column width across both blocks, wide enough for the longest
+        # label either can produce, so the means and the rates line up under
+        # each other rather than under two different left edges.
+        for name, mean in sorted(row["dimensions"].items()):
+            print(f"    {name:26} {mean:.2f}  (of 2)")
+        for name, rate in sorted(row["flags"].items()):
+            print(f"    {'flag ' + name:26} {rate:.1%}")
+
+    print(
+        f"\nElo -- DESCRIPTIVE, it follows the win rates above rather than "
+        f"adjudicating them (K={ELO_K:g}, base {ELO_BASE:g})"
+    )
+    for model, rating in sorted(
+        summary["elo"].items(), key=lambda item: (-item[1], item[0])
+    ):
+        print(f"  {model:24} {rating:8.1f}")
+
+    if summary["superseded_gate_decided"]:
+        print(
+            f"\n{summary['superseded_gate_decided']} gate-decided line(s) were "
+            "SUPERSEDED by real votes for the same comparison and left out of "
+            "the numbers above. The usual cause is a re-grade that flipped the "
+            "losing side, making a pair the ladder had settled judgeable; the "
+            "judgment file is append-only, so the older line stays on disk and "
+            "the disagreement is the finding."
+        )
+    for reason, count in sorted(summary["dropped"].items()):
+        if count:
+            print(
+                f"\n{count} line(s) or comparison(s) could not be aggregated "
+                f"({reason}) and are absent from every number above."
+            )
+
+
+def _print_kappa_caveat() -> None:
+    """The one line in this file that no argument, flag or branch can suppress.
+
+    The `except` is not decoration: `KAPPA_CAVEAT` carries a κ and an em dash,
+    and a stdout the environment pinned to ASCII raises `UnicodeEncodeError` on
+    it -- which drops the caveat and takes the exit path down with it. That is
+    the failure this line exists to prevent, reached through an environment
+    variable rather than a flag, so the fallback says the same sentence in
+    letters every terminal has.
+    """
+    try:
+        print(f"\n{KAPPA_CAVEAT}")
+    except UnicodeEncodeError:
+        print(f"\n{_KAPPA_CAVEAT_ASCII}")
 
 
 def main(argv: list[str] | None = None) -> int:
