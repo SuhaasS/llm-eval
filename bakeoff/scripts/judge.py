@@ -56,6 +56,15 @@ one model that cannot produce JSON, or one payload that tripped the secret scan
 costs its own line and not the rest of the batch. `MalformedVerdict` after
 exhausted retries lands here: an error, no line, exit 1.
 
+That per-unit isolation has one failure mode of its own, and
+`MAX_CONSECUTIVE_ERRORS` is placed against it: when the cause is systemic
+rather than per-unit -- a credential that expired and could not be re-minted,
+against a pass that runs for hours past a ~1h window -- every remaining unit
+fails identically, and the driver would grind through thousands of them
+printing an error line for each. A run of consecutive unit errors aborts the
+batch instead, with the abort recorded in `warnings`. Exit 1, and the resume
+picks up the same command where it stopped.
+
 THE SUMMARY IS A PRINTOUT, NOT A STORED SCORE
 ---------------------------------------------
 
@@ -161,6 +170,27 @@ _MAX_NAMED = 10
 #: rather than this module importing another module's private name.
 _VOTE_VERDICTS: tuple[str, ...] = ("a", "b", "tie")
 
+#: How many unit errors IN A ROW abort the batch.
+#:
+#: The failure this is placed against: the mantle bearer token's real window is
+#: about an hour -- the Identity Center session policy caps it well below the
+#: token's own TTL -- and a real 60-task pass is ~10,800 calls over many more
+#: hours than that. `live_completion` re-mints once per call when the
+#: credential dies, which covers an expiry; it cannot cover a revoked role, a
+#: dead `aws sso` session or an endpoint that has stopped accepting this
+#: principal at all. In those cases the auth error propagates past
+#: `_ask_and_parse`, the per-unit `except` records it and continues, and the
+#: driver grinds through every remaining unit on a credential that will never
+#: work -- thousands of paid-looking attempts and thousands of error lines,
+#: with the one message that matters buried at the top.
+#:
+#: Five, and CONSECUTIVE: a systemic failure fails every unit it touches from
+#: the moment it starts, while a flaky endpoint or one unreadable diff produces
+#: scattered errors a long batch must survive. Any successful unit resets the
+#: count. Gate-decided pairs make no call and so are neither -- see
+#: `_BatchAborted`.
+MAX_CONSECUTIVE_ERRORS = 5
+
 #: Elo, at GDPval's parameters. CONSTANTS rather than flags: K and the base are
 #: not tuning knobs but part of what the number means, and a rating printed
 #: under an unrecorded K is a number nobody can reproduce.
@@ -195,6 +225,24 @@ class ResumeRefused(RuntimeError):
     two drivers refuse for related reasons over different files, and a shared
     class would make a `except ResumeRefused` around one of them catch the
     other's refusal about a file it never touched.
+    """
+
+
+class _BatchAborted(RuntimeError):
+    """`MAX_CONSECUTIVE_ERRORS` units failed in a row, so the loop stops.
+
+    PRIVATE and control flow only: it never leaves `judge_event_log`, which
+    catches it, records the abort in `warnings` and returns the partial batch
+    exactly as if the loop had run out of cells. The operator gets the summary
+    over everything already judged, the errors that were recorded, and one
+    message saying the pass stopped early -- rather than a traceback and no
+    reading at all.
+
+    Raised from the per-unit handlers, which are siblings rather than nested,
+    so nothing catches this on the way out. The gate-decided handler does not
+    raise it and does not reset the count either: that unit makes no call, so
+    it is no evidence the credential recovered, and treating it as a success
+    would mean a collection full of failed-gate arms never trips the breaker.
     """
 
 
@@ -543,9 +591,15 @@ def judge_event_log(event_log_root, tasks, *,
     LAZY -- see `lazy_live_completion`.
 
     A UNIT is one rubric call, one pairwise vote, or one gate-decided pair. That
-    is the granularity of the resume key, of the `try/except`, and of the exit
-    contract, and keeping the three aligned is what makes "exit 0 means every
-    selected unit produced its lines" a statement about something.
+    is the granularity of the resume key, of the `try/except`, of the
+    consecutive-failure breaker and of the exit contract, and keeping the four
+    aligned is what makes "exit 0 means every selected unit produced its lines"
+    a statement about something.
+
+    `MAX_CONSECUTIVE_ERRORS` units failing in a row stops the walk early --
+    see that constant and `_BatchAborted`. The batch still returns: everything
+    already judged is on disk and in the summary, and the abort is a warning
+    beside the errors rather than an exception out of this function.
 
     `sorted()` at every level -- runs, cells, models, pairs. `list_runs` globs
     and glob order is nondeterministic; sorted is arbitrary but DETERMINISTIC,
@@ -687,110 +741,162 @@ def judge_event_log(event_log_root, tasks, *,
     skipped: list[tuple] = []
     missing_tasks: set[str] = set()
 
-    for task_id, sample_index in sorted(cells):
-        if wanted_tasks is not None and task_id not in wanted_tasks:
-            continue
-        if wanted_samples is not None and sample_index not in wanted_samples:
-            continue
-        task = by_task.get(task_id)
-        if task is None:
-            missing_tasks.add(task_id)
-            continue
+    # The breaker's state. Two closures rather than an inline counter, so the
+    # three per-unit handlers cannot each grow their own version of "does this
+    # one count" -- which is exactly where a gate-decided pair would quietly
+    # become a success.
+    consecutive_errors = 0
 
-        cell = cells[(task_id, sample_index)]
-        # Per CELL, and shared across the rubric call and all three votes of
-        # every pair the cell produces -- `similarity_context` walks two diffs
-        # and the payload builders take `PayloadInputs` by value, so rebuilding
-        # per unit would pay for the same walk six times over.
-        inputs: dict[str, PayloadInputs] = {}
+    def _unit_succeeded() -> None:
+        """A unit produced its line, so whatever was failing is not systemic."""
+        nonlocal consecutive_errors
+        consecutive_errors = 0
 
-        if rubric:
-            for model in sorted(cell):
-                record = cell[model]
-                grade = gating[record.run_id]
-                # Selection-time gate. The assert before the append is the one
-                # that is load-bearing; this is what keeps the batch from
-                # paying for a call it must then refuse to record.
-                if grade.resolved is not True:
-                    continue
-                key = _rubric_key(record.run_id, judge_model_id)
-                if not re_judge and key in done:
-                    skipped.append(key)
-                    continue
-                try:
-                    judged.append(_rubric_line(
-                        record, grade, task,
-                        _inputs_for(inputs, record, grade, task),
-                        payloads, path, complete, judge_model_id,
-                    ))
-                except Exception as exc:  # noqa: BLE001 - one unit, not the batch
-                    errors.append(
-                        f"rubric {record.run_id}: {type(exc).__name__}: {exc}"
-                    )
+    def _unit_failed(message: str) -> None:
+        """Record one unit's error, and abort the batch on a run of them.
 
-        for model_x, model_y in itertools.combinations(sorted(cell), 2):
-            # Canonical a/b is the two run ids sorted, NOT the two models: the
-            # identity has to be stable under a model rename, and `(x, y)` and
-            # `(y, x)` must be one comparison or the position-swap probe can no
-            # longer find its own pairs.
-            run_id_a, run_id_b = sorted(
-                (cell[model_x].run_id, cell[model_y].run_id)
+        See `MAX_CONSECUTIVE_ERRORS`. The message the abort carries is the
+        warning the operator reads, so there is one copy of it.
+        """
+        nonlocal consecutive_errors
+        errors.append(message)
+        consecutive_errors += 1
+        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+            raise _BatchAborted(
+                f"{consecutive_errors} consecutive unit failures -- aborting "
+                f"the batch with units left unattempted. The usual cause is "
+                f"systemic rather than per-unit: a credential that expired and "
+                f"could not be re-minted (the window is ~1h against a "
+                f"multi-hour pass), a revoked role, or an endpoint that has "
+                f"stopped answering. Nothing is lost -- judgments are "
+                f"append-only and the resume is keyed on units already bought, "
+                f"so resume with the same command once the cause is fixed. The "
+                f"errors below name it."
             )
-            grade_a, grade_b = gating[run_id_a], gating[run_id_b]
-            passed_a = grade_a.resolved is True
-            passed_b = grade_b.resolved is True
 
-            if not passed_a and not passed_b:
-                # Nothing. Neither side is a submission worth ranking, and a
-                # "tie" here would be a verdict about two failures.
+    try:
+        for task_id, sample_index in sorted(cells):
+            if wanted_tasks is not None and task_id not in wanted_tasks:
+                continue
+            if (wanted_samples is not None
+                    and sample_index not in wanted_samples):
+                continue
+            task = by_task.get(task_id)
+            if task is None:
+                missing_tasks.add(task_id)
                 continue
 
-            if passed_a != passed_b:
-                key = _pairwise_key(task_id, sample_index, run_id_a, run_id_b,
-                                    None, judge_model_id)
-                if not re_judge and key in done:
-                    skipped.append(key)
-                    continue
-                try:
-                    gate_decided.append(_gate_decided_line(
-                        task, sample_index, run_id_a, run_id_b,
-                        grade_a, grade_b, path, judge_model_id,
-                    ))
-                except Exception as exc:  # noqa: BLE001 - one unit, not the batch
-                    errors.append(
-                        f"gate-decided {run_id_a} vs {run_id_b}: "
-                        f"{type(exc).__name__}: {exc}"
-                    )
-                continue
+            cell = cells[(task_id, sample_index)]
+            # Per CELL, and shared across the rubric call and all three
+            # votes of every pair the cell produces -- `similarity_context`
+            # walks two diffs and the payload builders take `PayloadInputs` by
+            # value, so rebuilding per unit would pay for the same walk six
+            # times over.
+            inputs: dict[str, PayloadInputs] = {}
 
-            for vote_index in range(votes):
-                key = _pairwise_key(task_id, sample_index, run_id_a, run_id_b,
-                                    vote_index, judge_model_id)
-                if not re_judge and key in done:
-                    skipped.append(key)
+            if rubric:
+                for model in sorted(cell):
+                    record = cell[model]
+                    grade = gating[record.run_id]
+                    # Selection-time gate. The assert before the append is
+                    # the one that is load-bearing; this is what keeps the
+                    # batch from paying for a call it must then refuse to
+                    # record.
+                    if grade.resolved is not True:
+                        continue
+                    key = _rubric_key(record.run_id, judge_model_id)
+                    if not re_judge and key in done:
+                        skipped.append(key)
+                        continue
+                    try:
+                        judged.append(_rubric_line(
+                            record, grade, task,
+                            _inputs_for(inputs, record, grade, task),
+                            payloads, path, complete, judge_model_id,
+                        ))
+                        _unit_succeeded()
+                    except Exception as exc:  # noqa: BLE001 - one unit
+                        _unit_failed(
+                            f"rubric {record.run_id}: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+
+            for model_x, model_y in itertools.combinations(sorted(cell), 2):
+                # Canonical a/b is the two run ids sorted, NOT the two
+                # models: the identity has to be stable under a model rename,
+                # and `(x, y)` and `(y, x)` must be one comparison or the
+                # position-swap probe can no longer find its own pairs.
+                run_id_a, run_id_b = sorted(
+                    (cell[model_x].run_id, cell[model_y].run_id)
+                )
+                grade_a, grade_b = gating[run_id_a], gating[run_id_b]
+                passed_a = grade_a.resolved is True
+                passed_b = grade_b.resolved is True
+
+                if not passed_a and not passed_b:
+                    # Nothing. Neither side is a submission worth ranking,
+                    # and a "tie" here would be a verdict about two failures.
                     continue
-                try:
-                    # Bound before the call rather than inline: two
-                    # positional `PayloadInputs` four lines apart is where an
-                    # a/b transposition hides, and a transposed pair produces
-                    # a complete, confident, inverted verdict.
-                    inputs_a = _inputs_for(
-                        inputs, records[run_id_a], grade_a, task
-                    )
-                    inputs_b = _inputs_for(
-                        inputs, records[run_id_b], grade_b, task
-                    )
-                    judged.append(_vote_line(
-                        task, sample_index, run_id_a, run_id_b,
-                        inputs_a, inputs_b,
-                        vote_index, grade_a, grade_b, rng, payloads, path,
-                        complete, judge_model_id,
-                    ))
-                except Exception as exc:  # noqa: BLE001 - one unit, not the batch
-                    errors.append(
-                        f"vote {vote_index} {run_id_a} vs {run_id_b}: "
-                        f"{type(exc).__name__}: {exc}"
-                    )
+
+                if passed_a != passed_b:
+                    key = _pairwise_key(task_id, sample_index, run_id_a,
+                                        run_id_b, None, judge_model_id)
+                    if not re_judge and key in done:
+                        skipped.append(key)
+                        continue
+                    try:
+                        gate_decided.append(_gate_decided_line(
+                            task, sample_index, run_id_a, run_id_b,
+                            grade_a, grade_b, path, judge_model_id,
+                        ))
+                    except Exception as exc:  # noqa: BLE001 - one unit
+                        # Straight into `errors`, deliberately: a gate-decided
+                        # pair makes no call, so it is neither evidence that
+                        # the credential is dead nor evidence that it
+                        # recovered. See `_BatchAborted`.
+                        errors.append(
+                            f"gate-decided {run_id_a} vs {run_id_b}: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                    continue
+
+                for vote_index in range(votes):
+                    key = _pairwise_key(task_id, sample_index, run_id_a,
+                                        run_id_b, vote_index, judge_model_id)
+                    if not re_judge and key in done:
+                        skipped.append(key)
+                        continue
+                    try:
+                        # Bound before the call rather than inline: two
+                        # positional `PayloadInputs` four lines apart is where
+                        # an a/b transposition hides, and a transposed pair
+                        # produces a complete, confident, inverted verdict.
+                        inputs_a = _inputs_for(
+                            inputs, records[run_id_a], grade_a, task
+                        )
+                        inputs_b = _inputs_for(
+                            inputs, records[run_id_b], grade_b, task
+                        )
+                        judged.append(_vote_line(
+                            task, sample_index, run_id_a, run_id_b,
+                            inputs_a, inputs_b,
+                            vote_index, grade_a, grade_b, rng, payloads, path,
+                            complete, judge_model_id,
+                        ))
+                        _unit_succeeded()
+                    except Exception as exc:  # noqa: BLE001 - one unit
+                        _unit_failed(
+                            f"vote {vote_index} {run_id_a} vs {run_id_b}: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+
+    except _BatchAborted as exc:
+        # The abort is a WARNING and not an error, because it is not a unit:
+        # the units that failed are already in `errors`, and the exit code
+        # follows them. The batch still returns its partial reading rather
+        # than a traceback -- everything judged before the run of failures is
+        # on disk and belongs in the summary.
+        warnings.append(str(exc))
 
     if missing_tasks:
         warnings.append(

@@ -1447,6 +1447,50 @@ FAKE_MANTLE_TOKEN = "fake-mantle-bearer-token-not-a-credential"
 
 STUB_REPLY = '{"verdict": "A", "reasoning": "stubbed; no model was called"}'
 
+#: What a re-minted token looks like here. Distinguishable from
+#: `FAKE_MANTLE_TOKEN` on purpose: "the router was rebuilt" is satisfied just
+#: as happily by a rebuild around the SAME expired credential, which is the
+#: half of the fix that would leave a batch retrying into the same 401.
+FRESH_TOKEN = "freshly-minted-mantle-token"
+
+
+class _StatusOnlyAuthError(Exception):
+    """A 401 the way a generic `APIError` carries one: a status code and
+    nothing else in the name.
+
+    Some routes on this endpoint do not raise litellm's own
+    `AuthenticationError` -- they raise `APIError` with `status_code` set, and
+    a classifier that read only the class name would let an expired token look
+    like a model failure and take the retry budget with it.
+    """
+
+    def __init__(self, status_code: int = 401):
+        super().__init__(f"HTTP {status_code}: the security token has expired")
+        self.status_code = status_code
+
+
+class AuthenticationError(Exception):
+    """Named exactly as litellm names it, and carrying NO status attribute.
+
+    The other half of the classifier. `bakeoff.judge` cannot catch litellm's
+    class without importing litellm at module scope -- which the payload
+    builders and the leak tests would then pay for -- so it matches on the
+    name, and this stand-in is what pins that path independently of the status
+    one.
+    """
+
+
+class PermissionDeniedError(Exception):
+    """litellm's 403 -- the other name the same dead credential arrives
+    under, and a separate class here so the set is pinned name by name."""
+
+
+class _SubclassedAuthError(AuthenticationError):
+    """A library subclassing its own auth error. The classifier walks the MRO
+    rather than reading `type(exc).__name__`, so the name on a base class
+    still counts -- otherwise one litellm release adding a subclass turns the
+    whole fix off silently."""
+
 
 def _stub_response(text: str):
     """The two attribute hops `live_completion` makes into a litellm response.
@@ -1500,6 +1544,70 @@ def routers(monkeypatch, dotenv_settled):
 
     monkeypatch.setattr(litellm, "Router", _RecordingRouter)
     return built
+
+
+@pytest.fixture
+def scripted_routers(monkeypatch, dotenv_settled):
+    """`litellm.Router` replaced by a recorder driven by a per-CALL script.
+
+    Per call rather than per router, because the behaviour under test spans
+    both: one call fails on the first router, the next lands on a router the
+    closure rebuilt. A script of "what the i-th completion does" says that in
+    one list, and it is the only shape that can express a batch whose SECOND
+    credential also expires an hour later.
+    """
+    import litellm
+
+    built = []
+
+    def install(script):
+        """`script[i]` is what the i-th completion call does: an exception
+        instance to raise, or `None` to answer. Past the end, it answers."""
+        calls = iter(list(script))
+
+        class _ScriptedRouter:
+            def __init__(self, **kwargs):
+                self.init_kwargs = kwargs
+                self.calls = []
+                built.append(self)
+
+            @property
+            def api_key(self):
+                return self.init_kwargs["model_list"][0]["litellm_params"][
+                    "api_key"
+                ]
+
+            def completion(self, **kwargs):
+                self.calls.append(kwargs)
+                error = next(calls, None)
+                if error is not None:
+                    raise error
+                return _stub_response(STUB_REPLY)
+
+        monkeypatch.setattr(litellm, "Router", _ScriptedRouter)
+        return built
+
+    return install
+
+
+@pytest.fixture
+def minted(monkeypatch, dotenv_settled):
+    """Every mint the closure asks for, and a distinguishable token each time.
+
+    Patched on `scripts.smoke_bedrock` because that module is where the
+    harness's ONE token derivation lives -- `bakeoff.judge` calls it rather
+    than reimplementing it, so this is the seam a re-mint has to come through.
+    """
+    import scripts.smoke_bedrock as smoke_bedrock
+
+    regions = []
+
+    def _mint(region):
+        regions.append(region)
+        return f"{FRESH_TOKEN}-{len(regions)}"
+
+    monkeypatch.setattr(smoke_bedrock, "derive_mantle_token", _mint)
+    return regions
 
 
 @pytest.fixture
@@ -1711,6 +1819,140 @@ def test_the_router_is_built_once_and_carries_transport_retries(
     assert len(router.calls) == 2
     assert router.init_kwargs["num_retries"] == 2
     assert router.init_kwargs["disable_cooldowns"] is True
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        _StatusOnlyAuthError(401),
+        _StatusOnlyAuthError(403),
+        AuthenticationError("the security token included in the request is "
+                            "expired"),
+        PermissionDeniedError("not authorized to perform bedrock:InvokeModel"),
+        _SubclassedAuthError("a release added a subclass"),
+    ],
+    ids=["status-401", "status-403", "authentication", "permission-denied",
+         "subclass"],
+)
+def test_a_token_that_died_mid_batch_is_re_minted_once_and_the_call_retried(
+    error, mantle_token, minted, scripted_routers
+):
+    """The ~1h window against a multi-hour pass, at the layer that can fix it.
+
+    The Identity Center session policy caps the mantle token at about an hour,
+    a real 60-task pass is ~10,800 calls and runs for many more than that, and
+    the router is built once on the first vote. So the token dies in the middle
+    of every real batch. Left to propagate, every remaining unit fails on its
+    own dead credential and the operator gets one hour of judged units per
+    invocation plus thousands of error lines.
+
+    One rebuild around a FRESHLY MINTED token, then the same call again. The
+    fresh token is asserted on the second deployment because "a second router
+    was built" is satisfied just as well by a rebuild around the expired copy
+    still sitting in `MANTLE_ENV` -- which would retry straight into the same
+    401.
+
+    Both signals are parametrized because one route gives one: litellm raises
+    `AuthenticationError`/`PermissionDeniedError` on this handler, and some
+    paths raise a generic `APIError` carrying only `status_code`.
+    """
+    built = scripted_routers([error])
+
+    complete = live_completion()
+    assert complete("RENDERED PROMPT") == STUB_REPLY
+
+    assert len(built) == 2, "the dead router was not replaced"
+    assert minted == ["us-east-1"], "no fresh token was minted"
+    assert built[0].api_key == FAKE_MANTLE_TOKEN
+    assert built[1].api_key == f"{FRESH_TOKEN}-1"
+    assert len(built[0].calls) == len(built[1].calls) == 1
+    # Verbatim on the retry: the record's `judge_prompt_sha` attests to the
+    # text the model saw, and a rebuild that re-rendered anything would make
+    # the sha describe a prompt the second call never sent.
+    assert built[1].calls[0]["messages"] == [
+        {"role": "user", "content": "RENDERED PROMPT"}
+    ]
+
+    # And the rebuilt router is CACHED. A mint per vote would spend the whole
+    # batch on credentials and start a new clock on every one of them.
+    assert complete("second vote") == STUB_REPLY
+    assert len(built) == 2
+    assert minted == ["us-east-1"]
+
+
+def test_a_second_consecutive_auth_failure_propagates_rather_than_churning(
+    mantle_token, minted, scripted_routers
+):
+    """A token minted seconds ago that still 401s is a real credential problem
+    -- a revoked role, the wrong region, a principal that never had access --
+    and the design's answer to that is to fail loud. A closure that kept
+    re-minting would turn it into an unbounded mint loop against every unit in
+    the batch, and the error an operator finally read would be about the last
+    attempt rather than the first."""
+    built = scripted_routers([_StatusOnlyAuthError(401),
+                              _StatusOnlyAuthError(401)])
+
+    with pytest.raises(_StatusOnlyAuthError):
+        live_completion()("RENDERED PROMPT")
+
+    assert len(built) == 2, "more than one rebuild for one call"
+    assert minted == ["us-east-1"]
+
+
+def test_each_call_carries_its_own_rebuild_so_a_long_batch_survives_two(
+    mantle_token, minted, scripted_routers
+):
+    """The budget is per CALL, not per closure. A pass long enough to outlive
+    two tokens is the ordinary case at ~10,800 calls, so a one-shot rebuild
+    would buy the second hour and no more."""
+    built = scripted_routers([
+        _StatusOnlyAuthError(401), None, _StatusOnlyAuthError(401),
+    ])
+
+    complete = live_completion()
+    assert complete("first hour") == STUB_REPLY
+    assert complete("third hour") == STUB_REPLY
+
+    assert len(built) == 3
+    assert minted == ["us-east-1", "us-east-1"]
+    assert [router.api_key for router in built] == [
+        FAKE_MANTLE_TOKEN, f"{FRESH_TOKEN}-1", f"{FRESH_TOKEN}-2",
+    ]
+
+
+def test_a_failure_that_is_not_an_auth_failure_never_mints_a_credential(
+    mantle_token, minted, scripted_routers
+):
+    """A connection reset, a 5xx and a rate limit are the TRANSPORT retries
+    `Router(num_retries=2)` already owns. Answering them with a fresh
+    credential hides a broken endpoint behind a token churn, and doubles the
+    call count of every failing unit for nothing."""
+    built = scripted_routers([RuntimeError("connection reset by peer")])
+
+    with pytest.raises(RuntimeError, match="connection reset"):
+        live_completion()("RENDERED PROMPT")
+
+    assert len(built) == 1, "a non-auth failure rebuilt the router"
+    assert minted == [], "a non-auth failure minted a credential"
+
+
+def test_an_auth_failure_with_no_replacement_token_raises_the_auth_error(
+    monkeypatch, mantle_token, scripted_routers
+):
+    """`aws sso login` has expired too, so there is nothing to retry with. The
+    operator must see the 401 that actually stopped the batch -- not a "no
+    mantle credential: set BAKEOFF_MANTLE_TOKEN" message about a variable that
+    is still set, which sends them looking for a config error that is not
+    there."""
+    import scripts.smoke_bedrock as smoke_bedrock
+
+    monkeypatch.setattr(smoke_bedrock, "derive_mantle_token", lambda r: None)
+    built = scripted_routers([_StatusOnlyAuthError(401)])
+
+    with pytest.raises(_StatusOnlyAuthError):
+        live_completion()("RENDERED PROMPT")
+
+    assert len(built) == 1
 
 
 def test_verify_logger_selector_excludes_judge_live():

@@ -989,6 +989,69 @@ def _ask_and_parse(
 #: a credential this host rejects. Both move together or neither does.
 MANTLE_BASE = "https://bedrock-mantle.us-east-1.api.aws/v1"
 
+#: The class names litellm raises an HTTP 401/403 under. Matched by NAME
+#: rather than by class, for `_judge_router`'s reason: naming the classes means
+#: importing litellm at module scope, and this module is imported by the
+#: payload builders and by the leak tests, none of which should pay for that
+#: import.
+_AUTH_ERROR_NAMES = frozenset({"AuthenticationError", "PermissionDeniedError"})
+
+#: The two statuses that mean the CREDENTIAL rather than the request. Read off
+#: `status_code` because some routes on this endpoint raise a generic
+#: `APIError` instead of one of the names above, and a classifier with only one
+#: of the two signals misses whichever half the route it hits produces.
+_AUTH_STATUS = (401, 403)
+
+
+def _is_auth_failure(exc: BaseException) -> bool:
+    """Whether the credential died, as opposed to the model or the network.
+
+    Deliberately NARROW. A false positive costs one mint and one retry; the
+    thing it must never match is a rate limit, a 5xx or a connection reset --
+    those are the transport retries `Router(num_retries=2)` already owns, and
+    answering them with a fresh credential hides a broken endpoint behind a
+    token churn while doubling the call count of every failing unit.
+
+    The MRO is walked rather than `type(exc).__name__` read, so a library
+    release that subclasses its own auth error does not silently turn the
+    refresh off.
+    """
+    status = getattr(exc, "status_code", None)
+    try:
+        if int(status) in _AUTH_STATUS:
+            return True
+    except (TypeError, ValueError):
+        # No status, or one that is not a number: fall through to the names.
+        pass
+    return any(cls.__name__ in _AUTH_ERROR_NAMES for cls in type(exc).__mro__)
+
+
+def _completion(router: Any, judge_model_id: str, prompt: str) -> str:
+    """One call: one user turn in, the reply text out.
+
+    Its own function because `live_completion` makes this call TWICE -- once,
+    and once more on a router rebuilt around a freshly minted token. Two copies
+    of the request are two places for the sampling block or the message shape
+    to drift apart, and a retry that sent different text would make the
+    record's `judge_prompt_sha` attest to a prompt the second call never sent.
+    """
+    response = router.completion(
+        model=judge_model_id,
+        messages=[{"role": "user", "content": prompt}],
+        # As sent, hand-spelled. `bakeoff.litellm_patches` is what renames
+        # `max_tokens` -> `max_completion_tokens` for the candidate arms, and
+        # it applies process-wide ON IMPORT -- so it is deliberately never
+        # imported by an in-process caller and this router is unpatched by
+        # design. `smoke_bedrock.live` reproduces the same rename by hand
+        # (line 379) for exactly this reason.
+        **JUDGE_SAMPLING,
+    )
+    # `content` is None on an empty completion. Returned as "" rather than
+    # passed on, so the strict parser reports a malformed verdict and re-asks
+    # -- which is the right response to an empty reply, and is not what an
+    # AttributeError three frames deeper would produce.
+    return response.choices[0].message.content or ""
+
 
 def live_completion(
     judge_model_id: str = JUDGE_MODEL_ID_DEFAULT,
@@ -1011,9 +1074,36 @@ def live_completion(
     conversation -- each call is one user turn holding the whole rendered
     prompt.
 
-    Auth failures propagate. Retrying past one is how a batch is spent against
-    a token that expired mid-run, and the error an operator needs to see says
-    `ExpiredToken`, not "no parsable verdict after 3 attempts".
+    ONE AUTH FAILURE PER CALL BUYS ONE FRESH CREDENTIAL, and that is the whole
+    of the retry policy here. The window is about an hour and a real 60-task
+    pass is ~10,800 calls over many more hours than that, so the token does not
+    merely *risk* expiring mid-batch -- it expires in the middle of every real
+    one. Left to propagate, the driver's per-unit `except` records an error and
+    moves on, so the operator gets about an hour of judged units per invocation
+    and then thousands of error lines from units that were never going to
+    succeed. On a 401/403 (`_is_auth_failure`) the cached router is therefore
+    dropped, a NEW token is minted, one router is rebuilt around it, and the
+    same call is made once more.
+
+    The mint deliberately bypasses `_mantle_token`'s environment-first read:
+    the copy in `MANTLE_ENV` is the one that just expired, and a router
+    rebuilt around it would retry straight into the same 401. If nothing can be
+    minted the ORIGINAL auth error is re-raised, because "no mantle credential:
+    set BAKEOFF_MANTLE_TOKEN" would send an operator looking for a config error
+    while the variable sits there, populated and dead.
+
+    A SECOND consecutive auth failure propagates. A token minted seconds ago
+    that still 401s is a real credential problem -- a revoked role, the wrong
+    region, a principal that never had access -- and the design's answer to
+    that is to fail loud rather than churn tokens against every unit in the
+    batch. The budget is per call, not per closure, so a pass that outlives two
+    tokens gets a fresh one for each; the driver's consecutive-failure breaker
+    (`scripts/judge.py`) is what stops the case this cannot fix.
+
+    Everything else propagates untouched. A malformed verdict is
+    `_ask_and_parse`'s retry and a connection reset is the router's
+    `num_retries`; three retry policies in one place is how a batch burns its
+    budget on the wrong failure.
 
     Building the router also leaves the process with the AWS-named bearer
     variable unset, which is credential hygiene rather than a side effect
@@ -1044,33 +1134,41 @@ def live_completion(
                 judge_model_id, region, smoke_bedrock
             )
 
-        response = built["router"].completion(
-            model=judge_model_id,
-            messages=[{"role": "user", "content": prompt}],
-            # As sent, hand-spelled. `bakeoff.litellm_patches` is what renames
-            # `max_tokens` -> `max_completion_tokens` for the candidate arms,
-            # and it applies process-wide ON IMPORT -- so it is deliberately
-            # never imported by an in-process caller and this router is
-            # unpatched by design. `smoke_bedrock.live` reproduces the same
-            # rename by hand (line 379) for exactly this reason.
-            **JUDGE_SAMPLING,
-        )
-        # `content` is None on an empty completion. Returned as "" rather than
-        # passed on, so the strict parser reports a malformed verdict and
-        # re-asks -- which is the right response to an empty reply, and is not
-        # what an AttributeError three frames deeper would produce.
-        return response.choices[0].message.content or ""
+        try:
+            return _completion(built["router"], judge_model_id, prompt)
+        except Exception as exc:  # noqa: BLE001 - re-raised unless it is auth
+            if not _is_auth_failure(exc):
+                raise
+            # The ~1h window closed mid-batch. Minted rather than re-read: see
+            # the docstring -- the environment's copy is the dead one.
+            fresh = smoke_bedrock.derive_mantle_token(region)
+            if not fresh:
+                raise
+            built["router"] = _judge_router(
+                judge_model_id, region, smoke_bedrock, token=fresh
+            )
+
+        # ONE retry, on a router holding a credential minted seconds ago. A
+        # second auth failure propagates from here, which is the loud failure
+        # the design asks for.
+        return _completion(built["router"], judge_model_id, prompt)
 
     return complete
 
 
-def _judge_router(judge_model_id: str, region: str, credentials: Any) -> Any:
+def _judge_router(judge_model_id: str, region: str, credentials: Any,
+                  token: str | None = None) -> Any:
     """One single-deployment LiteLLM Router for the judge, credential and all.
 
     `credentials` is the `scripts.smoke_bedrock` module, imported by
     `live_completion` at construction and PASSED rather than re-imported here:
     one resolution, happening early enough that a mis-wired `sys.path` is
     reported before the batch is spent rather than after.
+
+    `token` is the mid-batch refresh path and is the ONLY way to bypass
+    `_mantle_token`'s environment-first read. The first build has no token to
+    supply and takes the environment's; a rebuild after a 401 must not, because
+    the environment's copy is precisely the credential that just expired.
 
     Annotated `Any` rather than `Router`: naming the type would mean importing
     litellm at module scope, and this module is imported by the payload
@@ -1123,7 +1221,7 @@ def _judge_router(judge_model_id: str, region: str, credentials: Any) -> Any:
                 "litellm_params": {
                     "model": f"openai/{judge_model_id}",
                     "api_base": MANTLE_BASE,
-                    "api_key": _mantle_token(region, credentials),
+                    "api_key": token or _mantle_token(region, credentials),
                 },
             }
         ],

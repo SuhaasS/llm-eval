@@ -74,6 +74,7 @@ from scripts.judge import (
     ELO_BASE,
     ELO_K,
     KAPPA_CAVEAT,
+    MAX_CONSECUTIVE_ERRORS,
     GateInvariantError,
     _KAPPA_CAVEAT_ASCII,
     ResumeRefused,
@@ -1108,6 +1109,167 @@ def test_main_passes_the_judge_model_and_vote_count_through(
     lines = _lines(root)
     assert len(lines) == 2
     assert {j.judge_model_id for j in lines} == {"openai.gpt-5.6-terra"}
+
+
+# --------------------------------------------------------------------------
+# 6b. the consecutive-failure breaker
+# --------------------------------------------------------------------------
+#
+# The failure mode these are placed against: the mantle token's real window is
+# about an hour (Identity Center caps the session well below the token's own
+# TTL) and a 60-task pass is ~10,800 calls over many more hours than that. When
+# the credential dies mid-batch and `live_completion`'s own refresh cannot
+# recover it, the per-unit `except` records an error and continues -- so the
+# driver grinds through every remaining unit on a dead credential and prints
+# thousands of error lines. Resume recovers the WORK; what it cannot recover is
+# an operator's afternoon.
+
+
+class _ExpiredToken(RuntimeError):
+    """What escapes `live_completion` when the credential is gone for good --
+    a freshly minted token that still 401s, or no token to mint at all."""
+
+
+class _DiesAfter(FakeComplete):
+    """A `CompleteFn` that raises on every call except the ones named.
+
+    `succeed_at` holds 1-based CALL indices. One call is one unit here: a
+    raised exception is not a `MalformedVerdict`, so `_ask_and_parse` does not
+    re-ask and the driver's per-unit `except` sees it directly.
+    """
+
+    def __init__(self, succeed_at=()):
+        super().__init__()
+        self.succeed_at = set(succeed_at)
+
+    def __call__(self, prompt: str) -> str:
+        if len(self.prompts) + 1 in self.succeed_at:
+            return super().__call__(prompt)
+        self.prompts.append(prompt)
+        raise _ExpiredToken(
+            "ExpiredTokenException: the security token included in the "
+            "request is expired"
+        )
+
+
+def _three_arms(tmp_path, resolved_three=True) -> Path:
+    """One cell, three models: 3 rubric units and 3 pairs, so a batch here has
+    more units than the breaker's limit and can prove where it stopped."""
+    return _collection(
+        tmp_path,
+        [
+            _record("run-a", model="model-one", final_diff=DIFF_A),
+            _record("run-b", model="model-two", final_diff=DIFF_B),
+            _record("run-c", model="model-three", final_diff=DIFF_C),
+        ],
+        [
+            _grade("run-a", model="model-one", resolved=True),
+            _grade("run-b", model="model-two", resolved=True),
+            _grade("run-c", model="model-three", resolved=resolved_three),
+        ],
+    )
+
+
+def test_a_run_of_consecutive_unit_failures_aborts_the_batch(tmp_path):
+    """The breaker, at exactly the limit. Twelve units are available and five
+    are attempted: a dead credential fails every unit it touches, so the sixth
+    error carries no information the first five did not, and the other seven
+    would each cost a call, a line of noise, and a place in a list the operator
+    has to read past to find the one message that matters."""
+    root = _three_arms(tmp_path)
+    fake = _DiesAfter()
+
+    result = _run(root, complete=fake, rubric=True, votes=3)
+
+    assert fake.calls == MAX_CONSECUTIVE_ERRORS
+    assert len(result["errors"]) == MAX_CONSECUTIVE_ERRORS
+    # Nothing was judged, so nothing was written: the abort costs no line.
+    assert _lines(root) == []
+    (abort,) = [w for w in result["warnings"] if "consecutive" in w]
+    assert f"{MAX_CONSECUTIVE_ERRORS} consecutive" in abort
+    assert "aborting" in abort
+    # The recovery instruction is the point of the message. The resume is keyed
+    # on units already bought, so the same command is the whole procedure.
+    assert "resume with the same command" in abort
+
+
+def test_one_successful_unit_resets_the_consecutive_failure_count(tmp_path):
+    """CONSECUTIVE, not cumulative. A judging pass over a flaky endpoint
+    produces scattered errors all day, and a cumulative counter would abort a
+    healthy batch that had simply been running for long enough. The credential
+    failure this breaker is for looks nothing like that: it fails every unit
+    from the moment it starts.
+    """
+    root = _three_arms(tmp_path)
+    # Four failures, one success, then the run that trips it.
+    fake = _DiesAfter(succeed_at={5})
+
+    result = _run(root, complete=fake, rubric=True, votes=3)
+
+    assert fake.calls == 5 + MAX_CONSECUTIVE_ERRORS
+    assert len(result["errors"]) == 4 + MAX_CONSECUTIVE_ERRORS
+    assert len(_lines(root)) == 1, "the one unit that succeeded wrote its line"
+    assert any("consecutive" in w for w in result["warnings"])
+
+
+def test_a_gate_decided_pair_neither_trips_the_breaker_nor_resets_it(tmp_path):
+    """A gate-decided pair makes no call, so it is not evidence that the
+    credential recovered. Counting it as a success would reset the counter on
+    the strength of nothing having been asked -- and in a collection with many
+    failed-gate arms, that is a breaker that never trips.
+
+    The cell here interleaves one deliberately: two rubric units, then the
+    gate-decided pair, then the three votes that carry the count to the limit.
+    """
+    root = _three_arms(tmp_path, resolved_three=False)
+    fake = _DiesAfter()
+
+    result = _run(root, complete=fake, rubric=True, votes=3)
+
+    assert fake.calls == MAX_CONSECUTIVE_ERRORS
+    assert any("consecutive" in w for w in result["warnings"])
+    # The gate-decided line was still written, and is not an error.
+    assert len(result["gate_decided"]) == 1
+    assert [j.verdict for j in _lines(root)] == ["gate_decided"]
+
+
+def test_the_abort_is_reported_on_the_terminal_and_exits_one(
+    tmp_path, monkeypatch, capsys,
+):
+    """Exit 1 for the reason every other error path exits 1 -- units that
+    produced no line -- and the abort says so distinctly, because "5 unit(s)
+    produced NO line" alone reads as a batch that finished with five holes in
+    it rather than one that stopped early with seven units never attempted."""
+    root = _three_arms(tmp_path)
+    monkeypatch.setattr("scripts.judge.load_task_set",
+                        lambda *a, **k: [_task()])
+    monkeypatch.setattr("scripts.judge.live_completion",
+                        lambda *a, **k: _DiesAfter())
+
+    assert main(["--event-log", str(root)]) == 1
+
+    out = capsys.readouterr().out
+    assert f"{MAX_CONSECUTIVE_ERRORS} consecutive" in out
+    assert "resume with the same command" in out
+    # The κ caveat is not skipped by an abort: it is the one line no branch
+    # may drop.
+    assert KAPPA_CAVEAT in out
+
+
+def test_a_batch_whose_failures_stay_below_the_limit_runs_to_the_end(tmp_path):
+    """The breaker is for a systemic failure, not for a bad unit. One
+    unreadable diff or one model that could not produce JSON must still cost
+    its own line and nothing else -- that is the exit contract, and a breaker
+    that fired early would turn a 99%-complete batch into a resume."""
+    root = _three_arms(tmp_path)
+    # Every other unit fails: the count never reaches two in a row.
+    fake = _DiesAfter(succeed_at=set(range(2, 25, 2)))
+
+    result = _run(root, complete=fake, rubric=True, votes=3)
+
+    assert fake.calls == 12, "the batch stopped short of its twelve units"
+    assert len(result["errors"]) == 6
+    assert not any("consecutive" in w for w in result["warnings"])
 
 
 # --------------------------------------------------------------------------
