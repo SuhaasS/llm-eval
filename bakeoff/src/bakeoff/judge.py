@@ -1018,14 +1018,31 @@ def live_completion(
     Building the router also leaves the process with the AWS-named bearer
     variable unset, which is credential hygiene rather than a side effect
     nobody asked for -- see `_judge_router`.
+
+    What is NOT deferred is the credential module's import. Lazy is for work
+    that costs something, not for wiring that can simply be wrong.
     """
+    # Resolved at CONSTRUCTION even though nothing in it is called until the
+    # first vote. This module reaches out of the package into `scripts/`,
+    # which is importable only when the repo root is on `sys.path` -- every
+    # script inserts it (`grade.py:76-77`), and a driver that forgets would
+    # otherwise be told so by a `ModuleNotFoundError: scripts` raised AT THE
+    # FIRST VOTE: after the batch being judged has already been run and paid
+    # for, which is the most expensive moment in the pass to discover a typo.
+    # Deferring it buys nothing the lazy router is for -- smoke_bedrock's own
+    # litellm, yaml and boto3 imports are all function-local, so importing it
+    # mints no token, reads no credential and opens no socket.
+    from scripts import smoke_bedrock
+
     # A one-slot cache rather than `nonlocal`: the closure only ever reads and
     # fills it, so there is no rebind to get wrong.
     built: dict[str, Any] = {}
 
     def complete(prompt: str) -> str:
         if "router" not in built:
-            built["router"] = _judge_router(judge_model_id, region)
+            built["router"] = _judge_router(
+                judge_model_id, region, smoke_bedrock
+            )
 
         response = built["router"].completion(
             model=judge_model_id,
@@ -1047,8 +1064,13 @@ def live_completion(
     return complete
 
 
-def _judge_router(judge_model_id: str, region: str) -> Any:
+def _judge_router(judge_model_id: str, region: str, credentials: Any) -> Any:
     """One single-deployment LiteLLM Router for the judge, credential and all.
+
+    `credentials` is the `scripts.smoke_bedrock` module, imported by
+    `live_completion` at construction and PASSED rather than re-imported here:
+    one resolution, happening early enough that a mis-wired `sys.path` is
+    reported before the batch is spent rather than after.
 
     Annotated `Any` rather than `Router`: naming the type would mean importing
     litellm at module scope, and this module is imported by the payload
@@ -1080,21 +1102,19 @@ def _judge_router(judge_model_id: str, region: str) -> Any:
     a plain ValueError with no status code -- and the operator reads "No
     deployments available" instead of the expired credential that caused it.
     """
-    # Imported FIRST, and the ordering is load-bearing rather than tidy:
-    # `import litellm` runs `load_dotenv()` (smoke_bedrock's
-    # `scrub_placeholders` documents the same trap costing an AWS_PROFILE), so
-    # `bakeoff/.env` does not reach `os.environ` until this line has run. A
-    # credential read before it misses a token sitting in the file the
-    # operator just filled in.
+    # Imported BEFORE every credential read below, and that ordering is
+    # load-bearing rather than tidy: `import litellm` runs `load_dotenv()`
+    # (smoke_bedrock's `scrub_placeholders` documents the same trap costing an
+    # AWS_PROFILE), so `bakeoff/.env` does not reach `os.environ` until this
+    # line has run. A credential read before it misses a token sitting in the
+    # file the operator just filled in.
     from litellm import Router
-
-    from scripts.smoke_bedrock import LITELLM_BEARER_ENV, normalize_mantle_token
 
     # A token the operator put under the AWS name is a WORKING credential, and
     # the scrub below is about to remove it. Adopt it onto the name the
     # harness reads first, so the sequence relocates a credential rather than
     # destroying one -- `smoke_bedrock.main` runs these two in the same order.
-    normalize_mantle_token()
+    credentials.normalize_mantle_token()
 
     router = Router(
         model_list=[
@@ -1103,7 +1123,7 @@ def _judge_router(judge_model_id: str, region: str) -> Any:
                 "litellm_params": {
                     "model": f"openai/{judge_model_id}",
                     "api_base": MANTLE_BASE,
-                    "api_key": _mantle_token(region),
+                    "api_key": _mantle_token(region, credentials),
                 },
             }
         ],
@@ -1121,14 +1141,14 @@ def _judge_router(judge_model_id: str, region: str) -> Any:
     # call does not depend on the ordering; `smoke_bedrock.py:243` scrubs
     # after construction for a config whose deployments do, and keeping the
     # two sequences identical is what lets one comment explain both.
-    os.environ.pop(LITELLM_BEARER_ENV, None)
+    os.environ.pop(credentials.LITELLM_BEARER_ENV, None)
     return router
 
 
-def _mantle_token(region: str) -> str:
+def _mantle_token(region: str, credentials: Any) -> str:
     """The mantle bearer token: the environment's, else one minted in memory.
 
-    Imported from `scripts.smoke_bedrock` rather than reimplemented, so the
+    Taken from `scripts.smoke_bedrock` rather than reimplemented, so the
     harness has ONE derivation with one set of failure messages
     (`proxy.py:427` reaches for the same functions). The token is held in
     memory for the life of the router and is never written to disk: a
@@ -1144,12 +1164,13 @@ def _mantle_token(region: str) -> str:
     pre-defined prefix`, which reads as a config error and sends an operator
     into `litellm_config.yaml` looking for a typo that is not there.
     """
-    from scripts.smoke_bedrock import MANTLE_ENV, derive_mantle_token
-
-    token = os.environ.get(MANTLE_ENV) or derive_mantle_token(region)
+    token = os.environ.get(credentials.MANTLE_ENV) or (
+        credentials.derive_mantle_token(region)
+    )
     if not token:
         raise RuntimeError(
-            f"no mantle credential for the judge: set {MANTLE_ENV}, or run "
-            f"`aws sso login` so a short-term token can be minted for {region}"
+            f"no mantle credential for the judge: set "
+            f"{credentials.MANTLE_ENV}, or run `aws sso login` so a "
+            f"short-term token can be minted for {region}"
         )
     return token

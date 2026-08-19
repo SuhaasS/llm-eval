@@ -41,6 +41,7 @@ import hashlib
 import json
 import os
 import random
+import sys
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -1575,6 +1576,15 @@ def test_live_completion_never_sets_the_litellm_bearer_env(
     [deployment] = router.init_kwargs["model_list"]
     assert deployment["litellm_params"]["api_key"] == FAKE_MANTLE_TOKEN
     assert deployment["litellm_params"]["api_base"] == MANTLE_BASE
+    # `openai/` twice is neither a typo nor cosmetic. The prefix picks
+    # LiteLLM's OpenAI-compatible chat-completions handler; `openai.` is
+    # Bedrock's vendor namespace inside the model id. Without the prefix the
+    # call falls through to the bedrock/ SigV4 handler -- which reaches for
+    # AWS_BEARER_TOKEN_BEDROCK, the variable this test has just proved is
+    # gone, and then signs a request for an endpoint that does not take one.
+    assert deployment["litellm_params"]["model"] == (
+        f"openai/{JUDGE_MODEL_ID_DEFAULT}"
+    )
 
 
 def test_an_ambient_aws_named_token_is_adopted_rather_than_discarded(
@@ -1640,6 +1650,32 @@ def test_the_router_is_not_built_until_the_first_call(monkeypatch, routers):
     assert routers == [], "a router was built without a credential to use"
 
 
+def test_a_missing_scripts_package_fails_at_construction_not_at_the_first_vote(
+    monkeypatch, routers
+):
+    """Mis-wiring is reported before the batch, not after it is paid for.
+
+    `live_completion` reaches out of the package into `scripts.smoke_bedrock`
+    for the credential helpers, which resolves only with the repo root on
+    `sys.path` -- every script inserts it (`grade.py:76-77`) and a driver that
+    forgets is a one-line mistake. Left inside the closure, that import raises
+    `ModuleNotFoundError: scripts` at the FIRST VOTE: after a grading pass has
+    already run and spent on the candidate arms, which is the worst moment in
+    the pass to learn about a typo. Resolved at construction it costs one
+    import and fails while the run has spent nothing.
+
+    `None` in `sys.modules` is the import system's own "this is unavailable"
+    sentinel, and is used rather than editing `sys.path`, which would leave
+    the module cached and importable anyway.
+    """
+    monkeypatch.setitem(sys.modules, "scripts", None)
+
+    with pytest.raises(ImportError):
+        live_completion()
+
+    assert routers == []
+
+
 def test_the_router_is_built_once_and_carries_transport_retries(
     mantle_token, routers
 ):
@@ -1654,6 +1690,17 @@ def test_the_router_is_built_once_and_carries_transport_retries(
     hides which one a batch is burning: a model that cannot produce JSON and a
     model that cannot be reached fail the same number of times and need
     opposite responses.
+
+    `disable_cooldowns` is asserted beside it because the two interact, and
+    the interaction is what makes an auth failure loud. Measured against
+    litellm 1.95.0 and written up in `config/litellm_config.yaml`'s
+    router_settings: `_should_cooldown_deployment`'s
+    `litellm._should_retry(status_code) is False` branch is unguarded, and
+    _should_retry(401) and (403) are both False -- so ONE auth failure cools
+    this deployment down. It is a single-deployment group, so there is nothing
+    to fail over to; the retries above return `RouterRateLimitError`, a plain
+    ValueError with no status code, and the operator reads "No deployments
+    available" instead of the expired token that actually stopped the batch.
     """
     complete = live_completion()
     complete("first vote")
@@ -1663,6 +1710,7 @@ def test_the_router_is_built_once_and_carries_transport_retries(
     [router] = routers
     assert len(router.calls) == 2
     assert router.init_kwargs["num_retries"] == 2
+    assert router.init_kwargs["disable_cooldowns"] is True
 
 
 def test_verify_logger_selector_excludes_judge_live():
