@@ -78,6 +78,9 @@ from scripts.judge import (
     _KAPPA_CAVEAT_ASCII,
     ResumeRefused,
     _assert_rubric_gate,
+    _comparison_key,
+    _generation_of,
+    _judge_generation,
     _print_kappa_caveat,
     _VOTE_VERDICTS,
     elo_from_outcomes,
@@ -1178,12 +1181,22 @@ def _rubric(run_id, *, scores=2, flags=False, **kw):
     )
 
 
+def _judge_gen(judge_model_id=JUDGE_MODEL_ID_DEFAULT,
+               prompt_version=JUDGE_PROMPT_VERSION,
+               rubric_version=RUBRIC_VERSION):
+    """One judge generation: the oracle a verdict came from. The key a win-rate
+    matrix block and an Elo table each sit under, and the tail of the key a
+    rubric profile block sits under."""
+    return (judge_model_id, prompt_version, rubric_version)
+
+
 def _generation(model, judge_model_id=JUDGE_MODEL_ID_DEFAULT,
                 prompt_version=JUDGE_PROMPT_VERSION,
                 rubric_version=RUBRIC_VERSION):
     """The key a rubric profile block sits under: the arm, and the judge
     generation that profiled it."""
-    return (model, judge_model_id, prompt_version, rubric_version)
+    return (model,) + _judge_gen(judge_model_id, prompt_version,
+                                 rubric_version)
 
 
 def _empty_result() -> dict:
@@ -1220,7 +1233,7 @@ def test_majority_over_vote_lines_with_gate_decided_wins_and_half_point_ties():
 
     summary = summarize(judgments, MODEL_OF)
 
-    row = summary["comparisons"][("model-one", "model-two")]
+    row = summary["comparisons"][_judge_gen()][("model-one", "model-two")]
     assert row["voted"] == 2
     assert row["gate_decided"] == 2
     assert (row["wins_x"], row["wins_y"], row["ties"]) == (2, 1, 1)
@@ -1237,7 +1250,7 @@ def test_a_comparison_short_of_a_strict_majority_is_a_tie_not_a_plurality_win():
         _vote("run-a", "run-b", "b", vote_index=1),
     ]
 
-    row = summarize(judgments, MODEL_OF)["comparisons"][
+    row = summarize(judgments, MODEL_OF)["comparisons"][_judge_gen()][
         ("model-one", "model-two")
     ]
 
@@ -1262,7 +1275,7 @@ def test_vote_lines_supersede_a_stale_gate_decided_line_for_the_same_pair():
 
     summary = summarize(judgments, MODEL_OF)
 
-    row = summary["comparisons"][("model-one", "model-two")]
+    row = summary["comparisons"][_judge_gen()][("model-one", "model-two")]
     assert row["comparisons"] == 1
     assert row["voted"] == 1
     assert row["gate_decided"] == 0
@@ -1322,6 +1335,84 @@ def test_the_summary_dedupes_to_the_last_line_per_resume_identity():
 
     assert summary["lines"]["pairwise_votes"] == 1
     assert summary["vote_verdicts"] == {"b": 1}
+
+
+def test_two_judge_generations_over_one_pair_are_two_blocks_never_pooled():
+    """`--judge-model openai.gpt-5.6-luna` re-judges a collection under a
+    SECOND oracle, and the judgment file is append-only, so both generations'
+    verdicts live in it. A matrix keyed on the two model names alone enters
+    that pair twice: the comparison count doubles and the win rate is the mean
+    of two oracles nobody asked for a joint opinion. That is the average
+    `_comparison_key` keeps out of a bucket and `_rubric_profile` keeps out of
+    a block -- here on the PRIMARY channel, which is the one a reader ranks on.
+
+    Deliberately OPPOSITE verdicts. Two generations that agree pool into a
+    number that happens to be right, so a pooled matrix only shows itself when
+    they disagree -- and 1-1 over 2 comparisons is exactly the 50% a reader
+    would take for a real dead heat.
+    """
+    other = "openai.gpt-5.6-luna"
+    judgments = [
+        _vote("run-a", "run-b", "a", vote_index=0),
+        _vote("run-a", "run-b", "b", vote_index=0, judge_model_id=other),
+    ]
+
+    summary = summarize(judgments, MODEL_OF)
+
+    assert set(summary["comparisons"]) == {_judge_gen(), _judge_gen(other)}
+    pair = ("model-one", "model-two")
+    sol = summary["comparisons"][_judge_gen()][pair]
+    luna = summary["comparisons"][_judge_gen(other)][pair]
+    # One comparison each, not two in one row: the counts are not blended.
+    assert sol["comparisons"] == luna["comparisons"] == 1
+    assert (sol["wins_x"], sol["wins_y"], sol["ties"]) == (1, 0, 0)
+    assert (luna["wins_x"], luna["wins_y"], luna["ties"]) == (0, 1, 0)
+    assert (sol["win_rate_x"], sol["win_rate_y"]) == (1.0, 0.0)
+    assert (luna["win_rate_x"], luna["win_rate_y"]) == (0.0, 1.0)
+
+    # Two Elo tables, each over its own oracle's comparisons. Pooled, the two
+    # opposite results cancel to the base and the table prints a dead heat
+    # neither judge reported.
+    assert set(summary["elo"]) == {_judge_gen(), _judge_gen(other)}
+    sol_elo = summary["elo"][_judge_gen()]
+    luna_elo = summary["elo"][_judge_gen(other)]
+    assert sol_elo["model-one"] > sol_elo["model-two"]
+    assert luna_elo["model-two"] > luna_elo["model-one"]
+
+
+def test_a_bumped_prompt_or_rubric_version_also_opens_its_own_matrix_block():
+    """The whole generation key partitions, not just the model id. A verdict is
+    reproducible against the model that gave it, the prompt text it saw AND the
+    rubric it was scored under -- `_resume_key` treats a change to any of the
+    three as new work, so the matrix has to treat it as a new reading."""
+    judgments = [
+        _vote("run-a", "run-b", "a", vote_index=0),
+        _vote("run-a", "run-b", "a", vote_index=0, judge_prompt_version=99),
+        _vote("run-a", "run-b", "a", vote_index=0, rubric_version="99"),
+    ]
+
+    summary = summarize(judgments, MODEL_OF)
+
+    assert set(summary["comparisons"]) == {
+        _judge_gen(),
+        _judge_gen(prompt_version=99),
+        _judge_gen(rubric_version="99"),
+    }
+    assert set(summary["elo"]) == set(summary["comparisons"])
+    for block in summary["comparisons"].values():
+        assert block[("model-one", "model-two")]["comparisons"] == 1
+
+
+def test_the_comparison_key_carries_the_generation_the_matrix_partitions_on():
+    """The matrix reads the generation back off the tail of a
+    `_comparison_key`. Two independent derivations of "which oracle is this"
+    would drift, and the drift is silent: the buckets stay apart while the
+    blocks they are printed in pool."""
+    vote = _vote("run-a", "run-b", "a", vote_index=0,
+                 judge_model_id="openai.gpt-5.6-luna")
+
+    assert _generation_of(_comparison_key(vote)) == _judge_generation(vote)
+    assert _judge_generation(vote) == _judge_gen("openai.gpt-5.6-luna")
 
 
 def test_rubric_profile_reports_per_dimension_means_and_never_a_sum():
@@ -1569,11 +1660,12 @@ def test_the_matrix_reports_each_arms_rate_under_its_own_name():
 
     summary = summarize(judgments, model_of)
 
-    row = summary["comparisons"][("alpha-model", "zeta-model")]
+    row = summary["comparisons"][_judge_gen()][("alpha-model", "zeta-model")]
     assert (row["wins_x"], row["wins_y"], row["ties"]) == (0, 1, 0)
     assert row["win_rate_x"] == 0.0
     assert row["win_rate_y"] == 1.0
-    assert summary["elo"]["zeta-model"] > summary["elo"]["alpha-model"]
+    elo = summary["elo"][_judge_gen()]
+    assert elo["zeta-model"] > elo["alpha-model"]
 
 
 def test_elo_refuses_a_score_that_is_not_a_win_a_loss_or_a_tie():
@@ -1596,9 +1688,10 @@ def test_elo_follows_the_win_rates_rather_than_leading_them():
 
     summary = summarize(judgments, MODEL_OF)
 
-    row = summary["comparisons"][("model-one", "model-two")]
+    row = summary["comparisons"][_judge_gen()][("model-one", "model-two")]
     assert row["win_rate_x"] > row["win_rate_y"]
-    assert summary["elo"]["model-one"] > summary["elo"]["model-two"]
+    elo = summary["elo"][_judge_gen()]
+    assert elo["model-one"] > elo["model-two"]
 
 
 def test_a_comparison_whose_arms_cannot_be_named_is_dropped_and_counted():
@@ -1614,7 +1707,9 @@ def test_a_comparison_whose_arms_cannot_be_named_is_dropped_and_counted():
 
     summary = summarize(judgments, MODEL_OF)
 
-    assert set(summary["comparisons"]) == {("model-one", "model-two")}
+    assert set(summary["comparisons"][_judge_gen()]) == {
+        ("model-one", "model-two")
+    }
     assert summary["dropped"]["unknown_model_comparison"] == 1
     assert summary["dropped"]["unknown_model_rubric"] == 1
     assert summary["rubric_profile"] == {}
@@ -1666,9 +1761,9 @@ def test_a_judgment_naming_a_run_this_log_never_held_does_not_stop_the_batch(
 
     assert result["errors"] == []
     assert result["summary"]["dropped"]["unknown_model_comparison"] == 1
-    assert result["summary"]["comparisons"][("model-one", "model-two")][
-        "comparisons"
-    ] == 1
+    assert result["summary"]["comparisons"][_judge_gen()][
+        ("model-one", "model-two")
+    ]["comparisons"] == 1
 
 
 def test_a_pairwise_line_with_an_unreadable_verdict_is_counted_not_raised():
@@ -1685,7 +1780,7 @@ def test_a_pairwise_line_with_an_unreadable_verdict_is_counted_not_raised():
 
     assert summary["dropped"]["unreadable_verdict"] == 1
     assert summary["dropped"]["unreadable_kind"] == 1
-    assert summary["comparisons"][("model-one", "model-two")][
+    assert summary["comparisons"][_judge_gen()][("model-one", "model-two")][
         "comparisons"
     ] == 1
 
@@ -1848,6 +1943,36 @@ def test_the_printed_profile_carries_each_dimension_count_beside_its_mean(
     assert "n=1" in partial
 
 
+def test_the_printed_matrix_and_elo_table_name_the_generation_over_each_block(
+    capsys,
+):
+    """A block that does not name its oracle is one the reader pools in their
+    head, which is the same wrong number the arithmetic was just stopped from
+    producing. Two generations, two matrix blocks, two Elo tables, each headed
+    by the judge that produced it.
+    """
+    other = "openai.gpt-5.6-luna"
+    result = _empty_result()
+    result["summary"] = summarize(
+        [
+            _vote("run-a", "run-b", "a", vote_index=0),
+            _vote("run-a", "run-b", "b", vote_index=0, judge_model_id=other),
+        ],
+        MODEL_OF,
+    )
+
+    print_summary(result)
+
+    out = capsys.readouterr().out
+    # Once over the matrix block and once over the Elo table, per generation.
+    assert out.count(f"judge {JUDGE_MODEL_ID_DEFAULT},") == 2
+    assert out.count(f"judge {other},") == 2
+    assert out.count("model-one vs model-two") == 2
+    # The pooled shape this partition exists to prevent: one row saying 1-1
+    # over two comparisons, which reads as a dead heat neither judge reported.
+    assert "over 2 comparison(s)" not in out
+
+
 def test_the_summary_mentions_a_superseded_gate_decided_line_when_there_is_one(
     capsys,
 ):
@@ -1892,7 +2017,7 @@ def test_summary_covers_the_campaign_not_the_invocation(tmp_path, capsys):
         "rubric": 2, "pairwise_votes": 1, "gate_decided": 0,
     }
     # The comparison the FIRST invocation judged is still in the matrix.
-    assert summary["comparisons"][("model-one", "model-two")][
+    assert summary["comparisons"][_judge_gen()][("model-one", "model-two")][
         "comparisons"
     ] == 1
     assert set(summary["rubric_profile"]) == {
@@ -1922,7 +2047,9 @@ def test_the_summary_names_arms_for_runs_this_invocation_never_read(tmp_path):
     )
     second = _run(root, rubric=False, votes=1)
 
-    row = second["summary"]["comparisons"][("model-one", "model-two")]
+    row = second["summary"]["comparisons"][_judge_gen()][
+        ("model-one", "model-two")
+    ]
     assert row["comparisons"] == 1
     assert second["summary"]["dropped"]["unknown_model_comparison"] == 0
 

@@ -60,10 +60,15 @@ THE SUMMARY IS A PRINTOUT, NOT A STORED SCORE
 ---------------------------------------------
 
 `summarize` reads the judgment file back and says what it holds: a pairwise
-win-rate matrix per model pair (primary), a rubric PROFILE per model and judge
-generation (diagnostic -- per-dimension means with the count each was taken
-over, plus flag rates; never summed, never joined to `resolved`), and an Elo
-table that FOLLOWS the win rates rather than adjudicating them. Nothing it computes is written anywhere, on `grade.py
+win-rate matrix per model pair (primary), a rubric PROFILE per model
+(diagnostic -- per-dimension means with the count each was taken over, plus
+flag rates; never summed, never joined to `resolved`), and an Elo table that
+FOLLOWS the win rates rather than adjudicating them. All three are partitioned
+by JUDGE GENERATION -- `(judge_model_id, judge_prompt_version,
+rubric_version)` -- and never pooled across one: a re-judge under a second
+oracle is a second reading of the same collection, so pooling it would double
+every comparison count and report each rate as the mean of two verdicts nobody
+gave together. Nothing it computes is written anywhere, on `grade.py
 summarize`'s precedent and for a sharper reason: a stored Elo is a published
 number, and §4.3 forbids publishing one without the κ that was in force.
 
@@ -876,6 +881,46 @@ def _named(values: list[str]) -> str:
     return ", ".join(values[:_MAX_NAMED]) + f", and {rest} more"
 
 
+def _judge_generation(judgment: JudgeRecord) -> tuple:
+    """WHICH ORACLE said it: judge model, prompt version, rubric version.
+
+    ONE derivation, read by `_comparison_key`, by the win-rate matrix, by the
+    Elo tables and by `_rubric_profile`. Two copies of "which oracle is this"
+    drift silently and in the worst direction: the comparison buckets stay
+    apart while the blocks they are reported in pool, so the file is right and
+    the printout -- the only place a reader meets these numbers -- is wrong.
+
+    A verdict is reproducible against the model that gave it, the prompt text
+    it saw and the rubric it was scored under. `_resume_key` treats a change to
+    any of the three as new work rather than a resume, which is what puts two
+    generations in one append-only file in the first place; everything that
+    aggregates that file has to treat them as two readings of one collection,
+    never as more comparisons of it.
+    """
+    return (
+        judgment.judge_model_id,
+        judgment.judge_prompt_version,
+        judgment.rubric_version,
+    )
+
+
+#: How many trailing elements of a `_comparison_key` name the generation.
+#: `_comparison_key` APPENDS `_judge_generation`'s tuple and the matrix walk
+#: slices it back off, so one constant holds both halves of that layout
+#: together -- a hand-counted `[-3:]` beside a four-field generation would
+#: partition on a slice of one, which is a pooling nothing would report.
+_GENERATION_FIELDS = 3
+
+
+def _generation_of(key: tuple) -> tuple:
+    """The generation back out of a `_comparison_key` -- its last elements.
+
+    The inverse of the append in `_comparison_key`, and pinned as such by
+    `test_the_comparison_key_carries_the_generation_the_matrix_partitions_on`.
+    """
+    return key[-_GENERATION_FIELDS:]
+
+
 def _comparison_key(judgment: JudgeRecord) -> tuple:
     """One COMPARISON: this pair, at this sample, under one judge generation.
 
@@ -889,16 +934,15 @@ def _comparison_key(judgment: JudgeRecord) -> tuple:
     The three version fields stay, for `_resume_key`'s reason. A re-judge under
     a new prompt is a new generation of verdict, and pooling two generations
     into one comparison would average a disagreement the file exists to keep.
+    They go LAST and as one appended tuple, because the matrix walk slices them
+    back off with `_generation_of` to partition its blocks.
     """
     return (
         judgment.task_id,
         judgment.sample_index,
         judgment.run_id_a,
         judgment.run_id_b,
-        judgment.judge_model_id,
-        judgment.judge_prompt_version,
-        judgment.rubric_version,
-    )
+    ) + _judge_generation(judgment)
 
 
 def _deterministic(keys) -> list:
@@ -991,6 +1035,15 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
        thing the judge said, and every rate off that denominator is wrong by
        however many pairs the ladder settled. It gets its own count in `lines`,
        and its own column in each matrix row.
+    4. **Two judge generations are never pooled.** `comparisons` and `elo` are
+       keyed on `_judge_generation` first and the model pair second, so
+       `--judge-model openai.gpt-5.6-luna` over an already-judged collection
+       produces a SECOND matrix block and a SECOND Elo table rather than twice
+       as many comparisons in the first. Pooled, every pair enters the primary
+       report twice, the comparison count doubles, and each rate is the mean of
+       two oracles nobody asked for a joint opinion -- silently, and with the
+       right shape. This is `_comparison_key`'s partition and
+       `_rubric_profile`'s, carried into the report they feed.
 
     A gate-decided comparison IS a win for `gate_decided_by`'s side in the win
     rates and in Elo -- the objective result settled it, which is a result about
@@ -1049,8 +1102,11 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
         )
 
     superseded = 0
-    outcomes: list[tuple[str, str, float]] = []
-    pairs: dict[tuple[str, str], dict[str, int]] = {}
+    # Rule 4: keyed on the generation FIRST. Both walks below stay inside one
+    # oracle's verdicts, so neither a comparison count nor an Elo update can
+    # cross from one generation into another's numbers.
+    outcomes: dict[tuple, list[tuple[str, str, float]]] = {}
+    pairs: dict[tuple, dict[tuple[str, str], dict[str, int]]] = {}
 
     for key in _deterministic(set(votes_by) | set(gate_by)):
         vote_lines = votes_by.get(key)
@@ -1078,15 +1134,18 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
             dropped["same_model_comparison"] += 1
             continue
 
+        generation = _generation_of(key)
         score_a = {"a": 1.0, "b": 0.0}.get(winner, 0.5)
-        outcomes.append((model_a, model_b, score_a))
+        outcomes.setdefault(generation, []).append(
+            (model_a, model_b, score_a)
+        )
 
         # The matrix is keyed on the two model names SORTED, so `(x, y)` and
         # `(y, x)` are one row -- the same reason `run_id_a`/`run_id_b` are
-        # canonical on the record.
+        # canonical on the record. Inside ONE generation's block: see rule 4.
         model_x, model_y = sorted((model_a, model_b))
         score_x = score_a if model_x == model_a else 1.0 - score_a
-        row = pairs.setdefault(
+        row = pairs.setdefault(generation, {}).setdefault(
             (model_x, model_y),
             {"voted": 0, "gate_decided": 0, "wins_x": 0, "wins_y": 0,
              "ties": 0},
@@ -1099,18 +1158,22 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
         else:
             row["ties"] += 1
 
-    comparisons: dict[tuple[str, str], dict] = {}
-    for pair in sorted(pairs):
-        row = pairs[pair]
-        total = row["voted"] + row["gate_decided"]
-        comparisons[pair] = {
-            **row,
-            "comparisons": total,
-            # A tie is half a point to each, exactly as it is to Elo. The two
-            # have to agree or the table and the matrix rank differently.
-            "win_rate_x": (row["wins_x"] + 0.5 * row["ties"]) / total,
-            "win_rate_y": (row["wins_y"] + 0.5 * row["ties"]) / total,
-        }
+    comparisons: dict[tuple, dict[tuple[str, str], dict]] = {}
+    for generation in sorted(pairs):
+        block: dict[tuple[str, str], dict] = {}
+        for pair in sorted(pairs[generation]):
+            row = pairs[generation][pair]
+            total = row["voted"] + row["gate_decided"]
+            block[pair] = {
+                **row,
+                "comparisons": total,
+                # A tie is half a point to each, exactly as it is to Elo. The
+                # two have to agree or the table and the matrix rank
+                # differently.
+                "win_rate_x": (row["wins_x"] + 0.5 * row["ties"]) / total,
+                "win_rate_y": (row["wins_y"] + 0.5 * row["ties"]) / total,
+            }
+        comparisons[generation] = block
 
     return {
         "lines": {
@@ -1121,7 +1184,14 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
         "vote_verdicts": dict(sorted(vote_verdicts.items())),
         "comparisons": comparisons,
         "rubric_profile": _rubric_profile(rubric_lines, model_of, dropped),
-        "elo": elo_from_outcomes(outcomes),
+        # One table per generation, for rule 4's reason. Elo is path-dependent
+        # as well as pooled -- two oracles' opposite verdicts about one pair
+        # cancel back to the base and print a dead heat neither of them
+        # reported.
+        "elo": {
+            generation: elo_from_outcomes(rows)
+            for generation, rows in sorted(outcomes.items())
+        },
         "superseded_gate_decided": superseded,
         "dropped": dropped,
     }
@@ -1186,9 +1256,7 @@ def _rubric_profile(rubric_lines: list[JudgeRecord],
             dropped["unknown_model_rubric"] += 1
             continue
         by_key.setdefault(
-            (model, judgment.judge_model_id, judgment.judge_prompt_version,
-             judgment.rubric_version),
-            [],
+            (model,) + _judge_generation(judgment), []
         ).append(judgment)
 
     profile: dict[tuple, dict] = {}
@@ -1291,6 +1359,22 @@ def print_summary(result: dict) -> None:
         )
 
 
+def _generation_label(generation: tuple) -> str:
+    """One judge generation, said the same way over every block that has one.
+
+    `(judge_model_id, judge_prompt_version, rubric_version)` -- the three
+    fields `_comparison_key` and `_rubric_profile` partition on, and therefore
+    the three a reader needs in order to know which two blocks are comparable.
+    One phrasing across the matrix, the profile and the Elo tables, because
+    three spellings of one generation read as three generations.
+    """
+    judge_model_id, prompt_version, rubric_version = generation
+    return (
+        f"judge {judge_model_id}, prompt v{prompt_version}, "
+        f"rubric {rubric_version}"
+    )
+
+
 def _print_reading(result: dict) -> None:
     """Every number, in the report's order of authority.
 
@@ -1325,19 +1409,28 @@ def _print_reading(result: dict) -> None:
     print(
         "\npairwise win rates over COMPARISONS, not votes -- three votes are "
         "one comparison, a tie is half a point, and a gate-decided pair is a "
-        "win for the side the ladder picked"
+        "win for the side the ladder picked. ONE BLOCK PER JUDGE "
+        "GENERATION: a re-judge under a second oracle is a second reading "
+        "of this collection, never more comparisons of it"
     )
-    for (model_x, model_y), row in sorted(summary["comparisons"].items()):
-        print(f"  {model_x} vs {model_y}")
-        print(
-            f"    {row['wins_x']}-{row['wins_y']}-{row['ties']} "
-            f"(W-L-T for {model_x}) over {row['comparisons']} comparison(s): "
-            f"{model_x} {row['win_rate_x']:.1%} / "
-            f"{model_y} {row['win_rate_y']:.1%}"
-        )
-        print(
-            f"    {row['voted']} judged, {row['gate_decided']} gate-decided"
-        )
+    for generation, block in sorted(summary["comparisons"].items()):
+        # The generation is named above every block for `_rubric_profile`'s
+        # reason. A block that does not name its oracle is one the reader
+        # pools in their head, which is the same wrong number the partition
+        # just kept out of the arithmetic.
+        print(f"  {_generation_label(generation)}")
+        for (model_x, model_y), row in sorted(block.items()):
+            print(f"    {model_x} vs {model_y}")
+            print(
+                f"      {row['wins_x']}-{row['wins_y']}-{row['ties']} "
+                f"(W-L-T for {model_x}) over {row['comparisons']} "
+                f"comparison(s): {model_x} {row['win_rate_x']:.1%} / "
+                f"{model_y} {row['win_rate_y']:.1%}"
+            )
+            print(
+                f"      {row['voted']} judged, "
+                f"{row['gate_decided']} gate-decided"
+            )
 
     print(
         "\nrubric profile per model and judge generation -- diagnostic, never "
@@ -1346,12 +1439,11 @@ def _print_reading(result: dict) -> None:
         "that name"
     )
     for key, row in sorted(summary["rubric_profile"].items()):
-        model, judge_model_id, prompt_version, rubric_version = key
         # The generation is named beside every block, never folded into one.
         # Two rubric versions disagreeing about one arm is the finding.
         print(
-            f"  {model}  ({row['runs']} run(s); judge {judge_model_id}, "
-            f"prompt v{prompt_version}, rubric {rubric_version})"
+            f"  {key[0]}  ({row['runs']} run(s); "
+            f"{_generation_label(_generation_of(key))})"
         )
         # One column width across both blocks, wide enough for the longest
         # label either can produce, so the means and the rates line up under
@@ -1363,12 +1455,18 @@ def _print_reading(result: dict) -> None:
 
     print(
         f"\nElo -- DESCRIPTIVE, it follows the win rates above rather than "
-        f"adjudicating them (K={ELO_K:g}, base {ELO_BASE:g})"
+        f"adjudicating them (K={ELO_K:g}, base {ELO_BASE:g}). ONE TABLE PER "
+        f"JUDGE GENERATION, for the matrix's reason and one of its own: "
+        f"Elo is path-dependent, so two oracles' opposite verdicts about "
+        f"one pair cancel back to the base and print a dead heat neither "
+        f"of them reported"
     )
-    for model, rating in sorted(
-        summary["elo"].items(), key=lambda item: (-item[1], item[0])
-    ):
-        print(f"  {model:24} {rating:8.1f}")
+    for generation, ratings in sorted(summary["elo"].items()):
+        print(f"  {_generation_label(generation)}")
+        for model, rating in sorted(
+            ratings.items(), key=lambda item: (-item[1], item[0])
+        ):
+            print(f"    {model:24} {rating:8.1f}")
 
     if summary["superseded_gate_decided"]:
         print(
