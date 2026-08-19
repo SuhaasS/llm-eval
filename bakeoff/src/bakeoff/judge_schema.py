@@ -57,7 +57,10 @@ judge inputs are logged, a re-judge is a re-score, not a re-run*. The tokens for
 the original run are already spent, so a verdict whose input cannot be
 reconstructed forces a re-collection to re-score. It is stored gzipped beside
 the jsonl rather than inline because payloads carry two full diffs and would
-otherwise dominate the line file.
+otherwise dominate the line file, and it is NAMED RELATIVELY -- an absolute
+path is a fact about the machine that judged, so it breaks every line in the
+file the first time the collection is moved or copied, which is the same loss
+as no payload at all arriving silently and late.
 
 Judgments are APPEND-ONLY. There is no update and no delete, for the reason the
 event log and the grade file have none: a re-judge under a different model,
@@ -135,12 +138,104 @@ def _payload_strings(value: Any) -> Iterator[str]:
 class PayloadSecretsFound(RuntimeError):
     """A judge payload matched a secret pattern and was not written.
 
-    Raised BEFORE any file exists, tmp included. The payload carries the
-    repository source the model was shown, so it is the same exposure spec
+    Raised BEFORE any file exists, tmp included, and -- from `bakeoff.judge` --
+    before the payload is rendered into a prompt at all. The payload carries
+    the repository source the model was shown, so it is the same exposure spec
     section 6.2 has wire logs scanned for; refusing after the temporary file
     landed would leave the secret on disk under a name nothing later reads or
-    cleans up, losing the judgment and keeping the secret.
+    cleans up, losing the judgment and keeping the secret, and refusing after
+    the call would leave the disk clean and the credential already sent.
     """
+
+
+def scan_payload(payload: dict[str, Any]) -> set[str]:
+    """Every secret pattern this payload matches. An empty set means clean.
+
+    PUBLIC and extracted out of `write_payload`, because the scan has two
+    callers whose stakes are different and only one of them is about the disk.
+    `bakeoff.judge` runs it the moment a payload is built -- before the prompt
+    is rendered and before the paid third-party call -- so a payload carrying a
+    credential is refused at the WIRE. The write-time call is the backstop
+    behind that one: whichever layer a later caller bypasses, the other still
+    refuses, and neither is the only one.
+
+    TWO SCANS over one payload, and the raw walk is the PRIMARY.
+    `scanners._SECRET_PATTERNS["generic_api_key"]` requires the value to follow
+    ``[:=]\\s*['"]?`` immediately, and serialising puts a backslash in between:
+    measured, a candidate diff line reading ``+api_key = "sk-live-…"`` -- the
+    commonest shape there is -- scans clean as canonical JSON and dirty as the
+    raw string it came from. The canonical scan is kept as a backstop against
+    `_payload_strings` drifting out of step with what is actually serialised,
+    which is a silent divergence in the failing-open direction, and it costs
+    one pass over bytes this function was going to see anyway.
+
+    Returns rather than raises, so the two callers can word their own refusal:
+    one of them has a judgment id and a file it did not write, the other has a
+    call it did not make.
+    """
+    found: set[str] = set()
+    for text in _payload_strings(payload):
+        found.update(scan_secrets(text))
+    found.update(scan_secrets(json.dumps(payload, sort_keys=True)))
+    return found
+
+
+#: The one directory name payloads live under, relative to the judgments
+#: directory. `scripts/judge.py`'s `payloads_root` joins the same name onto the
+#: collection root, and the driver asserts the two agree on every line it
+#: writes -- two copies of this string is how a renamed directory becomes a
+#: file of verdicts naming inputs nobody can find.
+_PAYLOADS_DIRNAME = "payloads"
+
+
+def payload_relative_path(judgment_id: str) -> str:
+    """`payloads/<judgment_id>.json.gz` -- what a judgment line STORES.
+
+    Relative to the judgments directory, never absolute, and that is the whole
+    of it: an absolute path records where the collection sat on the machine
+    that judged it, which is a fact about that machine rather than about the
+    verdict. `mv` on the collection, a copy to another host, or a container
+    mount at a different root then turns every line in the file into a verdict
+    naming an input nobody can read. Section 4.3 says a re-judge is a re-score
+    rather than a re-run BECAUSE the full inputs were logged, so a path that
+    resolves in one place and nowhere else is the same loss as a missing
+    payload -- arriving silently, and long after the tokens were spent.
+
+    Derived from the judgment id rather than from the path `write_payload`
+    returned, so it is a claim about where the payload BELONGS. The driver
+    checks that claim against what was actually written, once, per line.
+    """
+    return f"{_PAYLOADS_DIRNAME}/{judgment_id}.json.gz"
+
+
+def resolve_payload_path(
+    judgments_dir: Path | str, stored: str | Path
+) -> Path:
+    """The file a stored value names: relative joined, absolute passed through.
+
+    Both generations are real and neither may be guessed at. Lines written from
+    now on carry `payloads/<judgment_id>.json.gz` and resolve against whatever
+    directory the judgment file is being read from, which is what makes a moved
+    collection readable at all. Lines written BEFORE the change carry the
+    absolute path of a directory that may or may not still exist, and
+    rewriting them is not on the table -- judgments are append-only, and a
+    reader that "fixed" one would be editing the evidence the payload sha
+    exists to protect. So an absolute value is returned unchanged and fails, if
+    it fails, as the missing file it actually is.
+
+    The value itself says which it is, which is why this needed no schema bump:
+    `Path.is_absolute()` answers it for everything either generation can hold,
+    and a version flag would have to be trusted where the path can simply be
+    read.
+
+    The branch is written out even though `Path.__truediv__` already discards
+    its left operand when the right one is absolute, so the join alone would
+    behave identically here. Resting the older generation's whole read path on
+    that operator edge case is the kind of thing a later reader "simplifies"
+    without knowing it was doing two jobs; the `if` says which two.
+    """
+    stored = Path(stored)
+    return stored if stored.is_absolute() else Path(judgments_dir) / stored
 
 
 @dataclass(frozen=True)
@@ -220,8 +315,14 @@ class JudgeRecord:
     # human, and it is what a disputed kappa is re-examined against.
     full_reasoning_text: str = ""
     # The gzipped payload beside the jsonl, and the sha256 of its UNCOMPRESSED
-    # canonical JSON. Required for every verdict a model produced; `None`
-    # together on a gate-decided pair.
+    # canonical JSON. The path is RELATIVE to the judgments directory --
+    # `payloads/<judgment_id>.json.gz`, see `payload_relative_path` -- so a
+    # collection that is moved, copied or mounted at another root still
+    # resolves its own inputs. Lines written before that change carry an
+    # absolute path forever, because the file is append-only; every reader goes
+    # through `resolve_payload_path`, which reads the value to tell the two
+    # apart. Required for every verdict a model produced; `None` together on a
+    # gate-decided pair.
     input_payload_path: str | None = None
     input_payload_sha: str | None = None
     # `run_id -> grader_version`. A verdict names the grade generation it was
@@ -322,37 +423,39 @@ def write_payload(
 ) -> tuple[str, str]:
     """Store one judge payload gzipped. Returns `(path, sha256_hex)`.
 
+    The returned path is ABSOLUTE whenever `payloads_dir` is, and it is not
+    what a judgment line stores: `payload_relative_path` is, and the driver
+    checks the two against each other. See that function for why.
+
     Order is the contract, and each step is placed against a specific failure:
 
-    1. Canonicalise with `sort_keys=True`. The same payload assembled in a
+    1. Scan for secrets (`scan_payload`, both directions) and raise
+       `PayloadSecretsFound` BEFORE anything is created. This is the BACKSTOP
+       scan -- `bakeoff.judge` runs the same one on the payload it just built,
+       in front of the model call -- and it is kept here because this function
+       is what any later caller reaches for, and a payload that arrives from
+       one of those has been scanned by nobody.
+    2. Canonicalise with `sort_keys=True`. The same payload assembled in a
        different dict order must produce the same bytes, or the sha stops
        identifying the payload and starts identifying the assembly.
-    2. Scan for secrets TWICE -- once over each raw string in the payload, once
-       over the canonical text -- and raise `PayloadSecretsFound` BEFORE
-       anything is created. The payload carries the repository source shown to
-       a third-party model.
-
-       Two scans because JSON escaping disarms the quote-anchored patterns.
-       `scanners._SECRET_PATTERNS["generic_api_key"]` requires the value to
-       follow ``[:=]\\s*['"]?`` immediately, and serialising puts a backslash in
-       between: measured, a candidate diff line reading
-       ``+api_key = "sk-live-…"`` -- the commonest shape there is -- scans clean
-       as canonical JSON and dirty as the raw string it came from. Scanning the
-       raw strings is therefore the primary check, not a refinement of the
-       canonical one. The canonical scan is kept as a backstop against
-       `_payload_strings` drifting out of step with what is actually
-       serialised, which is a silent divergence in the failing-open direction,
-       and it costs one pass over bytes already in hand.
     3. sha256 the UNCOMPRESSED canonical bytes, never the archive. A digest over
        the compressed form would move with the zlib level or a gzip header
        change, and a verdict whose recorded input digest no longer matches its
        own input is indistinguishable from a tampered one.
-    4. Write to `<judgment_id>.json.gz.tmp` and `os.replace` into place. The
-       rename is atomic, so a killed batch leaves either a whole payload or no
-       payload -- a torn gzip beside an already-written jsonl line is a verdict
-       that names an input nobody can read, which breaks "a re-judge is a
-       re-score, not a re-run" (section 4.3) exactly as a missing payload does,
-       while looking like a present one.
+    4. Write to `<judgment_id>.json.gz.tmp`, `os.replace` into place, and fsync
+       the DIRECTORY. The rename is atomic, so a killed batch leaves either a
+       whole payload or no payload -- a torn gzip beside an already-written
+       jsonl line is a verdict that names an input nobody can read, which
+       breaks "a re-judge is a re-score, not a re-run" (section 4.3) exactly as
+       a missing payload does, while looking like a present one. The directory
+       fsync closes the window the rename alone leaves open; see
+       `_fsync_directory`.
+    5. On ANY failure, unlink the temporary file and re-raise. `BaseException`
+       and not `Exception`, because the likeliest way a judging pass dies
+       mid-write is an operator's Ctrl-C. Left behind, a `.tmp` is debris no
+       reader looks for and no pass cleans up, and it accumulates fastest on
+       the disk that can least afford it: a full disk fails every write, so the
+       pass failing for want of space was also the one consuming it.
 
     `mtime=0` and `filename=""` are both required for the archive to be a
     function of the payload alone. Left to itself, `GzipFile` stamps the current
@@ -362,31 +465,65 @@ def write_payload(
     surfaces as an error; both surface as two archives of one payload that no
     longer compare equal.
     """
-    canonical = json.dumps(payload, sort_keys=True).encode()
-
-    found: set[str] = set()
-    for text in _payload_strings(payload):
-        found.update(scan_secrets(text))
-    found.update(scan_secrets(canonical.decode()))
+    found = scan_payload(payload)
     if found:
         raise PayloadSecretsFound(
             f"judge payload for {judgment_id} matched {', '.join(sorted(found))}; "
             "not written"
         )
 
+    canonical = json.dumps(payload, sort_keys=True).encode()
     sha = hashlib.sha256(canonical).hexdigest()
 
     payloads_dir = Path(payloads_dir)
     payloads_dir.mkdir(parents=True, exist_ok=True)
     final = payloads_dir / f"{judgment_id}.json.gz"
     tmp = payloads_dir / f"{judgment_id}.json.gz.tmp"
-    with open(tmp, "wb") as raw:
-        with gzip.GzipFile(filename="", fileobj=raw, mode="wb", mtime=0) as gz:
-            gz.write(canonical)
-        raw.flush()
-        os.fsync(raw.fileno())
-    os.replace(tmp, final)
+    try:
+        with open(tmp, "wb") as raw:
+            with gzip.GzipFile(
+                filename="", fileobj=raw, mode="wb", mtime=0
+            ) as gz:
+                gz.write(canonical)
+            raw.flush()
+            os.fsync(raw.fileno())
+        os.replace(tmp, final)
+        _fsync_directory(payloads_dir)
+    except BaseException:
+        # `missing_ok` because the rename may already have consumed it: a
+        # failure in the fsync below the replace leaves nothing at this name,
+        # and an unlink that raised there would replace the real error with a
+        # FileNotFoundError about a file whose absence is the correct state.
+        tmp.unlink(missing_ok=True)
+        raise
     return str(final), sha
+
+
+def _fsync_directory(path: Path) -> None:
+    """Make the RENAME durable, not just the bytes it renamed.
+
+    `os.fsync` on the payload's own handle commits its CONTENT. The directory
+    entry that gives it its final name is a separate write, and on a power loss
+    between the two the payload exists under no name at all while the jsonl
+    line naming it is already on disk -- `append_judgment` fsyncs per line, so
+    the verdict is the durable half. That is precisely the "line naming an
+    input nobody can read" case section 4.3 rules out, reached by the one route
+    the atomic rename does not close.
+
+    A failure here is REAL and propagates: the rename may not have reached the
+    disk, so the honest answer is to refuse the payload. The caller then writes
+    no line and the unit is retried on the next pass, which is the same
+    fail-safe direction every other step here takes.
+
+    POSIX only -- opening a directory read-only is not portable to Windows, and
+    neither is the rest of this harness (docker, `os.fsync` per grade line, the
+    container mounts).
+    """
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def read_payload(path: str | Path) -> dict[str, Any]:

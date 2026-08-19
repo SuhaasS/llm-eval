@@ -21,6 +21,16 @@ identical bytes. The second assertion is what catches gzip's two nondeterminism
 sources -- the mtime in the header and the FNAME the header picks up off the
 file handle -- neither of which shows up as an error, only as two artifacts of
 one payload that no longer compare equal.
+
+The store's other two promises are about what happens when the write does NOT
+succeed, and where the file is afterwards findable. A failed write leaves no
+`.tmp` behind on any path, `BaseException` included, because the disk that
+fails these writes is usually the full one and the debris was accumulating
+fastest exactly there. And what a line stores is a path RELATIVE to the
+judgments directory, so `mv` on a collection does not turn every verdict in it
+into one naming an input nobody can read -- with absolute values from older
+lines still resolving, because an append-only file keeps both generations
+forever.
 """
 
 from __future__ import annotations
@@ -28,17 +38,22 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
 
+import bakeoff.judge_schema as judge_schema
 from bakeoff.judge_schema import (
     JUDGE_SCHEMA_VERSION,
     JudgeRecord,
     PayloadSecretsFound,
     append_judgment,
     load_judgments,
+    payload_relative_path,
     read_payload,
+    resolve_payload_path,
+    scan_payload,
     write_payload,
 )
 from bakeoff.scanners import scan_secrets
@@ -52,6 +67,11 @@ FAKE_AWS_KEY = "AKIAIOSFODNN7EXAMPLE"
 # Python source and the one JSON escaping hides. `generic_api_key` anchors on
 # the quote immediately after `=`, and serialising puts a backslash there.
 DOUBLE_QUOTED_SECRET_LINE = '+api_key = "sk-live-abcdefghijklmnopqrstuv"\n'
+
+# The same shape sitting on the LEFT of the colon. A payload is assembled from
+# records, and a dict keyed by an environment variable name is a shape the
+# builder is free to produce.
+DOUBLE_QUOTED_SECRET_KEY = 'api_key = "sk-live-abcdefghijklmnopqrstuv"'
 
 
 def _common(**kw) -> dict:
@@ -292,6 +312,143 @@ def test_a_double_quoted_secret_is_refused_though_json_escaping_hides_it(
 
     assert "generic_api_key" in str(excinfo.value)
     assert list(payloads.iterdir()) == []
+
+
+def test_a_secret_sitting_in_a_dict_key_refuses_the_write(tmp_path: Path):
+    """The raw walk reads KEYS as well as values, and the backstop cannot.
+
+    A secret does not stop being one for sitting on the left of the colon, and
+    a payload keyed by an environment variable name is a shape the builder is
+    free to produce. This is the case that proves the two scans are not
+    interchangeable: the canonical scan is asserted CLEAN over the same payload
+    here -- `json.dumps` escapes the quote `generic_api_key` anchors on,
+    whichever side of the colon it sits -- so a `write_payload` that had kept
+    only the serialization scan would have written this key to disk unflagged.
+    """
+    payloads = tmp_path / "payloads"
+    payloads.mkdir()
+    payload = {"env": {DOUBLE_QUOTED_SECRET_KEY: "1"}}
+
+    assert scan_secrets(DOUBLE_QUOTED_SECRET_KEY) == ["generic_api_key"]
+    assert scan_secrets(json.dumps(payload, sort_keys=True)) == []
+    assert scan_payload(payload) == {"generic_api_key"}
+
+    with pytest.raises(PayloadSecretsFound) as excinfo:
+        write_payload(payloads, "j-key", payload)
+
+    assert "generic_api_key" in str(excinfo.value)
+    assert list(payloads.iterdir()) == []
+
+
+def test_a_failed_payload_write_leaves_no_tmp_file_behind(
+    tmp_path: Path, monkeypatch
+):
+    """A write that dies mid-flight takes its own `.tmp` with it.
+
+    The failure this is placed against arrives fastest on the machine that can
+    least afford it: a full disk fails every write, and every failed write used
+    to leave `<judgment_id>.json.gz.tmp` behind, so the pass that is failing
+    for want of space was also the pass consuming the most of it. Nothing later
+    reads or cleans a name no record mentions -- the atomic rename only
+    promises that a payload is whole or absent, never that a half-written one
+    is removed.
+
+    `BaseException` and not `Exception`, which is the second case below: the
+    likeliest way a judging pass dies mid-write is an operator's Ctrl-C, and a
+    `KeyboardInterrupt` is exactly what a bare `except Exception` lets past
+    with the temporary file still on disk.
+    """
+    payloads = tmp_path / "payloads"
+    payload = {"candidate_diff": "@@\n+x\n"}
+
+    def _no_space(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(os, "replace", _no_space)
+    with pytest.raises(OSError):
+        write_payload(payloads, "j-full", payload)
+    monkeypatch.undo()
+    assert list(payloads.iterdir()) == []
+
+    def _interrupted(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(os, "fsync", _interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        write_payload(payloads, "j-killed", payload)
+    monkeypatch.undo()
+    assert list(payloads.iterdir()) == []
+
+    # The same call with nothing sabotaged still writes, so the two failures
+    # above are the injection and not a payload this function cannot store.
+    written, _ = write_payload(payloads, "j-fine", payload)
+    assert Path(written).exists()
+    assert list(payloads.glob("*.tmp")) == []
+
+
+def test_the_payloads_directory_is_fsynced_after_the_rename(
+    tmp_path: Path, monkeypatch
+):
+    """The rename is made durable, not only the bytes it renamed.
+
+    `os.fsync` on the payload's own handle commits its CONTENT; the directory
+    entry that gives it its final name is a separate write. On a power loss
+    between the two the payload exists under no name while the jsonl line
+    naming it is already flushed -- `append_judgment` fsyncs per line, so the
+    verdict is the durable half -- which is the §4.3 "line naming an input
+    nobody can read" case reached by the one route the atomic rename does not
+    close.
+
+    The ORDER is asserted and not merely the call: a directory fsync before the
+    rename commits an entry that does not exist yet, which is a durability step
+    that reads exactly like this one and does nothing.
+    """
+    events: list = []
+    real_replace = os.replace
+    real_fsync_directory = judge_schema._fsync_directory
+
+    def _replace(src, dst):
+        events.append("replace")
+        return real_replace(src, dst)
+
+    def _fsync_directory(path):
+        events.append(("fsync-directory", Path(path)))
+        return real_fsync_directory(path)
+
+    monkeypatch.setattr(os, "replace", _replace)
+    monkeypatch.setattr(judge_schema, "_fsync_directory", _fsync_directory)
+
+    payloads = tmp_path / "payloads"
+    written, _ = write_payload(payloads, "j-durable", {"a": 1})
+
+    assert events == ["replace", ("fsync-directory", payloads)]
+    assert Path(written).exists()
+
+
+def test_an_old_absolute_payload_path_still_resolves(tmp_path: Path):
+    """Both generations of stored value name the same file.
+
+    Judgments are append-only, so every line written before payload paths went
+    relative carries an absolute one forever, and rewriting them is not on the
+    table -- a reader that "fixed" a stored path would be editing the evidence
+    the sha exists to protect. So the resolver reads the value itself: relative
+    joins against the judgments directory it is being read from, absolute is
+    passed through and fails, if it fails, as the missing file it actually is.
+    That is also why no schema bump was needed -- `is_absolute()` answers it
+    for every value either generation can hold.
+    """
+    judgments = tmp_path / "judgments"
+    payload = {"kind": "rubric", "candidate_diff": "@@\n+x\n"}
+    written, _ = write_payload(judgments / "payloads", "j-old", payload)
+
+    assert Path(written).is_absolute()
+    assert resolve_payload_path(judgments, written) == Path(written)
+
+    relative = payload_relative_path("j-old")
+    assert relative == "payloads/j-old.json.gz"
+    assert not Path(relative).is_absolute()
+    assert resolve_payload_path(judgments, relative) == Path(written)
+    assert read_payload(resolve_payload_path(judgments, relative)) == payload
 
 
 def test_read_payload_round_trips_write_payload(tmp_path: Path):

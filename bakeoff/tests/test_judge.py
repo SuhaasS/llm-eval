@@ -17,6 +17,11 @@ Two things make these tests worth more than an eyeball over `judge.py`:
   sweep that only checks absence passes perfectly against a fixture that
   stopped populating the field, which is the failure mode where a leak test
   stops testing and nothing says so.
+* The same sweep runs over the RENDERED PROMPTS, which is the text that is
+  actually sent and the text `judge_prompt_sha` attests to. The renderers do
+  real work between the payload and the wire -- headings, the check list, the
+  similarity block, a `None` ratio rendered as words -- so a payload proven
+  clean is not by itself a prompt proven clean.
 
 Some fields cannot carry a sentinel and are covered by the other half of the
 guard, `test_payload_key_sets_are_closed`, which pins the payload to an exact
@@ -75,6 +80,7 @@ from bakeoff.judge import (
     render_pairwise_prompt,
     render_rubric_prompt,
 )
+from bakeoff.judge_schema import PayloadSecretsFound, write_payload
 from bakeoff.schema import (
     Artifacts,
     CacheState,
@@ -148,6 +154,21 @@ OTHER_CANDIDATE_DIFF = (
     "@@ -1,2 +1,2 @@ def add(a, b):\n"
     "-    return a - b\n"
     "+    return sum((a, b))\n"
+)
+
+# A submission carrying a live-looking credential. The double-quoted shape on
+# purpose: `generic_api_key` anchors on the quote immediately after `=`, and
+# `json.dumps` puts a backslash there -- so this line is DIRTY as a raw string
+# and CLEAN as canonical JSON, and only a scan that walks the payload's own
+# strings catches it. See `test_judge_schema.DOUBLE_QUOTED_SECRET_LINE`, which
+# pins both directions against the real scanner.
+SECRET_BEARING_DIFF = (
+    "diff --git a/app.py b/app.py\n"
+    "--- a/app.py\n"
+    "+++ b/app.py\n"
+    "@@ -1,2 +1,3 @@ def main():\n"
+    '+    api_key = "sk-live-abcdefghijklmnopqrstuv"\n'
+    "     return app\n"
 )
 
 # Both sides touch a changelog `allow_extra_paths` excluded from both halves.
@@ -597,6 +618,41 @@ def test_no_run_record_leak_surface_field_reaches_the_serialized_payload():
         assert token not in pairwise, f"{name} leaked into the pairwise payload"
 
 
+def test_no_record_sentinel_survives_into_a_rendered_prompt():
+    """The same sweep over the text that is actually SENT.
+
+    Every other leak test in this file stops at the payload, and the payload is
+    not what the judge reads: `render_*_prompt` interpolates it into prose, and
+    the rendered string is what goes on the wire and what `judge_prompt_sha`
+    attests to. The gap between the two is real work -- headings, the check
+    list, the similarity block, the `None` ratio rendered as words -- and it is
+    work done by functions that take a payload dict and could reach a value the
+    payload sweep never reads, or add one of their own.
+
+    The fixture-honesty half is asserted first, for the reason the payload
+    sweep asserts it: a sentinel sweep that only checks absence passes
+    perfectly against a fixture that stopped populating the field, which is the
+    failure mode where a leak test stops testing and nothing says so.
+    """
+    record, grade, task = _record(), _grade(), _task()
+    record_blob = json.dumps(record.to_dict()) + json.dumps(grade.to_dict())
+    surface = {**LEAK_SURFACE, **GRADE_LEAK_SURFACE}
+
+    for name, token in surface.items():
+        assert token in record_blob, f"fixture does not populate {name}"
+
+    inputs = payload_inputs_from(record, grade, task)
+    rubric = render_rubric_prompt(build_rubric_payload(inputs))
+    pairwise = render_pairwise_prompt(build_pairwise_payload(inputs, inputs))
+
+    # The prompts really were rendered, so the sweep below is over text rather
+    # than over two empty strings.
+    assert CANDIDATE_DIFF in rubric and CANDIDATE_DIFF in pairwise
+    for name, token in surface.items():
+        assert token not in rubric, f"{name} leaked into the rubric prompt"
+        assert token not in pairwise, f"{name} leaked into the pairwise prompt"
+
+
 def test_a_run_record_field_added_tomorrow_is_absent_from_the_payload_by_default():  # noqa: E501
     @dataclass(frozen=True)
     class _WiderRunRecord(RunRecord):
@@ -801,6 +857,18 @@ def render_vote_prompt(record: RunRecord, inputs: PayloadInputs) -> str:
 def _vote_label(record, grade) -> str:
     """Unannotated -- the shape only a name-based scan catches."""
     return record.run_id + grade.grader_version
+
+
+def _tally_row(run, rr) -> str:
+    """Innocently named -- what somebody writes when `record` is already taken
+    by an enclosing scope, or when one line felt short enough not to matter."""
+    return run.model + rr.run_id
+
+
+def _score_row(rec, grade_rec) -> str:
+    """The abbreviation half. `rec` and `grade_rec` read as local shorthand
+    rather than as a record, which is exactly what made them invisible."""
+    return rec.task_id + grade_rec.grader_version
 '''
 
 
@@ -808,14 +876,32 @@ def _record_touchers(source: str) -> dict[str, list[str]]:
     """Functions that read an attribute off a `RunRecord` or `GradeRecord`.
 
     A name is treated as record-bound when its annotation mentions either
-    class, OR when it is conventionally named -- `record`, `grade`,
-    `run_record`, `grade_record`. The second half is not redundant: an
-    unannotated helper is exactly the shape that slips past a reader looking
-    for types, and this is a tripwire rather than a type checker.
+    class, OR when it is conventionally named. The second half is not
+    redundant: an unannotated helper is exactly the shape that slips past a
+    reader looking for types, and this is a tripwire rather than a type
+    checker.
+
+    The conventional set is deliberately wider than the four names this module
+    happens to use. `run`, `rr`, `rec` and `grade_rec` are what an unannotated
+    helper is actually called when `record` is taken by the enclosing scope or
+    the line felt short enough not to matter, and a leak arriving under one of
+    those names would satisfy every leak test in this file AND the guard
+    written to catch what the leak tests cannot. Widening it costs a false
+    positive on any future parameter genuinely named `run` -- which is a
+    docstring and a rename, against a silent hole.
 
     Returns `{function name: [attribute chains it read]}`.
     """
-    conventional = {"record", "grade", "run_record", "grade_record"}
+    conventional = {
+        "record",
+        "grade",
+        "run_record",
+        "grade_record",
+        "run",
+        "rr",
+        "rec",
+        "grade_rec",
+    }
     found: dict[str, list[str]] = {}
 
     for node in ast.walk(ast.parse(source)):
@@ -874,10 +960,35 @@ def test_only_payload_inputs_from_touches_a_run_record_or_a_grade_record():
     assert set(_record_touchers(TASK_4_STYLE_VIOLATIONS)) == {
         "render_vote_prompt",
         "_vote_label",
+        "_tally_row",
+        "_score_row",
     }
 
     source = Path(bakeoff.judge.__file__).read_text(encoding="utf-8")
     assert set(_record_touchers(source)) == {"payload_inputs_from"}
+
+
+def test_an_innocently_named_helper_that_reads_a_record_still_trips_the_source_scan():  # noqa: E501
+    """The tripwire's blind spot was the PARAMETER NAME, not the attribute.
+
+    The scan binds a parameter when its annotation names a record class or when
+    it is conventionally named, and the conventional set was `record`, `grade`,
+    `run_record`, `grade_record`. An unannotated helper is the whole reason the
+    name half exists -- and `run`, `rr`, `rec` and `grade_rec` are what an
+    unannotated helper is actually called, because `record` is usually taken by
+    the enclosing scope and the abbreviation reads as local shorthand rather
+    than as a record. A leak arriving under one of those names satisfied every
+    leak test in this file AND the structural guard that was written to catch
+    what the leak tests cannot.
+
+    The reads are asserted, not just the function names, so a widened set that
+    matched the parameter but stopped following the attribute chain would fail
+    here rather than pass with an empty list.
+    """
+    caught = _record_touchers(TASK_4_STYLE_VIOLATIONS)
+
+    assert caught["_tally_row"] == ["rr.run_id", "run.model"]
+    assert caught["_score_row"] == ["grade_rec.grader_version", "rec.task_id"]
 
 
 # --- prompts, parsing and the vote protocol ----------------------------------
@@ -1436,6 +1547,83 @@ def test_a_pairwise_vote_across_two_tasks_never_reaches_the_model():
         with pytest.raises(ValueError, match="same task"):
             judge_pair_vote(*pair, "a_first", complete)
         assert complete.prompts == []
+
+
+def test_a_secret_shaped_payload_never_reaches_the_complete_seam():
+    """The scan moved in front of the wire, where the exposure actually is.
+
+    Scanning at WRITE time protects the disk and nothing else: by then the
+    payload has been rendered into a prompt and sent to a third-party model, so
+    the credential has already left the machine and the only copy refused is
+    the one that would have stayed. §6.2 has wire logs scanned for exactly this
+    exposure, and the judge's payload carries the same repository source.
+
+    Refused here it costs the unit and nothing else -- no prompt rendered, no
+    call made, no file, no line -- and the counting fake is what pins that: it
+    raises on any call at all, and `prompts` is asserted empty besides, so a
+    seam invoked once before the raise cannot pass as never invoked.
+
+    Both kinds, both positions, and the secret on each SIDE of the pairwise:
+    the payload builders take the two submissions separately, so a scan reached
+    through one slot only would refuse half of these and look like a working
+    guard on the other half.
+    """
+    dirty = _inputs(artifacts=Artifacts(final_diff=SECRET_BEARING_DIFF))
+    clean = _other_inputs()
+
+    complete = _FakeComplete()
+    with pytest.raises(PayloadSecretsFound) as excinfo:
+        judge_rubric(dirty, complete)
+    assert "generic_api_key" in str(excinfo.value)
+    assert complete.prompts == []
+
+    for position in VOTE_POSITIONS:
+        for pair in ((dirty, clean), (clean, dirty)):
+            complete = _FakeComplete()
+            with pytest.raises(PayloadSecretsFound) as excinfo:
+                judge_pair_vote(*pair, position, complete)
+            assert "generic_api_key" in str(excinfo.value)
+            assert complete.prompts == []
+
+    # The same call over a clean submission still reaches the seam, so the four
+    # refusals above are the scanner and not a fixture nothing can judge.
+    assert judge_rubric(clean, _FakeComplete(_rubric_json())) is not None
+
+
+def test_the_write_time_scan_survives_as_a_backstop_behind_the_build_time_one(
+    tmp_path: Path, monkeypatch
+):
+    """Two layers, and either one alone still refuses the payload.
+
+    The build-time scan is the one that matters -- it is the only one in front
+    of the paid call -- but it is also new, reachable only through the two
+    functions here, and a payload assembled by some later caller that skipped
+    them would arrive at the store unscanned. So `write_payload` keeps its own
+    scan rather than trusting the layer above, and this test proves that layer
+    is load-bearing on its own: the build-time scan is stubbed blind, the vote
+    goes all the way to the model, and the store still refuses the payload and
+    still leaves nothing on disk.
+
+    Stubbing `scan_payload` in `bakeoff.judge` and not in `bakeoff.judge_schema`
+    is the whole point -- patching the shared name would disable both layers and
+    the test would be pinning nothing.
+    """
+    monkeypatch.setattr(bakeoff.judge, "scan_payload", lambda payload: set())
+
+    dirty = _inputs(artifacts=Artifacts(final_diff=SECRET_BEARING_DIFF))
+    complete = _FakeComplete(_rubric_json())
+    payload, _, _ = judge_rubric(dirty, complete)
+
+    # The build-time guard really was blind: the call happened.
+    assert len(complete.prompts) == 1
+
+    payloads = tmp_path / "payloads"
+    payloads.mkdir()
+    with pytest.raises(PayloadSecretsFound) as excinfo:
+        write_payload(payloads, "j-backstop", payload)
+
+    assert "generic_api_key" in str(excinfo.value)
+    assert list(payloads.iterdir()) == []
 
 
 def test_the_protocol_change_bumped_the_prompt_version():

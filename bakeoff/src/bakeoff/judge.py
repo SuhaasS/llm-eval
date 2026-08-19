@@ -5,8 +5,12 @@ judge receives, and what it must never receive" and §4.2.3.
 
 The judge RANKS; the deterministic ladder GATES, and the two are never
 averaged. This module builds the input to a ranking call and nothing else --
-it writes no `JudgeRecord` (`judge_schema.py`), reads no event log, and cannot
-promote a `GradeFailure` into a pass.
+it WRITES no `JudgeRecord`, reads no event log, and cannot promote a
+`GradeFailure` into a pass. It does import `judge_schema`, for one function:
+`scan_payload`, which takes a payload dict and returns the secret patterns it
+matched. Importing that module is not writing a record -- nothing here
+constructs a `JudgeRecord`, opens the jsonl, or touches the payload store, and
+`scripts/judge.py` is still the only writer of either.
 
 The judge receives exactly six things: the task prompt, the reference diff,
 the candidate diff, the deterministic check results as name plus status, the
@@ -109,6 +113,7 @@ from dataclasses import dataclass
 from typing import Any, TypeVar
 
 from bakeoff.grade_schema import GradeRecord
+from bakeoff.judge_schema import PayloadSecretsFound, scan_payload
 from bakeoff.schema import RunRecord
 from bakeoff.similarity import SimilarityContext, similarity_context
 from bakeoff.tasks import TaskManifest
@@ -361,6 +366,37 @@ def _checks(inputs: PayloadInputs) -> list[dict[str, str]]:
     `PayloadInputs` -- which is shared between the two payload kinds and
     between the two votes over one comparison."""
     return [dict(check) for check in inputs.checks]
+
+
+def _refuse_payload_secrets(payload: dict[str, Any], kind: str) -> None:
+    """Scan a freshly built payload, and refuse it BEFORE the wire.
+
+    Placed here rather than left to `judge_schema.write_payload`, because those
+    two moments protect different things. The write-time scan protects the
+    DISK: it fires after the payload has been rendered into a prompt and sent
+    to a third-party model, so the credential has already left the machine and
+    the only copy refused is the one that would have stayed. Spec section 6.2
+    has wire logs scanned for exactly this exposure, and a judge payload
+    carries the same repository source -- two full diffs of it.
+
+    Refused here the unit costs nothing: no prompt is rendered, no call is
+    made, no file and no line exist, and the driver records one failed unit
+    whose error names the pattern that matched. That unit then fails
+    identically on every resume, which is correct -- a secret in a submission
+    is fixed in the collection, never by another pass -- and it is what the
+    driver's data-shaped abort message is written for.
+
+    `write_payload` keeps its own scan, and the redundancy IS the design: two
+    independent layers, either of which alone refuses the payload, so neither
+    can quietly become the one that was skipped.
+    """
+    found = scan_payload(payload)
+    if found:
+        raise PayloadSecretsFound(
+            f"the {kind} payload matched {', '.join(sorted(found))} before it "
+            "was rendered: nothing was sent to the judge, and nothing was "
+            "written"
+        )
 
 
 # --- prompts -----------------------------------------------------------------
@@ -901,8 +937,12 @@ def judge_rubric(
     All three come back because all three are evidence: the caller stores the
     payload gzipped, the prompt's sha, and the profile, and any of the three
     rebuilt afterwards from the inputs could differ from what was sent.
+
+    The secret scan sits between the build and the render, which is the only
+    place it protects anything but the disk -- see `_refuse_payload_secrets`.
     """
     payload = build_rubric_payload(inputs)
+    _refuse_payload_secrets(payload, "rubric")
     rendered = render_rubric_prompt(payload)
     result = _ask_and_parse(
         rendered, complete, parse_rubric_response, retries
@@ -937,17 +977,24 @@ def judge_pair_vote(
        was seen. Building `a_first` and swapping afterwards produces the same
        bytes today and is the shape that lets `position_assignment` and the
        payload disagree tomorrow.
-    3. Render, and hand the rendered text back on the outcome. The caller
+    3. Scan the built payload and refuse a secret HERE, before the render and
+       the call. Scanning at write time protects the disk and not the wire,
+       which is the wrong half of the exposure; see
+       `_refuse_payload_secrets`. The scan is of the payload for THIS position,
+       because that is the object about to be sent -- the two positions hold
+       the same two submissions, so both refuse, but the one that is scanned is
+       always the one that would have gone out.
+    4. Render, and hand the rendered text back on the outcome. The caller
        shas it with `prompt_sha` -- per CALL rather than per comparison,
        since position changes the text -- and it is carried out rather than
        rebuilt so the sha attests to what the model actually saw.
-    4. Complete and parse. A `MalformedVerdict` re-sends the IDENTICAL prompt
+    5. Complete and parse. A `MalformedVerdict` re-sends the IDENTICAL prompt
        as a fresh independent call; the model is never shown its own bad
        output, because a repair turn makes attempt two a correction of
        attempt one rather than a new opinion. Kept at temperature 0 because
        what it answers is transport nondeterminism -- truncation, an empty
        completion -- and it is unpaid whenever parsing succeeds.
-    5. Map the shown-order verdict back through the position. This is the step
+    6. Map the shown-order verdict back through the position. This is the step
        whose failure is total (see `_CANONICAL_VERDICT`).
 
     The two votes over one comparison are two calls with no shared context -- a
@@ -961,6 +1008,7 @@ def judge_pair_vote(
     first, second = (a, b) if position_assignment == "a_first" else (b, a)
 
     payload = build_pairwise_payload(first, second)
+    _refuse_payload_secrets(payload, "pairwise")
     rendered = render_pairwise_prompt(payload)
     shown, reasoning = _ask_and_parse(
         rendered, complete, _pairwise_verdict_and_reasoning, retries

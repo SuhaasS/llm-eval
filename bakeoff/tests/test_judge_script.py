@@ -39,6 +39,7 @@ import io
 import json
 import math
 import random
+import shutil
 import sys
 import uuid
 from pathlib import Path
@@ -63,7 +64,9 @@ from bakeoff.judge_schema import (
     JudgeRecord,
     append_judgment,
     load_judgments,
+    payload_relative_path,
     read_payload,
+    resolve_payload_path,
 )
 from bakeoff.schema import (
     SCHEMA_VERSION,
@@ -311,6 +314,19 @@ def _lines(root):
     records, malformed = load_judgments(judgments_path(root))
     assert malformed == 0
     return records
+
+
+def _payload_of(root, line):
+    """The payload one line names, resolved the way every reader must.
+
+    A stored path is RELATIVE to the judgments directory, so reaching for
+    `Path(line.input_payload_path)` on its own is the bug relativization was
+    for, arriving in the test file: it works from the collection's parent
+    directory and nowhere else.
+    """
+    return resolve_payload_path(
+        judgments_path(root).parent, line.input_payload_path
+    )
 
 
 def _bytes_under(root: Path) -> dict[str, bytes]:
@@ -691,7 +707,7 @@ def test_vote_index_zero_is_shown_a_first_and_vote_index_one_is_shown_b_first(
     assert by_index[1].position_assignment == "b_first"
 
     for line in lines:
-        payload = read_payload(line.input_payload_path)
+        payload = read_payload(_payload_of(root, line))
         shown_first = payload["submission_first"]["diff"]
         expected = (
             diffs[line.run_id_a]
@@ -809,36 +825,49 @@ index 1111111..6666666 100644
 """
 
 
-def test_a_rubric_payload_that_cannot_be_written_leaves_no_line_behind(
+def test_a_rubric_payload_carrying_a_secret_costs_nothing_but_its_own_unit(
     tmp_path,
 ):
-    """`write_payload` BEFORE `append_judgment`. A line pointing at a payload
-    that failed to write is a verdict naming an input nobody can read, which
-    breaks "a re-judge is a re-score, not a re-run" (§4.3) exactly as a missing
-    payload does -- while looking like a present one. Driven with a real secret
-    so the refusal comes from `PayloadSecretsFound` rather than a stub."""
+    """No call, no file, no line -- and the batch goes on.
+
+    The scan is in front of the wire now, so a secret-bearing submission is
+    refused before the prompt is rendered and the unit costs nothing at all.
+    What survives from the write-time-only version of this guarantee is the
+    other half, and it is the half §4.3 rests on: no judgment line is appended
+    for a payload that never landed, because a line naming an input nobody can
+    read breaks "a re-judge is a re-score, not a re-run" exactly as a missing
+    payload does while looking like a present one.
+
+    Driven with a real secret so the refusal comes from `PayloadSecretsFound`
+    over the real scanner rather than from a stub.
+    """
     root = _collection(
         tmp_path,
         [_record("run-a", final_diff=SECRET_DIFF)],
         [_grade("run-a")],
     )
+    fake = FakeComplete()
 
-    result = _run(root, rubric=True)
+    result = _run(root, complete=fake, rubric=True)
 
+    assert fake.calls == 0
     assert _lines(root) == []
+    assert list(payloads_root(root).glob("*")) == []
     assert len(result["errors"]) == 1
     assert "PayloadSecretsFound" in result["errors"][0]
 
 
-def test_a_vote_payload_that_cannot_be_written_leaves_no_line_behind(tmp_path):
-    """The same ordering on the path that carries most of the units.
+def test_a_vote_payload_carrying_a_secret_costs_nothing_but_its_own_units(
+    tmp_path,
+):
+    """The same refusal on the path that carries most of the units.
 
     The rubric test above builds a single-run collection, so no pair forms and
-    only `_rubric_line` runs -- which leaves the vote path, the one `--no-rubric`
-    makes the ONLY path, unpinned. `_vote_line` has its own `write_payload` call
-    and its own append, and a reorder there is invisible to every other test in
-    this file: the verdict is well formed, the line looks complete, and the
-    payload it names is not on disk.
+    only `_rubric_line` runs -- which leaves the vote path, the one
+    `--no-rubric` makes the ONLY path, unpinned. `judge_pair_vote` builds its
+    payload in the position's own order and scans that, so a guard reached
+    through one slot only would refuse one of the two forced positions and look
+    like a working one on the other.
     """
     root = _collection(
         tmp_path,
@@ -851,13 +880,41 @@ def test_a_vote_payload_that_cannot_be_written_leaves_no_line_behind(tmp_path):
             _grade("run-b", model="model-two"),
         ],
     )
+    fake = FakeComplete()
 
-    result = _run(root, rubric=False)
+    result = _run(root, complete=fake, rubric=False)
 
+    assert fake.calls == 0
     assert _lines(root) == []
+    assert list(payloads_root(root).glob("*")) == []
     # Both forced positions carry the same secret, so both units fail.
     assert len(result["errors"]) == 2
     assert all("PayloadSecretsFound" in error for error in result["errors"])
+
+
+def test_a_payload_the_disk_refuses_still_leaves_no_line_behind(
+    tmp_path, monkeypatch
+):
+    """`write_payload` BEFORE `append_judgment`, pinned by a failing disk.
+
+    The two secret tests above no longer reach `write_payload` at all -- the
+    build-time scan refuses the payload before the store is asked -- so the
+    ordering they used to pin needs its own driver. A write that fails for a
+    reason no scan can anticipate is that driver, and it is also the case the
+    ordering was written for: the reverse order leaves a line naming a payload
+    that is not on disk, which reads as a complete verdict forever.
+    """
+    root = _collection(tmp_path, [_record("run-a")], [_grade("run-a")])
+
+    def _no_space(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("scripts.judge.write_payload", _no_space)
+    result = _run(root, rubric=True)
+
+    assert _lines(root) == []
+    assert len(result["errors"]) == 1
+    assert "OSError" in result["errors"][0]
 
 
 def test_payload_sits_beside_the_jsonl_and_its_sha_matches_the_record(tmp_path):
@@ -871,11 +928,67 @@ def test_payload_sits_beside_the_jsonl_and_its_sha_matches_the_record(tmp_path):
     lines = _lines(root)
     assert lines
     for line in lines:
-        path = Path(line.input_payload_path)
+        path = _payload_of(root, line)
         assert path.parent == payloads_root(root)
         assert path.exists()
         canonical = json.dumps(read_payload(path), sort_keys=True).encode()
         assert hashlib.sha256(canonical).hexdigest() == line.input_payload_sha
+
+
+def test_stored_payload_paths_are_relative_to_the_judgments_directory(tmp_path):
+    """What a line stores is `payloads/<judgment_id>.json.gz`, and nothing more.
+
+    An absolute path records where the collection sat on the machine that
+    judged it, which is a fact about that machine rather than about the
+    verdict. §4.3 says a re-judge is a re-score BECAUSE the inputs were logged,
+    so a path that resolves on one host and nowhere else is the same loss as no
+    payload at all -- arriving silently, and months later.
+
+    The relative value is asserted to be exactly what `payload_relative_path`
+    derives from the judgment id, not merely "not absolute": a driver that
+    stored some other relative string would satisfy the weaker assertion and
+    still send every reader to the wrong file.
+    """
+    root = _two_arms(tmp_path)
+
+    _run(root, rubric=True)
+
+    lines = _lines(root)
+    assert lines
+    for line in lines:
+        stored = line.input_payload_path
+        assert stored == payload_relative_path(line.judgment_id)
+        assert not Path(stored).is_absolute()
+        assert str(root) not in stored
+        assert _payload_of(root, line).exists()
+
+
+def test_a_moved_collection_still_resolves_every_payload(tmp_path):
+    """`mv` on a collection, and every verdict still names a readable input.
+
+    This is the whole of what relativization buys, and it is not a hypothetical
+    -- collections are copied off the machine that judged them, mounted at
+    another root inside a container, and moved out of `~/.cache` when they stop
+    being the current one. Under absolute paths every line in the file breaks
+    at once, and nothing about the file looks any different afterwards.
+
+    The move is asserted to be a real move first, so the resolution below is
+    over a collection whose old location genuinely no longer exists.
+    """
+    root = _two_arms(tmp_path)
+    _run(root, rubric=True)
+    before = {line.judgment_id: read_payload(_payload_of(root, line))
+              for line in _lines(root)}
+    assert before
+
+    moved = tmp_path / "elsewhere" / "eventlog"
+    moved.parent.mkdir()
+    shutil.move(str(root), str(moved))
+    assert not root.exists()
+
+    after = {line.judgment_id: read_payload(_payload_of(moved, line))
+             for line in _lines(moved)}
+    assert after == before
 
 
 # --------------------------------------------------------------------------

@@ -54,7 +54,10 @@ vote, or one gate-decided pair -- the same granularity the resume is keyed on --
 and each is wrapped in a bare `except Exception` so that one unreadable diff,
 one model that cannot produce JSON, or one payload that tripped the secret scan
 costs its own line and not the rest of the batch. `MalformedVerdict` after
-exhausted retries lands here: an error, no line, exit 1.
+exhausted retries lands here: an error, no line, exit 1. A payload that tripped
+the scan costs its line and NOTHING ELSE -- the scan runs on the built payload
+before the prompt is rendered (`bakeoff.judge`), so that unit makes no call, is
+never billed, and leaves no file.
 
 That per-unit isolation has one failure mode of its own, and
 `MAX_CONSECUTIVE_ERRORS` is placed against it: when the cause is systemic
@@ -156,6 +159,7 @@ from bakeoff.judge_schema import (  # noqa: E402
     JudgeRecord,
     append_judgment,
     load_judgments,
+    payload_relative_path,
     write_payload,
 )
 from bakeoff.tasks import TaskError, load_task_set  # noqa: E402
@@ -339,8 +343,39 @@ def payloads_root(event_log_root: Path | str) -> Path:
     the same `judgments/` directory so the verdicts and the inputs they were
     derived from move as one thing -- copying the jsonl without this directory
     produces a file of verdicts that can no longer be re-scored (§4.3).
+
+    The last two components are the same two `judge_schema.payload_relative_path`
+    produces, which is what a stored line holds. The names are not shared
+    through a constant, and they do not need to be: `_stored_payload_path`
+    compares them on every line written, so a rename here is a loud failure on
+    the first unit rather than a file of paths that resolve to nothing.
     """
     return Path(event_log_root) / "judgments" / "payloads"
+
+
+def _stored_payload_path(judgment_id: str, written: str) -> str:
+    """The relative value the line stores, checked against what was written.
+
+    `write_payload` returns an absolute path and the record keeps
+    `payloads/<judgment_id>.json.gz`, so the two are no longer the same string
+    and "the line stores what was written" has stopped being true by
+    inspection. This is what keeps it true by construction: the stored value
+    must be the TAIL of the path that was actually written, or the payload is
+    not where every reader will join it and the mismatch surfaces on the first
+    line rather than on a collection nobody can re-score months later.
+
+    A check and not a derivation. Slicing the relative value OFF the returned
+    path is what a caller writes once it has stopped checking, and it would
+    happily record `payloads/x.json.gz` for a payload written into a directory
+    called something else entirely.
+    """
+    relative = payload_relative_path(judgment_id)
+    assert Path(written).parts[-2:] == Path(relative).parts, (
+        f"payload for {judgment_id} was written to {written!r}, which is not "
+        f"{relative!r} under the judgments directory: the stored path would "
+        "name a file no reader can find"
+    )
+    return relative
 
 
 # ---------------------------------------------------------------------------
@@ -491,10 +526,14 @@ def _rubric_line(record, grade: GradeRecord, task, inputs: PayloadInputs,
     `write_payload` first, then the gate assert, then the append. The payload is
     required, not optional (§4.3), and the assert sits in the last position
     before the permanent write for the reason `GateInvariantError` gives.
+
+    What lands on the line is the RELATIVE path, checked against the absolute
+    one `write_payload` returned -- see `_stored_payload_path`.
     """
     payload, rendered, result = judge_rubric(inputs, complete)
     judgment_id = uuid.uuid4().hex
-    payload_path, payload_sha = write_payload(payloads, judgment_id, payload)
+    written, payload_sha = write_payload(payloads, judgment_id, payload)
+    payload_path = _stored_payload_path(judgment_id, written)
 
     judgment = JudgeRecord(
         judgment_id=judgment_id,
@@ -551,14 +590,17 @@ def _vote_line(task, sample_index: int, run_id_a: str, run_id_b: str,
     does now.
 
     `write_payload` BEFORE `append_judgment`: see the module docstring, step 7.
+    The stored path is relative and is checked against the absolute one that
+    was written -- see `_stored_payload_path`.
     """
     outcome = judge_pair_vote(
         inputs_a, inputs_b, position_assignment, complete
     )
     judgment_id = uuid.uuid4().hex
-    payload_path, payload_sha = write_payload(
+    written, payload_sha = write_payload(
         payloads, judgment_id, outcome.payload
     )
+    payload_path = _stored_payload_path(judgment_id, written)
 
     judgment = JudgeRecord(
         judgment_id=judgment_id,
@@ -816,11 +858,17 @@ def judge_event_log(event_log_root, tasks, *,
     which is what a resumable batch needs, since a killed pass that resumes in a
     different order redoes different work.
 
-    `input_payload_path` is stored exactly as `write_payload` returned it, so it
-    is absolute whenever `event_log_root` is. Passing a collection-relative root
-    is what makes a stored path portable; the alternative -- rewriting the path
-    on the record -- would store something `write_payload` did not write, which
-    is the class of drift the payload sha exists to rule out.
+    `input_payload_path` is stored RELATIVE to the judgments directory --
+    `payloads/<judgment_id>.json.gz` -- and never as the absolute path
+    `write_payload` returns. An absolute path records where this collection sat
+    on the machine that judged it, so the first `mv`, copy or container mount
+    at another root turns every line in the file into a verdict naming an input
+    nobody can read, which is exactly the loss §4.3 logs payloads to prevent
+    and it arrives silently. The old argument for storing the return value
+    verbatim -- that the line names what was actually written -- is kept as a
+    CHECK instead of an identity: `_stored_payload_path` compares the two on
+    every line. Lines written before this change stay absolute and go on
+    resolving, through `judge_schema.resolve_payload_path`.
     """
     event_log_root = Path(event_log_root)
     path = judgments_path(event_log_root)
