@@ -160,6 +160,7 @@ from bakeoff.judge_schema import (  # noqa: E402
     append_judgment,
     load_judgments,
     payload_relative_path,
+    resolve_payload_path,
     write_payload,
 )
 from bakeoff.tasks import TaskError, load_task_set  # noqa: E402
@@ -344,36 +345,52 @@ def payloads_root(event_log_root: Path | str) -> Path:
     derived from move as one thing -- copying the jsonl without this directory
     produces a file of verdicts that can no longer be re-scored (§4.3).
 
-    The last two components are the same two `judge_schema.payload_relative_path`
-    produces, which is what a stored line holds. The names are not shared
-    through a constant, and they do not need to be: `_stored_payload_path`
-    compares them on every line written, so a rename here is a loud failure on
-    the first unit rather than a file of paths that resolve to nothing.
+    This directory MUST sit under the judgments directory and be named what
+    `judge_schema.payload_relative_path` says, because that is the value a line
+    stores and every reader joins. The two are not shared through a constant
+    and do not need to be: `_stored_payload_path` resolves the stored value the
+    way a reader would and compares it against the file that was written, on
+    every line -- so moving or renaming this directory is a loud failure on the
+    first unit rather than a file of paths that resolve to nothing.
     """
     return Path(event_log_root) / "judgments" / "payloads"
 
 
-def _stored_payload_path(judgment_id: str, written: str) -> str:
+def _stored_payload_path(
+    judgments_dir: Path, judgment_id: str, written: str
+) -> str:
     """The relative value the line stores, checked against what was written.
 
     `write_payload` returns an absolute path and the record keeps
     `payloads/<judgment_id>.json.gz`, so the two are no longer the same string
     and "the line stores what was written" has stopped being true by
-    inspection. This is what keeps it true by construction: the stored value
-    must be the TAIL of the path that was actually written, or the payload is
-    not where every reader will join it and the mismatch surfaces on the first
-    line rather than on a collection nobody can re-score months later.
+    inspection. This is what keeps it true by construction, and it asks the
+    question a READER will ask rather than a cheaper one: resolved the way
+    every reader resolves it, does the stored value name the file that was
+    actually written?
 
-    A check and not a derivation. Slicing the relative value OFF the returned
-    path is what a caller writes once it has stopped checking, and it would
-    happily record `payloads/x.json.gz` for a payload written into a directory
-    called something else entirely.
+    Resolved, and not compared component-wise. A check on the last two
+    components alone passes for a `payloads/` relocated anywhere at all -- out
+    of `judgments/`, or into another collection -- while the stored value goes
+    on being joined against the judgments directory, where nothing is. That is
+    exactly the file of dead paths this check exists to prevent, so the weaker
+    version would have been a check that agreed with the bug.
+
+    `judgments_dir` is the directory holding the jsonl, which is the directory
+    a reader resolves against: they open the judgment file and join its
+    siblings. Deriving it from `payloads` instead would compare the driver's
+    own value against itself.
+
+    A check and not a derivation, either. Slicing the relative value OFF the
+    returned path is what a caller writes once it has stopped checking, and it
+    would happily record `payloads/x.json.gz` for a payload written into a
+    directory called something else entirely.
     """
     relative = payload_relative_path(judgment_id)
-    assert Path(written).parts[-2:] == Path(relative).parts, (
+    assert resolve_payload_path(judgments_dir, relative) == Path(written), (
         f"payload for {judgment_id} was written to {written!r}, which is not "
-        f"{relative!r} under the judgments directory: the stored path would "
-        "name a file no reader can find"
+        f"where {relative!r} resolves under {str(judgments_dir)!r}: the stored "
+        "path would name a file no reader can find"
     )
     return relative
 
@@ -533,7 +550,9 @@ def _rubric_line(record, grade: GradeRecord, task, inputs: PayloadInputs,
     payload, rendered, result = judge_rubric(inputs, complete)
     judgment_id = uuid.uuid4().hex
     written, payload_sha = write_payload(payloads, judgment_id, payload)
-    payload_path = _stored_payload_path(judgment_id, written)
+    # `path.parent` is the judgments directory: the jsonl's own directory is
+    # what a reader joins a stored payload path against.
+    payload_path = _stored_payload_path(path.parent, judgment_id, written)
 
     judgment = JudgeRecord(
         judgment_id=judgment_id,
@@ -600,7 +619,7 @@ def _vote_line(task, sample_index: int, run_id_a: str, run_id_b: str,
     written, payload_sha = write_payload(
         payloads, judgment_id, outcome.payload
     )
-    payload_path = _stored_payload_path(judgment_id, written)
+    payload_path = _stored_payload_path(path.parent, judgment_id, written)
 
     judgment = JudgeRecord(
         judgment_id=judgment_id,

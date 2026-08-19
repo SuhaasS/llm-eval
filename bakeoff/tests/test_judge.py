@@ -869,7 +869,20 @@ def _score_row(rec, grade_rec) -> str:
     """The abbreviation half. `rec` and `grade_rec` read as local shorthand
     rather than as a record, which is exactly what made them invisible."""
     return rec.task_id + grade_rec.grader_version
+
+
+_leak = lambda record: record.model
 '''
+
+#: Where the lambda violation sits inside the block above, computed rather than
+#: written down. A lambda carries no `def` name to report, so the scan labels
+#: it by line; a hand-counted constant would go stale the first time a shape is
+#: added above it.
+_VIOLATION_LAMBDA_LINE = next(
+    number
+    for number, line in enumerate(TASK_4_STYLE_VIOLATIONS.splitlines(), start=1)
+    if "lambda" in line
+)
 
 
 def _record_touchers(source: str) -> dict[str, list[str]]:
@@ -890,6 +903,14 @@ def _record_touchers(source: str) -> dict[str, list[str]]:
     positive on any future parameter genuinely named `run` -- which is a
     docstring and a rename, against a silent hole.
 
+    LAMBDAS COUNT. `_leak = lambda record: record.model` is a whole leaking
+    function, and walking `FunctionDef` alone did not look at it -- nothing
+    about a lambda makes it less able to leak, it only makes it shorter to
+    write, which is the wrong direction for a guard to be blind in. A
+    `key=lambda record: record.cost_usd` handed to a sort is the plausible
+    accident. A lambda has no name to report, so it is labelled by line, which
+    is what a reader needs out of a failure anyway.
+
     Returns `{function name: [attribute chains it read]}`.
     """
     conventional = {
@@ -905,7 +926,11 @@ def _record_touchers(source: str) -> dict[str, list[str]]:
     found: dict[str, list[str]] = {}
 
     for node in ast.walk(ast.parse(source)):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            label = node.name
+        elif isinstance(node, ast.Lambda):
+            label = f"<lambda at line {node.lineno}>"
+        else:
             continue
 
         args = node.args
@@ -937,7 +962,7 @@ def _record_touchers(source: str) -> dict[str, list[str]]:
         # A record-typed parameter with no attribute read is still a toucher:
         # passing the whole record on to a helper is the same leak one call
         # deeper, and the helper may live in another module.
-        found[node.name] = sorted(set(reads))
+        found[label] = sorted(set(reads))
 
     return found
 
@@ -962,6 +987,7 @@ def test_only_payload_inputs_from_touches_a_run_record_or_a_grade_record():
         "_vote_label",
         "_tally_row",
         "_score_row",
+        f"<lambda at line {_VIOLATION_LAMBDA_LINE}>",
     }
 
     source = Path(bakeoff.judge.__file__).read_text(encoding="utf-8")
@@ -989,6 +1015,28 @@ def test_an_innocently_named_helper_that_reads_a_record_still_trips_the_source_s
 
     assert caught["_tally_row"] == ["rr.run_id", "run.model"]
     assert caught["_score_row"] == ["grade_rec.grader_version", "rec.task_id"]
+
+
+def test_a_lambda_that_reads_a_record_is_not_invisible_to_the_source_scan():
+    """`ast.FunctionDef` is not the only way to write a function.
+
+    The scan walked `FunctionDef` and `AsyncFunctionDef` only, so
+    `_leak = lambda record: record.model` -- a whole leaking function, bound to
+    a module-level name, reading the arm off a record -- was not looked at.
+    Nothing about a lambda makes it less able to leak; it only makes it shorter
+    to write, which is the wrong direction for a guard to be blind in. A
+    `key=lambda record: record.cost_usd` handed to a sort is the plausible
+    accident, and it would have shipped the field into whatever the caller did
+    with it.
+
+    Labelled by LINE because there is no name to report. The label is what an
+    operator reads out of a failure, so it has to point at something.
+    """
+    caught = _record_touchers(TASK_4_STYLE_VIOLATIONS)
+
+    assert caught[f"<lambda at line {_VIOLATION_LAMBDA_LINE}>"] == [
+        "record.model"
+    ]
 
 
 # --- prompts, parsing and the vote protocol ----------------------------------

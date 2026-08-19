@@ -233,9 +233,37 @@ def resolve_payload_path(
     behave identically here. Resting the older generation's whole read path on
     that operator edge case is the kind of thing a later reader "simplifies"
     without knowing it was doing two jobs; the `if` says which two.
+
+    A RELATIVE value carrying a `..` component is REFUSED, for the same
+    portability this function exists to provide: a judgment file that resolves
+    anywhere is a judgment file that travels, so a `judgments.jsonl` can arrive
+    from another host, another collection or a colleague, and its stored paths
+    are untrusted input. `load_judgments` is deliberately tolerant of damaged
+    lines and `read_payload` gzip-opens whatever it is handed, so
+    `../../../etc/passwd.gz` joined against the judgments directory is a read
+    outside the collection entirely. The check costs nothing legitimate --
+    `payload_relative_path` builds its value out of a uuid4 hex judgment id and
+    cannot produce a `..` in any generation -- and the message names the value,
+    because the only way this fires on a real file is a line somebody has to go
+    and look at.
+
+    The absolute case is deliberately NOT narrowed to match. An absolute stored
+    path has always been able to name anything on the host, which is exactly
+    what made it unportable; old lines carry one forever, and a containment
+    rule applied to them would refuse payloads sitting where they belong.
+    Refusing to read an old collection is not a security improvement.
     """
     stored = Path(stored)
-    return stored if stored.is_absolute() else Path(judgments_dir) / stored
+    if stored.is_absolute():
+        return stored
+    if ".." in stored.parts:
+        raise ValueError(
+            f"stored payload path {str(stored)!r} climbs out of the judgments "
+            "directory with a '..' component. A judgment file is portable and "
+            "may therefore have come from anywhere, and the writer derives "
+            "this value from a uuid4 judgment id -- it can never produce one"
+        )
+    return Path(judgments_dir) / stored
 
 
 @dataclass(frozen=True)
@@ -450,12 +478,17 @@ def write_payload(
        a missing payload does, while looking like a present one. The directory
        fsync closes the window the rename alone leaves open; see
        `_fsync_directory`.
-    5. On ANY failure, unlink the temporary file and re-raise. `BaseException`
-       and not `Exception`, because the likeliest way a judging pass dies
-       mid-write is an operator's Ctrl-C. Left behind, a `.tmp` is debris no
-       reader looks for and no pass cleans up, and it accumulates fastest on
-       the disk that can least afford it: a full disk fails every write, so the
-       pass failing for want of space was also the one consuming it.
+    5. On ANY failure, remove whatever this call created and re-raise.
+       `BaseException` and not `Exception`, because the likeliest way a judging
+       pass dies mid-write is an operator's Ctrl-C. Left behind, a `.tmp` is
+       debris no reader looks for and no pass cleans up, and it accumulates
+       fastest on the disk that can least afford it: a full disk fails every
+       write, so the pass failing for want of space was also the one consuming
+       it. AFTER the rename the debris is the final file instead -- complete,
+       under its own name, and referenced by no line, because a raise from here
+       means the caller writes none. It is removed for the same reason, and
+       removing it is safe because `judgment_id` is a fresh uuid4 per call: the
+       name cannot be one an existing line depends on.
 
     `mtime=0` and `filename=""` are both required for the archive to be a
     function of the payload alone. Left to itself, `GzipFile` stamps the current
@@ -479,6 +512,7 @@ def write_payload(
     payloads_dir.mkdir(parents=True, exist_ok=True)
     final = payloads_dir / f"{judgment_id}.json.gz"
     tmp = payloads_dir / f"{judgment_id}.json.gz.tmp"
+    replaced = False
     try:
         with open(tmp, "wb") as raw:
             with gzip.GzipFile(
@@ -488,13 +522,19 @@ def write_payload(
             raw.flush()
             os.fsync(raw.fileno())
         os.replace(tmp, final)
+        replaced = True
         _fsync_directory(payloads_dir)
     except BaseException:
-        # `missing_ok` because the rename may already have consumed it: a
-        # failure in the fsync below the replace leaves nothing at this name,
-        # and an unlink that raised there would replace the real error with a
-        # FileNotFoundError about a file whose absence is the correct state.
+        # `missing_ok` on both, because which of the two names exists depends
+        # on how far the write got, and an unlink that raised over an absent
+        # file would replace the real error with a FileNotFoundError about a
+        # file whose absence is the correct state.
         tmp.unlink(missing_ok=True)
+        if replaced:
+            # Past the rename: what is on disk is a COMPLETE payload no line
+            # will ever name, since this call is about to raise and the caller
+            # writes no line. Same debris, one name further along.
+            final.unlink(missing_ok=True)
         raise
     return str(final), sha
 

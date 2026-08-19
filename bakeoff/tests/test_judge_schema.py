@@ -451,6 +451,75 @@ def test_an_old_absolute_payload_path_still_resolves(tmp_path: Path):
     assert read_payload(resolve_payload_path(judgments, relative)) == payload
 
 
+def test_a_stored_payload_path_that_climbs_out_of_the_collection_is_refused(
+    tmp_path: Path,
+):
+    """A relative value carrying `..` is refused, not joined.
+
+    Relativization exists so judgment files TRAVEL, which is the same thing as
+    saying a `judgments.jsonl` can arrive from somewhere else. `load_judgments`
+    is deliberately tolerant of damage and `read_payload` gzip-opens whatever
+    it is handed, so the stored path is untrusted input the moment the file is
+    portable -- and `../../../etc/passwd.gz` joined against the judgments
+    directory is a read outside the collection entirely.
+
+    Rejection costs nothing legitimate: the writer derives this value from a
+    uuid4 hex `judgment_id`, so no generation of it can produce a `..`
+    component. The error names the offending value, because the only way this
+    fires on a real file is a line somebody has to go and look at.
+    """
+    judgments = tmp_path / "judgments"
+
+    for hostile in (
+        "../../../etc/passwd.gz",
+        "payloads/../../../../etc/shadow.gz",
+        "..",
+    ):
+        with pytest.raises(ValueError) as excinfo:
+            resolve_payload_path(judgments, hostile)
+        assert hostile in str(excinfo.value)
+
+    # The shape the writer actually produces still joins.
+    ordinary = payload_relative_path("0f1e2d3c4b5a69788796a5b4c3d2e1f0")
+    assert resolve_payload_path(judgments, ordinary) == judgments / ordinary
+
+    # And the absolute pass-through is UNCHANGED. An absolute stored value has
+    # always been able to name anything on the host -- that is exactly what
+    # made it unportable -- and older lines carry one forever, so narrowing it
+    # here would refuse payloads sitting right where they belong.
+    absolute = judgments / "payloads" / "j-old.json.gz"
+    assert resolve_payload_path(judgments, absolute) == absolute
+
+
+def test_a_write_that_fails_after_the_rename_leaves_no_payload_behind(
+    tmp_path: Path, monkeypatch
+):
+    """The post-rename window leaves no debris either.
+
+    `os.replace` succeeding and the directory fsync failing is the one path
+    where the payload is COMPLETE and under its final name while
+    `write_payload` still raises -- so the caller writes no line, and the file
+    is an orphan under a uuid nothing will ever mention again. That is the same
+    debris class as the leaked `.tmp`, arriving through the durability step
+    added beside it, and the fsync-raises case above cannot reach it because
+    the file's own fsync raises first.
+
+    Removing it is safe precisely because `judgment_id` is a fresh uuid4 per
+    call: the name cannot collide with a payload some existing line depends on.
+    """
+    payloads = tmp_path / "payloads"
+
+    def _boom(path):
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(judge_schema, "_fsync_directory", _boom)
+    with pytest.raises(OSError):
+        write_payload(payloads, "j-orphan", {"a": 1})
+    monkeypatch.undo()
+
+    assert list(payloads.iterdir()) == []
+
+
 def test_read_payload_round_trips_write_payload(tmp_path: Path):
     payload = {
         "task_prompt": "fix add",

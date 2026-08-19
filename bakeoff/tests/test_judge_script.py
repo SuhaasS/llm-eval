@@ -963,6 +963,35 @@ def test_stored_payload_paths_are_relative_to_the_judgments_directory(tmp_path):
         assert _payload_of(root, line).exists()
 
 
+def test_a_payloads_directory_outside_the_judgments_directory_is_refused(
+    tmp_path, monkeypatch
+):
+    """The per-line check is against the RESOLVED path, not against the tail.
+
+    A check comparing only the last two components passes for a `payloads/`
+    relocated anywhere at all -- out of `judgments/`, or into another
+    collection -- while the stored `payloads/<id>.json.gz` goes on being joined
+    against the judgments directory, where nothing is. That is precisely the
+    file of dead paths `payloads_root`'s docstring claims this prevents, so the
+    check asks the question a reader will ask: does
+    `resolve_payload_path(judgments_dir, stored)` name the file that was
+    actually written?
+
+    Driven by moving the directory out from under the driver, because a correct
+    driver cannot produce the mismatch.
+    """
+    root = _collection(tmp_path, [_record("run-a")], [_grade("run-a")])
+    monkeypatch.setattr(
+        "scripts.judge.payloads_root", lambda log: Path(log) / "payloads"
+    )
+
+    result = _run(root, rubric=True)
+
+    assert _lines(root) == []
+    assert len(result["errors"]) == 1
+    assert "AssertionError" in result["errors"][0]
+
+
 def test_a_moved_collection_still_resolves_every_payload(tmp_path):
     """`mv` on a collection, and every verdict still names a readable input.
 
