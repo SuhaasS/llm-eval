@@ -43,6 +43,15 @@ markers = [
     # `verify_logger.py` selects `-m "integration and not task_image"`; the
     # default `addopts` keeps them out of the unit run through `integration`.
     "task_image: builds a task image and needs the repo mirror",
+    # Also a SUBSET of `integration`, always carried beside it, never alone --
+    # and this one costs money rather than time. It makes a real, billed call
+    # to the pinned judge model, which the section 6.6 logger gate must not do
+    # for the same reason as above: CLAUDE.md pins that gate as offline, no
+    # credentials, no spend. `verify_logger.py` therefore selects
+    # `-m "integration and not task_image and not judge_live"`, and the default
+    # `addopts` keeps these out of the unit run through `integration`.
+    # Run deliberately: `pytest -m "integration and judge_live"`.
+    "judge_live: makes a real, paid call to the judge model",
 ]
 testpaths = ["tests"]
 # The repo root, so tests can import scripts/ the way an operator runs it.

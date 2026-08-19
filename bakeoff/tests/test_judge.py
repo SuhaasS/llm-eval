@@ -39,9 +39,12 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import os
 import random
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -51,6 +54,7 @@ from bakeoff.judge import (
     JUDGE_MODEL_ID_DEFAULT,
     JUDGE_PROMPT_VERSION,
     JUDGE_SAMPLING,
+    MANTLE_BASE,
     RUBRIC_DIMENSIONS,
     RUBRIC_FLAGS,
     RUBRIC_VERSION,
@@ -60,6 +64,7 @@ from bakeoff.judge import (
     build_rubric_payload,
     judge_pair_vote,
     judge_rubric,
+    live_completion,
     majority,
     parse_pairwise_response,
     parse_rubric_response,
@@ -1404,3 +1409,298 @@ def test_the_pinned_judge_identity_constants():
         "left_debug_artifacts",
         "wrote_tests",
     )
+
+
+# --- the live completion seam ------------------------------------------------
+#
+# CONSTRUCTION-ONLY, and that is a safety property rather than a convenience.
+# Every test below drives `live_completion` to the exact point where the real
+# code would open a socket, and a recording stand-in for `litellm.Router` is
+# what stands there instead. A unit test here that reached Bedrock would be a
+# PAID test in the default run -- which is the thing the `judge_live` marker
+# and the section 6.6 gate's selector exist to prevent, so it cannot be the
+# thing this file does while asserting the marker works.
+
+#: The env var the harness carries the mantle bearer token under. Written out
+#: rather than imported from `scripts.smoke_bedrock`, because this name is the
+#: contract: `config/litellm_config.yaml` names it on every mantle deployment,
+#: and a rename that these tests followed automatically would be a rename that
+#: broke the proxy with the suite still green.
+MANTLE_ENV_NAME = "BAKEOFF_MANTLE_TOKEN"
+
+#: `bakeoff/`, the directory pytest is run from and the one `pythonpath = ["."]`
+#: puts on the path. Two files below are asserted as SOURCE TEXT, so they are
+#: read rather than imported.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+#: The name LiteLLM itself consults, and the one that must never be set: the
+#: bedrock/ handler falls back to it when a deployment has no api_key, so a
+#: process holding it bearer-authenticates every SigV4 arm and fails them all
+#: with `bedrock:CallWithBearerToken` (smoke_bedrock.py:125).
+LITELLM_BEARER_ENV_NAME = "AWS_BEARER_TOKEN_BEDROCK"
+
+#: Shaped like nothing real. Its job is to be FINDABLE in the constructed
+#: deployment: "not in os.environ" passes just as happily for a token that
+#: never reached the router at all, so the bearer-env test asserts both halves.
+FAKE_MANTLE_TOKEN = "fake-mantle-bearer-token-not-a-credential"
+
+STUB_REPLY = '{"verdict": "A", "reasoning": "stubbed; no model was called"}'
+
+
+def _stub_response(text: str):
+    """The two attribute hops `live_completion` makes into a litellm response.
+
+    Deliberately not a real `ModelResponse`: building one would couple these
+    tests to the pinned version's response model, and the contract under test
+    is only that the reply text is read out of `choices[0].message.content`.
+    """
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=text))]
+    )
+
+
+@pytest.fixture
+def dotenv_settled():
+    """Import litellm BEFORE any test here touches the environment.
+
+    `import litellm` calls `load_dotenv()` -- so `bakeoff/.env` does not reach
+    `os.environ` until it has run. On any machine that has run the live smoke
+    that file carries `AWS_BEARER_TOKEN_BEDROCK`, so a test that cleared the
+    variable first would watch litellm put it straight back and fail for a
+    reason that has nothing to do with the code under test. Measured here on
+    2026-08-18: this test file passed as a whole and failed when its bearer
+    case was run alone, which is the same import-order accident
+    `scrub_placeholders` documents costing an AWS_PROFILE.
+    """
+    import litellm  # noqa: F401 -- imported for load_dotenv's side effect
+
+
+@pytest.fixture
+def routers(monkeypatch, dotenv_settled):
+    """Replace `litellm.Router` with a recorder; yield the list it builds into.
+
+    Patched on the litellm module rather than on `bakeoff.judge`, because the
+    import is deliberately inside the closure -- patching a name judge.py never
+    binds at module level would stub nothing and let the real Router through.
+    """
+    import litellm
+
+    built = []
+
+    class _RecordingRouter:
+        def __init__(self, **kwargs):
+            self.init_kwargs = kwargs
+            self.calls = []
+            built.append(self)
+
+        def completion(self, **kwargs):
+            self.calls.append(kwargs)
+            return _stub_response(STUB_REPLY)
+
+    monkeypatch.setattr(litellm, "Router", _RecordingRouter)
+    return built
+
+
+@pytest.fixture
+def mantle_token(monkeypatch, dotenv_settled):
+    """A token under the harness's own name, and no AWS-named copy anywhere.
+
+    Both halves are set explicitly rather than inherited, so these tests say
+    the same thing on a laptop holding live credentials and in CI holding
+    none.
+    """
+    monkeypatch.setenv(MANTLE_ENV_NAME, FAKE_MANTLE_TOKEN)
+    monkeypatch.delenv(LITELLM_BEARER_ENV_NAME, raising=False)
+
+
+def test_live_completion_sends_max_completion_tokens_not_max_tokens(
+    mantle_token, routers
+):
+    """The cap's SPELLING, as sent, plus the rest of `JUDGE_SAMPLING`.
+
+    The candidate arms reach `max_completion_tokens` through
+    `bakeoff.litellm_patches`, which renames `max_tokens` -- and that module is
+    never imported in process (it patches litellm globally on import), so this
+    router is unpatched by design and has to spell the cap by hand. A judge
+    call that shipped `max_tokens` to the /openai/v1 route would 400 at best
+    and go out silently uncapped at worst; `smoke_bedrock.live` reproduces the
+    same rename by hand at line 379 for exactly this reason.
+    """
+    complete = live_completion()
+    assert complete("RENDERED PROMPT") == STUB_REPLY
+
+    [router] = routers
+    [call] = router.calls
+    assert call["max_completion_tokens"] == 4096
+    assert (
+        call["max_completion_tokens"]
+        == JUDGE_SAMPLING["max_completion_tokens"]
+    )
+    assert "max_tokens" not in call
+    assert call["temperature"] == JUDGE_SAMPLING["temperature"] == 0.0
+    assert call["model"] == JUDGE_MODEL_ID_DEFAULT
+    # Verbatim, in one user turn: the rendered prompt IS the prompt whose sha
+    # the record attests to, so a wrapper or a system split here would make
+    # `judge_prompt_sha` describe text no model saw.
+    assert call["messages"] == [{"role": "user", "content": "RENDERED PROMPT"}]
+
+
+def test_live_completion_never_sets_the_litellm_bearer_env(
+    monkeypatch, mantle_token, routers
+):
+    """The AWS-named bearer variable is gone afterwards, however it got there.
+
+    `AWS_BEARER_TOKEN_BEDROCK` is what LiteLLM's bedrock/ handler falls back to
+    for any deployment carrying no api_key. A process holding it
+    bearer-authenticates every bedrock-runtime arm and fails them all with
+    `bedrock:CallWithBearerToken` while the judge, which passes its key
+    literally, stays green -- a credential fault that reads as three broken
+    models.
+
+    Set here on purpose rather than merely left unset: the judge does not have
+    to SET it to hold it, because `import litellm` runs `load_dotenv()` and
+    `bakeoff/.env` carries that name. Asserting "we never assigned it" would
+    be a test of an irrelevant fact. The api_key assertion is the other half --
+    absence from the environment means nothing unless the token demonstrably
+    reached the deployment in memory.
+    """
+    monkeypatch.setenv(LITELLM_BEARER_ENV_NAME, "ambient-token-from-a-dotenv")
+
+    complete = live_completion()
+    complete("RENDERED PROMPT")
+
+    assert LITELLM_BEARER_ENV_NAME not in os.environ
+
+    [router] = routers
+    [deployment] = router.init_kwargs["model_list"]
+    assert deployment["litellm_params"]["api_key"] == FAKE_MANTLE_TOKEN
+    assert deployment["litellm_params"]["api_base"] == MANTLE_BASE
+
+
+def test_an_ambient_aws_named_token_is_adopted_rather_than_discarded(
+    monkeypatch, mantle_token, routers
+):
+    """Scrubbing an operator's only credential would be worse than holding it.
+
+    A token pasted under the AWS name is a WORKING credential -- the console
+    hands Bedrock API keys over under that name, which is why
+    `normalize_mantle_token` exists. The sequence therefore relocates it onto
+    the name the harness reads and then removes the AWS-named copy, so the
+    judge runs on the credential the operator supplied and the SigV4 arms stay
+    on SigV4.
+    """
+    pasted = "a-real-token-pasted-under-the-aws-name"
+    monkeypatch.delenv(MANTLE_ENV_NAME, raising=False)
+    monkeypatch.setenv(LITELLM_BEARER_ENV_NAME, pasted)
+
+    live_completion()("RENDERED PROMPT")
+
+    [router] = routers
+    [deployment] = router.init_kwargs["model_list"]
+    assert deployment["litellm_params"]["api_key"] == pasted
+    assert LITELLM_BEARER_ENV_NAME not in os.environ
+
+
+def test_the_router_is_not_built_until_the_first_call(monkeypatch, routers):
+    """A fully gate-decided batch must not mint a token or build a router.
+
+    The `task_resolver` pattern (`scripts/grade.py:317`): the expensive setup
+    lives inside the closure so that a batch whose comparisons are all decided
+    by the deterministic ladder pays nothing for a judge it never asks. Minting
+    at construction would also start the ~1h credential clock before the first
+    call, so a long grading pass would reach the judge with a dead token.
+
+    The failure when no credential exists must NAME the variable -- a
+    `KeyError` or LiteLLM's own "Invalid API Key format" sends the operator to
+    the config rather than to `aws sso login`.
+    """
+    import scripts.smoke_bedrock as smoke_bedrock
+
+    monkeypatch.delenv(MANTLE_ENV_NAME, raising=False)
+    # Both names, or `normalize_mantle_token` adopts the ambient AWS-named copy
+    # this machine's .env supplies and there is no missing-credential case left
+    # to test.
+    monkeypatch.delenv(LITELLM_BEARER_ENV_NAME, raising=False)
+    minted = []
+
+    def _no_token(region):
+        minted.append(region)
+        return None
+
+    monkeypatch.setattr(smoke_bedrock, "derive_mantle_token", _no_token)
+
+    complete = live_completion()
+    assert routers == [], "a router was built before anything was judged"
+    assert minted == [], "a token was minted before anything was judged"
+
+    with pytest.raises(RuntimeError, match=MANTLE_ENV_NAME):
+        complete("this must never reach a model")
+
+    assert minted == ["us-east-1"], "the default region reaches the minter"
+    assert routers == [], "a router was built without a credential to use"
+
+
+def test_the_router_is_built_once_and_carries_transport_retries(
+    mantle_token, routers
+):
+    """One router across every vote, and `num_retries` is the TRANSPORT count.
+
+    Built once because three votes over one comparison are three calls, and a
+    router per call would re-mint the token and re-resolve the deployment on
+    every vote of a 2,400-run batch.
+
+    `num_retries=2` retries a connection or a 5xx. It is a different counter
+    from the malformed-verdict retries in `_ask_and_parse`, and conflating them
+    hides which one a batch is burning: a model that cannot produce JSON and a
+    model that cannot be reached fail the same number of times and need
+    opposite responses.
+    """
+    complete = live_completion()
+    complete("first vote")
+    complete("second vote")
+
+    assert len(routers) == 1
+    [router] = routers
+    assert len(router.calls) == 2
+    assert router.init_kwargs["num_retries"] == 2
+
+
+def test_verify_logger_selector_excludes_judge_live():
+    """The section 6.6 gate is offline, no credentials, no spend -- keep it so.
+
+    `verify_logger.py` runs `-m "integration and not task_image"`, and Task 8's
+    live judge test is marked `integration` too. Without `not judge_live` in
+    that selector the gate an operator runs BEFORE a collection makes a paid
+    Bedrock call, in the one check whose docstring promises it will not.
+
+    Asserted against the source text rather than by running the gate, because
+    what is under test is the string an operator would read in the file.
+    """
+    source = (REPO_ROOT / "scripts" / "verify_logger.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "integration and not task_image and not judge_live" in source
+    # The old selector must be GONE, not merely joined by the new one: a stale
+    # copy left in a second CHECKS entry or in the comment above it is how the
+    # gate ends up documented one way and run another.
+    assert 'integration and not task_image"' not in source
+
+
+def test_the_judge_live_marker_is_registered_beside_task_image():
+    """An unregistered marker is a warning, not an error -- so it stays broken.
+
+    Task 8 carries `pytest.mark.judge_live`, and pytest applies an unknown mark
+    happily with a `PytestUnknownMarkWarning` nobody reads in a green run. The
+    registration is also where the "subset of `integration`, never alone"
+    contract is written down, which is the sentence that keeps a future author
+    from marking a paid test `judge_live` only and having it run by default.
+    """
+    config = tomllib.loads(
+        (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    markers = config["tool"]["pytest"]["ini_options"]["markers"]
+
+    judge_live = [m for m in markers if m.startswith("judge_live:")]
+    assert len(judge_live) == 1, markers
+    assert judge_live[0].split(":", 1)[1].strip()

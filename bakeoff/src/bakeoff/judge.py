@@ -61,8 +61,9 @@ serialization differ between the sent copy and the stored one.
 not a wrapper around "judge this pair", because the Invariants section
 requires three votes to be three independent calls with no shared context, and
 a raw-completion seam makes shared context structurally impossible rather than
-merely discouraged. Task 5 supplies the live implementation; nothing here
-opens a socket.
+merely discouraged. `live_completion` at the bottom of this file is the one
+implementation that opens a socket, and it opens none until it is CALLED --
+everything else here is pure, and every test above the seam drives a fake.
 
 *Two vocabularies, deliberately kept apart.* The pairwise prompt shows
 "Submission A" and "Submission B" in the order the payload carries, and the
@@ -85,6 +86,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import random
 from collections import Counter
 from collections.abc import Callable, Sequence
@@ -972,3 +974,182 @@ def _ask_and_parse(
         f"no parsable verdict after {retries + 1} attempts on the same "
         f"prompt; last failure: {last}"
     ) from last
+
+
+# --- the live completion seam ------------------------------------------------
+
+#: The mantle chat-completions route, us-east-1 -- the same base
+#: `config/litellm_config.yaml` gives nemotron and kimi. NOT gemma's
+#: `/openai/v1`: the path differs per model family on this endpoint and the two
+#: are not interchangeable, so a judge pointed at the wrong one 404s.
+#:
+#: The region is baked into the host and is therefore coupled to
+#: `live_completion`'s `region` argument, which is what the token is minted
+#: FOR. A bearer token is region-scoped, so moving one without the other mints
+#: a credential this host rejects. Both move together or neither does.
+MANTLE_BASE = "https://bedrock-mantle.us-east-1.api.aws/v1"
+
+
+def live_completion(
+    judge_model_id: str = JUDGE_MODEL_ID_DEFAULT,
+    region: str = "us-east-1",
+) -> CompleteFn:
+    """The live `CompleteFn`: one rendered prompt in, the model's raw text out.
+
+    The router is built ONCE, LAZILY, inside the closure -- the `task_resolver`
+    pattern (`scripts/grade.py:317`). Two reasons, and the second is the one
+    that bites: a batch whose comparisons are all decided by the deterministic
+    ladder must not mint a credential for a judge it never asks, and minting at
+    construction starts the credential clock before the first call. The real
+    window is about an hour (the Identity Center session policy caps it well
+    below `MANTLE_TOKEN_TTL`), so a long grading pass that built its judge up
+    front would reach the first vote holding a dead token.
+
+    Stateless per call, which is the `CompleteFn` contract: three votes over
+    one comparison are three independent calls carrying no shared context. The
+    router is shared; the conversation is not, because there is no
+    conversation -- each call is one user turn holding the whole rendered
+    prompt.
+
+    Auth failures propagate. Retrying past one is how a batch is spent against
+    a token that expired mid-run, and the error an operator needs to see says
+    `ExpiredToken`, not "no parsable verdict after 3 attempts".
+
+    Building the router also leaves the process with the AWS-named bearer
+    variable unset, which is credential hygiene rather than a side effect
+    nobody asked for -- see `_judge_router`.
+    """
+    # A one-slot cache rather than `nonlocal`: the closure only ever reads and
+    # fills it, so there is no rebind to get wrong.
+    built: dict[str, Any] = {}
+
+    def complete(prompt: str) -> str:
+        if "router" not in built:
+            built["router"] = _judge_router(judge_model_id, region)
+
+        response = built["router"].completion(
+            model=judge_model_id,
+            messages=[{"role": "user", "content": prompt}],
+            # As sent, hand-spelled. `bakeoff.litellm_patches` is what renames
+            # `max_tokens` -> `max_completion_tokens` for the candidate arms,
+            # and it applies process-wide ON IMPORT -- so it is deliberately
+            # never imported by an in-process caller and this router is
+            # unpatched by design. `smoke_bedrock.live` reproduces the same
+            # rename by hand (line 379) for exactly this reason.
+            **JUDGE_SAMPLING,
+        )
+        # `content` is None on an empty completion. Returned as "" rather than
+        # passed on, so the strict parser reports a malformed verdict and
+        # re-asks -- which is the right response to an empty reply, and is not
+        # what an AttributeError three frames deeper would produce.
+        return response.choices[0].message.content or ""
+
+    return complete
+
+
+def _judge_router(judge_model_id: str, region: str) -> Any:
+    """One single-deployment LiteLLM Router for the judge, credential and all.
+
+    Annotated `Any` rather than `Router`: naming the type would mean importing
+    litellm at module scope, and this module is imported by the payload
+    builders and the leak tests, none of which should pay for it.
+
+    `openai/` twice over is not a typo: the prefix is LiteLLM's provider (the
+    OpenAI-compatible chat-completions handler) and `openai.` is Bedrock's
+    vendor namespace inside the model id, exactly as `openai/google.gemma-4-31b`
+    reads in `config/litellm_config.yaml`.
+
+    The token is passed as this deployment's `api_key` -- an in-memory value,
+    never an environment variable and never a file. That is what keeps it off
+    `AWS_BEARER_TOKEN_BEDROCK`, the name LiteLLM's bedrock/ handler falls back
+    to when a deployment has no api_key: a process that exported it there would
+    bearer-authenticate every SigV4 arm and fail them all with
+    `bedrock:CallWithBearerToken`, while the judge itself stayed green
+    (`smoke_bedrock.py:125` scrubs it for the same reason).
+
+    `num_retries=2` is TRANSPORT retries -- a connection reset or a 5xx. It is
+    a separate counter from `_ask_and_parse`'s malformed-verdict retries, and
+    conflating the two hides which one a batch is burning: a model that cannot
+    produce JSON and a model that cannot be reached fail the same number of
+    times and need opposite responses.
+
+    `disable_cooldowns=True` for the reason `config/litellm_config.yaml`'s
+    router_settings gives, measured against litellm 1.95.0: one auth failure
+    cools a deployment down, and this group is single-deployment so there is
+    nothing to fail over to. The retries then return `RouterRateLimitError` --
+    a plain ValueError with no status code -- and the operator reads "No
+    deployments available" instead of the expired credential that caused it.
+    """
+    # Imported FIRST, and the ordering is load-bearing rather than tidy:
+    # `import litellm` runs `load_dotenv()` (smoke_bedrock's
+    # `scrub_placeholders` documents the same trap costing an AWS_PROFILE), so
+    # `bakeoff/.env` does not reach `os.environ` until this line has run. A
+    # credential read before it misses a token sitting in the file the
+    # operator just filled in.
+    from litellm import Router
+
+    from scripts.smoke_bedrock import LITELLM_BEARER_ENV, normalize_mantle_token
+
+    # A token the operator put under the AWS name is a WORKING credential, and
+    # the scrub below is about to remove it. Adopt it onto the name the
+    # harness reads first, so the sequence relocates a credential rather than
+    # destroying one -- `smoke_bedrock.main` runs these two in the same order.
+    normalize_mantle_token()
+
+    router = Router(
+        model_list=[
+            {
+                "model_name": judge_model_id,
+                "litellm_params": {
+                    "model": f"openai/{judge_model_id}",
+                    "api_base": MANTLE_BASE,
+                    "api_key": _mantle_token(region),
+                },
+            }
+        ],
+        num_retries=2,
+        disable_cooldowns=True,
+    )
+
+    # The variable is scrubbed rather than merely left unset, because THIS
+    # PROCESS DID NOT SET IT -- `load_dotenv` did, three lines up, out of a
+    # `.env` written for the live smoke. Nothing in the harness may hold it:
+    # LiteLLM's bedrock/ handler falls back to it for any deployment with no
+    # api_key, so a bedrock-runtime deployment built later in this process
+    # bearer-authenticates and fails with `bedrock:CallWithBearerToken` while
+    # the judge, which passes its key literally, stays green. The judge's own
+    # call does not depend on the ordering; `smoke_bedrock.py:243` scrubs
+    # after construction for a config whose deployments do, and keeping the
+    # two sequences identical is what lets one comment explain both.
+    os.environ.pop(LITELLM_BEARER_ENV, None)
+    return router
+
+
+def _mantle_token(region: str) -> str:
+    """The mantle bearer token: the environment's, else one minted in memory.
+
+    Imported from `scripts.smoke_bedrock` rather than reimplemented, so the
+    harness has ONE derivation with one set of failure messages
+    (`proxy.py:427` reaches for the same functions). The token is held in
+    memory for the life of the router and is never written to disk: a
+    long-lived copy in `.env` would outlive the run that needed it and sit
+    there with no expiry anyone tracks.
+
+    Two sources and no third. The caller has already run
+    `normalize_mantle_token`, so a token supplied under the AWS name is
+    findable here under `MANTLE_ENV` -- that is a rename, not a source.
+
+    A missing credential raises here and NAMES the variable. LiteLLM's own
+    answer to an absent token is `Invalid API Key format: Must start with
+    pre-defined prefix`, which reads as a config error and sends an operator
+    into `litellm_config.yaml` looking for a typo that is not there.
+    """
+    from scripts.smoke_bedrock import MANTLE_ENV, derive_mantle_token
+
+    token = os.environ.get(MANTLE_ENV) or derive_mantle_token(region)
+    if not token:
+        raise RuntimeError(
+            f"no mantle credential for the judge: set {MANTLE_ENV}, or run "
+            f"`aws sso login` so a short-term token can be minted for {region}"
+        )
+    return token
