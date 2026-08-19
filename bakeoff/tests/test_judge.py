@@ -1723,7 +1723,10 @@ def test_prompt_sha_changes_when_position_changes():
 # different capital -- which the membership pins are deliberately blind to and
 # which moves model output all the same. `JUDGE_PROMPT_VERSION`'s docstring
 # says the version moves on any change "including one that reads as cosmetic";
-# this is the only thing in the repo that makes that sentence enforceable.
+# this is the only thing in the repo that puts that sentence in front of the
+# person editing the text. It cannot require the bump -- re-record both
+# constants without one and this file passes -- and the golden test's own
+# docstring below says why that is attention rather than enforcement.
 
 #: A payload frozen HERE rather than built from `_record()`/`_grade()`/
 #: `_task()`, and that is the whole design of this fixture. A golden sha over a

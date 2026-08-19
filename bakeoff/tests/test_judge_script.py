@@ -2441,9 +2441,15 @@ def test_a_data_shaped_failure_run_is_not_blamed_on_credentials(tmp_path):
     operator to re-mint one -- so the fix that was actually needed (exclude the
     task, or raise the limit) was the one thing the abort did not mention.
 
-    "Resume with the same command" is worse than useless here: these units fail
-    deterministically, so the resume re-attempts them in the same order and
-    aborts in the same place, forever.
+    The paragraph names TWO shapes, and both halves are pinned here, because
+    "not auth" is not the same as "deterministic": `is_auth_failure` is
+    401/403 only, so a rate-limit or quota window lands in this paragraph too,
+    and on a pass of thousands of calls it is the likelier arrival. An
+    unconditional "these units fail deterministically" sends that operator to
+    `--only-task` to exclude a task that is fine, when the fix is to wait and
+    run the same command again. So the transient fix is offered under a
+    rate-limit condition, and the futile-resume warning under a data-shaped
+    one -- what must never come back is the flat determinism claim.
     """
     root = _three_arms(tmp_path)
     fake = _DiesAfter(error=_UnreadableDiff)
@@ -2454,7 +2460,14 @@ def test_a_data_shaped_failure_run_is_not_blamed_on_credentials(tmp_path):
     assert "--only-task" in abort
     assert "--max-consecutive-errors" in abort
     assert "credential" not in abort
-    assert "resume with the same command" not in abort
+    # The transient half, conditioned on the error being rate-limit shaped.
+    assert "Rate-limit" in abort
+    assert "wait for the window to clear and resume with the same command" in (
+        abort
+    )
+    # The overclaim itself, in either phrasing.
+    assert "fail deterministically" not in abort
+    assert "these units fail" not in abort
 
 
 def test_the_abort_names_the_task_model_and_sample_of_every_unit_in_the_failing_run(

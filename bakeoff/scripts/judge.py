@@ -756,13 +756,16 @@ def _print_ascii_safe(line: str) -> None:
     of `main`, taking a batch that had been running for hours down on a
     traceback with no summary and no usage totals.
 
-    `_print_reading` is NOT among them and that is a known gap rather than a
-    judgement: it prints two `§` legends of its own through bare `print`s and
-    still propagates, which is T5's recorded OPEN. It fires after every line is
-    written and fsynced, so money and data are safe -- but it fires BEFORE the
-    WARNING loop, so on an ASCII stdout the guard below does not yet get the
-    non-neutral banner onto the terminal. Closing that needs its own pass over
-    ~40 print sites and is not a fix-round change.
+    `_print_reading` is NOT among them and no longer needs to be: `main`
+    reconfigures the stdout STREAM to `errors="backslashreplace"` before the
+    report, which covers its two `§` legends and every other report print,
+    current and future, without a guard at each site. That is what closed T5's
+    recorded OPEN, and the comment at the reconfigure carries the reasoning.
+
+    What the reconfigure does NOT touch is what this helper is still the cover
+    for: everything printed BEFORE that line on the CLI path (the census, the
+    per-unit progress lines, the non-neutral banner), and a library caller of
+    `print_summary`, whose stream is theirs and stays as they set it.
 
     `backslashreplace` rather than a dropped line: an id an operator has to
     grep for is worth more mangled than absent, and the escape is reversible.
@@ -1074,6 +1077,15 @@ def _abort_message(failure_run: list[tuple[str, bool]]) -> str:
     `PayloadSecretsFound` are data-shaped by construction and land in the
     second paragraph, which is where they belong: neither is fixed by a mint.
 
+    THAT NARROWNESS IS ALSO WHY THE SECOND PARAGRAPH NAMES TWO SHAPES rather
+    than promising determinism. Non-auth is not the same as data-shaped: a
+    rate limit or an exhausted quota answers with a 429, so it lands there
+    too, and on a pass of thousands of calls it is the likelier of the two --
+    `Router(num_retries=2)` has already spent the transport retries by the
+    time a unit reaches the breaker at all. Telling that operator their units
+    fail deterministically sends them to exclude a task that is fine, when the
+    fix is to wait for the window and run the same command again.
+
     A MIXED run gets BOTH paragraphs rather than a majority verdict. Mixed is
     real -- a credential dying in the middle of a task whose diffs are also
     unreadable -- and the honest report is that both were seen, in the counts
@@ -1114,10 +1126,15 @@ def _abort_message(failure_run: list[tuple[str, bool]]) -> str:
     if data:
         parts.append(
             f"{len(data)} of them did not fail authentication, so a fresh "
-            "token would change nothing: these units fail deterministically "
-            "and will fail again on resume, in the same order and in the same "
-            "place, until something about the collection or the command "
-            "changes. The errors below name each one. Judge past them by "
+            "token would change nothing, and the errors below name each one. "
+            "Two shapes land here and they take different fixes. Rate-limit "
+            "and quota errors are transient -- throttling answers with a 429, "
+            "not a 401, and the transport retries behind each call have "
+            "already lost -- so wait for the window to clear and resume with "
+            "the same command. Data-shaped errors (malformed verdicts, "
+            "secret-bearing payloads, unjudgeable runs) will fail again on "
+            "resume, in the same order and in the same place, until something "
+            "about the collection or the command changes. Judge past them by "
             "raising --max-consecutive-errors, or leave their task out of "
             "--only-task, which names the tasks to judge -- a task it does "
             "not name is one this pass never reaches."
@@ -1573,10 +1590,10 @@ def judge_event_log(event_log_root, tasks, *,
 
     # The unit currently being attempted, and how many have been. Written by
     # `_begin` and read by `_finish`, which is the ONE place a progress line is
-    # printed. Every outcome a unit can have ends in a `_finish` call: four of
-    # the five go through an outcome closure below (`_unit_succeeded`,
+    # printed. Every outcome a unit can have ends in a `_finish` call: five of
+    # the six go through an outcome closure below (`_unit_succeeded`,
     # `_unit_failed`, `_unit_failed_fatally`, `_gate_unit_failed`,
-    # `_unit_not_judged`), and the fifth -- a gate-decided pair that WROTE its
+    # `_unit_not_judged`), and the sixth -- a gate-decided pair that WROTE its
     # line -- calls `_finish("ok")` from `_attempt` directly, because it must
     # not reset the breaker and so cannot use `_unit_succeeded`. That one
     # deliberate exception is why the rule is "exactly one `_finish` per
@@ -1877,8 +1894,8 @@ def judge_event_log(event_log_root, tasks, *,
         """Execute one selected unit, and account for however it ends.
 
         Every path out of this ends in exactly one `_finish` call, which is
-        what makes the one-line-per-attempted-unit rule structural. Four of the
-        five reach it through an outcome closure; the fifth -- a gate-decided
+        what makes the one-line-per-attempted-unit rule structural. Five of the
+        six reach it through an outcome closure; the sixth -- a gate-decided
         pair whose line was written -- calls `_finish("ok")` here directly,
         because `_unit_succeeded` would reset the breaker and that unit made no
         call, so it is no evidence the credential recovered. The exception is
