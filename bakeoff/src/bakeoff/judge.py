@@ -41,6 +41,14 @@ function here that touches a `RunRecord` or a `GradeRecord`, and the builders
 take `PayloadInputs`, so they physically cannot leak a record field because
 they never see a record.
 
+That split is the whole security argument, so it is a TEST and not a comment:
+`test_only_payload_inputs_from_touches_a_run_record_or_a_grade_record` parses
+this file and fails if any other function reads an attribute off a record.
+Later work extends this module with prompts, parsing and vote handling, and a
+helper there that reached for `record.model` to label a vote would satisfy
+every leak test in the file -- those exercise the two builders as written,
+not the rule the builders happen to follow.
+
 Both builders return plain JSON-ready dicts. `judge_schema.write_payload`
 gzips and hashes exactly what is returned, so the payload the record proves is
 the payload that was sent -- a builder that returned dataclasses would let
@@ -169,10 +177,38 @@ def build_pairwise_payload(
     it reports a bias figure.
 
     Blind: neither slot carries a run id, a model, or anything a judge could
-    map back to an arm. `task_prompt` and `reference_diff` are taken from
-    `first` because the pairing rule (§4.2.3) is sample *i* against sample *i*
-    ON THE SAME TASK, so the two agree by construction.
+    map back to an arm.
+
+    `task_prompt` and `reference_diff` are taken from `first`, and the two
+    sides are CHECKED to agree rather than trusted to. The pairing rule
+    (§4.2.3) is sample *i* against sample *i* ON THE SAME TASK, which makes
+    this the class of invariant that deserves an assert instead of a sentence
+    in a docstring: taking `first`'s and discarding `second`'s silently means a
+    mispaired call renders a payload showing one task's prompt above another
+    task's submission, and the judge answers it. The verdict comes back well
+    formed and confident, the stored payload looks exactly like a legitimate
+    one, and nothing in the `JudgeRecord` can reveal it.
+
+    Compared as strings rather than by task id, which is strictly stronger --
+    and is why `PayloadInputs` needs no id. It also catches two runs on the
+    same task whose MANIFESTS differ: a re-harvested task, or an edit to
+    `task.yaml` mid-collection. There the id matches, the anchors do not, and
+    the two submissions were graded against different references, so the
+    comparison is not like-for-like even though the pairing was.
+
+    A validity guard, not a leak guard, and the only thing about the pair a
+    builder can check at all without seeing a record.
     """
+    if (first.task_prompt, first.reference_diff) != (
+        second.task_prompt,
+        second.reference_diff,
+    ):
+        raise ValueError(
+            "pairwise submissions must come from the same task and the same "
+            "manifest: the prompt or the reference anchor differs between the "
+            "two sides, so this pair is not a like-for-like comparison"
+        )
+
     return {
         "kind": "pairwise",
         "task_prompt": first.task_prompt,

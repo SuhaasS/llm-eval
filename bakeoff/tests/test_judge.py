@@ -36,12 +36,14 @@ is not in that set. Three groups:
 
 from __future__ import annotations
 
+import ast
 import json
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
+import bakeoff.judge
 from bakeoff.grade_schema import CheckResult, GradeRecord
 from bakeoff.judge import (
     build_pairwise_payload,
@@ -710,3 +712,127 @@ def test_pairwise_shows_the_two_submissions_in_the_order_given():
     swapped = build_pairwise_payload(second, first)
     assert swapped["submission_first"]["diff"] == SOLUTION_DIFF
     assert swapped["submission_second"]["diff"] == CANDIDATE_DIFF
+
+
+def test_pairing_submissions_from_different_tasks_raises():
+    """§4.2.3 pairs sample *i* against sample *i* ON THE SAME TASK.
+
+    The builder takes the prompt and the anchor from `first` and would
+    otherwise discard `second`'s silently, so a driver that mispaired would
+    produce a well-formed, confident verdict comparing one task's prompt
+    against another task's submission -- and nothing in the stored
+    `JudgeRecord` would say so.
+    """
+    first = payload_inputs_from(_record(), _grade(), _task())
+
+    other_task = payload_inputs_from(
+        _record(),
+        _grade(),
+        _task(prompt="Fix the subtraction bug in math_utils.py."),
+    )
+    with pytest.raises(ValueError, match="same task"):
+        build_pairwise_payload(first, other_task)
+
+    # Same task, drifted manifest -- a re-harvest or a mid-collection edit to
+    # `task.yaml`. The anchors differ, so the two submissions were graded
+    # against different references and the comparison is not blind.
+    drifted_anchor = payload_inputs_from(
+        _record(),
+        _grade(),
+        _task(solution_diff=SOLUTION_DIFF + CHANGELOG_CHUNK),
+    )
+    with pytest.raises(ValueError, match="same task"):
+        build_pairwise_payload(first, drifted_anchor)
+
+
+# --- the structural guarantee ------------------------------------------------
+
+#: What a Task 4 helper that reached back into a record would look like. The
+#: detector is asserted against this, because a source scan that matches
+#: nothing passes just as quietly on a clean module as on a leaking one.
+TASK_4_STYLE_VIOLATIONS = '''
+def render_vote_prompt(record: RunRecord, inputs: PayloadInputs) -> str:
+    """Annotated -- the shape a type-aware reader would catch."""
+    return f"Arm {record.model} submitted:\\n{inputs.candidate_diff}"
+
+
+def _vote_label(record, grade) -> str:
+    """Unannotated -- the shape only a name-based scan catches."""
+    return record.run_id + grade.grader_version
+'''
+
+
+def _record_touchers(source: str) -> dict[str, list[str]]:
+    """Functions that read an attribute off a `RunRecord` or `GradeRecord`.
+
+    A name is treated as record-bound when its annotation mentions either
+    class, OR when it is conventionally named -- `record`, `grade`,
+    `run_record`, `grade_record`. The second half is not redundant: an
+    unannotated helper is exactly the shape that slips past a reader looking
+    for types, and this is a tripwire rather than a type checker.
+
+    Returns `{function name: [attribute chains it read]}`.
+    """
+    conventional = {"record", "grade", "run_record", "grade_record"}
+    found: dict[str, list[str]] = {}
+
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+
+        args = node.args
+        params = [*args.posonlyargs, *args.args, *args.kwonlyargs]
+        params += [a for a in (args.vararg, args.kwarg) if a is not None]
+
+        bound = {
+            arg.arg
+            for arg in params
+            if arg.arg in conventional
+            or (
+                arg.annotation is not None
+                and any(
+                    cls in ast.unparse(arg.annotation)
+                    for cls in ("RunRecord", "GradeRecord")
+                )
+            )
+        }
+        if not bound:
+            continue
+
+        reads = [
+            f"{inner.value.id}.{inner.attr}"
+            for inner in ast.walk(node)
+            if isinstance(inner, ast.Attribute)
+            and isinstance(inner.value, ast.Name)
+            and inner.value.id in bound
+        ]
+        # A record-typed parameter with no attribute read is still a toucher:
+        # passing the whole record on to a helper is the same leak one call
+        # deeper, and the helper may live in another module.
+        found[node.name] = sorted(set(reads))
+
+    return found
+
+
+def test_only_payload_inputs_from_touches_a_run_record_or_a_grade_record():
+    """The whitelist's structure, as a regression guard rather than a review.
+
+    The entire leak argument rests on one structural claim: the builders never
+    see a record, so they cannot leak a record field. The sentinel sweep does
+    not test that claim -- it exercises the two builders as they are written
+    today, and a helper added tomorrow that reads `record.model` to label a
+    vote would pass every other test in this file.
+
+    Task 4 extends THIS module with prompts, parsing and vote handling, which
+    is exactly when the claim is most likely to be broken by someone who never
+    read the docstring asserting it.
+    """
+    # The detector works: a clean scan of a leaking module would be a test
+    # that passes because it matches nothing.
+    assert set(_record_touchers(TASK_4_STYLE_VIOLATIONS)) == {
+        "render_vote_prompt",
+        "_vote_label",
+    }
+
+    source = Path(bakeoff.judge.__file__).read_text(encoding="utf-8")
+    assert set(_record_touchers(source)) == {"payload_inputs_from"}
