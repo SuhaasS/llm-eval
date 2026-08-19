@@ -37,7 +37,9 @@ is not in that set. Three groups:
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
+import random
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -46,9 +48,25 @@ import pytest
 import bakeoff.judge
 from bakeoff.grade_schema import CheckResult, GradeRecord
 from bakeoff.judge import (
+    JUDGE_MODEL_ID_DEFAULT,
+    JUDGE_PROMPT_VERSION,
+    JUDGE_SAMPLING,
+    RUBRIC_DIMENSIONS,
+    RUBRIC_FLAGS,
+    RUBRIC_VERSION,
+    MalformedVerdict,
+    PayloadInputs,
     build_pairwise_payload,
     build_rubric_payload,
+    judge_pair_vote,
+    judge_rubric,
+    majority,
+    parse_pairwise_response,
+    parse_rubric_response,
     payload_inputs_from,
+    prompt_sha,
+    render_pairwise_prompt,
+    render_rubric_prompt,
 )
 from bakeoff.schema import (
     Artifacts,
@@ -836,3 +854,511 @@ def test_only_payload_inputs_from_touches_a_run_record_or_a_grade_record():
 
     source = Path(bakeoff.judge.__file__).read_text(encoding="utf-8")
     assert set(_record_touchers(source)) == {"payload_inputs_from"}
+
+
+# --- prompts, parsing and the vote protocol ----------------------------------
+
+#: Five DISTINCT values, so a parser that returned a constant profile -- or
+#: zipped the dimension names against the wrong order -- fails rather than
+#: agreeing with itself.
+GOOD_SCORES: dict[str, int] = {
+    "functional_equivalence": 2,
+    "completeness": 1,
+    "cross_file_consistency": 2,
+    "scope_discipline": 0,
+    "convention_adherence": 1,
+}
+
+#: Mixed, for the same reason.
+GOOD_FLAGS: dict[str, bool] = {
+    "introduced_stub": False,
+    "left_debug_artifacts": True,
+    "wrote_tests": False,
+}
+
+GOOD_REASONING = "Different code, same result: operator.add for a + b."
+
+
+def _rubric_json(**overrides) -> str:
+    body: dict = {
+        "dimension_scores": dict(GOOD_SCORES),
+        "flags": dict(GOOD_FLAGS),
+        "reasoning": GOOD_REASONING,
+    }
+    body.update(overrides)
+    return json.dumps(body)
+
+
+def _pairwise_json(verdict: str = "A", **overrides) -> str:
+    body: dict = {"verdict": verdict, "reasoning": GOOD_REASONING}
+    body.update(overrides)
+    return json.dumps(body)
+
+
+class _FakeComplete:
+    """A scripted `CompleteFn`. Records every prompt it was handed.
+
+    Raises rather than repeating the last response once the queue is empty: a
+    fake that keeps answering hides a retry loop that ran more times than the
+    test claims, which is the exact fact the retry tests assert on.
+    """
+
+    def __init__(self, *responses: str) -> None:
+        self._responses = list(responses)
+        self.prompts: list[str] = []
+
+    def __call__(self, prompt: str) -> str:
+        self.prompts.append(prompt)
+        if not self._responses:
+            raise AssertionError(
+                f"complete() called {len(self.prompts)} times, "
+                "more often than the test scripted"
+            )
+        return self._responses.pop(0)
+
+
+def _inputs(**kw) -> PayloadInputs:
+    """One submission's payload inputs. `kw` goes to the `RunRecord`."""
+    return payload_inputs_from(_record(**kw), _grade(), _task())
+
+
+def _other_inputs() -> PayloadInputs:
+    """A second, distinguishable submission on the SAME task."""
+    return _inputs(artifacts=Artifacts(final_diff=SOLUTION_DIFF))
+
+
+# --- parsing -----------------------------------------------------------------
+
+
+def test_three_point_scores_reject_booleans_and_out_of_range_ints():
+    """`isinstance(True, int)` is Python's trap, and it is a real one here.
+
+    A model that answers `true` for a dimension is not answering the question,
+    but `True == 1` and `isinstance(True, int)` both hold -- so an
+    `isinstance` check silently records a boolean as a partial score, and the
+    stored profile reads exactly like an honest 1.
+    """
+    good = parse_rubric_response(_rubric_json())
+    assert good.dimension_scores == GOOD_SCORES
+    assert good.flags == GOOD_FLAGS
+    assert good.reasoning == GOOD_REASONING
+
+    for bad in (True, False, 3, -1, 1.0, "2", None):
+        scores = {**GOOD_SCORES, "completeness": bad}
+        with pytest.raises(MalformedVerdict):
+            parse_rubric_response(_rubric_json(dimension_scores=scores))
+
+    # The whole in-range integer scale still parses.
+    for value in (0, 1, 2):
+        scores = {**GOOD_SCORES, "completeness": value}
+        parsed = parse_rubric_response(_rubric_json(dimension_scores=scores))
+        assert parsed.dimension_scores["completeness"] == value
+
+
+def test_flags_are_real_booleans_and_exactly_the_three_names():
+    """`1` is not `true`. The flags are unscored, so an int there is a
+    category error that a truthiness check would launder into a flag."""
+    for bad in (1, 0, "true", None):
+        flags = {**GOOD_FLAGS, "wrote_tests": bad}
+        with pytest.raises(MalformedVerdict):
+            parse_rubric_response(_rubric_json(flags=flags))
+
+    missing = {k: v for k, v in GOOD_FLAGS.items() if k != "wrote_tests"}
+    with pytest.raises(MalformedVerdict):
+        parse_rubric_response(_rubric_json(flags=missing))
+
+    extra = {**GOOD_FLAGS, "looked_suspicious": True}
+    with pytest.raises(MalformedVerdict):
+        parse_rubric_response(_rubric_json(flags=extra))
+
+
+def test_a_fenced_json_response_still_parses():
+    """Models wrap JSON in ```json fences and preface it with prose."""
+    fenced = (
+        "Here is my assessment of the submission.\n\n"
+        "```json\n" + _rubric_json() + "\n```\n"
+        "Happy to expand on any dimension.\n"
+    )
+    assert parse_rubric_response(fenced).dimension_scores == GOOD_SCORES
+
+    fenced_vote = "Thinking it over:\n```json\n" + _pairwise_json("B") + "\n```"
+    assert parse_pairwise_response(fenced_vote) == "second"
+
+
+def test_braces_in_the_prose_around_the_object_do_not_move_its_boundaries():
+    """The scan is brace-balanced and string-aware, and BOTH halves matter.
+
+    Reasoning about a diff quotes code, and code holds braces. Each naive
+    extractor fails on one side and looks fine on the other, so both are
+    asserted here: `find('{')` to the first `}` truncates inside the
+    reasoning, and `find('{')` to `rfind('}')` swallows a brace in the prose
+    the model wrote *after* its answer. Either way a perfectly good reply is
+    called malformed and the whole retry budget is spent re-asking a model
+    that was right the first time.
+    """
+    reasoning = "It writes `if (x) { return y; }` where the reference did not."
+    parsed = parse_rubric_response(_rubric_json(reasoning=reasoning))
+    assert parsed.reasoning == reasoning
+
+    trailing = _rubric_json() + "\n\nHappy to expand on the `{...}` handling."
+    assert parse_rubric_response(trailing).dimension_scores == GOOD_SCORES
+
+    vote = _pairwise_json("B") + "\nB's guard clause `{ }` is the difference."
+    assert parse_pairwise_response(vote) == "second"
+
+    # String tracking starts at the opening brace, so an unbalanced quote in
+    # the prose ABOVE the object cannot swallow the brace that opens it.
+    prefaced = 'My "verdict follows.\n' + _pairwise_json("A")
+    assert parse_pairwise_response(prefaced) == "first"
+
+
+def test_missing_or_unknown_dimension_names_are_malformed():
+    missing = {k: v for k, v in GOOD_SCORES.items() if k != "scope_discipline"}
+    with pytest.raises(MalformedVerdict):
+        parse_rubric_response(_rubric_json(dimension_scores=missing))
+
+    renamed = {
+        ("scope_creep" if k == "scope_discipline" else k): v
+        for k, v in GOOD_SCORES.items()
+    }
+    with pytest.raises(MalformedVerdict):
+        parse_rubric_response(_rubric_json(dimension_scores=renamed))
+
+    extra = {**GOOD_SCORES, "elegance": 2}
+    with pytest.raises(MalformedVerdict):
+        parse_rubric_response(_rubric_json(dimension_scores=extra))
+
+    with pytest.raises(MalformedVerdict):
+        parse_rubric_response(_rubric_json(dimension_scores="excellent"))
+
+
+def test_unknown_top_level_keys_are_tolerated():
+    """Models editorialize. An extra sibling key is not a malformed verdict --
+    the dimensions and flags are what is pinned, and refusing the whole answer
+    over a `confidence` field spends three calls to learn nothing."""
+    parsed = parse_rubric_response(
+        _rubric_json(confidence="high", notes=["chatty"])
+    )
+    assert parsed.dimension_scores == GOOD_SCORES
+
+    vote = parse_pairwise_response(_pairwise_json("TIE", confidence=0.4))
+    assert vote == "tie"
+
+
+def test_a_verdict_without_reasoning_is_malformed():
+    """`full_reasoning_text` is the only thing that makes a verdict auditable
+    by a human, and it is what a disputed kappa is re-examined against. An
+    empty one is a verdict nobody can check."""
+    for bad in ("", "   ", None, 42):
+        with pytest.raises(MalformedVerdict):
+            parse_rubric_response(_rubric_json(reasoning=bad))
+        with pytest.raises(MalformedVerdict):
+            parse_pairwise_response(_pairwise_json(reasoning=bad))
+
+    with pytest.raises(MalformedVerdict):
+        parse_rubric_response(json.dumps({"dimension_scores": GOOD_SCORES}))
+
+
+def test_a_response_with_no_json_object_at_all_is_malformed():
+    for text in ("", "I decline to answer.", "```\nnot json\n```", "{"):
+        with pytest.raises(MalformedVerdict):
+            parse_rubric_response(text)
+        with pytest.raises(MalformedVerdict):
+            parse_pairwise_response(text)
+
+
+def test_pairwise_verdicts_are_case_insensitive_and_stay_in_shown_terms():
+    """A/B is the WIRE vocabulary and first/second is the shown-order one.
+
+    `parse_pairwise_response` translates the first into the second and must
+    never emit canonical "a"/"b" -- those mean the caller's own pair order,
+    which the parser has no way to know. Two vocabularies that look alike are
+    exactly the pair a position-mapping bug hides between.
+    """
+    assert parse_pairwise_response(_pairwise_json("A")) == "first"
+    assert parse_pairwise_response(_pairwise_json("b")) == "second"
+    assert parse_pairwise_response(_pairwise_json(" tie ")) == "tie"
+    assert parse_pairwise_response(_pairwise_json("Tie")) == "tie"
+
+    for bad in ("C", "", "AB", "first", "neither", 1, True, None):
+        with pytest.raises(MalformedVerdict):
+            parse_pairwise_response(_pairwise_json(bad))
+
+
+# --- prompts -----------------------------------------------------------------
+
+
+def test_the_rendered_prompt_contains_the_payload_diffs_verbatim():
+    """Rendering interpolates; it does not summarize, truncate or re-wrap.
+
+    A renderer that trimmed a diff would change what was judged while the
+    stored payload went on showing the whole thing, and `judge_prompt_sha`
+    would attest to the trimmed text nobody kept.
+    """
+    inputs = _inputs()
+    rubric = render_rubric_prompt(build_rubric_payload(inputs))
+    assert inputs.task_prompt in rubric
+    assert SOLUTION_DIFF in rubric
+    assert CANDIDATE_DIFF in rubric
+    # The check names and statuses the ladder established, and nothing more.
+    assert "f2p" in rubric and "not_configured" in rubric
+
+    pairwise = render_pairwise_prompt(
+        build_pairwise_payload(inputs, _other_inputs())
+    )
+    assert inputs.task_prompt in pairwise
+    assert CANDIDATE_DIFF in pairwise
+    assert SOLUTION_DIFF in pairwise
+    assert "Submission A" in pairwise and "Submission B" in pairwise
+
+
+def test_the_rubric_prompt_anchors_every_dimension_and_flag():
+    """Five dimensions on a 0/1/2 anchored scale, three unscored flags.
+
+    Short scales are deliberate -- 1-10 scales show poor inter-rater
+    agreement -- so a prompt that asks for the names without stating what 0,
+    1 and 2 mean has quietly reintroduced an unanchored scale.
+    """
+    rendered = render_rubric_prompt(build_rubric_payload(_inputs()))
+
+    for name in RUBRIC_DIMENSIONS:
+        assert name in rendered, f"{name} is not named in the rubric prompt"
+    for flag in RUBRIC_FLAGS:
+        assert flag in rendered, f"{flag} is not named in the rubric prompt"
+    for anchor in ("0 ", "1 ", "2 "):
+        assert anchor in rendered
+
+    # The one anchor the spec spells out in words, because it is the one a
+    # judge gets wrong by default: equivalence is about the RESULT.
+    assert "not" in rendered.lower()
+    assert "same code" in rendered.lower()
+
+
+def test_prompt_sha_is_the_sha256_of_the_exact_rendered_text():
+    rendered = render_rubric_prompt(build_rubric_payload(_inputs()))
+    expected = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+    assert prompt_sha(rendered) == expected
+    assert prompt_sha(rendered) != prompt_sha(rendered + "\n")
+
+
+def test_prompt_sha_changes_when_position_changes():
+    """Position changes the prompt text, so the sha is per CALL, not per pair.
+
+    One sha stored for both orders would make the position-swap probe
+    unverifiable after the fact: nothing would say which of the two texts the
+    verdict answered.
+    """
+    a, b = _inputs(), _other_inputs()
+    a_first = render_pairwise_prompt(build_pairwise_payload(a, b))
+    b_first = render_pairwise_prompt(build_pairwise_payload(b, a))
+
+    assert a_first != b_first
+    assert prompt_sha(a_first) != prompt_sha(b_first)
+
+
+# --- the vote protocol -------------------------------------------------------
+
+
+def test_retry_on_malformed_re_sends_the_same_prompt_and_counts_calls():
+    """A retry is a fresh independent call, never a repair turn.
+
+    Handing the model back its own bad output would make attempt two a
+    continuation of attempt one -- and the same reasoning that makes three
+    votes three separate calls (a single call asked for three opinions is one
+    vote wearing three hats) makes a repair turn a correction of a vote rather
+    than a new one.
+    """
+    complete = _FakeComplete("I refuse.", '{"scores": "great"}', _rubric_json())
+    inputs = _inputs()
+
+    payload, rendered, result = judge_rubric(inputs, complete)
+
+    assert len(complete.prompts) == 3
+    assert len(set(complete.prompts)) == 1, "the prompt was not re-sent as-is"
+    assert complete.prompts[0] == rendered
+    assert "I refuse." not in rendered
+    assert result.dimension_scores == GOOD_SCORES
+    assert payload == build_rubric_payload(inputs)
+
+
+def test_exhausted_retries_raise_malformed_verdict():
+    complete = _FakeComplete("no", "still no", "no again")
+    with pytest.raises(MalformedVerdict):
+        judge_rubric(_inputs(), complete)
+    assert len(complete.prompts) == 3, "default retries=2 means three attempts"
+
+    once = _FakeComplete("no")
+    with pytest.raises(MalformedVerdict):
+        judge_rubric(_inputs(), once, retries=0)
+    assert len(once.prompts) == 1
+
+    voting = _FakeComplete("no", "no", "no")
+    with pytest.raises(MalformedVerdict):
+        judge_pair_vote(
+            _inputs(), _other_inputs(), random.Random(0), voting
+        )
+    assert len(voting.prompts) == 3
+    assert len(set(voting.prompts)) == 1
+
+
+def test_a_first_attempt_that_parses_makes_exactly_one_call():
+    complete = _FakeComplete(_rubric_json())
+    judge_rubric(_inputs(), complete)
+    assert len(complete.prompts) == 1
+
+
+def test_majority_arithmetic_including_ties():
+    assert majority(["a", "a", "b"]) == "a"
+    assert majority(["a", "b", "tie"]) == "tie"
+    assert majority(["tie", "tie", "a"]) == "tie"
+    assert majority(["b", "b", "b"]) == "b"
+    # A strict majority, not a plurality: 2 of 4 is not a majority.
+    assert majority(["a", "a", "b", "b"]) == "tie"
+    assert majority(["a", "a", "a", "b"]) == "a"
+    assert majority(["a"]) == "a"
+
+
+def test_majority_refuses_the_shown_order_vocabulary():
+    """"first"/"second" are presentation terms and mean nothing here.
+
+    A caller that passed raw parser output would get a confident answer in a
+    vocabulary no `JudgeRecord.verdict` field accepts, and the mistake would
+    survive as a stored verdict rather than as an exception.
+    """
+    with pytest.raises(ValueError):
+        majority(["first", "first", "second"])
+    with pytest.raises(ValueError):
+        majority(["a", "a", "A"])
+    with pytest.raises(ValueError):
+        majority([])
+
+
+def test_seeded_rng_produces_both_position_assignments_and_maps_verdicts_back_correctly():  # noqa: E501
+    """Position is drawn per vote, and the verdict is mapped back through it.
+
+    The failure this guards is silent and total: a vote protocol that
+    randomizes position but forgets to invert the mapping records the loser as
+    the winner on half the comparisons, and every Elo number downstream is
+    computed from it without anything looking wrong.
+    """
+    a, b = _inputs(), _other_inputs()
+    seen: set[str] = set()
+
+    for seed in range(24):
+        for wire, first_wins, second_wins in (
+            ("A", "a", "b"),
+            ("B", "b", "a"),
+        ):
+            complete = _FakeComplete(_pairwise_json(wire))
+            outcome = judge_pair_vote(a, b, random.Random(seed), complete)
+            seen.add(outcome.position_assignment)
+
+            if outcome.position_assignment == "a_first":
+                assert outcome.payload["submission_first"]["diff"] == (
+                    CANDIDATE_DIFF
+                )
+                assert outcome.verdict == first_wins
+            else:
+                assert outcome.position_assignment == "b_first"
+                assert outcome.payload["submission_first"]["diff"] == (
+                    SOLUTION_DIFF
+                )
+                assert outcome.verdict == second_wins
+
+    assert seen == {"a_first", "b_first"}, "position was not randomized"
+
+    # A tie is a tie under either assignment -- the one verdict the mapping
+    # must leave alone.
+    for seed in range(8):
+        complete = _FakeComplete(_pairwise_json("TIE"))
+        assert judge_pair_vote(a, b, random.Random(seed), complete).verdict == (
+            "tie"
+        )
+
+
+def test_the_vote_outcome_carries_the_payload_and_prompt_that_were_sent():
+    """Task 6 stores `write_payload(outcome.payload)` and
+    `prompt_sha(outcome.rendered_prompt)`, so a `VoteOutcome` that rebuilt
+    either would attest to something other than what the model saw."""
+    a, b = _inputs(), _other_inputs()
+    complete = _FakeComplete(_pairwise_json("A"))
+    outcome = judge_pair_vote(a, b, random.Random(1), complete)
+
+    assert complete.prompts == [outcome.rendered_prompt]
+    assert outcome.rendered_prompt == render_pairwise_prompt(outcome.payload)
+    assert outcome.reasoning == GOOD_REASONING
+    assert outcome.payload["kind"] == "pairwise"
+
+    shown = (a, b) if outcome.position_assignment == "a_first" else (b, a)
+    assert outcome.payload == build_pairwise_payload(*shown)
+
+
+def test_the_position_is_drawn_before_the_payload_is_built():
+    """Draw first, then build in shown order -- never build then swap.
+
+    Building an `a_first` payload and reordering it afterwards is the same
+    output today and the shape that lets `position_assignment` and the payload
+    disagree tomorrow. Pinned by consuming exactly one draw from an rng whose
+    stream is known.
+    """
+    a, b = _inputs(), _other_inputs()
+
+    class _OneDraw(random.Random):
+        def __init__(self, value: float) -> None:
+            super().__init__(0)
+            self.value = value
+            self.draws = 0
+
+        def random(self) -> float:
+            self.draws += 1
+            return self.value
+
+    for value, expected in ((0.0, "a_first"), (0.5, "b_first")):
+        rng = _OneDraw(value)
+        outcome = judge_pair_vote(
+            a, b, rng, _FakeComplete(_pairwise_json("A"))
+        )
+        assert outcome.position_assignment == expected
+        assert rng.draws == 1, "one draw per vote, taken before the build"
+
+
+def test_a_pairwise_vote_across_two_tasks_never_reaches_the_model():
+    """The pairing guard fires before any call is made, in either order."""
+    other_task = payload_inputs_from(
+        _record(), _grade(), _task(prompt="Fix the parser in tokens.py.")
+    )
+    for pair in ((_inputs(), other_task), (other_task, _inputs())):
+        complete = _FakeComplete(_pairwise_json("A"))
+        with pytest.raises(ValueError, match="same task"):
+            judge_pair_vote(*pair, random.Random(0), complete)
+        assert complete.prompts == []
+
+
+def test_the_pinned_judge_identity_constants():
+    """Tasks 5 and 6 read these, and two of them are load-bearing.
+
+    `judge_model_id` must be a PINNED variant -- luna/sol/terra are three
+    models, not three names for one, and a floating alias is a moving oracle.
+    The cap goes out as `max_completion_tokens`: the candidate arms need a
+    litellm patch to rename `max_tokens`, and a judge call that shipped the
+    old name would be silently uncapped.
+    """
+    assert JUDGE_MODEL_ID_DEFAULT == "openai.gpt-5.6-sol"
+    assert JUDGE_PROMPT_VERSION == 1
+    assert RUBRIC_VERSION == "1.0.0"
+    assert JUDGE_SAMPLING["temperature"] == 0.0
+    assert "max_completion_tokens" in JUDGE_SAMPLING
+    assert "max_tokens" not in JUDGE_SAMPLING
+
+    assert RUBRIC_DIMENSIONS == (
+        "functional_equivalence",
+        "completeness",
+        "cross_file_consistency",
+        "scope_discipline",
+        "convention_adherence",
+    )
+    assert RUBRIC_FLAGS == (
+        "introduced_stub",
+        "left_debug_artifacts",
+        "wrote_tests",
+    )
