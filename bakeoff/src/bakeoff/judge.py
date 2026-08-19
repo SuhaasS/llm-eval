@@ -100,6 +100,15 @@ The retry survives the move to temperature 0 because what it is against is
 TRANSPORT nondeterminism -- a truncated reply, an empty completion -- which a
 fresh identical call still fixes, and it costs nothing whenever parsing
 succeeds the first time.
+
+**And one refusal that precedes all of it: the judge's own family.** §4.3 makes
+a neutral family MANDATORY rather than preferable, and `assert_neutral_judge`
+is that rule as code. The default is pinned and neutral, so the guard exists
+for the id an operator types -- and the failure it prevents is the quietest one
+in this file, because a judge from a compared family produces a complete,
+well-formed, fully populated table with every number in it shifted the same
+way. Nothing downstream can detect it: the payloads are clean, the verdicts
+parse, the intervals are honest about sampling error and silent about bias.
 """
 
 from __future__ import annotations
@@ -197,6 +206,152 @@ RUBRIC_FLAGS: tuple[str, ...] = (
 CompleteFn = Callable[[str], str]
 
 _Parsed = TypeVar("_Parsed")
+
+
+# --- the neutral-family guard ------------------------------------------------
+
+#: The four compared families as they appear in a Bedrock model id's VENDOR
+#: namespace, dot included. Prefix-matched, so `anthropic.` catches
+#: `anthropic.opus-6` -- a model from a compared family whose name never says
+#: "claude", which is exactly what a token-only guard cannot see.
+#:
+#: The dot is part of each entry rather than added at match time: `google.` must
+#: not match a hypothetical `googlebrain-x`, and a bare `nvidia` would match any
+#: id with the word in it anywhere. Anchoring the vendor and anchoring the
+#: family are two different jobs, which is why there are two tuples.
+NON_NEUTRAL_VENDOR_PREFIXES: tuple[str, ...] = (
+    "anthropic.",
+    "google.",
+    "nvidia.",
+    "moonshot.",
+)
+
+#: The same four families by MODEL NAME, substring-matched anywhere in the id.
+#: This is the re-host case and it is not hypothetical: the same weights are
+#: served as `bedrock.claude-sonnet-5`, `vertex.gemini-3-pro`,
+#: `openrouter.gemma-4-31b`. The vendor namespace in front of the dot is a
+#: routing detail; the WEIGHTS are what prefer their own backbone, so a family
+#: served from somebody else's namespace is the identical self-preference path
+#: with none of the prefix signal.
+#:
+#: Two Google entries because Google ships two compared-family lines under one
+#: vendor. Substring rather than word-boundary matching, deliberately over-wide:
+#: a false positive costs one operator one confused minute and is answered by
+#: the message, while a false negative costs a whole pass and answers nothing.
+NON_NEUTRAL_FAMILY_TOKENS: tuple[str, ...] = (
+    "claude",
+    "gemma",
+    "gemini",
+    "nemotron",
+    "kimi",
+)
+
+#: The escape, and it is an ENVIRONMENT VARIABLE rather than a flag, on
+#: `KAPPA_CAVEAT`'s reasoning: a flag is how a mandatory rule becomes a default.
+#: A variable has to be typed on purpose, does not appear in `--help` beside the
+#: ordinary options, and cannot be added to a wrapper script by somebody who
+#: read the refusal as an obstacle rather than as a finding.
+#:
+#: It exists at all because a rule with no escape gets deleted rather than
+#: obeyed, and because measuring how much a Claude judge inflates Sonnet 5 on
+#: THIS endpoint is a real experiment -- it is how §4.3's rule gets re-confirmed
+#: rather than merely cited.
+ALLOW_NON_NEUTRAL_JUDGE_ENV = "BAKEOFF_ALLOW_NON_NEUTRAL_JUDGE"
+
+
+class NonNeutralJudge(RuntimeError):
+    """The judge model belongs to one of the four families being compared.
+
+    Its own class rather than a `ValueError` because the driver catches it
+    beside `ResumeRefused` and `CollectionNotFound`: three refusals that mean
+    the batch never ran, print no numbers, and are answered by fixing the
+    invocation rather than by re-running it.
+    """
+
+
+def assert_neutral_judge(judge_model_id: str) -> str | None:
+    """Refuse a judge from a compared family. Returns a warning, or `None`.
+
+    §4.3, which makes a neutral family MANDATORY rather than preferable. The
+    compared families are Anthropic, Google, NVIDIA and Moonshot; a Claude
+    judge inflates Sonnet 5 and a Gemini judge inflates Gemma 4, and
+    self-preference is measured rather than suspected -- one case had a model
+    rate its own backbone at 33.7% faithfulness where an independent judge said
+    14.13%.
+
+    THIS IS THE ONLY LAYER THAT CAN CATCH IT. A biased judge produces a
+    complete pass: clean payloads, parsable verdicts, a full matrix, honest
+    intervals -- honest about sampling error, and silent about the bias, which
+    is not a source of variance and so does not widen a band. Every check
+    downstream passes, because none of them is a check about the judge. So the
+    refusal happens at the identity, before the first call, and the driver
+    calls this before it reads the collection.
+
+    TWO MATCH RULES, and each covers what the other cannot. The vendor prefix
+    catches `anthropic.opus-6` -- a compared family under a model name that
+    never says "claude". The family token catches `bedrock.claude-sonnet-5` --
+    Claude itself under a neutral vendor namespace, which is what a re-host
+    looks like. A guard with either half missing admits a biased judge, and the
+    table it produces is indistinguishable from a clean one.
+
+    Lowercased before either rule runs: `--judge-model` is typed by hand.
+
+    `os.environ.get(...) == "1"` and not a presence check, which is the half
+    that protects anything. `BAKEOFF_ALLOW_NON_NEUTRAL_JUDGE=0` is what
+    somebody writes to turn the override OFF, and under a presence check it
+    turns it on -- the exact inversion, arrived at by a person being careful.
+    Under the override the caller gets TEXT rather than silence: the driver
+    appends it to `warnings` and prints it, so the terminal says so while the
+    pass is still cheap to stop and the result says so to whoever reads the
+    numbers later.
+    """
+    lowered = judge_model_id.lower()
+
+    matched: str | None = next(
+        (
+            prefix
+            for prefix in NON_NEUTRAL_VENDOR_PREFIXES
+            if lowered.startswith(prefix)
+        ),
+        None,
+    )
+    if matched is None:
+        matched = next(
+            (token for token in NON_NEUTRAL_FAMILY_TOKENS if token in lowered),
+            None,
+        )
+    if matched is None:
+        return None
+
+    if os.environ.get(ALLOW_NON_NEUTRAL_JUDGE_ENV) == "1":
+        return (
+            f"NON-NEUTRAL JUDGE ADMITTED: {judge_model_id!r} matches the "
+            f"compared family {matched!r}, and "
+            f"{ALLOW_NON_NEUTRAL_JUDGE_ENV}=1 let it through. §4.3 makes a "
+            "neutral family mandatory -- a Claude judge inflates Sonnet 5, a "
+            "Gemini judge inflates Gemma 4 -- and self-preference is measured: "
+            "one case had a model rate its own backbone at 33.7% faithfulness "
+            "where an independent judge said 14.13%. Every number this pass "
+            "produces is shifted in one direction by an amount nothing "
+            "downstream can measure. Read it as a probe of the judge, never as "
+            "a reading of the arms, and never beside a neutral-judge pass."
+        )
+
+    raise NonNeutralJudge(
+        f"{judge_model_id!r} matches the compared family {matched!r}, and "
+        "§4.3 makes a neutral judge family mandatory: the compared families "
+        "are Anthropic, Google, NVIDIA and Moonshot, and the judge must sit "
+        "outside all four. A Claude judge inflates Sonnet 5 and a Gemini judge "
+        "inflates Gemma 4 -- one measured case had a model rate its own "
+        "backbone at 33.7% faithfulness where an independent judge said "
+        "14.13%. This is refused rather than warned about because nothing "
+        "downstream can see it: the payloads are clean, the verdicts parse, "
+        "the matrix fills in, and every number in it moves together. Judge "
+        f"with {JUDGE_MODEL_ID_DEFAULT} (the pinned default) or another model "
+        "outside all four families -- qwen.qwen3-235b-a22b-2507 is §4.3's "
+        f"named drop-in. Setting {ALLOW_NON_NEUTRAL_JUDGE_ENV}=1 admits this "
+        "judge anyway, loudly, for a deliberate self-preference probe."
+    )
 
 
 @dataclass(frozen=True)

@@ -57,16 +57,21 @@ import pytest
 import bakeoff.judge
 from bakeoff.grade_schema import CheckResult, GradeRecord
 from bakeoff.judge import (
+    ALLOW_NON_NEUTRAL_JUDGE_ENV,
     JUDGE_MODEL_ID_DEFAULT,
     JUDGE_PROMPT_VERSION,
     JUDGE_SAMPLING,
     MANTLE_BASE,
+    NON_NEUTRAL_FAMILY_TOKENS,
+    NON_NEUTRAL_VENDOR_PREFIXES,
     RUBRIC_DIMENSIONS,
     RUBRIC_FLAGS,
     RUBRIC_VERSION,
     VOTE_POSITIONS,
     MalformedVerdict,
+    NonNeutralJudge,
     PayloadInputs,
+    assert_neutral_judge,
     build_pairwise_payload,
     build_rubric_payload,
     is_auth_failure,
@@ -1721,6 +1726,144 @@ def test_the_pinned_judge_identity_constants():
         "left_debug_artifacts",
         "wrote_tests",
     )
+
+
+# --- the neutral-family guard ------------------------------------------------
+#
+# §4.3 makes a neutral judge MANDATORY, and the failure it forbids is the
+# quietest one this harness can produce: a Claude judge returns well-formed
+# verdicts, writes complete payloads, fills every column of the matrix and
+# shifts every number in it the same way. Nothing downstream can see it -- the
+# intervals are honest about sampling error and silent about bias -- so the
+# refusal has to happen at the identity, before the first call.
+
+#: Ids where the VENDOR NAMESPACE is the only signal: no compared-family token
+#: appears anywhere in the name, so a guard matching tokens alone lets every one
+#: of these through. `anthropic.opus-6` is the realistic shape -- a vendor ships
+#: a model whose name never says "claude" -- and it is still a judge from the
+#: family the eval is measuring. Keyed by the constant each one is caught by, so
+#: the test can assert the table covers `NON_NEUTRAL_VENDOR_PREFIXES` whole.
+PREFIX_ONLY_JUDGES = {
+    "anthropic.": "anthropic.opus-6",
+    "google.": "google.palm-2-unicorn",
+    "nvidia.": "nvidia.mistral-nemo-12b",
+    "moonshot.": "moonshot.moonshot-v1-128k",
+}
+
+#: Ids where the FAMILY TOKEN is the only signal: the vendor namespace is
+#: neutral or simply somebody else's, which is what a re-host looks like. The
+#: weights are what prefer their own backbone, not the string in front of the
+#: dot, so a compared family served from another namespace is the same
+#: self-preference path -- and it is the one a prefix-only guard cannot see.
+TOKEN_ONLY_JUDGES = {
+    "claude": "bedrock.claude-sonnet-5",
+    "gemma": "openrouter.gemma-4-31b",
+    "gemini": "vertex.gemini-3-pro",
+    "nemotron": "together.nemotron-4-340b",
+    "kimi": "groq.kimi-k2-instruct",
+}
+
+
+def test_a_judge_from_a_compared_family_is_refused_with_the_spec_section_named(
+    monkeypatch,
+):
+    """All four compared families, in both the shapes they arrive in.
+
+    Two match rules rather than one, and each table above is what makes the
+    other one load-bearing. `anthropic.opus-6` carries no family token, so
+    dropping the prefix rule admits a judge from the family Sonnet 5 belongs
+    to; `bedrock.claude-sonnet-5` carries no compared vendor prefix, so
+    dropping the token rule admits Claude itself under a re-host. A guard with
+    either half missing passes a table full of biased numbers, and every one of
+    them looks exactly like a clean one.
+
+    The message NAMES the family it matched and NAMES §4.3, because the
+    operator reading it typed a model id on purpose and needs to know which
+    rule caught it and where that rule comes from. "invalid judge model" would
+    read as a typo and get answered with a second guess.
+
+    The env is cleared first: this refusal must not depend on what the shell
+    was carrying, and an ambient override would otherwise turn the whole table
+    green.
+    """
+    monkeypatch.delenv(ALLOW_NON_NEUTRAL_JUDGE_ENV, raising=False)
+
+    # The tables cover the constants WHOLE, so a family added to either tuple
+    # without a case here fails at this assertion rather than going untested.
+    assert set(PREFIX_ONLY_JUDGES) == set(NON_NEUTRAL_VENDOR_PREFIXES)
+    assert set(TOKEN_ONLY_JUDGES) == set(NON_NEUTRAL_FAMILY_TOKENS)
+
+    for family, model_id in {**PREFIX_ONLY_JUDGES, **TOKEN_ONLY_JUDGES}.items():
+        with pytest.raises(NonNeutralJudge) as exc:
+            assert_neutral_judge(model_id)
+        message = str(exc.value)
+        # QUOTED, so the family is named as a family. A bare `in` would pass on
+        # the token cases against a message that only echoed the model id back.
+        assert f"{family!r}" in message, message
+        assert f"{model_id!r}" in message, message
+        assert "§4.3" in message, message
+
+    # Case-folded before either rule runs. `--judge-model` is typed by hand and
+    # a capitalised vendor is a plausible way to type it.
+    for shouted in ("ANTHROPIC.Claude-Sonnet-5", "Vertex.Gemini-3-Pro"):
+        with pytest.raises(NonNeutralJudge):
+            assert_neutral_judge(shouted)
+
+    # The two that must pass. The default is what every unconfigured pass uses,
+    # and Qwen is §4.3's named drop-in if residency policy changes -- a guard
+    # that refused either one would be a guard nobody could run behind.
+    assert assert_neutral_judge(JUDGE_MODEL_ID_DEFAULT) is None
+    assert assert_neutral_judge("openai.gpt-5.6-sol") is None
+    assert assert_neutral_judge("qwen.qwen3-235b-a22b-2507") is None
+
+
+def test_the_env_override_admits_a_non_neutral_judge_with_a_loud_warning_and_nothing_else_does(  # noqa: E501
+    monkeypatch,
+):
+    """Exactly `"1"` opens the door, and the door is never quiet.
+
+    An override exists because a deliberate self-preference PROBE is a real
+    experiment -- measuring how much a Claude judge inflates Sonnet 5 is how
+    §4.3's rule gets re-confirmed on this endpoint -- and because a rule with
+    no escape gets deleted rather than obeyed. What it must never become is a
+    convenience: the returned text is carried into `warnings` and printed by
+    the driver, so the pass that used it says so on the terminal and in its own
+    result, and the numbers cannot be quoted as if a neutral judge produced
+    them.
+
+    `== "1"` and not truthiness, which is the half that actually protects
+    anything. `BAKEOFF_ALLOW_NON_NEUTRAL_JUDGE=0` is what somebody writes to
+    turn the override OFF, and under a presence check it turns it on -- the
+    exact inversion, arrived at by a person trying to be careful.
+    """
+    monkeypatch.setenv(ALLOW_NON_NEUTRAL_JUDGE_ENV, "1")
+
+    warning = assert_neutral_judge("anthropic.claude-sonnet-5")
+
+    assert warning is not None
+    # LOUD: a banner a reader cannot skim past, the id, the rule, the variable
+    # that admitted it, and the measured size of the effect -- 33.7% against
+    # 14.13% is what makes "biased" a number rather than an adjective.
+    assert warning.startswith("NON-NEUTRAL JUDGE")
+    assert "'anthropic.claude-sonnet-5'" in warning
+    assert "§4.3" in warning
+    assert ALLOW_NON_NEUTRAL_JUDGE_ENV in warning
+    assert "33.7" in warning and "14.13" in warning
+
+    # The override says nothing about a neutral judge: no warning, no text to
+    # carry, nothing on the terminal.
+    assert assert_neutral_judge(JUDGE_MODEL_ID_DEFAULT) is None
+
+    # NOTHING ELSE DOES. Every one of these is a way somebody actually spells
+    # "on", and every one of them refuses.
+    for value in ("0", "", "true", "TRUE", "yes", "on", "01", " 1", "1 ", "2"):
+        monkeypatch.setenv(ALLOW_NON_NEUTRAL_JUDGE_ENV, value)
+        with pytest.raises(NonNeutralJudge):
+            assert_neutral_judge("anthropic.claude-sonnet-5")
+
+    monkeypatch.delenv(ALLOW_NON_NEUTRAL_JUDGE_ENV)
+    with pytest.raises(NonNeutralJudge):
+        assert_neutral_judge("anthropic.claude-sonnet-5")
 
 
 # --- the live completion seam ------------------------------------------------

@@ -126,11 +126,26 @@ about a decision somebody has to make while the batch is still running:
    walk rather than allowed to unwind through it, so the reading over everything
    the pass DID buy survives the way every long pass actually ends. Exit 130.
 
-And one refusal before any of it: `CollectionNotFound`. `EventLog.__init__`
-mkdirs `runs/`, so a mistyped `--event-log` used to be CREATED, found empty, and
-reported as a clean pass over zero units -- every number in it zero and none of
-them wrong. The check is the first statement of `judge_event_log`, before that
-constructor can run.
+And two refusals before any of it, in this order.
+
+`NonNeutralJudge` is first, because it is a refusal about the COMMAND rather
+than about anything on disk. §4.3 makes a neutral judge family mandatory -- the
+compared families are Anthropic, Google, NVIDIA and Moonshot, a Claude judge
+inflates Sonnet 5, and self-preference is measured rather than suspected -- and
+a judge from a compared family is the one failure nothing below can detect: the
+payloads are clean, the verdicts parse, the matrix fills in, the intervals are
+honest about sampling error and silent about the bias, and every number moves
+together. Placed second it could be masked by a typo in `--event-log`, which the
+operator would fix before re-running into the same biased pass.
+`BAKEOFF_ALLOW_NON_NEUTRAL_JUDGE=1` admits one anyway, loudly and in the
+result's `warnings` -- an environment variable and not a flag, for the reason
+the κ caveat has no flag either.
+
+`CollectionNotFound` is second. `EventLog.__init__` mkdirs `runs/`, so a
+mistyped `--event-log` used to be CREATED, found empty, and reported as a clean
+pass over zero units -- every number in it zero and none of them wrong. The
+check still runs before that constructor can; the guard above it reads nothing
+and creates nothing.
 
 Which is why `print_summary` ends every run with `KAPPA_CAVEAT`,
 unconditionally. OPEN-5 is blocked on people rather than on code, an unmeasured
@@ -202,7 +217,9 @@ from bakeoff.judge import (  # noqa: E402
     RUBRIC_VERSION,
     VOTE_POSITIONS,
     CompleteFn,
+    NonNeutralJudge,
     PayloadInputs,
+    assert_neutral_judge,
     is_auth_failure,
     judge_pair_vote,
     judge_rubric,
@@ -722,6 +739,36 @@ def _append_or_fail(path: Path, judgment: JudgeRecord) -> None:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _print_ascii_safe(line: str) -> None:
+    """`print`, surviving a stdout the environment pinned to ASCII.
+
+    ONE implementation for three lines that each carry text `str.encode`
+    can refuse: the per-unit progress line (collection-derived -- a task id,
+    model names, run ids), the neutral-judge warning and the refusal path in
+    `main` (both carry a `§`). On an ASCII stdout -- `LC_ALL=C`, or a pipe into
+    a tool that pinned it -- `print` raises `UnicodeEncodeError`, which is not
+    an `Exception` any per-unit handler catches: it goes past the breaker, past
+    `except KeyboardInterrupt` and out of `main`, taking a batch that had been
+    running for hours down on a traceback with no summary and no usage totals.
+
+    `backslashreplace` rather than a dropped line: an id an operator has to
+    grep for is worth more mangled than absent, and the escape is reversible.
+    The fallback is pure ASCII by construction, so it cannot raise the same
+    error a second time.
+
+    `_print_kappa_caveat` deliberately does NOT use this, and the difference is
+    what each line is FOR. An id is grepped, so mangling it into escapes keeps
+    it usable; the caveat is a claim a reader has to understand, and a sentence
+    delivered in escape sequences is one they skip. So that line keeps its
+    hand-written ASCII twin, which says the same thing in letters every
+    terminal has.
+    """
+    try:
+        print(line)
+    except UnicodeEncodeError:
+        print(line.encode("ascii", "backslashreplace").decode("ascii"))
 
 
 # ---------------------------------------------------------------------------
@@ -1276,13 +1323,27 @@ def judge_event_log(event_log_root, tasks, *,
     every line. Lines written before this change stay absolute and go on
     resolving, through `judge_schema.resolve_payload_path`.
 
-    Raises `CollectionNotFound` before touching anything, `ResumeRefused` if
-    either input file cannot be read completely, and nothing else: a batch that
-    got as far as the walk returns its partial reading whatever happens in it.
+    Raises `NonNeutralJudge` on the argument alone, `CollectionNotFound` before
+    touching anything, `ResumeRefused` if either input file cannot be read
+    completely, and nothing else: a batch that got as far as the walk returns
+    its partial reading whatever happens in it.
     """
-    # FIRST, and before `EventLog(...)` below, which mkdirs `runs/` -- see
-    # `CollectionNotFound`. `Path()` creates nothing, so this is still the
-    # first statement that could.
+    # FIRST, ahead of even the collection check, and the order is the content.
+    # This is a refusal about the COMMAND rather than about what is on disk:
+    # §4.3 makes a neutral judge family mandatory, and a judge from a compared
+    # family is the one failure nothing downstream can see -- the payloads are
+    # clean, the verdicts parse, the matrix fills in and every number in it
+    # shifts together. Placed after the collection check, a typo in
+    # `--event-log` would answer with the wrong refusal, and the operator would
+    # fix the path and re-run straight into the biased pass. It reads nothing,
+    # creates nothing and mints nothing, so `CollectionNotFound`'s own
+    # "before `EventLog(...)` mkdirs runs/" constraint is untouched.
+    #
+    # It also sits ahead of the resume: `done` cannot skip a unit under a judge
+    # this function would refuse, which is what keeps a re-judge from
+    # inheriting the first pass's model by accident.
+    non_neutral = assert_neutral_judge(judge_model_id)
+
     event_log_root = Path(event_log_root)
     if not (event_log_root / "runs").is_dir():
         raise CollectionNotFound(
@@ -1298,6 +1359,16 @@ def judge_event_log(event_log_root, tasks, *,
     path = judgments_path(event_log_root)
     payloads = payloads_root(event_log_root)
     warnings: list[str] = []
+
+    if non_neutral is not None:
+        # BOTH destinations, because they answer two readers. The terminal line
+        # reaches the operator while the pass is still cheap to stop -- above
+        # the census, before a credential is minted -- and the `warnings` entry
+        # reaches whoever reads the numbers afterwards, attached to the result
+        # that carries them. Either one alone leaves a reading that looks
+        # neutral to somebody.
+        warnings.append(non_neutral)
+        _print_ascii_safe(f"\n{non_neutral}")
 
     existing, malformed = load_judgments(path)
     if malformed and not re_judge:
@@ -1507,25 +1578,17 @@ def judge_event_log(event_log_root, tasks, *,
         been running for hours would die on a traceback with no summary, no
         usage totals and every remaining unit unbought. Exactly the failure
         class this whole section exists to remove, arriving from the code added
-        to remove it. `_print_kappa_caveat` carries the same guard for the same
-        reason, reached by an environment variable rather than by a flag.
-
-        `backslashreplace` rather than a dropped label: an id an operator has
-        to grep for is worth more mangled than absent, and the escape is
-        reversible. The fallback is pure ASCII by construction, so it cannot
-        raise the same error a second time.
+        to remove it. `_print_ascii_safe` is that guard, and it is shared with
+        the two other lines in this file that can carry text an ASCII terminal
+        refuses.
         """
         now = time.monotonic()
         progress["attempted"] += 1
-        line = (
+        _print_ascii_safe(
             f"[{progress['index']}/{progress['total']}] {progress['label']} "
             f"{status} (unit {_seconds(now - progress['start'])}, "
             f"elapsed {_elapsed(now - progress['batch_started'])})"
         )
-        try:
-            print(line)
-        except UnicodeEncodeError:
-            print(line.encode("ascii", "backslashreplace").decode("ascii"))
 
     def _unit_succeeded() -> None:
         """A unit produced its line, so whatever was failing is not systemic."""
@@ -3753,12 +3816,15 @@ def main(argv: list[str] | None = None) -> int:
             re_judge=args.re_judge,
             max_consecutive_errors=args.max_consecutive_errors,
         )
-    # `CollectionNotFound` beside `ResumeRefused`: two refusals, one exit path.
-    # Both mean the batch never ran, both print no numbers, and neither is
-    # something a flag can talk past -- so the operator gets the sentence and
-    # exit 1 rather than a traceback out of a driver they pointed at a typo.
-    except (ResumeRefused, CollectionNotFound) as exc:
-        print(f"\nREFUSED: {exc}")
+    # Three refusals, one exit path. All three mean the batch never ran, all
+    # three print no numbers, and none is something a flag can talk past -- so
+    # the operator gets the sentence and exit 1 rather than a traceback out of
+    # a driver they pointed at a typo or aimed at a judge from a compared
+    # family. `NonNeutralJudge` is the one whose message carries a `§`, which
+    # is why the print goes through the encoding guard: a refusal an ASCII
+    # terminal turns into a traceback is a refusal nobody reads.
+    except (ResumeRefused, CollectionNotFound, NonNeutralJudge) as exc:
+        _print_ascii_safe(f"\nREFUSED: {exc}")
         return 1
 
     print_summary(result)

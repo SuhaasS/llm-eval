@@ -53,6 +53,7 @@ import pytest
 from bakeoff.eventlog import EventLog
 from bakeoff.grade_schema import CheckResult, GradeRecord, append_grade
 from bakeoff.judge import (
+    ALLOW_NON_NEUTRAL_JUDGE_ENV,
     JUDGE_MODEL_ID_DEFAULT,
     JUDGE_PROMPT_VERSION,
     JUDGE_SAMPLING,
@@ -60,6 +61,7 @@ from bakeoff.judge import (
     RUBRIC_FLAGS,
     RUBRIC_VERSION,
     VOTE_POSITIONS,
+    NonNeutralJudge,
     _CANONICAL_VERDICTS,
     prompt_sha,
 )
@@ -343,6 +345,109 @@ def _bytes_under(root: Path) -> dict[str, bytes]:
         for p in sorted(root.rglob("*"))
         if p.is_file()
     }
+
+
+# --------------------------------------------------------------------------
+# 0. the judge's own family
+#
+# Numbered 0 because it happens before everything below it: §4.3's neutral
+# family is checked on the ARGUMENT, before the collection is opened, before a
+# credential is minted and before the resume can skip a single unit. The unit
+# behaviour of `assert_neutral_judge` is `test_judge.py`'s; what these two pin
+# is the wiring -- that the driver calls it first, that `main` answers a
+# refusal with a sentence instead of a traceback, and that the override's
+# warning reaches BOTH the result and the terminal.
+# --------------------------------------------------------------------------
+
+
+CLAUDE_JUDGE = "anthropic.claude-sonnet-5"
+
+
+def test_a_non_neutral_judge_is_refused_before_the_collection_is_even_read(
+    tmp_path, monkeypatch, capsys
+):
+    """The refusal is about the COMMAND, so nothing on disk can change it.
+
+    A judge from a compared family is the one failure this driver cannot
+    detect after the fact: the payloads are clean, the verdicts parse, the
+    matrix fills in and every number in it is shifted the same way. So the
+    guard runs on the argument, ahead of the `CollectionNotFound` check that
+    used to be the first statement -- and the ordering is asserted with a path
+    holding no `runs/` directory, where a guard placed second would answer with
+    the wrong refusal and let the operator fix the path and re-run into the
+    same biased pass.
+
+    Nothing is created, nothing is asked, and `main` turns it into a sentence
+    and exit 1 rather than a traceback, on the `ResumeRefused` precedent.
+
+    And there is NO FLAG, which is the κ caveat's philosophy applied to the
+    other unconditional rule in this file: a flag is how a mandatory rule
+    becomes a default, so the override is an environment variable an operator
+    has to type on purpose and cannot leave in a shell script by habit.
+    """
+    monkeypatch.delenv(ALLOW_NON_NEUTRAL_JUDGE_ENV, raising=False)
+    root = _two_arms(tmp_path)
+    fake = FakeComplete()
+
+    with pytest.raises(NonNeutralJudge):
+        _run(root, complete=fake, judge_model_id=CLAUDE_JUDGE)
+
+    assert fake.calls == 0
+    assert not judgments_path(root).exists()
+
+    # No `runs/` here, so `CollectionNotFound` is the refusal a guard placed
+    # after it would raise. The family is checked first.
+    with pytest.raises(NonNeutralJudge):
+        _run(tmp_path / "not-a-collection", judge_model_id=CLAUDE_JUDGE)
+
+    monkeypatch.setattr("scripts.judge.load_task_set", lambda *a, **k: [_task()])
+    monkeypatch.setattr(
+        "scripts.judge.live_completion",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no call")),
+    )
+    assert main([
+        "--event-log", str(root), "--judge-model", CLAUDE_JUDGE,
+    ]) == 1
+    out = capsys.readouterr().out
+    assert "REFUSED" in out
+    assert "4.3" in out
+
+    with pytest.raises(SystemExit):
+        main(["--help"])
+    help_text = capsys.readouterr().out.lower()
+    for banned in ("--allow-non-neutral", "--non-neutral", "--any-judge",
+                   "--no-judge-check"):
+        assert banned not in help_text
+
+
+def test_the_override_warning_reaches_the_result_and_the_terminal_both(
+    tmp_path, monkeypatch, capsys
+):
+    """`BAKEOFF_ALLOW_NON_NEUTRAL_JUDGE=1` admits the judge and says so twice.
+
+    Two destinations because they answer two different readers. `warnings` is
+    what a caller prints beside the matrix and what a later reader of this
+    result finds attached to the numbers; the terminal line is what the
+    operator sees while the pass is still running, next to the census, before
+    thousands of paid calls have been made against a judge that will inflate
+    one of the arms being compared.
+
+    The batch does RUN -- that is what "admits" means, and a probe of judge
+    self-preference is a real experiment -- so the lines are asserted present.
+    A warning attached to an empty batch would be a refusal wearing a
+    warning's clothes.
+    """
+    monkeypatch.setenv(ALLOW_NON_NEUTRAL_JUDGE_ENV, "1")
+    root = _two_arms(tmp_path)
+
+    result = _run(root, rubric=False, judge_model_id=CLAUDE_JUDGE)
+
+    (loud,) = [w for w in result["warnings"] if w.startswith("NON-NEUTRAL")]
+    assert CLAUDE_JUDGE in loud
+    assert loud in capsys.readouterr().out
+    assert len(_lines(root)) == 2
+    assert {j.judge_model_id for j in _lines(root)} == {CLAUDE_JUDGE}
+    assert result["errors"] == []
 
 
 # --------------------------------------------------------------------------
@@ -657,6 +762,167 @@ def test_only_tasks_selects_the_named_tasks(tmp_path):
     assert {j.task_id for j in _lines(root)} == {"calc-2"}
 
 
+# --- what the operator is told about what did NOT enter -----------------------
+#
+# Four warnings, and each one is the only signal for a mistake that otherwise
+# reads as a smaller collection. A batch that silently judges 40 of 60 tasks
+# reports a clean pass over the 40, and every rate in it is computed over a
+# denominator nobody chose.
+
+
+def test_orphan_grade_lines_are_warned_with_the_copied_file_diagnosis(tmp_path):
+    """A grade line naming a run this log does not hold, with the CAUSE named.
+
+    Run ids are `sha256(task|model|sample|attempt)[:16]` and unique within a
+    collection, not across one, so an id in `grades.jsonl` that no run answers
+    to almost always means the grade file came from somewhere else -- a copy, a
+    restored backup, a `--event-log` pointed one directory over. The warning
+    says that, because "3 grade line(s) name a run this event log does not
+    hold" on its own reads as data loss and sends an operator looking for
+    missing runs that were never here.
+
+    Silence is the failure this replaces: the orphans simply do not appear in
+    any cell, so the batch judges whatever DOES match -- possibly nothing --
+    and reports a clean pass over it.
+    """
+    root = _collection(
+        tmp_path,
+        [
+            _record("run-a", model="model-one", final_diff=DIFF_A),
+            _record("run-b", model="model-two", final_diff=DIFF_B),
+        ],
+        [
+            _grade("run-a", model="model-one"),
+            _grade("run-b", model="model-two"),
+            _grade("run-ghost", model="model-three"),
+        ],
+    )
+
+    result = _run(root, rubric=False)
+
+    (warning,) = [w for w in result["warnings"] if "run-ghost" in w]
+    assert "1 grade line(s)" in warning
+    assert "copied from another collection" in warning
+    assert result["errors"] == []
+
+
+def test_the_excluded_warning_counts_and_names_the_dropped_runs(tmp_path):
+    """`resolved is None` rows are dropped before pairing, and SAID SO.
+
+    Five such rows exist in `trucking-pilot-v2`, and an excluded row is not an
+    observation of the model -- ranking it ranks the infrastructure. But the
+    drop is invisible from the output: the arm simply has fewer comparisons,
+    which reads as a smaller sample rather than as rows that were removed. The
+    count and the ids are what let an operator decide whether the exclusions
+    are spread across arms or sitting entirely on one, which is the difference
+    between a narrower interval and a biased one.
+    """
+    root = _collection(
+        tmp_path,
+        [
+            _record("run-a", model="model-one", final_diff=DIFF_A),
+            _record("run-b", model="model-two", final_diff=DIFF_B),
+            _record("run-c", model="model-three", final_diff=DIFF_C),
+            _record("run-d", model="model-four", final_diff=DIFF_D),
+        ],
+        [
+            _grade("run-a", model="model-one"),
+            _grade("run-b", model="model-two"),
+            _grade("run-c", model="model-three", resolved=None),
+            _grade("run-d", model="model-four", resolved=None),
+        ],
+    )
+
+    result = _run(root, rubric=False)
+
+    (warning,) = [w for w in result["warnings"] if "excluded" in w]
+    assert "2 graded run(s)" in warning
+    assert "run-c, run-d" in warning
+    assert "resolved is null" in warning
+
+
+def test_only_task_ids_absent_from_the_log_are_warned_not_errored(tmp_path):
+    """A named task with no judgeable run is a WARNING, and the exit stays 0.
+
+    The exit contract is about units that were selected and exist, so an id
+    that selected nothing errors nothing -- but the usual cause is a pointer at
+    the wrong collection, where EVERY id is missing and the batch reports a
+    clean zero. The warning is the only thing between that and a satisfied
+    operator, and it names the ids so a typo is visible as a typo.
+
+    Only the absent id is named: an id that DID select work is not a problem,
+    and a warning listing every requested task would be a warning nobody reads.
+    """
+    root = _collection(
+        tmp_path,
+        [
+            _record("run-a", task_id="calc-1", model="model-one"),
+            _record("run-b", task_id="calc-1", model="model-two",
+                    final_diff=DIFF_B),
+        ],
+        [
+            _grade("run-a", task_id="calc-1", model="model-one"),
+            _grade("run-b", task_id="calc-1", model="model-two"),
+        ],
+    )
+
+    result = _run(root, [_task("calc-1"), _task("calc-9")], rubric=False,
+                  only_tasks=["calc-1", "calc-9"])
+
+    (warning,) = [w for w in result["warnings"] if "--only-task" in w]
+    assert "1 task(s)" in warning
+    assert "calc-9" in warning
+    assert "calc-1" not in warning
+    assert result["errors"] == []
+    assert len(_lines(root)) == 2
+
+
+def test_a_task_missing_from_the_task_set_is_warned_and_its_cells_skipped(
+    tmp_path,
+):
+    """A graded task absent from the loaded task set is skipped, and NAMED.
+
+    The payload is anchored on the manifest's prompt and solution diff, so
+    there is nothing to judge a submission against -- the cell cannot be
+    judged, and the driver walks past it. What it must not do is walk past it
+    quietly: a task set at the wrong commit, or one task folder missing, drops
+    those cells out of every rate in the summary while the pass exits 0 and
+    prints a matrix that looks complete.
+
+    Both halves are asserted, because they fail apart: a driver that warned and
+    then judged anyway would build a payload against another task's manifest,
+    and one that skipped without warning is the silence above.
+    """
+    root = _collection(
+        tmp_path,
+        [
+            _record("run-a", task_id="calc-1", model="model-one"),
+            _record("run-b", task_id="calc-1", model="model-two",
+                    final_diff=DIFF_B),
+            _record("run-c", task_id="calc-2", model="model-one"),
+            _record("run-d", task_id="calc-2", model="model-two",
+                    final_diff=DIFF_B),
+        ],
+        [
+            _grade("run-a", task_id="calc-1", model="model-one"),
+            _grade("run-b", task_id="calc-1", model="model-two"),
+            _grade("run-c", task_id="calc-2", model="model-one"),
+            _grade("run-d", task_id="calc-2", model="model-two"),
+        ],
+    )
+    fake = FakeComplete()
+
+    result = _run(root, [_task("calc-1")], complete=fake, rubric=False)
+
+    (warning,) = [w for w in result["warnings"] if "task set" in w]
+    assert "1 task(s)" in warning
+    assert "calc-2" in warning
+    assert {j.task_id for j in _lines(root)} == {"calc-1"}
+    # Skipped rather than asked about: two votes for calc-1 and nothing else.
+    assert fake.calls == 2
+    assert result["errors"] == []
+
+
 # --------------------------------------------------------------------------
 # 3. the vote protocol as the driver drives it
 # --------------------------------------------------------------------------
@@ -819,6 +1085,156 @@ def test_a_rubric_line_is_one_call_at_vote_index_zero(tmp_path):
     assert set(line.flags) == set(RUBRIC_FLAGS)
     assert line.judge_sampling == dict(JUDGE_SAMPLING)
     assert line.full_reasoning_text
+
+
+# --- the evidence fields: what a line PROVES about the call it names ----------
+#
+# `judge_prompt_sha` and `judge_sampling` are the two fields that attest to a
+# request. Everything else on a line is a claim; these two are the receipt, and
+# a receipt for a request nobody made is worse than none -- it is what makes a
+# fabricated line indistinguishable from a real one when the file is read in
+# bulk months later.
+
+
+def test_a_gate_decided_line_carries_an_empty_sha_and_an_empty_sampling_block(
+    tmp_path,
+):
+    """No call was made, so both as-sent fields are EMPTY rather than copied.
+
+    `judge_prompt_sha` and `judge_sampling` are populated from constants on
+    every other kind of line, which is exactly why they are the two easiest to
+    fill in here by habit -- `dict(JUDGE_SAMPLING)` is already on the line
+    above in both siblings. A gate-decided pair rendered no prompt and sent no
+    request, so a sha would attest to text that never existed and a sampling
+    block would describe a call nobody made. Read in bulk, that line is
+    indistinguishable from a vote.
+
+    The identity fields ARE populated beside them, and the contrast is the
+    point: `judge_model_id`, `judge_prompt_version` and `rubric_version` are
+    the resume key, so a later pass can see this unit is done. They say who
+    WOULD have been asked; the two above would say what was sent.
+    """
+    root = _two_arms(tmp_path, resolved_a=True, resolved_b=False)
+
+    _run(root, rubric=False)
+
+    (line,) = _lines(root)
+    assert line.verdict == "gate_decided"
+    assert line.judge_prompt_sha == ""
+    assert line.judge_sampling == {}
+    # The resume identity, populated, on the same line.
+    assert line.judge_model_id == JUDGE_MODEL_ID_DEFAULT
+    assert line.judge_prompt_version == JUDGE_PROMPT_VERSION
+    assert line.rubric_version == RUBRIC_VERSION
+
+
+def test_a_rubric_line_stores_the_sha_of_the_prompt_it_actually_sent_and_the_sampling_as_sent(  # noqa: E501
+    tmp_path,
+):
+    """The sha is of the text the model saw, carried out of `judge_rubric`.
+
+    Rebuilding the prompt at record-assembly time produces the same bytes
+    today and is the shape that lets them differ tomorrow -- a renderer that
+    grew a timestamp, a payload re-serialized in another key order, a retry
+    that re-rendered. The record would still hold a 64-hex digest, still look
+    like evidence, and attest to a prompt nobody sent. `judge_prompt_sha` is
+    the only thing that makes `judge_prompt_version` an honest declaration
+    rather than a label, so it is asserted against the prompt the SEAM saw and
+    not against anything the driver could recompute.
+
+    The sampling block is asserted as a COPY, and asserted on the IN-MEMORY
+    record rather than on the line read back: a `JudgeRecord` reconstructed
+    from JSON holds a fresh dict whatever the driver did, so the same
+    assertion over `_lines(root)` is one that is always true. Storing the
+    module constant itself would hand every record in the campaign one shared
+    dict, where a caller normalizing a value on one silently rewrites what
+    every other record claims to have sent.
+    """
+    root = _collection(tmp_path, [_record("run-a")], [_grade("run-a")])
+    fake = FakeComplete()
+
+    result = _run(root, complete=fake, rubric=True)
+
+    (line,) = _lines(root)
+    (sent,) = fake.prompts
+    # The prompt the model saw, identified by content rather than by index
+    # alone: a sha over an empty string or over the payload is also 64 hex.
+    assert "Fix the adder in calc-1." in sent
+    assert line.judge_prompt_sha == prompt_sha(sent)
+    assert line.judge_prompt_sha != prompt_sha("")
+
+    assert line.judge_sampling == dict(JUDGE_SAMPLING)
+    (built,) = result["judged"]
+    assert built.judge_sampling == dict(JUDGE_SAMPLING)
+    assert built.judge_sampling is not JUDGE_SAMPLING
+
+
+def test_a_vote_line_records_the_sampling_block_as_sent(tmp_path):
+    """Both votes carry the sampling the call went out under, each its own copy.
+
+    Temperature 0 is what makes two forced positions the whole of the signal --
+    a comparison judged at temperature 1 is two draws rather than two positions,
+    and the position-consistency figure taken off it measures sampling noise
+    instead of position bias. The stored block is the only place a reader can
+    check that after the fact, and a reader who finds it empty cannot tell a
+    temperature-0 pass from a temperature-1 one.
+
+    The cap is spelled `max_completion_tokens` because that is the name it left
+    under: the candidate arms reach that spelling through a litellm patch this
+    module deliberately never imports, so a line recording `max_tokens` would
+    describe a call that went out uncapped.
+
+    The copy check runs over the records the DRIVER built, not the ones read
+    back: a `JudgeRecord` reconstructed from a JSON line holds a fresh dict
+    whatever the driver did, so `is not` over `_lines(root)` asserts nothing.
+    """
+    root = _two_arms(tmp_path)
+
+    result = _run(root, rubric=False)
+
+    lines = _lines(root)
+    assert len(lines) == 2
+    for line in lines:
+        assert line.judge_sampling == dict(JUDGE_SAMPLING)
+        assert line.judge_sampling["temperature"] == 0.0
+        assert "max_completion_tokens" in line.judge_sampling
+        assert "max_tokens" not in line.judge_sampling
+
+    first, second = result["judged"]
+    assert first.judge_sampling is not JUDGE_SAMPLING
+    # Two records, two dicts: one shared object would make a later
+    # normalization of either rewrite both -- and the campaign's whole file.
+    assert first.judge_sampling is not second.judge_sampling
+
+
+def test_a_rubric_line_names_exactly_the_one_grade_generation_it_was_gated_on(
+    tmp_path,
+):
+    """One entry, for its own run -- not the pair's two, and not none.
+
+    A verdict is only interpretable against the grade generation it saw: a
+    re-grade under a new `GRADER_VERSION` can flip `resolved`, which changes
+    which runs are eligible for a rubric call at all. `grade_version_seen` is
+    what lets a later reader tell a profile scored under grader 2 from one
+    scored under grader 3, and an empty dict there is not "unknown" -- it reads
+    as a line nobody can date, sitting in an append-only file beside lines that
+    can be.
+
+    Exactly one key, because a rubric is about one run. The pairwise sibling
+    carries two and that difference is the schema's, not an accident of which
+    dict was in scope.
+    """
+    root = _collection(
+        tmp_path,
+        [_record("run-a")],
+        [_grade("run-a", grader_version="7")],
+    )
+
+    _run(root, rubric=True)
+
+    (line,) = _lines(root)
+    assert line.kind == "rubric"
+    assert line.grade_version_seen == {"run-a": "7"}
 
 
 SECRET_DIFF = """diff --git a/src/calc.py b/src/calc.py
@@ -1365,6 +1781,141 @@ def test_main_passes_the_judge_model_through(tmp_path, monkeypatch):
     lines = _lines(root)
     assert len(lines) == 2
     assert {j.judge_model_id for j in lines} == {"openai.gpt-5.6-terra"}
+
+
+def _cli(monkeypatch, tasks=None, complete=None):
+    """Wire `main` to a task set and a seam without touching the network.
+
+    The three tests below are about ARGPARSE-TO-DRIVER wiring and nothing else,
+    so both of `main`'s outside edges are replaced: `load_task_set` (which would
+    otherwise read `taskset/` off disk) and `live_completion` (which would mint
+    a credential). What is left is exactly the mapping from a flag to a keyword
+    argument -- which is untested code with three real ways to be silently
+    wrong, since a flag wired to nothing produces a batch that runs, exits 0 and
+    quietly judges the wrong set of units.
+    """
+    monkeypatch.setattr(
+        "scripts.judge.load_task_set", lambda *a, **k: tasks or [_task()]
+    )
+    monkeypatch.setattr(
+        "scripts.judge.live_completion",
+        lambda *a, **k: complete if complete is not None else FakeComplete(),
+    )
+
+
+def test_re_judge_from_the_command_line_appends_rather_than_skips(
+    tmp_path, monkeypatch
+):
+    """`--re-judge` has to reach `re_judge`, or the resume silently wins.
+
+    The flag's whole job is to defeat the resume, and a flag wired to nothing
+    fails in the direction that looks like success: every unit is already
+    judged, so every unit is skipped, the pass exits 0 in a second and prints a
+    summary computed off the OLD verdicts. An operator re-judging a collection
+    after a prompt fix would read that as confirmation rather than as a batch
+    that did nothing.
+    """
+    root = _two_arms(tmp_path)
+    _cli(monkeypatch)
+
+    assert main(["--event-log", str(root), "--no-rubric"]) == 0
+    first = _lines(root)
+    assert len(first) == 2
+
+    assert main([
+        "--event-log", str(root), "--no-rubric", "--re-judge",
+    ]) == 0
+
+    second = _lines(root)
+    assert len(second) == 4
+    # Appended, not replaced: the first two lines are still the first two.
+    assert [j.judgment_id for j in second[:2]] == [
+        j.judgment_id for j in first
+    ]
+
+
+def test_samples_from_the_command_line_select_exactly_the_named_indices(
+    tmp_path, monkeypatch
+):
+    """`--samples 1` judges sample 1 and nothing else.
+
+    Subsampling SAMPLES is §4.2.3's answer to a binding cost budget -- dropping
+    pairs breaks the Elo graph's connectivity, while subsampling only widens
+    the intervals -- so this flag is the one an operator reaches for when the
+    money is real. Wired to nothing it judges every sample, which is the
+    opposite of the request and is discovered on the invoice.
+
+    `type=int` matters here too: the driver compares against
+    `record.sample_index`, an int, so a string "1" from argparse would select
+    nothing at all and report a clean pass over zero units.
+    """
+    root = _collection(
+        tmp_path,
+        [
+            _record("run-a0", model="model-one", sample_index=0),
+            _record("run-b0", model="model-two", sample_index=0,
+                    final_diff=DIFF_B),
+            _record("run-a1", model="model-one", sample_index=1,
+                    final_diff=DIFF_C),
+            _record("run-b1", model="model-two", sample_index=1,
+                    final_diff=DIFF_B),
+        ],
+        [
+            _grade("run-a0", model="model-one"),
+            _grade("run-b0", model="model-two"),
+            _grade("run-a1", model="model-one"),
+            _grade("run-b1", model="model-two"),
+        ],
+    )
+    _cli(monkeypatch)
+
+    assert main([
+        "--event-log", str(root), "--no-rubric", "--samples", "1",
+    ]) == 0
+
+    assert {
+        (j.sample_index, j.run_id_a, j.run_id_b) for j in _lines(root)
+    } == {(1, "run-a1", "run-b1")}
+
+
+def test_only_task_from_the_command_line_reaches_the_selection(
+    tmp_path, monkeypatch
+):
+    """`--only-task calc-2` judges calc-2 and leaves calc-1 unbought.
+
+    This is the flag the breaker's own abort message tells an operator to
+    reach for -- a collection holding units that fail deterministically aborts
+    every resume in the same place, and narrowing the selection is one of the
+    two documented ways out. A flag that did not reach the selection would make
+    that advice wrong, at the moment somebody is following it to get a stuck
+    campaign moving.
+    """
+    root = _collection(
+        tmp_path,
+        [
+            _record("run-a", task_id="calc-1", model="model-one"),
+            _record("run-b", task_id="calc-1", model="model-two",
+                    final_diff=DIFF_B),
+            _record("run-c", task_id="calc-2", model="model-one"),
+            _record("run-d", task_id="calc-2", model="model-two",
+                    final_diff=DIFF_B),
+        ],
+        [
+            _grade("run-a", task_id="calc-1", model="model-one"),
+            _grade("run-b", task_id="calc-1", model="model-two"),
+            _grade("run-c", task_id="calc-2", model="model-one"),
+            _grade("run-d", task_id="calc-2", model="model-two"),
+        ],
+    )
+    _cli(monkeypatch, tasks=[_task("calc-1"), _task("calc-2")])
+
+    assert main([
+        "--event-log", str(root), "--no-rubric", "--only-task", "calc-2",
+    ]) == 0
+
+    lines = _lines(root)
+    assert {j.task_id for j in lines} == {"calc-2"}
+    assert len(lines) == 2
 
 
 def test_there_is_no_vote_count_flag_to_set(tmp_path, monkeypatch, capsys):
@@ -4227,11 +4778,27 @@ def test_the_kappa_caveat_says_exactly_what_it_has_to_say():
 def test_no_command_line_flag_offers_to_suppress_the_caveat(capsys):
     """The tripwire for the way the caveat actually dies: somebody adds
     `--quiet` or `--no-caveat` and the printout becomes conditional. There is no
-    such flag, and this fails the moment one appears."""
+    such flag, and this fails the moment one appears.
+
+    THE POSITIVE ASSERTIONS ARE THE TEST'S OWN TRIPWIRE. A `not in` sweep over
+    captured stdout passes perfectly on an EMPTY string, so anything that stops
+    the help text reaching this capture -- a parser that writes it to stderr, a
+    `SystemExit` raised before argparse formats anything, a `main` that grew an
+    early return -- would leave the sweep asserting nothing while staying
+    green. Two flags that must be there are asserted alongside, so the sweep is
+    only ever read against a help text that actually arrived.
+
+    Those two rather than any two: `--event-log` is required, so its absence is
+    a driver nobody can invoke, and `--max-consecutive-errors` is the operator's
+    only escape from a collection whose deterministic failures abort every
+    resume in the same place.
+    """
     with pytest.raises(SystemExit):
         main(["--help"])
 
     text = capsys.readouterr().out.lower()
+    assert "--event-log" in text
+    assert "--max-consecutive-errors" in text
     for banned in ("--quiet", "--no-caveat", "--no-kappa", "--brief",
                    "--no-summary"):
         assert banned not in text

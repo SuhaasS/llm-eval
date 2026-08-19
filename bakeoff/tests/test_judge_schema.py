@@ -215,6 +215,72 @@ def test_a_blank_line_is_damage_not_padding(tmp_path: Path):
     assert malformed == 1
 
 
+def test_a_json_line_that_is_not_an_object_is_counted_malformed_not_fatal(
+    tmp_path: Path,
+):
+    """Valid JSON that is not a mapping is DAMAGE, and it has its own branch.
+
+    `json.loads` accepts a list, a bare string and a number, so none of them
+    reaches the decode guard above -- they arrive at `from_dict` intact, where
+    `_build` asks for `.items()` and gets an `AttributeError`. That is not one
+    of the two exceptions the construction guard names, so without the
+    isinstance check it propagates out of `load_judgments` and takes every good
+    verdict after it in the file with it: the driver's resume then cannot read
+    what has already been judged, and the batch either refuses or re-buys
+    thousands of verdicts it already owns.
+
+    The three shapes are the three a truncation or a stray tool actually
+    produces -- a JSON array where a line was expected, a quoted string, a
+    number -- and each is counted once.
+    """
+    path = tmp_path / "judgments.jsonl"
+    path.write_text(
+        json.dumps(_rubric("j1").to_dict()) + "\n"
+        + '[{"judgment_id": "j-list"}]\n'
+        + '"just a string"\n'
+        + "42\n"
+        + json.dumps(_pairwise("j2").to_dict()) + "\n"
+    )
+
+    records, malformed = load_judgments(path)
+
+    assert [r.judgment_id for r in records] == ["j1", "j2"]
+    assert malformed == 3
+
+
+def test_a_line_that_parses_but_cannot_construct_a_record_is_counted_not_fatal(
+    tmp_path: Path,
+):
+    """A JSON object missing a required field is countable damage too.
+
+    The commonest way to get one is a hand edit: somebody opens the file to
+    remove a bad verdict, deletes a few too many keys, and leaves an object
+    that parses. `_build` filters unknown keys but cannot invent missing ones,
+    so the dataclass constructor raises `TypeError` -- and it must be COUNTED,
+    for the reason every other damage branch here is counted. An exception
+    escaping this loop loses every verdict below the damaged line, which is
+    the append-only file's whole tail: the newest verdicts, the ones a resume
+    most needs to see.
+
+    A field of the wrong TYPE is deliberately not tested as a second case:
+    dataclasses do not enforce annotations, so `judge_prompt_version: "two"`
+    constructs. Nothing here pretends otherwise.
+    """
+    path = tmp_path / "judgments.jsonl"
+    path.write_text(
+        json.dumps(_rubric("j1").to_dict()) + "\n"
+        # Parses, and is a mapping, and can never be a JudgeRecord: `judged_at`,
+        # `kind`, `task_id` and five more have no default.
+        + json.dumps({"judgment_id": "j-hand-edited"}) + "\n"
+        + json.dumps(_pairwise("j2").to_dict()) + "\n"
+    )
+
+    records, malformed = load_judgments(path)
+
+    assert [r.judgment_id for r in records] == ["j1", "j2"]
+    assert malformed == 1
+
+
 def test_missing_file_loads_as_empty(tmp_path: Path):
     """Nothing has been judged yet is the first state every collection is in."""
     assert load_judgments(tmp_path / "nope.jsonl") == ([], 0)
