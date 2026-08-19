@@ -126,6 +126,23 @@ TEST_HALF_DIFF = (
 
 REFERENCE_DIFF = SOLUTION_DIFF + TEST_HALF_DIFF
 
+# A SECOND submission, for the pairwise. Deliberately distinct from both
+# `CANDIDATE_DIFF` and `SOLUTION_DIFF`: reusing the solution diff here reads as
+# harmless -- it is a plausible submission and it differs from the candidate --
+# but it is also the payload's reference anchor, so any assertion of the form
+# `SOLUTION_DIFF in prompt` is satisfied by the reference section and pins
+# nothing about submission B. Two renderer bugs survived that collision: a
+# renderer that dropped `submission_second` entirely, and one that showed the
+# two submissions under swapped labels.
+OTHER_CANDIDATE_DIFF = (
+    "diff --git a/calc.py b/calc.py\n"
+    "--- a/calc.py\n"
+    "+++ b/calc.py\n"
+    "@@ -1,2 +1,2 @@ def add(a, b):\n"
+    "-    return a - b\n"
+    "+    return sum((a, b))\n"
+)
+
 # Both sides touch a changelog `allow_extra_paths` excluded from both halves.
 CHANGELOG_CHUNK = (
     "diff --git a/CHANGELOG.md b/CHANGELOG.md\n"
@@ -923,8 +940,13 @@ def _inputs(**kw) -> PayloadInputs:
 
 
 def _other_inputs() -> PayloadInputs:
-    """A second, distinguishable submission on the SAME task."""
-    return _inputs(artifacts=Artifacts(final_diff=SOLUTION_DIFF))
+    """A second submission on the SAME task, distinct from the reference too.
+
+    See `OTHER_CANDIDATE_DIFF`: a fixture that reused `SOLUTION_DIFF` here
+    would collide with the payload's own reference anchor, and every prompt
+    assertion about submission B would be satisfied by the reference section.
+    """
+    return _inputs(artifacts=Artifacts(final_diff=OTHER_CANDIDATE_DIFF))
 
 
 # --- parsing -----------------------------------------------------------------
@@ -1094,22 +1116,42 @@ def test_the_rendered_prompt_contains_the_payload_diffs_verbatim():
     A renderer that trimmed a diff would change what was judged while the
     stored payload went on showing the whole thing, and `judge_prompt_sha`
     would attest to the trimmed text nobody kept.
+
+    Asserted by POSITION, not by membership. Membership is the weaker claim
+    and it is weak in a way that matters: it holds for a renderer that shows a
+    diff under the wrong heading, and the pairwise labels ARE the vote. A
+    consistent label swap inverts every verdict in the file while the payload,
+    the position assignment and the sha all stay exactly right, which is the
+    "complete, confident, inverted Elo table" this module is built to prevent.
     """
     inputs = _inputs()
+
     rubric = render_rubric_prompt(build_rubric_payload(inputs))
     assert inputs.task_prompt in rubric
-    assert SOLUTION_DIFF in rubric
-    assert CANDIDATE_DIFF in rubric
     # The check names and statuses the ladder established, and nothing more.
     assert "f2p" in rubric and "not_configured" in rubric
+
+    reference_at = rubric.index("## Reference change")
+    submitted_at = rubric.index("## Submitted change")
+    assert reference_at < submitted_at
+    assert reference_at < rubric.index(SOLUTION_DIFF, reference_at)
+    assert rubric.index(SOLUTION_DIFF, reference_at) < submitted_at
+    assert submitted_at < rubric.index(CANDIDATE_DIFF, submitted_at)
 
     pairwise = render_pairwise_prompt(
         build_pairwise_payload(inputs, _other_inputs())
     )
     assert inputs.task_prompt in pairwise
-    assert CANDIDATE_DIFF in pairwise
-    assert SOLUTION_DIFF in pairwise
-    assert "Submission A" in pairwise and "Submission B" in pairwise
+
+    a_at = pairwise.index("## Submission A")
+    b_at = pairwise.index("## Submission B")
+    assert a_at < b_at
+    assert a_at < pairwise.index(CANDIDATE_DIFF, a_at) < b_at
+    assert b_at < pairwise.index(OTHER_CANDIDATE_DIFF, b_at)
+    # The reference anchor sits in its own section above both, and -- now that
+    # no submission reuses it -- appears exactly once.
+    assert pairwise.count(SOLUTION_DIFF) == 1
+    assert pairwise.index(SOLUTION_DIFF) < a_at
 
 
 def test_the_rubric_prompt_anchors_every_dimension_and_flag():
@@ -1261,7 +1303,7 @@ def test_seeded_rng_produces_both_position_assignments_and_maps_verdicts_back_co
             else:
                 assert outcome.position_assignment == "b_first"
                 assert outcome.payload["submission_first"]["diff"] == (
-                    SOLUTION_DIFF
+                    OTHER_CANDIDATE_DIFF
                 )
                 assert outcome.verdict == second_wins
 
