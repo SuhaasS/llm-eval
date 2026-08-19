@@ -67,15 +67,15 @@ picks up the same command where it stopped.
 
 The breaker has one failure mode of ITS own, and three things are placed
 against it. A collection holding a run of units that fail DETERMINISTICALLY --
-one unreadable record takes every pair its arm is in -- aborts, and the resume
-attempts the same units in the same order and aborts identically, forever. So
-the limit is `--max-consecutive-errors` rather than a constant; the abort names
-every unit in the failing run by task, sample and arm rather than by run-id
-hash, so the operator can act on it with `--only-task`; and it asks
+one record with no `final_diff` takes every pair its arm is in -- aborts, and
+the resume attempts the same units in the same order and aborts identically,
+forever. So the limit is `--max-consecutive-errors` rather than a constant; the
+abort names every unit in the failing run by task, sample and arm rather than
+by run-id hash, so the operator can act on it with `--only-task`; and it asks
 `is_auth_failure` what the run was actually about instead of asserting a
-credential problem it cannot see. A unit whose run could not be read is
-pre-filtered out of the breaker entirely -- it never reached the judge, so it
-is no evidence about the judge.
+credential problem it cannot see. A unit whose run yields no judgeable payload
+is pre-filtered out of the breaker entirely -- it never reached the judge, so
+it is no evidence about the judge.
 
 THE SUMMARY IS A PRINTOUT, NOT A STORED SCORE
 ---------------------------------------------
@@ -299,9 +299,10 @@ class _BatchAborted(RuntimeError):
     is the wrong one -- the pass that follows an abort is skip-heavy by
     construction, so a counter a skip could reset would never reach the limit
     again and the breaker would be off for exactly the pass it was written for.
-    A unit whose run could not be read is PRE-FILTERED before the `try` for the
-    same reason from the other side: it is not evidence about the judge, and
-    counting it let one unusable run abort a batch with nothing else wrong.
+    A unit whose run yields no judgeable payload is PRE-FILTERED before the
+    `try` for the same reason from the other side: it is not evidence about the
+    judge, and counting it let one unjudgeable run abort a batch with nothing
+    else wrong.
 
     The message is built from the failing run itself -- every unit named, and
     `is_auth_failure` asked about each -- so it diagnoses rather than guesses.
@@ -649,7 +650,7 @@ def _gate_decided_line(task, sample_index: int, run_id_a: str, run_id_b: str,
 # ---------------------------------------------------------------------------
 
 
-def _unit_label(kind: str, task_id: str, sample_index: int | None,
+def _unit_label(kind: str, task_id: str, sample_index: int,
                 models: Sequence[str], run_ids: Sequence[str]) -> str:
     """One unit, named in the fields an operator can actually act on.
 
@@ -675,6 +676,11 @@ def _unit_label(kind: str, task_id: str, sample_index: int | None,
     responsible for keeping them so -- canonical a/b is the two RUN IDS sorted,
     which is not the model order, so a caller that passed `sorted(cell)` beside
     `(run_id_a, run_id_b)` would print a label naming each arm as the other.
+
+    `sample_index` is an `int` and not `int | None`. Every unit belongs to a
+    cell and a cell is keyed `(task_id, sample_index)`, so there is no caller
+    without one -- and the widened type would only ever print `sample=None`,
+    which is the field failing at the one job it is here for.
     """
     who = " vs ".join(models)
     noun = "run" if len(run_ids) == 1 else "runs"
@@ -799,8 +805,8 @@ def judge_event_log(event_log_root, tasks, *,
     batch still returns: everything already judged is on disk and in the
     summary, and the abort is a warning beside the errors rather than an
     exception out of this function. The run it counts is a run of units
-    ATTEMPTED here: a unit the resume skipped and a unit whose run could not be
-    read are neither, for the two different reasons `_BatchAborted` gives. The
+    ATTEMPTED here: a unit the resume skipped and a unit whose run yields no
+    payload are neither, for the two reasons `_BatchAborted` gives. The
     CLI validates the limit at `>= 1`; a caller passing less gets a breaker
     that fires on the first error it sees, which is a hair trigger rather than
     an exception worth raising from here.
@@ -891,9 +897,16 @@ def judge_event_log(event_log_root, tasks, *,
         try:
             records[run_id] = log.read_run(run_id)
         except Exception as exc:  # noqa: BLE001 - one run, not the batch
+            # Named by task and arm as well as by id. A run id is
+            # `sha256(task|model|sample|attempt)[:16]`, so the id alone tells
+            # an operator nothing they can act on -- this is the one path a
+            # GENUINE read failure takes, and it was reporting the digest and
+            # nothing else. `sample_index` is not on a `GradeRecord`, so this
+            # cannot be a full `_unit_label`; task and model are what the
+            # grade line has, and they close most of the gap.
             errors.append(
-                f"{run_id}: could not be read from the event log: "
-                f"{type(exc).__name__}: {exc}"
+                f"run {run_id} (task={grade.task_id} {grade.model}) could not "
+                f"be read from the event log: {type(exc).__name__}: {exc}"
             )
     if excluded:
         warnings.append(
@@ -942,7 +955,13 @@ def judge_event_log(event_log_root, tasks, *,
     # `_judgeable_inputs` the first time one is asked for, so a run that fails
     # to build is diagnosed once and then costs nothing for every further unit
     # it appears in.
-    unreadable: dict[str, str] = {}
+    #
+    # NOT "unreadable": these runs were read, and `records` holds them. What
+    # they could not produce is a payload. The distinction is the whole content
+    # of the two error phrasings -- a run that failed `EventLog.read_run` and a
+    # run whose record has no `final_diff` are different faults with different
+    # fixes, and one phrase over both is a claim that is false for one of them.
+    unjudgeable: dict[str, str] = {}
 
     # The breaker's state: the units attempted-and-failed since the last
     # success, each beside what `is_auth_failure` said about the exception that
@@ -976,22 +995,31 @@ def judge_event_log(event_log_root, tasks, *,
             raise _BatchAborted(_abort_message(failure_run))
 
     def _unit_not_judged(label: str, run_ids: Sequence[str]) -> None:
-        """One line for a unit whose run cannot be read. NOT a breaker event.
+        """One line for a unit whose run yielded no payload. NOT a breaker
+        event.
 
         The unit never reached the judge, so it is no evidence about the judge.
         Counting it is what deadlocked a collection with nothing else wrong:
-        one unusable run takes seven units in a four-arm cell (its rubric call,
-        and both votes of each of its three pairs), and on the RESUME those
-        seven are the only ones attempted -- every judgeable unit is already
-        bought and skipped -- so the fifth of them aborts the pass, under a
-        message blaming a credential that was working the whole time.
+        one unjudgeable run takes seven units in a four-arm cell (its rubric
+        call, and both votes of each of its three pairs), and on the RESUME
+        those seven are the only ones attempted -- every judgeable unit is
+        already bought and skipped -- so the fifth of them aborts the pass,
+        under a message blaming a credential that was working the whole time.
         Measured: the first pass judged 9 units and the next three resumes each
         judged 0 and aborted in the same place.
+
+        "YIELDED NO JUDGEABLE PAYLOAD", never "could not be read". The run WAS
+        read -- it is in `records`, and its record is what the parenthesised
+        cause was raised over. "Could not be read from the event log" is the
+        genuine read failure's phrasing, verbatim, and reusing it here would
+        put two different faults under one sentence: an operator grepping that
+        phrase would collect both and act on the wrong one, and the leading
+        clause would contradict the `ValueError` printed beside it.
         """
         why = "; ".join(
-            f"run {run_id} could not be read from the event log "
-            f"({unreadable[run_id]})"
-            for run_id in run_ids if run_id in unreadable
+            f"run {run_id} yielded no judgeable payload "
+            f"({unjudgeable[run_id]})"
+            for run_id in run_ids if run_id in unjudgeable
         )
         errors.append(f"{label}: not judged: {why}")
 
@@ -1008,18 +1036,23 @@ def judge_event_log(event_log_root, tasks, *,
         it, it was a run of identical failures the breaker could not tell from
         a dead credential.
 
+        The early return is the working half of that: the SECOND unit to ask
+        about a run already known bad gets `None` without re-raising, so the
+        seven units of a four-arm cell cost one diagnosis rather than seven.
+
         `records[run_id]` is expected to be present -- cells are grouped out of
         `records`, so a run that failed to READ never reaches a unit and its
-        one error line is already recorded above -- and a `KeyError` from it
-        would land in the same place with the same shape rather than taking the
-        walk down.
+        one error line is already recorded above, under its own phrasing. A
+        `KeyError` from it would land in the same place with the same shape
+        rather than taking the walk down; that arm is unreachable today and is
+        kept as a structural guard.
         """
-        if run_id in unreadable:
+        if run_id in unjudgeable:
             return None
         try:
             return _inputs_for(cache, records[run_id], grade, task)
         except Exception as exc:  # noqa: BLE001 - one run, not the batch
-            unreadable[run_id] = f"{type(exc).__name__}: {exc}"
+            unjudgeable[run_id] = f"{type(exc).__name__}: {exc}"
             return None
 
     try:
@@ -1131,9 +1164,15 @@ def judge_event_log(event_log_root, tasks, *,
                     if not re_judge and key in done:
                         skipped.append(key)
                         continue
+                    # The POSITION rides along with the index, as the string
+                    # this replaced carried it. It is derivable -- `enumerate`
+                    # over `VOTE_POSITIONS` ties the two -- but an error line
+                    # is read by somebody who does not have that mapping in
+                    # front of them, and `a_first`/`b_first` is what the stored
+                    # `position_assignment` calls the same thing.
                     label = _unit_label(
-                        f"vote {vote_index}", task_id, sample_index, arms,
-                        (run_id_a, run_id_b),
+                        f"vote {vote_index} ({position})", task_id,
+                        sample_index, arms, (run_id_a, run_id_b),
                     )
                     # Bound before the call rather than inline: two positional
                     # `PayloadInputs` four lines apart is where an a/b

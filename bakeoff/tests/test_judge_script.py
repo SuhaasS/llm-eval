@@ -1652,6 +1652,14 @@ def test_one_unreadable_run_fails_its_pairs_with_one_line_each_and_never_trips_t
     catches it (`resolved is None`, dropped before pairing), so reaching the
     walk means a grade line from a pass that saw a different record -- which is
     exactly the collection an operator arrives with.
+
+    The WORDING is asserted, not just the count. This run was read -- it is in
+    `records`, and the `ValueError` printed beside it came out of
+    `payload_inputs_from` -- so the line must not claim a read failure. "Could
+    not be read from the event log" is the genuine read failure's phrasing
+    verbatim; one phrase over both faults makes a grep for either return both,
+    one of them under a claim that is false, and it would contradict the cause
+    printed in the same sentence.
     """
     root = _collection(
         tmp_path,
@@ -1674,13 +1682,53 @@ def test_one_unreadable_run_fails_its_pairs_with_one_line_each_and_never_trips_t
 
     # One rubric unit and three pairs at two votes each.
     assert len(result["errors"]) == 7
-    assert all("could not be read" in line for line in result["errors"])
+    assert all("yielded no judgeable payload" in line
+               for line in result["errors"])
+    assert not any("could not be read" in line for line in result["errors"])
     assert all("run-d" in line for line in result["errors"])
+    assert all("no artifacts.final_diff" in line for line in result["errors"])
     assert not any("consecutive" in w for w in result["warnings"])
     # The nine units that never touched run-d were judged, and not one of the
     # seven paid for a call.
     assert fake.calls == 9
     assert len(_lines(root)) == 9
+
+
+def test_a_run_that_cannot_be_read_is_reported_by_task_and_arm_not_by_digest(
+    tmp_path,
+):
+    """The other fault, under its own phrasing and named the same way.
+
+    A run id is `sha256(task|model|sample|attempt)[:16]`
+    (`runner.make_run_id`), so those fields ARE its preimage and a line
+    carrying only the digest tells an operator nothing they can act on -- the
+    complaint this whole task was raised over, on the one path a genuine read
+    failure takes. `GradeRecord` has no `sample_index`, so this cannot be a
+    full `_unit_label`; the task and the arm are what the grade line holds.
+
+    The run never reaches a cell -- grouping is over the records that READ --
+    so it produces no units, costs no call, and has nothing to do with the
+    breaker. That is why it needs its own line: it is the only report this run
+    gets.
+    """
+    root = _two_arms(tmp_path)
+    corrupt = root / "runs" / "run-b.json"
+    corrupt.write_text("{not json at all", encoding="utf-8")
+    fake = FakeComplete()
+
+    result = _run(root, complete=fake, rubric=True)
+
+    (line,) = result["errors"]
+    assert "run run-b" in line
+    assert "task=calc-1" in line, "the id's preimage, not just the digest"
+    assert "model-two" in line
+    assert "could not be read from the event log" in line
+    # Its own phrasing, distinct from the pre-filter's: these are two faults
+    # with two fixes, and a grep for either must not return both.
+    assert "yielded no judgeable payload" not in line
+    # One arm left in the cell, so one rubric unit and no pair at all.
+    assert fake.calls == 1
+    assert len(_lines(root)) == 1
 
 
 # --------------------------------------------------------------------------
