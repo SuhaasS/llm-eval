@@ -60,10 +60,10 @@ THE SUMMARY IS A PRINTOUT, NOT A STORED SCORE
 ---------------------------------------------
 
 `summarize` reads the judgment file back and says what it holds: a pairwise
-win-rate matrix per model pair (primary), a rubric PROFILE per model
-(diagnostic -- per-dimension means and flag rates, never summed, never joined
-to `resolved`), and an Elo table that FOLLOWS the win rates rather than
-adjudicating them. Nothing it computes is written anywhere, on `grade.py
+win-rate matrix per model pair (primary), a rubric PROFILE per model and judge
+generation (diagnostic -- per-dimension means with the count each was taken
+over, plus flag rates; never summed, never joined to `resolved`), and an Elo
+table that FOLLOWS the win rates rather than adjudicating them. Nothing it computes is written anywhere, on `grade.py
 summarize`'s precedent and for a sharper reason: a stored Elo is a published
 number, and §4.3 forbids publishing one without the κ that was in force.
 
@@ -1009,6 +1009,7 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
     dropped = {
         "unreadable_kind": 0,
         "unreadable_verdict": 0,
+        "unreadable_rubric": 0,
         "unknown_model_rubric": 0,
         "unknown_model_comparison": 0,
         "same_model_comparison": 0,
@@ -1142,7 +1143,9 @@ def _last_line_per_judgment(judgments: list[JudgeRecord]) -> list[JudgeRecord]:
 
 def _rubric_profile(rubric_lines: list[JudgeRecord],
                     model_of: dict[str, str], dropped: dict) -> dict:
-    """Per model: the mean of each dimension, and the rate of each flag.
+    """Per model AND per judge generation: the mean of each dimension, and the
+    rate of each flag. Keyed
+    `(model, judge_model_id, judge_prompt_version, rubric_version)`.
 
     A PROFILE, never a score. Summing five dimensions into one number is the
     absolute 1-10 rating §4.2.3 rules out, wearing a rubric's clothes -- it is
@@ -1155,6 +1158,17 @@ def _rubric_profile(rubric_lines: list[JudgeRecord],
     Per model rather than pooled. Two arms averaged into one row says nothing
     about either, which is the one thing a diagnostic output must not do.
 
+    THE THREE VERSION FIELDS ARE IN THE KEY, for `_resume_key`'s reason and
+    `_comparison_key`'s. `_resume_key` keys a rubric line on
+    `("rubric", run_id, judge_model_id, judge_prompt_version, rubric_version)`,
+    so one run re-judged under a bumped rubric survives the dedupe as TWO lines
+    -- that is the point of the key. Grouping on the model alone would then
+    average two rubrics into one row under a `runs` count that is really a line
+    count: bump `RUBRIC_VERSION`, re-judge one arm, and every dimension mean for
+    that arm silently blends two scales beside a doubled denominator. Two
+    generations disagreeing about one run is the finding an append-only file
+    exists to keep, so they get two blocks and the reader compares them.
+
     The dimension and flag NAMES come from the records rather than from
     `RUBRIC_DIMENSIONS`, and are sorted. A judgment written under a later
     `rubric_version` can carry a sixth dimension, both generations coexist in
@@ -1162,18 +1176,25 @@ def _rubric_profile(rubric_lines: list[JudgeRecord],
     the newer rubric added -- the schema reader's `_build` reasoning, one layer
     up.
     """
-    by_model: dict[str, list[JudgeRecord]] = {}
+    by_key: dict[tuple, list[JudgeRecord]] = {}
     for judgment in rubric_lines:
+        if not _readable_rubric(judgment):
+            dropped["unreadable_rubric"] += 1
+            continue
         model = model_of.get(judgment.run_id)
         if model is None:
             dropped["unknown_model_rubric"] += 1
             continue
-        by_model.setdefault(model, []).append(judgment)
+        by_key.setdefault(
+            (model, judgment.judge_model_id, judgment.judge_prompt_version,
+             judgment.rubric_version),
+            [],
+        ).append(judgment)
 
-    profile: dict[str, dict] = {}
-    for model in sorted(by_model):
-        rows = by_model[model]
-        profile[model] = {
+    profile: dict[tuple, dict] = {}
+    for key in sorted(by_key):
+        rows = by_key[key]
+        profile[key] = {
             "runs": len(rows),
             "dimensions": _means(rows, "dimension_scores"),
             "flags": _means(rows, "flags"),
@@ -1181,18 +1202,60 @@ def _rubric_profile(rubric_lines: list[JudgeRecord],
     return profile
 
 
-def _means(rows: list[JudgeRecord], attribute: str) -> dict[str, float]:
-    """Mean of one dict-valued field, per key, over the rows that carry it.
+def _readable_rubric(judgment: JudgeRecord) -> bool:
+    """Whether a rubric line can be averaged at all.
+
+    Checked BEFORE the line reaches `_means`, because `sum(values) / len(values)`
+    raises `TypeError` on a hand-edited `dimension_scores` holding a string or a
+    `None` -- and `summarize` runs inside `judge_event_log`'s return, so that
+    exception would destroy the result of a batch that already paid for
+    thousands of calls. Precisely the failure `dropped` exists to prevent, and a
+    damaged rubric line gets the same treatment a pairwise line with an
+    unreadable verdict gets: counted, named, never raised.
+
+    A line missing either half, or carrying an EMPTY half, is unreadable rather
+    than "readable but contributing nothing". Counting it in `runs` while it
+    moves no mean is a denominator that grows with no number under it moving --
+    the same invisible-denominator failure the per-dimension counts in `_means`
+    are placed against. `kind == "rubric"` asserts both halves are populated, so
+    a line missing one is damaged, not partial.
+
+    Dimensions must be `int` and NOT `bool`; flags must be `bool`. `bool` is a
+    subclass of `int`, so without the second half of that test a `True` in a
+    dimension slot would average in as a 1, and a `2` in a flag slot would
+    report as a 200% flag rate.
+    """
+    scores, flags = judgment.dimension_scores, judgment.flags
+    if not isinstance(scores, dict) or not scores:
+        return False
+    if not isinstance(flags, dict) or not flags:
+        return False
+    if any(not isinstance(value, int) or isinstance(value, bool)
+           for value in scores.values()):
+        return False
+    return all(isinstance(value, bool) for value in flags.values())
+
+
+def _means(rows: list[JudgeRecord], attribute: str) -> dict[str, dict]:
+    """Per key: `{"mean": ..., "n": ...}` over the rows that carry that key.
+
+    THE COUNT TRAVELS WITH THE MEAN, because the block's `runs` cannot stand in
+    for it. The names are read from the records, so a dimension present on 3 of
+    40 lines is a shape this walk produces -- a newer rubric's sixth dimension
+    against an older one's five, both live in an append-only file. Reporting its
+    mean beside a `runs` of 40 with nothing saying 3 is a denominator moving
+    invisibly, which is the failure `dropped` exists to prevent, one level down.
 
     `bool` is a subclass of `int`, so the flag rates and the dimension means are
     the same arithmetic and share this walk rather than drifting apart in two
-    copies.
+    copies. `_readable_rubric` has already refused everything else, so there is
+    nothing left here to raise on.
     """
-    blocks = [getattr(row, attribute) or {} for row in rows]
-    means: dict[str, float] = {}
+    blocks = [getattr(row, attribute) for row in rows]
+    means: dict[str, dict] = {}
     for name in sorted({name for block in blocks for name in block}):
         values = [block[name] for block in blocks if name in block]
-        means[name] = sum(values) / len(values)
+        means[name] = {"mean": sum(values) / len(values), "n": len(values)}
     return means
 
 
@@ -1277,18 +1340,26 @@ def _print_reading(result: dict) -> None:
         )
 
     print(
-        "\nrubric profile per model -- diagnostic, never summed across "
-        "dimensions and never joined to resolved"
+        "\nrubric profile per model and judge generation -- diagnostic, never "
+        "summed across dimensions and never joined to resolved. Each mean is "
+        "on its own rubric's anchored scale, over the n line(s) that carried "
+        "that name"
     )
-    for model, row in sorted(summary["rubric_profile"].items()):
-        print(f"  {model}  ({row['runs']} run(s))")
+    for key, row in sorted(summary["rubric_profile"].items()):
+        model, judge_model_id, prompt_version, rubric_version = key
+        # The generation is named beside every block, never folded into one.
+        # Two rubric versions disagreeing about one arm is the finding.
+        print(
+            f"  {model}  ({row['runs']} run(s); judge {judge_model_id}, "
+            f"prompt v{prompt_version}, rubric {rubric_version})"
+        )
         # One column width across both blocks, wide enough for the longest
         # label either can produce, so the means and the rates line up under
         # each other rather than under two different left edges.
-        for name, mean in sorted(row["dimensions"].items()):
-            print(f"    {name:26} {mean:.2f}  (of 2)")
-        for name, rate in sorted(row["flags"].items()):
-            print(f"    {'flag ' + name:26} {rate:.1%}")
+        for name, cell in sorted(row["dimensions"].items()):
+            print(f"    {name:26} {cell['mean']:.2f}  (n={cell['n']})")
+        for name, cell in sorted(row["flags"].items()):
+            print(f"    {'flag ' + name:26} {cell['mean']:.1%}  (n={cell['n']})")
 
     print(
         f"\nElo -- DESCRIPTIVE, it follows the win rates above rather than "

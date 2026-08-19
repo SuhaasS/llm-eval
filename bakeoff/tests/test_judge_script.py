@@ -1163,17 +1163,27 @@ def _gate(run_id_a, run_id_b, by, *, sample_index=0, **kw):
 
 def _rubric(run_id, *, scores=2, flags=False, **kw):
     """One rubric line. `scores`/`flags` take a scalar for "same on every
-    dimension" or a dict for a specific profile."""
-    if not isinstance(scores, dict):
+    dimension", a dict for a specific profile, or `None` verbatim -- which is
+    how the damaged-line cases reach the reader with a half missing."""
+    if scores is not None and not isinstance(scores, dict):
         scores = {name: scores for name in RUBRIC_DIMENSIONS}
-    if not isinstance(flags, dict):
+    if flags is not None and not isinstance(flags, dict):
         flags = {name: flags for name in RUBRIC_FLAGS}
     return _judgment(
         kind="rubric", run_id=run_id, vote_index=0,
-        dimension_scores=dict(scores), flags=dict(flags),
+        dimension_scores=None if scores is None else dict(scores),
+        flags=None if flags is None else dict(flags),
         input_payload_path="/payloads/y.json.gz", input_payload_sha="t" * 64,
         **kw,
     )
+
+
+def _generation(model, judge_model_id=JUDGE_MODEL_ID_DEFAULT,
+                prompt_version=JUDGE_PROMPT_VERSION,
+                rubric_version=RUBRIC_VERSION):
+    """The key a rubric profile block sits under: the arm, and the judge
+    generation that profiled it."""
+    return (model, judge_model_id, prompt_version, rubric_version)
 
 
 def _empty_result() -> dict:
@@ -1336,30 +1346,108 @@ def test_rubric_profile_reports_per_dimension_means_and_never_a_sum():
         }),
     ]
 
-    row = summarize(judgments, MODEL_OF)["rubric_profile"]["model-one"]
+    row = summarize(judgments, MODEL_OF)["rubric_profile"][
+        _generation("model-one")
+    ]
 
     assert set(row) == {"runs", "dimensions", "flags"}
     assert row["runs"] == 2
-    assert row["dimensions"] == {
+    assert {name: cell["mean"] for name, cell in row["dimensions"].items()} == {
         "functional_equivalence": pytest.approx(1.0),
         "completeness": pytest.approx(1.5),
         "cross_file_consistency": pytest.approx(2.0),
         "scope_discipline": pytest.approx(2.0),
         "convention_adherence": pytest.approx(1.0),
     }
-    assert row["flags"] == {
+    assert {name: cell["mean"] for name, cell in row["flags"].items()} == {
         "introduced_stub": pytest.approx(0.5),
         "left_debug_artifacts": pytest.approx(0.0),
         "wrote_tests": pytest.approx(1.0),
     }
-    # No aggregate ANYWHERE in the profile -- not at the top, not per model.
+    # No aggregate ANYWHERE in the profile -- not at the top, not per block, not
+    # among the dimension names. The per-dimension cell holds the mean of ONE
+    # dimension and the count behind it, which is the opposite of an aggregate.
     banned = {"total", "sum", "score", "overall", "mean", "rank", "resolved"}
     assert not banned & set(row)
     assert not banned & set(row["dimensions"])
     assert not banned & set(summarize(judgments, MODEL_OF))
+    for cell in row["dimensions"].values():
+        assert set(cell) == {"mean", "n"}
 
 
-def test_the_rubric_profile_is_per_model_not_pooled(tmp_path):
+def test_each_dimension_carries_the_count_it_was_averaged_over():
+    """The names are read from the records, not from `RUBRIC_DIMENSIONS`, so a
+    dimension carried by some lines and not others is a shape this walk
+    produces -- a newer rubric's sixth against an older one's five. Its mean
+    printed beside the block's `runs`, with nothing saying how many lines it
+    actually came from, is a denominator moving invisibly."""
+    judgments = [
+        _rubric("run-a", scores={"functional_equivalence": 2}),
+        _rubric("run-a1", scores={
+            "functional_equivalence": 0, "novel_dimension": 2,
+        }),
+    ]
+
+    row = summarize(judgments, MODEL_OF)["rubric_profile"][
+        _generation("model-one")
+    ]
+
+    assert row["runs"] == 2
+    assert row["dimensions"]["functional_equivalence"] == {
+        "mean": pytest.approx(1.0), "n": 2,
+    }
+    # Carried by ONE of the two lines, and the profile says so rather than
+    # letting a reader assume the block's `runs` of 2.
+    assert row["dimensions"]["novel_dimension"] == {
+        "mean": pytest.approx(2.0), "n": 1,
+    }
+
+
+def test_two_rubric_generations_for_one_run_are_two_blocks_not_one_average():
+    """`_resume_key` keys a rubric line on the three version fields, so a run
+    re-judged under a bumped rubric survives the dedupe as TWO lines -- that is
+    the point of the key. Grouping the profile on the model alone would blend
+    two rubrics into one row under a `runs` count that is really a line count.
+    """
+    judgments = [
+        _rubric("run-a", scores=2, rubric_version="1.0.0"),
+        _rubric("run-a", scores=0, rubric_version="2.0.0"),
+    ]
+
+    profile = summarize(judgments, MODEL_OF)["rubric_profile"]
+
+    assert set(profile) == {
+        _generation("model-one", rubric_version="1.0.0"),
+        _generation("model-one", rubric_version="2.0.0"),
+    }
+    for version, expected in (("1.0.0", 2.0), ("2.0.0", 0.0)):
+        block = profile[_generation("model-one", rubric_version=version)]
+        # One run, not two: `runs` counts runs under ONE generation, and never
+        # lines across generations.
+        assert block["runs"] == 1
+        assert block["dimensions"]["completeness"] == {
+            "mean": expected, "n": 1,
+        }
+
+
+def test_a_changed_judge_model_or_prompt_version_also_splits_the_profile():
+    """The same rule for the other two thirds of a generation. A verdict is only
+    reproducible against the model that gave it and the prompt text it saw, so
+    neither may be averaged across."""
+    judgments = [
+        _rubric("run-a", scores=2),
+        _rubric("run-a", scores=0, judge_model_id="openai.gpt-5.6-luna"),
+        _rubric("run-a", scores=1,
+                judge_prompt_version=JUDGE_PROMPT_VERSION + 1),
+    ]
+
+    profile = summarize(judgments, MODEL_OF)["rubric_profile"]
+
+    assert len(profile) == 3
+    assert all(block["runs"] == 1 for block in profile.values())
+
+
+def test_the_rubric_profile_is_per_model_not_pooled():
     """Pooling is how a profile stops being a profile: two arms averaged into
     one row says nothing about either."""
     judgments = [
@@ -1369,9 +1457,64 @@ def test_the_rubric_profile_is_per_model_not_pooled(tmp_path):
 
     profile = summarize(judgments, MODEL_OF)["rubric_profile"]
 
-    assert set(profile) == {"model-one", "model-two"}
-    assert profile["model-one"]["dimensions"]["completeness"] == 2.0
-    assert profile["model-two"]["dimensions"]["completeness"] == 0.0
+    assert set(profile) == {_generation("model-one"), _generation("model-two")}
+    for model, expected in (("model-one", 2.0), ("model-two", 0.0)):
+        assert profile[_generation(model)]["dimensions"]["completeness"][
+            "mean"
+        ] == expected
+
+
+def test_a_rubric_line_with_an_unscorable_value_is_counted_not_raised():
+    """`sum(values) / len(values)` raises `TypeError` on a hand-edited score
+    holding a string or a `None` -- and a `None` passes a `name in block` guard.
+    `summarize` runs inside `judge_event_log`'s return, so that exception would
+    destroy the result of a batch that already paid for thousands of calls."""
+    good = _rubric("run-a", scores=2)
+    for bad_value in (None, "excellent", True, 1.5):
+        damaged = {**dict.fromkeys(RUBRIC_DIMENSIONS, 2),
+                   "completeness": bad_value}
+
+        summary = summarize([good, _rubric("run-a1", scores=damaged)],
+                            MODEL_OF)
+
+        assert summary["dropped"]["unreadable_rubric"] == 1
+        block = summary["rubric_profile"][_generation("model-one")]
+        assert block["runs"] == 1
+        assert block["dimensions"]["completeness"] == {"mean": 2.0, "n": 1}
+
+
+def test_a_rubric_line_with_a_score_in_a_flag_slot_is_unreadable():
+    """`bool` is a subclass of `int`. Without the second half of the type test a
+    `2` in a flag slot would report as a 200% flag rate, and a `True` in a
+    dimension slot would average in as a 1."""
+    judgments = [
+        _rubric("run-a", flags={**dict.fromkeys(RUBRIC_FLAGS, False),
+                                "wrote_tests": 2}),
+    ]
+
+    summary = summarize(judgments, MODEL_OF)
+
+    assert summary["rubric_profile"] == {}
+    assert summary["dropped"]["unreadable_rubric"] == 1
+
+
+def test_a_rubric_line_with_no_scores_is_unreadable_not_a_silent_denominator():
+    """The explicit choice: an empty or absent half makes the line UNREADABLE
+    rather than "readable and contributing nothing". Counting it in `runs` while
+    it moves no mean is a denominator that grows with no number under it
+    moving -- the same invisible-denominator failure the per-dimension counts
+    are placed against."""
+    for empty in ({}, None):
+        for kwargs in ({"scores": empty}, {"flags": empty}):
+            summary = summarize(
+                [_rubric("run-a", scores=2), _rubric("run-a1", **kwargs)],
+                MODEL_OF,
+            )
+
+            assert summary["dropped"]["unreadable_rubric"] == 1
+            assert summary["rubric_profile"][
+                _generation("model-one")
+            ]["runs"] == 1
 
 
 def test_elo_is_deterministic_over_a_fixed_outcome_set():
@@ -1474,7 +1617,7 @@ def test_a_comparison_whose_arms_cannot_be_named_is_dropped_and_counted():
     assert set(summary["comparisons"]) == {("model-one", "model-two")}
     assert summary["dropped"]["unknown_model_comparison"] == 1
     assert summary["dropped"]["unknown_model_rubric"] == 1
-    assert "model-one" not in summary["rubric_profile"]
+    assert summary["rubric_profile"] == {}
 
 
 def test_a_comparison_with_one_model_on_both_sides_is_dropped_and_counted():
@@ -1664,7 +1807,45 @@ def test_the_summary_prints_the_matrix_the_profile_and_the_elo_table(
     assert "elo" in out.lower()
     assert "functional_equivalence" in out
     assert "wrote_tests" in out
+    # The generation is named beside the profile block, and every mean carries
+    # the count it was taken over. Neither is inferable from the block header.
+    assert f"rubric {RUBRIC_VERSION}" in out
+    assert f"prompt v{JUDGE_PROMPT_VERSION}" in out
+    assert JUDGE_MODEL_ID_DEFAULT in out
+    assert "n=1" in out
     assert KAPPA_CAVEAT in out
+
+
+def test_the_printed_profile_carries_each_dimension_count_beside_its_mean(
+    capsys,
+):
+    """A mean on the terminal without its own denominator is what this pins.
+    The block's `runs` cannot stand in: two lines here carry
+    `functional_equivalence` and only one carries `novel_dimension`, so the two
+    means are over different denominators under one `2 run(s)` header.
+
+    Asserted on the DIMENSION lines specifically. A blanket `"n=" in out` is
+    satisfied by the flag block below it, which is how a dimension line that
+    lost its count would slip through.
+    """
+    result = _empty_result()
+    result["summary"] = summarize(
+        [
+            _rubric("run-a", scores={"functional_equivalence": 2}),
+            _rubric("run-a1", scores={
+                "functional_equivalence": 0, "novel_dimension": 2,
+            }),
+        ],
+        MODEL_OF,
+    )
+
+    print_summary(result)
+
+    lines = capsys.readouterr().out.splitlines()
+    (shared,) = [line for line in lines if "functional_equivalence" in line]
+    (partial,) = [line for line in lines if "novel_dimension" in line]
+    assert "n=2" in shared
+    assert "n=1" in partial
 
 
 def test_the_summary_mentions_a_superseded_gate_decided_line_when_there_is_one(
@@ -1714,7 +1895,9 @@ def test_summary_covers_the_campaign_not_the_invocation(tmp_path, capsys):
     assert summary["comparisons"][("model-one", "model-two")][
         "comparisons"
     ] == 1
-    assert set(summary["rubric_profile"]) == {"model-one", "model-two"}
+    assert set(summary["rubric_profile"]) == {
+        _generation("model-one"), _generation("model-two"),
+    }
 
     print_summary(second)
     out = capsys.readouterr().out
