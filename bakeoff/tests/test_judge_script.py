@@ -98,6 +98,7 @@ from scripts.judge import (
     _generation_of,
     _judge_generation,
     _print_kappa_caveat,
+    _recentred,
     _VOTE_VERDICTS,
     elo_from_outcomes,
     gating_view,
@@ -2781,7 +2782,8 @@ def test_position_consistency_counts_agreement_across_the_two_forced_positions()
     summary = summarize(judgments, MODEL_OF)
 
     assert summary["position_consistency"][_judge_gen()] == {
-        "measurable": 2, "consistent": 1, "rate": 0.5, "single_position": 0,
+        "measurable": 2, "consistent": 1, "rate": 0.5, "rate_ci95": (0.5, 0.5),
+        "single_position": 0, "position_unrecorded": 0,
     }
 
 
@@ -2804,7 +2806,8 @@ def test_a_v2_comparison_decided_on_one_position_is_counted_and_not_measurable()
     summary = summarize(judgments, MODEL_OF)
 
     assert summary["position_consistency"][_judge_gen()] == {
-        "measurable": 1, "consistent": 1, "rate": 1.0, "single_position": 1,
+        "measurable": 1, "consistent": 1, "rate": 1.0, "rate_ci95": (1.0, 1.0),
+        "single_position": 1, "position_unrecorded": 0,
     }
     # Still one comparison each in the matrix: visible, not dropped.
     assert summary["comparisons"][_judge_gen()][
@@ -2842,8 +2845,309 @@ def test_an_old_three_vote_comparison_is_measurable_only_when_both_positions_app
     summary = summarize(judgments, MODEL_OF)
 
     assert summary["position_consistency"][_judge_gen(prompt_version=1)] == {
-        "measurable": 2, "consistent": 1, "rate": 0.5, "single_position": 1,
+        "measurable": 2, "consistent": 1, "rate": 0.5, "rate_ci95": (0.5, 0.5),
+        "single_position": 1, "position_unrecorded": 0,
     }
+
+
+def test_a_comparison_whose_votes_record_no_position_gets_its_own_column():
+    """Two ways a `position_assignment` this reader cannot use reaches the
+    aggregation: a hand-edited line, and a line from a schema that never wrote
+    the field. Neither is measurable and neither rests on a KNOWN single
+    position, so a comparison made only of them belongs in a column of its
+    own -- absent from all three, it is a denominator moving invisibly, which
+    is the failure `dropped` is placed against one level down.
+
+    And the verdict set is taken over the same lines the position check
+    accepted. The second comparison here has both forced positions recorded and
+    agreeing, plus a third line with no position and the opposite verdict:
+    reading that verdict would mark the comparison inconsistent on the strength
+    of a line the measurable test had already thrown out, which is a position
+    effect reported off a line that records no position.
+    """
+    judgments = [
+        # Votes, no readable position anywhere in the comparison.
+        _vote("run-a", "run-b", "a", vote_index=0, sample_index=0,
+              position_assignment=None),
+        _vote("run-a", "run-b", "a", vote_index=1, sample_index=0,
+              position_assignment="somewhere-else"),
+        # Both positions recorded and agreeing, plus an unplaced dissenter.
+        _vote("run-a", "run-b", "a", vote_index=0, sample_index=1),
+        _vote("run-a", "run-b", "a", vote_index=1, sample_index=1),
+        _vote("run-a", "run-b", "b", vote_index=2, sample_index=1,
+              position_assignment=None),
+    ]
+
+    summary = summarize(judgments, MODEL_OF)
+
+    assert summary["position_consistency"][_judge_gen()] == {
+        "measurable": 1, "consistent": 1, "rate": 1.0, "rate_ci95": (1.0, 1.0),
+        "single_position": 0, "position_unrecorded": 1,
+    }
+
+
+def test_a_swept_pair_does_not_print_a_zero_width_interval_at_sixty_tasks():
+    """The boundary the bootstrap cannot express, and the one place a resampled
+    band lies rather than merely being wide.
+
+    Every resample of a pair one arm swept returns 1.0, and the percentiles of
+    a constant are that constant -- so the band printed was `[100.0%, 100.0%]`
+    at ANY task count, a 95% interval claiming the collection ruled out every
+    other value. A swept pair is not exotic: an arm the ladder gate-decided
+    against in every comparison is exactly this shape, and the pilot collection
+    has one at 9 of 9.
+
+    So a rate with no variation across resamples falls back to a Wilson score
+    interval on the TASK count: 60 swept tasks read as about [94%, 100%], which
+    is the figure an analyst computing it by hand would get, and two swept
+    tasks read as about [34%, 100%]. The consistency rate takes the same
+    fallback for the same reason -- a judge that agreed with itself on every
+    measurable comparison is the HEALTHY shape, so the degenerate resample is
+    the expected case there rather than the exception.
+
+    ONE TASK is deliberately left degenerate: there is nothing to resample, and
+    a Wilson band on n=1 would dress a single task up as a measurement of the
+    population. `test_win_rate_intervals_are_task_clustered_...` pins that end.
+    """
+    judgments = [
+        vote
+        for task in range(60)
+        for vote in _voted_pair("run-a", "run-b", "a", task_id=f"task-{task}")
+    ]
+
+    summary = summarize(judgments, MODEL_OF)
+
+    row = summary["comparisons"][_judge_gen()][("model-one", "model-two")]
+    low, high = row["win_rate_x_ci95"]
+    assert row["win_rate_x"] == 1.0
+    assert low < 1.0
+    assert high == pytest.approx(1.0)
+    assert low == pytest.approx(0.94, abs=0.01)
+    # The judge-voted rate is the same rate over the same comparisons here, and
+    # it gets the same treatment -- a second code path would be a second way to
+    # print a zero-width band.
+    assert row["win_rate_x_voted_ci95"] == (low, high)
+    consistency = summary["position_consistency"][_judge_gen()]
+    assert consistency["rate"] == 1.0
+    assert consistency["rate_ci95"] == (low, high)
+
+    # Two tasks, same sweep: the band is far wider, because two tasks say far
+    # less. Same rule, no threshold anywhere in the code.
+    thin = [
+        vote
+        for task in range(2)
+        for vote in _voted_pair("run-a", "run-b", "a", task_id=f"task-{task}")
+    ]
+
+    scarce = summarize(thin, MODEL_OF)["comparisons"][_judge_gen()][
+        ("model-one", "model-two")
+    ]
+
+    assert scarce["win_rate_x_ci95"][0] == pytest.approx(0.34, abs=0.01)
+
+
+def test_every_rating_resample_is_recentred_on_the_arms_it_shares_with_the_full_fit():
+    """Bradley-Terry identifies DIFFERENCES between strengths and nothing else,
+    so `elo_from_outcomes` anchors the mean of whatever arms it was handed at
+    1000. A resample that misses an arm therefore re-centres on a different arm
+    set, and every surviving arm's rating moves by the mean of the missing
+    ones -- a measured 69-point offset between one arm's samples with and
+    without another arm present. Those offset samples land in the percentiles
+    of arms that were never absent, so the anchor's movement is reported as
+    uncertainty about arms it says nothing about.
+
+    Re-centring is a pure translation onto the full fit's level over the shared
+    arms: every difference the resample fit survives it, and the level it lands
+    on is the one the printed point estimates are on.
+
+    The fixture is the shape that produces the offset -- `model-three` plays in
+    ONE of eight tasks, so a quarter of the resamples drop it entirely.
+    Measured on it: `model-two`'s band is 280 points wide re-centred and 428
+    points wide without, over a point estimate that does not move either way.
+    """
+    fit = {"a": 1100.0, "b": 900.0}
+    anchor = {"a": 1200.0, "b": 1000.0, "gone": 800.0}
+
+    shifted = _recentred(fit, anchor)
+
+    # The level matches over the shared arms, and the differences are intact.
+    assert shifted == {"a": 1200.0, "b": 1000.0}
+    assert shifted["a"] - shifted["b"] == fit["a"] - fit["b"]
+    # Nothing shared: no common level to move onto, so nothing is invented.
+    assert _recentred(fit, {"gone": 800.0}) == fit
+
+    judgments = [
+        vote
+        for task in range(8)
+        for vote in _voted_pair("run-a", "run-b", "a" if task % 2 else "b",
+                                task_id=f"task-{task}")
+    ]
+    judgments += [
+        vote
+        for sample in range(6)
+        for vote in (
+            *_voted_pair("run-a", "run-c", "a", sample_index=sample,
+                         task_id="task-0"),
+            *_voted_pair("run-b", "run-c", "a", sample_index=sample + 10,
+                         task_id="task-0"),
+        )
+    ]
+
+    summary = summarize(judgments, MODEL_OF)
+
+    low, high = summary["elo_ci95"][_judge_gen()]["model-two"]
+    assert low < summary["elo"][_judge_gen()]["model-two"] < high
+    # 280 re-centred, 428 without. Asserted with room either side: this pins
+    # that the anchor's movement is out of the band, not the exact width.
+    assert high - low < 350.0
+
+
+def test_the_voted_only_rates_and_the_consistency_rate_carry_intervals_too():
+    """§10.3 has no exemption in it: "any metric reported without a confidence
+    interval is not reported". The judge-voted rate is a win rate, the
+    judge-voted rating is a rating and the consistency rate is a rate, so all
+    three get the same treatment as the combined figures -- and out of the SAME
+    task resamples, so that a reader comparing the combined band with the
+    judge-voted band beside it is comparing draws of the collection that
+    actually happened together.
+
+    A rate that does not exist gets no band: `win_rate_x_voted_ci95` is `None`
+    exactly when `win_rate_x_voted` is, and an arm absent from the voted-only
+    fit is absent from its intervals too.
+    """
+    judgments = [
+        vote
+        for task in range(6)
+        for vote in (
+            *_voted_pair("run-a", "run-b", "a" if task % 3 else "b",
+                         sample_index=0, task_id=f"task-{task}"),
+            # The second comparison on each task splits its positions on two of
+            # the six, so the consistency rate has something to resample.
+            _vote("run-a", "run-b", "a", vote_index=0, sample_index=1,
+                  task_id=f"task-{task}"),
+            _vote("run-a", "run-b", "a" if task % 3 else "b", vote_index=1,
+                  sample_index=1, task_id=f"task-{task}"),
+        )
+    ]
+    judgments += [
+        _gate("run-a", "run-c", "a", sample_index=2, task_id="task-0"),
+    ]
+
+    summary = summarize(judgments, MODEL_OF)
+
+    block = summary["comparisons"][_judge_gen()]
+    row = block[("model-one", "model-two")]
+    voted_low, voted_high = row["win_rate_x_voted_ci95"]
+    assert voted_low < row["win_rate_x_voted"] < voted_high
+    # A pair with no judged comparison at all: no rate, and so no band either.
+    swept = block[("model-one", "model-three")]
+    assert swept["win_rate_x_voted"] is None
+    assert swept["win_rate_x_voted_ci95"] is None
+
+    consistency = summary["position_consistency"][_judge_gen()]
+    rate_low, rate_high = consistency["rate_ci95"]
+    assert rate_low < consistency["rate"] < rate_high
+
+    voted_elo = summary["elo_voted"][_judge_gen()]
+    voted_bands = summary["elo_voted_ci95"][_judge_gen()]
+    # `model-three` played one comparison and the ladder settled it, so it is
+    # in the combined fit and in neither voted-only table.
+    assert set(voted_elo) == set(voted_bands) == {"model-one", "model-two"}
+    assert "model-three" in summary["elo_ci95"][_judge_gen()]
+    for model, rating in voted_elo.items():
+        low, high = voted_bands[model]
+        assert low <= rating <= high
+
+
+def test_the_per_generation_seed_survives_a_different_process_hash_salt():
+    """`_bootstrap_seed` derives a seed from the generation, and the obvious
+    way to write it -- `hash((BOOTSTRAP_SEED,) + generation)` -- is wrong in a
+    way no in-process test can see. Python salts `hash()` for strings and
+    tuples per process (PYTHONHASHSEED), so the seed, and every band under it,
+    would differ between two runs of the SAME command on the SAME file. Inside
+    one interpreter the salt is fixed, so the equality test above stays green
+    and the damage only appears on someone else's machine, or on a re-run.
+
+    A SUBPROCESS PAIR, with the salt pinned to two different values, is the
+    only way to assert this at all. `hashlib` has no salt, which is why the
+    implementation uses it.
+    """
+    probe = "\n".join([
+        "import sys, uuid",
+        "sys.path.insert(0, 'bakeoff/src')",
+        "sys.path.insert(0, 'bakeoff')",
+        "from bakeoff.judge import (JUDGE_MODEL_ID_DEFAULT, "
+        "JUDGE_PROMPT_VERSION, JUDGE_SAMPLING, RUBRIC_VERSION)",
+        "from bakeoff.judge_schema import JudgeRecord",
+        "from scripts.judge import summarize",
+        "lines = [JudgeRecord(judgment_id=uuid.uuid4().hex,",
+        "    judged_at='2026-08-19T00:00:00Z',",
+        "    judge_model_id=JUDGE_MODEL_ID_DEFAULT,",
+        "    judge_prompt_version=JUDGE_PROMPT_VERSION,",
+        "    judge_prompt_sha='0' * 64,",
+        "    judge_sampling=dict(JUDGE_SAMPLING),",
+        "    rubric_version=RUBRIC_VERSION, kind='pairwise',",
+        "    task_id='task-' + str(task), sample_index=0,",
+        "    run_id_a='run-a', run_id_b='run-b', vote_index=index,",
+        "    position_assignment=('a_first', 'b_first')[index],",
+        "    verdict=('b' if task % 3 == 0 else 'a'),",
+        "    input_payload_path='/p/x.json.gz', input_payload_sha='s' * 64)",
+        "    for task in range(8) for index in (0, 1)]",
+        "summary = summarize(lines, "
+        "{'run-a': 'model-one', 'run-b': 'model-two'})",
+        "block = summary['comparisons'][list(summary['comparisons'])[0]]",
+        "print(block[('model-one', 'model-two')]['win_rate_x_ci95'])",
+    ])
+    printed = set()
+    for salt in ("0", "12345"):
+        done = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True, text=True, cwd=str(REPO_ROOT),
+            env={**os.environ, "PYTHONPATH": str(REPO_ROOT),
+                 "PYTHONDONTWRITEBYTECODE": "1", "PYTHONHASHSEED": salt},
+        )
+        assert done.returncode == 0, done.stderr
+        printed.add(done.stdout.strip())
+
+    # One band, from two processes that hash their strings differently. The
+    # band is asserted non-degenerate first, so this cannot pass by printing
+    # the point estimate twice.
+    (band,) = printed
+    low, high = eval(band)
+    assert low < high
+
+
+def test_a_foreign_generations_lines_cannot_move_another_generations_bands():
+    """One generator for the whole summary makes each block's draws depend on
+    how many blocks were resampled before it. Appending a single line under a
+    DIFFERENT oracle cannot change a v2 comparison, a v2 win rate or a v2
+    rating -- but with a shared generator it shifted the v2 bands anyway, by a
+    measured 2.8 rating points, with every point estimate byte-identical. A
+    band that moves when the collection did not is the failure the seed exists
+    to prevent; a band that moves because of a DIFFERENT oracle's lines reads
+    as a finding about that oracle.
+
+    `_bootstrap_seed` derives each block's seed from its own generation, so the
+    two blocks are independent no matter what else is in the file.
+    """
+    base = [
+        vote
+        for task in range(8)
+        for vote in _voted_pair("run-a", "run-b", "a" if task % 3 else "b",
+                                task_id=f"task-{task}")
+    ]
+    foreign = _voted_pair("run-a", "run-b", "b", task_id="task-0",
+                          judge_prompt_version=1)
+
+    alone = summarize(base, MODEL_OF)
+    beside = summarize(base + foreign, MODEL_OF)
+
+    assert set(beside["comparisons"]) == {
+        _judge_gen(), _judge_gen(prompt_version=1),
+    }
+    for key in ("comparisons", "elo", "elo_ci95", "elo_voted_ci95",
+                "position_consistency"):
+        assert alone[key][_judge_gen()] == beside[key][_judge_gen()], key
 
 
 def test_win_rate_intervals_are_task_clustered_so_one_task_collections_collapse_to_the_point():
@@ -2939,36 +3243,63 @@ def test_the_bootstrap_is_seeded_and_two_summaries_of_one_file_agree_exactly():
     in the last digit, which is where it looks like a real change in the
     collection rather than like noise the summary invented.
 
-    `random.Random(BOOTSTRAP_SEED)` per call, not a module-level generator:
-    module state would make the numbers depend on how many summaries this
-    process had already taken.
+    A generator built per BLOCK from `BOOTSTRAP_SEED` and the generation
+    (`_bootstrap_seed`), never module state: module state would make the
+    numbers depend on how many summaries this process had already taken.
+
+    THE FIXTURE HAS TO BE RICH TO PIN THIS, and the first version of this test
+    was not. Eight tasks at one rate per task put every resampled statistic on
+    a coarse lattice -- the pair rate can only be k/8 -- so the 2.5th and
+    97.5th percentiles land on the same two atoms in most runs and two
+    UNSEEDED summaries agree by accident about a fifth of the time. Twelve
+    tasks at three samples, three arms, per-task rates on a finer grid, some
+    comparisons the ladder settled and some positions that split gives ten-odd
+    bands that all have to coincide at once: measured, two unseeded summaries
+    disagreed in 20 of 20 trials.
 
     The constants are pinned to their literals for `test_ratings_are_mean_
     anchored`'s reason -- an interval whose resample count nobody recorded is
-    a number nobody can reproduce -- and the band is asserted non-degenerate so
-    the equality above has something to be equal about.
+    a number nobody can reproduce -- and the bands are asserted non-degenerate
+    so the equality above has something to be equal about.
     """
     assert (BOOTSTRAP_RESAMPLES, BOOTSTRAP_SEED) == (1000, 0)
 
-    judgments = [
-        vote
-        for sample in range(8)
-        for vote in _voted_pair(
-            "run-a", "run-b", "a" if sample % 3 else "b",
-            sample_index=sample, task_id=f"task-{sample}",
+    judgments = []
+    for task in range(12):
+        for sample in range(3):
+            judgments += _voted_pair(
+                "run-a", "run-b", "a" if sample < task % 4 else "b",
+                sample_index=sample, task_id=f"task-{task}",
+            )
+            # The two positions disagree on a third of these, so the
+            # consistency rate has a distribution of its own to resample.
+            split = (task + sample) % 3 == 0
+            judgments += [
+                _vote("run-a", "run-c", "a", vote_index=0,
+                      sample_index=sample + 10, task_id=f"task-{task}"),
+                _vote("run-a", "run-c", "b" if split else "a", vote_index=1,
+                      sample_index=sample + 10, task_id=f"task-{task}"),
+            ]
+        judgments.append(
+            _gate("run-b", "run-c", "b" if task % 2 else "a",
+                  sample_index=99, task_id=f"task-{task}")
         )
-    ]
 
     first = summarize(judgments, MODEL_OF)
     second = summarize(judgments, MODEL_OF)
 
     assert first == second
-    low, high = first["comparisons"][_judge_gen()][
-        ("model-one", "model-two")
-    ]["win_rate_x_ci95"]
-    assert low < high
-    ratings = first["elo_ci95"][_judge_gen()]
-    assert all(low < high for low, high in ratings.values())
+    block = first["comparisons"][_judge_gen()]
+    for pair, row in block.items():
+        low, high = row["win_rate_x_ci95"]
+        assert low < high, pair
+    assert all(
+        low < high for low, high in first["elo_ci95"][_judge_gen()].values()
+    )
+    consistency_low, consistency_high = first["position_consistency"][
+        _judge_gen()
+    ]["rate_ci95"]
+    assert consistency_low < consistency_high
 
 
 def test_a_three_vote_generation_and_a_two_vote_generation_report_side_by_side_never_pooled():
@@ -2998,14 +3329,16 @@ def test_a_three_vote_generation_and_a_two_vote_generation_report_side_by_side_n
     old, new = _judge_gen(prompt_version=1), _judge_gen()
     pair = ("model-one", "model-two")
     for key in ("position_consistency", "gate_decided_share", "elo_voted",
-                "elo_ci95"):
+                "elo_ci95", "elo_voted_ci95"):
         assert set(summary[key]) == {old, new}, key
 
     assert summary["position_consistency"][old] == {
-        "measurable": 1, "consistent": 0, "rate": 0.0, "single_position": 0,
+        "measurable": 1, "consistent": 0, "rate": 0.0, "rate_ci95": (0.0, 0.0),
+        "single_position": 0, "position_unrecorded": 0,
     }
     assert summary["position_consistency"][new] == {
-        "measurable": 1, "consistent": 1, "rate": 1.0, "single_position": 0,
+        "measurable": 1, "consistent": 1, "rate": 1.0, "rate_ci95": (1.0, 1.0),
+        "single_position": 0, "position_unrecorded": 0,
     }
     # The v1 generation holds no gate-decided comparison and the v2 one is half
     # gate-decided. Pooled, both arms would read 1 of 3.
@@ -3848,9 +4181,70 @@ def test_every_number_the_summary_gained_prints_above_the_kappa_caveat(capsys):
                    "gate-decided share"):
         assert marker in out, marker
         assert out.index(marker) < out.index(KAPPA_CAVEAT), marker
-    # The interval itself, beside the rate and beside the rating.
-    assert re.search(r"model-one \d+\.\d% \[\d+\.\d%, \d+\.\d%\]", out)
+    # The interval itself, beside the rate and beside the rating. Asserted on
+    # the COMBINED line by name rather than anywhere in the output: a blanket
+    # search is satisfied by the judge-voted line underneath, which is how the
+    # combined rate would lose its band and still pass.
+    (combined,) = [
+        line for line in out.splitlines()
+        if line.strip().startswith("combined")
+    ]
+    assert re.search(r"model-one \d+\.\d% \[\d+\.\d%, \d+\.\d%\]", combined)
     assert re.search(r"model-one\s+\d+\.\d\s+\[\s*\d+\.\d,\s+\d+\.\d\]", out)
+    # And beside the three numbers §10.3 would otherwise have left bare: the
+    # judge-voted rate, the judge-voted rating and the consistency rate.
+    (voted_line,) = [
+        line for line in out.splitlines() if "judge-voted only  model" in line
+    ]
+    assert re.search(r"\[\d+\.\d%, \d+\.\d%\]", voted_line)
+    (consistency_line,) = [
+        line for line in out.splitlines() if "position consistency" in line
+    ]
+    assert re.search(r"\[\d+\.\d%, \d+\.\d%\]", consistency_line)
+    assert re.search(
+        r"judge-voted only\s+\d+\.\d\s+\[\s*\d+\.\d,\s+\d+\.\d\]", out
+    )
+
+
+def test_the_printed_row_carries_the_second_arms_band_as_the_first_arms_mirror(
+    capsys,
+):
+    """The two rates on a row sum to 1 in every resample, so y's band is x's
+    mirrored -- `[1 - high, 1 - low]`, ends SWAPPED. Written `[1 - low, 1 -
+    high]` it comes out inverted, low above high, and every other assertion in
+    this file stays green: the numbers are individually right and the interval
+    is nonsense. This is the one test that reads the printed band rather than
+    the dict, because the mirror exists only on the terminal.
+    """
+    result = _empty_result()
+    result["summary"] = summarize(
+        [
+            vote
+            for task in range(6)
+            for vote in _voted_pair("run-a", "run-b",
+                                    "a" if task % 3 else "b",
+                                    task_id=f"task-{task}")
+        ],
+        MODEL_OF,
+    )
+
+    print_summary(result)
+
+    row = result["summary"]["comparisons"][_judge_gen()][
+        ("model-one", "model-two")
+    ]
+    low, high = row["win_rate_x_ci95"]
+    assert low < high
+    (combined,) = [
+        line for line in capsys.readouterr().out.splitlines()
+        if line.strip().startswith("combined")
+    ]
+    printed = re.findall(r"\[(\d+\.\d)%, (\d+\.\d)%\]", combined)
+    assert len(printed) == 2
+    for band in printed:
+        assert float(band[0]) < float(band[1])
+    assert printed[0] == (f"{low:.1%}"[:-1], f"{high:.1%}"[:-1])
+    assert printed[1] == (f"{1 - high:.1%}"[:-1], f"{1 - low:.1%}"[:-1])
 
 
 def test_the_summary_mentions_a_superseded_gate_decided_line_when_there_is_one(
