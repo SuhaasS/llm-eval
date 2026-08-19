@@ -63,6 +63,7 @@ from bakeoff.judge import (
     PayloadInputs,
     build_pairwise_payload,
     build_rubric_payload,
+    is_auth_failure,
     judge_pair_vote,
     judge_rubric,
     live_completion,
@@ -2027,6 +2028,40 @@ def test_an_auth_failure_with_no_replacement_token_raises_the_auth_error(
         live_completion()("RENDERED PROMPT")
 
     assert len(built) == 1
+
+
+def test_the_auth_classifier_answers_both_callers_and_never_reads_the_message():
+    """`is_auth_failure` is public because it has a second caller with a
+    different stake, and one narrowness rule has to serve both.
+
+    Here a false positive costs one mint and one retry. In
+    `scripts/judge.py` it costs the operator the abort message: a run of failed
+    units classified as auth prints the credential paragraph, and the two fixes
+    for a data failure -- exclude the task, raise the limit -- go unsaid. A
+    false NEGATIVE swaps the two. So the rule stays exactly as narrow as it was
+    and both callers ask the same function rather than each carrying a copy.
+
+    THE TEXT IS NEVER READ, which is the property the driver depends on most.
+    The last two cases below are the ones a message matcher gets wrong in both
+    directions at once: a data failure whose text says "token", and a real 401
+    from a route whose text says nothing about auth.
+    """
+    class _VendorSubclass(AuthenticationError):
+        """A library release that subclasses its own auth error."""
+
+    assert is_auth_failure(_StatusOnlyAuthError(401))
+    assert is_auth_failure(_StatusOnlyAuthError(403))
+    assert is_auth_failure(AuthenticationError("no status attribute at all"))
+    assert is_auth_failure(PermissionDeniedError("the 403 by name"))
+    assert is_auth_failure(_VendorSubclass("through the MRO"))
+
+    # The transport failures `Router(num_retries=2)` already owns, and the
+    # data-shaped ones the driver must report as data.
+    assert not is_auth_failure(_StatusOnlyAuthError(429))
+    assert not is_auth_failure(_StatusOnlyAuthError(503))
+    assert not is_auth_failure(RuntimeError("connection reset by peer"))
+    assert not is_auth_failure(MalformedVerdict("no JSON in the reply"))
+    assert not is_auth_failure(ValueError("expired token in the diff header"))
 
 
 def test_verify_logger_selector_excludes_judge_live():

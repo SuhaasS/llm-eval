@@ -1083,7 +1083,7 @@ _AUTH_ERROR_NAMES = frozenset({"AuthenticationError", "PermissionDeniedError"})
 _AUTH_STATUS = (401, 403)
 
 
-def _is_auth_failure(exc: BaseException) -> bool:
+def is_auth_failure(exc: BaseException) -> bool:
     """Whether the credential died, as opposed to the model or the network.
 
     Deliberately NARROW. A false positive costs one mint and one retry; the
@@ -1095,6 +1095,17 @@ def _is_auth_failure(exc: BaseException) -> bool:
     The MRO is walked rather than `type(exc).__name__` read, so a library
     release that subclasses its own auth error does not silently turn the
     refresh off.
+
+    PUBLIC because it has a second caller with a different stake:
+    `scripts/judge.py`'s consecutive-failure breaker asks it what a run of
+    failed units was ABOUT, and answers with a credential paragraph or a data
+    paragraph accordingly. That makes this the one classifier -- a driver that
+    matched words in the message text instead would send an operator to
+    `aws sso login` over a `ValueError` whose text happens to say "token", and
+    a second narrowness rule drifting apart from this one is how the two
+    answers stop agreeing about the same exception. The narrowness is what both
+    callers need: here a false positive costs a mint, there it costs the
+    operator the only paragraph that could have named the real fix.
     """
     status = getattr(exc, "status_code", None)
     try:
@@ -1162,7 +1173,7 @@ def live_completion(
     of every real one. Left to propagate, the driver's per-unit `except`
     records an error and moves on, so the operator gets about an hour of judged
     units per invocation and then thousands of error lines from units that were
-    never going to succeed. On a 401/403 (`_is_auth_failure`) the cached
+    never going to succeed. On a 401/403 (`is_auth_failure`) the cached
     router is therefore dropped, a NEW token is minted, one router is rebuilt
     around it, and the same call is made once more.
 
@@ -1218,7 +1229,7 @@ def live_completion(
         try:
             return _completion(built["router"], judge_model_id, prompt)
         except Exception as exc:  # noqa: BLE001 - re-raised unless it is auth
-            if not _is_auth_failure(exc):
+            if not is_auth_failure(exc):
                 raise
             # The ~1h window closed mid-batch. Minted rather than re-read: see
             # the docstring -- the environment's copy is the dead one.

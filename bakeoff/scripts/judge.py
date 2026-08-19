@@ -65,6 +65,18 @@ printing an error line for each. A run of consecutive unit errors aborts the
 batch instead, with the abort recorded in `warnings`. Exit 1, and the resume
 picks up the same command where it stopped.
 
+The breaker has one failure mode of ITS own, and three things are placed
+against it. A collection holding a run of units that fail DETERMINISTICALLY --
+one unreadable record takes every pair its arm is in -- aborts, and the resume
+attempts the same units in the same order and aborts identically, forever. So
+the limit is `--max-consecutive-errors` rather than a constant; the abort names
+every unit in the failing run by task, sample and arm rather than by run-id
+hash, so the operator can act on it with `--only-task`; and it asks
+`is_auth_failure` what the run was actually about instead of asserting a
+credential problem it cannot see. A unit whose run could not be read is
+pre-filtered out of the breaker entirely -- it never reached the judge, so it
+is no evidence about the judge.
+
 THE SUMMARY IS A PRINTOUT, NOT A STORED SCORE
 ---------------------------------------------
 
@@ -116,7 +128,7 @@ import uuid
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
@@ -132,6 +144,7 @@ from bakeoff.judge import (  # noqa: E402
     VOTE_POSITIONS,
     CompleteFn,
     PayloadInputs,
+    is_auth_failure,
     judge_pair_vote,
     judge_rubric,
     live_completion,
@@ -159,7 +172,9 @@ from scripts.grade import grades_path  # noqa: E402
 DEFAULT_TASK_SET = REPO / "taskset"
 
 #: How many ids a warning names before it stops listing them. A collection is
-#: ~800 runs and a warning that prints all of them is one nobody reads.
+#: ~2,400 runs at full N -- 60 tasks x 10 samples x 4 arms, which is where the
+#: 2,400 rubric calls below come from -- and a warning that prints all of them
+#: is one nobody reads.
 _MAX_NAMED = 10
 
 #: The three verdicts a model may return, as `majority` accepts them.
@@ -171,27 +186,39 @@ _MAX_NAMED = 10
 #: rather than this module importing another module's private name.
 _VOTE_VERDICTS: tuple[str, ...] = ("a", "b", "tie")
 
-#: How many unit errors IN A ROW abort the batch.
+#: How many unit errors IN A ROW abort the batch, unless
+#: `--max-consecutive-errors` says otherwise.
 #:
 #: The failure this is placed against: the mantle bearer token's real window is
 #: about an hour -- the Identity Center session policy caps it well below the
 #: token's own TTL -- and a real 60-task pass is ~9,600 calls over many more
 #: hours than that: 60 tasks x 10 samples x 6 pairs x 2 forced positions is
-#: 7,200 pairwise, plus 2,400 rubric at full N. `live_completion` re-mints
-#: once per call when the
-#: credential dies, which covers an expiry; it cannot cover a revoked role, a
-#: dead `aws sso` session or an endpoint that has stopped accepting this
-#: principal at all. In those cases the auth error propagates past
-#: `_ask_and_parse`, the per-unit `except` records it and continues, and the
-#: driver grinds through every remaining unit on a credential that will never
-#: work -- thousands of paid-looking attempts and thousands of error lines,
-#: with the one message that matters buried at the top.
+#: 7,200 pairwise, plus 2,400 rubric at full N. `live_completion` re-mints ONCE
+#: PER EXPIRY -- one auth failure buys one fresh credential and the retry runs
+#: on it, so a pass that outlives three tokens mints three -- which covers an
+#: expiry; it cannot cover a revoked role, a dead `aws sso` session or an
+#: endpoint that has stopped accepting this principal at all. In those cases
+#: the auth error propagates past `_ask_and_parse`, the per-unit `except`
+#: records it and continues, and the driver grinds through every remaining unit
+#: on a credential that will never work -- thousands of paid-looking attempts
+#: and thousands of error lines, with the one message that matters buried at
+#: the top.
 #:
 #: Five, and CONSECUTIVE: a systemic failure fails every unit it touches from
 #: the moment it starts, while a flaky endpoint or one unreadable diff produces
 #: scattered errors a long batch must survive. Any successful unit resets the
 #: count. Gate-decided pairs make no call and so are neither -- see
 #: `_BatchAborted`.
+#:
+#: A DEFAULT rather than a rule, which is the other half of the design. A
+#: credential is not the only way to fail five units in a row: a collection
+#: holding five permanently-failing units fails them on every pass, so the
+#: resume attempts the same units in the same order and aborts in the same
+#: place, and no sequence of resumes ever reaches the work behind them. That is
+#: a deadlock and it needs a way out that is not a code change, so the limit is
+#: an operator flag and the abort message says which units failed, whether they
+#: were credential failures, and -- when they were not -- that raising this
+#: number or narrowing `--only-task` is the fix.
 MAX_CONSECUTIVE_ERRORS = 5
 
 #: The reporting scale for `elo_from_outcomes`, whose fit is Bradley-Terry
@@ -249,7 +276,7 @@ class ResumeRefused(RuntimeError):
 
 
 class _BatchAborted(RuntimeError):
-    """`MAX_CONSECUTIVE_ERRORS` units failed in a row, so the loop stops.
+    """`max_consecutive_errors` units failed in a row, so the loop stops.
 
     PRIVATE and control flow only: it never leaves `judge_event_log`, which
     catches it, records the abort in `warnings` and returns the partial batch
@@ -263,6 +290,22 @@ class _BatchAborted(RuntimeError):
     raise it and does not reset the count either: that unit makes no call, so
     it is no evidence the credential recovered, and treating it as a success
     would mean a collection full of failed-gate arms never trips the breaker.
+
+    ATTEMPTED-AND-FAILED is the whole of what counts, and the two units that
+    look like exceptions to that are the two that make the rule readable. A
+    unit the resume SKIPS was bought by an earlier pass and never attempted
+    here: it cannot trip the breaker, and it cannot reset it either. Resetting
+    on a skip is the tempting fix for the deadlock the flag exists for, and it
+    is the wrong one -- the pass that follows an abort is skip-heavy by
+    construction, so a counter a skip could reset would never reach the limit
+    again and the breaker would be off for exactly the pass it was written for.
+    A unit whose run could not be read is PRE-FILTERED before the `try` for the
+    same reason from the other side: it is not evidence about the judge, and
+    counting it let one unusable run abort a batch with nothing else wrong.
+
+    The message is built from the failing run itself -- every unit named, and
+    `is_auth_failure` asked about each -- so it diagnoses rather than guesses.
+    See `_abort_message`.
     """
 
 
@@ -602,6 +645,123 @@ def _gate_decided_line(task, sample_index: int, run_id_a: str, run_id_b: str,
 
 
 # ---------------------------------------------------------------------------
+# what a unit is called, and what a run of failed ones means
+# ---------------------------------------------------------------------------
+
+
+def _unit_label(kind: str, task_id: str, sample_index: int | None,
+                models: Sequence[str], run_ids: Sequence[str]) -> str:
+    """One unit, named in the fields an operator can actually act on.
+
+    `vote 1 task=trucking-8 sample=0 gemma-4-31b vs kimi-k2-5
+    (runs 3fbe890adfa040cb, 960aa0e97cc82488)`.
+
+    THE TASK AND THE SAMPLE COME FIRST because they are the two the flags take:
+    `--only-task` wants a task id and `--samples` wants an index. The error
+    lines this replaces named the run ids and nothing else, and a run id is
+    `sha256(task|model|sample|attempt)[:16]` (`runner.make_run_id`) -- so those
+    four fields ARE the id's preimage, and printing only the digest left the
+    operator unable to recover any of them. The one message whose job was to
+    say what to do next was the one message that could not be used to do it.
+
+    The ids stay, in FULL, and go last in parentheses. Full because 16 hex
+    characters is short enough to print and truncating it would break the two
+    things an id is for -- grepping the event log and `EventLog.read_run` --
+    to save eight characters. Last because an id identifies a unit exactly and
+    explains nothing, so it should not be what a reader scans past to reach the
+    fields that do.
+
+    `models` and `run_ids` are parallel, in the same order, and the caller is
+    responsible for keeping them so -- canonical a/b is the two RUN IDS sorted,
+    which is not the model order, so a caller that passed `sorted(cell)` beside
+    `(run_id_a, run_id_b)` would print a label naming each arm as the other.
+    """
+    who = " vs ".join(models)
+    noun = "run" if len(run_ids) == 1 else "runs"
+    return (
+        f"{kind} task={task_id} sample={sample_index} {who} "
+        f"({noun} {', '.join(run_ids)})"
+    )
+
+
+def _abort_message(failure_run: list[tuple[str, bool]]) -> str:
+    """The abort, built out of the run of failures that caused it.
+
+    `failure_run` is `(label, is_auth_failure(exc))` per unit, oldest first.
+    Both halves are load-bearing and neither can be recovered later: the labels
+    are what make the abort diagnosable at all, and the classification is what
+    decides whether the operator is sent to their credential or to their data.
+
+    THE OLD MESSAGE ASSERTED THE CREDENTIAL UNCONDITIONALLY. That is the right
+    guess -- the breaker was placed against an expired token -- and it is a
+    guess this function does not have to make, because the exceptions that
+    caused the abort were in hand when it fired. A batch whose five failures
+    were unreadable diffs told the operator to check their SSO session, so the
+    two fixes that would have worked (exclude the task, raise the limit) went
+    unmentioned, and the resume they were told to run re-attempted the same
+    units in the same order and aborted in the same place.
+
+    `is_auth_failure` and NOTHING ELSE decides which paragraph is printed. It
+    is deliberately narrow -- 401/403 by status or by class name, never a match
+    against the message text -- and text matching is the version of this that
+    fails in both directions at once: a `ValueError` whose message happens to
+    say "token" reads as a credential failure, and a real auth error phrased by
+    a route that says nothing about auth reads as data. `MalformedVerdict` and
+    `PayloadSecretsFound` are data-shaped by construction and land in the
+    second paragraph, which is where they belong: neither is fixed by a mint.
+
+    A MIXED run gets BOTH paragraphs rather than a majority verdict. Mixed is
+    real -- a credential dying in the middle of a task whose diffs are also
+    unreadable -- and the honest report is that both were seen, in the counts
+    they were seen in.
+
+    The list is capped at `_MAX_NAMED`, for that constant's reason and because
+    the limit is now an operator flag: `--max-consecutive-errors 500` would
+    otherwise print a 500-line warning above a 500-line error list saying the
+    same thing twice. The counts in the paragraphs below are over the WHOLE
+    run, not over what was listed, and every unit is in `errors` regardless.
+    """
+    shown = failure_run[:_MAX_NAMED]
+    named = "\n".join(f"  - {label}" for label, _ in shown)
+    if len(failure_run) > _MAX_NAMED:
+        named += (
+            f"\n  ... and {len(failure_run) - _MAX_NAMED} more, all of them "
+            "in the errors below"
+        )
+    auth = [label for label, was_auth in failure_run if was_auth]
+    data = [label for label, was_auth in failure_run if not was_auth]
+
+    parts = [
+        f"{len(failure_run)} consecutive unit failures -- aborting the batch "
+        f"with units left unattempted. The units that failed, oldest first:\n"
+        f"{named}"
+    ]
+    if auth:
+        parts.append(
+            f"{len(auth)} of them failed authentication (HTTP 401/403). One "
+            "auth failure per call already buys a freshly minted credential "
+            "and retries on it, so reaching this point means the mint did not "
+            "help: the usual causes are an expired `aws sso` session, a "
+            "revoked role, or an endpoint that has stopped accepting this "
+            "principal at all. Nothing is lost -- judgments are append-only "
+            "and the resume is keyed on units already bought, so resume with "
+            "the same command once the credential works again."
+        )
+    if data:
+        parts.append(
+            f"{len(data)} of them did not fail authentication, so a fresh "
+            "token would change nothing: these units fail deterministically "
+            "and will fail again on resume, in the same order and in the same "
+            "place, until something about the collection or the command "
+            "changes. The errors below name each one. Judge past them by "
+            "raising --max-consecutive-errors, or leave their task out of "
+            "--only-task, which names the tasks to judge -- a task it does "
+            "not name is one this pass never reaches."
+        )
+    return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # the batch
 # ---------------------------------------------------------------------------
 
@@ -612,7 +772,9 @@ def judge_event_log(event_log_root, tasks, *,
                     only_tasks: Iterable[str] | None = None,
                     sample_indices: Iterable[int] | None = None,
                     rubric: bool = True,
-                    re_judge: bool = False) -> dict:
+                    re_judge: bool = False,
+                    max_consecutive_errors: int = MAX_CONSECUTIVE_ERRORS,
+                    ) -> dict:
     """Judge every selected unit in one event log. Returns the batch.
 
     `complete` is the ONE seam that keeps this testable without a socket: one
@@ -632,10 +794,16 @@ def judge_event_log(event_log_root, tasks, *,
     aligned is what makes "exit 0 means every selected unit produced its lines"
     a statement about something.
 
-    `MAX_CONSECUTIVE_ERRORS` units failing in a row stops the walk early --
-    see that constant and `_BatchAborted`. The batch still returns: everything
-    already judged is on disk and in the summary, and the abort is a warning
-    beside the errors rather than an exception out of this function.
+    `max_consecutive_errors` units failing in a row stops the walk early -- see
+    `MAX_CONSECUTIVE_ERRORS`, which is its default, and `_BatchAborted`. The
+    batch still returns: everything already judged is on disk and in the
+    summary, and the abort is a warning beside the errors rather than an
+    exception out of this function. The run it counts is a run of units
+    ATTEMPTED here: a unit the resume skipped and a unit whose run could not be
+    read are neither, for the two different reasons `_BatchAborted` gives. The
+    CLI validates the limit at `>= 1`; a caller passing less gets a breaker
+    that fires on the first error it sees, which is a hair trigger rather than
+    an exception worth raising from here.
 
     `sorted()` at every level -- runs, cells, models, pairs. `list_runs` globs
     and glob order is nondeterministic; sorted is arbitrary but DETERMINISTIC,
@@ -770,38 +938,89 @@ def judge_event_log(event_log_root, tasks, *,
     skipped: list[tuple] = []
     missing_tasks: set[str] = set()
 
-    # The breaker's state. Two closures rather than an inline counter, so the
-    # three per-unit handlers cannot each grow their own version of "does this
-    # one count" -- which is exactly where a gate-decided pair would quietly
-    # become a success.
-    consecutive_errors = 0
+    # Runs this pass could not turn into a submission, and why. Filled by
+    # `_judgeable_inputs` the first time one is asked for, so a run that fails
+    # to build is diagnosed once and then costs nothing for every further unit
+    # it appears in.
+    unreadable: dict[str, str] = {}
+
+    # The breaker's state: the units attempted-and-failed since the last
+    # success, each beside what `is_auth_failure` said about the exception that
+    # failed it. A LIST rather than a counter, because the abort message is
+    # built from exactly this run (`_abort_message`) -- a counter beside a
+    # separate record of the failures is two structures answering "how long is
+    # the run", and the day they disagree the message describes a run other
+    # than the one that fired.
+    #
+    # Three closures rather than inline bookkeeping, so the per-unit handlers
+    # cannot each grow their own version of "does this one count" -- which is
+    # exactly where a gate-decided pair would quietly become a success.
+    failure_run: list[tuple[str, bool]] = []
 
     def _unit_succeeded() -> None:
         """A unit produced its line, so whatever was failing is not systemic."""
-        nonlocal consecutive_errors
-        consecutive_errors = 0
+        failure_run.clear()
 
-    def _unit_failed(message: str) -> None:
+    def _unit_failed(label: str, exc: BaseException) -> None:
         """Record one unit's error, and abort the batch on a run of them.
 
-        See `MAX_CONSECUTIVE_ERRORS`. The message the abort carries is the
-        warning the operator reads, so there is one copy of it.
+        See `MAX_CONSECUTIVE_ERRORS`. The EXCEPTION is taken rather than a
+        finished message, because the abort needs two things from it -- the
+        text for the error line and `is_auth_failure`'s answer for the
+        diagnosis -- and a caller that formatted the text itself would be the
+        one place the classification could be skipped.
         """
-        nonlocal consecutive_errors
-        errors.append(message)
-        consecutive_errors += 1
-        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-            raise _BatchAborted(
-                f"{consecutive_errors} consecutive unit failures -- aborting "
-                f"the batch with units left unattempted. The usual cause is "
-                f"systemic rather than per-unit: a credential that expired and "
-                f"could not be re-minted (the window is ~1h against a "
-                f"multi-hour pass), a revoked role, or an endpoint that has "
-                f"stopped answering. Nothing is lost -- judgments are "
-                f"append-only and the resume is keyed on units already bought, "
-                f"so resume with the same command once the cause is fixed. The "
-                f"errors below name it."
-            )
+        errors.append(f"{label}: {type(exc).__name__}: {exc}")
+        failure_run.append((label, is_auth_failure(exc)))
+        if len(failure_run) >= max_consecutive_errors:
+            raise _BatchAborted(_abort_message(failure_run))
+
+    def _unit_not_judged(label: str, run_ids: Sequence[str]) -> None:
+        """One line for a unit whose run cannot be read. NOT a breaker event.
+
+        The unit never reached the judge, so it is no evidence about the judge.
+        Counting it is what deadlocked a collection with nothing else wrong:
+        one unusable run takes seven units in a four-arm cell (its rubric call,
+        and both votes of each of its three pairs), and on the RESUME those
+        seven are the only ones attempted -- every judgeable unit is already
+        bought and skipped -- so the fifth of them aborts the pass, under a
+        message blaming a credential that was working the whole time.
+        Measured: the first pass judged 9 units and the next three resumes each
+        judged 0 and aborted in the same place.
+        """
+        why = "; ".join(
+            f"run {run_id} could not be read from the event log "
+            f"({unreadable[run_id]})"
+            for run_id in run_ids if run_id in unreadable
+        )
+        errors.append(f"{label}: not judged: {why}")
+
+    def _judgeable_inputs(cache: dict[str, PayloadInputs], run_id: str,
+                          grade: GradeRecord, task) -> PayloadInputs | None:
+        """This run's payload inputs, or `None` if it has none to give.
+
+        THE PRE-FILTER, and it is one function because the failure is a
+        property of the RUN rather than of the unit: `payload_inputs_from`
+        raises on a record with no `artifacts.final_diff`, and it raises for
+        every unit that record appears in -- a rubric call and both votes of
+        every pair the arm is in. Discovered here, before the unit's `try`,
+        that is one diagnosis and one line per affected unit; discovered inside
+        it, it was a run of identical failures the breaker could not tell from
+        a dead credential.
+
+        `records[run_id]` is expected to be present -- cells are grouped out of
+        `records`, so a run that failed to READ never reaches a unit and its
+        one error line is already recorded above -- and a `KeyError` from it
+        would land in the same place with the same shape rather than taking the
+        walk down.
+        """
+        if run_id in unreadable:
+            return None
+        try:
+            return _inputs_for(cache, records[run_id], grade, task)
+        except Exception as exc:  # noqa: BLE001 - one run, not the batch
+            unreadable[run_id] = f"{type(exc).__name__}: {exc}"
+            return None
 
     try:
         for task_id, sample_index in sorted(cells):
@@ -836,18 +1055,24 @@ def judge_event_log(event_log_root, tasks, *,
                     if not re_judge and key in done:
                         skipped.append(key)
                         continue
+                    label = _unit_label(
+                        "rubric", task_id, sample_index,
+                        (record.model,), (record.run_id,),
+                    )
+                    unit_inputs = _judgeable_inputs(
+                        inputs, record.run_id, grade, task
+                    )
+                    if unit_inputs is None:
+                        _unit_not_judged(label, (record.run_id,))
+                        continue
                     try:
                         judged.append(_rubric_line(
-                            record, grade, task,
-                            _inputs_for(inputs, record, grade, task),
+                            record, grade, task, unit_inputs,
                             payloads, path, complete, judge_model_id,
                         ))
                         _unit_succeeded()
                     except Exception as exc:  # noqa: BLE001 - one unit
-                        _unit_failed(
-                            f"rubric {record.run_id}: "
-                            f"{type(exc).__name__}: {exc}"
-                        )
+                        _unit_failed(label, exc)
 
             for model_x, model_y in itertools.combinations(sorted(cell), 2):
                 # Canonical a/b is the two run ids sorted, NOT the two
@@ -860,6 +1085,11 @@ def judge_event_log(event_log_root, tasks, *,
                 grade_a, grade_b = gating[run_id_a], gating[run_id_b]
                 passed_a = grade_a.resolved is True
                 passed_b = grade_b.resolved is True
+                # Named off the RUN ids, not off `(model_x, model_y)`: a/b is
+                # the two run ids sorted, so the model order can be the other
+                # one, and a label naming each arm as the other is worse than
+                # no label at all.
+                arms = (records[run_id_a].model, records[run_id_b].model)
 
                 if not passed_a and not passed_b:
                     # Nothing. Neither side is a submission worth ranking,
@@ -872,6 +1102,10 @@ def judge_event_log(event_log_root, tasks, *,
                     if not re_judge and key in done:
                         skipped.append(key)
                         continue
+                    label = _unit_label(
+                        "gate-decided", task_id, sample_index, arms,
+                        (run_id_a, run_id_b),
+                    )
                     try:
                         gate_decided.append(_gate_decided_line(
                             task, sample_index, run_id_a, run_id_b,
@@ -883,8 +1117,7 @@ def judge_event_log(event_log_root, tasks, *,
                         # the credential is dead nor evidence that it
                         # recovered. See `_BatchAborted`.
                         errors.append(
-                            f"gate-decided {run_id_a} vs {run_id_b}: "
-                            f"{type(exc).__name__}: {exc}"
+                            f"{label}: {type(exc).__name__}: {exc}"
                         )
                     continue
 
@@ -898,17 +1131,27 @@ def judge_event_log(event_log_root, tasks, *,
                     if not re_judge and key in done:
                         skipped.append(key)
                         continue
+                    label = _unit_label(
+                        f"vote {vote_index}", task_id, sample_index, arms,
+                        (run_id_a, run_id_b),
+                    )
+                    # Bound before the call rather than inline: two positional
+                    # `PayloadInputs` four lines apart is where an a/b
+                    # transposition hides, and a transposed pair produces a
+                    # complete, confident, inverted verdict. Both are bound
+                    # BEFORE the `try` as well, so a run that cannot produce
+                    # inputs is pre-filtered rather than counted -- see
+                    # `_judgeable_inputs`.
+                    inputs_a = _judgeable_inputs(
+                        inputs, run_id_a, grade_a, task
+                    )
+                    inputs_b = _judgeable_inputs(
+                        inputs, run_id_b, grade_b, task
+                    )
+                    if inputs_a is None or inputs_b is None:
+                        _unit_not_judged(label, (run_id_a, run_id_b))
+                        continue
                     try:
-                        # Bound before the call rather than inline: two
-                        # positional `PayloadInputs` four lines apart is where
-                        # an a/b transposition hides, and a transposed pair
-                        # produces a complete, confident, inverted verdict.
-                        inputs_a = _inputs_for(
-                            inputs, records[run_id_a], grade_a, task
-                        )
-                        inputs_b = _inputs_for(
-                            inputs, records[run_id_b], grade_b, task
-                        )
                         judged.append(_vote_line(
                             task, sample_index, run_id_a, run_id_b,
                             inputs_a, inputs_b,
@@ -917,11 +1160,7 @@ def judge_event_log(event_log_root, tasks, *,
                         ))
                         _unit_succeeded()
                     except Exception as exc:  # noqa: BLE001 - one unit
-                        _unit_failed(
-                            f"vote {vote_index} ({position}) "
-                            f"{run_id_a} vs {run_id_b}: "
-                            f"{type(exc).__name__}: {exc}"
-                        )
+                        _unit_failed(label, exc)
 
     except _BatchAborted as exc:
         # The abort is a WARNING and not an error, because it is not a unit:
@@ -1003,10 +1242,18 @@ def _inputs_for(cache: dict[str, PayloadInputs], record, grade: GradeRecord,
                 task) -> PayloadInputs:
     """The whitelist chokepoint's output for one run, built at most once.
 
-    Called INSIDE the per-unit `try`, deliberately. `payload_inputs_from` raises
-    `ValueError` on a run with no `artifacts.final_diff`, and a driver that
-    built these eagerly would take the whole batch down over one record instead
-    of losing one unit's line.
+    Called through `_judgeable_inputs` and never directly, because
+    `payload_inputs_from` raises `ValueError` on a run with no
+    `artifacts.final_diff` and that failure belongs to the RUN rather than to
+    any one unit. Eagerly building these for a whole cell would take the batch
+    down over one record; building them inside each unit's `try` charged the
+    same record to the consecutive-failure breaker once per unit it appeared
+    in. The wrapper is the third option: caught once, per run, before the
+    `try`.
+
+    Still LAZY, and that is what the wrapper preserves. A resume whose cell is
+    already judged skips every unit in it, and a cell walked eagerly would pay
+    for `similarity_context` over every arm to build inputs nothing asks for.
     """
     if record.run_id not in cache:
         cache[record.run_id] = payload_inputs_from(record, grade, task)
@@ -1803,7 +2050,26 @@ def main(argv: list[str] | None = None) -> int:
         help="pairwise only. The rubric is diagnostic, so it is the first "
              "thing to run at a lower N when cost binds",
     )
+    parser.add_argument(
+        "--max-consecutive-errors", type=int, metavar="N",
+        default=MAX_CONSECUTIVE_ERRORS,
+        help="abort after N units fail in a row (default: "
+             f"{MAX_CONSECUTIVE_ERRORS}). The breaker is placed against a "
+             "credential that died mid-pass; raise it to judge PAST units "
+             "that fail deterministically, which otherwise abort every "
+             "resume in the same place",
+    )
     args = parser.parse_args(argv)
+    if args.max_consecutive_errors < 1:
+        # `parser.error` rather than a raise: this is a usage mistake, and an
+        # operator who meant `-1` should get the usage line and exit 2 rather
+        # than a traceback out of the middle of a batch that already read the
+        # collection.
+        parser.error(
+            "--max-consecutive-errors must be at least 1: below one, the "
+            "first unit that errors ends the batch, which is a hair trigger "
+            "rather than a breaker"
+        )
 
     event_log_root = Path(args.event_log)
     try:
@@ -1829,6 +2095,7 @@ def main(argv: list[str] | None = None) -> int:
             sample_indices=args.samples,
             rubric=not args.no_rubric,
             re_judge=args.re_judge,
+            max_consecutive_errors=args.max_consecutive_errors,
         )
     except ResumeRefused as exc:
         print(f"\nREFUSED: {exc}")

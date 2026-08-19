@@ -81,6 +81,7 @@ from scripts.judge import (
     MAX_CONSECUTIVE_ERRORS,
     GateInvariantError,
     _KAPPA_CAVEAT_ASCII,
+    _MAX_NAMED,
     ResumeRefused,
     _assert_rubric_gate,
     _comparison_key,
@@ -1253,7 +1254,28 @@ def test_there_is_no_vote_count_flag_to_set(tmp_path, monkeypatch, capsys):
 
 class _ExpiredToken(RuntimeError):
     """What escapes `live_completion` when the credential is gone for good --
-    a freshly minted token that still 401s, or no token to mint at all."""
+    a freshly minted token that still 401s, or no token to mint at all.
+
+    `status_code = 403` is not decoration: it is what makes this AUTH-SHAPED to
+    `is_auth_failure`, which is the one classifier the abort message asks. The
+    endpoint answers a dead principal with 401/403, so a stand-in that carried
+    no status would model a failure the driver has no way to recognise -- and
+    every test below that asserts the credential paragraph would be asserting
+    it against the wrong evidence.
+    """
+
+    status_code = 403
+
+
+class _UnreadableDiff(RuntimeError):
+    """A per-unit DATA failure: nothing about the credential is wrong.
+
+    No `status_code` and no auth class name in its MRO, so `is_auth_failure`
+    says False -- which is the whole difference the abort message is built on.
+    A run of these is deterministic: it fails again, identically, on every
+    resume, and telling the operator to re-mint a token would send them past
+    the only thing that can actually fix it.
+    """
 
 
 class _DiesAfter(FakeComplete):
@@ -1262,17 +1284,21 @@ class _DiesAfter(FakeComplete):
     `succeed_at` holds 1-based CALL indices. One call is one unit here: a
     raised exception is not a `MalformedVerdict`, so `_ask_and_parse` does not
     re-ask and the driver's per-unit `except` sees it directly.
+
+    `error` is the exception CLASS it raises, defaulting to the auth-shaped
+    one, because the credential death is the failure the breaker was built for.
     """
 
-    def __init__(self, succeed_at=()):
+    def __init__(self, succeed_at=(), error=_ExpiredToken):
         super().__init__()
         self.succeed_at = set(succeed_at)
+        self.error = error
 
     def __call__(self, prompt: str) -> str:
         if len(self.prompts) + 1 in self.succeed_at:
             return super().__call__(prompt)
         self.prompts.append(prompt)
-        raise _ExpiredToken(
+        raise self.error(
             "ExpiredTokenException: the security token included in the "
             "request is expired"
         )
@@ -1444,6 +1470,217 @@ def test_a_batch_whose_failures_stay_below_the_limit_runs_to_the_end(tmp_path):
     assert fake.calls == 9, "the batch stopped short of its nine units"
     assert len(result["errors"]) == 5
     assert not any("consecutive" in w for w in result["warnings"])
+
+
+def _abort_of(result) -> str:
+    (abort,) = [w for w in result["warnings"] if "consecutive" in w]
+    return abort
+
+
+def test_the_breaker_trips_only_on_attempted_units_so_a_skip_heavy_resume_reports_the_real_run_length(
+    tmp_path,
+):
+    """A resume attempts only what is not already bought, and the run the
+    breaker counts is a run of ATTEMPTS -- skips neither lengthen it nor break
+    it.
+
+    Both halves matter and they pull opposite ways. Counting a skip as a
+    failure would abort a resume that is merely walking past work it already
+    has. RESETTING on one, which is the tempting fix for the deadlock this
+    task is about, is worse: the resume that follows an aborted pass is
+    skip-heavy by construction, so a counter a skip could reset would never
+    reach the limit again and the breaker would be off for exactly the pass it
+    was written for.
+
+    The first pass here judges every other unit with the limit raised out of
+    the way, so the second sees failures separated by skips -- and still stops
+    at five, saying five.
+    """
+    root = _four_arms(tmp_path)
+    first = _DiesAfter(succeed_at=set(range(2, 17, 2)))
+    _run(root, complete=first, rubric=True, max_consecutive_errors=100)
+    assert len(_lines(root)) == 8, "the first pass did not judge half the cell"
+
+    second = _DiesAfter()
+    result = _run(root, complete=second, rubric=True)
+
+    # Units 1, 3, 5, 7, 9 are attempted and fail; 2, 4, 6, 8 are skipped.
+    assert second.calls == MAX_CONSECUTIVE_ERRORS
+    assert len(result["skipped"]) == 4, "the failures were not separated"
+    assert len(result["errors"]) == MAX_CONSECUTIVE_ERRORS
+    assert f"{MAX_CONSECUTIVE_ERRORS} consecutive" in _abort_of(result)
+
+
+def test_max_consecutive_errors_is_operator_settable_from_the_command_line(
+    tmp_path, monkeypatch, capsys,
+):
+    """The escape hatch, and the only one there is.
+
+    Without it a collection holding `MAX_CONSECUTIVE_ERRORS` permanently
+    failing units is a deadlock: the pass aborts, the resume attempts the same
+    units in the same order and aborts identically, and no sequence of resumes
+    ever reaches the units behind them. Raising the limit is what walks past
+    them, and the abort message names this flag for that reason.
+
+    Refused below 1 through `parser.error`, so an operator who meant `-1` gets
+    a usage line rather than a batch that aborts on its first unit -- and a
+    traceback out of argparse would be the same defect wearing a stack.
+    """
+    root = _four_arms(tmp_path)
+    monkeypatch.setattr("scripts.judge.load_task_set",
+                        lambda *a, **k: [_task()])
+    fake = _DiesAfter()
+    monkeypatch.setattr("scripts.judge.live_completion", lambda *a, **k: fake)
+
+    assert main(["--event-log", str(root),
+                 "--max-consecutive-errors", "20"]) == 1
+
+    assert fake.calls == 16, "the raised limit never reached the walk"
+    out = capsys.readouterr().out
+    # The phrase, not the word: `tmp_path` is named after this test, so the
+    # paths printed in the header carry "consecutive" all by themselves.
+    assert "consecutive unit failures" not in out, "it aborted anyway"
+
+    with pytest.raises(SystemExit):
+        main(["--event-log", str(root), "--max-consecutive-errors", "0"])
+    assert "--max-consecutive-errors" in capsys.readouterr().err
+
+
+def test_an_all_auth_failure_run_aborts_with_a_credential_shaped_message(
+    tmp_path,
+):
+    """Every unit in the run died on a 401/403, so the credential IS the
+    diagnosis and the recovery is the same command once it is fixed.
+
+    Classified by `is_auth_failure` and by nothing else -- never by matching
+    words in the message text, which is how a data failure whose text happens
+    to say "token" ends up sending an operator to `aws sso login`.
+    """
+    root = _three_arms(tmp_path)
+    fake = _DiesAfter()
+
+    abort = _abort_of(_run(root, complete=fake, rubric=True))
+
+    assert "credential" in abort
+    assert "aws sso" in abort
+    assert "resume with the same command" in abort
+    # The data diagnosis must be ABSENT, not merely present alongside: an
+    # operator handed both reads the one that matches their last outage.
+    assert "--only-task" not in abort
+
+
+def test_a_data_shaped_failure_run_is_not_blamed_on_credentials(tmp_path):
+    """The failure this whole task exists for. Five units failed for reasons
+    that have nothing to do with the token, and the old message told the
+    operator to re-mint one -- so the fix that was actually needed (exclude the
+    task, or raise the limit) was the one thing the abort did not mention.
+
+    "Resume with the same command" is worse than useless here: these units fail
+    deterministically, so the resume re-attempts them in the same order and
+    aborts in the same place, forever.
+    """
+    root = _three_arms(tmp_path)
+    fake = _DiesAfter(error=_UnreadableDiff)
+
+    abort = _abort_of(_run(root, complete=fake, rubric=True))
+
+    assert "will fail again on resume" in abort
+    assert "--only-task" in abort
+    assert "--max-consecutive-errors" in abort
+    assert "credential" not in abort
+    assert "resume with the same command" not in abort
+
+
+def test_the_abort_names_the_task_model_and_sample_of_every_unit_in_the_failing_run(
+    tmp_path,
+):
+    """A run id is a hash. `--only-task` takes a task id and `--samples` takes
+    an index, so an abort naming only run ids leaves the operator reversing
+    hashes by hand to use either -- which is the state that made the deadlock
+    undiagnosable rather than merely annoying.
+
+    Every unit in the failing run is named, not a count of them and not the
+    first: the shared field across five labels is the finding (one task, one
+    sample, one model on every line), and it is only visible if all five are
+    there.
+
+    Capped at `_MAX_NAMED`, which is the one thing that stops "every" being
+    literal, and only because the limit is now an operator flag: a run of 13
+    under `--max-consecutive-errors 13` would otherwise print the same 13 lines
+    twice, once as a warning and once as the error list.
+    """
+    root = _three_arms(tmp_path)
+    fake = _DiesAfter(error=_UnreadableDiff)
+
+    abort = _abort_of(_run(root, complete=fake, rubric=True))
+
+    assert abort.count("task=calc-1") == MAX_CONSECUTIVE_ERRORS
+    assert abort.count("sample=0") == MAX_CONSECUTIVE_ERRORS
+    # Three rubric units, then both votes of the first pair.
+    for model in ("model-one", "model-two", "model-three"):
+        assert model in abort
+    assert "rubric" in abort
+    assert "vote 0" in abort and "vote 1" in abort
+
+    long_run = _abort_of(_run(
+        _four_arms(tmp_path / "wider"),
+        complete=_DiesAfter(error=_UnreadableDiff),
+        rubric=True, max_consecutive_errors=13,
+    ))
+
+    assert long_run.count("task=calc-1") == _MAX_NAMED
+    assert "and 3 more" in long_run
+    assert "13 consecutive" in long_run, "the count is over the whole run"
+
+
+def test_one_unreadable_run_fails_its_pairs_with_one_line_each_and_never_trips_the_breaker(
+    tmp_path,
+):
+    """One run whose stored record cannot be turned into a submission takes
+    every unit it appears in with it -- a rubric call and both votes of three
+    pairs, seven units, adjacent in the walk. Under the old driver that was a
+    run of five inside a collection with nothing else wrong, and the batch
+    aborted blaming a credential that was fine.
+
+    So it is PRE-FILTERED: the driver finds out the run is unusable before the
+    unit's `try`, writes one line per unit saying which run and why, and the
+    breaker never sees any of it. Not a failure of the judge, not evidence
+    about the credential, and not a reason to stop -- the other three arms are
+    judgeable and the pass judges them.
+
+    `final_diff=None` is the shape: the ladder's own `NO_FINAL_DIFF` normally
+    catches it (`resolved is None`, dropped before pairing), so reaching the
+    walk means a grade line from a pass that saw a different record -- which is
+    exactly the collection an operator arrives with.
+    """
+    root = _collection(
+        tmp_path,
+        [
+            _record("run-a", model="model-one", final_diff=DIFF_A),
+            _record("run-b", model="model-two", final_diff=DIFF_B),
+            _record("run-c", model="model-three", final_diff=DIFF_C),
+            _record("run-d", model="model-four", final_diff=None),
+        ],
+        [
+            _grade("run-a", model="model-one"),
+            _grade("run-b", model="model-two"),
+            _grade("run-c", model="model-three"),
+            _grade("run-d", model="model-four"),
+        ],
+    )
+    fake = FakeComplete()
+
+    result = _run(root, complete=fake, rubric=True)
+
+    # One rubric unit and three pairs at two votes each.
+    assert len(result["errors"]) == 7
+    assert all("could not be read" in line for line in result["errors"])
+    assert all("run-d" in line for line in result["errors"])
+    assert not any("consecutive" in w for w in result["warnings"])
+    # The nine units that never touched run-d were judged, and not one of the
+    # seven paid for a call.
+    assert fake.calls == 9
+    assert len(_lines(root)) == 9
 
 
 # --------------------------------------------------------------------------
