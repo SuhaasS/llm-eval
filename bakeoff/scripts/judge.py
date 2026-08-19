@@ -110,6 +110,7 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import math
 import random
 import sys
 import uuid
@@ -191,11 +192,28 @@ _VOTE_VERDICTS: tuple[str, ...] = ("a", "b", "tie")
 #: `_BatchAborted`.
 MAX_CONSECUTIVE_ERRORS = 5
 
-#: Elo, at GDPval's parameters. CONSTANTS rather than flags: K and the base are
-#: not tuning knobs but part of what the number means, and a rating printed
-#: under an unrecorded K is a number nobody can reproduce.
-ELO_K = 32.0
-ELO_BASE = 1000.0
+#: The reporting scale for `elo_from_outcomes`, whose fit is Bradley-Terry
+#: rather than Elo. CONSTANTS rather than flags: neither is a tuning knob, both
+#: are part of what the printed number means, and a rating reported under an
+#: unrecorded scale is a number nobody can reproduce.
+#:
+#: 400/log10 is Elo's spacing, kept because it is the one rating scale a reader
+#: already has an intuition for -- 400 points is a 10:1 strength ratio, ~70
+#: points is 60/40. The ANCHOR is presentation only: Bradley-Terry identifies
+#: the DIFFERENCES between strengths and nothing else, so the overall level is
+#: free and would otherwise wander with the arm set.
+ELO_SCALE = 400.0
+ELO_ANCHOR = 1000.0
+
+#: Convergence for the MM/Zermelo iteration below. The tolerance is on the
+#: max-abs strength change between iterations, well inside the precision any
+#: printed rating shows. The cap is a HALT, not a target: the iteration is
+#: monotone in the likelihood and converges in tens of rounds at this scale, so
+#: reaching 10,000 means a fixture nobody anticipated (a disconnected
+#: comparison graph is the candidate) and an infinite loop inside a summary is
+#: worse than an imprecise rating.
+_BT_TOLERANCE = 1e-10
+_BT_MAX_ITERATIONS = 10_000
 
 #: §4.3: at κ below 0.6 a judge-derived number is directional only, and an
 #: UNMEASURED κ is below 0.6 by construction -- OPEN-5 is blocked on people, not
@@ -1066,24 +1084,67 @@ def _deterministic(keys) -> list:
 def elo_from_outcomes(
     outcomes: list[tuple[str, str, float]],
 ) -> dict[str, float]:
-    """Ratings from `(model_a, model_b, score_a)` triples. K=32, base 1000.
+    """Ratings from `(model_a, model_b, score_a)` triples. Bradley-Terry MLE.
 
-    DESCRIPTIVE. Elo follows the win rates, it does not adjudicate them: it is
-    a reading of the same comparisons in a scale that composes across pairs, and
-    the matrix above it is the primary report. Following GDPval, which is where
-    the parameters come from.
+    DESCRIPTIVE. The table follows the win rates, it does not adjudicate them:
+    it is a reading of the same comparisons in a scale that composes across
+    pairs, and the matrix above it is the primary report. §D7.
 
-    SORTED before the walk, because Elo is order-dependent and the outcomes are
-    assembled from a dict walk. Unsorted, two passes over one unchanged
-    collection print two different tables, and the ratings appear to move while
-    nothing about the collection did.
+    A MAXIMUM-LIKELIHOOD FIT, not a sequential rating walk, and that is the
+    whole point of this function's shape. The previous implementation was Elo
+    at K=32 applied one comparison at a time over `sorted(outcomes)` -- and
+    sorting by model name is what made the ranking a function of the NAMES.
+    Sorted triples arrive as one contiguous block per pair, losses before wins
+    inside each block, so every arm's final rating was mostly whatever the last
+    few dozen comparisons in its last block handed it. Measured on a four-arm
+    ladder at 150 comparisons per pair, names running against strength: 40 of
+    40 seeds printed a wrong ranking, and the fixture in the tests prints the
+    order exactly BACKWARDS -- the weakest arm on top by 740 points. Renaming
+    the arms, which says nothing about any of them, moved ratings by over 200
+    points. Bradley-Terry has no walk to be ordered: the likelihood is a
+    function of the win COUNTS, so a shuffle, a relabelling and a second pass
+    over one collection all give one table.
+
+    ONE VIRTUAL TIE per unordered pair that has at least one real comparison
+    (§D8). Without it the MLE for an arm that never lost is +infinity -- the
+    iteration either burns its whole cap chasing it or prints an `inf` that
+    formats as a rating -- and a winless arm is -infinity by the same argument.
+    Half a point each way per played pair is the lightest prior that bounds
+    both, and it is deliberately weak: at this bakeoff's size (~120-180
+    comparisons per pair) it moves arms within ~50 rating points of each other
+    by under half a point, and about 1.5 points at a 100-point spread. It never
+    reorders, because it pulls every arm toward the anchor, not past a
+    neighbour.
+
+    Ties are half a win each way, matching the matrix's `win_rate_x`. If the
+    two scored a draw differently they would rank differently off one
+    collection and the reader would have to guess which order the comparisons
+    actually support.
+
+    DISCONNECTED COMPARISON GRAPHS are the one case this does not really
+    answer. If no chain of comparisons links two groups of arms, their relative
+    strength is not in the data, and the fit will report some number anyway --
+    the normalisation and the anchor are what relate them, not evidence. The
+    driver pairs round-robin within a task, so a real collection is connected;
+    a hand-assembled outcome list is the way to get here, and the ratings
+    across such a split may only be read within each group.
+
+    `math.fsum`, not `sum`, for every aggregate. Relabelling changes the order
+    an arm's opponents are visited in, and float addition is not associative,
+    so plain `sum` leaves the rename invariance resting on the last bits
+    happening to agree. They do agree on today's fixtures -- swapping `fsum`
+    for `sum` keeps the suite green -- which is exactly why this is written
+    down: the tests would not catch its loss, and the next fixture, with more
+    arms or a wider spread, is where a bit-exact assertion would start flaking
+    for a reason nobody could find. Exactly-rounded summation makes the
+    invariance structural instead of lucky.
 
     Refuses a score outside `{0.0, 0.5, 1.0}` BEFORE any arithmetic. Those are
     the only three results a comparison has, and a vote COUNT arriving here in
     place of a result would inflate every rating by an amount no reader could
     reconstruct from the printout. Validated in a first pass so the message
-    names the offending pair rather than surfacing as a `TypeError` inside
-    `sorted`.
+    names the offending pair rather than surfacing mid-fit as an arithmetic
+    error naming nothing.
     """
     for outcome in outcomes:
         model_a, model_b, score_a = outcome
@@ -1094,17 +1155,81 @@ def elo_from_outcomes(
                 f"{score_a!r} for {model_a} vs {model_b}"
             )
 
-    ratings: dict[str, float] = {}
-    for model_a, model_b, score_a in sorted(outcomes):
-        rating_a = ratings.setdefault(model_a, ELO_BASE)
-        rating_b = ratings.setdefault(model_b, ELO_BASE)
-        expected_a = 1.0 / (1.0 + 10.0 ** ((rating_b - rating_a) / 400.0))
-        # Zero-sum by construction: b's update is a's, negated. Written as one
-        # delta rather than two symmetric expressions so the two cannot drift.
-        delta = ELO_K * (score_a - expected_a)
-        ratings[model_a] = rating_a + delta
-        ratings[model_b] = rating_b - delta
-    return dict(sorted(ratings.items()))
+    # Points per arm and comparisons per unordered pair -- the only two things
+    # the likelihood reads. `wins` accumulates 0.0/0.5/1.0, all exact in binary
+    # and exactly summable at these magnitudes, so a reordered stream builds an
+    # identical tally rather than a nearly identical one.
+    wins: dict[str, float] = {}
+    played: dict[tuple[str, str], float] = {}
+    for model_a, model_b, score_a in outcomes:
+        if model_a == model_b:
+            # One model on both sides is not a comparison, and it has no place
+            # in a denominator that sums over OPPONENTS. `summarize` already
+            # drops these into `dropped["same_model_comparison"]`; this only
+            # guards a direct caller, which is why it is silent here.
+            continue
+        wins[model_a] = wins.get(model_a, 0.0) + score_a
+        wins[model_b] = wins.get(model_b, 0.0) + (1.0 - score_a)
+        pair = (model_a, model_b) if model_a < model_b else (model_b, model_a)
+        played[pair] = played.get(pair, 0.0) + 1.0
+
+    for model_x, model_y in played:
+        wins[model_x] += 0.5
+        wins[model_y] += 0.5
+        played[(model_x, model_y)] += 1.0
+
+    models = sorted(wins)
+    if not models:
+        # Nothing comparable in the collection is not a dead heat. Every arm at
+        # the anchor would be a printed tie no comparison supports.
+        return {}
+
+    opponents: dict[str, list[tuple[str, float]]] = {
+        model: [] for model in models
+    }
+    for (model_x, model_y), games in played.items():
+        opponents[model_x].append((model_y, games))
+        opponents[model_y].append((model_x, games))
+
+    # MM/Zermelo. Every arm's update reads the PREVIOUS iterate for both itself
+    # and its opponents (Jacobi, not in-place): an in-place sweep converges to
+    # the same fit but takes a path through the name order to get there, which
+    # is the class of bug this function was rewritten to remove.
+    strength = {model: 1.0 for model in models}
+    for _ in range(_BT_MAX_ITERATIONS):
+        updated = {
+            model: wins[model] / math.fsum(
+                games / (strength[model] + strength[other])
+                for other, games in opponents[model]
+            )
+            for model in models
+        }
+        # Renormalise to geometric mean 1 each iteration. The likelihood is
+        # invariant under a common scale factor, so without this the iterates
+        # drift and the convergence test measures the drift instead of the fit.
+        scale = math.exp(
+            math.fsum(math.log(value) for value in updated.values())
+            / len(models)
+        )
+        updated = {model: value / scale for model, value in updated.items()}
+        delta = max(
+            abs(updated[model] - strength[model]) for model in models
+        )
+        strength = updated
+        if delta < _BT_TOLERANCE:
+            break
+
+    ratings = {
+        model: ELO_ANCHOR + ELO_SCALE * math.log10(strength[model])
+        for model in models
+    }
+    # The geometric-mean normalisation already puts the mean at the anchor in
+    # exact arithmetic; this removes the float drift, so the printed table sums
+    # to what the header claims rather than to a tenth of a point off it.
+    drift = math.fsum(ratings.values()) / len(models) - ELO_ANCHOR
+    return dict(
+        sorted((model, rating - drift) for model, rating in ratings.items())
+    )
 
 
 def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
@@ -1209,7 +1334,7 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
 
     superseded = 0
     # Rule 4: keyed on the generation FIRST. Both walks below stay inside one
-    # oracle's verdicts, so neither a comparison count nor an Elo update can
+    # oracle's verdicts, so neither a comparison count nor a rating fit can
     # cross from one generation into another's numbers.
     outcomes: dict[tuple, list[tuple[str, str, float]]] = {}
     pairs: dict[tuple, dict[tuple[str, str], dict[str, int]]] = {}
@@ -1290,10 +1415,9 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
         "vote_verdicts": dict(sorted(vote_verdicts.items())),
         "comparisons": comparisons,
         "rubric_profile": _rubric_profile(rubric_lines, model_of, dropped),
-        # One table per generation, for rule 4's reason. Elo is path-dependent
-        # as well as pooled -- two oracles' opposite verdicts about one pair
-        # cancel back to the base and print a dead heat neither of them
-        # reported.
+        # One table per generation, for rule 4's reason. Pooling two oracles
+        # fits one set of strengths to two different opinions about the same
+        # pair, printing a consensus neither of them gave.
         "elo": {
             generation: elo_from_outcomes(rows)
             for generation, rows in sorted(outcomes.items())
@@ -1560,12 +1684,12 @@ def _print_reading(result: dict) -> None:
             print(f"    {'flag ' + name:26} {cell['mean']:.1%}  (n={cell['n']})")
 
     print(
-        f"\nElo -- DESCRIPTIVE, it follows the win rates above rather than "
-        f"adjudicating them (K={ELO_K:g}, base {ELO_BASE:g}). ONE TABLE PER "
-        f"JUDGE GENERATION, for the matrix's reason and one of its own: "
-        f"Elo is path-dependent, so two oracles' opposite verdicts about "
-        f"one pair cancel back to the base and print a dead heat neither "
-        f"of them reported"
+        "\nRatings -- DESCRIPTIVE, they follow the win rates above rather "
+        "than adjudicating them. Bradley-Terry maximum likelihood, reported "
+        "on the Elo scale (400/log10 spacing, mean anchored at 1000). ONE "
+        "TABLE PER JUDGE GENERATION, for the matrix's reason: two oracles' "
+        "verdicts about one pair are two opinions, and pooling them prints a "
+        "fit to a joint opinion neither of them gave"
     )
     for generation, ratings in sorted(summary["elo"].items()):
         print(f"  {_generation_label(generation)}")

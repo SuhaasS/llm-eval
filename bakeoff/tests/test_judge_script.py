@@ -35,6 +35,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import math
 import random
 import sys
 import uuid
@@ -71,8 +72,8 @@ from bakeoff.schema import (
 
 from scripts.grade import grades_path
 from scripts.judge import (
-    ELO_BASE,
-    ELO_K,
+    ELO_ANCHOR,
+    ELO_SCALE,
     KAPPA_CAVEAT,
     MAX_CONSECUTIVE_ERRORS,
     GateInvariantError,
@@ -1770,44 +1771,12 @@ def test_a_rubric_line_with_no_scores_is_unreadable_not_a_silent_denominator():
             ]["runs"] == 1
 
 
-def test_elo_is_deterministic_over_a_fixed_outcome_set():
-    """Elo is order-dependent, and the outcome list is assembled from a dict
-    walk. Sorted inside the function is what makes two passes over one
-    unchanged collection print the same table -- otherwise the ratings move
-    while nothing about the collection did."""
-    outcomes = [
-        ("model-one", "model-two", 1.0),
-        ("model-two", "model-three", 0.5),
-        ("model-one", "model-three", 0.0),
-        ("model-two", "model-one", 1.0),
-    ]
+def test_the_ratings_are_returned_in_name_order():
+    """The printout sorts by rating, but the dict is the interface and a
+    stable key order is what makes two summaries diffable at all."""
+    ratings = elo_from_outcomes(_block_structured_outcomes())
 
-    first = elo_from_outcomes(outcomes)
-    second = elo_from_outcomes(outcomes)
-    shuffled = elo_from_outcomes(list(reversed(outcomes)))
-
-    assert first == second
-    assert first == shuffled
-    assert list(first) == sorted(first)
-
-
-def test_elo_starts_at_the_base_and_moves_by_k_on_an_even_first_match():
-    """K=32 over a base of 1000, GDPval's parameters. Two unrated models are
-    even, so the expectation is 0.5 and the first win moves exactly K/2.
-
-    The LITERAL numbers, not `ELO_BASE ± ELO_K / 2`. Written against the
-    constants, this test follows them wherever they go and says nothing about
-    which parameters the table was computed at -- and a rating printed under an
-    unrecorded K is a number nobody can reproduce.
-    """
-    assert (ELO_K, ELO_BASE) == (32.0, 1000.0)
-
-    ratings = elo_from_outcomes([("model-one", "model-two", 1.0)])
-
-    assert ratings["model-one"] == pytest.approx(1016.0)
-    assert ratings["model-two"] == pytest.approx(984.0)
-    # Zero-sum: Elo redistributes, it does not create rating.
-    assert sum(ratings.values()) == pytest.approx(2000.0)
+    assert list(ratings) == sorted(ratings)
 
 
 def test_the_matrix_reports_each_arms_rate_under_its_own_name():
@@ -1841,7 +1810,9 @@ def test_elo_refuses_a_score_that_is_not_a_win_a_loss_or_a_tie():
 
 def test_elo_follows_the_win_rates_rather_than_leading_them():
     """Descriptive, not a second opinion. The arm that won more comparisons
-    outranks the one that won fewer."""
+    outranks the one that won fewer, and it does so through `summarize`'s own
+    triples -- the call site is what has to keep working, not just the
+    function."""
     judgments = [
         _vote("run-a", "run-b", "a", vote_index=0, sample_index=0),
         _vote("run-a1", "run-b1", "a", vote_index=0, sample_index=1),
@@ -1854,6 +1825,202 @@ def test_elo_follows_the_win_rates_rather_than_leading_them():
     assert row["win_rate_x"] > row["win_rate_y"]
     elo = summary["elo"][_judge_gen()]
     assert elo["model-one"] > elo["model-two"]
+
+
+#: The C1 fixture. Four arms whose TRUE strength runs against their names:
+#: `arm-a` is the weakest and sorts first, `arm-d` is the strongest and sorts
+#: last. The win counts are a 100-point-per-rung ladder (1000/1100/1200/1300)
+#: rounded over 150 comparisons per pair -- roughly this bakeoff's real size,
+#: ~40-60 tasks at N>=3 samples -- so the win-rate order is strictly
+#: `arm-d > arm-c > arm-b > arm-a` with no tie to argue about.
+_LADDER_WINS = {
+    ("arm-a", "arm-b"): (54, 96),
+    ("arm-a", "arm-c"): (36, 114),
+    ("arm-a", "arm-d"): (23, 127),
+    ("arm-b", "arm-c"): (54, 96),
+    ("arm-b", "arm-d"): (36, 114),
+    ("arm-c", "arm-d"): (54, 96),
+}
+
+
+def _block_structured_outcomes() -> list[tuple[str, str, float]]:
+    """`_LADDER_WINS` emitted the way a sequential rating walk is worst hurt.
+
+    One contiguous block per pair in name order, and inside each block every
+    loss for the first-named arm before every win. That is not an adversarial
+    stream so much as the ONLY stream the sequential implementation ever saw:
+    it began with `sorted(outcomes)`, which turns any input order into exactly
+    this shape.
+    """
+    stream: list[tuple[str, str, float]] = []
+    for (model_x, model_y), (wins_x, wins_y) in sorted(_LADDER_WINS.items()):
+        stream.extend([(model_x, model_y, 0.0)] * wins_y)
+        stream.extend([(model_x, model_y, 1.0)] * wins_x)
+    return stream
+
+
+def _win_totals(outcomes) -> dict[str, float]:
+    """Points per arm straight off the triples, ties counted as half."""
+    totals: dict[str, float] = {}
+    for model_a, model_b, score_a in outcomes:
+        totals[model_a] = totals.get(model_a, 0.0) + score_a
+        totals[model_b] = totals.get(model_b, 0.0) + (1.0 - score_a)
+    return totals
+
+
+def test_elo_recovers_the_true_order_on_a_block_structured_outcome_stream():
+    """THE regression. A rating that is a function of the model NAMES is not a
+    rating, and the sequential K-update was one: it walked `sorted(outcomes)`,
+    so each pair arrived as one monotone block and the arm whose block landed
+    last kept whatever the last few dozen results handed it.
+
+    On this fixture the old code printed the ranking exactly BACKWARDS --
+    `arm-a`, with 113 of 900 points, on top at 1262, and `arm-d`, with 337, at
+    the bottom on 520. Rename the arms so the names sort with strength instead
+    of against it and the same collection printed the right answer, which is
+    the whole complaint.
+    """
+    outcomes = _block_structured_outcomes()
+    totals = _win_totals(outcomes)
+    assert sorted(totals, key=lambda arm: -totals[arm]) == [
+        "arm-d", "arm-c", "arm-b", "arm-a"
+    ]
+
+    ratings = elo_from_outcomes(outcomes)
+
+    assert sorted(ratings, key=lambda arm: -ratings[arm]) == [
+        "arm-d", "arm-c", "arm-b", "arm-a"
+    ]
+
+
+def test_elo_ratings_are_invariant_under_model_renaming():
+    """A relabelling carries no information about strength, so it may not move
+    a single rating. This is the property the sequential walk broke: the same
+    900 comparisons under `zulu`/`yankee`/`xray`/`whiskey` sorted into a
+    different order and therefore rated differently.
+
+    Bit-for-bit, not approximately, because an approximate assertion here would
+    pass on a function that had merely made the name dependence small. If this
+    ever starts flaking in the last decimal, the fix is `math.fsum` over the
+    per-arm denominators, not a tolerance -- see the function's docstring.
+    """
+    rename = {
+        "arm-a": "zulu", "arm-b": "yankee", "arm-c": "xray", "arm-d": "whiskey",
+    }
+    outcomes = _block_structured_outcomes()
+
+    before = elo_from_outcomes(outcomes)
+    after = elo_from_outcomes(
+        [(rename[a], rename[b], score) for a, b, score in outcomes]
+    )
+
+    assert after == {rename[arm]: rating for arm, rating in before.items()}
+
+
+def test_elo_is_a_function_of_the_outcome_multiset_not_its_order():
+    """The triples are assembled from a dict walk, so the order they arrive in
+    is an accident of iteration. Two passes over one unchanged collection must
+    print one table -- otherwise the ratings appear to move while nothing about
+    the collection did.
+
+    The old code bought this with `sorted(outcomes)`, which is precisely what
+    made it name-dependent. Bradley-Terry gets it for free: the likelihood is
+    defined over win COUNTS, and a shuffle does not move a count.
+    """
+    outcomes = _block_structured_outcomes()
+    shuffled = list(outcomes)
+    random.Random(11).shuffle(shuffled)
+    assert shuffled != outcomes
+
+    assert elo_from_outcomes(shuffled) == elo_from_outcomes(outcomes)
+
+
+def test_a_sixty_forty_split_between_two_arms_reads_as_about_seventy_elo():
+    """The scale has to MEAN something. Under Bradley-Terry a 60/40 split is a
+    strength ratio of 1.5, and 400*log10(1.5) is 69.7 rating points -- the same
+    number an Elo reader would quote for that split, which is the entire reason
+    the ratings are reported on this scale rather than as raw strengths.
+
+    Tolerance is +-10 for the virtual tie, which pulls the pair very slightly
+    together (here to 60.5/40.5, worth about a third of a point).
+    """
+    outcomes = [("winner", "loser", 1.0)] * 60 + [("winner", "loser", 0.0)] * 40
+
+    ratings = elo_from_outcomes(outcomes)
+
+    assert ratings["winner"] - ratings["loser"] == pytest.approx(69.7, abs=10.0)
+
+
+def test_an_undefeated_arm_gets_a_finite_rating():
+    """Why the virtual tie exists. The unregularised Bradley-Terry MLE for an
+    arm that never lost is +infinity, and the iteration chasing it either
+    diverges for 10,000 rounds or prints an `inf` that formats as a rating.
+    One virtual tie per played pair bounds every strength without touching the
+    ranking -- and the winless arm at the other end is bounded by the same
+    stroke.
+    """
+    outcomes = (
+        [("undefeated", "middle", 1.0)] * 20
+        + [("middle", "winless", 1.0)] * 10
+    )
+
+    ratings = elo_from_outcomes(outcomes)
+
+    assert all(math.isfinite(rating) for rating in ratings.values())
+    assert ratings["undefeated"] > ratings["middle"] > ratings["winless"]
+
+
+def test_ties_enter_the_likelihood_as_half_wins():
+    """The matrix already scores a tie as half a point to each side. If the
+    rating table scored it any other way the two would rank differently off one
+    collection, and the reader would have to guess which of the two printed
+    orders the comparisons actually support.
+    """
+    four_ties = elo_from_outcomes([("model-one", "model-two", 0.5)] * 4)
+    split = elo_from_outcomes(
+        [("model-one", "model-two", 1.0)] * 2
+        + [("model-one", "model-two", 0.0)] * 2
+    )
+
+    assert four_ties == split
+    # Four drawn comparisons are four comparisons, not a reason to separate.
+    assert four_ties["model-one"] == pytest.approx(four_ties["model-two"])
+
+
+def test_ratings_are_mean_anchored():
+    """Bradley-Terry fixes only the DIFFERENCES between strengths; the overall
+    level is free, and left free it wanders with the arm set. Anchoring the
+    mean at 1000 is what lets a reader carry an intuition about the number
+    across two blocks -- and it is a presentation choice, not a measurement, so
+    it is pinned here rather than left to whatever the normalisation happened
+    to land on.
+
+    LITERAL 1000, not the constant: written against the constant this test
+    would follow it anywhere and say nothing about which scale the table was
+    printed on, and a rating whose anchor nobody recorded is a number nobody
+    can reproduce. The constants are pinned to their literals once, here, for
+    the same reason.
+    """
+    assert (ELO_SCALE, ELO_ANCHOR) == (400.0, 1000.0)
+
+    for outcomes in (
+        _block_structured_outcomes(),
+        [("model-one", "model-two", 1.0)],
+        [("solo-a", "solo-b", 0.5), ("solo-b", "solo-c", 1.0)],
+    ):
+        ratings = elo_from_outcomes(outcomes)
+
+        assert math.fsum(ratings.values()) / len(ratings) == pytest.approx(
+            1000.0
+        )
+
+
+def test_empty_outcomes_yield_an_empty_table():
+    """A collection with nothing comparable in it has no ranking, and an empty
+    table says so. The alternative -- every arm at the anchor -- is a printed
+    dead heat that no comparison supports.
+    """
+    assert elo_from_outcomes([]) == {}
 
 
 def test_a_comparison_whose_arms_cannot_be_named_is_dropped_and_counted():
