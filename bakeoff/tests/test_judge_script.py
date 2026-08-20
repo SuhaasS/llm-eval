@@ -4385,8 +4385,9 @@ def test_each_dimension_carries_the_count_it_was_averaged_over():
 
 
 def test_two_rubric_generations_for_one_run_are_two_blocks_not_one_average():
-    """`_resume_key` keys a rubric line on the three version fields, so a run
-    re-judged under a bumped rubric survives the dedupe as TWO lines -- that is
+    """`_resume_key` keys a rubric line on the four version fields -- the model,
+    the prompt version, the rubric version and the reasoning effort -- so a run
+    re-judged under a bumped rubric survives the dedupe as TWO lines; that is
     the point of the key. Grouping the profile on the model alone would blend
     two rubrics into one row under a `runs` count that is really a line count.
     """
@@ -4412,9 +4413,9 @@ def test_two_rubric_generations_for_one_run_are_two_blocks_not_one_average():
 
 
 def test_a_changed_judge_model_or_prompt_version_also_splits_the_profile():
-    """The same rule for the other two thirds of a generation. A verdict is only
-    reproducible against the model that gave it and the prompt text it saw, so
-    neither may be averaged across."""
+    """The same rule for two more of a generation's four fields. A verdict is
+    only reproducible against the model that gave it and the prompt text it saw,
+    so neither may be averaged across."""
     judgments = [
         _rubric("run-a", scores=2),
         _rubric("run-a", scores=0, judge_model_id="openai.gpt-5.6-luna"),
@@ -6032,6 +6033,51 @@ def test_the_mantle_backend_receives_the_batch_stop_event_too(
     judge_event_log(root, [_task()], rubric=False)
 
     assert seen == {"model": JUDGE_MODEL_ID_DEFAULT, "stop": True}
+
+
+def test_the_lazy_mantle_wrapper_forwards_the_stop_event_it_was_handed(
+    monkeypatch,
+):
+    """The hop AFTER the one the test above pins, and a stop dropped here is
+    invisible to that one.
+
+    `test_the_mantle_backend_receives_the_batch_stop_event_too` replaces
+    `lazy_live_completion` outright, so it proves the driver HANDS the event
+    over and can say nothing about what the wrapper does with it. The wrapper
+    builds `live_completion` on the first prompt, and that closure's own
+    pre-call check is the only thing standing between an aborted concurrent
+    pass and calls bought after the summary printed -- a `stop=stop` lost from
+    the construction at `scripts/judge.py:741-743` would leave every test in
+    this file green, because none of them ever build the real closure.
+
+    Both halves are asserted because the refusal has to be TOTAL: the router
+    is what a mantle call is bought with, and a closure that refused the call
+    after building one would have minted a credential for it.
+    """
+    from bakeoff import judge as judge_module
+
+    routers: list = []
+    calls: list = []
+    monkeypatch.setattr(
+        judge_module, "_judge_router",
+        lambda *a, **k: routers.append(a) or object(),
+    )
+    monkeypatch.setattr(
+        judge_module, "_completion",
+        lambda *a, **k: calls.append(a) or "reply",
+    )
+
+    stop = threading.Event()
+    stop.set()
+    complete = judge_script.lazy_live_completion(
+        JUDGE_MODEL_ID_DEFAULT, None, stop
+    )
+
+    with pytest.raises(RuntimeError, match="stopped before this call"):
+        complete("RENDERED PROMPT")
+
+    assert calls == [], "a stopped wrapper bought a completion"
+    assert routers == [], "a stopped wrapper built a router to buy one with"
 
 
 def test_the_concurrency_flag_is_validated_at_one_or_more(monkeypatch, tmp_path):

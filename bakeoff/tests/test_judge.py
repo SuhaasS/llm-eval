@@ -3074,6 +3074,62 @@ def test_a_stopped_live_completion_never_calls_and_never_mints(
     assert minted == []
 
 
+def test_a_stop_set_during_the_call_refuses_the_mint_and_re_raises_the_401(
+    monkeypatch, mantle_token, minted
+):
+    """The SECOND stop check -- the one before the refresh -- and the race it
+    is actually for.
+
+    The pre-call check above cannot cover this: the abort arrives while the
+    call is already on the wire, which is the ordinary shape of an abort under
+    `--concurrency`, since the driver sets the event while workers are mid-call.
+    That call comes back 401 -- the ~1h window closes mid-batch in every real
+    pass -- and without this check the closure would mint a fresh credential,
+    start a fresh clock and buy one more completion with it, all after the
+    summary has reported what the pass spent. The mint is spend of a kind the
+    call counter cannot see, which is why `minted` is asserted rather than the
+    retry alone.
+
+    THE ORIGINAL FAILURE PROPAGATES, identity-checked. A stopped closure that
+    raised its own `RuntimeError` here would tell the operator the pass was
+    stopped and say nothing about the dead credential that is the truthful
+    reason this call ended -- and on a batch aborted BY that credential, the
+    one message naming it would be the one replaced.
+    """
+    import threading as _threading
+    from bakeoff import judge as judge_module
+
+    stop = _threading.Event()
+    failure = _StatusOnlyAuthError(401)
+    calls = {"n": 0}
+
+    def _dies_and_stops_the_pass(*args, **kwargs):
+        calls["n"] += 1
+        # Set INSIDE the call, before the failure surfaces: the closure's
+        # pre-call check has already passed, so the guard under test is the
+        # only one left between this 401 and a fresh token.
+        stop.set()
+        raise failure
+
+    monkeypatch.setattr(
+        judge_module, "_judge_router", lambda *a, **k: object()
+    )
+    monkeypatch.setattr(judge_module, "_completion", _dies_and_stops_the_pass)
+
+    complete = judge_module.live_completion(
+        "openai.gpt-5.6-sol", usage_totals=None, stop=stop
+    )
+
+    with pytest.raises(_StatusOnlyAuthError) as raised:
+        complete("prompt")
+
+    assert raised.value is failure, "the auth failure was replaced on the way"
+    assert minted == [], "a stopped pass minted a credential"
+    # Exactly one: the retry the refresh path exists to make must not happen
+    # either, and a second call here is what a mint would have bought.
+    assert calls["n"] == 1
+
+
 def test_the_auth_classifier_answers_both_callers_and_never_reads_the_message():
     """`is_auth_failure` is public because it has a second caller with a
     different stake, and one narrowness rule has to serve both.

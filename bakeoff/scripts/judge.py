@@ -182,6 +182,7 @@ import hashlib
 import itertools
 import math
 import random
+import re
 import sys
 import threading
 import time
@@ -1616,9 +1617,10 @@ def judge_event_log(event_log_root, tasks, *,
     every line. Lines written before this change stay absolute and go on
     resolving, through `judge_schema.resolve_payload_path`.
 
-    Raises `NonNeutralJudge` on the argument alone, `ValueError` on the two
-    argument shapes that would otherwise be silently dropped (a mixed-case
-    `codex:` prefix, an effort with a mantle backend), `CollectionNotFound`
+    Raises `NonNeutralJudge` on the argument alone, `ValueError` on the three
+    argument shapes that would otherwise cost a pass before anything downstream
+    could report them (a mixed-case `codex:` prefix, an effort with a mantle
+    backend, an effort that is not lowercase letters), `CollectionNotFound`
     before touching anything, `ResumeRefused` if either input file cannot be
     read completely, and nothing else: a batch that got as far as the walk
     returns its partial reading whatever happens in it.
@@ -1660,6 +1662,28 @@ def judge_event_log(event_log_root, tasks, *,
             "reasoning_effort is a codex-backend knob; the mantle path "
             "cannot send it and must not record it"
         )
+    # THE SAME SHAPE `codex_judge.build_codex_argv` refuses, asserted HERE --
+    # a batch away from the argv it corrupts, and before anything is read or
+    # spent. That guard fires per CALL, and by then this batch has already
+    # walked the collection, mounted the gate and committed a line for every
+    # comparison the deterministic ladder decided; each paid unit after that
+    # dies identically inside `build_codex_argv` -- the value is interpolated
+    # into a `model_reasoning_effort="..."` TOML override, so a quote, a
+    # backslash or a newline invalidates the config of EVERY call rather than
+    # of one -- until `max_consecutive_errors` aborts a pass whose only
+    # product is error lines. The CLI's `choices=` refuses it at the usage
+    # line; this is the batch-level guard for a direct library caller, where
+    # argparse enforces nothing.
+    #
+    # Truthiness, exactly as `build_codex_argv` gates: `""` is the absent
+    # effort here (see `batch_effort` below), and it never reaches an argv.
+    if reasoning_effort and not re.fullmatch(r"[a-z]+", reasoning_effort):
+        raise ValueError(
+            f"unusable reasoning effort {reasoning_effort!r}: the value is "
+            "interpolated into a TOML -c override, so anything beyond "
+            "lowercase letters would corrupt every call of this batch rather "
+            "than fail one"
+        )
     # The batch side of the sampling identity in every resume key. `None` on
     # the mantle backend whatever the argument says, because the mantle path
     # sends no effort -- the key must describe what goes out, not what was
@@ -1673,7 +1697,12 @@ def judge_event_log(event_log_root, tasks, *,
     # every one of them and re-buy the whole collection on the next resume,
     # reporting a clean pass over work already paid for.
     batch_effort = (reasoning_effort or None) if backend == "codex" else None
-    judge_sampling, harness_of = judge_facts(judge_model_id, reasoning_effort)
+    # `batch_effort`, never the raw argument, from here down. The `or None`
+    # above is the ONE place this batch decides what "no effort" spells, and
+    # every consumer reading the argument instead would be a second copy of
+    # that decision -- three of them today, each gating on truthiness, so the
+    # copies agree until one stops.
+    judge_sampling, harness_of = judge_facts(judge_model_id, batch_effort)
 
     event_log_root = Path(event_log_root)
     if not (event_log_root / "runs").is_dir():
@@ -1843,7 +1872,7 @@ def judge_event_log(event_log_root, tasks, *,
         # to exist.
         complete = (
             lazy_codex_completion(
-                judge_model_id, judge_usage, reasoning_effort, stop_spending
+                judge_model_id, judge_usage, batch_effort, stop_spending
             )
             if backend == "codex"
             else lazy_live_completion(judge_model_id, judge_usage,
@@ -3826,9 +3855,9 @@ def _rubric_profile(rubric_lines: list[JudgeRecord],
     Per model rather than pooled. Two arms averaged into one row says nothing
     about either, which is the one thing a diagnostic output must not do.
 
-    THE THREE VERSION FIELDS ARE IN THE KEY, for `_resume_key`'s reason and
-    `_comparison_key`'s. `_resume_key` keys a rubric line on
-    `("rubric", run_id, judge_model_id, judge_prompt_version, rubric_version)`,
+    THE FOUR VERSION FIELDS ARE IN THE KEY, for `_resume_key`'s reason and
+    `_comparison_key`'s. `_resume_key` keys a rubric line on `("rubric",
+    run_id, judge_model_id, judge_prompt_version, rubric_version, effort)`,
     so one run re-judged under a bumped rubric survives the dedupe as TWO lines
     -- that is the point of the key. Grouping on the model alone would then
     average two rubrics into one row under a `runs` count that is really a line
@@ -4044,7 +4073,7 @@ def _generation_label(generation: tuple) -> str:
     four fields `_comparison_key` and `_rubric_profile` partition on, and
     therefore the four a reader needs in order to know which two blocks are
     comparable. One phrasing across the matrix, the profile and the Elo tables,
-    because three spellings of one generation read as three generations.
+    because two spellings of one generation read as two generations.
 
     The effort is printed only when there is one, so every mantle block and
     every block from a pass that named no effort prints the bytes it always
