@@ -649,7 +649,14 @@ def _resume_key(judgment: JudgeRecord) -> tuple:
         # Absent from the key, a resume that changed the flag would skip
         # vote 0 bought at one effort and buy vote 1 at another, and
         # `majority` would combine two different judges as one.
-        judgment.judge_sampling.get("model_reasoning_effort"),
+        #
+        # `or {}` because a hand-edited `judge_sampling: null` reaches here
+        # intact -- `JudgeRecord` is a bare frozen dataclass, so the field is
+        # present and `load_judgments` never sees the `TypeError` that would
+        # make the line malformed. A bare `.get` then raises `AttributeError`
+        # out of `summarize`, which runs inside `judge_event_log`'s RETURN,
+        # losing the reading of a batch whose every call is already bought.
+        (judgment.judge_sampling or {}).get("model_reasoning_effort"),
     )
     if judgment.kind == "rubric":
         return ("rubric", judgment.run_id) + versions
@@ -2577,12 +2584,18 @@ def _judge_generation(judgment: JudgeRecord) -> tuple:
     `judge_sampling` -- `None` on every mantle line, every gate-decided line
     and every codex line judged before the flag existed -- so no line already
     on disk changes generation.
+
+    `or {}` for `_resume_key`'s reason, which is sharper here: a hand-edited
+    `judge_sampling: null` is a line `load_judgments` hands over intact, and a
+    bare `.get` on it raises `AttributeError` out of `summarize` -- after every
+    call in the batch is bought. A null sampling block is the absent effort it
+    looks like, and both readers of the field say so identically.
     """
     return (
         judgment.judge_model_id,
         judgment.judge_prompt_version,
         judgment.rubric_version,
-        judgment.judge_sampling.get("model_reasoning_effort"),
+        (judgment.judge_sampling or {}).get("model_reasoning_effort"),
     )
 
 

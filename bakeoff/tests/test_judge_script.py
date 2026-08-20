@@ -5585,6 +5585,28 @@ def test_two_efforts_in_one_file_summarize_and_print_and_stay_told_apart(
     assert "effort None" not in printed
 
 
+def test_a_line_whose_judge_sampling_is_null_still_keys_and_partitions():
+    """The effort is read off a field a hand-edited line can null out.
+
+    `judge_sampling: null` survives every guard between the file and here:
+    `JudgeRecord` is a bare frozen dataclass, so the field is present and
+    `load_judgments` -- which counts a line malformed only when construction
+    raises `TypeError`/`ValueError` -- hands it over intact. A bare
+    `.get` on it then raises `AttributeError` out of `summarize`, which runs
+    inside `judge_event_log`'s RETURN: every call in the batch is already
+    bought by then, and the reading of all of them is what is lost. That is
+    exactly the failure `_readable_rubric`, `_deterministic` and the
+    `"unreadable-kind"` branch each exist to prevent, so the two readers of
+    this field tolerate the null the same way -- as the absent effort it is.
+    """
+    line = _vote("run-a", "run-b", "a", vote_index=0, judge_sampling=None)
+
+    assert judge_script._judge_generation(line) == _judge_gen()
+    assert judge_script._resume_key(line) == (
+        "pairwise", "calc-1", 0, "run-a", "run-b", 0,
+    ) + _judge_gen()
+
+
 def test_the_abort_paragraph_names_codex_login_and_never_an_aws_session(tmp_path):
     """A codex 401 is answered by a browser flow, and by nothing this process
     can do. Sending that operator to `aws sso login` names a credential the
