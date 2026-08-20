@@ -2355,3 +2355,57 @@ tests and the mutation anchors, not this run. What this run proves is
 narrower and is the thing that was missing: the store now holds derived
 verdicts about models, produced offline, from stored diffs, in the pinned
 image, beside a log that was not modified to hold them.
+
+## 2026-08-20 — Codex-judge review fixes (branch codex-judge, 05c6812..cd611b1)
+
+A 10-finder + adversarial-verify review of the codex-judge branch surfaced 15
+findings; 13 were fixed across 8 plan tasks plus one final wave
+(`docs/superpowers/plans/2026-08-20-codex-judge-review-fixes.md`), each task
+TDD'd, per-task reviewed, and re-reviewed after fixes.
+
+- [x] The reasoning effort is part of a verdict's identity: `_resume_key`,
+      `_rubric_key`/`_pairwise_key`, `_judge_generation` (now 4 fields) all
+      carry it; gate-decided units key on `None` because nothing is sent.
+      Stored and batch sides derive identically for every input including
+      `""` (normalized `or None`) and `judge_sampling: null` (hand-edited
+      line). Seven generation-keyed `sorted` calls moved onto
+      `_deterministic` — `None` beside `"high"` raised `TypeError` out of
+      `summarize`, at the end of a paid batch.
+- [x] `_run_codex`: every escape from `communicate` kills the process group
+      (`start_new_session=True` means Ctrl-C never reached the child), and
+      both pipes decode `utf-8/replace` so one bad diagnostic byte cannot
+      discard a paid verdict. The timeout path now folds usage the recovered
+      stdout already reported (exit-124 synthetic run; never bumps
+      `calls_without_usage`).
+- [x] The stop signal reaches both backends (mantle's `live_completion`
+      refuses at entry and refuses the pre-mint retry) and the codex backoff
+      waits on the event (`stop.wait`), not `time.sleep`.
+- [x] The CLI refuses what it silently dropped: `--reasoning-effort` with a
+      mantle id, a mixed-case `codex:` prefix, and non-`[a-z]+` effort values
+      (choices= at the CLI, ValueError in `judge_event_log` and
+      `build_codex_argv`); `codex_harness` records `effort or None`.
+- [x] Resolution re-checks its documented invariants: the judge home refuses
+      `config.toml`/`AGENTS.md` beside `auth.json`; the binary must be an
+      executable file, not a path that exists.
+- [x] `_walk_concurrently`: the worker budget counts running futures and a
+      `FIRST_COMPLETED` wake loop tops up behind a slow head (the plan's
+      counter-only fix was measured insufficient — the main thread had no
+      wake point); buffer capped at `2 × width`, discard bound now
+      `2 × concurrency − 1` in code, help, and spec. Cap and wake both
+      mutation-pinned.
+- [x] The paid smoke's attestation assert can fail (`!= "unattested"`).
+
+Skipped with reasons (review outcomes recorded): `turn.failed` outranking an
+exit-0 written verdict (contradicts a documented design choice on a
+speculated codex behavior — revisit on live evidence), and the unserialized
+concurrent mantle mint (bounded waste; single-flight refresh is its own task;
+the expensive post-abort half is closed by the stop event).
+
+Review: full offline suite **1091 passed** (was 1068), every task's diff
+reviewed against its brief plus a whole-wave final review (verdict: ready to
+merge, zero Critical/Important). Not verified, and the reason to say so: the
+codex-side changes are pinned offline against a faked `_run_codex`; the two
+real-process tests cover the kill and decode paths, but the seat, the real
+`codex exec` flag set, and whether `codex login` writes a `config.toml` into
+a fresh home (which would now refuse, loudly) are still live-run questions —
+V1–V9 of the codex-judge plan remain the gate before a paid pass.
