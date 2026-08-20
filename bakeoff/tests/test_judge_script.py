@@ -3123,11 +3123,16 @@ def _rubric(run_id, *, scores=2, flags=False, **kw):
 
 def _judge_gen(judge_model_id=JUDGE_MODEL_ID_DEFAULT,
                prompt_version=JUDGE_PROMPT_VERSION,
-               rubric_version=RUBRIC_VERSION):
+               rubric_version=RUBRIC_VERSION,
+               effort=None):
     """One judge generation: the oracle a verdict came from. The key a win-rate
     matrix block and an Elo table each sit under, and the tail of the key a
-    rubric profile block sits under."""
-    return (judge_model_id, prompt_version, rubric_version)
+    rubric profile block sits under.
+
+    `effort` defaults to `None` because that is what `_judgment` produces: its
+    `judge_sampling` is `JUDGE_SAMPLING`, which carries no reasoning effort, as
+    does every mantle line and every gate-decided one."""
+    return (judge_model_id, prompt_version, rubric_version, effort)
 
 
 def _generation(model, judge_model_id=JUDGE_MODEL_ID_DEFAULT,
@@ -5392,9 +5397,9 @@ def test_mantle_lines_still_carry_the_pinned_sampling_block_unchanged(tmp_path):
     `judge_harness: {"backend": "litellm-mantle"}` and
     `judge_schema_version: "1.1.0"`, both deliberate and both additive. What
     must not move is anything `_judge_generation` reads -- judge model id,
-    prompt version, rubric version -- because a mantle verdict that changed
-    generation would be re-bought on the next resume and would stop pooling
-    with every mantle verdict already on disk.
+    prompt version, rubric version, reasoning effort -- because a mantle
+    verdict that changed generation would be re-bought on the next resume and
+    would stop pooling with every mantle verdict already on disk.
     """
     root = _two_arms(tmp_path)
 
@@ -5407,7 +5412,10 @@ def test_mantle_lines_still_carry_the_pinned_sampling_block_unchanged(tmp_path):
         assert line.judge_sampling["temperature"] == 0.0
         assert line.judge_harness == {"backend": "litellm-mantle"}
         assert judge_script._judge_generation(line) == (
-            JUDGE_MODEL_ID_DEFAULT, JUDGE_PROMPT_VERSION, RUBRIC_VERSION
+            JUDGE_MODEL_ID_DEFAULT, JUDGE_PROMPT_VERSION, RUBRIC_VERSION,
+            # The mantle path sends no reasoning effort, so its generation
+            # carries the same `None` it did before the field joined the tuple.
+            None,
         )
 
 
@@ -5478,6 +5486,103 @@ def test_codex_and_mantle_verdicts_in_one_file_are_never_pooled(tmp_path, monkey
         judge_script._judge_generation(line) for line in _lines(root)
     }
     assert len(generations) == 2
+
+
+def test_two_efforts_over_one_collection_are_two_generations_never_pooled(
+    tmp_path, monkeypatch
+):
+    """The effort is the codex backend's one sampling knob, so two passes at
+    two efforts are two readings of the collection -- resume must re-buy, and
+    aggregation must partition. Without this, a resume that omitted the flag
+    would skip vote 0 (bought at high) and buy vote 1 at default, and
+    `majority` would combine two different judges as one.
+    """
+    _fake_harness(monkeypatch, tmp_path)
+    root = _two_arms(tmp_path)
+
+    _run(root, judge_model_id=CODEX_JUDGE, rubric=False,
+         reasoning_effort="high")
+    first = len(_lines(root))
+    result = _run(root, judge_model_id=CODEX_JUDGE, rubric=False)
+
+    # Nothing skipped: the default-effort pass is new work, not a resume.
+    assert not result["skipped"]
+    assert len(_lines(root)) > first
+    generations = {
+        judge_script._judge_generation(line) for line in _lines(root)
+    }
+    assert len(generations) == 2
+
+
+def test_a_resume_at_the_same_effort_skips_every_unit_already_bought(
+    tmp_path, monkeypatch
+):
+    _fake_harness(monkeypatch, tmp_path)
+    root = _two_arms(tmp_path)
+
+    _run(root, judge_model_id=CODEX_JUDGE, rubric=False,
+         reasoning_effort="high")
+    before = len(_lines(root))
+    result = _run(root, judge_model_id=CODEX_JUDGE, rubric=False,
+                  reasoning_effort="high")
+
+    assert result["skipped"]
+    assert len(_lines(root)) == before
+
+
+def test_a_gate_decided_line_resumes_across_efforts_without_a_duplicate(
+    tmp_path, monkeypatch
+):
+    """A gate-decided pair sends nothing, so effort is not part of its
+    identity. Keying it on the batch's effort would append a duplicate
+    gate line on every resume that changed the flag -- permanent lines in an
+    append-only file, saying nothing new.
+    """
+    _fake_harness(monkeypatch, tmp_path)
+    root = _two_arms(tmp_path, resolved_b=False)
+
+    _run(root, judge_model_id=CODEX_JUDGE, rubric=False,
+         reasoning_effort="high")
+    gate_lines = [ln for ln in _lines(root) if ln.verdict == "gate_decided"]
+    assert len(gate_lines) == 1
+
+    result = _run(root, judge_model_id=CODEX_JUDGE, rubric=False)
+    gate_lines = [ln for ln in _lines(root) if ln.verdict == "gate_decided"]
+    assert len(gate_lines) == 1
+    assert result["skipped"]
+
+
+def test_two_efforts_in_one_file_summarize_and_print_and_stay_told_apart(
+    tmp_path, monkeypatch, capsys
+):
+    """The effort is the first generation element that can be `None` on one
+    block and a string on another, and every walk over a generation-keyed dict
+    used to be a plain `sorted`. `None < "high"` raises `TypeError` -- at the
+    END of a batch that has already paid for every call in it, which is the
+    loss `_deterministic` exists to prevent one key further out.
+
+    And the printout has to keep the two apart by eye: a second block that
+    reads identically to the first is the pooling the partition just kept out
+    of the arithmetic, moved into the reader's head.
+    """
+    _fake_harness(monkeypatch, tmp_path)
+    root = _two_arms(tmp_path)
+
+    _run(root, judge_model_id=CODEX_JUDGE, reasoning_effort="high")
+    result = _run(root, judge_model_id=CODEX_JUDGE)
+
+    print_summary(result)
+    printed = capsys.readouterr().out
+
+    plain = (
+        f"judge {CODEX_JUDGE}, prompt v{JUDGE_PROMPT_VERSION}, "
+        f"rubric {RUBRIC_VERSION}"
+    )
+    assert f"{plain}, effort high" in printed
+    # The default-effort block prints the label a mantle block always printed,
+    # with no trailing `effort None` for a reader to learn to skip.
+    assert f"{plain}\n" in printed
+    assert "effort None" not in printed
 
 
 def test_the_abort_paragraph_names_codex_login_and_never_an_aws_session(tmp_path):

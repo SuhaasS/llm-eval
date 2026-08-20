@@ -619,11 +619,15 @@ def _resume_key(judgment: JudgeRecord) -> tuple:
     frozen dataclass and is therefore unhashable, so a set of records would
     raise on the first insert rather than skip anything.
 
-    The three version fields are the whole gate. A verdict is only reproducible
-    against the model that gave it, the prompt text it saw and the rubric it was
-    scored under, so a change to any of the three makes a NEW generation of
-    verdict rather than a resume -- and the disagreement between the two lines
-    is the finding the file exists to keep.
+    The four version fields are the whole gate. A verdict is only reproducible
+    against the model that gave it, the prompt text it saw, the rubric it was
+    scored under and -- on the codex backend -- the reasoning effort it was
+    sampled at, so a change to any of the four makes a NEW generation of
+    verdict rather than a resume, and the disagreement between the two lines
+    is the finding the file exists to keep. `None` is itself one of the effort's
+    values, derived identically on both sides of the key, which is what keeps
+    every mantle line and every codex line judged before the flag existed
+    resuming exactly as it did.
 
     A gate-decided pair carries `vote_index=None` and so resumes as its own
     unit. Keying it on 0 would make it collide with the first vote of a pair
@@ -638,6 +642,14 @@ def _resume_key(judgment: JudgeRecord) -> tuple:
         judgment.judge_model_id,
         judgment.judge_prompt_version,
         judgment.rubric_version,
+        # The one operator-variable sampling knob. `None` on every mantle
+        # line (JUDGE_SAMPLING carries no such key), every gate-decided line
+        # (judge_sampling is {}), and every codex line judged without the
+        # flag -- so every line that exists today keys exactly as it did.
+        # Absent from the key, a resume that changed the flag would skip
+        # vote 0 bought at one effort and buy vote 1 at another, and
+        # `majority` would combine two different judges as one.
+        judgment.judge_sampling.get("model_reasoning_effort"),
     )
     if judgment.kind == "rubric":
         return ("rubric", judgment.run_id) + versions
@@ -653,16 +665,17 @@ def _resume_key(judgment: JudgeRecord) -> tuple:
     return ("unreadable-kind", judgment.judgment_id, judgment.kind)
 
 
-def _rubric_key(run_id: str, judge_model_id: str) -> tuple:
+def _rubric_key(run_id: str, judge_model_id: str,
+                effort: str | None) -> tuple:
     return ("rubric", run_id, judge_model_id, JUDGE_PROMPT_VERSION,
-            RUBRIC_VERSION)
+            RUBRIC_VERSION, effort)
 
 
 def _pairwise_key(task_id: str, sample_index: int, run_id_a: str,
                   run_id_b: str, vote_index: int | None,
-                  judge_model_id: str) -> tuple:
+                  judge_model_id: str, effort: str | None) -> tuple:
     return ("pairwise", task_id, sample_index, run_id_a, run_id_b, vote_index,
-            judge_model_id, JUDGE_PROMPT_VERSION, RUBRIC_VERSION)
+            judge_model_id, JUDGE_PROMPT_VERSION, RUBRIC_VERSION, effort)
 
 
 # ---------------------------------------------------------------------------
@@ -1613,6 +1626,11 @@ def judge_event_log(event_log_root, tasks, *,
     # backend is a property of the id the guard just admitted, and both facts
     # below are needed by the first line this pass writes.
     backend = _judge_backend(judge_model_id)
+    # The batch side of the sampling identity in every resume key. `None` on
+    # the mantle backend whatever the argument says, because the mantle path
+    # sends no effort -- the key must describe what goes out, not what was
+    # typed.
+    batch_effort = reasoning_effort if backend == "codex" else None
     judge_sampling, harness_of = judge_facts(judge_model_id, reasoning_effort)
 
     event_log_root = Path(event_log_root)
@@ -2042,7 +2060,7 @@ def judge_event_log(event_log_root, tasks, *,
                 # paying for a call it must then refuse to record.
                 if grade.resolved is not True:
                     continue
-                key = _rubric_key(record.run_id, judge_model_id)
+                key = _rubric_key(record.run_id, judge_model_id, batch_effort)
                 if not re_judge and key in done:
                     skipped.append(key)
                     continue
@@ -2080,8 +2098,11 @@ def judge_event_log(event_log_root, tasks, *,
                 continue
 
             if passed_a != passed_b:
+                # effort None: nothing is sent for a gate-decided pair, so
+                # effort is not part of its identity and a flag change must not
+                # re-append it.
                 key = _pairwise_key(task_id, sample_index, run_id_a,
-                                    run_id_b, None, judge_model_id)
+                                    run_id_b, None, judge_model_id, None)
                 if not re_judge and key in done:
                     skipped.append(key)
                     continue
@@ -2101,8 +2122,8 @@ def judge_event_log(event_log_root, tasks, *,
             # `vote_index` to `VOTE_POSITIONS` -- 0 is `a_first`, 1 is
             # `b_first`.
             for vote_index, position in enumerate(VOTE_POSITIONS):
-                key = _pairwise_key(task_id, sample_index, run_id_a,
-                                    run_id_b, vote_index, judge_model_id)
+                key = _pairwise_key(task_id, sample_index, run_id_a, run_id_b,
+                                    vote_index, judge_model_id, batch_effort)
                 if not re_judge and key in done:
                     skipped.append(key)
                     continue
@@ -2533,7 +2554,8 @@ def _named(values: list[str]) -> str:
 
 
 def _judge_generation(judgment: JudgeRecord) -> tuple:
-    """WHICH ORACLE said it: judge model, prompt version, rubric version.
+    """WHICH ORACLE said it: judge model, prompt version, rubric version, and
+    the reasoning effort it was sampled at.
 
     ONE derivation, read by `_comparison_key`, by the win-rate matrix, by the
     Elo tables and by `_rubric_profile`. Two copies of "which oracle is this"
@@ -2547,20 +2569,30 @@ def _judge_generation(judgment: JudgeRecord) -> tuple:
     generations in one append-only file in the first place; everything that
     aggregates that file has to treat them as two readings of one collection,
     never as more comparisons of it.
+
+    The reasoning effort is the fourth for the same reason, one backend down:
+    it is the codex backend's only sampling knob, so two passes at two efforts
+    are two oracles, and pooling them would average a disagreement under one
+    number that describes neither. It is derived from the STORED
+    `judge_sampling` -- `None` on every mantle line, every gate-decided line
+    and every codex line judged before the flag existed -- so no line already
+    on disk changes generation.
     """
     return (
         judgment.judge_model_id,
         judgment.judge_prompt_version,
         judgment.rubric_version,
+        judgment.judge_sampling.get("model_reasoning_effort"),
     )
 
 
 #: How many trailing elements of a `_comparison_key` name the generation.
 #: `_comparison_key` APPENDS `_judge_generation`'s tuple and the matrix walk
 #: slices it back off, so one constant holds both halves of that layout
-#: together -- a hand-counted `[-3:]` beside a four-field generation would
-#: partition on a slice of one, which is a pooling nothing would report.
-_GENERATION_FIELDS = 3
+#: together -- a hand-counted `[-3:]`, which is what this was until the
+#: reasoning effort became the fourth field, would partition on a slice of one,
+#: which is a pooling nothing would report.
+_GENERATION_FIELDS = 4
 
 
 def _generation_of(key: tuple) -> tuple:
@@ -2595,9 +2627,10 @@ def _comparison_key(judgment: JudgeRecord) -> tuple:
     exist, they win" can be applied. `_resume_key` keeps `vote_index` because
     it answers a different question: which unit of WORK is already bought.
 
-    The three version fields stay, for `_resume_key`'s reason. A re-judge under
-    a new prompt is a new generation of verdict, and pooling two generations
-    into one comparison would average a disagreement the file exists to keep.
+    The four version fields stay, for `_resume_key`'s reason. A re-judge under
+    a new prompt -- or, on the codex backend, at a new reasoning effort -- is a
+    new generation of verdict, and pooling two generations into one comparison
+    would average a disagreement the file exists to keep.
     They go LAST and as one appended tuple, because the matrix walk slices them
     back off with `_generation_of` to partition its blocks.
     """
@@ -2610,13 +2643,20 @@ def _comparison_key(judgment: JudgeRecord) -> tuple:
 
 
 def _deterministic(keys) -> list:
-    """`sorted`, over keys that may hold a `None` beside an `int`.
+    """`sorted`, over keys that may hold a `None` beside an `int` or a `str`.
 
     A hand-edited or foreign-schema line can carry `sample_index=None`, and
     `sorted` on a tuple mixing `None` with `int` raises `TypeError` -- which
     would take the whole summary down at the end of a batch that already paid
     for thousands of calls. `repr` is a total order over anything, arbitrary but
     stable, and stable is the only property the walk needs.
+
+    A GENERATION key needs it too, and needs it on a file no hand ever touched:
+    its reasoning-effort element is `None` on every mantle and gate-decided
+    line and a string on a codex line judged under `--reasoning-effort`, so one
+    collection judged under both is the ordinary case that raises. That is why
+    every walk over a generation-keyed dict here goes through this and not
+    through `sorted`.
     """
     return sorted(keys, key=repr)
 
@@ -3485,7 +3525,7 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
     elo_voted_ci95: dict[tuple, dict[str, tuple[float, float]]] = {}
     resampled: dict[tuple, _Resamples] = {}
     rate_tasks: dict[tuple, _RateTasks] = {}
-    for generation in sorted(pairs):
+    for generation in _deterministic(pairs):
         # One table per generation, for rule 4's reason. Pooling two oracles
         # fits one set of strengths to two different opinions about the same
         # pair, printing a consensus neither of them gave.
@@ -3575,14 +3615,18 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
         "elo_ci95": elo_ci95,
         "elo_voted_ci95": elo_voted_ci95,
         "gate_decided_share": {
-            generation: {model: arms[model] for model in sorted(arms)}
-            for generation, arms in sorted(gate_share.items())
+            generation: {
+                model: gate_share[generation][model]
+                for model in sorted(gate_share[generation])
+            }
+            for generation in _deterministic(gate_share)
         },
         "position_consistency": {
             generation: _consistency_block(
-                counts, resampled.get(generation), rate_tasks.get(generation),
+                consistency[generation], resampled.get(generation),
+                rate_tasks.get(generation),
             )
-            for generation, counts in sorted(consistency.items())
+            for generation in _deterministic(consistency)
         },
         "superseded_gate_decided": superseded,
         "dropped": dropped,
@@ -3692,7 +3736,7 @@ def _rubric_profile(rubric_lines: list[JudgeRecord],
         ).append(judgment)
 
     profile: dict[tuple, dict] = {}
-    for key in sorted(by_key):
+    for key in _deterministic(by_key):
         rows = by_key[key]
         profile[key] = {
             "runs": len(rows),
@@ -3874,17 +3918,24 @@ def _print_usage(usage: dict[str, int] | None) -> None:
 def _generation_label(generation: tuple) -> str:
     """One judge generation, said the same way over every block that has one.
 
-    `(judge_model_id, judge_prompt_version, rubric_version)` -- the three
-    fields `_comparison_key` and `_rubric_profile` partition on, and therefore
-    the three a reader needs in order to know which two blocks are comparable.
-    One phrasing across the matrix, the profile and the Elo tables, because
-    three spellings of one generation read as three generations.
+    `(judge_model_id, judge_prompt_version, rubric_version, effort)` -- the
+    four fields `_comparison_key` and `_rubric_profile` partition on, and
+    therefore the four a reader needs in order to know which two blocks are
+    comparable. One phrasing across the matrix, the profile and the Elo tables,
+    because three spellings of one generation read as three generations.
+
+    The effort is printed only when there is one, so every mantle block and
+    every block from a pass that named no effort prints the bytes it always
+    did -- a trailing `, effort None` on the three-quarters of blocks that can
+    never carry one is a field a reader learns to skip, and then skips on the
+    codex block where it is the whole difference between two of them.
     """
-    judge_model_id, prompt_version, rubric_version = generation
-    return (
+    judge_model_id, prompt_version, rubric_version, effort = generation
+    label = (
         f"judge {judge_model_id}, prompt v{prompt_version}, "
         f"rubric {rubric_version}"
     )
+    return label if effort is None else f"{label}, effort {effort}"
 
 
 def _rate_pair(
@@ -4083,7 +4134,8 @@ def _print_reading(result: dict) -> None:
         "cannot separate can still sit either side of §10.1's 40% pairwise "
         "reference on their gate results alone. Read the two together"
     )
-    for generation, block in sorted(summary["comparisons"].items()):
+    for generation in _deterministic(summary["comparisons"]):
+        block = summary["comparisons"][generation]
         # The generation is named above every block for `_rubric_profile`'s
         # reason. A block that does not name its oracle is one the reader
         # pools in their head, which is the same wrong number the partition
@@ -4124,7 +4176,8 @@ def _print_reading(result: dict) -> None:
         "on its own rubric's anchored scale, over the n line(s) that carried "
         "that name"
     )
-    for key, row in sorted(summary["rubric_profile"].items()):
+    for key in _deterministic(summary["rubric_profile"]):
+        row = summary["rubric_profile"][key]
         # The generation is named beside every block, never folded into one.
         # Two rubric versions disagreeing about one arm is the finding.
         print(
@@ -4167,7 +4220,8 @@ def _print_reading(result: dict) -> None:
         "unambiguously for two arms only, and past two a rating is a function "
         "of the whole comparison graph. Read the widened win rate above it"
     )
-    for generation, ratings in sorted(summary["elo"].items()):
+    for generation in _deterministic(summary["elo"]):
+        ratings = summary["elo"][generation]
         print(f"  {_generation_label(generation)}")
         intervals = summary["elo_ci95"][generation]
         voted = summary["elo_voted"][generation]
