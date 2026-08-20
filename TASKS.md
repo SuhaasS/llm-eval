@@ -945,6 +945,72 @@ size. Two exceptions are marked CAPTURE and should ride along with Gate 1.
   failure `_build` exists to prevent — and every schema bump since 2.2.0 has
   added nested fields, so the gap is reachable.
 
+- [ ] **No neutral judge model is invokable, so the judge channel cannot
+  produce a single number.** §4.3 makes a neutral family MANDATORY, and
+  `assert_neutral_judge` refuses one from the four compared families. Measured
+  2026-08-19 against `AWSReservedSSO_BedrockModelTester_cd3c44c7ea0e8a37`: the
+  bedrock-mantle catalog lists 40+ models, and the principal can invoke exactly
+  the four eval arms. Everything else answers
+
+      401 access_denied — not authorized to perform: bedrock-mantle:CreateInference
+      on arn:aws:bedrock-mantle:us-east-1:610746058075:project/default
+
+  including the pinned default `openai.gpt-5.6-sol`. The denial is per MODEL and
+  not per route or per action: the same bearer token, the same
+  `.../v1/chat/completions`, the same instant returns 200 for
+  `moonshotai.kimi-k2.5` and 401 for `openai.gpt-5.6-sol`. Twelve neutral
+  candidates were probed and all twelve were denied — `openai.gpt-5.6-luna`,
+  `-terra`, `gpt-5.5-2026-04-23`, `gpt-5.4-2026-03-05`, `gpt-oss-120b`,
+  `gpt-oss-20b`, `xai.grok-4.3`, `deepseek.v3.2`, `zai.glm-4.7`,
+  `qwen.qwen3-coder-next`, `mistral.mistral-large-3-675b-instruct`,
+  `minimax.minimax-m2.5` — as were `anthropic.claude-opus-4-8`,
+  `claude-haiku-4-5` and `moonshotai.kimi-k2-thinking`, which are non-neutral
+  anyway and are listed here only because they bound the entitlement: it is
+  scoped to the four arm ids, not to a vendor or a family.
+
+  This is an IAM change, not a code change, and it is a **prerequisite for any
+  Tier B number** — the driver runs to completion without it, writing
+  gate-decided pairs and zero judged ones, which reads as a judge that agreed
+  with the ladder rather than as a judge that was never asked. Do not close it
+  with `BAKEOFF_ALLOW_NON_NEUTRAL_JUDGE=1`: the only entitled models ARE the
+  compared arms, so the override buys a Claude judge rating the Sonnet arm,
+  which is the exact self-preference §4.3 cites (33.7% self-rated against
+  14.13% independent). Note also that this interacts with OPEN-5: even once a
+  neutral judge is entitled, §4.3 forbids publishing any judge number without
+  the κ that was in force.
+
+- [ ] **`JUDGE_SAMPLING`'s `temperature: 0.0` is refused before the request
+  leaves the process, for any gpt-5-family judge.** litellm 1.95.0 routes
+  `openai/openai.gpt-5.6-sol` through `gpt_5_transformation`, which allows a
+  non-1.0 temperature only when `_supports_reasoning_effort_level(model,
+  "none")` is True. That reads `supports_none_reasoning_effort` out of
+  `litellm.model_cost`, and a Bedrock vendor-namespaced id is not in the
+  built-in map, so it returns False (documented "safe fallback for unknown
+  models") and the call raises
+
+      litellm.UnsupportedParamsError: gpt-5 models (including gpt-5-codex)
+      don't support temperature=0.0. Only temperature=1 is supported.
+
+  Measured 2026-08-19: 4 of 4 paid units in a real pass errored this way, at 0.0 s
+  each, having made no request. Two non-fixes were probed and both failed.
+  Adding `reasoning_effort: "none"` alone does nothing — the guard is on
+  `supports_none`, and the effort value is only consulted after it. Declaring
+  the capability in the deployment's `model_info` does nothing either: the
+  transformation is handed a model STRING and reads global `litellm.model_cost`,
+  with no router context to consult. `litellm.drop_params` is not an option in
+  either form — it drops `temperature` silently and the judge then runs at the
+  route's default, which destroys the determinism the whole protocol rests on
+  ("at temperature 0 these two answers ARE the judge", `VOTE_POSITIONS`).
+
+  So the only mechanism that works is a global `litellm.register_model` for the
+  judge id, and that is a design decision rather than a typo fix: `judge.py`
+  deliberately never imports `litellm_patches` because it mutates litellm
+  process-wide on import, and a `register_model` at router-build time is the
+  same class of mutation in a module the payload builders and leak tests import.
+  Deferred until the entitlement above is settled, because the right shape
+  depends on which model gets entitled — a non-gpt-5 neutral judge (deepseek,
+  qwen, mistral, grok) hits no such guard and needs no change at all.
+
 ---
 
 ## P3 — Decisions to settle before numbers are published
