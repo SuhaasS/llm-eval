@@ -1573,12 +1573,29 @@ def live_completion(
     # A one-slot cache rather than `nonlocal`: the closure only ever reads and
     # fills it, so there is no rebind to get wrong.
     built: dict[str, Any] = {}
+    # AND A LOCK AROUND THE FILL, because `--concurrency` submits the first
+    # prompts of a batch together and a bare check-then-set lets every one of
+    # them build its own router. That costs N derived tokens and N-1 discarded
+    # routers, and it runs `_judge_router`'s environment scrub and adopt --
+    # `scrub_placeholders`, `normalize_mantle_token`, the
+    # `LITELLM_BEARER_ENV` pop -- concurrently on one process-wide
+    # `os.environ`. Each of those is idempotent, so the measured cost is
+    # waste rather than corruption; the reason to hold the lock anyway is
+    # that "idempotent under interleaving" is a property of three functions
+    # in another module, and nothing here would notice the day one of them
+    # stops being.
+    #
+    # The lock covers ONLY the build. Holding it across the completion would
+    # serialise every call in the batch, which is the whole of what
+    # `--concurrency` buys.
+    build_lock = threading.Lock()
 
     def complete(prompt: str) -> str:
-        if "router" not in built:
-            built["router"] = _judge_router(
-                judge_model_id, region, smoke_bedrock
-            )
+        with build_lock:
+            if "router" not in built:
+                built["router"] = _judge_router(
+                    judge_model_id, region, smoke_bedrock
+                )
 
         try:
             return _completion(
@@ -1599,9 +1616,10 @@ def live_completion(
             if usage_totals is not None:
                 with USAGE_LOCK:
                     usage_totals["auth_refreshes"] += 1
-            built["router"] = _judge_router(
-                judge_model_id, region, smoke_bedrock, token=fresh
-            )
+            with build_lock:
+                built["router"] = _judge_router(
+                    judge_model_id, region, smoke_bedrock, token=fresh
+                )
 
         # ONE retry, on a router holding a credential minted seconds ago. A
         # second auth failure propagates from here, which is the loud failure

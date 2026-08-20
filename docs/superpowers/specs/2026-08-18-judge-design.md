@@ -681,11 +681,19 @@ same unit on every run and the abort message's promise about a resume stays
 true. The bounded price: an abort or a Ctrl-C discards up to `concurrency − 1`
 in-flight calls unwritten — the same shape the sequential walk already accepted
 for its one in-flight unit. The summary prints immediately rather than after
-the slowest of them, but `concurrent.futures`' own atexit join means a worker
-still inside a `codex exec` can keep the process alive *after* the report is on
-the terminal. That is a lingering process, not a hidden one: nothing further is
-written, and killing those children would need this driver to track the
-backend's subprocesses through a seam the `CompleteFn` contract does not have.
+the slowest of them.
+
+Two consequences of *not* waiting, both handled rather than accepted. A worker
+already inside the backend's rate-limit ladder would otherwise wake after the
+report and buy a **fresh** call — money spent on a verdict nobody commits, and
+spent after the pass reported what it had spent — so the backend takes a
+cooperative stop signal that is checked before every spawn and every backoff.
+And `concurrent.futures`' own atexit join means a worker still inside a
+`codex exec` can keep the process alive after the report is on the terminal:
+that is a lingering process, not a hidden one — nothing further is written and,
+with the stop signal, nothing further is bought. Killing those children outright
+would need the driver to track the backend's subprocesses through a seam the
+`CompleteFn` contract deliberately does not have.
 
 `--concurrency` defaults to **1**, and 1 runs the original sequential walk
 rather than a window of width one. The two are not the same: a window submits

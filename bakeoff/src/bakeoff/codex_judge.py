@@ -35,13 +35,20 @@ instruction file happen to be on the operator's machine, and the resulting
 table would look exactly like a clean one.
 
 The second layer is the flag set in `build_codex_argv`, and it is real rather
-than decorative. Measured 2026-08-20 against `codex-cli 0.145.0-alpha.18` on
-the same trivial prompt: 18,042 input tokens with the user config loaded,
-14,606 with `--ignore-user-config`. The ~3.4k difference is the operator's
-`AGENTS.md` plus the tool schemas their `config.toml` pulls in, and the flag
-removes all of it. The model's own answer to "were you told about X" was
-UNRELIABLE in the same experiment -- it said yes at both token counts -- so the
-token count is the evidence and the self-report is not.
+than decorative. Measured 2026-08-20 against `codex-cli 0.145.0-alpha.18`, ONE
+prompt asked twice: 18,042 input tokens with the user config loaded, 14,606
+with `--ignore-user-config`. The flag removes ~3.4k tokens of it.
+
+What those 3.4k ARE is inference and not measurement. The operator's
+`AGENTS.md` and the tool schemas their `config.toml` pulls in are the two
+candidates, and one aggregate delta cannot separate them -- which matters
+because the purpose-built home above is what actually closes the question,
+and a decomposition asserted as fact would make the flag look load-bearing
+when it is the second layer.
+
+The model's own answer to "were you told about X" was UNRELIABLE in the same
+experiment: it said yes at both token counts. The token count is the evidence
+and the self-report is not.
 
 **~14.6k tokens of Codex scaffolding ride on every call, and nothing hashes
 them.** That floor is the agent system prompt and tool schemas Codex wraps
@@ -152,6 +159,44 @@ CODEX_RATE_LIMIT_CAP_S = 480.0
 CODEX_SANDBOX = "read-only"
 
 LAST_MESSAGE_NAME = "last_message.txt"
+
+#: Cooperative shutdown for in-flight workers. Set by the driver once it has
+#: stopped committing; checked here before every spawn and before every
+#: rate-limit backoff.
+#:
+#: It exists because `ThreadPoolExecutor.shutdown(cancel_futures=True)` can
+#: only cancel calls that have not STARTED. A worker already inside the
+#: rate-limit ladder would otherwise wake from a backoff after the summary
+#: has printed and start a fresh `codex exec` -- real money spent on a verdict
+#: nobody will commit, and spent AFTER the pass reported what it had spent, so
+#: the printed `calls` is short by exactly those spawns. "Nothing further will
+#: be written" was already true; this is what makes "nothing further will be
+#: spent" true as well.
+#:
+#: A module-level Event rather than a parameter threaded through
+#: `CompleteFn`: that contract is one string in and one string out precisely
+#: so a test can inject a function, and widening it for a shutdown signal
+#: would put process lifecycle into the seam that exists to keep it out.
+_STOP = threading.Event()
+
+
+def request_stop() -> None:
+    """Ask in-flight calls to stop spending. Idempotent."""
+    _STOP.set()
+
+
+def clear_stop() -> None:
+    """Re-arm the backend for a new pass. Called at the START of a walk.
+
+    At the start rather than at the end of the previous one: a driver that
+    cleared on the way out would re-arm the very workers it had just told to
+    stop, which is the opposite of the point.
+    """
+    _STOP.clear()
+
+
+def stop_requested() -> bool:
+    return _STOP.is_set()
 
 #: HTTP statuses that mean the CREDENTIAL rather than the request, spelled the
 #: same way `judge._AUTH_STATUS` spells them so the two backends agree about
@@ -371,7 +416,17 @@ def _run_codex(
                 os.killpg(os.getpgid(process.pid), signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 process.kill()
-            stdout, stderr = process.communicate()
+            try:
+                # BOUNDED. `process.kill()` is the fallback path, and it kills
+                # only the leader -- a codex helper that survives holding the
+                # pipe would keep an unbounded `communicate()` waiting
+                # forever, on a worker thread the interpreter joins at exit.
+                # That is the one way this module can hang a process rather
+                # than merely outlive its report.
+                stdout, stderr = process.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                stdout, stderr = "", "(the killed process never closed its pipes)"
+
             raise CodexCallFailed(
                 f"codex exec exceeded {timeout_s:.0f}s and its process group "
                 f"was killed; stderr: {_tail(stderr)}"
@@ -406,10 +461,14 @@ def parse_events(stdout: str) -> tuple[dict[str, Any], ...]:
     Tolerant on purpose, and `failure_message` is what makes the tolerance
     safe: success is the exit code rather than any event, so a line this
     version of codex emits in a shape this parser has never seen costs a
-    token count or an error message and never a paid verdict. Dropping the
-    usage event leaves `calls_without_usage` saying the total is short;
-    dropping a `turn.failed` leaves the exit code and stderr to say the run
-    failed, without the status that would have classified it.
+    token count or an error message and never a paid verdict.
+
+    Dropping a `turn.completed` on a run that still exited 0 leaves
+    `calls_without_usage` saying the total is short -- `_fold_usage` keys on
+    the run's OUTCOME, so a successful run whose usage cannot be read is
+    counted rather than silently skipped. Dropping a `turn.failed` leaves the
+    exit code and stderr to say the run failed, without the status that would
+    have classified it.
     """
     events: list[dict[str, Any]] = []
     for line in stdout.splitlines():
@@ -567,21 +626,36 @@ def _fold_usage(usage_totals: dict[str, int] | None, run: CodexRun) -> None:
     """
     if usage_totals is None:
         return
-    # A run that never completed a turn is not a run whose usage was
-    # UNREADABLE -- it is one that has no usage to read. Counting it here
-    # would make every auth failure and every dead endpoint raise
-    # `calls_without_usage`, and that counter's whole job is to tell an
-    # operator their token TOTAL is an under-count. Buried under failures it
-    # stops meaning that. `calls` already counts the attempt.
-    if not any(event.get("type") == "turn.completed" for event in run.events):
-        return
+
     counts = usage_from_events(run.events)
+
+    # TWO DECISIONS, and they key on different things -- which is the whole
+    # correctness of this function, and the thing two earlier versions each
+    # got half of.
+    #
+    # WHETHER TO FOLD keys on the counts alone. Tokens codex reported were
+    # spent, and they were spent whatever the run did afterwards: a turn that
+    # completed and then failed on a 401 still burned its input. A spend
+    # figure must never be wrong in the low direction -- the same rule that
+    # counts `calls` before the wire.
+    #
+    # WHETHER TO RAISE `calls_without_usage` keys on the run's OUTCOME. That
+    # counter says one thing only: the token TOTAL is an under-count. A failed
+    # run has no usage to READ rather than usage that could not be read, so
+    # counting it would bury the signal under every auth failure and every
+    # dead endpoint. But a SUCCESSFUL run whose counts are unreadable is
+    # exactly what it is for -- and keying that on `turn.completed` being
+    # present, as an earlier version did, breaks in the precise scenario
+    # `failure_message` exists to survive: once success is the exit code, a
+    # codex release that renames that event leaves every successful call
+    # folding no tokens AND raising no counter, so the pass reports `calls=N`
+    # beside a zero total with the under-count warning suppressed.
     with USAGE_LOCK:
-        if counts is None:
+        if counts is not None:
+            for field, value in counts.items():
+                usage_totals[field] += value
+        elif failure_message(run) is None:
             usage_totals["calls_without_usage"] += 1
-            return
-        for field, value in counts.items():
-            usage_totals[field] += value
 
 
 def _count_call(usage_totals: dict[str, int] | None) -> None:
@@ -773,9 +847,9 @@ def codex_completion(
             if isinstance(run, CodexRun):
                 return run.last_message
 
-            if isinstance(run, CodexRateLimited) and attempt < CODEX_RATE_LIMIT_RETRIES:
-                # Jittered so a concurrent pool does not resynchronise every
-                # worker onto the same wake-up and hit the window together.
+            if (isinstance(run, CodexRateLimited)
+                    and attempt < CODEX_RATE_LIMIT_RETRIES
+                    and not stop_requested()):
                 # Jittered so a concurrent pool does not resynchronise
                 # every worker onto one wake-up and hit the window together,
                 # and the cap is applied AFTER the jitter: capping first lets
@@ -819,6 +893,13 @@ def _attempt_once(
     last: RuntimeError | None = None
 
     for _ in range(2):
+        if stop_requested():
+            # Checked before the spawn rather than after: the point is to not
+            # BUY the call, and a check after it has already been paid for
+            # would only decide whether to look at the answer.
+            return CodexCallFailed(
+                "the pass stopped before this call was made"
+            )
         scratch = Path(tempfile.mkdtemp(prefix="bakeoff-judge-"))
         try:
             output_file = scratch / LAST_MESSAGE_NAME

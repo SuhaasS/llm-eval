@@ -85,7 +85,12 @@ class _FakeCodex:
         self.calls: list[dict] = []
 
     def __call__(self, argv, prompt, env, timeout_s, output_file):
-        outcome = self.outcomes.pop(0) if self.outcomes else self.outcomes
+        if not self.outcomes:
+            raise AssertionError(
+                "the fake ran out of scripted outcomes: the code under test "
+                "spawned more times than this test expected"
+            )
+        outcome = self.outcomes.pop(0)
         self.calls.append(
             {"argv": argv, "prompt": prompt, "env": env, "timeout_s": timeout_s}
         )
@@ -669,3 +674,123 @@ def test_an_unparsable_event_line_never_costs_a_paid_verdict():
     events = parse_events('not json\n{"type": "turn.completed"}\n\n[1,2]\n')
 
     assert events == ({"type": "turn.completed"},)
+
+
+# --- the usage counter's one job --------------------------------------------
+
+
+def test_a_successful_run_with_no_completion_event_is_still_counted_as_unreadable(
+    monkeypatch, judge_home: Path, codex_bin: Path
+):
+    """The skip keys on the run's OUTCOME, never on an event's presence.
+
+    This is the scenario `failure_message` is built for -- a codex release
+    renames `turn.completed`, verdicts keep arriving from the `-o` file, exit
+    stays 0 -- and an earlier version of `_fold_usage` skipped on that event
+    being absent. The pass would then end with `calls=N`, a zero token total,
+    and the under-count warning suppressed because the counter it keys on was
+    never raised: the exact silence the counter exists to break.
+    """
+    totals = new_usage_totals()
+    _install(
+        monkeypatch,
+        [CodexRun(0, _events({"type": "turn.finished_v2"}), "", '{"verdict": "A"}')],
+    )
+    complete = codex_completion(
+        PINNED, codex_bin=str(codex_bin), codex_home=str(judge_home),
+        usage_totals=totals,
+    )
+
+    assert complete("prompt") == '{"verdict": "A"}'
+    assert totals["calls"] == 1
+    assert totals["calls_without_usage"] == 1
+    assert totals["total_tokens"] == 0
+
+
+def test_a_run_that_completed_and_then_failed_still_folds_the_tokens_it_used(
+    monkeypatch, judge_home: Path, codex_bin: Path
+):
+    """Tokens that were spent are counted whatever the run did afterwards.
+
+    A spend figure must never be wrong in the low direction -- the same rule
+    that counts `calls` before the wire.
+    """
+    totals = new_usage_totals()
+    _install(
+        monkeypatch,
+        [CodexRun(
+            1,
+            _events(_completed(500, 20),
+                    _failed("unexpected status 401 Unauthorized")),
+            "", "",
+        )],
+    )
+    complete = codex_completion(
+        PINNED, codex_bin=str(codex_bin), codex_home=str(judge_home),
+        usage_totals=totals,
+    )
+
+    with pytest.raises(CodexAuthFailure):
+        complete("prompt")
+
+    assert totals["prompt_tokens"] == 500
+    assert totals["completion_tokens"] == 20
+
+
+# --- cooperative shutdown ----------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _rearm_stop():
+    codex_judge.clear_stop()
+    yield
+    codex_judge.clear_stop()
+
+
+def test_a_stop_request_prevents_the_next_spawn_from_being_bought(
+    monkeypatch, judge_home: Path, codex_bin: Path
+):
+    """`cancel_futures` can only cancel calls that have not started.
+
+    A worker already inside the rate-limit ladder would otherwise wake from a
+    backoff after the summary has printed and buy a fresh call -- money spent
+    on a verdict nobody will commit, and spent after the pass reported what it
+    had spent.
+    """
+    fake = _install(monkeypatch, [CodexRun(0, _events(_completed()), "", "ok")])
+    complete = codex_completion(
+        PINNED, codex_bin=str(codex_bin), codex_home=str(judge_home)
+    )
+    codex_judge.request_stop()
+
+    with pytest.raises(CodexCallFailed, match="stopped before this call"):
+        complete("prompt")
+
+    assert fake.calls == []
+
+
+def test_a_stop_request_ends_the_rate_limit_ladder_instead_of_waiting_it_out(
+    monkeypatch, judge_home: Path, codex_bin: Path
+):
+    limited = CodexRun(1, _events(_failed("unexpected status 429")), "", "")
+    _install(monkeypatch, [limited] * (CODEX_RATE_LIMIT_RETRIES + 1))
+    waits: list[float] = []
+
+    def sleep_then_stop(seconds: float) -> None:
+        waits.append(seconds)
+        codex_judge.request_stop()
+
+    complete = codex_completion(
+        PINNED, codex_bin=str(codex_bin), codex_home=str(judge_home),
+        sleep=sleep_then_stop,
+    )
+
+    # The stop is what ends it, so the failure names the stop rather than the
+    # rate limit: the ladder was abandoned, not exhausted, and an operator
+    # reading "stayed rate limited across 5 backoffs" would be told the seat
+    # refused five waits it never made.
+    with pytest.raises(CodexCallFailed, match="stopped before this call"):
+        complete("prompt")
+
+    # One backoff, then the stop is honoured instead of the remaining four.
+    assert len(waits) == 1

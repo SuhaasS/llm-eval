@@ -216,9 +216,11 @@ from bakeoff.codex_judge import (  # noqa: E402
     # anyway -- so a mantle pass pays nothing for this edge. What is deferred
     # is the RESOLUTION (binary, judge home, auth.json), which happens on the
     # first prompt inside `lazy_codex_completion`.
+    clear_stop as codex_request_stop_clear,
     codex_harness,
     codex_sampling,
     is_codex_judge,
+    request_stop as codex_request_stop,
 )
 from bakeoff.judge import (  # noqa: E402
     JUDGE_MODEL_ID_DEFAULT,
@@ -683,8 +685,13 @@ def lazy_live_completion(judge_model_id: str,
 
     A one-slot dict rather than `nonlocal`, so there is no rebind to get
     wrong, and a lock around the fill because `--concurrency` submits the
-    first prompts of a batch together. `live_completion`'s own inner cache is
-    reached only through this one, so guarding here guards both.
+    first prompts of a batch together.
+
+    THIS LOCK GUARDS ONLY THIS CACHE. `live_completion`'s router is built on
+    the first INVOCATION, not at construction, so it is reached outside this
+    lock entirely and carries its own -- an earlier version of this sentence
+    claimed guarding here guarded both, which was false in the direction that
+    matters: two threads through one closure.
 
     `usage_totals` is passed THROUGH rather than counted here, and the laziness
     is why that matters: this wrapper sees a prompt and a reply, not a response,
@@ -729,8 +736,9 @@ def lazy_codex_completion(judge_model_id: str,
     import.
 
     Locked for `lazy_live_completion`'s reason: `--concurrency` submits the
-    first prompts of a batch together, and two winners of that race would each
-    resolve the binary, the home and the auth file.
+    first prompts of a batch together. As there, this guards only this cache;
+    `codex_completion` resolves the binary, the home and the auth file on its
+    first invocation and holds its own lock for that.
     """
     built: dict[str, CompleteFn] = {}
     # A LOCK, not a bare check-then-set. Under `--concurrency` the first
@@ -2315,6 +2323,10 @@ def judge_event_log(event_log_root, tasks, *,
         # summary -- exactly the failure `_finish`'s docstring says this
         # section exists to remove.
         pool = ThreadPoolExecutor(max_workers=width)
+        # Re-armed at the START of the walk, never at the end of the previous
+        # one: clearing on the way out would re-arm the very workers the
+        # `finally` below has just told to stop.
+        codex_request_stop_clear()
         try:
             def _top_up() -> None:
                 nonlocal cursor
@@ -2358,6 +2370,14 @@ def judge_event_log(event_log_root, tasks, *,
             # `wait=False` means the SUMMARY PRINTS NOW rather than after the
             # slowest in-flight call.
             #
+            # `codex_request_stop` first, because `cancel_futures` can only
+            # cancel calls that have not STARTED. A worker already inside the
+            # backend's rate-limit ladder would otherwise wake from a backoff
+            # after the report is on the terminal and buy a fresh call -- real
+            # money spent on a verdict nobody will commit, and spent after the
+            # pass reported what it had spent. Cooperative rather than a kill,
+            # because the seam is one string in and one string out.
+            #
             # Honest about what this does not fix: `concurrent.futures`
             # registers its own atexit join, so a worker still inside a
             # `codex exec` can keep the interpreter alive after the report is
@@ -2367,6 +2387,7 @@ def judge_event_log(event_log_root, tasks, *,
             # Killing those children would mean this driver tracking the
             # backend's subprocesses, which is a seam the `CompleteFn`
             # contract deliberately does not have.
+            codex_request_stop()
             pool.shutdown(wait=False, cancel_futures=True)
 
     try:
