@@ -35,6 +35,8 @@ import pytest
 
 from bakeoff.codex_judge import (
     CODEX_HOME_ENV,
+    CODEX_SEAT_ENV,
+    CODEX_SEAT_UNATTESTED,
     codex_completion,
     codex_harness,
 )
@@ -105,5 +107,14 @@ def test_the_harness_block_names_a_real_version_and_the_attested_seat():
     assert harness["auth_mode"] == "chatgpt"
     assert harness["sandbox"] == "read-only"
     # Never derived from a token: auth.json proves a session, not whose seat.
-    assert harness["auth_seat"], "BAKEOFF_CODEX_SEAT is the operator's attestation"
+    # Compared against the fallback, not merely truth-tested: `codex_harness`
+    # substitutes the TRUTHY string "unattested" when the variable is unset, so
+    # `assert harness["auth_seat"]` held with it unset and the one test gating
+    # the attestation passed -- after which a production pass would stamp
+    # auth_seat: "unattested" onto every line of the one field an audit reads.
+    assert harness["auth_seat"] != CODEX_SEAT_UNATTESTED, (
+        f"set {CODEX_SEAT_ENV} before the paid smoke: auth_seat is the "
+        "operator's attestation of WHOSE seat signs the pass, and it is "
+        "about to be recorded verbatim on every production line"
+    )
     json.dumps(harness)  # it has to survive the record's serialization
