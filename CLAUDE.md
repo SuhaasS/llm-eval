@@ -185,7 +185,7 @@ Current state: Tasks 1–11 complete, Task 12's offline half done, Gate 0 (every
 This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
 
 Rules:
-- For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
+- **When graphify-out/graph.json exists, `graphify query "<question>"` is MANDATORY before grepping raw files.** Grep only after graphify has oriented you, or to modify or debug specific lines. This is the same rule the PreToolUse hook enforces on every Bash call; it is repeated here because a hook message attached to a tool call is easy to read past, and this one has been. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
 - If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
 - Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
 - After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
