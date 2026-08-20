@@ -5838,6 +5838,66 @@ def test_a_gate_decided_pair_commits_inline_and_does_not_occupy_the_window(
     assert result["errors"] == []
 
 
+def test_a_slow_head_unit_does_not_idle_the_rest_of_the_window(tmp_path):
+    """`in_flight` counted done-but-uncommitted futures against the width,
+    so one slow head unit idled every other worker until it committed --
+    on real codex latencies (30s..20min) that is serial execution wearing
+    a --concurrency flag. The window must keep submitting while the head
+    runs, bounded at 2*width uncommitted so the abort-time discard stays
+    O(width).
+    """
+    root = _four_vote_collection(tmp_path)
+    head_may_finish = threading.Event()
+    started: list[str] = []
+    lock = threading.Lock()
+
+    class _BlockingHead(FakeComplete):
+        def __call__(self, prompt: str) -> str:
+            with lock:
+                started.append(prompt)
+                first = len(started) == 1
+            if first:
+                # Comfortably longer than the observation window below, and
+                # not a tunable: a head that frees itself on its own timeout
+                # tops the window up for the same reason a fixed one does,
+                # so equal deadlines make a stalled window look repaired.
+                # The `finally` releases it, so this bound is only ever
+                # reached by a test that has already failed.
+                assert head_may_finish.wait(timeout=60.0), \
+                    "the walk never released the head unit"
+            return super().__call__(prompt)
+
+    seam = _BlockingHead()
+    walked: list = []
+    walker = threading.Thread(
+        target=lambda: walked.append(
+            _run(root, complete=seam, rubric=False, concurrency=2)
+        )
+    )
+    walker.start()
+    try:
+        # Four paid units, width 2. With the head blocked, the old window
+        # stalled at 2 submissions; the fixed window keeps going to the
+        # uncommitted cap (2 * width = 4).
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            with lock:
+                if len(started) >= 4:
+                    break
+            time.sleep(0.02)
+        with lock:
+            assert len(started) >= 3, (
+                f"only {len(started)} calls started behind a blocked head: "
+                "the window is still counting finished futures as in flight"
+            )
+    finally:
+        head_may_finish.set()
+        walker.join(timeout=30.0)
+    assert walked and walked[0]["errors"] == []
+    # Commit order is still the worklist's, whatever order the race ran.
+    assert [ln.vote_index for ln in _lines(root)] == [0, 1, 0, 1]
+
+
 def test_the_reasoning_effort_reaches_the_backend_and_not_only_the_record(
     tmp_path, monkeypatch
 ):

@@ -2378,18 +2378,26 @@ def judge_event_log(event_log_root, tasks, *,
           be reproducible.
 
         The price is bounded and worth naming: when the batch aborts or the
-        operator interrupts, up to `width - 1` calls are already in flight and
-        their results are discarded unwritten. That is the same bound the
-        sequential walk already accepted for its one in-flight unit, and it is
-        why the window is not larger than it needs to be.
+        operator interrupts, up to `2 * width - 1` paid calls are in flight or
+        buffered -- already answered, not yet committed -- and every one of
+        their results is discarded unwritten. The buffer above `width` is what
+        the ordered commit costs: the worker budget counts only RUNNING calls,
+        so answers pile up behind a slow head unit instead of the pool idling
+        until it commits, which on a backend whose latencies span 30 s to 20
+        minutes is the difference between a concurrent pass and a serial one.
+        It is capped at twice the width, and not left to grow with the
+        worklist, so the discard stays O(width) -- the same reason the window
+        is not larger than it needs to be.
         """
-        from concurrent.futures import ThreadPoolExecutor
+        from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor
         from concurrent.futures import wait as futures_wait
 
         # A future per unit, in worklist order. `None` for units that make no
-        # call. The queue is the window: it is refilled to `width` PAID calls
-        # before each commit, so a stretch of gate-decided pairs cannot starve
-        # the pool and a stretch of votes cannot overfill it.
+        # call. The queue is the window: it is refilled to `width` RUNNING
+        # paid calls -- and at most `2 * width` uncommitted ones -- before
+        # each commit AND every time a worker frees during one, so a stretch
+        # of gate-decided pairs cannot starve the pool and a stretch of votes
+        # cannot overfill it.
         queue: deque[tuple[_Unit, Any, dict]] = deque()
         cursor = 0
 
@@ -2409,8 +2417,23 @@ def judge_event_log(event_log_root, tasks, *,
         try:
             def _top_up() -> None:
                 nonlocal cursor
-                in_flight = sum(1 for _, future, _ in queue if future is not None)
-                while cursor < len(worklist) and in_flight < width:
+                # RUNNING futures gate the worker budget; ALL uncommitted
+                # paid entries gate the buffer. Counting done futures
+                # against the width -- the first version -- idled every
+                # worker behind one slow head unit, which is serial
+                # execution wearing a --concurrency flag. The buffer cap is
+                # what keeps the abort-time discard O(width): at most
+                # 2*width - 1 paid results can be uncommitted when the walk
+                # stops.
+                running = sum(
+                    1 for _, future, _ in queue
+                    if future is not None and not future.done()
+                )
+                buffered = sum(
+                    1 for _, future, _ in queue if future is not None
+                )
+                while (cursor < len(worklist) and running < width
+                       and buffered < 2 * width):
                     unit = worklist[cursor]
                     cursor += 1
                     call = _paid_call(unit)
@@ -2418,13 +2441,23 @@ def judge_event_log(event_log_root, tasks, *,
                     if call is None:
                         queue.append((unit, None, clock))
                         continue
-                    queue.append((unit, pool.submit(_timed, clock, call), clock))
-                    in_flight += 1
+                    queue.append(
+                        (unit, pool.submit(_timed, clock, call), clock)
+                    )
+                    running += 1
+                    buffered += 1
 
             for index in range(1, len(worklist) + 1):
                 _top_up()
-                unit, future, clock = queue.popleft()
+                # PEEKED, not popped, and popped only once its future is
+                # done: the head has to stay in the queue for the top-ups
+                # below to count it. Popped first, it would hold a worker
+                # that nothing counted, the window would run `width + 1`
+                # calls against `width` workers, and the discard bound below
+                # would be off by the one unit that is never discarded.
+                unit, future, clock = queue[0]
                 if future is None:
+                    queue.popleft()
                     _begin(index, unit)
                     _attempt(unit)
                     continue
@@ -2438,7 +2471,42 @@ def judge_event_log(event_log_root, tasks, *,
                 # catch it and a single bad diff would end the batch. The
                 # bound method is handed on unevaluated instead, so the raise
                 # happens inside.
-                futures_wait([future])
+                #
+                # Topping up only at the head of the for-loop is what made
+                # the counting fix above a no-op for the very case it was
+                # written for: the main thread spends the whole of a slow
+                # head unit parked in this wait, so a worker that freed
+                # during it stayed free until the head committed. Measured on
+                # the fix without this loop -- four units, width 2, head
+                # blocked -- exactly two calls ever started. So the wait is
+                # FIRST_COMPLETED over the head AND its siblings, and every
+                # wake tops the window up again.
+                #
+                # It is not a poll. Every wake is a future completing, and a
+                # completed future is either replaced by a submission or
+                # dropped from `waiting_on`, so the loop runs at most once
+                # per future and then blocks on the head alone.
+                while not future.done():
+                    # Top up BEFORE the wait, never after it. The for-loop's
+                    # call above ran while this unit's siblings were still
+                    # running, so by the time the head blocks its counts are
+                    # already stale -- and waiting on a stale set is not a
+                    # smaller version of this bug, it is the whole bug back:
+                    # a sibling that finished in between is filtered out of
+                    # `waiting_on` as done, the wait then has nothing left to
+                    # wake it, and the pool idles until the head returns.
+                    _top_up()
+                    # The head is ALWAYS waited on, even when `_top_up` just
+                    # finished it, so a head that completes mid-top-up is
+                    # committed now rather than held hostage to whichever
+                    # sibling finishes next -- which on this backend is a
+                    # twenty-minute hostage.
+                    waiting_on = [future] + [
+                        f for _, f, _ in queue
+                        if f is not None and f is not future and not f.done()
+                    ]
+                    futures_wait(waiting_on, return_when=FIRST_COMPLETED)
+                queue.popleft()
                 _begin(index, unit, clock.get("seconds"))
                 _attempt(unit, future.result)
         finally:
