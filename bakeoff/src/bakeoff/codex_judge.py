@@ -105,7 +105,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -160,43 +160,32 @@ CODEX_SANDBOX = "read-only"
 
 LAST_MESSAGE_NAME = "last_message.txt"
 
-#: Cooperative shutdown for in-flight workers. Set by the driver once it has
-#: stopped committing; checked here before every spawn and before every
-#: rate-limit backoff.
+#: Cooperative shutdown, as a per-closure `threading.Event` the CALLER owns
+#: and passes in -- deliberately not module state.
 #:
 #: It exists because `ThreadPoolExecutor.shutdown(cancel_futures=True)` can
 #: only cancel calls that have not STARTED. A worker already inside the
-#: rate-limit ladder would otherwise wake from a backoff after the summary
-#: has printed and start a fresh `codex exec` -- real money spent on a verdict
+#: rate-limit ladder would otherwise wake from a backoff after the summary has
+#: printed and start a fresh `codex exec` -- real money spent on a verdict
 #: nobody will commit, and spent AFTER the pass reported what it had spent, so
 #: the printed `calls` is short by exactly those spawns. "Nothing further will
 #: be written" was already true; this is what makes "nothing further will be
 #: spent" true as well.
 #:
-#: A module-level Event rather than a parameter threaded through
-#: `CompleteFn`: that contract is one string in and one string out precisely
-#: so a test can inject a function, and widening it for a shutdown signal
-#: would put process lifecycle into the seam that exists to keep it out.
-_STOP = threading.Event()
-
-
-def request_stop() -> None:
-    """Ask in-flight calls to stop spending. Idempotent."""
-    _STOP.set()
-
-
-def clear_stop() -> None:
-    """Re-arm the backend for a new pass. Called at the START of a walk.
-
-    At the start rather than at the end of the previous one: a driver that
-    cleared on the way out would re-arm the very workers it had just told to
-    stop, which is the opposite of the point.
-    """
-    _STOP.clear()
-
-
-def stop_requested() -> bool:
-    return _STOP.is_set()
+#: A MODULE-LEVEL EVENT WAS THE FIRST ATTEMPT AND IT WAS WRONG, in a way worth
+#: recording because it looked simpler. A process-global flag has to be
+#: re-armed, only one code path did the re-arming, and the flag was set
+#: unconditionally -- so a process that ran any concurrent batch and then a
+#: second one would have every paid unit of the second killed by a stop
+#: request the first pass made, straight into a breaker abort. And re-arming
+#: it would revive the first batch's still-running workers, which then spend
+#: against totals that were already reported. Both disappear when the event's
+#: lifetime is the closure's: a new batch builds a new closure, so there is
+#: nothing to re-arm and nothing to revive.
+#:
+#: `CompleteFn` is untouched by this -- the seam is still one string in and
+#: one string out, and the event is a construction-time argument that the
+#: driver keeps its own reference to.
 
 #: HTTP statuses that mean the CREDENTIAL rather than the request, spelled the
 #: same way `judge._AUTH_STATUS` spells them so the two backends agree about
@@ -798,6 +787,7 @@ def codex_completion(
     reasoning_effort: str | None = None,
     timeout_s: float = CODEX_CALL_TIMEOUT_S,
     sleep: Any = time.sleep,
+    stop: threading.Event | None = None,
 ) -> CompleteFn:
     """The live codex `CompleteFn`: rendered prompt in, raw model text out.
 
@@ -814,6 +804,13 @@ def codex_completion(
 
     `sleep` is injected so the backoff is testable without a test suite that
     waits minutes.
+
+    `stop` is the caller's own `threading.Event` -- see the note above the
+    constants. When it is set, no further call is SPAWNED and no further
+    backoff is waited out; calls already on the wire run to their timeout,
+    which is the part a cooperative signal cannot reach. `None` means this
+    closure never stops early, which is right for a caller that makes one call
+    and waits for it.
     """
     resolved: dict[str, str] = {}
     # A LOCK AROUND THE RESOLUTION, not a bare `if not resolved`. Under
@@ -828,6 +825,7 @@ def codex_completion(
     # serialise every paid call in the batch onto one thread, which is the
     # whole of what `--concurrency` buys.
     resolve_lock = threading.Lock()
+    stopped = (lambda: False) if stop is None else stop.is_set
 
     def complete(prompt: str) -> str:
         with resolve_lock:
@@ -842,14 +840,15 @@ def codex_completion(
 
         for attempt in range(CODEX_RATE_LIMIT_RETRIES + 1):
             run = _attempt_once(
-                resolved, env, prompt, usage_totals, timeout_s, reasoning_effort
+                resolved, env, prompt, usage_totals, timeout_s,
+                reasoning_effort, stopped,
             )
             if isinstance(run, CodexRun):
                 return run.last_message
 
             if (isinstance(run, CodexRateLimited)
                     and attempt < CODEX_RATE_LIMIT_RETRIES
-                    and not stop_requested()):
+                    and not stopped()):
                 # Jittered so a concurrent pool does not resynchronise
                 # every worker onto one wake-up and hit the window together,
                 # and the cap is applied AFTER the jitter: capping first lets
@@ -876,6 +875,7 @@ def _attempt_once(
     usage_totals: dict[str, int] | None,
     timeout_s: float,
     reasoning_effort: str | None,
+    stopped: Callable[[], bool] = lambda: False,
 ) -> CodexRun | RuntimeError:
     """One spawn, with the transport retry. Returns the run OR the exception.
 
@@ -893,7 +893,7 @@ def _attempt_once(
     last: RuntimeError | None = None
 
     for _ in range(2):
-        if stop_requested():
+        if stopped():
             # Checked before the spawn rather than after: the point is to not
             # BUY the call, and a check after it has already been paid for
             # would only decide whether to look at the answer.

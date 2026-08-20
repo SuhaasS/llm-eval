@@ -5725,8 +5725,8 @@ def test_the_reasoning_effort_reaches_the_backend_and_not_only_the_record(
     seen: dict = {}
     monkeypatch.setattr(
         judge_script, "lazy_codex_completion",
-        lambda model, usage=None, effort=None: seen.update(
-            model=model, effort=effort
+        lambda model, usage=None, effort=None, stop=None: seen.update(
+            model=model, effort=effort, stop=stop is not None
         ) or FakeComplete(),
     )
     _fake_harness(monkeypatch, tmp_path)
@@ -5737,7 +5737,9 @@ def test_the_reasoning_effort_reaches_the_backend_and_not_only_the_record(
         rubric=False, reasoning_effort="high",
     )
 
-    assert seen == {"model": CODEX_JUDGE, "effort": "high"}
+    # The batch's own stop event travels with it: without one, an
+    # interrupted concurrent pass would keep buying calls after its summary.
+    assert seen == {"model": CODEX_JUDGE, "effort": "high", "stop": True}
 
 
 def test_the_concurrency_flag_is_validated_at_one_or_more(monkeypatch, tmp_path):

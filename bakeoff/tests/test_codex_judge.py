@@ -740,13 +740,6 @@ def test_a_run_that_completed_and_then_failed_still_folds_the_tokens_it_used(
 # --- cooperative shutdown ----------------------------------------------------
 
 
-@pytest.fixture(autouse=True)
-def _rearm_stop():
-    codex_judge.clear_stop()
-    yield
-    codex_judge.clear_stop()
-
-
 def test_a_stop_request_prevents_the_next_spawn_from_being_bought(
     monkeypatch, judge_home: Path, codex_bin: Path
 ):
@@ -758,15 +751,60 @@ def test_a_stop_request_prevents_the_next_spawn_from_being_bought(
     had spent.
     """
     fake = _install(monkeypatch, [CodexRun(0, _events(_completed()), "", "ok")])
+    stop = threading.Event()
     complete = codex_completion(
-        PINNED, codex_bin=str(codex_bin), codex_home=str(judge_home)
+        PINNED, codex_bin=str(codex_bin), codex_home=str(judge_home), stop=stop
     )
-    codex_judge.request_stop()
+    stop.set()
 
     with pytest.raises(CodexCallFailed, match="stopped before this call"):
         complete("prompt")
 
     assert fake.calls == []
+
+
+def test_one_batch_stopping_cannot_stop_the_next_one(
+    monkeypatch, judge_home: Path, codex_bin: Path
+):
+    """The event's lifetime is the CLOSURE's, not the process's.
+
+    A module-global flag was the first attempt: it had to be re-armed, only
+    one code path re-armed it, and it was set unconditionally -- so a process
+    that ran one concurrent batch and then a second would have every paid unit
+    of the second killed by a stop the first pass requested, straight into a
+    breaker abort. Re-arming it would instead revive the first batch's workers
+    to spend against totals already reported. A fresh event per closure has
+    neither problem: there is nothing to re-arm and nothing to revive.
+    """
+    first_stop = threading.Event()
+    first = codex_completion(
+        PINNED, codex_bin=str(codex_bin), codex_home=str(judge_home),
+        stop=first_stop,
+    )
+    first_stop.set()
+
+    _install(monkeypatch, [CodexRun(0, _events(_completed()), "", "second ok")])
+    second = codex_completion(
+        PINNED, codex_bin=str(codex_bin), codex_home=str(judge_home),
+        stop=threading.Event(),
+    )
+
+    with pytest.raises(CodexCallFailed):
+        first("prompt")
+    assert second("prompt") == "second ok"
+
+
+def test_a_closure_with_no_stop_event_never_stops_itself_early(
+    monkeypatch, judge_home: Path, codex_bin: Path
+):
+    """`None` is right for a caller that makes one call and waits for it --
+    the live smoke, and any direct use of the backend."""
+    _install(monkeypatch, [CodexRun(0, _events(_completed()), "", "ok")])
+    complete = codex_completion(
+        PINNED, codex_bin=str(codex_bin), codex_home=str(judge_home)
+    )
+
+    assert complete("prompt") == "ok"
 
 
 def test_a_stop_request_ends_the_rate_limit_ladder_instead_of_waiting_it_out(
@@ -776,13 +814,15 @@ def test_a_stop_request_ends_the_rate_limit_ladder_instead_of_waiting_it_out(
     _install(monkeypatch, [limited] * (CODEX_RATE_LIMIT_RETRIES + 1))
     waits: list[float] = []
 
+    stop = threading.Event()
+
     def sleep_then_stop(seconds: float) -> None:
         waits.append(seconds)
-        codex_judge.request_stop()
+        stop.set()
 
     complete = codex_completion(
         PINNED, codex_bin=str(codex_bin), codex_home=str(judge_home),
-        sleep=sleep_then_stop,
+        sleep=sleep_then_stop, stop=stop,
     )
 
     # The stop is what ends it, so the failure names the stop rather than the

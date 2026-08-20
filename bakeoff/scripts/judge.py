@@ -216,11 +216,9 @@ from bakeoff.codex_judge import (  # noqa: E402
     # anyway -- so a mantle pass pays nothing for this edge. What is deferred
     # is the RESOLUTION (binary, judge home, auth.json), which happens on the
     # first prompt inside `lazy_codex_completion`.
-    clear_stop as codex_request_stop_clear,
     codex_harness,
     codex_sampling,
     is_codex_judge,
-    request_stop as codex_request_stop,
 )
 from bakeoff.judge import (  # noqa: E402
     JUDGE_MODEL_ID_DEFAULT,
@@ -723,6 +721,7 @@ def lazy_live_completion(judge_model_id: str,
 def lazy_codex_completion(judge_model_id: str,
                           usage_totals: dict[str, int] | None = None,
                           reasoning_effort: str | None = None,
+                          stop: threading.Event | None = None,
                           ) -> CompleteFn:
     """`codex_completion`, built on the first prompt that needs it.
 
@@ -764,6 +763,11 @@ def lazy_codex_completion(judge_model_id: str,
                     # is to be true about the request, and one nothing
                     # downstream could detect because the value parses.
                     reasoning_effort=reasoning_effort,
+                    # The batch's own event, so a second batch in the same
+                    # process builds a second closure holding a second event
+                    # -- nothing to re-arm, and nothing of this batch's left
+                    # to revive. See `codex_judge`'s note above its constants.
+                    stop=stop,
                 )
         return built["fn"](prompt)
 
@@ -1757,6 +1761,14 @@ def judge_event_log(event_log_root, tasks, *,
     # zeros would be a measurement of a batch that made no live call, and the
     # driver has no way to count tokens through a function whose contract is
     # one string in and one string out.
+    # ONE PER BATCH, owned here and handed to the backend at construction.
+    # `_walk_concurrently` sets it once it has stopped committing, so a worker
+    # still inside the rate-limit ladder does not wake up and buy a call whose
+    # verdict nobody will record -- money spent after the pass has already
+    # reported what it spent. Never cleared, because it never outlives the
+    # closure it was built into.
+    stop_spending = threading.Event()
+
     judge_usage: dict[str, int] | None = None
     if complete is None:
         judge_usage = new_usage_totals()
@@ -1765,7 +1777,9 @@ def judge_event_log(event_log_root, tasks, *,
         # ladder decides entirely must not require either backend's credential
         # to exist.
         complete = (
-            lazy_codex_completion(judge_model_id, judge_usage, reasoning_effort)
+            lazy_codex_completion(
+                judge_model_id, judge_usage, reasoning_effort, stop_spending
+            )
             if backend == "codex"
             else lazy_live_completion(judge_model_id, judge_usage)
         )
@@ -2323,10 +2337,6 @@ def judge_event_log(event_log_root, tasks, *,
         # summary -- exactly the failure `_finish`'s docstring says this
         # section exists to remove.
         pool = ThreadPoolExecutor(max_workers=width)
-        # Re-armed at the START of the walk, never at the end of the previous
-        # one: clearing on the way out would re-arm the very workers the
-        # `finally` below has just told to stop.
-        codex_request_stop_clear()
         try:
             def _top_up() -> None:
                 nonlocal cursor
@@ -2370,13 +2380,16 @@ def judge_event_log(event_log_root, tasks, *,
             # `wait=False` means the SUMMARY PRINTS NOW rather than after the
             # slowest in-flight call.
             #
-            # `codex_request_stop` first, because `cancel_futures` can only
+            # The stop is set FIRST, because `cancel_futures` can only
             # cancel calls that have not STARTED. A worker already inside the
             # backend's rate-limit ladder would otherwise wake from a backoff
             # after the report is on the terminal and buy a fresh call -- real
             # money spent on a verdict nobody will commit, and spent after the
             # pass reported what it had spent. Cooperative rather than a kill,
             # because the seam is one string in and one string out.
+            #
+            # This event belongs to THIS batch, so there is nothing to re-arm
+            # afterwards: a second batch in the same process builds its own.
             #
             # Honest about what this does not fix: `concurrent.futures`
             # registers its own atexit join, so a worker still inside a
@@ -2387,7 +2400,7 @@ def judge_event_log(event_log_root, tasks, *,
             # Killing those children would mean this driver tracking the
             # backend's subprocesses, which is a seam the `CompleteFn`
             # contract deliberately does not have.
-            codex_request_stop()
+            stop_spending.set()
             pool.shutdown(wait=False, cancel_futures=True)
 
     try:
