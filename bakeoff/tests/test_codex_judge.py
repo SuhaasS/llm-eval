@@ -262,6 +262,50 @@ def test_a_missing_binary_refuses_and_names_the_environment_variable(
         complete("prompt")
 
 
+def test_a_config_toml_or_agents_md_in_the_judge_home_is_refused(
+    monkeypatch, tmp_path: Path, codex_bin: Path
+):
+    """The purpose-built home is the LOAD-BEARING hermeticism layer -- the
+    flags are the second layer, and their AGENTS.md coverage is inference.
+    A home that holds either injection file must be refused at resolution,
+    the pruned-mirror lesson applied here: re-check the invariant against
+    the artifact, not the setup story.
+    """
+    for name in ("config.toml", "AGENTS.md"):
+        home = tmp_path / f"home-{name}"
+        home.mkdir()
+        (home / "auth.json").write_text(json.dumps({"auth_mode": "chatgpt"}))
+        (home / name).write_text("injected")
+        complete = codex_completion(
+            PINNED, codex_bin=str(codex_bin), codex_home=str(home)
+        )
+
+        with pytest.raises(CodexUnavailable, match=name):
+            complete("prompt")
+
+
+def test_a_directory_or_non_executable_binary_is_refused_with_the_env_var(
+    monkeypatch, judge_home: Path, tmp_path: Path
+):
+    """exists() passed a directory (the ChatGPT.app path itself -- the
+    documented likely mistake) and a non-executable file; both then failed
+    per unit as a raw OSError that named neither the binary nor
+    BAKEOFF_CODEX_BIN, marching the breaker into an abort."""
+    a_directory = tmp_path / "ChatGPT.app"
+    a_directory.mkdir()
+    not_executable = tmp_path / "codex-noexec"
+    not_executable.write_text("#!/bin/sh\n")
+    not_executable.chmod(0o644)
+
+    for wrong in (a_directory, not_executable):
+        complete = codex_completion(
+            PINNED, codex_bin=str(wrong), codex_home=str(judge_home)
+        )
+        with pytest.raises(CodexUnavailable,
+                           match=codex_judge.CODEX_BIN_ENV):
+            complete("prompt")
+
+
 # --- replies -----------------------------------------------------------------
 
 

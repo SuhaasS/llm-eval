@@ -34,6 +34,12 @@ REFUSED rather than defaulted (`_resolve_codex_home`): defaulting to
 instruction file happen to be on the operator's machine, and the resulting
 table would look exactly like a clean one.
 
+Both halves of that are ENFORCED at resolution, not assumed from the setup
+instructions: the variable is required, and the directory it names is then
+checked for those two files by name. A property this docstring calls
+load-bearing and nothing verifies is a property the first stray copy silently
+removes -- and the resulting table, again, would look exactly like a clean one.
+
 The second layer is the flag set in `build_codex_argv`, and it is real rather
 than decorative. Measured 2026-08-20 against `codex-cli 0.145.0-alpha.18`, ONE
 prompt asked twice: 18,042 input tokens with the user config loaded, 14,606
@@ -711,23 +717,39 @@ def _count_call(usage_totals: dict[str, int] | None) -> None:
 
 def _resolve_codex_bin(codex_bin: str | None) -> str:
     resolved = codex_bin or os.environ.get(CODEX_BIN_ENV) or CODEX_BIN_DEFAULT
-    if not Path(resolved).exists():
+    # RUNNABLE, not merely present. `exists()` passed a directory -- and
+    # `/Applications/ChatGPT.app` is the wrong answer `CODEX_BIN_DEFAULT`
+    # anticipates, since the CLI ships inside that bundle -- and passed a
+    # file with no execute bit. Both cleared resolution and then died per
+    # unit inside `Popen` as a raw `IsADirectoryError`/`PermissionError`
+    # naming neither the path nor the environment variable, so the operator
+    # met the breaker's abort instead of the one-line fix.
+    path = Path(resolved)
+    if not (path.is_file() and os.access(resolved, os.X_OK)):
         raise CodexUnavailable(
-            f"no codex binary at {resolved!r}: set {CODEX_BIN_ENV} to the "
-            "path of the Codex CLI (it ships inside the ChatGPT app and is "
-            "not on PATH)"
+            f"no runnable codex binary at {resolved!r} (missing, a "
+            f"directory, or not executable): set {CODEX_BIN_ENV} to the "
+            "CLI itself -- it ships INSIDE the ChatGPT app at "
+            f"{CODEX_BIN_DEFAULT!r}, and the app bundle's own path is the "
+            "usual wrong answer"
         )
     return resolved
 
 
 def _resolve_codex_home(codex_home: str | None) -> str:
-    """The judge's `CODEX_HOME`. REFUSED when unset -- never defaulted.
+    """The judge's `CODEX_HOME`. REFUSED when unset, and re-checked when set.
 
     Defaulting to `~/.codex` is the quiet failure this guard exists for: that
     directory holds the operator's personal session, their `config.toml` and
     their `AGENTS.md`, so a pass that fell back to it would judge on an
     unattested account with the operator's own standing instructions folded
     into every verdict, and would produce a complete table saying none of it.
+
+    A DELIBERATE home is not the same claim as a CLEAN one, which is why the
+    two injection files are checked against the directory itself. `<dir>` was
+    read as proof of its own contents -- the same shape as trusting a pruned
+    mirror's setup story -- and a `config.toml` copied there once rides into
+    every verdict thereafter, unrecorded and looking exactly like a clean pass.
     """
     resolved = codex_home or os.environ.get(CODEX_HOME_ENV)
     if not resolved:
@@ -744,7 +766,23 @@ def _resolve_codex_home(codex_home: str | None) -> str:
             f"`CODEX_HOME={resolved} <codex> login` and confirm with "
             f"`CODEX_HOME={resolved} <codex> login status` before judging"
         )
-    return str(Path(resolved).expanduser())
+    home = Path(resolved).expanduser()
+    # The docstring above calls "holds ONLY auth.json" the load-bearing
+    # layer, so it is re-checked against the directory itself rather than
+    # trusted from the setup story -- the pruned-mirror rule. Two named
+    # files rather than an allowlist: codex leaves harmless artifacts of
+    # its own in CODEX_HOME, and refusing one of those mid-pass would kill
+    # a healthy batch over nothing.
+    for name in ("config.toml", "AGENTS.md"):
+        if (home / name).exists():
+            raise CodexUnavailable(
+                f"{resolved!r} holds {name} beside auth.json: that file "
+                "would ride into every verdict unrecorded. The judge home "
+                "must hold ONLY auth.json -- move or delete it, or point "
+                f"{CODEX_HOME_ENV} at a home created solely by "
+                f"`{CODEX_HOME_ENV}=<dir> ... codex login`"
+            )
+    return str(home)
 
 
 def codex_cli_version(codex_bin: str) -> str:
