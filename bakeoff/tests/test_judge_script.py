@@ -5897,3 +5897,85 @@ def test_the_concurrency_flag_is_validated_at_one_or_more(monkeypatch, tmp_path)
         main(["--event-log", str(root), "--concurrency", "0"])
 
     assert exit_info.value.code == 2
+
+
+# ---------------------------------------------------------------------------
+# the usage line refuses what it used to drop
+# ---------------------------------------------------------------------------
+
+
+def test_the_reasoning_effort_is_refused_with_a_mantle_judge(tmp_path):
+    """Silently dropped configuration is this repo's named enemy. The flag
+    is the codex backend's one knob; accepted beside a mantle id it ran the
+    whole paid pass at defaults with nothing anywhere saying so.
+    """
+    root = _two_arms(tmp_path)
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(["--event-log", str(root), "--reasoning-effort", "high"])
+    assert exit_info.value.code == 2
+
+    with pytest.raises(ValueError, match="codex"):
+        judge_event_log(root, [_task()], reasoning_effort="high")
+
+
+def test_a_mixed_case_codex_prefix_is_refused_not_silently_mantled(tmp_path):
+    """`is_codex_judge` is exact while the neutrality guard lowercases, so
+    'Codex:...' passed the guard and ran against the mantle router --
+    permanent gate-decided lines under a mistyped id, then a breaker abort.
+    """
+    root = _two_arms(tmp_path)
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(["--event-log", str(root),
+              "--judge-model", "Codex:gpt-5.2-codex"])
+    assert exit_info.value.code == 2
+
+    with pytest.raises(ValueError, match="case"):
+        judge_event_log(root, [_task()], judge_model_id="CODEX:gpt-5.2-codex")
+
+
+def test_an_unknown_reasoning_effort_value_is_refused_at_the_usage_line(
+    tmp_path,
+):
+    root = _two_arms(tmp_path)
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(["--event-log", str(root),
+              "--judge-model", "codex:gpt-5.2-codex",
+              "--reasoning-effort", 'hi"gh'])
+    assert exit_info.value.code == 2
+
+
+def test_an_empty_effort_keys_as_the_absent_effort_every_line_records(
+    tmp_path, monkeypatch
+):
+    """`""` reaches `batch_effort` -- the library guard is `is not None` --
+    and everything downstream drops it, so the key must drop it too.
+
+    `codex_sampling` gates on truthiness, so an empty effort writes
+    `judge_sampling: {}` and `_judge_generation` reads `None` back off it.
+    A batch keying on `""` therefore mismatches every line it just wrote:
+    a resume at the SAME arguments skips nothing and re-buys the whole
+    collection at full price, in silence, appending a second set of lines
+    that are byte-identical in generation to the first.
+    """
+    _fake_harness(monkeypatch, tmp_path)
+    root = _two_arms(tmp_path)
+
+    _run(root, judge_model_id=CODEX_JUDGE, rubric=False, reasoning_effort="")
+    paid = [line for line in _lines(root) if line.judge_prompt_sha]
+    assert paid
+    assert all(line.judge_sampling == {} for line in paid)
+
+    before = len(_lines(root))
+    resumed = _run(root, judge_model_id=CODEX_JUDGE, rubric=False,
+                   reasoning_effort="")
+    assert resumed["skipped"]
+    assert len(_lines(root)) == before
+
+    # And the pass that omits the flag entirely is the same generation, since
+    # neither one sent an effort: two spellings of absence, one reading.
+    omitted = _run(root, judge_model_id=CODEX_JUDGE, rubric=False)
+    assert omitted["skipped"]
+    assert len(_lines(root)) == before

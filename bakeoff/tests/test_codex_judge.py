@@ -187,6 +187,35 @@ def test_the_reasoning_effort_is_sent_only_when_set_and_is_the_whole_of_sampling
     assert "temperature" not in json.dumps(codex_sampling("high"))
 
 
+def test_the_argv_builder_refuses_an_effort_that_would_break_the_toml(
+    tmp_path: Path,
+):
+    """The effort is interpolated inside -c model_reasoning_effort="...".
+    A quote or backslash yields invalid TOML that fails EVERY paid call
+    until the breaker aborts -- a typo that deserved exit 2 before anything
+    was read. The CLI's choices= already refuses it; this is the guard for
+    direct library callers.
+    """
+    for bad in ('hi"gh', "hi\\gh", "hi gh", "hi\ngh"):
+        with pytest.raises(ValueError, match="reasoning effort"):
+            build_codex_argv(
+                "/bin/codex", "m", tmp_path, tmp_path / "o.txt", bad
+            )
+
+
+def test_a_falsy_effort_never_reaches_the_harness_record(
+    monkeypatch, judge_home: Path, codex_bin: Path
+):
+    """argv and judge_sampling drop a falsy effort; the harness recorded it
+    verbatim -- two evidence fields disagreeing about one request."""
+    harness = codex_judge.codex_harness(
+        PINNED, codex_bin=str(codex_bin), codex_home=str(judge_home),
+        reasoning_effort="",
+    )
+
+    assert harness["reasoning_effort"] is None
+
+
 def test_an_ambient_openai_api_key_never_reaches_the_subprocess():
     env = codex_environment("/judge/home", {"OPENAI_API_KEY": "sk-personal", "X": "1"})
 

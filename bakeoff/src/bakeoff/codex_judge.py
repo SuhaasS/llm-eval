@@ -332,6 +332,14 @@ def build_codex_argv(
     `reasoning_effort` is passed through `-c` only when set, and it is the
     ONLY sampling knob this backend has -- there is no temperature on `codex
     exec`. Whatever is sent here is what `judge_sampling` records; see D7.
+
+    Anything but lowercase letters is REFUSED rather than interpolated. The
+    value lands inside `model_reasoning_effort="..."`, so a quote, a backslash
+    or a newline makes the override invalid TOML -- which fails not this call
+    but EVERY call in the pass, until the consecutive-error breaker aborts a
+    batch that has already spent on nothing. The CLI's `choices=` refuses the
+    same thing at the usage line; this is the guard for a direct library
+    caller, where the closed set is not enforced by argparse.
     """
     argv = [
         codex_bin,
@@ -347,6 +355,13 @@ def build_codex_argv(
         "-m",
         model,
     ]
+    if reasoning_effort and not re.fullmatch(r"[a-z]+", reasoning_effort):
+        raise ValueError(
+            f"unusable reasoning effort {reasoning_effort!r}: the value is "
+            "interpolated into a TOML -c override, so anything beyond "
+            "lowercase letters would corrupt every call's config rather "
+            "than fail one"
+        )
     if reasoning_effort:
         argv += ["-c", f'model_reasoning_effort="{reasoning_effort}"']
     argv += ["--json", "-o", str(output_file), "--color", "never", "-"]
@@ -799,7 +814,9 @@ def codex_harness(
         "auth_mode": _auth_mode(_resolve_codex_home(codex_home)),
         "auth_seat": os.environ.get(CODEX_SEAT_ENV) or CODEX_SEAT_UNATTESTED,
         "sandbox": CODEX_SANDBOX,
-        "reasoning_effort": reasoning_effort,
+        # `or None`: argv and sampling drop a falsy value, and the harness
+        # must not claim what they dropped.
+        "reasoning_effort": reasoning_effort or None,
     }
 
 

@@ -216,6 +216,7 @@ from bakeoff.codex_judge import (  # noqa: E402
     # anyway -- so a mantle pass pays nothing for this edge. What is deferred
     # is the RESOLUTION (binary, judge home, auth.json), which happens on the
     # first prompt inside `lazy_codex_completion`.
+    CODEX_MODEL_PREFIX,
     codex_harness,
     codex_sampling,
     is_codex_judge,
@@ -1615,10 +1616,12 @@ def judge_event_log(event_log_root, tasks, *,
     every line. Lines written before this change stay absolute and go on
     resolving, through `judge_schema.resolve_payload_path`.
 
-    Raises `NonNeutralJudge` on the argument alone, `CollectionNotFound` before
-    touching anything, `ResumeRefused` if either input file cannot be read
-    completely, and nothing else: a batch that got as far as the walk returns
-    its partial reading whatever happens in it.
+    Raises `NonNeutralJudge` on the argument alone, `ValueError` on the two
+    argument shapes that would otherwise be silently dropped (a mixed-case
+    `codex:` prefix, an effort with a mantle backend), `CollectionNotFound`
+    before touching anything, `ResumeRefused` if either input file cannot be
+    read completely, and nothing else: a batch that got as far as the walk
+    returns its partial reading whatever happens in it.
     """
     # FIRST, ahead of even the collection check, and the order is the content.
     # This is a refusal about the COMMAND rather than about what is on disk:
@@ -1640,11 +1643,36 @@ def judge_event_log(event_log_root, tasks, *,
     # backend is a property of the id the guard just admitted, and both facts
     # below are needed by the first line this pass writes.
     backend = _judge_backend(judge_model_id)
+    # THE LIBRARY HALF of the two refusals `main` makes at the usage line, and
+    # it is not redundant with them: everything below runs for any caller that
+    # imports this function, and both shapes below are silently dropped rather
+    # than reported. A refusal here costs a traceback; the alternative costs a
+    # collection of lines that parse and say nothing about what was ignored.
+    if judge_model_id.lower().startswith(CODEX_MODEL_PREFIX) \
+            and backend != "codex":
+        raise ValueError(
+            f"{judge_model_id!r} spells the codex namespace with the wrong "
+            "case: the prefix is spelled 'codex:' exactly, and a normalised "
+            "id would put two spellings of one judge in one file"
+        )
+    if reasoning_effort is not None and backend != "codex":
+        raise ValueError(
+            "reasoning_effort is a codex-backend knob; the mantle path "
+            "cannot send it and must not record it"
+        )
     # The batch side of the sampling identity in every resume key. `None` on
     # the mantle backend whatever the argument says, because the mantle path
     # sends no effort -- the key must describe what goes out, not what was
     # typed.
-    batch_effort = reasoning_effort if backend == "codex" else None
+    #
+    # `or None` for the same reason one clause further in: `""` passes the
+    # `is not None` guard above, and every consumer of it -- `codex_sampling`,
+    # `build_codex_argv`, `codex_harness` -- gates on TRUTHINESS and drops it.
+    # The lines this batch writes therefore carry `judge_sampling: {}`, off
+    # which `_judge_generation` reads `None`; a key holding `""` would mismatch
+    # every one of them and re-buy the whole collection on the next resume,
+    # reporting a clean pass over work already paid for.
+    batch_effort = (reasoning_effort or None) if backend == "codex" else None
     judge_sampling, harness_of = judge_facts(judge_model_id, reasoning_effort)
 
     event_log_root = Path(event_log_root)
@@ -4368,10 +4396,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--reasoning-effort", default=None, metavar="LEVEL",
+        choices=("minimal", "low", "medium", "high"),
         help="codex backend only: the ONE sampling knob it has, recorded into "
              "judge_sampling as sent. There is no temperature -- `codex exec` "
              "cannot send one -- so a codex pass is not exactly reproducible "
-             "the way a mantle pass at temperature 0 is",
+             "the way a mantle pass at temperature 0 is. The choices are the "
+             "values the backend sends",
     )
     # No `--votes`. Under forced positions a comparison is exactly one vote per
     # entry in `VOTE_POSITIONS`, so the only thing a count could express is a
@@ -4410,6 +4440,31 @@ def main(argv: list[str] | None = None) -> int:
             "--max-consecutive-errors must be at least 1: below one, the "
             "first unit that errors ends the batch, which is a hair trigger "
             "rather than a breaker"
+        )
+    # Both of these are DROPPED-CONFIGURATION shapes, which is the class of
+    # failure this repo refuses on sight: the pass runs, every line parses, and
+    # the file says nothing about the thing that was ignored. `judge_event_log`
+    # raises on both as well -- these two are the operator-facing half, and
+    # they fire before the task set is read and long before a credential is
+    # minted, so the cost of the mistake is the usage line rather than a
+    # collection.
+    lowered = args.judge_model.lower()
+    if lowered.startswith(CODEX_MODEL_PREFIX) and not is_codex_judge(
+        args.judge_model
+    ):
+        parser.error(
+            f"{args.judge_model!r} spells the codex namespace with the wrong "
+            "case: the prefix is 'codex:' exactly. Refused rather than "
+            "normalised, because the id goes onto every line verbatim and "
+            "two spellings would be two generations of one judge"
+        )
+    if args.reasoning_effort is not None and not is_codex_judge(
+        args.judge_model
+    ):
+        parser.error(
+            "--reasoning-effort is the codex backend's knob and the mantle "
+            "path cannot send it; with a mantle judge id the flag would be "
+            "silently dropped, which is worse than this refusal"
         )
 
     event_log_root = Path(args.event_log)
