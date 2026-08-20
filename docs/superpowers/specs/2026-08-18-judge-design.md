@@ -571,3 +571,156 @@ A live pairwise call added to `tests/test_integration_judge.py`, behind the
 suite and remains open. **Not implemented** — the one-task smoke answers the
 same question today, and answers it against the real collection rather than a
 fixture.
+
+---
+
+## Amendments (2026-08-20): the judge runs on Codex CLI
+
+*Supersedes the "Model configuration" section's endpoint table and the open
+question **Residency re-confirmation**.* Superseded passages are left standing
+above, per the 2026-08-19 amendments' convention.
+
+The judge's completion backend is now **Codex CLI (`codex exec`) on a Pindrop
+ChatGPT Business/Enterprise seat**, selected by a `codex:<model>` judge id. The
+mantle route is unchanged and still reachable by its own id; the two are
+separate judge generations and are never pooled.
+
+### The residency question is answered, in the direction §4.3 accepted
+
+The open question asked whether "a GPT-class judge sends candidate diffs to a
+third party" — reviewed and accepted at §4.3 — still described what was built,
+since the mantle endpoint is AWS-side and is therefore a *narrower* exposure
+than the one that was approved. It now describes it exactly: the diffs go to
+OpenAI directly, which is the thing that was reviewed. The seat is
+company-owned rather than personal, and every line records which one under
+`judge_harness.auth_seat` — **operator-attested, never derived**, because
+`auth.json` proves a session and not which organisation granted it, and a
+residency audit is precisely what reads that field. `qwen.qwen3-235b-a22b-2507`
+remains the swappable alternative if the posture changes again.
+
+Neutrality is untouched. GPT-class still sits outside all four compared
+families, and `assert_neutral_judge` needs no change: `codex:gpt-…` carries no
+compared vendor prefix and no family token, while `codex:claude-…` is still
+refused. A re-host under the codex namespace is caught by the same second rule
+that catches `bedrock.claude-sonnet-5`.
+
+### Temperature is gone, and the two-vote protocol survives it anyway
+
+`codex exec` has no temperature flag and the models behind it take none, so
+`judge_sampling` on a codex line records the reasoning effort or nothing at
+all. **It must never claim `temperature: 0.0`** — that block's entire job is to
+be true about the request, the value would parse, and the number it implies is
+the number a mantle line legitimately carries.
+
+That costs the 2026-08-19 amendment its stated justification: *"at temperature
+0 a judge is completely described by its answer under each of the two orders"*
+is now an approximation rather than an identity. The protocol is **kept**, and
+the reasons that survive are these. Position consistency is still measured
+directly, because every comparison still holds one vote in each order. The two
+orders still extract the position effect, which is the thing the pair was for.
+And a third vote at a drawn position would re-introduce the unreproducibility
+the amendment removed while buying a sample of a distribution nobody has
+characterised.
+
+What is honestly lost is exact reproducibility: the same collection judged
+twice on this backend can return different verdicts. Two consequences follow.
+A same-generation `--re-judge` A/A pass is now a *meaningful measurement* — it
+reads the judge's self-agreement, which under mantle was zero by construction —
+and it should be run before any published number, beside κ. And the
+malformed-verdict retry now answers sampling nondeterminism as well as
+transport nondeterminism, which strengthens it: re-sending the identical
+prompt is a fresh draw rather than a re-ask of a settled question.
+
+### The prompt sha attests half the input
+
+Codex wraps every prompt in its own agent system prompt and tool schemas.
+Measured 2026-08-20 against `codex-cli 0.145.0-alpha.18`: **14,591 input
+tokens for a nine-word prompt.** None of it passes through `prompt_sha`, so
+`judge_prompt_sha` proves what the harness sent and not the whole of what the
+model read, and `judge_harness.codex_cli_version` is the only identity that
+wrapper has. Two further consequences worth recording rather than discovering:
+the judge is answering inside a *coding-agent* frame rather than as a bare
+completion, which is a real difference from the mantle path and is part of why
+the two backends are separate generations; and at ~9,600 calls that floor is
+~140M input tokens of scaffolding before a single diff is counted.
+
+Hermeticism is therefore two layers, and the load-bearing one is not a flag: a
+purpose-built `CODEX_HOME` holding **only** `auth.json`. The flag set
+(`--ignore-user-config --ignore-rules --skip-git-repo-check --ephemeral -s
+read-only -C <empty dir>`) is real and measured — the same prompt costs 18,042
+input tokens with a populated user config and 14,606 without — but an absent
+file cannot be injected regardless of what a flag means next release. Measured
+alongside: the model's own answer to "were you told about X" was **unreliable**
+at both token counts, so the token count is the evidence and the self-report is
+not.
+
+### Model pinning is weaker than mantle's
+
+`luna`/`sol`/`terra` are three pinned Bedrock ids. A codex model string can
+float server-side, so `judge_model_id` is a weaker guarantee here than the
+spec's "PINNED, never an alias" rule assumes. The compensating record is
+`judge_harness.codex_cli_version` plus `judged_at`; the rule itself is not
+satisfiable on this backend and saying so is better than implying it is.
+
+### Concurrency, and what the breaker now means
+
+A full pass is ~9,600 calls, one subprocess each, so the driver gained
+`--concurrency N`: paid calls run on worker threads, **lines are committed in
+worklist order on one thread**. Writes, progress, and the breaker never leave
+that thread, so the judgments file, the resume, and `StorageFailure`'s
+batch-fatal handling behave exactly as at concurrency 1.
+
+The invariant **N consecutive unit failures abort the batch** keeps its
+sentence and is now explicitly evaluated in **commit order**. Completion order
+is nondeterministic; commit order is the worklist's, so a batch aborts at the
+same unit on every run and the abort message's promise about a resume stays
+true. The bounded price: an abort or a Ctrl-C discards up to `concurrency − 1`
+in-flight calls unwritten — the same shape the sequential walk already accepted
+for its one in-flight unit.
+
+`--concurrency` defaults to **1**, and 1 runs the original sequential walk
+rather than a window of width one. The two are not the same: a window submits
+the next unit's call before the current one commits, and the gate-invariant
+tests move the collection under the driver mid-unit precisely to catch a driver
+acting on a stale read.
+
+### Failure classes, and the one classifier
+
+Codex ends a failed turn with a structured `turn.failed` event whose message
+carries the HTTP status verbatim, so classification reads the status rather
+than error prose a release can reword. Three classes, and they need opposite
+answers:
+
+* **401/403 is auth and is never retried.** Unlike the mantle bearer nothing is
+  mintable — `codex login` is a browser flow — so the abort's credential
+  paragraph names that and not `aws sso`. `CodexAuthFailure` carries
+  `status_code`, which keeps `is_auth_failure` the ONE classifier both backends
+  answer to.
+* **429 is rate limiting, with backoff inside the backend, and is never auth.**
+  A seat's usage window is an expected recurring condition at this call volume.
+  A 429 that still reaches the breaker means the backoff was exhausted first,
+  and the abort says so.
+* **Everything else is one retry then a per-unit failure.** Codex already
+  retries transport internally — measured: five websocket attempts, a fallback
+  to HTTPS, five more — so a second layer is deliberately thin. A failure with
+  no readable status is generic rather than guessed auth: a false data
+  paragraph costs a confused minute, a false auth paragraph sends the operator
+  to re-login over a transient.
+
+### Still open
+
+* **Token accounting is derived.** Codex reports `input_tokens` /
+  `output_tokens` and no total, so `total_tokens` is a driver-side sum — a
+  departure from `_add_usage`'s refusal to sum, permissible only because there
+  is no reported total to contradict. `reasoning_output_tokens` is treated as a
+  breakdown of `output_tokens` rather than a sibling; a high-effort call whose
+  reasoning count exceeds its output count would falsify that and mean
+  completion tokens are under-counted by the reasoning half.
+* **The production `--concurrency`** is unset until a short pass measures
+  per-call latency and whether 429s appear.
+* **The pinned codex model id** is a rollout decision (`BAKEOFF_CODEX_JUDGE`
+  overrides it in the live test).
+* **OPEN-5 is unchanged and still blocking** for any published number: without
+  the human gold subset, κ is unmeasurable and every judge-derived figure is
+  directional by default. The A/A self-agreement pass above is additional to
+  it, never a substitute.
