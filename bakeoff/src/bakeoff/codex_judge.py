@@ -846,11 +846,15 @@ def codex_completion(
     waits minutes.
 
     `stop` is the caller's own `threading.Event` -- see the note above the
-    constants. When it is set, no further call is SPAWNED and no further
-    backoff is waited out; calls already on the wire run to their timeout,
-    which is the part a cooperative signal cannot reach. `None` means this
-    closure never stops early, which is right for a caller that makes one call
-    and waits for it.
+    constants. When it is set, no further call is SPAWNED, no further backoff
+    is entered, and a backoff ALREADY IN PROGRESS is woken: with `time.sleep`
+    the default wait becomes `stop.wait`, because `sleep` cannot be
+    interrupted and a worker inside the capped 480s wait would otherwise hold
+    the interpreter (`concurrent.futures` registers an atexit join) for up to
+    eight minutes after the report is on the terminal. Calls already on the
+    wire run to their timeout, which is the part a cooperative signal cannot
+    reach. `None` means this closure never stops early, which is right for a
+    caller that makes one call and waits for it.
     """
     resolved: dict[str, str] = {}
     # A LOCK AROUND THE RESOLUTION, not a bare `if not resolved`. Under
@@ -866,6 +870,11 @@ def codex_completion(
     # whole of what `--concurrency` buys.
     resolve_lock = threading.Lock()
     stopped = (lambda: False) if stop is None else stop.is_set
+    if sleep is time.sleep and stop is not None:
+        # The default wait is the EVENT's, so a stop set mid-backoff wakes
+        # the worker instead of sleeping out up to 480s after the summary.
+        # An injected sleep wins -- tests inject one to observe the waits.
+        sleep = stop.wait
 
     def complete(prompt: str) -> str:
         with resolve_lock:

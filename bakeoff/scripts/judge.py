@@ -691,7 +691,8 @@ def _pairwise_key(task_id: str, sample_index: int, run_id_a: str,
 
 
 def lazy_live_completion(judge_model_id: str,
-                         usage_totals: dict[str, int] | None = None
+                         usage_totals: dict[str, int] | None = None,
+                         stop: threading.Event | None = None,
                          ) -> CompleteFn:
     """`live_completion`, built on the first prompt that needs it.
 
@@ -718,6 +719,12 @@ def lazy_live_completion(judge_model_id: str,
     never builds the live judge -- fully gate-decided, or fully skipped --
     still hands the driver a set of zeros to print rather than a `None` that
     would read as "not counted".
+
+    `stop` is passed THROUGH for the same reason `usage_totals` is: it belongs
+    to the batch, not to this wrapper. The batch's event has to reach the
+    closure that makes the calls, or an aborted concurrent pass keeps buying --
+    and on this backend a stopped worker that hits a 401 also mints a fresh
+    credential, which is spend the summary has already been printed without.
     """
     built: dict[str, CompleteFn] = {}
     # A LOCK, not a bare check-then-set. Under `--concurrency` the first
@@ -731,7 +738,7 @@ def lazy_live_completion(judge_model_id: str,
         with lock:
             if "fn" not in built:
                 built["fn"] = live_completion(
-                    judge_model_id, usage_totals=usage_totals
+                    judge_model_id, usage_totals=usage_totals, stop=stop
                 )
         return built["fn"](prompt)
 
@@ -1786,12 +1793,17 @@ def judge_event_log(event_log_root, tasks, *,
     # zeros would be a measurement of a batch that made no live call, and the
     # driver has no way to count tokens through a function whose contract is
     # one string in and one string out.
-    # ONE PER BATCH, owned here and handed to the backend at construction.
+    # ONE PER BATCH, owned here and handed to BOTH backends at construction.
     # `_walk_concurrently` sets it once it has stopped committing, so a worker
     # still inside the rate-limit ladder does not wake up and buy a call whose
     # verdict nobody will record -- money spent after the pass has already
     # reported what it spent. Never cleared, because it never outlives the
     # closure it was built into.
+    #
+    # BOTH, because for a while only the codex arm received it while this
+    # comment already claimed otherwise: a stopped mantle worker went on making
+    # its call, and on a 401 minted a fresh credential to retry it with, which
+    # is spend of a second kind after the same summary.
     stop_spending = threading.Event()
 
     judge_usage: dict[str, int] | None = None
@@ -1806,7 +1818,8 @@ def judge_event_log(event_log_root, tasks, *,
                 judge_model_id, judge_usage, reasoning_effort, stop_spending
             )
             if backend == "codex"
-            else lazy_live_completion(judge_model_id, judge_usage)
+            else lazy_live_completion(judge_model_id, judge_usage,
+                                      stop_spending)
         )
 
     judged: list[JudgeRecord] = []

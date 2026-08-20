@@ -1490,6 +1490,7 @@ def live_completion(
     judge_model_id: str = JUDGE_MODEL_ID_DEFAULT,
     region: str = "us-east-1",
     usage_totals: dict[str, int] | None = None,
+    stop: threading.Event | None = None,
 ) -> CompleteFn:
     """The live `CompleteFn`: one rendered prompt in, the model's raw text out.
 
@@ -1557,6 +1558,18 @@ def live_completion(
     exist: the judgment file records no tokens, and `costs.PRICE_BOOK`
     deliberately has no entry for the judge models, so a total not accumulated
     here is a number nothing downstream can reconstruct.
+
+    `stop` is the caller's own `threading.Event`, the same cooperative signal
+    the codex backend takes and for the same reason: the driver sets it once it
+    has stopped committing, and a worker that woke afterwards would buy a call
+    whose verdict nobody records -- money spent after the pass has already
+    reported what it spent. It is checked before the completion and AGAIN
+    before the auth refresh, because the mint is spend of its own: a stopped
+    pass that re-minted would replace a credential, start a fresh clock and buy
+    one more retry, all after the summary. `None` means this closure never
+    stops early, which is right for a caller that makes one call and waits for
+    it. Calls already on the wire run to their end, which is the part a
+    cooperative signal cannot reach.
     """
     # Resolved at CONSTRUCTION even though nothing in it is called until the
     # first vote. This module reaches out of the package into `scripts/`,
@@ -1591,6 +1604,12 @@ def live_completion(
     build_lock = threading.Lock()
 
     def complete(prompt: str) -> str:
+        if stop is not None and stop.is_set():
+            # Checked before the call rather than after, for the codex
+            # backend's reason: the point is to not BUY it. RuntimeError
+            # rather than a named class because the driver discards these --
+            # the walk has already stopped committing when the event is set.
+            raise RuntimeError("the pass stopped before this call was made")
         with build_lock:
             if "router" not in built:
                 built["router"] = _judge_router(
@@ -1603,6 +1622,11 @@ def live_completion(
             )
         except Exception as exc:  # noqa: BLE001 - re-raised unless it is auth
             if not is_auth_failure(exc):
+                raise
+            if stop is not None and stop.is_set():
+                # A stopped pass must not mint: the fresh credential and the
+                # retry it buys are spend after the summary. Re-raise the
+                # auth failure -- it is the truthful reason this call ends.
                 raise
             # The ~1h window closed mid-batch. Minted rather than re-read: see
             # the docstring -- the environment's copy is the dead one.

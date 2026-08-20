@@ -3037,6 +3037,43 @@ def test_a_half_readable_usage_block_is_both_counted_and_contributed(
     )
 
 
+def test_a_stopped_live_completion_never_calls_and_never_mints(
+    monkeypatch, mantle_token, minted
+):
+    """The stop event's contract is batch-wide: 'nothing further is bought'.
+    Only the codex backend honoured it; a stopped mantle worker still made
+    its call -- and on a 401 minted a fresh credential -- after the pass
+    reported its totals.
+
+    `minted` is the neighbouring tests' seam onto `scripts.smoke_bedrock`,
+    which `live_completion` resolves at construction. It is here for the
+    half of the claim the call counter cannot make: a mint is spend of its
+    own, and it is the one this closure does WITHOUT a completion call.
+    """
+    import threading as _threading
+    from bakeoff import judge as judge_module
+
+    calls = {"n": 0}
+    monkeypatch.setattr(
+        judge_module, "_judge_router", lambda *a, **k: object()
+    )
+    monkeypatch.setattr(
+        judge_module, "_completion",
+        lambda *a, **k: calls.__setitem__("n", calls["n"] + 1) or "reply",
+    )
+    stop = _threading.Event()
+    complete = judge_module.live_completion(
+        "openai.gpt-5.6-sol", usage_totals=None, stop=stop
+    )
+    stop.set()
+
+    with pytest.raises(RuntimeError, match="stopped before this call"):
+        complete("prompt")
+
+    assert calls["n"] == 0
+    assert minted == []
+
+
 def test_the_auth_classifier_answers_both_callers_and_never_reads_the_message():
     """`is_auth_failure` is public because it has a second caller with a
     different stake, and one narrowness rule has to serve both.

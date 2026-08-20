@@ -845,6 +845,41 @@ def test_a_stop_request_ends_the_rate_limit_ladder_instead_of_waiting_it_out(
     assert len(waits) == 1
 
 
+def test_a_stop_request_wakes_a_backoff_already_in_progress(
+    monkeypatch, judge_home: Path, codex_bin: Path
+):
+    """`shutdown(cancel_futures=True)` cannot cancel a started call, and
+    `time.sleep` cannot be woken -- so without this, a worker in a capped
+    480s backoff holds the interpreter for up to 8 minutes after the
+    summary, and the docstring's 'no further backoff is waited out' is
+    false in exactly the window it matters.
+
+    With no injected sleep and a stop event, the backoff must wait ON THE
+    EVENT, so setting it mid-wait returns promptly instead of sleeping out
+    the delay.
+    """
+    limited = CodexRun(1, _events(_failed("unexpected status 429")), "", "")
+    _install(monkeypatch, [limited] * (CODEX_RATE_LIMIT_RETRIES + 1))
+    stop = threading.Event()
+    complete = codex_completion(
+        PINNED, codex_bin=str(codex_bin), codex_home=str(judge_home),
+        stop=stop,
+    )
+
+    timer = threading.Timer(0.2, stop.set)
+    timer.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(CodexCallFailed, match="stopped before this call"):
+            complete("prompt")
+    finally:
+        timer.cancel()
+
+    # The first backoff alone is >= 15s (30 * 0.5 jitter floor). Waking
+    # within a couple of seconds proves the wait was on the event.
+    assert time.monotonic() - started < 5.0
+
+
 def test_any_escape_from_communicate_kills_the_process_group(
     tmp_path: Path,
 ):

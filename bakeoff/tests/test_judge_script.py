@@ -5869,6 +5869,27 @@ def test_the_reasoning_effort_reaches_the_backend_and_not_only_the_record(
     assert seen == {"model": CODEX_JUDGE, "effort": "high", "stop": True}
 
 
+def test_the_mantle_backend_receives_the_batch_stop_event_too(
+    tmp_path, monkeypatch
+):
+    """`stop_spending`'s comment says 'handed to the backend at
+    construction'. Only the codex arm got it, so an aborted concurrent
+    mantle pass kept minting and spending after the summary printed.
+    """
+    seen: dict = {}
+    monkeypatch.setattr(
+        judge_script, "lazy_live_completion",
+        lambda model, usage=None, stop=None: seen.update(
+            model=model, stop=stop is not None
+        ) or FakeComplete(),
+    )
+    root = _two_arms(tmp_path)
+
+    judge_event_log(root, [_task()], rubric=False)
+
+    assert seen == {"model": JUDGE_MODEL_ID_DEFAULT, "stop": True}
+
+
 def test_the_concurrency_flag_is_validated_at_one_or_more(monkeypatch, tmp_path):
     root = _two_arms(tmp_path)
 
