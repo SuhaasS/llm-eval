@@ -44,6 +44,8 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -5494,3 +5496,214 @@ def test_the_codex_rate_limit_paragraph_says_the_backoff_already_lost(tmp_path):
     codex = judge_script._abort_message(run, backend="codex")
 
     assert "backoff was exhausted" in codex
+
+
+# ---------------------------------------------------------------------------
+# concurrency: concurrent compute, strictly ordered commit
+# ---------------------------------------------------------------------------
+
+
+class _SlowComplete(FakeComplete):
+    """A seam whose latency is chosen per prompt, so completion order can be
+    forced to differ from worklist order.
+
+    `delays` is consumed in SUBMISSION order, which is worklist order, so a
+    descending list makes the first-submitted call finish last -- the shape
+    that catches a driver committing whatever finished first.
+    """
+
+    def __init__(self, delays, **kw):
+        super().__init__(**kw)
+        self.delays = list(delays)
+        # The delays IN FINISH ORDER. Prompts cannot serve as identities here:
+        # two samples of the same arms render byte-identical prompts, so a
+        # test that compared prompt text would be comparing two equal strings
+        # and would pass whatever the driver did.
+        self.finished: list[float] = []
+        self._lock = threading.Lock()
+
+    def __call__(self, prompt: str) -> str:
+        with self._lock:
+            delay = self.delays.pop(0) if self.delays else 0.0
+        time.sleep(delay)
+        reply = super().__call__(prompt)
+        with self._lock:
+            self.finished.append(delay)
+        return reply
+
+
+def _four_vote_collection(tmp_path) -> Path:
+    """Two samples of two arms: four votes over two comparisons."""
+    return _collection(
+        tmp_path,
+        [
+            _record("run-a0", model="model-one", sample_index=0, final_diff=DIFF_A),
+            _record("run-b0", model="model-two", sample_index=0, final_diff=DIFF_B),
+            _record("run-a1", model="model-one", sample_index=1, final_diff=DIFF_A),
+            _record("run-b1", model="model-two", sample_index=1, final_diff=DIFF_B),
+        ],
+        [
+            _grade("run-a0", model="model-one"),
+            _grade("run-b0", model="model-two"),
+            _grade("run-a1", model="model-one"),
+            _grade("run-b1", model="model-two"),
+        ],
+    )
+
+
+def test_concurrency_commits_in_worklist_order_regardless_of_completion_order(
+    tmp_path,
+):
+    """The file's line order is the worklist's, never the race's.
+
+    Resume determinism is pinned on the worklist order, and a file written in
+    completion order would make two passes over one collection produce two
+    different files -- neither reproducible, and both looking correct.
+    """
+    root = _four_vote_collection(tmp_path)
+    # Descending: the first call submitted is the last to finish.
+    seam = _SlowComplete([0.20, 0.15, 0.10, 0.0])
+
+    _run(root, complete=seam, rubric=False, concurrency=4)
+
+    lines = _lines(root)
+    assert [ln.vote_index for ln in lines] == [0, 1, 0, 1]
+    assert [ln.sample_index for ln in lines] == [0, 0, 1, 1]
+    # The race really did invert -- calls finished shortest-first while the
+    # file was written submission-first -- so the guarantee is not vacuous.
+    assert seam.finished == sorted(seam.finished)
+    assert seam.finished[0] == 0.0
+
+
+def test_concurrency_one_produces_the_same_file_as_the_sequential_walk(tmp_path):
+    """`--concurrency 1` is the untouched sequential path, and must stay it.
+
+    Compared on the lines rather than on the bytes, because judgment_id is a
+    fresh uuid and judged_at is a clock -- neither is a claim about ordering.
+    """
+    root_one = _four_vote_collection(tmp_path / "one")
+    root_two = _four_vote_collection(tmp_path / "two")
+
+    _run(root_one, rubric=False, concurrency=1)
+    _run(root_two, rubric=False, concurrency=3)
+
+    def shape(root):
+        return [
+            (ln.task_id, ln.sample_index, ln.run_id_a, ln.run_id_b,
+             ln.vote_index, ln.position_assignment, ln.verdict,
+             ln.judge_prompt_sha)
+            for ln in _lines(root)
+        ]
+
+    assert shape(root_one) == shape(root_two)
+
+
+def test_both_positions_of_one_comparison_are_two_independent_calls(tmp_path):
+    """The contract the concurrency rests on: no shared context between the
+    two votes, which is what makes running them at the same time legal."""
+    root = _two_arms(tmp_path)
+    seam = _SlowComplete([0.05, 0.0])
+
+    _run(root, complete=seam, rubric=False, concurrency=2)
+
+    assert len(seam.prompts) == 2
+    # Two distinct renderings -- one per forced position -- and neither call
+    # was shown the other's reply.
+    assert seam.prompts[0] != seam.prompts[1]
+    assert [ln.position_assignment for ln in _lines(root)] == list(VOTE_POSITIONS)
+
+
+def test_the_breaker_counts_consecutive_failures_in_commit_order(tmp_path):
+    """Commit order is deterministic; completion order is not.
+
+    Counted in completion order, the same collection judged twice would abort
+    at two different units and neither run would be reproducible -- so the
+    abort message's promise that a resume behaves the same way would be
+    false.
+    """
+    root = _four_vote_collection(tmp_path)
+
+    class _AlwaysFails(FakeComplete):
+        def __call__(self, prompt: str) -> str:
+            super().__call__(prompt)
+            raise _UnreadableDiff("cannot read the diff")
+
+    result = _run(
+        root, complete=_AlwaysFails(), rubric=False,
+        concurrency=4, max_consecutive_errors=2,
+    )
+
+    abort = _abort_of(result)
+    assert "2 consecutive unit failures" in abort
+    # The first two units of the WORKLIST, not of the race.
+    assert "vote 0 (a_first)" in abort
+    assert len(_lines(root)) == 0
+
+
+def test_a_storage_failure_under_concurrency_still_ends_the_batch(tmp_path):
+    """Writes are single-threaded, so a full disk is raised on the committing
+    thread and stops the walk before any further line is written."""
+    root = _four_vote_collection(tmp_path)
+    calls = {"n": 0}
+    real = judge_script.append_judgment
+
+    def explode(path, record):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise OSError(28, "No space left on device")
+        return real(path, record)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(judge_script, "append_judgment", explode)
+        result = _run(root, rubric=False, concurrency=4)
+
+    assert any("writes are failing" in w for w in result["warnings"])
+    assert len(_lines(root)) == 1
+
+
+def test_every_attempted_unit_still_prints_exactly_one_progress_line(
+    tmp_path, capsys
+):
+    root = _four_vote_collection(tmp_path)
+
+    _run(root, complete=_SlowComplete([0.1, 0.0, 0.05, 0.0]), rubric=False,
+         concurrency=3)
+
+    lines = _progress_lines(capsys.readouterr().out)
+    assert len(lines) == 4
+    assert [line.split("]")[0] for line in lines] == ["[1/4", "[2/4", "[3/4", "[4/4"]
+
+
+def test_a_gate_decided_pair_commits_inline_and_does_not_occupy_the_window(
+    tmp_path,
+):
+    """A unit that makes no call has no future to wait on, so it must not be
+    handed to the pool and must not be counted against the width."""
+    root = _collection(
+        tmp_path,
+        [
+            _record("run-a", model="model-one", final_diff=DIFF_A),
+            _record("run-b", model="model-two", final_diff=DIFF_B),
+        ],
+        [
+            _grade("run-a", model="model-one", resolved=True),
+            _grade("run-b", model="model-two", resolved=False),
+        ],
+    )
+    seam = FakeComplete()
+
+    result = _run(root, complete=seam, rubric=False, concurrency=4)
+
+    assert seam.calls == 0
+    (line,) = _lines(root)
+    assert line.verdict == "gate_decided"
+    assert result["errors"] == []
+
+
+def test_the_concurrency_flag_is_validated_at_one_or_more(monkeypatch, tmp_path):
+    root = _two_arms(tmp_path)
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(["--event-log", str(root), "--concurrency", "0"])
+
+    assert exit_info.value.code == 2

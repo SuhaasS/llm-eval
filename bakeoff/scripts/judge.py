@@ -183,9 +183,10 @@ import itertools
 import math
 import random
 import sys
+import threading
 import time
 import uuid
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -680,10 +681,10 @@ def lazy_live_completion(judge_model_id: str,
     resolves `scripts.smoke_bedrock` at construction, and a batch that makes no
     call should not require the credential module to be importable at all.
 
-    A one-slot dict rather than `nonlocal`, so there is no rebind to get wrong.
-    Not thread-safe (check-then-set), which is fine while the two votes of a
-    comparison are sequential and is the same shape `live_completion`'s own
-    cache has.
+    A one-slot dict rather than `nonlocal`, so there is no rebind to get
+    wrong, and a lock around the fill because `--concurrency` submits the
+    first prompts of a batch together. `live_completion`'s own inner cache is
+    reached only through this one, so guarding here guards both.
 
     `usage_totals` is passed THROUGH rather than counted here, and the laziness
     is why that matters: this wrapper sees a prompt and a reply, not a response,
@@ -694,12 +695,19 @@ def lazy_live_completion(judge_model_id: str,
     would read as "not counted".
     """
     built: dict[str, CompleteFn] = {}
+    # A LOCK, not a bare check-then-set. Under `--concurrency` the first
+    # prompts of a batch are submitted together, so two workers race here --
+    # and on the mantle side losing that race means minting a second
+    # credential for a router that is thrown away, which is a real cost
+    # against a token whose window is about an hour.
+    lock = threading.Lock()
 
     def complete(prompt: str) -> str:
-        if "fn" not in built:
-            built["fn"] = live_completion(
-                judge_model_id, usage_totals=usage_totals
-            )
+        with lock:
+            if "fn" not in built:
+                built["fn"] = live_completion(
+                    judge_model_id, usage_totals=usage_totals
+                )
         return built["fn"](prompt)
 
     return complete
@@ -719,20 +727,26 @@ def lazy_codex_completion(judge_model_id: str,
     what is deferred here is the RESOLUTION and the closure it builds, not the
     import.
 
-    Not thread-safe (check-then-set), which is fine for the same reason
-    `lazy_live_completion` says it is: the first prompt is bought on the main
-    thread's first submission, and two threads that both won the race would
-    build two equivalent closures rather than corrupt one.
+    Locked for `lazy_live_completion`'s reason: `--concurrency` submits the
+    first prompts of a batch together, and two winners of that race would each
+    resolve the binary, the home and the auth file.
     """
     built: dict[str, CompleteFn] = {}
+    # A LOCK, not a bare check-then-set. Under `--concurrency` the first
+    # prompts of a batch are submitted together, so two workers race here --
+    # and on the mantle side losing that race means minting a second
+    # credential for a router that is thrown away, which is a real cost
+    # against a token whose window is about an hour.
+    lock = threading.Lock()
 
     def complete(prompt: str) -> str:
-        if "fn" not in built:
-            from bakeoff.codex_judge import codex_completion
+        with lock:
+            if "fn" not in built:
+                from bakeoff.codex_judge import codex_completion
 
-            built["fn"] = codex_completion(
-                judge_model_id, usage_totals=usage_totals
-            )
+                built["fn"] = codex_completion(
+                    judge_model_id, usage_totals=usage_totals
+                )
         return built["fn"](prompt)
 
     return complete
@@ -935,7 +949,8 @@ def _encodable(text: str) -> bool:
 def _rubric_line(record, grade: GradeRecord, task, inputs: PayloadInputs,
                  payloads: Path, path: Path, complete: CompleteFn,
                  judge_model_id: str, judge_sampling: dict,
-                 harness_of: Callable[[], dict | None]) -> JudgeRecord:
+                 harness_of: Callable[[], dict | None],
+                 precomputed: Callable[[], Any] | None = None) -> JudgeRecord:
     """One absolute-rubric profile: one call, `vote_index=0`.
 
     The forced positions are pairwise-only: there is no second submission to
@@ -957,7 +972,17 @@ def _rubric_line(record, grade: GradeRecord, task, inputs: PayloadInputs,
     the wrap: a socket error from the seam is an `OSError` as well, and it is a
     per-unit failure rather than a reason to end the batch.
     """
-    payload, rendered, result = judge_rubric(inputs, complete)
+    # THE COMPUTE/COMMIT SEAM. `precomputed` is a zero-argument callable --
+    # in practice `Future.result` -- so a call already made on a worker thread
+    # arrives here as a value, and a worker that RAISED re-raises from the
+    # same line the inline call would have raised from. Passing the future's
+    # method rather than its value is what buys that: a caller that unwrapped
+    # the result itself would have to re-raise by hand, and an exception
+    # re-raised outside this frame is one the per-unit handler does not catch.
+    payload, rendered, result = (
+        precomputed() if precomputed is not None
+        else judge_rubric(inputs, complete)
+    )
     judgment_id = uuid.uuid4().hex
     written, payload_sha = _write_payload_or_fail(
         payloads, judgment_id, payload
@@ -1010,7 +1035,8 @@ def _vote_line(task, sample_index: int, run_id_a: str, run_id_b: str,
                payloads: Path, path: Path,
                complete: CompleteFn, judge_model_id: str,
                judge_sampling: dict,
-               harness_of: Callable[[], dict | None]) -> JudgeRecord:
+               harness_of: Callable[[], dict | None],
+               precomputed: Callable[[], Any] | None = None) -> JudgeRecord:
     """One blind pairwise vote, in the position the caller forces.
 
     `inputs_a`/`inputs_b` are CANONICAL a and b -- the two run ids
@@ -1030,8 +1056,12 @@ def _vote_line(task, sample_index: int, run_id_a: str, run_id_b: str,
     The stored path is relative and is checked against the absolute one that
     was written -- see `_stored_payload_path`.
     """
-    outcome = judge_pair_vote(
-        inputs_a, inputs_b, position_assignment, complete
+    # See `_rubric_line`: the same compute/commit seam, and the position is
+    # applied in the WORKER so the payload that was built is the payload that
+    # was sent, exactly as it is when the call happens inline.
+    outcome = (
+        precomputed() if precomputed is not None
+        else judge_pair_vote(inputs_a, inputs_b, position_assignment, complete)
     )
     judgment_id = uuid.uuid4().hex
     written, payload_sha = _write_payload_or_fail(
@@ -1471,6 +1501,7 @@ def judge_event_log(event_log_root, tasks, *,
                     re_judge: bool = False,
                     max_consecutive_errors: int = MAX_CONSECUTIVE_ERRORS,
                     reasoning_effort: str | None = None,
+                    concurrency: int = 1,
                     ) -> dict:
     """Judge every selected unit in one event log. Returns the batch.
 
@@ -1771,12 +1802,24 @@ def judge_event_log(event_log_root, tasks, *,
     # attempted unit" rather than "every path goes through a closure".
     progress: dict[str, Any] = {
         "index": 0, "label": "", "start": 0.0, "attempted": 0,
-        "total": 0, "batch_started": 0.0,
+        "total": 0, "batch_started": 0.0, "unit_seconds": None,
     }
 
-    def _begin(index: int, unit: _Unit) -> None:
+    def _begin(index: int, unit: _Unit,
+               unit_seconds: float | None = None) -> None:
+        """Open one unit's progress line. `unit_seconds` is the WORKER's clock.
+
+        Under `--concurrency` the paid call happens on a worker thread and
+        this frame only commits its result, so a duration measured here would
+        be the commit's -- near zero for every unit, and near the whole wait
+        for one unlucky unit that happened to sit at the head while the window
+        filled. Neither number is what the operator is dividing by the index
+        to estimate the rest of a forty-hour batch. `None` means the call was
+        made inline and this frame's own clock is the right one.
+        """
         progress.update(
-            index=index, label=unit.label, start=time.monotonic()
+            index=index, label=unit.label, start=time.monotonic(),
+            unit_seconds=unit_seconds,
         )
 
     def _finish(status: str) -> None:
@@ -1810,9 +1853,12 @@ def judge_event_log(event_log_root, tasks, *,
         """
         now = time.monotonic()
         progress["attempted"] += 1
+        unit_seconds = progress["unit_seconds"]
+        if unit_seconds is None:
+            unit_seconds = now - progress["start"]
         _print_ascii_safe(
             f"[{progress['index']}/{progress['total']}] {progress['label']} "
-            f"{status} (unit {_seconds(now - progress['start'])}, "
+            f"{status} (unit {_seconds(unit_seconds)}, "
             f"elapsed {_elapsed(now - progress['batch_started'])})"
         )
 
@@ -2061,7 +2107,8 @@ def judge_event_log(event_log_root, tasks, *,
     progress["batch_started"] = time.monotonic()
     interrupted = False
 
-    def _attempt(unit: _Unit) -> None:
+    def _attempt(unit: _Unit,
+                 precomputed: Callable[[], Any] | None = None) -> None:
         """Execute one selected unit, and account for however it ends.
 
         Every path out of this ends in exactly one `_finish` call, which is
@@ -2088,7 +2135,7 @@ def judge_event_log(event_log_root, tasks, *,
                 judged.append(_rubric_line(
                     records[run_id], grade, unit.task, unit_inputs,
                     payloads, path, complete, judge_model_id,
-                    judge_sampling, harness_of,
+                    judge_sampling, harness_of, precomputed,
                 ))
             except StorageFailure as exc:
                 _unit_failed_fatally(exc)
@@ -2135,7 +2182,7 @@ def judge_event_log(event_log_root, tasks, *,
                 inputs_a, inputs_b,
                 unit.vote_index, unit.position, grade_a, grade_b,
                 payloads, path, complete, judge_model_id,
-                judge_sampling, harness_of,
+                judge_sampling, harness_of, precomputed,
             ))
         except StorageFailure as exc:
             _unit_failed_fatally(exc)
@@ -2144,10 +2191,154 @@ def judge_event_log(event_log_root, tasks, *,
         else:
             _unit_succeeded()
 
-    try:
+    def _paid_call(unit: _Unit) -> Callable[[], Any] | None:
+        """The worker half of one unit: the paid call and NOTHING else.
+
+        Returns a zero-argument callable to run on a worker, or `None` for a
+        unit that makes no call -- a gate-decided pair, or one whose runs
+        cannot be turned into submissions. Those are committed inline at the
+        head of the queue, where they cost nothing and cannot reorder
+        anything.
+
+        `_judgeable_inputs` is called HERE, on the main thread, and its two
+        caches (`inputs`, `unjudgeable`) are therefore never touched
+        concurrently. `_attempt` calls it again at commit time and gets the
+        same memoised answer, so a run that could not be judged is diagnosed
+        once and reported once, exactly as in the sequential walk.
+        """
+        if unit.kind == "gate-decided":
+            return None
+        if unit.kind == "rubric":
+            (run_id,) = unit.run_ids
+            ready = _judgeable_inputs(run_id, gating[run_id], unit.task)
+            if ready is None:
+                return None
+            return lambda: judge_rubric(ready, complete)
+
+        run_id_a, run_id_b = unit.run_ids
+        ready_a = _judgeable_inputs(run_id_a, gating[run_id_a], unit.task)
+        ready_b = _judgeable_inputs(run_id_b, gating[run_id_b], unit.task)
+        if ready_a is None or ready_b is None:
+            return None
+        return lambda: judge_pair_vote(
+            ready_a, ready_b, unit.position, complete
+        )
+
+    def _timed(clock: dict, call: Callable[[], Any]) -> Any:
+        """Run one paid call and leave its duration where `_begin` can read it.
+
+        `finally`, so a call that RAISED still reports how long it took: the
+        progress line for a failed unit is where an operator sees a timeout
+        as a timeout rather than as an unexplained error.
+        """
+        started = time.monotonic()
+        try:
+            return call()
+        finally:
+            clock["seconds"] = time.monotonic() - started
+
+    def _walk_sequentially() -> None:
+        """The original walk, untouched, and it is what `--concurrency 1` runs.
+
+        Kept as its own path rather than expressed as a window of size one,
+        because the two are NOT the same thing: a window submits the next
+        unit's call before the current one commits, and the gate-invariant
+        tests move the collection under the driver mid-unit precisely to catch
+        a driver that acts on a stale read. A one-wide window would make that
+        prefetch happen at concurrency 1 too, which is a semantic change
+        smuggled in under a default.
+        """
         for index, unit in enumerate(worklist, 1):
             _begin(index, unit)
             _attempt(unit)
+
+    def _walk_concurrently(width: int) -> None:
+        """Concurrent COMPUTE, strictly ordered COMMIT.
+
+        A sliding window of paid calls runs ahead of a cursor that commits in
+        WORKLIST ORDER -- the order phase 1 built and that resume determinism
+        is pinned on. Everything that writes, prints or counts stays on this
+        thread, and that single fact is what preserves the invariants one by
+        one:
+
+        * `judgments.jsonl` and the payload store are written by one thread,
+          so the append-plus-fsync needs no lock and the file's line order is
+          the worklist's order rather than a race's.
+        * Exactly one `_finish` per attempted unit survives verbatim, because
+          `_attempt` is called here and nowhere else.
+        * `StorageFailure` can only be raised on this thread, so it still ends
+          the batch BEFORE any further commit.
+        * THE BREAKER KEEPS ITS MEANING. "N consecutive failures" is evaluated
+          in commit order, which is deterministic, so a batch aborts at the
+          same unit on every run and a resume behaves the way the abort
+          message says it will. Counting in COMPLETION order would make the
+          abort point depend on thread scheduling: the same collection,
+          judged twice, would stop in two different places and neither would
+          be reproducible.
+
+        The price is bounded and worth naming: when the batch aborts or the
+        operator interrupts, up to `width - 1` calls are already in flight and
+        their results are discarded unwritten. That is the same bound the
+        sequential walk already accepted for its one in-flight unit, and it is
+        why the window is not larger than it needs to be.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+        from concurrent.futures import wait as futures_wait
+
+        # A future per unit, in worklist order. `None` for units that make no
+        # call. The queue is the window: it is refilled to `width` PAID calls
+        # before each commit, so a stretch of gate-decided pairs cannot starve
+        # the pool and a stretch of votes cannot overfill it.
+        queue: deque[tuple[_Unit, Any, dict]] = deque()
+        cursor = 0
+
+        with ThreadPoolExecutor(max_workers=width) as pool:
+            def _top_up() -> None:
+                nonlocal cursor
+                in_flight = sum(1 for _, future, _ in queue if future is not None)
+                while cursor < len(worklist) and in_flight < width:
+                    unit = worklist[cursor]
+                    cursor += 1
+                    call = _paid_call(unit)
+                    clock: dict = {}
+                    if call is None:
+                        queue.append((unit, None, clock))
+                        continue
+                    queue.append((unit, pool.submit(_timed, clock, call), clock))
+                    in_flight += 1
+
+            try:
+                for index in range(1, len(worklist) + 1):
+                    _top_up()
+                    unit, future, clock = queue.popleft()
+                    if future is None:
+                        _begin(index, unit)
+                        _attempt(unit)
+                        continue
+                    # Block on THIS unit even if later ones finished
+                    # first: commit order is the whole point. `futures_wait`
+                    # and not `future.result()`, because the duration has to
+                    # be read out of the clock BEFORE `_begin` opens the line
+                    # -- and a `result()` here would raise the worker's
+                    # exception one frame OUTSIDE `_attempt`'s try, where the
+                    # per-unit handler cannot catch it and a single bad diff
+                    # would end the batch. The bound method is handed on
+                    # unevaluated instead, so the raise happens inside.
+                    futures_wait([future])
+                    _begin(index, unit, clock.get("seconds"))
+                    _attempt(unit, future.result)
+            finally:
+                # Nothing in flight is worth waiting for once the walk has
+                # stopped: an abort, an interrupt and a clean finish all leave
+                # results nobody will commit. `cancel_futures` keeps the
+                # not-yet-started ones from being bought at all.
+                pool.shutdown(wait=False, cancel_futures=True)
+
+    try:
+        if concurrency <= 1:
+            _walk_sequentially()
+        else:
+            _walk_concurrently(concurrency)
     except _BatchAborted as exc:
         # The abort is a WARNING and not an error, because it is not a unit:
         # the units that failed are already in `errors`, and the exit code
@@ -4017,6 +4208,16 @@ def main(argv: list[str] | None = None) -> int:
              "never be pooled into one number",
     )
     parser.add_argument(
+        "--concurrency", type=int, default=1, metavar="N",
+        help="how many paid calls may be in flight at once (default: 1). "
+             "Calls run concurrently; lines are still COMMITTED in worklist "
+             "order, so the judgments file, the resume and the "
+             "consecutive-error breaker all behave exactly as they do at 1. "
+             "The default is 1 because a seat's rate window is unmeasured "
+             "until a pass has run against it -- raise it once a short pass "
+             "has shown the per-call latency and whether 429s appear",
+    )
+    parser.add_argument(
         "--reasoning-effort", default=None, metavar="LEVEL",
         help="codex backend only: the ONE sampling knob it has, recorded into "
              "judge_sampling as sent. There is no temperature -- `codex exec` "
@@ -4042,6 +4243,15 @@ def main(argv: list[str] | None = None) -> int:
              "resume in the same place",
     )
     args = parser.parse_args(argv)
+    if args.concurrency < 1:
+        # `parser.error` and not a raise, for `--max-consecutive-errors`'
+        # reason: a usage mistake deserves the usage line and exit 2, not a
+        # traceback out of the middle of a batch that already read the
+        # collection.
+        parser.error(
+            "--concurrency must be at least 1: below one there is no walk at "
+            "all, and 1 is the sequential pass"
+        )
     if args.max_consecutive_errors < 1:
         # `parser.error` rather than a raise: this is a usage mistake, and an
         # operator who meant `-1` should get the usage line and exit 2 rather
@@ -4102,6 +4312,7 @@ def main(argv: list[str] | None = None) -> int:
             re_judge=args.re_judge,
             max_consecutive_errors=args.max_consecutive_errors,
             reasoning_effort=args.reasoning_effort,
+            concurrency=args.concurrency,
         )
     # Three refusals, one exit path. All three mean the batch never ran, all
     # three print no numbers, and none is something a flag can talk past -- so
