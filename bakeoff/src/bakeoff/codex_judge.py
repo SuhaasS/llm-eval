@@ -246,7 +246,16 @@ class CodexRateLimited(RuntimeError):
 
 
 class CodexCallFailed(RuntimeError):
-    """Any other non-zero exit, timeout, or failed turn. Per-unit."""
+    """Any other non-zero exit, timeout, or failed turn. Per-unit.
+
+    The TIMEOUT path attaches an `events` tuple: that raise is the one place
+    a paid stream is carried out of `_run_codex` without a `CodexRun` around
+    it, and the usage block in it has to survive the raise or the total goes
+    wrong in the low direction. Set on the instance rather than through
+    `__init__` because every other raise site has no stream to offer, so the
+    reader takes `getattr(exc, "events", ())` and an absent attribute means
+    "nothing was recovered" rather than a parameter each site must repeat.
+    """
 
 
 @dataclass(frozen=True)
@@ -461,10 +470,16 @@ def _run_codex(
             except subprocess.TimeoutExpired:
                 stdout, stderr = "", "(the killed process never closed its pipes)"
 
-            raise CodexCallFailed(
+            exc = CodexCallFailed(
                 f"codex exec exceeded {timeout_s:.0f}s and its process group "
                 f"was killed; stderr: {_tail(stderr)}"
-            ) from None
+            )
+            # The recovered stdout can already hold a turn.completed block:
+            # a turn that finished and then wedged before exit. Those tokens
+            # were reported as spent, and a raise that dropped them made the
+            # total wrong in the one direction a spend figure must never be.
+            exc.events = parse_events(stdout)
+            raise exc from None
         except BaseException:
             # Ctrl-C above all. The child is in its own session, so the
             # terminal's SIGINT never reached it -- and Popen.__exit__
@@ -1015,6 +1030,17 @@ def _attempt_once(
             try:
                 run = _run_codex(argv, prompt, env, timeout_s, output_file)
             except CodexCallFailed as exc:  # the timeout path
+                _fold_usage(usage_totals, CodexRun(
+                    # exit_code 124 marks a timed-out run as FAILED for
+                    # `_fold_usage`'s outcome test, so the fold takes the
+                    # tokens and never the calls_without_usage bump --
+                    # a failed run has no usage to read, not usage that
+                    # could not be read.
+                    exit_code=124,
+                    events=getattr(exc, "events", ()),
+                    stderr="",
+                    last_message="",
+                ))
                 last = exc
                 continue
 

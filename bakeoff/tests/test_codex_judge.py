@@ -819,6 +819,33 @@ def test_a_run_that_completed_and_then_failed_still_folds_the_tokens_it_used(
     assert totals["completion_tokens"] == 20
 
 
+def test_a_timeout_still_folds_the_usage_the_stream_already_reported(
+    monkeypatch, judge_home: Path, codex_bin: Path
+):
+    """Tokens codex reported were spent whatever happened afterwards -- the
+    rule that folds a completed-then-401 run. The timeout path raised
+    without building a CodexRun, so a turn that completed and then wedged
+    before exit dropped its reported spend from the total with every
+    counter silent.
+    """
+    totals = new_usage_totals()
+    timed_out = CodexCallFailed("codex exec exceeded 1s")
+    timed_out.events = _events(_completed(700, 30))
+    # Two timeouts: the transport retry burns its one retry, then fails.
+    _install(monkeypatch, [timed_out, CodexCallFailed("codex exec exceeded 1s")])
+    complete = codex_completion(
+        PINNED, codex_bin=str(codex_bin), codex_home=str(judge_home),
+        usage_totals=totals,
+    )
+
+    with pytest.raises(CodexCallFailed):
+        complete("prompt")
+
+    assert totals["calls"] == 2
+    assert totals["prompt_tokens"] == 700
+    assert totals["completion_tokens"] == 30
+
+
 # --- cooperative shutdown ----------------------------------------------------
 
 
