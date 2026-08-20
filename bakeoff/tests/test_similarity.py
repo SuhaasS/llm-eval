@@ -149,6 +149,153 @@ PATCH_FIXTURE_EDIT = (
 )
 
 
+# Git terminates a `---`/`+++` path with a TAB when the path contains a space
+# and needs no C-quoting. Verified against git 2.50.1 (Apple Git-155) on a
+# throwaway repo: `--- a/CHANGES 3360.rst\t`, and the `diff --git` line carries
+# no such terminator. The TAB is what an `allow_extra_paths` changelog named
+# `CHANGES 3360.rst` arrives with, and it never equals the manifest's path.
+SPACE_IN_PATH = (
+    "diff --git a/CHANGES 3360.rst b/CHANGES 3360.rst\n"
+    "index 1111111..2222222 100644\n"
+    "--- a/CHANGES 3360.rst\t\n"
+    "+++ b/CHANGES 3360.rst\t\n"
+    "@@ -1,2 +1,4 @@\n"
+    "+- fixed the pager\n"
+    "+- bumped version\n"
+)
+
+# Git C-quotes a path holding a non-ASCII byte, a control character, a quote or
+# a backslash, and the quotes wrap the `a/`/`b/` prefix too. Verified against
+# git 2.50.1: `café.py` -> `"a/caf\303\251.py"` (octal, exactly three digits,
+# one escape per UTF-8 byte) under the default `core.quotepath=true`.
+QUOTED_NON_ASCII = (
+    'diff --git "a/caf\\303\\251.py" "b/caf\\303\\251.py"\n'
+    "index 1111111..2222222 100644\n"
+    '--- "a/caf\\303\\251.py"\n'
+    '+++ "b/caf\\303\\251.py"\n'
+    "@@ -1,2 +1,3 @@\n"
+    "+accent\n"
+)
+
+# Both at once: a path with a space AND a non-ASCII byte is quoted AND TAB
+# terminated. Verified against git 2.50.1 -- `--- "a/caf\303\251 x.py"\t` --
+# which is why the terminator has to come off before the unquote, not after.
+QUOTED_AND_TAB_TERMINATED = (
+    'diff --git "a/caf\\303\\251 x.py" "b/caf\\303\\251 x.py"\n'
+    "index 1111111..2222222 100644\n"
+    '--- "a/caf\\303\\251 x.py"\t\n'
+    '+++ "b/caf\\303\\251 x.py"\t\n'
+    "@@ -1,2 +1,3 @@\n"
+    "+accent\n"
+)
+
+# A mode change carries no `---`/`+++` pair at all, so the `diff --git` line is
+# the only path source -- and this path contains ` b/`, so every split of the
+# line is a candidate. Verified against git 2.50.1: chmod +x on `we b/ird.py`
+# yields exactly this header plus `old mode`/`new mode`.
+MODE_CHANGE_AMBIGUOUS = (
+    "diff --git a/we b/ird.py b/we b/ird.py\n"
+    "old mode 100644\n"
+    "new mode 100755\n"
+)
+
+# Git quotes per side, not per line. Verified against git 2.50.1: renaming
+# `café.py` to `plain.py` yields one quoted endpoint and one bare one.
+RENAME_MIXED_QUOTING = (
+    'diff --git "a/caf\\303\\251.py" b/plain.py\n'
+    "similarity index 100%\n"
+    'rename from "caf\\303\\251.py"\n'
+    "rename to plain.py\n"
+)
+
+
+def test_a_tab_terminated_path_is_dropped_when_the_manifest_names_it():
+    # `tasks.py` records `extra_files` from `git apply --numstat -z`, which
+    # emits raw paths -- no quoting, no terminator. A drop filter comparing
+    # against the header verbatim never matches, and the excluded changelog
+    # goes on inflating both facts it was recorded to be removed from.
+    assert diff_files(SPACE_IN_PATH) == ("CHANGES 3360.rst",)
+
+    dropped = similarity_context(
+        CANDIDATE_CALC + SPACE_IN_PATH,
+        REFERENCE_WITH_CHANGELOG,
+        drop_paths=("CHANGES 3360.rst", "CHANGELOG.md"),
+    )
+    assert dropped.file_overlap.common == ("calc.py",)
+    assert dropped.file_overlap.candidate_only == ()
+    assert dropped.diff_size_ratio == 1.0
+
+
+def test_a_c_quoted_path_is_unquoted_to_the_bytes_git_plumbing_reports():
+    assert diff_files(QUOTED_NON_ASCII) == ("café.py",)
+    assert diff_files(QUOTED_AND_TAB_TERMINATED) == ("café x.py",)
+
+    dropped = similarity_context(
+        CANDIDATE_CALC + QUOTED_NON_ASCII,
+        CANDIDATE_CALC,
+        drop_paths=("café.py",),
+    )
+    assert dropped.file_overlap.common == ("calc.py",)
+    assert dropped.file_overlap.candidate_only == ()
+    assert dropped.diff_size_ratio == 1.0
+
+
+def test_every_c_escape_git_emits_round_trips():
+    for encoded, decoded in (
+        (r"be\all.py", "be\all.py"),
+        (r"bac\bk.py", "bac\bk.py"),
+        (r"f\ff.py", "f\ff.py"),
+        (r"n\nl.py", "n\nl.py"),
+        (r"c\rr.py", "c\rr.py"),
+        (r"pa\tth.py", "pa\tth.py"),
+        (r"v\vt.py", "v\vt.py"),
+        (r"esc\033.py", "esc\x1b.py"),
+        (r"del\177.py", "del\x7f.py"),
+        (r"back\\slash.py", "back\\slash.py"),
+        ('qu\\"ote.py', 'qu"ote.py'),
+    ):
+        chunk = f'diff --git "a/{encoded}" "b/{encoded}"\n--- "a/{encoded}"\n+++ "b/{encoded}"\n@@ -1 +1 @@\n+x\n'
+        assert diff_files(chunk) == (decoded,), encoded
+
+
+def test_a_quoted_form_that_is_not_gits_output_degrades_instead_of_guessing():
+    # An unterminated escape and a two-digit octal are shapes `quote_c_style`
+    # never emits. Reporting a half-decoded path would be a wrong path with the
+    # provenance of a right one, so the raw string is kept -- it matches no
+    # manifest entry, which is the same visible outcome as an unknown file.
+    for encoded in ("trailing\\", r"sh\77rt.py", r"unknown\qescape.py"):
+        chunk = f'diff --git "a/{encoded}" "b/{encoded}"\n--- "a/{encoded}"\n+++ "b/{encoded}"\n@@ -1 +1 @@\n+x\n'
+        assert diff_files(chunk) == (f'"b/{encoded}"',), encoded
+
+
+def test_a_mode_change_whose_path_contains_b_slash_resolves_both_endpoints():
+    # Greedy `^diff --git a/(.+) b/(.+)$` splits on the LAST ` b/` and reports
+    # ("we b/ird.py b/we", "ird.py") -- two paths, neither of which exists.
+    assert diff_files(MODE_CHANGE_AMBIGUOUS) == ("we b/ird.py",)
+
+    dropped = similarity_context(
+        CANDIDATE_CALC + MODE_CHANGE_AMBIGUOUS,
+        CANDIDATE_CALC,
+        drop_paths=("we b/ird.py",),
+    )
+    assert dropped.file_overlap.common == ("calc.py",)
+    assert dropped.file_overlap.candidate_only == ()
+
+
+def test_a_diff_git_line_quoted_on_one_side_only_still_names_both_endpoints():
+    assert diff_files(RENAME_MIXED_QUOTING) == ("plain.py",)
+
+    dropped = similarity_context(
+        CANDIDATE_CALC + RENAME_MIXED_QUOTING,
+        CANDIDATE_CALC,
+        drop_paths=("café.py",),
+    )
+    # The manifest recorded the rename SOURCE; the chunk goes anyway, because a
+    # rename touched both names.
+    assert dropped.file_overlap.common == ("calc.py",)
+    assert dropped.file_overlap.candidate_only == ()
+
+
 def test_a_correct_fix_with_zero_file_overlap_produces_empty_common_and_carries_no_penalty():
     context = similarity_context(CANDIDATE_CALC, REFERENCE_TOTALS)
 

@@ -37,12 +37,23 @@ Two parsing hazards, both of which read as ordinary output when got wrong:
   reason and is not re-implemented here.
 
 Paths are read lexically off the header lines rather than from git, which is
-the price of being pure. Git C-quotes a path containing a control character or
-a quote (`+++ "b/pa\\th.py"`), and this module reports that string as written.
-The result degrades a CONTEXT SIGNAL on a pathological filename -- the judge
-sees a file it cannot match rather than a wrong number -- which is a different
-class of harm from a score that moves. `tasks.py` asks git for the paths it
-binds to task halves, and that is where exactness is load-bearing.
+the price of being pure -- but that price may NOT be paid by the drop filter.
+`similarity_context` removes `drop_paths` before computing all three facts, so
+a lexical path that cannot equal the git-exact path in the manifest does not
+degrade a signal, it moves a NUMBER: the excluded changelog stays in, and
+inflates `file_overlap` and `diff_size_ratio` in every payload the judge sees.
+The two lexical forms are therefore undone here rather than reported verbatim
+(`_header_path`, `_c_unquote`), and the result equals what `git apply
+--numstat -z` hands `tasks.py` for the same file.
+
+What remains lexical is the residue: a quoted form that `quote_c_style` does
+not emit is kept as written rather than half-decoded, and an ambiguous
+`diff --git` line with no `---`/`+++` pair to disambiguate it is a guess that
+`_diff_git_endpoints` narrows but cannot always settle. Those degrade a CONTEXT
+SIGNAL -- the judge sees a file it cannot match rather than a wrong number --
+which is a different class of harm from a score that moves. `tasks.py` asks git
+for the paths it binds to task halves, and that is where exactness is
+load-bearing.
 """
 
 from __future__ import annotations
@@ -56,15 +67,34 @@ from bakeoff.tasks import diff_chunks
 
 #: `diff --git a/<old> b/<new>`, the only path source a chunk with no hunks
 #: has -- a pure rename or a mode change carries no `---`/`+++` pair at all.
-#: Unanchored at the end and greedy, so it declines the quoted form
-#: (`diff --git "a/x" "b/x"`) rather than guessing at an escaped path.
-_DIFF_GIT = re.compile(r"^diff --git a/(.+) b/(.+)$")
+#: Parsed by `_diff_git_endpoints` rather than by one regex: the line is not an
+#: unambiguous encoding, and a regex has to pick a split before it can look at
+#: what the split produced. `tasks.py` refuses to parse this line at all for the
+#: same reason and asks git instead; here there is no git to ask.
+_DIFF_GIT_PREFIX = "diff --git "
 
 #: `@@ -1,4 +1,6 @@ def foo(self):` -- the trailing text is the enclosing
 #: symbol git's own hunk-header heuristic guessed, and is empty as often as not.
 _HUNK = re.compile(r"^@@ -\S+ \+\S+ @@ ?(.*)$")
 
 _DEV_NULL = "/dev/null"
+
+#: The single-character escapes `quote_c_style` emits, verified against git
+#: 2.50.1 (Apple Git-155) by diffing files named for each one: `\a \b \f \n \r
+#: \t \v` plus `\"` and `\\`. Everything else it escapes octally.
+_C_ESCAPES = {
+    "a": "\a",
+    "b": "\b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "v": "\v",
+    '"': '"',
+    "\\": "\\",
+}
+
+_OCTAL_DIGITS = "01234567"
 
 
 @dataclass(frozen=True)
@@ -194,7 +224,7 @@ def _chunk_endpoints(chunk: str) -> tuple[str | None, str | None]:
     back to its `diff --git` line, since a rename did touch both names.
     """
     old = new = None
-    header: re.Match[str] | None = None
+    header: tuple[str | None, str | None] | None = None
     for line in chunk.split("\n"):
         if _HUNK.match(line):
             break
@@ -202,20 +232,120 @@ def _chunk_endpoints(chunk: str) -> tuple[str | None, str | None]:
             old = _header_path(line[4:])
         elif line.startswith("+++ "):
             new = _header_path(line[4:])
-        elif header is None and line.startswith("diff --git "):
-            header = _DIFF_GIT.match(line)
+        elif header is None and line.startswith(_DIFF_GIT_PREFIX):
+            header = _diff_git_endpoints(line[len(_DIFF_GIT_PREFIX) :])
     if old is None and new is None and header is not None:
-        return header.group(1), header.group(2)
+        return header
     return old, new
 
 
+def _diff_git_endpoints(rest: str) -> tuple[str | None, str | None] | None:
+    """`(old, new)` out of the tail of a `diff --git` line, or `None`.
+
+    The line is ambiguous by construction: `a/`, ` `, and `b/` are all legal
+    inside a path, so `diff --git a/we b/ird.py b/we b/ird.py` (a mode change on
+    `we b/ird.py`, verified against git 2.50.1) admits three splits and a greedy
+    regex takes the wrong one -- reporting two paths, neither of which exists.
+
+    Every split that could be the separator is enumerated, then ONE rule picks
+    among them: prefer a split whose two sides name the same file. That settles
+    the shape this fallback actually runs on, since a chunk reaching here has no
+    `---`/`+++` pair and a mode change is the common such chunk. A rename cannot
+    be settled that way -- its two sides differ by definition -- so an ambiguous
+    rename takes the first candidate, which is a GUESS and is documented as one
+    rather than presented as a parse. Git quotes per side, not per line
+    (verified: `diff --git "a/caf\\303\\251.py" b/plain.py`), so each side is
+    unquoted on its own.
+    """
+    candidates: list[tuple[str | None, str | None]] = []
+    for index, char in enumerate(rest):
+        if char != " ":
+            continue
+        left, right = rest[:index], rest[index + 1 :]
+        if not left.startswith(("a/", '"a/')) or not right.startswith(
+            ("b/", '"b/')
+        ):
+            continue
+        if left[:1] == '"' and left[-1:] != '"':
+            continue
+        if right[:1] == '"' and right[-1:] != '"':
+            continue
+        candidates.append((_header_path(left), _header_path(right)))
+    if not candidates:
+        return None
+    for old, new in candidates:
+        if old is not None and old == new:
+            return old, new
+    return candidates[0]
+
+
 def _header_path(value: str) -> str | None:
-    """The repo-relative path out of a `--- a/x` / `+++ b/x` header tail."""
+    """The repo-relative path out of a `--- a/x` / `+++ b/x` header tail.
+
+    Git terminates the path with a TAB when it contains a space and C-quotes it
+    when it contains a byte `quote_c_style` escapes -- and does BOTH when it
+    contains both, `--- "a/caf\\303\\251 x.py"\\t`, with the terminator outside
+    the closing quote (verified against git 2.50.1). So the terminator comes off
+    first, then the unquote, then the `a/`/`b/` prefix, which git quotes along
+    with the rest of the path. The result equals what `git apply --numstat -z`
+    reports for the same file, which is what `tasks.py` puts in the manifest and
+    what `similarity_context` compares `drop_paths` against.
+    """
+    if value.endswith("\t"):
+        value = value[:-1]
     if value == _DEV_NULL:
         return None
+    value = _c_unquote(value)
     if value[:2] in ("a/", "b/"):
         return value[2:] or None
     return value or None
+
+
+def _c_unquote(value: str) -> str:
+    """`quote_c_style` undone, or the input unchanged if it was not that.
+
+    Git escapes `\\a \\b \\f \\n \\r \\t \\v \\" \\\\` singly and every other
+    byte it quotes as `\\NNN` -- **exactly** three octal digits, one escape per
+    byte, so a non-ASCII path is a run of them (`café.py` -> `caf\\303\\251.py`,
+    verified against git 2.50.1 under the default `core.quotepath=true`). The
+    bytes are reassembled and decoded with `surrogateescape`, matching how
+    `tasks._numstat` decodes the raw `-z` paths it records; a path that is not
+    UTF-8 has to compare equal to the manifest entry for the same bytes.
+
+    Anything git would not have emitted -- a dangling backslash, an unknown
+    escape, a short octal run -- returns the input VERBATIM rather than a
+    partial decode. A half-decoded path is a wrong path carrying the provenance
+    of a right one; the verbatim string matches no manifest entry, which is the
+    already-understood "file the judge cannot match" outcome.
+    """
+    if len(value) < 2 or value[0] != '"' or value[-1] != '"':
+        return value
+    body = value[1:-1]
+    raw = bytearray()
+    index = 0
+    while index < len(body):
+        char = body[index]
+        if char != "\\":
+            raw.extend(char.encode("utf-8", "surrogateescape"))
+            index += 1
+            continue
+        index += 1
+        if index >= len(body):
+            return value
+        char = body[index]
+        if char in _C_ESCAPES:
+            raw.append(ord(_C_ESCAPES[char]))
+            index += 1
+            continue
+        digits = body[index : index + 3]
+        if len(digits) < 3 or any(d not in _OCTAL_DIGITS for d in digits):
+            return value
+        octet = int(digits, 8)
+        if octet > 0xFF:
+            return value
+        raw.append(octet)
+        index += 3
+    return raw.decode("utf-8", "surrogateescape")
 
 
 def _chunk_file(chunk: str) -> str | None:
