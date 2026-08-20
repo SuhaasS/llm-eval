@@ -52,6 +52,16 @@ markers = [
     # `addopts` keeps these out of the unit run through `integration`.
     # Run deliberately: `pytest -m "integration and judge_live"`.
     "judge_live: makes a real, paid call to the judge model",
+    # The codex backend's twin of `judge_live`, and separate from it
+    # because the two cost different things and are unblocked by
+    # different acts: `judge_live` needs an `aws sso` session and bills
+    # Bedrock, `codex_live` needs BAKEOFF_CODEX_HOME logged in to the
+    # attested seat and spends that seat's usage window. An operator who
+    # has one has usually not got the other, so one marker over both
+    # would make "run the paid tests" fail for a reason that is not
+    # about the test it stopped on.
+    # Run deliberately: `pytest -m "integration and codex_live"`.
+    "codex_live: makes a real, paid call through the Codex CLI seat",
 ]
 testpaths = ["tests"]
 # The repo root, so tests can import scripts/ the way an operator runs it.

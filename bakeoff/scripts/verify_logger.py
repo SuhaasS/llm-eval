@@ -54,15 +54,18 @@ CHECKS: list[tuple[str, list[str], bool]] = [
         "container + proxy integration (live capture, wire log, fault injection)",
         # Both exclusions are on purpose, and neither is optional. The
         # grader's integration tests build a task image and hit the repo
-        # mirror; the judge's live test makes a real, BILLED call to the
-        # pinned judge model. This gate is documented as offline, no
+        # mirror; the judge's live tests make a real, BILLED call to the
+        # pinned judge model -- `judge_live` through Bedrock and `codex_live`
+        # through the Codex seat, two markers because the two are unblocked by
+        # different credentials. This gate is documented as offline, no
         # credentials, no spend, and a marker that widened it would change
         # what the section 6.6 gate NEEDS without changing what it is called
         # -- an operator who ran it before a collection would find it failing
         # for want of a network it was promised not to use, or find it
         # quietly spending on a judge it was promised not to call.
         _pytest("tests/", "-q", "-m",
-                "integration and not task_image and not judge_live",
+                "integration and not task_image and not judge_live "
+                "and not codex_live",
                 f"--basetemp={BASETEMP}"),
         True,
     ),

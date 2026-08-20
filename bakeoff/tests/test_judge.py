@@ -3110,3 +3110,34 @@ def test_the_judge_live_marker_is_registered_beside_task_image():
     judge_live = [m for m in markers if m.startswith("judge_live:")]
     assert len(judge_live) == 1, markers
     assert judge_live[0].split(":", 1)[1].strip()
+
+
+def test_verify_logger_selector_excludes_codex_live_too():
+    """The section 6.6 gate stays offline, no credentials, no spend.
+
+    `codex_live` is a second paid marker and it is `integration` as well, so
+    the gate's selector has to name it too. Without this the gate an operator
+    runs BEFORE a collection would spend the judge seat's usage window in the
+    one check whose docstring promises it will not -- the same failure
+    `judge_live` was excluded for, arriving through a second door.
+    """
+    source = (REPO_ROOT / "scripts" / "verify_logger.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "and not codex_live" in source
+
+
+def test_the_codex_live_marker_is_registered_beside_judge_live():
+    """An unregistered marker is a warning, not an error -- so it stays broken.
+
+    `test_integration_codex.py` carries `pytest.mark.codex_live`, and pytest
+    applies an unknown mark happily with a `PytestUnknownMarkWarning` nobody
+    reads in a green run. A gate that then selects `not codex_live` still
+    works, but nothing tells an operator the marker was never real -- and the
+    day someone runs `-m codex_live` they collect nothing and read it as "the
+    paid test passed".
+    """
+    source = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+
+    assert "codex_live: makes a real, paid call" in source
