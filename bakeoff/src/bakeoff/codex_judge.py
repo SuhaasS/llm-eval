@@ -193,6 +193,12 @@ LAST_MESSAGE_NAME = "last_message.txt"
 #: one string out, and the event is a construction-time argument that the
 #: driver keeps its own reference to.
 
+#: The provider-authority surface, as name prefixes. See `codex_environment`
+#: for why this one closed set is a denylist in a repo that prefers allowlists:
+#: what codex needs from the ambient environment cannot be enumerated, and what
+#: tells it whose account and which endpoint to use can.
+_PROVIDER_ENV_PREFIXES = ("OPENAI_", "CODEX_")
+
 #: HTTP statuses that mean the CREDENTIAL rather than the request, spelled the
 #: same way `judge._AUTH_STATUS` spells them so the two backends agree about
 #: what auth means.
@@ -386,19 +392,45 @@ def build_codex_argv(
 def codex_environment(
     codex_home: str, base_env: dict[str, str] | None = None
 ) -> dict[str, str]:
-    """The subprocess environment: the judge home, and no ambient API key.
+    """The subprocess environment: the judge home, and no ambient provider
+    authority of any kind.
 
-    `OPENAI_API_KEY` is POPPED rather than merely not set. A key exported in
-    the operator's shell would flip the call off the attested seat and onto an
-    account nobody recorded, and the verdicts would be complete, well formed
-    and wrong about their own provenance -- exactly the shape of
-    `_judge_router`'s `AWS_BEARER_TOKEN_BEDROCK` scrub (`judge.py:1671`), for
-    the same reason: the process did not set the variable, so the process must
-    not silently inherit its authority.
+    Every `OPENAI_`/`CODEX_` variable is REMOVED rather than merely not set.
+    A key exported in the operator's shell would flip the call off the attested
+    seat and onto an account nobody recorded, and the verdicts would be
+    complete, well formed and wrong about their own provenance -- exactly the
+    shape of `_judge_router`'s `AWS_BEARER_TOKEN_BEDROCK` scrub
+    (`judge.py:1671`), for the same reason: the process did not set the
+    variable, so the process must not silently inherit its authority.
+
+    **`OPENAI_API_KEY` ALONE WAS THE FIRST VERSION AND IT WAS NOT THE SURFACE.**
+    `OPENAI_BASE_URL` rides through a single-name pop and reroutes the call to
+    a different endpoint entirely -- a strictly worse version of the same
+    defect, since a wrong key at least stays inside a provider the record
+    names, while a wrong base URL puts the verdict on a machine
+    `judge_harness` has no field for. `CODEX_*` is the same class one layer up:
+    the CLI's own configuration namespace, which includes credentials.
+
+    **A PREFIX DENYLIST, and deliberately not this repo's preferred full
+    allowlist.** An allowlist is right when the required set can be
+    enumerated, and here it cannot: codex needs `PATH` to find its helpers, a
+    locale to decode its own output, a tmpdir, and whatever else a given macOS
+    or CI image expects -- a list that is wrong on the next machine and fails
+    as a codex that cannot start. The PROVIDER-AUTHORITY surface, though, *can*
+    be enumerated, and it is exactly these two prefixes: nothing outside them
+    tells codex which account or which endpoint to use. So the closed set is
+    applied where a closed set is knowable, and the open set is left open.
+
+    `CODEX_HOME` is set AFTER the scrub, because it is itself a `CODEX_`
+    variable and the denylist would otherwise remove the one thing this
+    function exists to establish.
     """
-    env = dict(os.environ if base_env is None else base_env)
+    env = {
+        name: value
+        for name, value in (os.environ if base_env is None else base_env).items()
+        if not name.startswith(_PROVIDER_ENV_PREFIXES)
+    }
     env["CODEX_HOME"] = codex_home
-    env.pop("OPENAI_API_KEY", None)
     return env
 
 

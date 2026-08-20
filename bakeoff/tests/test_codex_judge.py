@@ -224,6 +224,42 @@ def test_an_ambient_openai_api_key_never_reaches_the_subprocess():
     assert env["X"] == "1"
 
 
+def test_every_ambient_provider_variable_is_scrubbed_not_only_the_api_key():
+    """`OPENAI_API_KEY` was the only one popped, and it is not the only one
+    codex honours.
+
+    `OPENAI_BASE_URL` reroutes the call to another endpoint entirely while the
+    record still attests the seat -- a verdict that is complete, well formed
+    and wrong about its own provenance, which is the same failure the key pop
+    exists to prevent and a worse one: the key at least changes the account
+    inside a known provider.
+    """
+    env = codex_environment(
+        "/judge/home",
+        {
+            "OPENAI_API_KEY": "sk-personal",
+            "OPENAI_BASE_URL": "http://localhost:4000/v1",
+            "OPENAI_ORG": "org-elsewhere",
+            "CODEX_API_KEY": "sk-also-personal",
+            "CODEX_HOME": "/home/personal/.codex",
+            "PATH": "/usr/bin",
+            "LANG": "en_US.UTF-8",
+            "TMPDIR": "/var/tmp",
+        },
+    )
+
+    assert not [name for name in env
+                if name.startswith(("OPENAI_", "CODEX_"))
+                and name != "CODEX_HOME"]
+    # Set AFTER the scrub: the prefix denylist would otherwise remove the one
+    # variable this function exists to set.
+    assert env["CODEX_HOME"] == "/judge/home"
+    # The system-level variables codex needs and no allowlist could enumerate.
+    assert env["PATH"] == "/usr/bin"
+    assert env["LANG"] == "en_US.UTF-8"
+    assert env["TMPDIR"] == "/var/tmp"
+
+
 # --- refusals ----------------------------------------------------------------
 
 
