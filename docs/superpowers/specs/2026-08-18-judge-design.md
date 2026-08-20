@@ -133,7 +133,10 @@ that treats a Sonnet run as a reference has changed what the eval measures.
 
 Receives: task prompt, reference diff, candidate diff, deterministic check
 results, rubric items seeded from human correction turns (§3.3), and the
-`SimilarityContext` above.
+`SimilarityContext` above. The seeded rubric items are **deferred**:
+`TaskManifest` carries no rubric field yet, and because the payload is built
+from a whitelist the key is simply absent until it does, rather than present
+and empty (ambiguity 10 in `docs/superpowers/plans/2026-08-18-judge.md`).
 
 **Never receives: model identity, cost, timing, or any prior verdict.**
 
@@ -527,3 +530,44 @@ model id — reaches the wire without passing through it. That is harmless there
 since the id it passes is the pinned neutral default, but it is a hole in the
 claim that the guard is unconditional: anything that calls the seam directly is
 outside it, and the next caller to do so need not be a test.
+
+---
+
+## Before the first paid pass
+
+Run one task first, because the pairwise prompt has never met the live judge.
+`tests/test_integration_judge.py` buys a single **rubric** call, so
+`render_rubric_prompt` is the only render this endpoint has answered;
+`render_pairwise_prompt` is about three quarters of what a full pass spends and
+everything that has ever replied to it is a reply this repo wrote. Whether the
+pinned judge, shown that prompt's actual text, returns a verdict
+`_pairwise_verdict_and_reasoning` accepts is a fact about the model and the
+prompt together, and no fake below the seam can report it.
+
+The failure mode is bounded but badly timed. A judge that answers the pairwise
+format in prose fails identically on every unit, and it fails by spending:
+`retries=2` is three calls per comparison, `MAX_CONSECUTIVE_ERRORS = 5` units
+in a row is where the breaker stops the walk, so roughly fifteen paid calls buy
+nothing and the pass ends at hour zero of a run planned in tens of hours.
+
+The smoke test is the driver itself, narrowed to one unit of work:
+
+```
+python scripts/judge.py --event-log <collection> --taskset <taskset> \
+    --only-task <one task> --samples 0
+```
+
+One task at one sample index is at most six pairs — twelve pairwise calls at
+two forced positions each — against the real prompt, the real parser, the real
+judge and the collection actually about to be judged. Read the census line it
+prints before the first paid call, confirm the count is the one expected, and
+let it finish. Verdicts that parse mean the format is answerable and the full
+pass is only a scale question; the lines it writes are resumed over rather than
+re-bought, so the smoke is not a tax on the real run. Add `--no-rubric` if the
+rubric side is already known good and the point is the pairwise alone.
+
+A live pairwise call added to `tests/test_integration_judge.py`, behind the
+`judge_live` marker already on that module, would fold this fact into the test
+suite and remains open. **Not implemented** — the one-task smoke answers the
+same question today, and answers it against the real collection rather than a
+fixture.

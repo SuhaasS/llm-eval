@@ -546,9 +546,20 @@ def test_an_ascii_terminal_gets_the_whole_report_of_an_override_pass(
     that must be READ rather than grepped would arrive as
     `\\u03ba unmeasured (OPEN-5) \\u2014 ...`. `_encodable` is what keeps the
     twin reachable: escaping is right for an id and wrong for a claim.
+
+    THE COLLECTION SITS UNDER A NON-ASCII DIRECTORY, which is what reaches the
+    HEADER -- the five lines `main` prints before the collection is read and
+    before a credential is minted. Those are ABOVE the reconfigure, so the
+    widened error handler does not cover them, and four of them carry a path:
+    `--event-log`, the two paths derived from it, and `--taskset` as the
+    operator typed it. Unguarded, a collection under an accented directory --
+    ordinary, not exotic -- takes `main` down on a traceback at hour zero,
+    above the census, having named nothing. Asserted FIRST and in printing
+    order for the same reason the rest of this test is: a guard covering only
+    the report still loses everything above it.
     """
     monkeypatch.setenv(ALLOW_NON_NEUTRAL_JUDGE_ENV, "1")
-    root = _two_arms(tmp_path)
+    root = _two_arms(tmp_path / "café")
     # One vote answered, the rest unparsable: a real ERROR section, and a
     # second unit that leaves its hole in the derived view.
     _cli(monkeypatch, complete=FakeComplete(replies=[_pairwise_reply("A")]))
@@ -557,6 +568,7 @@ def test_an_ascii_terminal_gets_the_whole_report_of_an_override_pass(
 
     code = main([
         "--event-log", str(root), "--no-rubric",
+        "--taskset", "tâches.yaml",
         "--judge-model", CLAUDE_JUDGE,
     ])
     stream.flush()
@@ -565,7 +577,14 @@ def test_an_ascii_terminal_gets_the_whole_report_of_an_override_pass(
     assert code == 1, "exit 1 from the errored unit, not from a traceback"
     assert len(_lines(root)) == 1, "the pass died before writing its line"
 
-    # The whole report, in the order it prints.
+    # The header, printed above the reconfigure and before anything is spent.
+    assert "event log  " in text
+    assert "caf\\xe9" in text          # escaped, so the path is still greppable
+    assert "grades     " in text       # derived from the same root, same guard
+    assert "judgments  " in text       # and so is this one
+    assert "t\\xe2ches.yaml" in text   # the operator's own --taskset, echoed back
+
+    # Then the whole report, in the order it prints.
     assert "judged" in text and "errored" in text     # the invocation counts
     assert "pairwise win rates" in text               # the matrix section
     assert "\\xa74.4" in text                         # a legend that used to kill it

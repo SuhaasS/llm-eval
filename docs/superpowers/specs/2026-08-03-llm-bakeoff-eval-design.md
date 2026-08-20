@@ -249,13 +249,15 @@ Round-robin over 4 models is 6 pairs per task-sample. At 60 tasks × 10 samples 
 
 Protocol: 3 judge samples per comparison, majority vote. Position-swap probe on a subset with position-consistency reported. Cohen's κ against the ~20% human gold subset (§4.3). If κ < 0.6, Tier B is reported as directional only and must not carry the decision.
 
+*The sampling protocol above is superseded by the 2026-08-19 amendments in `2026-08-18-judge-design.md`: the built judge runs at temperature 0, where the two orders exhaust what it can say, so every comparison is shown in both forced positions at one vote each — deterministic, a third cheaper, and the position probe read off each comparison rather than inferred across a subset.*
+
 ### 4.3 Judge configuration
 
 - **Neutral family, mandatory.** Compared families are Anthropic, Google, NVIDIA, Moonshot. A Claude judge inflates Sonnet 5; a Gemini judge inflates Gemma 4. The judge must sit outside all four. Self-preference bias is well documented: one measured case had a model rate its own backbone at 33.7% faithfulness where an independent judge said 14.13%.
 - **Judge is a GPT-class model** (existing Pindrop credits). Sits outside all four compared families, so no self-preference path exists.
 - **Accepted tradeoff, recorded:** a GPT-class judge sends candidate diffs to a third party, which is the same class of objection that ruled out OpenRouter in §2, though at judging volume rather than for all production traffic. Decision reviewed and accepted. Qwen on Bedrock or self-hosted remains the drop-in alternative if residency policy changes — the judge is swappable without touching anything else, and because full judge inputs are logged (§6.3), a re-judge is a re-score, not a re-run.
 - **Evidence-fed, not diff-only.** Give the judge the candidate diff, the reference diff, the rubric items, and any test results. Judge-with-evidence materially outperforms judge-blind and is the difference between a usable and an unusable Tier B number.
-- **Blind and position-randomized.** Model identity stripped; A/B order shuffled per comparison; position-swap probe on a subset to bound position bias.
+- **Blind and position-randomized.** Model identity stripped; A/B order shuffled per comparison; position-swap probe on a subset to bound position bias. *The randomization half is superseded by the 2026-08-19 amendments in `2026-08-18-judge-design.md` — both positions are forced, one vote each, so the order is deterministic rather than shuffled; the blinding is unchanged and enforced by a whitelist payload builder.*
 - **Calibrated.** Engineers grade a ~20% gold subset blind. Report Cohen's κ against it. κ ≥ 0.6 acceptable, ≥ 0.8 strong. **If κ falls below 0.6, the Tier B number is reported as directional only and must not carry the decision.**
 - **Fully logged.** Complete judge reasoning, not just verdicts, plus judge model ID and prompt version, so judge drift is traceable and re-scoring is possible.
 

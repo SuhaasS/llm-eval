@@ -744,17 +744,35 @@ def _now() -> str:
 def _print_ascii_safe(line: str) -> None:
     """`print`, surviving a stdout the environment pinned to ASCII.
 
-    ONE implementation for the four lines that carry text `str.encode` can
-    refuse. Two are collection-derived -- the per-unit progress line (a task
-    id, model names, run ids) and `print_summary`'s WARNING loop (run ids in
-    the excluded and ungraded warnings, task ids and model names in the abort)
-    -- and two carry a `§`: the neutral-judge warning, which the WARNING loop
-    then re-emits, and the refusal path in `main`. On an ASCII stdout --
-    `LC_ALL=C`, or a pipe into a tool that pinned it -- `print` raises
-    `UnicodeEncodeError`, which is not an `Exception` any per-unit handler
-    catches: it goes past the breaker, past `except KeyboardInterrupt` and out
-    of `main`, taking a batch that had been running for hours down on a
-    traceback with no summary and no usage totals.
+    ONE implementation for every site in this file whose text `str.encode` can
+    refuse, which is these and no others:
+
+    * `main`'s pre-summary header and its task-set load failure -- the two
+      paths the operator passed (`--event-log`, `--taskset`), the two derived
+      from the first, and the `TaskError` message, which opens with the
+      task-set root it could not read.
+    * The non-neutral judge warning, which carries a `§`.
+    * The per-unit progress line, collection-derived: a task id, model names,
+      run ids.
+    * `print_summary`'s WARNING loop -- run ids in the excluded and ungraded
+      warnings, task ids and model names in the abort, and the neutral-judge
+      warning re-emitted.
+    * The refusal path in `main`, whose `NonNeutralJudge` message carries a `§`.
+
+    On an ASCII stdout -- `LC_ALL=C`, or a pipe into a tool that pinned it --
+    `print` raises `UnicodeEncodeError`, which is not an `Exception` any
+    per-unit handler catches: it goes past the breaker, past
+    `except KeyboardInterrupt` and out of `main`, taking a batch that had been
+    running for hours down on a traceback with no summary and no usage totals.
+    The header is the same failure one step earlier and one step cheaper --
+    before the collection is read, before a credential is minted -- which is
+    worth surviving for the path it prints rather than for the spend it saves.
+
+    THE CENSUS IS NOT ON THIS LIST, and the docstring used to say it was.
+    `_census_line` is a format string over five integers, so it is ASCII by
+    construction and its bare `print` cannot raise. Listing it here read as
+    coverage this helper does not provide and hid the header, which needed it.
+    A census line that ever grows collection-derived text becomes a site.
 
     `_print_reading` is NOT among them and no longer needs to be: `main`
     reconfigures the stdout STREAM to `errors="backslashreplace"` before the
@@ -763,7 +781,7 @@ def _print_ascii_safe(line: str) -> None:
     recorded OPEN, and the comment at the reconfigure carries the reasoning.
 
     What the reconfigure does NOT touch is what this helper is still the cover
-    for: everything printed BEFORE that line on the CLI path (the census, the
+    for: everything printed BEFORE that line on the CLI path (the header, the
     per-unit progress lines, the non-neutral banner), and a library caller of
     `print_summary`, whose stream is theirs and stays as they set it.
 
@@ -1634,8 +1652,8 @@ def judge_event_log(event_log_root, tasks, *,
         usage totals and every remaining unit unbought. Exactly the failure
         class this whole section exists to remove, arriving from the code added
         to remove it. `_print_ascii_safe` is that guard, and it is shared with
-        the two other lines in this file that can carry text an ASCII terminal
-        refuses.
+        every other line in this file that can carry text an ASCII terminal
+        refuses -- that helper's docstring enumerates them.
         """
         now = time.monotonic()
         progress["attempted"] += 1
@@ -3871,14 +3889,31 @@ def main(argv: list[str] | None = None) -> int:
     try:
         tasks = load_task_set(Path(args.taskset))
     except TaskError as exc:
-        print(f"task set: {exc}")
+        # Through the guard for the same reason the header below is: the
+        # message names the path the operator passed, and a bad `--taskset` is
+        # exactly how this branch is reached.
+        _print_ascii_safe(f"task set: {exc}")
         return 1
 
-    print(f"event log  {event_log_root}")
-    print(f"grades     {grades_path(event_log_root)}")
-    print(f"judgments  {judgments_path(event_log_root)}")
-    print(f"task set   {args.taskset}  ({len(tasks)} task(s))")
-    print(
+    # THROUGH THE GUARD, and every line of it. Four of these five carry a
+    # path -- the two the operator supplied on the command line
+    # (`--event-log`, `--taskset`) and the two derived from the first -- and a
+    # path is the one thing here that can hold a character `str.encode`
+    # refuses: a collection under an accented directory name is ordinary, not
+    # exotic. The fifth is guarded with them rather than left bare, since a
+    # header that survives in four lines and dies in the fifth is a worse
+    # thing to reason about than one rule. They also print BEFORE the
+    # stream reconfigure further down, which is what covers the report, so on
+    # an ASCII stdout (`LC_ALL=C`, or a pipe into a tool that pinned it) a bare
+    # `print` here raises `UnicodeEncodeError` out of `main` before the
+    # collection is read and before anything is spent. Cheap to survive, and a
+    # traceback where the header belongs tells the operator nothing about the
+    # path that caused it -- `backslashreplace` at least prints it.
+    _print_ascii_safe(f"event log  {event_log_root}")
+    _print_ascii_safe(f"grades     {grades_path(event_log_root)}")
+    _print_ascii_safe(f"judgments  {judgments_path(event_log_root)}")
+    _print_ascii_safe(f"task set   {args.taskset}  ({len(tasks)} task(s))")
+    _print_ascii_safe(
         f"judge      {args.judge_model}, prompt v{JUDGE_PROMPT_VERSION}, "
         f"rubric {RUBRIC_VERSION}"
     )
@@ -3923,9 +3958,9 @@ def main(argv: list[str] | None = None) -> int:
     # Guarded with `getattr` -- pytest's capture object and other exotic
     # streams need not expose `reconfigure`, and a missing one is skipped
     # silently: the driver's own prints still carry `_print_ascii_safe`, which
-    # is also what covers everything printed BEFORE this line (the census, the
-    # per-unit progress lines, the non-neutral banner) since the walk has
-    # already run by the time we get here.
+    # is also what covers everything printed BEFORE this line (the header
+    # above, the per-unit progress lines, the non-neutral banner) since the
+    # walk has already run by the time we get here.
     reconfigure = getattr(sys.stdout, "reconfigure", None)
     if reconfigure is not None:
         reconfigure(errors="backslashreplace")
