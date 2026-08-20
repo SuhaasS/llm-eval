@@ -545,26 +545,109 @@ def test_a_rate_limit_that_clears_returns_the_verdict(
 
 
 def test_the_usage_block_maps_onto_the_harness_keys_and_derives_the_total():
-    counts = usage_from_events(_events(_completed(input_tokens=14591, output_tokens=5)))
+    usage = usage_from_events(_events(_completed(input_tokens=14591, output_tokens=5)))
 
-    assert counts == {
+    assert usage.counts == {
         "prompt_tokens": 14591,
         "completion_tokens": 5,
         # DERIVED: codex reports no total, unlike the mantle route whose
         # reported total must never be re-summed.
         "total_tokens": 14596,
     }
+    assert usage.unreadable_blocks == 0
 
 
 def test_an_unreadable_usage_block_is_counted_rather_than_guessed():
-    assert usage_from_events(_events({"type": "turn.completed"})) is None
-    assert usage_from_events(_events(_failed("nope"))) is None
+    assert usage_from_events(_events({"type": "turn.completed"})).counts is None
     # bool is a subclass of int, and True in a token slot would add 1 and read
     # as a measurement.
     assert usage_from_events(
         _events({"type": "turn.completed", "usage": {"input_tokens": True,
                                                      "output_tokens": 3}})
-    ) is None
+    ).counts is None
+
+
+def test_a_stream_with_no_completed_turn_reports_nothing_to_read_and_no_block():
+    """`counts is None` with ZERO unreadable blocks is its own answer.
+
+    It is what a renamed `turn.completed` and a failed turn both leave behind,
+    and it is not the same fact as "a block was there and could not be read" --
+    `_fold_usage` keys the under-count marker on the run's outcome for the
+    first and on the block itself for the second.
+    """
+    usage = usage_from_events(_events(_failed("nope")))
+
+    assert usage.counts is None
+    assert usage.unreadable_blocks == 0
+
+
+def test_every_completed_turn_contributes_its_tokens_not_only_the_last():
+    """The fold walks the WHOLE stream, not backwards to the first match.
+
+    Reading only the last `turn.completed` drops every earlier turn's spend --
+    wrong in the low direction, the one direction a spend figure must never be
+    wrong in. Codex emits one block per turn, so a call the agent layer took
+    two turns over reported exactly half of what it billed.
+    """
+    usage = usage_from_events(_events(_completed(100, 10), _completed(200, 20)))
+
+    assert usage.counts == {
+        "prompt_tokens": 300,
+        "completion_tokens": 30,
+        "total_tokens": 330,
+    }
+    assert usage.unreadable_blocks == 0
+
+
+def test_an_unreadable_block_beside_a_readable_one_folds_one_and_marks_the_other():
+    """Partial readability is BOTH facts, and neither may swallow the other.
+
+    Returning `None` because the last block was unreadable threw away a
+    readable earlier one; returning the readable counts alone would report a
+    total short by the unreadable block with every counter silent. This is
+    `judge._add_usage`'s partial-block rule on this backend.
+    """
+    usage = usage_from_events(
+        _events(_completed(100, 10), {"type": "turn.completed", "usage": None})
+    )
+
+    assert usage.counts == {
+        "prompt_tokens": 100,
+        "completion_tokens": 10,
+        "total_tokens": 110,
+    }
+    assert usage.unreadable_blocks == 1
+
+
+def test_a_successful_run_with_a_partly_readable_stream_folds_and_marks(
+    monkeypatch, judge_home: Path, codex_bin: Path
+):
+    """The caller has to act on both halves, not only on the counts.
+
+    An earlier turn's tokens reach the total AND `calls_without_usage` says the
+    total is still short -- the two-key decision `_fold_usage` documents,
+    applied to a stream that is partly readable rather than wholly one or the
+    other.
+    """
+    totals = new_usage_totals()
+    _install(
+        monkeypatch,
+        [CodexRun(
+            0,
+            _events(_completed(100, 10), {"type": "turn.completed"}),
+            "",
+            '{"verdict": "A"}',
+        )],
+    )
+    complete = codex_completion(
+        PINNED, codex_bin=str(codex_bin), codex_home=str(judge_home),
+        usage_totals=totals,
+    )
+
+    assert complete("prompt") == '{"verdict": "A"}'
+    assert totals["prompt_tokens"] == 100
+    assert totals["completion_tokens"] == 10
+    assert totals["calls_without_usage"] == 1
 
 
 def test_calls_count_before_the_wire_and_missing_usage_is_counted_not_dropped(

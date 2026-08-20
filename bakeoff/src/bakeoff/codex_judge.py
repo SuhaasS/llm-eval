@@ -657,12 +657,47 @@ _CODEX_INPUT_FIELD = "input_tokens"
 _CODEX_OUTPUT_FIELD = "output_tokens"
 
 
-def usage_from_events(events: Iterable[dict[str, Any]]) -> dict[str, int] | None:
-    """`turn.completed`'s token counts, mapped onto `new_usage_totals`' keys.
+@dataclass(frozen=True)
+class CodexUsage:
+    """What one run's stream said about its own spend -- BOTH halves.
 
-    `None` when no readable block exists, which the caller turns into
-    `calls_without_usage` -- the counter that tells an operator their total is
-    an under-count rather than a measurement.
+    `counts` is the sum over every readable `turn.completed` block, or `None`
+    when not one of them could be read. `unreadable_blocks` is how many
+    `turn.completed` events were present and unreadable.
+
+    TWO FIELDS because one value cannot carry both facts, and an interface
+    that returned only the first made a partly-readable stream indistinguishable
+    from a wholly readable one. A caller that folds `counts` and ignores
+    `unreadable_blocks` reports a total that is short with every counter
+    silent -- the precise silence `calls_without_usage` exists to break.
+
+    Note the asymmetry with `counts is None` and `unreadable_blocks == 0`
+    together: that is a stream with NO `turn.completed` at all -- a failed
+    turn, or the release that renames the event -- which is a different fact
+    from a block that was there and could not be read, and `_fold_usage`
+    answers them differently.
+    """
+
+    counts: dict[str, int] | None
+    unreadable_blocks: int
+
+
+def usage_from_events(events: Iterable[dict[str, Any]]) -> CodexUsage:
+    """Every `turn.completed`'s token counts, on `new_usage_totals`' keys.
+
+    **FOLDED ACROSS THE WHOLE STREAM, not read off the last block.** Codex
+    emits one `turn.completed` per turn, so a call the agent layer took two
+    turns over reports two blocks -- and a reader that returned on the first
+    match walking backwards dropped every earlier turn's spend. Wrong in the
+    low direction, which is the one direction this module's totals may never
+    be wrong in, and invisible: the figure it produced was a real block's real
+    counts, just not all of them.
+
+    A single unreadable block no longer costs the readable ones either. It is
+    surfaced as `unreadable_blocks` instead, so the caller can fold what was
+    readable AND still raise `calls_without_usage` -- the counter that tells an
+    operator their total is an under-count rather than a measurement. That is
+    `judge._add_usage`'s partial-block rule expressed for a stream of blocks.
 
     **`total_tokens` is DERIVED here, and that is a departure worth naming.**
     `judge._add_usage` refuses to sum the halves because the mantle endpoint
@@ -679,22 +714,42 @@ def usage_from_events(events: Iterable[dict[str, Any]]) -> dict[str, int] | None
     exceeds its `output_tokens` would prove the two disjoint, and the mapping
     here would then be under-counting completion tokens by the reasoning half.
     """
-    for event in reversed(tuple(events)):
+    totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    readable = 0
+    unreadable = 0
+    for event in events:
         if event.get("type") != "turn.completed":
             continue
-        usage = event.get("usage")
-        if not isinstance(usage, dict):
-            return None
-        prompt_tokens = _int_or_none(usage.get(_CODEX_INPUT_FIELD))
-        completion_tokens = _int_or_none(usage.get(_CODEX_OUTPUT_FIELD))
-        if prompt_tokens is None or completion_tokens is None:
-            return None
-        return {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-        }
-    return None
+        block = _block_counts(event.get("usage"))
+        if block is None:
+            unreadable += 1
+            continue
+        readable += 1
+        for field, value in block.items():
+            totals[field] += value
+    return CodexUsage(totals if readable else None, unreadable)
+
+
+def _block_counts(usage: Any) -> dict[str, int] | None:
+    """One `turn.completed` usage block, or `None` when it cannot be read.
+
+    Split out of the fold so "this block is unreadable" is ONE decision in one
+    place. Inlined, the fold would decide it twice -- once to skip the block
+    and once to count it -- and the two copies drifting is how a partial block
+    starts being folded as a zero while `unreadable_blocks` stays down: a
+    total short by that block with the counter that says so silent.
+    """
+    if not isinstance(usage, dict):
+        return None
+    prompt_tokens = _int_or_none(usage.get(_CODEX_INPUT_FIELD))
+    completion_tokens = _int_or_none(usage.get(_CODEX_OUTPUT_FIELD))
+    if prompt_tokens is None or completion_tokens is None:
+        return None
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
 
 
 def _int_or_none(value: Any) -> int | None:
@@ -718,7 +773,7 @@ def _fold_usage(usage_totals: dict[str, int] | None, run: CodexRun) -> None:
     if usage_totals is None:
         return
 
-    counts = usage_from_events(run.events)
+    usage = usage_from_events(run.events)
 
     # TWO DECISIONS, and they key on different things -- which is the whole
     # correctness of this function, and the thing two earlier versions each
@@ -741,11 +796,18 @@ def _fold_usage(usage_totals: dict[str, int] | None, run: CodexRun) -> None:
     # codex release that renames that event leaves every successful call
     # folding no tokens AND raising no counter, so the pass reports `calls=N`
     # beside a zero total with the under-count warning suppressed.
+    #
+    # The two are NOT mutually exclusive, which is why this is no longer an
+    # `elif`. A stream whose first turn is readable and whose second is not
+    # both contributes tokens and leaves the total short, and an `elif` said
+    # only the first of those. The counter counts CALLS, so a call with three
+    # unreadable blocks raises it once: it is one total, and it is short.
     with USAGE_LOCK:
-        if counts is not None:
-            for field, value in counts.items():
+        if usage.counts is not None:
+            for field, value in usage.counts.items():
                 usage_totals[field] += value
-        elif failure_message(run) is None:
+        short = usage.counts is None or usage.unreadable_blocks > 0
+        if short and failure_message(run) is None:
             usage_totals["calls_without_usage"] += 1
 
 
