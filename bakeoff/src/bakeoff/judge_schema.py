@@ -92,7 +92,11 @@ from bakeoff.scanners import scan_secrets
 # grade file's. A reader that cannot tell judgment schema versions apart reads
 # an absent field as a positive negative claim -- the same reason
 # `SCHEMA_VERSION` and `GRADE_SCHEMA_VERSION` move for additive bumps.
-JUDGE_SCHEMA_VERSION = "1.0.0"
+# 1.0.0 -> 1.1.0 adds `judge_harness`, additively: a mantle-era line loads
+# with it `None` and every reader must read that `None` as "not recorded"
+# rather than as "no harness", which is exactly the positive-negative-claim
+# trap the paragraph above names.
+JUDGE_SCHEMA_VERSION = "1.1.0"
 
 
 def _build(klass: type, data: dict[str, Any]) -> Any:
@@ -357,6 +361,22 @@ class JudgeRecord:
     # gated on. See the module docstring.
     grade_version_seen: dict[str, str] = field(default_factory=dict)
     graded_against_task_set_commit: str = ""
+    # WHAT CARRIED THE PROMPT TO THE MODEL, which `judge_sampling` cannot say
+    # and `judge_model_id` only half says. Added at schema 1.1.0 for the codex
+    # backend, where the harness is not a thin HTTP client: `codex exec` wraps
+    # every prompt in its own agent system prompt and tool schemas -- measured
+    # at ~14.6k input tokens for a nine-word prompt -- so `judge_prompt_sha`
+    # attests the user turn and NOT the whole of what the model read.
+    # `codex_cli_version` is the only identity that wrapper has, which is why
+    # this field is the compensating record rather than a convenience.
+    #
+    # `auth_seat` is OPERATOR-ATTESTED and never derived: `auth.json` proves a
+    # session, not which organisation's seat granted it, and a residency
+    # question is precisely what somebody would read this field to answer.
+    #
+    # `None` means mantle-era or gate-decided -- a line where nothing was sent,
+    # or one written before the field existed. Neither is "no harness".
+    judge_harness: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Plain JSON-ready dict.

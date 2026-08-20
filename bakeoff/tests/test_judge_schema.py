@@ -596,3 +596,62 @@ def test_read_payload_round_trips_write_payload(tmp_path: Path):
     path, _ = write_payload(tmp_path / "payloads", "j-round", payload)
     assert read_payload(path) == payload
     assert read_payload(Path(path)) == payload
+
+
+# --- judge_harness (schema 1.1.0) -------------------------------------------
+
+
+def test_a_schema_1_0_0_line_loads_with_judge_harness_none():
+    """A mantle-era line predates the field and must go on loading forever.
+
+    `None` is the honest value: that line's harness was not recorded, which is
+    a different claim from "there was no harness" -- the same distinction
+    `JUDGE_SCHEMA_VERSION`'s docstring makes about absent fields.
+    """
+    line = {
+        "judgment_id": "j-1",
+        "judged_at": "2026-08-19T00:00:00Z",
+        "judge_model_id": "openai.gpt-5.6-sol",
+        "judge_prompt_version": 2,
+        "judge_prompt_sha": "abc",
+        "judge_sampling": {"temperature": 0.0, "max_completion_tokens": 4096},
+        "rubric_version": "1.0.0",
+        "kind": "pairwise",
+        "task_id": "t-1",
+        "judge_schema_version": "1.0.0",
+    }
+
+    record = JudgeRecord.from_dict(line)
+
+    assert record.judge_harness is None
+    assert record.judge_schema_version == "1.0.0"
+
+
+def test_judge_harness_round_trips_and_the_schema_version_moved():
+    from bakeoff.judge_schema import JUDGE_SCHEMA_VERSION
+
+    assert JUDGE_SCHEMA_VERSION == "1.1.0"
+
+    harness = {
+        "backend": "codex-cli",
+        "codex_cli_version": "codex-cli 0.145.0-alpha.18",
+        "codex_model": "gpt-5.2-codex",
+        "auth_mode": "chatgpt",
+        "auth_seat": "pindrop-chatgpt-business",
+        "sandbox": "read-only",
+        "reasoning_effort": None,
+    }
+    record = JudgeRecord(
+        judgment_id="j-2",
+        judged_at="2026-08-20T00:00:00Z",
+        judge_model_id="codex:gpt-5.2-codex",
+        judge_prompt_version=2,
+        judge_prompt_sha="def",
+        judge_sampling={},
+        rubric_version="1.0.0",
+        kind="pairwise",
+        task_id="t-1",
+        judge_harness=harness,
+    )
+
+    assert JudgeRecord.from_dict(record.to_dict()).judge_harness == harness
