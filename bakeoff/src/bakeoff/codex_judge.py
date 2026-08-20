@@ -372,6 +372,19 @@ def codex_environment(
     return env
 
 
+def _kill_group(process: subprocess.Popen) -> None:
+    """SIGKILL the child's whole process group, falling back to the leader.
+
+    Codex spawns helpers; killing only the leader leaves them holding the
+    pipe, and the `communicate` that follows would wait on a call already
+    declared dead.
+    """
+    try:
+        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        process.kill()
+
+
 def _run_codex(
     argv: list[str],
     prompt: str,
@@ -381,13 +394,20 @@ def _run_codex(
 ) -> CodexRun:
     """THE spawn. The one function in this module that starts a process.
 
-    Monkeypatched by every unit test, which is why the classification, the
-    retry policy and the usage folding all live above it and take a `CodexRun`.
+    Monkeypatched by every unit test that exercises a verdict, which is why the
+    classification, the retry policy and the usage folding all live above it
+    and take a `CodexRun`. The two that drive it for real script a shell binary
+    instead, because what it guarantees is about the PROCESS and a fake of it
+    cannot be wrong in the ways this function can.
 
-    `start_new_session=True` puts the child in its own process group so a
-    timeout can kill the GROUP. Codex spawns helpers; `Popen.kill` would leave
-    them holding the pipe, and the `communicate` that follows would hang on a
-    call already declared dead -- a worker slot lost for the rest of the pass.
+    `start_new_session=True` puts the child in its own process group, which is
+    what lets an escape kill the GROUP (`_kill_group`) -- and is equally why it
+    must: the child is detached from the terminal, so the SIGINT an operator's
+    Ctrl-C sends the foreground group never reaches it. EVERY escape from
+    `communicate` kills, not only the timeout. A KeyboardInterrupt used to
+    leave a detached `codex exec` billing the seat with nothing left enforcing
+    the timeout, because `Popen.__exit__` assumes the SIGINT was delivered and
+    waits a quarter of a second on that assumption.
     """
     with subprocess.Popen(
         argv,
@@ -396,15 +416,19 @@ def _run_codex(
         stderr=subprocess.PIPE,
         env=env,
         text=True,
+        # Lenient on purpose, and asymmetric with nothing: the -o file is
+        # already read with errors="replace", and a strict decode here turned
+        # one bad byte in the DIAGNOSTIC stream into a discarded paid
+        # verdict, and the SIGKILL-truncated recovery read into a
+        # UnicodeDecodeError reported in place of the timeout it was.
+        encoding="utf-8",
+        errors="replace",
         start_new_session=True,
     ) as process:
         try:
             stdout, stderr = process.communicate(prompt, timeout=timeout_s)
         except subprocess.TimeoutExpired:
-            try:
-                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                process.kill()
+            _kill_group(process)
             try:
                 # BOUNDED. `process.kill()` is the fallback path, and it kills
                 # only the leader -- a codex helper that survives holding the
@@ -420,6 +444,16 @@ def _run_codex(
                 f"codex exec exceeded {timeout_s:.0f}s and its process group "
                 f"was killed; stderr: {_tail(stderr)}"
             ) from None
+        except BaseException:
+            # Ctrl-C above all. The child is in its own session, so the
+            # terminal's SIGINT never reached it -- and Popen.__exit__
+            # assumes it did: on KeyboardInterrupt it waits a fraction of a
+            # second and moves on, leaving a detached codex exec billing the
+            # seat with nothing enforcing the timeout; on anything else it
+            # blocks in an untimed wait(). Killing the group here is the only
+            # thing that makes either path end.
+            _kill_group(process)
+            raise
         exit_code = process.returncode
 
     return CodexRun(
@@ -710,7 +744,13 @@ def codex_cli_version(codex_bin: str) -> str:
         result = subprocess.run(
             [codex_bin, "--version"],
             capture_output=True,
-            text=True,
+            # `encoding=` implies text mode, and `errors="replace"` is what
+            # keeps a banner byte the locale codec cannot read from raising a
+            # UnicodeDecodeError past the `SubprocessError` guard below --
+            # losing the whole harness record over a decoration in a version
+            # string that is recorded and never asserted on.
+            encoding="utf-8",
+            errors="replace",
             timeout=30,
             check=False,
         )

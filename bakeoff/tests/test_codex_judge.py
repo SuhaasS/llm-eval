@@ -1,16 +1,25 @@
 """The codex judge backend: argv hermeticism, classification, usage, cleanup.
 
-Every test here drives `_run_codex` through a fake. That function is the ONE
-place this module starts a process, so faking it is what keeps the suite
-offline, unpaid and fast while still exercising the real classification, the
-real retry policy and the real accounting -- the three things a wrong verdict
-would come from.
+Every test of a VERDICT drives `_run_codex` through a fake. That function is
+the ONE place this module starts a process, so faking it is what keeps the
+suite offline, unpaid and fast while still exercising the real classification,
+the real retry policy and the real accounting -- the three things a wrong
+verdict would come from.
+
+The two exceptions are at the bottom, and they are exceptions because their
+subject IS the process: whether an escape from `communicate` leaves a detached
+child spending, and whether a byte the decoder cannot read discards a paid
+exit-0 verdict. Both are properties a fake defines away. They spawn a scripted
+`/bin/sh`, so they stay offline and unpaid like the rest.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import signal
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -834,3 +843,78 @@ def test_a_stop_request_ends_the_rate_limit_ladder_instead_of_waiting_it_out(
 
     # One backoff, then the stop is honoured instead of the remaining four.
     assert len(waits) == 1
+
+
+def test_any_escape_from_communicate_kills_the_process_group(
+    tmp_path: Path,
+):
+    """Only TimeoutExpired had a kill path. A KeyboardInterrupt (or any
+    other exception) out of `communicate` must not leave the detached child
+    running -- `start_new_session=True` means the terminal's Ctrl-C never
+    reached it, so the driver is the only thing that can stop the spend.
+    """
+    import subprocess as _subprocess
+
+    marker = tmp_path / "child-alive"
+    binary = tmp_path / "codex"
+    # A child that records its pid, ignores stdin, and lingers.
+    binary.write_text(
+        "#!/bin/sh\n"
+        f"echo $$ > {marker}\n"
+        "sleep 300\n"
+    )
+    binary.chmod(0o755)
+
+    real_communicate = _subprocess.Popen.communicate
+
+    def interrupted(self, *args, **kwargs):
+        # Let the child start and write its pid, then interrupt.
+        deadline = time.monotonic() + 5.0
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        raise KeyboardInterrupt
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(_subprocess.Popen, "communicate", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            codex_judge._run_codex(
+                [str(binary)], "prompt", dict(os.environ), 60.0,
+                tmp_path / "out.txt",
+            )
+
+    child_pid = int(marker.read_text().strip())
+    # SIGKILL is asynchronous; give it a moment, then the pid must be gone.
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        os.kill(child_pid, signal.SIGKILL)
+        pytest.fail("the child survived the escape from communicate")
+
+
+def test_undecodable_output_never_discards_a_paid_verdict(tmp_path: Path):
+    """`text=True` with no errors= decoded strictly, so one bad byte in the
+    diagnostic stream turned an exit-0 run with a written verdict into a
+    per-unit error -- the most expensive way this module can be wrong.
+    """
+    binary = tmp_path / "codex"
+    out_file = tmp_path / "out.txt"
+    binary.write_text(
+        "#!/bin/sh\n"
+        "printf '\\377\\376 not utf-8\\n'\n"
+        f"printf 'the verdict' > {out_file}\n"
+        "exit 0\n"
+    )
+    binary.chmod(0o755)
+
+    run = codex_judge._run_codex(
+        [str(binary)], "prompt", dict(os.environ), 60.0, out_file
+    )
+
+    assert run.exit_code == 0
+    assert run.last_message == "the verdict"
+    assert failure_message(run) is None
