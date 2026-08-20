@@ -2652,6 +2652,46 @@ def test_an_ambient_aws_named_token_is_adopted_rather_than_discarded(
     assert LITELLM_BEARER_ENV_NAME not in os.environ
 
 
+def test_an_unfilled_placeholder_is_scrubbed_rather_than_adopted_as_a_token(
+    monkeypatch, routers
+):
+    """`AWS_BEARER_TOKEN_BEDROCK=<paste-a-token-here>` is not a credential.
+
+    An operator `.env` may hold that name with an angle-bracketed value, and
+    `import litellm` runs `load_dotenv()` -- so the literal string
+    `<bedrock-api-key>` reaches `os.environ` on any machine whose `.env` still
+    carries the unedited line. `normalize_mantle_token` then relocates it onto
+    `BAKEOFF_MANTLE_TOKEN` and the judge sends it as its bearer, which the
+    endpoint answers with `Invalid bearer token` -- reported per unit, so a
+    whole pass errors out naming an authentication problem while a mintable
+    session sits right there. Measured 2026-08-19: a 23-character placeholder
+    reached the deployment as the api_key.
+
+    `scrub_placeholders` is what removes it, and the sequence is the one
+    `smoke_bedrock.main` and `proxy.proxy_environment` both run: scrub FIRST,
+    adopt second. Adopting first would relocate the placeholder onto the name
+    the scrub does not check, which is the same defect one rename along.
+    """
+    import scripts.smoke_bedrock as smoke_bedrock
+
+    monkeypatch.delenv(MANTLE_ENV_NAME, raising=False)
+    monkeypatch.setenv(LITELLM_BEARER_ENV_NAME, "<bedrock-api-key>")
+    monkeypatch.setattr(
+        smoke_bedrock, "derive_mantle_token", lambda region: FRESH_TOKEN
+    )
+
+    live_completion()("RENDERED PROMPT")
+
+    [router] = routers
+    [deployment] = router.init_kwargs["model_list"]
+    assert deployment["litellm_params"]["api_key"] == FRESH_TOKEN, (
+        "the placeholder was sent as a bearer token instead of being scrubbed"
+    )
+    assert MANTLE_ENV_NAME not in os.environ or (
+        not os.environ[MANTLE_ENV_NAME].startswith("<")
+    )
+
+
 def test_the_router_is_not_built_until_the_first_call(monkeypatch, routers):
     """A fully gate-decided batch must not mint a token or build a router.
 

@@ -1632,10 +1632,25 @@ def _judge_router(judge_model_id: str, region: str, credentials: Any,
     # file the operator just filled in.
     from litellm import Router
 
+    # An angle-bracketed value is an UNFILLED PLACEHOLDER, not a credential,
+    # and the `load_dotenv` above has just put every one of them in
+    # `os.environ`. Without this, an operator's `.env` line left at
+    # `AWS_BEARER_TOKEN_BEDROCK=<bedrock-api-key>` is adopted by the call
+    # below onto the name this router reads and sent as the bearer. Measured
+    # 2026-08-19 on a real pass: a 23-character placeholder reached the
+    # deployment as the api_key and the endpoint answered `Invalid bearer
+    # token`, which the driver reports per unit -- so the whole pass failed
+    # naming an authentication problem while a mintable session sat right
+    # there. Scrub FIRST and adopt second, the order `smoke_bedrock.main` and
+    # `proxy.proxy_environment` both run: the reverse relocates the
+    # placeholder onto `MANTLE_ENV`, which is the name the scrub no longer
+    # gets to look at.
+    credentials.scrub_placeholders()
+
     # A token the operator put under the AWS name is a WORKING credential, and
-    # the scrub below is about to remove it. Adopt it onto the name the
+    # the pop below is about to remove it. Adopt it onto the name the
     # harness reads first, so the sequence relocates a credential rather than
-    # destroying one -- `smoke_bedrock.main` runs these two in the same order.
+    # destroying one -- `smoke_bedrock.main` runs these three in the same order.
     credentials.normalize_mantle_token()
 
     router = Router(
