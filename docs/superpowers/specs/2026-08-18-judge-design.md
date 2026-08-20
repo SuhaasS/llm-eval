@@ -678,10 +678,17 @@ The invariant **N consecutive unit failures abort the batch** keeps its
 sentence and is now explicitly evaluated in **commit order**. Completion order
 is nondeterministic; commit order is the worklist's, so a batch aborts at the
 same unit on every run and the abort message's promise about a resume stays
-true. The bounded price: an abort or a Ctrl-C discards up to `concurrency − 1`
-in-flight calls unwritten — the same shape the sequential walk already accepted
-for its one in-flight unit. The summary prints immediately rather than after
-the slowest of them.
+true. The bounded price: an abort or a Ctrl-C discards up to
+`2 × concurrency − 1` paid calls unwritten — in flight *or* buffered, meaning
+already answered and waiting their turn to commit. The buffer above
+`concurrency` is what the ordered commit costs. The worker budget counts only
+**running** calls, so answers pile up behind a slow head unit instead of the
+pool idling until that unit commits; counted the other way, one 20-minute call
+at the head of the worklist idles every other worker for 20 minutes, which is
+serial execution wearing a `--concurrency` flag on exactly the latency profile
+the flag exists for. The buffer is capped at twice `concurrency` rather than
+left to grow with the worklist, so the discard stays O(concurrency). The
+summary prints immediately rather than after the slowest of them.
 
 Two consequences of *not* waiting, both handled rather than accepted. A worker
 already inside the backend's rate-limit ladder would otherwise wake after the

@@ -4458,6 +4458,9 @@ def main(argv: list[str] | None = None) -> int:
              "Calls run concurrently; lines are still COMMITTED in worklist "
              "order, so the judgments file, the resume and the "
              "consecutive-error breaker all behave exactly as they do at 1. "
+             "Committing in order costs a buffer: N calls RUN at once, but "
+             "up to 2N may be paid for and not yet committed, and an abort "
+             "or a Ctrl-C discards every one of those unwritten. "
              "The default is 1 because a seat's rate window is unmeasured "
              "until a pass has run against it -- raise it once a short pass "
              "has shown the per-call latency and whether 429s appear",

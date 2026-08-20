@@ -5670,23 +5670,85 @@ class _SlowComplete(FakeComplete):
         return reply
 
 
+class _BlockingHead(FakeComplete):
+    """A seam whose FIRST call parks until it is released.
+
+    One slow unit at the head of the worklist, held open on demand: what the
+    window does behind it -- keep submitting, or idle -- is observable for as
+    long as the test needs, without any test sleeping for a real latency.
+    """
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.release = threading.Event()
+        self.started: list[str] = []
+        self._lock = threading.Lock()
+
+    def __call__(self, prompt: str) -> str:
+        with self._lock:
+            self.started.append(prompt)
+            first = len(self.started) == 1
+        if first:
+            # Comfortably longer than any observation window below, and not a
+            # tunable: a head that frees itself on its own timeout tops the
+            # window up for the same reason a fixed one does, so equal
+            # deadlines make a stalled window look repaired. Every caller
+            # releases it in a `finally`, so this bound is only ever reached
+            # by a test that has already failed.
+            assert self.release.wait(timeout=60.0), \
+                "the walk never released the head unit"
+        return super().__call__(prompt)
+
+    @property
+    def started_count(self) -> int:
+        with self._lock:
+            return len(self.started)
+
+    def await_started(self, n: int, timeout: float = 10.0) -> int:
+        """Block until `n` calls have STARTED, and answer how many did.
+
+        Returns the count rather than asserting on it, so the caller decides
+        whether too few (a stalled window) or too many (an uncapped one) is
+        the failure -- both are failures, and they are different bugs.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and self.started_count < n:
+            time.sleep(0.02)
+        return self.started_count
+
+
+def _walk_in_a_thread(root, seam, **kw):
+    """Run one walk off the main thread, so the test can watch it work.
+
+    The walk blocks on its head unit by construction here, so it cannot be
+    the thread that also observes and releases.
+    """
+    walked: list = []
+    walker = threading.Thread(
+        target=lambda: walked.append(_run(root, complete=seam, **kw))
+    )
+    walker.start()
+    return walked, walker
+
+
+def _vote_collection(tmp_path, samples: int) -> Path:
+    """`samples` samples of two arms: two votes per sample, worklist order."""
+    records, grades = [], []
+    for sample in range(samples):
+        for suffix, model, diff in (
+            ("a", "model-one", DIFF_A), ("b", "model-two", DIFF_B),
+        ):
+            run_id = f"run-{suffix}{sample}"
+            records.append(_record(
+                run_id, model=model, sample_index=sample, final_diff=diff,
+            ))
+            grades.append(_grade(run_id, model=model))
+    return _collection(tmp_path, records, grades)
+
+
 def _four_vote_collection(tmp_path) -> Path:
     """Two samples of two arms: four votes over two comparisons."""
-    return _collection(
-        tmp_path,
-        [
-            _record("run-a0", model="model-one", sample_index=0, final_diff=DIFF_A),
-            _record("run-b0", model="model-two", sample_index=0, final_diff=DIFF_B),
-            _record("run-a1", model="model-one", sample_index=1, final_diff=DIFF_A),
-            _record("run-b1", model="model-two", sample_index=1, final_diff=DIFF_B),
-        ],
-        [
-            _grade("run-a0", model="model-one"),
-            _grade("run-b0", model="model-two"),
-            _grade("run-a1", model="model-one"),
-            _grade("run-b1", model="model-two"),
-        ],
-    )
+    return _vote_collection(tmp_path, 2)
 
 
 def test_concurrency_commits_in_worklist_order_regardless_of_completion_order(
@@ -5847,55 +5909,77 @@ def test_a_slow_head_unit_does_not_idle_the_rest_of_the_window(tmp_path):
     O(width).
     """
     root = _four_vote_collection(tmp_path)
-    head_may_finish = threading.Event()
-    started: list[str] = []
-    lock = threading.Lock()
-
-    class _BlockingHead(FakeComplete):
-        def __call__(self, prompt: str) -> str:
-            with lock:
-                started.append(prompt)
-                first = len(started) == 1
-            if first:
-                # Comfortably longer than the observation window below, and
-                # not a tunable: a head that frees itself on its own timeout
-                # tops the window up for the same reason a fixed one does,
-                # so equal deadlines make a stalled window look repaired.
-                # The `finally` releases it, so this bound is only ever
-                # reached by a test that has already failed.
-                assert head_may_finish.wait(timeout=60.0), \
-                    "the walk never released the head unit"
-            return super().__call__(prompt)
-
     seam = _BlockingHead()
-    walked: list = []
-    walker = threading.Thread(
-        target=lambda: walked.append(
-            _run(root, complete=seam, rubric=False, concurrency=2)
-        )
+    walked, walker = _walk_in_a_thread(
+        root, seam, rubric=False, concurrency=2,
     )
-    walker.start()
     try:
         # Four paid units, width 2. With the head blocked, the old window
         # stalled at 2 submissions; the fixed window keeps going to the
         # uncommitted cap (2 * width = 4).
-        deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline:
-            with lock:
-                if len(started) >= 4:
-                    break
-            time.sleep(0.02)
-        with lock:
-            assert len(started) >= 3, (
-                f"only {len(started)} calls started behind a blocked head: "
-                "the window is still counting finished futures as in flight"
-            )
+        #
+        # 4 and not 3, even though 3 already proves the window moved: the
+        # head is not always the first call into the seam, and on the
+        # interleaving where it is not, the OLD code reaches 3 by itself --
+        # committing the real head, topping up once, then stalling. A pin
+        # that its own bug can satisfy on a lucky schedule is a slow green.
+        started = seam.await_started(4)
+        assert started >= 4, (
+            f"only {started} calls started behind a blocked head: "
+            "the window is still counting finished futures as in flight"
+        )
     finally:
-        head_may_finish.set()
+        seam.release.set()
         walker.join(timeout=30.0)
     assert walked and walked[0]["errors"] == []
     # Commit order is still the worklist's, whatever order the race ran.
     assert [ln.vote_index for ln in _lines(root)] == [0, 1, 0, 1]
+
+
+def test_the_window_buys_no_more_than_twice_its_width_ahead_of_the_commit(
+    tmp_path,
+):
+    """The buffer cap is the whole reason the abort-time discard is bounded.
+
+    Without it the window keeps submitting for as long as a worker is free,
+    so one slow head unit lets it prefetch the ENTIRE worklist -- ~9,600 paid
+    calls on a full pass -- and an abort or a Ctrl-C then discards every one
+    of them unwritten. Nothing else in the suite can see that: prefetching
+    everything still commits everything in order, so a walk with no cap
+    passes every other concurrency test here and only shows up on the bill.
+
+    Eight paid units at width 2, so `2 * width` and "the worklist" are
+    different numbers -- the four-unit collection cannot tell them apart.
+    """
+    root = _vote_collection(tmp_path, 4)
+    seam = _BlockingHead()
+    walked, walker = _walk_in_a_thread(
+        root, seam, rubric=False, concurrency=2,
+    )
+    try:
+        reached = seam.await_started(4)
+        assert reached == 4, (
+            f"{reached} calls started behind a blocked head at width 2, "
+            "expected exactly 2 * width: fewer means the window stalled, "
+            "more means the buffer is uncapped"
+        )
+        # A settle window: an uncapped window empties the remaining four
+        # units in microseconds behind an instant seam, so half a second is
+        # ~1000x what the failure it guards needs to show itself.
+        time.sleep(0.5)
+        assert seam.started_count == 4, (
+            f"{seam.started_count} calls bought behind a blocked head at "
+            "width 2: the uncommitted buffer is no longer capped, and an "
+            "abort now discards more than 2 * width - 1 paid calls"
+        )
+    finally:
+        seam.release.set()
+        walker.join(timeout=30.0)
+    # The cap bounds the LOOKAHEAD, not the pass: all eight still commit,
+    # in worklist order, once the head lets go.
+    assert walked and walked[0]["errors"] == []
+    assert [ln.sample_index for ln in _lines(root)] == [0, 0, 1, 1, 2, 2, 3, 3]
+    assert [ln.vote_index for ln in _lines(root)] == [0, 1] * 4
 
 
 def test_the_reasoning_effort_reaches_the_backend_and_not_only_the_record(
