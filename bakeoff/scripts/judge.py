@@ -1787,6 +1787,12 @@ def judge_event_log(event_log_root, tasks, *,
             "and not across one."
         )
 
+    # The two selection filters, read HERE rather than at the worklist walk,
+    # because the read loop below is the first thing that can be narrowed by
+    # them. `wanted_samples` cannot narrow it -- see the boundary comment there.
+    wanted_tasks = None if only_tasks is None else set(only_tasks)
+    wanted_samples = None if sample_indices is None else set(sample_indices)
+
     # Step 4: read the runs, and drop the excluded ones BEFORE grouping.
     records: dict[str, Any] = {}
     excluded: list[str] = []
@@ -1796,6 +1802,24 @@ def judge_event_log(event_log_root, tasks, *,
             continue
         if grade.resolved is None:
             excluded.append(run_id)
+            continue
+        # THE SELECTION BOUNDARY, and the exit contract is what draws it.
+        # "Exit 0 means every selected unit produced its lines" -- so a read
+        # failure counts only for a run this pass would have judged.
+        # Unfiltered, ONE damaged record made every future pass over this
+        # collection exit 1, the passes that select another task included:
+        # they never wanted the record, no flag routes around it, and the
+        # error line they carry is about a unit nobody selected. Unselected
+        # and unreadable is not this pass's problem; SELECTED and unreadable
+        # is, and stays an error below.
+        #
+        # `task_id` is on the grade line, which is what makes this filter
+        # possible before the read. `sample_index` is NOT (`GradeRecord` has
+        # no such field -- see the error line below, which cannot name one),
+        # so `--samples` cannot narrow the read and keeps filtering at the
+        # worklist walk. A run selected by task and dropped by sample is
+        # therefore still read: that is a cost, not a wrong exit code.
+        if wanted_tasks is not None and grade.task_id not in wanted_tasks:
             continue
         try:
             records[run_id] = log.read_run(run_id)
@@ -1832,8 +1856,6 @@ def judge_event_log(event_log_root, tasks, *,
         ):
             cell[record.model] = record
 
-    wanted_tasks = None if only_tasks is None else set(only_tasks)
-    wanted_samples = None if sample_indices is None else set(sample_indices)
     if wanted_tasks is not None:
         absent = sorted(wanted_tasks - {task_id for task_id, _ in cells})
         if absent:

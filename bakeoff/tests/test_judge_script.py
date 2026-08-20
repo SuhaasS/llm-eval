@@ -2633,6 +2633,86 @@ def test_a_run_that_cannot_be_read_is_reported_by_task_and_arm_not_by_digest(
     assert len(_lines(root)) == 1
 
 
+def _two_tasks_one_corrupt(tmp_path) -> Path:
+    """Two independent tasks, and one run of `calc-1` unreadable on disk.
+
+    The shape the exit contract is argued over: the damage is in one task and
+    the pass that wants the other one has no business paying for it.
+    """
+    root = _collection(
+        tmp_path,
+        [
+            _record("run-a", task_id="calc-1", model="model-one"),
+            _record("run-b", task_id="calc-1", model="model-two",
+                    final_diff=DIFF_B),
+            _record("run-c", task_id="calc-2", model="model-one"),
+            _record("run-d", task_id="calc-2", model="model-two",
+                    final_diff=DIFF_B),
+        ],
+        [
+            _grade("run-a", task_id="calc-1", model="model-one"),
+            _grade("run-b", task_id="calc-1", model="model-two"),
+            _grade("run-c", task_id="calc-2", model="model-one"),
+            _grade("run-d", task_id="calc-2", model="model-two"),
+        ],
+    )
+    (root / "runs" / "run-b.json").write_text("{not json at all",
+                                              encoding="utf-8")
+    return root
+
+
+def test_a_corrupt_run_in_a_task_this_pass_never_selected_is_not_its_problem(
+    tmp_path,
+):
+    """`--only-task` narrows what is judged, so it must narrow what is READ.
+
+    The contract this file states is "exit 0 means every selected unit
+    produced its lines". A read loop that walks the whole collection before
+    the filter turns ONE damaged record into a permanent exit 1 for every
+    future pass over that event log -- including the passes that select
+    another task entirely, which never wanted the record and cannot be helped
+    by it. There is no flag to route around it, so the collection is stuck
+    reporting a failure about a unit nobody selected.
+
+    It is also the eager read this filter removes: an `--only-task` pass over
+    a 60-task collection used to read all 60 tasks' records to judge one.
+    """
+    root = _two_tasks_one_corrupt(tmp_path)
+    fake = FakeComplete()
+
+    result = _run(root, [_task("calc-1"), _task("calc-2")], complete=fake,
+                  rubric=False, only_tasks=["calc-2"])
+
+    assert result["errors"] == []
+    assert {j.task_id for j in _lines(root)} == {"calc-2"}
+    assert fake.calls == 2
+
+
+def test_a_corrupt_run_in_the_task_this_pass_did_select_is_still_an_error(
+    tmp_path,
+):
+    """The other half, and the half that keeps "selected" honest.
+
+    A filter that swallowed the read failure of a run the pass WOULD have
+    judged would buy exit 0 by hiding a hole in the reading -- the same trade
+    the whole file is arranged against. `test_a_run_that_cannot_be_read_is_
+    reported_by_task_and_arm_not_by_digest` above pins the no-filter pass;
+    this pins that a filter selecting the damaged task changes nothing.
+    """
+    root = _two_tasks_one_corrupt(tmp_path)
+    fake = FakeComplete()
+
+    result = _run(root, [_task("calc-1"), _task("calc-2")], complete=fake,
+                  rubric=False, only_tasks=["calc-1"])
+
+    (line,) = result["errors"]
+    assert "run run-b" in line
+    assert "task=calc-1" in line
+    assert "could not be read from the event log" in line
+    # One arm left in calc-1's cell, so there is no pair to vote on at all.
+    assert fake.calls == 0
+
+
 # --------------------------------------------------------------------------
 # 6c. what a forty-hour pass looks like from the terminal
 # --------------------------------------------------------------------------
