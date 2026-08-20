@@ -116,6 +116,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -759,6 +760,14 @@ def prompt_sha(rendered: str) -> str:
     evidence that the declared `judge_prompt_version` was honest, and a prompt
     edited without a version bump shows up as a sha nothing else in the file
     shares.
+
+    ON THE CODEX BACKEND THIS ATTESTS THE USER TURN ONLY. `codex exec` wraps
+    the rendered text in its own agent system prompt and tool schemas --
+    measured at ~14.6k input tokens for a nine-word prompt on
+    `codex-cli 0.145.0-alpha.18` -- and none of that passes through here, so
+    the sha proves what the harness sent and not the whole of what the model
+    read. `judge_harness.codex_cli_version` is the compensating identity: it
+    is the only thing a later reader can use to ask what that wrapper was.
     """
     return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
 
@@ -1337,6 +1346,20 @@ _USAGE_FIELDS: tuple[str, ...] = (
 )
 
 
+#: Serialises every mutation of a `usage_totals` dict, across BOTH judge
+#: backends. Module-level and shared rather than one lock per backend: the
+#: dict is the caller's, one pass uses one of it, and two locks guarding one
+#: object is the same as no lock at all.
+#:
+#: It exists because `--concurrency` puts completion calls on worker threads
+#: and `usage_totals[field] += value` is a read, an add and a store -- three
+#: bytecodes the interpreter may switch between. An unlocked accumulator
+#: therefore under-reports spend, and it does so ONLY on the passes big enough
+#: to be run concurrently, which is the half of the space where the number
+#: matters most and where a lost increment is least likely to be noticed.
+USAGE_LOCK = threading.Lock()
+
+
 def new_usage_totals() -> dict[str, int]:
     """A fresh accumulator for `live_completion`, with every key at zero.
 
@@ -1397,6 +1420,11 @@ def _add_usage(usage_totals: dict[str, int] | None, response: Any) -> None:
         return
     usage = getattr(response, "usage", None)
     complete = True
+    # The response is read OUTSIDE the lock and only the accumulation is
+    # inside it: the lock protects a dict shared between worker threads, not
+    # a response object this call owns, and holding it across attribute
+    # lookups would serialise every concurrent call on the slowest one.
+    readings: list[tuple[str, int]] = []
     for field in _USAGE_FIELDS:
         value = (
             usage.get(field) if isinstance(usage, dict)
@@ -1405,9 +1433,12 @@ def _add_usage(usage_totals: dict[str, int] | None, response: Any) -> None:
         if isinstance(value, bool) or not isinstance(value, int):
             complete = False
             continue
-        usage_totals[field] += value
-    if not complete:
-        usage_totals["calls_without_usage"] += 1
+        readings.append((field, value))
+    with USAGE_LOCK:
+        for field, value in readings:
+            usage_totals[field] += value
+        if not complete:
+            usage_totals["calls_without_usage"] += 1
 
 
 def _completion(router: Any, judge_model_id: str, prompt: str,
@@ -1434,7 +1465,8 @@ def _completion(router: Any, judge_model_id: str, prompt: str,
     that raised would discard usage for a call that was already paid for.
     """
     if usage_totals is not None:
-        usage_totals["calls"] += 1
+        with USAGE_LOCK:
+            usage_totals["calls"] += 1
     response = router.completion(
         model=judge_model_id,
         messages=[{"role": "user", "content": prompt}],
@@ -1565,7 +1597,8 @@ def live_completion(
             # auth failure with nothing to mint re-raises above and is a
             # credential problem the operator has to fix, not a refresh.
             if usage_totals is not None:
-                usage_totals["auth_refreshes"] += 1
+                with USAGE_LOCK:
+                    usage_totals["auth_refreshes"] += 1
             built["router"] = _judge_router(
                 judge_model_id, region, smoke_bedrock, token=fresh
             )
