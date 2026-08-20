@@ -1207,6 +1207,58 @@ def test_braces_in_the_prose_around_the_object_do_not_move_its_boundaries():
     assert parse_pairwise_response(prefaced) == "first"
 
 
+def test_braced_prose_before_the_verdict_does_not_burn_the_unit():
+    """A balanced-but-not-JSON group ahead of the answer is not a malformed
+    reply, and stopping at it costs the whole unit rather than one call.
+
+    The scan takes the FIRST balanced group, and a model that writes
+    `{A, B, TIE}` or quotes `if (n) { retry(n); }` before its verdict hands it
+    a group that balances and does not parse. The verdict is right there,
+    complete, in the same reply -- and the protocol runs at temperature 0, so
+    every retry re-draws the identical text and fails identically. That is the
+    expensive shape: not one wasted call but the unit's entire paid budget,
+    spent re-reading an answer that was correct the first time.
+
+    The resume point is one character PAST the failed group's opening brace,
+    not past its end, which is the nesting case: prose that wraps the verdict
+    -- `{my working: {...verdict...}}` -- has the good object INSIDE the group
+    that failed, and a scan resuming after the group's close would step over
+    it.
+    """
+    preamble = "First I ruled out {A, B, TIE} as a set of equals.\n"
+    parsed = parse_rubric_response(preamble + _rubric_json())
+    assert parsed.dimension_scores == GOOD_SCORES
+    assert parse_pairwise_response(preamble + _pairwise_json("B")) == "second"
+
+    quoted_code = "It reuses `if (n) { retry(n); }` verbatim.\n\n"
+    assert parse_pairwise_response(quoted_code + _pairwise_json("A")) == "first"
+
+    nested = "{working notes: " + _pairwise_json("TIE") + "}"
+    assert parse_pairwise_response(nested) == "tie"
+
+
+def test_a_reply_whose_brace_groups_are_all_non_json_is_still_malformed():
+    """Scanning on is not falling back to a guess: with nothing in the reply
+    that parses, the verdict is still refused.
+
+    And the two absences keep their own messages, because they are answered
+    differently -- a reply carrying no object at all is a model that declined
+    or truncated, while a reply full of unparsable groups is a model that
+    answered in prose. The first failure is the one reported, because it is
+    the group the model meant as its answer.
+    """
+    for text in ("{not json}", "{not json} then {also, not json}"):
+        for parse in (parse_rubric_response, parse_pairwise_response):
+            with pytest.raises(MalformedVerdict) as exc:
+                parse(text)
+            assert "does not parse" in str(exc.value), text
+
+    for empty in ("", "I decline to answer.", "{"):
+        with pytest.raises(MalformedVerdict) as exc:
+            parse_rubric_response(empty)
+        assert "carries no complete JSON object" in str(exc.value), empty
+
+
 def test_missing_or_unknown_dimension_names_are_malformed():
     missing = {k: v for k, v in GOOD_SCORES.items() if k != "scope_discipline"}
     with pytest.raises(MalformedVerdict):
@@ -2198,12 +2250,13 @@ def test_the_pinned_judge_identity_constants():
 
 #: Ids where the VENDOR NAMESPACE is the only signal: no compared-family token
 #: appears anywhere in the name, so a guard matching tokens alone lets every one
-#: of these through. `anthropic.opus-6` is the realistic shape -- a vendor ships
-#: a model whose name never says "claude" -- and it is still a judge from the
-#: family the eval is measuring. Keyed by the constant each one is caught by, so
-#: the test can assert the table covers `NON_NEUTRAL_VENDOR_PREFIXES` whole.
+#: of these through. `anthropic.atlas-1` is the realistic shape -- a vendor
+#: ships a model under a name no token tuple has heard of yet -- and it is still
+#: a judge from the family the eval is measuring. Keyed by the constant each one
+#: is caught by, so the test can assert the table covers
+#: `NON_NEUTRAL_VENDOR_PREFIXES` whole.
 PREFIX_ONLY_JUDGES = {
-    "anthropic.": "anthropic.opus-6",
+    "anthropic.": "anthropic.atlas-1",
     "google.": "google.palm-2-unicorn",
     "nvidia.": "nvidia.mistral-nemo-12b",
     "moonshot.": "moonshot.moonshot-v1-128k",
@@ -2220,6 +2273,13 @@ TOKEN_ONLY_JUDGES = {
     "gemini": "vertex.gemini-3-pro",
     "nemotron": "together.nemotron-4-340b",
     "kimi": "groq.kimi-k2-instruct",
+    # Anthropic ships PRODUCT names, and a re-host serves them without the
+    # vendor namespace and without the word "claude" anywhere in the id. A
+    # token tuple that knows only the umbrella name reads `some-host.sonnet-5`
+    # as neutral, which is the compared family the reference arm is drawn from.
+    "sonnet": "some-host.sonnet-5",
+    "opus": "reseller.opus-6",
+    "haiku": "openrouter.haiku-4.5",
 }
 
 
@@ -2229,9 +2289,9 @@ def test_a_judge_from_a_compared_family_is_refused_with_the_spec_section_named(
     """All four compared families, in both the shapes they arrive in.
 
     Two match rules rather than one, and each table above is what makes the
-    other one load-bearing. `anthropic.opus-6` carries no family token, so
-    dropping the prefix rule admits a judge from the family Sonnet 5 belongs
-    to; `bedrock.claude-sonnet-5` carries no compared vendor prefix, so
+    other one load-bearing. `anthropic.atlas-1` carries no family token, so
+    dropping the vendor rule admits a judge from the family Sonnet 5 belongs
+    to; `bedrock.claude-sonnet-5` carries no compared vendor namespace, so
     dropping the token rule admits Claude itself under a re-host. A guard with
     either half missing passes a table full of biased numbers, and every one of
     them looks exactly like a clean one.
@@ -2274,6 +2334,71 @@ def test_a_judge_from_a_compared_family_is_refused_with_the_spec_section_named(
     assert assert_neutral_judge(JUDGE_MODEL_ID_DEFAULT) is None
     assert assert_neutral_judge("openai.gpt-5.6-sol") is None
     assert assert_neutral_judge("qwen.qwen3-235b-a22b-2507") is None
+
+
+#: The id shapes BEDROCK ITSELF USES, and the ones an anchored guard walks
+#: straight past. A region-qualified id (`us.anthropic.opus-6`) and a
+#: route-qualified one (`bedrock/anthropic.opus-6`, which is how every
+#: deployment in `litellm_config.yaml` is spelled) put characters in FRONT of
+#: the vendor namespace, so `startswith` sees `us.` and `bedrock/` and reports
+#: neutral. And Anthropic's own product names carry no "claude", so a re-host
+#: serving `sonnet-5` or `haiku-4.5` under somebody else's namespace has
+#: neither signal an anchored-prefix, umbrella-token guard looks for.
+EVADING_JUDGES = (
+    "us.anthropic.opus-6",
+    "bedrock/anthropic.opus-6",
+    "some-host.sonnet-5",
+    "openrouter.haiku-4.5",
+)
+
+#: Neutral ids that must survive the widening. The guard errs toward refusal on
+#: purpose, but a rule that refused the pinned default or §4.3's named drop-in
+#: is a rule no pass can run behind, and the escape hatch is not an answer to a
+#: guard that refuses everything.
+NEUTRAL_JUDGES = (
+    JUDGE_MODEL_ID_DEFAULT,
+    "openai.gpt-5.6-sol",
+    "deepseek.v3.2",
+    "qwen.qwen3-235b-a22b-2507",
+)
+
+
+def test_a_region_or_route_qualified_id_and_a_product_name_are_both_refused(
+    monkeypatch,
+):
+    """The two evasions an ANCHORED guard has: a prefix in front, a name it
+    does not know.
+
+    Both are the ordinary spelling rather than an adversarial one. Bedrock
+    publishes cross-region inference profiles as `us.anthropic.opus-6` and
+    this harness addresses every deployment as `bedrock/<model>`, so an
+    operator who copies a working model id out of `litellm_config.yaml` into
+    `--judge-model` types exactly the string `startswith` cannot see. And
+    "claude" is the umbrella, not the model name: the products are Sonnet,
+    Opus and Haiku, and a re-host advertises them that way.
+
+    Either miss admits a judge from the family the REFERENCE ARM is drawn
+    from, which is the worst arm to inflate -- the eval's whole question is
+    whether a candidate beats buying Sonnet. And it is admitted silently:
+    §4.3's bias is not a source of variance, so no interval widens and no
+    downstream check fires.
+
+    The guard is deliberately over-wide in this direction. A neutral model
+    whose id happens to carry one of these substrings is refused too, and
+    `BAKEOFF_ALLOW_NON_NEUTRAL_JUDGE=1` is the answer to that -- a false
+    positive costs a variable and a loud warning, a false negative costs a
+    published table nothing downstream can tell from a clean one.
+    """
+    monkeypatch.delenv(ALLOW_NON_NEUTRAL_JUDGE_ENV, raising=False)
+
+    for model_id in EVADING_JUDGES:
+        with pytest.raises(NonNeutralJudge) as exc:
+            assert_neutral_judge(model_id)
+        assert f"{model_id!r}" in str(exc.value)
+        assert "§4.3" in str(exc.value)
+
+    for model_id in NEUTRAL_JUDGES:
+        assert assert_neutral_judge(model_id) is None, model_id
 
 
 def test_the_env_override_admits_a_non_neutral_judge_with_a_loud_warning_and_nothing_else_does(  # noqa: E501

@@ -118,7 +118,7 @@ import json
 import os
 import threading
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
@@ -212,14 +212,20 @@ _Parsed = TypeVar("_Parsed")
 # --- the neutral-family guard ------------------------------------------------
 
 #: The four compared families as they appear in a Bedrock model id's VENDOR
-#: namespace, dot included. Prefix-matched, so `anthropic.` catches
-#: `anthropic.opus-6` -- a model from a compared family whose name never says
-#: "claude", which is exactly what a token-only guard cannot see.
+#: namespace, dot included. Each entry is the prefix of the MODEL NAME, and it
+#: is matched ANYWHERE in the id, because what sits in front of a vendor
+#: namespace is a routing detail rather than a different model: Bedrock
+#: publishes cross-region inference profiles as `us.anthropic.opus-6`, and
+#: every deployment in `litellm_config.yaml` is addressed as
+#: `bedrock/anthropic.opus-6`. Anchored with `startswith`, both of those read
+#: as neutral -- and they are the two shapes an operator is most likely to
+#: paste into `--judge-model`, because they are the shapes that work everywhere
+#: else in this harness.
 #:
-#: The dot is part of each entry rather than added at match time: `google.` must
-#: not match a hypothetical `googlebrain-x`, and a bare `nvidia` would match any
-#: id with the word in it anywhere. Anchoring the vendor and anchoring the
-#: family are two different jobs, which is why there are two tuples.
+#: The dot is what keeps the substring test narrow: `google.` must not match a
+#: hypothetical `googlebrain-x`, and a bare `nvidia` would match any id with the
+#: word in it anywhere. Naming the vendor and naming the family are two
+#: different jobs, which is why there are two tuples.
 NON_NEUTRAL_VENDOR_PREFIXES: tuple[str, ...] = (
     "anthropic.",
     "google.",
@@ -246,8 +252,19 @@ NON_NEUTRAL_VENDOR_PREFIXES: tuple[str, ...] = (
 #: false negative publishes a biased table nothing downstream can detect and
 #: tells nobody -- but "answered by the message" is not what the escape does,
 #: and pretending otherwise is how the width stops being reviewed.
+#:
+#: The three Anthropic entries are PRODUCT names, and they are here because
+#: "claude" is the umbrella rather than the model name: the reference arm is
+#: `claude-sonnet-5`, but a re-host is free to serve the same weights as
+#: `some-host.sonnet-5` or `openrouter.haiku-4.5`, with no vendor namespace and
+#: no "claude" anywhere. That id is the compared family the eval's whole
+#: question is asked against -- whether a candidate beats buying Sonnet -- so it
+#: is the worst one to let through.
 NON_NEUTRAL_FAMILY_TOKENS: tuple[str, ...] = (
     "claude",
+    "sonnet",
+    "opus",
+    "haiku",
     "gemma",
     "gemini",
     "nemotron",
@@ -295,12 +312,29 @@ def assert_neutral_judge(judge_model_id: str) -> str | None:
     refusal happens at the identity, before the first call, and the driver
     calls this before it reads the collection.
 
-    TWO MATCH RULES, and each covers what the other cannot. The vendor prefix
-    catches `anthropic.opus-6` -- a compared family under a model name that
-    never says "claude". The family token catches `bedrock.claude-sonnet-5` --
-    Claude itself under a neutral vendor namespace, which is what a re-host
-    looks like. A guard with either half missing admits a biased judge, and the
-    table it produces is indistinguishable from a clean one.
+    TWO MATCH RULES, and each covers what the other cannot. The vendor
+    namespace catches `anthropic.atlas-1` -- a compared family under a model
+    name no token tuple has heard of. The family token catches
+    `bedrock.claude-sonnet-5` -- Claude itself under a neutral vendor
+    namespace, which is what a re-host looks like. A guard with either half
+    missing admits a biased judge, and the table it produces is
+    indistinguishable from a clean one.
+
+    NEITHER RULE IS ANCHORED, and both used to be, each in its own way. The
+    vendor rule was `startswith`, so `us.anthropic.opus-6` (Bedrock's own
+    cross-region inference profile) and `bedrock/anthropic.opus-6` (how every
+    deployment in `litellm_config.yaml` is spelled) walked past it -- the two
+    ids an operator is likeliest to paste in, because they are the ones that
+    work everywhere else here. The family rule was anchored at the umbrella
+    name: "claude" without "sonnet", "opus" or "haiku", so a re-host serving
+    `some-host.sonnet-5` was read as neutral. Both misses admit a judge from
+    the family the REFERENCE ARM is drawn from.
+
+    So the guard is deliberately over-wide: a neutral model whose id happens to
+    carry one of these substrings is refused too. That direction is the cheap
+    one -- a false positive costs a variable and a loud warning, a false
+    negative costs a published table nothing downstream can tell from a clean
+    one -- and `BAKEOFF_ALLOW_NON_NEUTRAL_JUDGE` is what it is for.
 
     Lowercased before either rule runs: `--judge-model` is typed by hand.
 
@@ -316,11 +350,7 @@ def assert_neutral_judge(judge_model_id: str) -> str | None:
     lowered = judge_model_id.lower()
 
     matched: str | None = next(
-        (
-            prefix
-            for prefix in NON_NEUTRAL_VENDOR_PREFIXES
-            if lowered.startswith(prefix)
-        ),
+        (prefix for prefix in NON_NEUTRAL_VENDOR_PREFIXES if prefix in lowered),
         None,
     )
     if matched is None:
@@ -1008,24 +1038,49 @@ def _pairwise_verdict_and_reasoning(text: str) -> tuple[str, str]:
 
 
 def _json_object(text: str) -> dict[str, Any]:
-    """The first balanced `{...}` in the reply, parsed.
+    """The first balanced `{...}` in the reply THAT PARSES.
 
     Code fences need no special handling: the scan starts at the first `{`,
     so ```` ```json ```` above it and prose below it fall outside the slice
     either way. Stripping fences first would be a second rule doing the first
     rule's job, with its own way to be wrong.
+
+    Braced prose ahead of the verdict is what the retry does: a model that
+    writes `{A, B, TIE}` or quotes `if (n) { retry(n); }` before its answer
+    hands the scan a group that balances and does not parse, while the verdict
+    sits complete in the same reply. Stopping there does not cost a call, it
+    costs THE UNIT -- the protocol runs at temperature 0, so every retry
+    re-draws the identical text and fails identically, and the whole paid
+    budget goes on re-reading an answer that was right the first time.
+
+    The first decode error is the one reported, because the group the model
+    meant as its answer is the one an operator has to look at. Scanning on is
+    not a fallback to a guess: with nothing in the reply that parses, the
+    verdict is still refused, and the two absences keep separate messages
+    because they are answered differently -- no object at all is a model that
+    declined or truncated, unparsable groups is a model that answered in prose.
     """
-    raw = _first_balanced_object(text)
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError as exc:
+    first_error: json.JSONDecodeError | None = None
+
+    for raw in _balanced_objects(text):
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            if first_error is None:
+                first_error = exc
+
+    if first_error is None:
         raise MalformedVerdict(
-            f"the reply's first JSON object does not parse: {exc}"
-        ) from exc
+            f"the reply carries no complete JSON object: {text[:200]!r}"
+        )
+    raise MalformedVerdict(
+        f"the reply's first JSON object does not parse: {first_error}"
+    ) from first_error
 
 
-def _first_balanced_object(text: str) -> str:
-    """Brace-balanced and string-aware, not `find('{')` to `rfind('}')`.
+def _balanced_objects(text: str) -> Iterator[str]:
+    """Every balanced `{...}` in the reply, brace-balanced and string-aware,
+    not `find('{')` to `rfind('}')`.
 
     Reasoning about a diff quotes code, and code holds braces. A naive
     extractor truncates the object at the first `}` inside the prose, reports
@@ -1035,13 +1090,38 @@ def _first_balanced_object(text: str) -> str:
     String tracking starts only after the opening brace, so an unbalanced
     quote in the prose above the object -- `my "verdict:` -- cannot swallow
     the brace that opens it.
+
+    RESUMES ONE PAST THE OPENING BRACE, never past the group's close, which is
+    the nesting case: prose that wraps the verdict -- `{working notes: {...}}`
+    -- has the good object INSIDE the group that failed, and a scan resuming
+    after the close steps over the only answer in the reply. The cost is
+    re-scanning the interior of a group the caller already rejected: linear on
+    any reply a model has produced here, quadratic in the worst case of one
+    that is nothing but nested braces. Uncapped anyway, because a cap on the
+    number of groups tried buys that bound by silently refusing a valid verdict
+    that sits past the cap -- the exact failure this function exists to end.
+    """
+    offset = 0
+    while (found := _balanced_object_at(text, offset)) is not None:
+        start, raw = found
+        yield raw
+        offset = start + 1
+
+
+def _balanced_object_at(text: str, offset: int) -> tuple[int, str] | None:
+    """The first balanced `{...}` at or after `offset`, with where it started.
+
+    `None` rather than a raise: "no object here" is an ordinary end of scan for
+    `_balanced_objects`, and only `_json_object` knows whether that means the
+    reply carried nothing or that everything it carried failed to parse.
     """
     depth = 0
     start = -1
     in_string = False
     escaped = False
 
-    for index, char in enumerate(text):
+    for index in range(offset, len(text)):
+        char = text[index]
         if depth == 0:
             if char == "{":
                 start, depth = index, 1
@@ -1060,11 +1140,9 @@ def _first_balanced_object(text: str) -> str:
         elif char == "}":
             depth -= 1
             if depth == 0:
-                return text[start : index + 1]
+                return start, text[start : index + 1]
 
-    raise MalformedVerdict(
-        f"the reply carries no complete JSON object: {text[:200]!r}"
-    )
+    return None
 
 
 def _closed_block(

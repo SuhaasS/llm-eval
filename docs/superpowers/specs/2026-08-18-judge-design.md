@@ -495,13 +495,25 @@ an arm the judge never voted on: a refusal, not a value.
 A neutral judge family is checked in code, at the driver, before the collection
 is read and ahead of the resume — so a re-judge cannot inherit a compared-family
 judge from the first pass. Two match rules, because each covers what the other
-cannot: a vendor-namespace prefix (`anthropic.`, `google.`, `nvidia.`,
-`moonshot.`) catches `anthropic.opus-6`, a compared family under a model name
-that never says "claude"; a family token (`claude`, `gemma`, `gemini`,
-`nemotron`, `kimi`) catches `bedrock.claude-sonnet-5`, Claude itself under a
-neutral vendor namespace, which is what a re-host looks like. A guard missing
-either half admits a biased judge whose table is indistinguishable from a clean
-one.
+cannot: a vendor namespace (`anthropic.`, `google.`, `nvidia.`, `moonshot.`)
+catches `anthropic.atlas-1`, a compared family under a model name no token
+tuple has heard of; a family token (`claude`, `sonnet`, `opus`, `haiku`,
+`gemma`, `gemini`, `nemotron`, `kimi`) catches `bedrock.claude-sonnet-5`,
+Claude itself under a neutral vendor namespace, which is what a re-host looks
+like. A guard missing either half admits a biased judge whose table is
+indistinguishable from a clean one.
+
+**Neither rule is anchored, and both used to be.** The vendor rule matches the
+namespace *anywhere* in the id, because what sits in front of it is a routing
+detail rather than a different model: under `startswith`, Bedrock's own
+cross-region profile (`us.anthropic.opus-6`) and this harness's own deployment
+spelling (`bedrock/anthropic.opus-6`) both read as neutral, and those are the
+two ids an operator is likeliest to paste in. The family rule carries
+Anthropic's *product* names beside the umbrella one, because a re-host is free
+to serve `some-host.sonnet-5` with no vendor namespace and no "claude" in it —
+the compared family the eval's whole question is asked against. The guard is
+therefore deliberately over-wide: a neutral model whose id happens to carry one
+of these substrings is refused too, which is what the escape below is for.
 
 The escape is an environment variable, `BAKEOFF_ALLOW_NON_NEUTRAL_JUDGE=1`, and
 not a flag — a flag beside the ordinary options is how a mandatory rule becomes
