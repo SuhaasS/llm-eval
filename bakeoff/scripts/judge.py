@@ -1582,6 +1582,12 @@ def judge_event_log(event_log_root, tasks, *,
     would be a report rather than a decision an operator can still act on, and
     a walk that decided as it went could not produce one at all.
 
+    ONE refusal is taken between the two phases and files an error for units
+    it never selects: a task whose gating grades name a manifest other than the
+    one loaded here (`_digest_check`). Its units are not "selected and
+    unjudged" -- they are units this pass refuses to select at all -- and the
+    error line is what keeps that refusal from reading as a smaller collection.
+
     `_judgeable_inputs` deliberately stays in PHASE 2, even though it is
     selection-shaped. Building payload inputs walks two diffs per run
     (`similarity_context`), it is exactly the work a skip-heavy resume must not
@@ -1855,6 +1861,32 @@ def judge_event_log(event_log_root, tasks, *,
             prior.attempt_number, prior.run_id
         ):
             cell[record.model] = record
+
+    # Step 5b: is every gating grade anchored on the manifest this pass loaded?
+    # ONE VERDICT PER TASK, taken here rather than inside the worklist walk,
+    # because the refusal covers every unit of the task and a task spreads over
+    # as many cells as it has samples -- a check made per cell would refuse the
+    # cells it had reached and judge the rest. See `_digest_check`.
+    refused: dict[str, str] = {}
+    for task_id in sorted({task_id for task_id, _ in cells}):
+        task = by_task.get(task_id)
+        if task is None:
+            # Absent from the task set: warned once by the walk below, and
+            # there is no manifest here to compare a digest against.
+            continue
+        graded_runs = sorted(
+            record.run_id
+            for (cell_task, _), cell in cells.items() if cell_task == task_id
+            for record in cell.values()
+        )
+        refusal, unknown = _digest_check(
+            task, [(run_id, gating[run_id]) for run_id in graded_runs]
+        )
+        if unknown is not None:
+            warnings.append(unknown)
+        if refusal is not None:
+            errors.append(refusal)
+            refused[task_id] = refusal
 
     if wanted_tasks is not None:
         absent = sorted(wanted_tasks - {task_id for task_id, _ in cells})
@@ -2146,6 +2178,12 @@ def judge_event_log(event_log_root, tasks, *,
         task = by_task.get(task_id)
         if task is None:
             missing_tasks.add(task_id)
+            continue
+        if task_id in refused:
+            # The manifest this pass loaded is not the one the gate gated. The
+            # refusal is already in `errors` -- one line for the task rather
+            # than one per unit, since every unit of it fails for one reason
+            # and the fix is the same for all of them.
             continue
 
         cell = cells[(task_id, sample_index)]
@@ -2711,6 +2749,93 @@ def _inputs_for(cache: dict[str, PayloadInputs], record, grade: GradeRecord,
     if record.run_id not in cache:
         cache[record.run_id] = payload_inputs_from(record, grade, task)
     return cache[record.run_id]
+
+
+def _digest_check(task, graded: Sequence[tuple[str, GradeRecord]],
+                  ) -> tuple[str | None, str | None]:
+    """Was every gating grade for this task taken against the manifest THIS
+    pass loaded? Returns `(refusal, unknown)`, either or both `None`.
+
+    The gate and the payload have to be anchored on one manifest. The gate
+    decided which pairs are judgeable at all, against whatever `task.yaml` and
+    `reference.diff` held at grading time; the payload anchors every verdict on
+    the prompt and the solution diff this pass just loaded. Edit the task
+    between the two and the judge scores submissions against a reference the
+    gate never gated -- silently, with the right shape, and with no
+    `task_version` bump needed, which is exactly why `GradeRecord` stores the
+    digest beside the version rather than trusting the version to follow it.
+
+    A MISMATCH REFUSES THE WHOLE TASK, into the errors bucket. It is a hole in
+    the reading rather than a verdict, and holes are what that bucket counts;
+    the alternative is a block of comparisons that resolve, print and rank
+    while naming two manifests. Per task and not per collection: the mismatch
+    is a property of one manifest, and every other task in the collection is
+    still coherent. The message names BOTH digests, because nothing in the
+    numbers says which side moved, and BOTH remedies, because either end can
+    be brought back to the other.
+
+    AN ABSENT DIGEST IS UNKNOWN, NOT A MISMATCH. `graded_against_manifest_digest`
+    defaults to `""`, so a grade written before the field existed carries none,
+    and a task stand-in can carry none either -- refusing on that would refuse
+    a collection over a fact nobody recorded, while judging on it silently
+    would claim a check that never ran. It warns and proceeds, and the two
+    absences are worded apart: which SIDE could not answer is the whole content
+    of the warning, and one phrase over both would send an operator to the
+    wrong file.
+    """
+    expected = getattr(task, "manifest_digest", "") or ""
+    mismatched: dict[str, list[str]] = {}
+    unchecked: list[str] = []
+    for run_id, grade in graded:
+        seen = getattr(grade, "graded_against_manifest_digest", "") or ""
+        if not seen:
+            unchecked.append(run_id)
+        elif expected and seen != expected:
+            mismatched.setdefault(seen, []).append(run_id)
+
+    refusal = None
+    if mismatched:
+        named = "; ".join(
+            f"{digest} ({_named(sorted(runs))})"
+            for digest, runs in sorted(mismatched.items())
+        )
+        count = sum(len(runs) for runs in mismatched.values())
+        refusal = (
+            f"task {task.task_id}: {count} grade line(s) were taken against "
+            f"manifest digest {named}, but the task set loaded here carries "
+            f"{expected}. Every unit of this task is refused rather than "
+            "judged: the deterministic gate decided which pairs are judgeable "
+            "against one manifest and the payload would anchor every verdict "
+            "on another, so the verdicts would be taken against a reference "
+            "the gate never gated. An edit to task.yaml or reference.diff "
+            "moves the digest with no task_version bump, which is the usual "
+            "cause. Two remedies: re-grade this task under the current task "
+            "set (scripts/grade.py), or check out the task set state the "
+            "grades were taken against -- graded_against_task_set_commit on "
+            "the same grade lines -- and judge there."
+        )
+
+    unknown = None
+    if unchecked and not expected:
+        # THE OTHER SIDE could not answer: nothing to compare against.
+        unknown = (
+            f"task {task.task_id}: the loaded task carries no "
+            f"manifest_digest, so the {len(unchecked)} grade line(s) gating "
+            "it could not be checked against it. Judged anyway -- an absent "
+            "digest is unknown, not a mismatch -- but nothing here proves the "
+            "payloads are anchored on the manifest the gate gated."
+        )
+    elif unchecked:
+        unknown = (
+            f"task {task.task_id}: {len(unchecked)} grade line(s) name no "
+            f"manifest digest ({_named(sorted(unchecked))}) and could not be "
+            f"checked against the loaded task's {expected}. Judged anyway -- "
+            "an absent digest is unknown, not a mismatch, and a grade written "
+            "before the field existed carries none -- but nothing here proves "
+            "the payloads are anchored on the manifest the gate gated. "
+            "Re-grading under the current grader records it."
+        )
+    return refusal, unknown
 
 
 def _named(values: list[str]) -> str:

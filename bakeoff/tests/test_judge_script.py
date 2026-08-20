@@ -175,10 +175,18 @@ index 1111111..7777777 100644
 # --------------------------------------------------------------------------
 
 
-def _task(task_id="calc-1"):
+#: What `TaskManifest.manifest_digest` is: sha256 over the manifest bytes and
+#: the reference diff, truncated. The fixtures below carry a MATCHING pair --
+#: the task's digest and the digest every grade line was taken against -- so
+#: the ordinary collection exercises the silent path, and a test that wants a
+#: mismatch or an unknown says so where it does.
+MANIFEST_DIGEST = "d1e5701c3e2f4a90"
+
+
+def _task(task_id="calc-1", manifest_digest=MANIFEST_DIGEST):
     """A manifest stand-in carrying exactly what the driver and the whitelist
     read: `prompt`, `solution_diff`, `extra_files`, `task_id`,
-    `task_set_commit`."""
+    `task_set_commit`, `manifest_digest`."""
     return SimpleNamespace(
         task_id=task_id,
         task_version=3,
@@ -186,6 +194,7 @@ def _task(task_id="calc-1"):
         solution_diff=REFERENCE_DIFF,
         extra_files=(),
         task_set_commit="taskset-def",
+        manifest_digest=manifest_digest,
     )
 
 
@@ -212,7 +221,7 @@ def _record(run_id, *, task_id="calc-1", model="model-one", sample_index=0,
 
 
 def _grade(run_id, *, task_id="calc-1", model="model-one", resolved=True,
-           grader_version=GRADER, **kw):
+           grader_version=GRADER, manifest_digest=MANIFEST_DIGEST, **kw):
     """A grade line of the shape the ladder writes.
 
     `resolved is None` carries a `not_graded_reason`, because the grader's own
@@ -237,6 +246,10 @@ def _grade(run_id, *, task_id="calc-1", model="model-one", resolved=True,
         grade_failure=None if resolved is not False else "f2p_failed",
         not_graded_reason=None if resolved is not None else "excluded",
         not_graded_detail=None if resolved is not None else "credential failure",
+        # The manifest this grade was taken against. Matches `_task`'s by
+        # default: a stand-in whose two digests disagreed would put every
+        # driver test on the refusal path.
+        graded_against_manifest_digest=manifest_digest,
         **kw,
     )
 
@@ -1097,6 +1110,133 @@ def test_a_task_missing_from_the_task_set_is_warned_and_its_cells_skipped(
     # Skipped rather than asked about: two votes for calc-1 and nothing else.
     assert fake.calls == 2
     assert result["errors"] == []
+
+
+def _two_tasks(tmp_path, grades) -> Path:
+    """Two tasks, two arms each, and the caller's own grade lines.
+
+    The grades are the parameter because the digest check reads nothing else:
+    every other field of these four runs is identical across the tests below.
+    """
+    return _collection(
+        tmp_path,
+        [
+            _record("run-a", task_id="calc-1", model="model-one"),
+            _record("run-b", task_id="calc-1", model="model-two",
+                    final_diff=DIFF_B),
+            _record("run-c", task_id="calc-2", model="model-one"),
+            _record("run-d", task_id="calc-2", model="model-two",
+                    final_diff=DIFF_B),
+        ],
+        grades,
+    )
+
+
+def test_a_task_edited_since_it_was_graded_refuses_its_units_and_names_both_digests(
+    tmp_path,
+):
+    """The gate and the payload must be anchored on ONE manifest.
+
+    The payload carries the manifest's prompt and its solution diff, and the
+    gate that decided which pairs are judgeable at all was taken against
+    whatever `task.yaml` and `reference.diff` said at grading time. Edit the
+    task between the two -- a reworded prompt, a re-cut reference diff, no
+    `task_version` bump needed -- and the judge anchors every verdict on a
+    reference the gate never gated, silently, with the right shape.
+
+    So the units of that task are refused rather than judged: this is a hole
+    in the reading, and the errors bucket is where holes go. The message
+    names BOTH digests and BOTH remedies, because the operator cannot tell
+    from the numbers which side moved and there are two ways back.
+
+    The other task is judged. The mismatch is a property of one manifest, and
+    refusing a whole collection over it would throw away every task that is
+    still coherent.
+    """
+    root = _two_tasks(
+        tmp_path,
+        [
+            _grade("run-a", task_id="calc-1", model="model-one",
+                   manifest_digest="0123456789abcdef"),
+            _grade("run-b", task_id="calc-1", model="model-two",
+                   manifest_digest="0123456789abcdef"),
+            _grade("run-c", task_id="calc-2", model="model-one"),
+            _grade("run-d", task_id="calc-2", model="model-two"),
+        ],
+    )
+    fake = FakeComplete()
+
+    result = _run(root, [_task("calc-1"), _task("calc-2")], complete=fake,
+                  rubric=False)
+
+    (error,) = result["errors"]
+    assert "calc-1" in error
+    assert "0123456789abcdef" in error, "the digest the grades were taken at"
+    assert MANIFEST_DIGEST in error, "the digest the loaded task carries"
+    assert "scripts/grade.py" in error, "remedy one: re-grade"
+    assert "task set" in error, "remedy two: judge at the state graded against"
+    # calc-1 bought nothing and left no line; calc-2 was judged in full.
+    assert {j.task_id for j in _lines(root)} == {"calc-2"}
+    assert fake.calls == 2
+
+
+def test_a_grade_line_naming_no_manifest_digest_is_unknown_and_not_a_mismatch(
+    tmp_path,
+):
+    """An absent digest is a grade written before the field existed, which is
+    not evidence the task moved.
+
+    Refusing on it would refuse every collection graded by an older grader --
+    a real loss over a fact nobody recorded. Judging on it silently would
+    claim a check that never ran. So it warns and proceeds: absence is
+    recorded, never implied.
+    """
+    root = _two_tasks(
+        tmp_path,
+        [
+            _grade("run-a", task_id="calc-1", model="model-one",
+                   manifest_digest=""),
+            _grade("run-b", task_id="calc-1", model="model-two",
+                   manifest_digest=""),
+            _grade("run-c", task_id="calc-2", model="model-one"),
+            _grade("run-d", task_id="calc-2", model="model-two"),
+        ],
+    )
+    fake = FakeComplete()
+
+    result = _run(root, [_task("calc-1"), _task("calc-2")], complete=fake,
+                  rubric=False)
+
+    (warning,) = [w for w in result["warnings"] if "digest" in w]
+    assert "calc-1" in warning
+    assert "2 grade line(s)" in warning
+    assert result["errors"] == []
+    # Judged anyway: both tasks, both pairs.
+    assert {j.task_id for j in _lines(root)} == {"calc-1", "calc-2"}
+    assert fake.calls == 4
+
+
+def test_a_grade_taken_against_the_loaded_manifest_says_nothing_at_all(
+    tmp_path,
+):
+    """The ordinary collection. A check that announced itself on every pass
+    would be a line an operator learns to skip, and the warnings above are
+    only readable because the silent case is genuinely silent."""
+    root = _two_tasks(
+        tmp_path,
+        [
+            _grade("run-a", task_id="calc-1", model="model-one"),
+            _grade("run-b", task_id="calc-1", model="model-two"),
+            _grade("run-c", task_id="calc-2", model="model-one"),
+            _grade("run-d", task_id="calc-2", model="model-two"),
+        ],
+    )
+
+    result = _run(root, [_task("calc-1"), _task("calc-2")], rubric=False)
+
+    assert result["errors"] == []
+    assert not [w for w in result["warnings"] if "digest" in w]
+    assert {j.task_id for j in _lines(root)} == {"calc-1", "calc-2"}
 
 
 # --------------------------------------------------------------------------
