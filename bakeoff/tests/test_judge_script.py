@@ -63,6 +63,7 @@ from bakeoff.judge import (
     VOTE_POSITIONS,
     NonNeutralJudge,
     _CANONICAL_VERDICTS,
+    is_auth_failure,
     prompt_sha,
 )
 from bakeoff.judge_schema import (
@@ -81,6 +82,7 @@ from bakeoff.schema import (
     TerminationReason,
 )
 
+import scripts.judge as judge_script
 from scripts.grade import grades_path
 from scripts.judge import (
     BOOTSTRAP_RESAMPLES,
@@ -5276,3 +5278,219 @@ def test_the_summary_is_a_printout_and_stores_nothing(tmp_path):
     print_summary(result)
 
     assert _bytes_under(root) == before
+
+
+# ---------------------------------------------------------------------------
+# the codex backend: selection, record honesty, and the abort it needs
+# ---------------------------------------------------------------------------
+
+CODEX_JUDGE = "codex:gpt-5.2-codex"
+
+
+def _codex_home(tmp_path) -> Path:
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    (home / "auth.json").write_text(json.dumps({"auth_mode": "chatgpt"}))
+    return home
+
+
+def _fake_harness(monkeypatch, tmp_path):
+    """`codex_harness` without a binary to read a version off.
+
+    Patched at the name `scripts.judge` imported rather than in the backend
+    module: the driver holds its own reference, so patching the source would
+    leave the driver calling the real one.
+    """
+    home = _codex_home(tmp_path)
+    monkeypatch.setenv("BAKEOFF_CODEX_HOME", str(home))
+    monkeypatch.setattr(
+        judge_script,
+        "codex_harness",
+        lambda judge_model_id, reasoning_effort=None: {
+            "backend": "codex-cli",
+            "codex_cli_version": "codex-cli 0.145.0-alpha.18",
+            "codex_model": judge_model_id.split(":", 1)[1],
+            "auth_mode": "chatgpt",
+            "auth_seat": "pindrop-chatgpt-business",
+            "sandbox": "read-only",
+            "reasoning_effort": reasoning_effort,
+        },
+    )
+    return home
+
+
+def test_the_backend_is_read_off_the_id_because_a_flag_could_disagree_with_it():
+    assert judge_script._judge_backend(CODEX_JUDGE) == "codex"
+    assert judge_script._judge_backend(JUDGE_MODEL_ID_DEFAULT) == "mantle"
+
+
+def test_a_codex_judge_id_passes_the_neutrality_guard_and_a_codex_claude_does_not(
+    tmp_path, monkeypatch
+):
+    """Neutrality is about the FAMILY, and the codex namespace changes neither
+    half of the guard: a GPT-class judge still sits outside all four compared
+    families, and a compared family re-hosted under `codex:` is still refused.
+    """
+    _fake_harness(monkeypatch, tmp_path)
+    root = _two_arms(tmp_path)
+
+    result = _run(root, judge_model_id=CODEX_JUDGE)
+    assert result["errors"] == []
+
+    with pytest.raises(NonNeutralJudge):
+        _run(root, judge_model_id="codex:claude-sonnet-5")
+
+
+def test_codex_lines_never_claim_temperature_zero_and_carry_the_harness(
+    tmp_path, monkeypatch
+):
+    """The record says what was SENT, and codex cannot send a temperature.
+
+    A line that copied `JUDGE_SAMPLING` in would claim exact reproducibility
+    for a call that has none, in the one field whose whole job is to be true
+    about the request -- and nothing downstream could tell, because the value
+    would parse and the number it implies is the number a mantle line carries.
+    """
+    _fake_harness(monkeypatch, tmp_path)
+    root = _two_arms(tmp_path)
+
+    _run(root, judge_model_id=CODEX_JUDGE)
+    paid = [line for line in _lines(root) if line.judge_prompt_sha]
+    assert paid
+
+    for line in paid:
+        assert "temperature" not in line.judge_sampling
+        assert line.judge_sampling == {}
+        assert line.judge_harness["backend"] == "codex-cli"
+        assert line.judge_harness["codex_model"] == "gpt-5.2-codex"
+        assert line.judge_harness["auth_seat"] == "pindrop-chatgpt-business"
+        # The only identity the ~14.6k tokens of un-hashed Codex scaffolding
+        # have. Without it `judge_prompt_sha` silently attests half the input.
+        assert line.judge_harness["codex_cli_version"]
+
+
+def test_the_reasoning_effort_reaches_the_record_as_sent(tmp_path, monkeypatch):
+    _fake_harness(monkeypatch, tmp_path)
+    root = _two_arms(tmp_path)
+
+    _run(root, judge_model_id=CODEX_JUDGE, reasoning_effort="high")
+    paid = [line for line in _lines(root) if line.judge_prompt_sha]
+
+    assert all(
+        line.judge_sampling == {"model_reasoning_effort": "high"} for line in paid
+    )
+    assert all(line.judge_harness["reasoning_effort"] == "high" for line in paid)
+
+
+def test_mantle_lines_still_carry_the_pinned_sampling_block_unchanged(tmp_path):
+    """The swap must not move the mantle path by one byte: a collection judged
+    before and after this change has to produce identical lines, or every
+    stored mantle verdict becomes a different generation for no reason."""
+    root = _two_arms(tmp_path)
+
+    _run(root)
+    paid = [line for line in _lines(root) if line.judge_prompt_sha]
+
+    assert paid
+    for line in paid:
+        assert line.judge_sampling == dict(JUDGE_SAMPLING)
+        assert line.judge_sampling["temperature"] == 0.0
+        assert line.judge_harness == {"backend": "litellm-mantle"}
+
+
+def test_a_gate_decided_line_records_no_harness_because_nothing_carried_it(
+    tmp_path, monkeypatch
+):
+    """Nothing was sent, so all three as-sent fields are empty TOGETHER.
+
+    A harness block here would additionally resolve a credential for a line
+    that needs none -- which is the property that lets an analysis-only pass
+    run with no seat at all.
+    """
+    _fake_harness(monkeypatch, tmp_path)
+    root = _two_arms(tmp_path, resolved_b=False)
+
+    _run(root, judge_model_id=CODEX_JUDGE, rubric=False)
+    (line,) = [ln for ln in _lines(root) if ln.verdict == "gate_decided"]
+
+    assert line.judge_harness is None
+    assert line.judge_sampling == {}
+    assert line.judge_prompt_sha == ""
+
+
+def test_a_fully_gate_decided_codex_batch_never_needs_a_seat(tmp_path, monkeypatch):
+    """The laziness that matters: no binary, no judge home, no auth.json.
+
+    `codex_completion` refuses at its first call when any of the three is
+    missing, so a batch the deterministic ladder settles entirely must reach
+    neither the closure nor the harness. Every environment variable the
+    backend reads is unset here, and the pass must still produce its line.
+    """
+    monkeypatch.delenv("BAKEOFF_CODEX_HOME", raising=False)
+    monkeypatch.delenv("BAKEOFF_CODEX_BIN", raising=False)
+    root = _two_arms(tmp_path, resolved_b=False)
+
+    # No injected seam: the driver builds the real lazy codex one.
+    result = judge_event_log(
+        root, [_task()], judge_model_id=CODEX_JUDGE, rubric=False
+    )
+
+    assert result["errors"] == []
+    (line,) = [ln for ln in _lines(root) if ln.verdict == "gate_decided"]
+    assert line.judge_model_id == CODEX_JUDGE
+
+
+def test_codex_and_mantle_verdicts_in_one_file_are_never_pooled(tmp_path, monkeypatch):
+    """Judging one collection under both backends leaves two GENERATIONS.
+
+    This is the whole reason the backend is inferred from the id rather than
+    set by a flag: `judge_model_id` is the first element of every resume key
+    and of `_judge_generation`, so a codex id cannot collide with a mantle one
+    and no aggregation can average the two into a number that describes
+    neither.
+    """
+    _fake_harness(monkeypatch, tmp_path)
+    root = _two_arms(tmp_path)
+
+    _run(root, rubric=False)
+    before = len(_lines(root))
+    # No `--re-judge`: every unit is fresh under the other generation.
+    result = _run(root, judge_model_id=CODEX_JUDGE, rubric=False)
+
+    # Nothing was skipped: the codex generation's resume keys differ in
+    # `judge_model_id`, so every unit is fresh without `--re-judge`.
+    assert not result["skipped"]
+    assert len(_lines(root)) > before
+    generations = {
+        judge_script._judge_generation(line) for line in _lines(root)
+    }
+    assert len(generations) == 2
+
+
+def test_the_abort_paragraph_names_codex_login_and_never_an_aws_session(tmp_path):
+    """A codex 401 is answered by a browser flow, and by nothing this process
+    can do. Sending that operator to `aws sso login` names a credential the
+    pass never used, which is the failure `_abort_message`'s classification
+    was built to stop -- one backend further on."""
+    from bakeoff.codex_judge import CodexAuthFailure
+
+    run = [("vote 0", True)] * 5
+    codex = judge_script._abort_message(run, backend="codex")
+    mantle = judge_script._abort_message(run, backend="mantle")
+
+    assert "codex" in codex.lower() and "login" in codex
+    assert "aws sso" not in codex
+    assert "aws sso" in mantle
+    # The one classifier both backends answer to.
+    assert is_auth_failure(CodexAuthFailure("nope"))
+
+
+def test_the_codex_rate_limit_paragraph_says_the_backoff_already_lost(tmp_path):
+    """A 429 that reaches the breaker on this backend is not a blip: the
+    backend's own backoff spent five waits first, so "wait for the window"
+    has to mean a longer wait than it does on mantle."""
+    run = [("vote 0", False)] * 5
+
+    codex = judge_script._abort_message(run, backend="codex")
+
+    assert "backoff was exhausted" in codex

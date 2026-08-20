@@ -189,7 +189,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
@@ -209,6 +209,15 @@ from bakeoff.grade_schema import (  # noqa: E402
     # one import edge lighter.
     grades_path,
     load_grades,
+)
+from bakeoff.codex_judge import (  # noqa: E402
+    # Stdlib-only and it imports `bakeoff.judge`, which is imported below
+    # anyway -- so a mantle pass pays nothing for this edge. What is deferred
+    # is the RESOLUTION (binary, judge home, auth.json), which happens on the
+    # first prompt inside `lazy_codex_completion`.
+    codex_harness,
+    codex_sampling,
+    is_codex_judge,
 )
 from bakeoff.judge import (  # noqa: E402
     JUDGE_MODEL_ID_DEFAULT,
@@ -696,6 +705,94 @@ def lazy_live_completion(judge_model_id: str,
     return complete
 
 
+def lazy_codex_completion(judge_model_id: str,
+                          usage_totals: dict[str, int] | None = None
+                          ) -> CompleteFn:
+    """`codex_completion`, built on the first prompt that needs it.
+
+    The twin of `lazy_live_completion`, and lazy for the same reason one layer
+    further out than that function's own laziness: `codex_completion` refuses
+    at its first call when there is no binary, no `BAKEOFF_CODEX_HOME` or no
+    `auth.json` in it, and a batch every comparison of which the deterministic
+    ladder already decided must not require any of the three to exist. The
+    module itself is stdlib-only and is imported at the top of this file --
+    what is deferred here is the RESOLUTION and the closure it builds, not the
+    import.
+
+    Not thread-safe (check-then-set), which is fine for the same reason
+    `lazy_live_completion` says it is: the first prompt is bought on the main
+    thread's first submission, and two threads that both won the race would
+    build two equivalent closures rather than corrupt one.
+    """
+    built: dict[str, CompleteFn] = {}
+
+    def complete(prompt: str) -> str:
+        if "fn" not in built:
+            from bakeoff.codex_judge import codex_completion
+
+            built["fn"] = codex_completion(
+                judge_model_id, usage_totals=usage_totals
+            )
+        return built["fn"](prompt)
+
+    return complete
+
+
+def _judge_backend(judge_model_id: str) -> str:
+    """Which backend this id selects: `"codex"` or `"mantle"`.
+
+    INFERRED FROM THE ID, and there is deliberately no `--judge-backend` flag
+    to disagree with it. `judge_model_id` is already the identity every resume
+    key and every generation partition reads first (`_rubric_key`,
+    `_pairwise_key`, `_judge_generation`), so a `codex:` id cannot collide with
+    a mantle id and the two backends can never be pooled into one number by
+    accident. A flag beside the id could be set to one backend while the id
+    named the other, and the resulting file would carry lines whose recorded
+    identity is not the thing that answered them -- a mislabelling nothing
+    downstream could detect, since every field would parse.
+    """
+    return "codex" if is_codex_judge(judge_model_id) else "mantle"
+
+
+def judge_facts(judge_model_id: str, reasoning_effort: str | None = None
+                ) -> tuple[dict, Callable[[], dict | None]]:
+    """`(judge_sampling, harness_of)` for this backend. See D7.
+
+    Returns the sampling block by VALUE and the harness block behind a
+    MEMOISED CALLABLE, and the asymmetry is the point. Sampling is knowable
+    from the arguments alone; the harness is not -- `codex_harness` reads the
+    CLI's version off the binary and the auth mode out of the judge home, so
+    building it eagerly would make a fully gate-decided batch refuse for want
+    of a credential it is never going to use. Deferred, it is built by the
+    first PAID line and by nothing else, which is the same rule
+    `lazy_codex_completion` follows one layer down.
+
+    The mantle side is a value in a callable's clothing on purpose: one shape
+    for both backends means the two line builders have one code path, and a
+    builder with an `if backend ==` in it is where the two records drift.
+
+    The sampling block is what the record will claim was sent. On the codex
+    side that is the reasoning effort or nothing at all -- never
+    `temperature`, which `codex exec` cannot send and which would therefore be
+    a false statement in the one field whose entire job is to be true about
+    the request. See `codex_judge.codex_sampling`.
+    """
+    if not is_codex_judge(judge_model_id):
+        mantle = {"backend": "litellm-mantle"}
+        return dict(JUDGE_SAMPLING), lambda: dict(mantle)
+
+    built: dict[str, dict] = {}
+
+    def harness_of() -> dict | None:
+        if "harness" not in built:
+            built["harness"] = codex_harness(
+                judge_model_id, reasoning_effort=reasoning_effort
+            )
+        return dict(built["harness"])
+
+    return codex_sampling(reasoning_effort), harness_of
+
+
 def _write_payload_or_fail(payloads: Path, judgment_id: str,
                            payload: dict) -> tuple[str, str]:
     """`write_payload`, with an `OSError` promoted to `StorageFailure`.
@@ -837,7 +934,8 @@ def _encodable(text: str) -> bool:
 
 def _rubric_line(record, grade: GradeRecord, task, inputs: PayloadInputs,
                  payloads: Path, path: Path, complete: CompleteFn,
-                 judge_model_id: str) -> JudgeRecord:
+                 judge_model_id: str, judge_sampling: dict,
+                 harness_of: Callable[[], dict | None]) -> JudgeRecord:
     """One absolute-rubric profile: one call, `vote_index=0`.
 
     The forced positions are pairwise-only: there is no second submission to
@@ -877,7 +975,11 @@ def _rubric_line(record, grade: GradeRecord, task, inputs: PayloadInputs,
         # rather than re-rendered: a sha over a rebuilt prompt attests to
         # something other than what the model saw.
         judge_prompt_sha=prompt_sha(rendered),
-        judge_sampling=dict(JUDGE_SAMPLING),
+        # THREADED, not read off the constant. `JUDGE_SAMPLING` describes the
+        # mantle request and nothing else; a codex line that copied it in
+        # would claim a `temperature: 0.0` no codex call can send.
+        judge_sampling=dict(judge_sampling),
+        judge_harness=harness_of(),
         rubric_version=RUBRIC_VERSION,
         kind="rubric",
         task_id=task.task_id,
@@ -906,7 +1008,9 @@ def _vote_line(task, sample_index: int, run_id_a: str, run_id_b: str,
                vote_index: int, position_assignment: str,
                grade_a: GradeRecord, grade_b: GradeRecord,
                payloads: Path, path: Path,
-               complete: CompleteFn, judge_model_id: str) -> JudgeRecord:
+               complete: CompleteFn, judge_model_id: str,
+               judge_sampling: dict,
+               harness_of: Callable[[], dict | None]) -> JudgeRecord:
     """One blind pairwise vote, in the position the caller forces.
 
     `inputs_a`/`inputs_b` are CANONICAL a and b -- the two run ids
@@ -943,7 +1047,9 @@ def _vote_line(task, sample_index: int, run_id_a: str, run_id_b: str,
         # Per CALL, not per comparison: position changes the text, so the two
         # votes over one pair carry two distinct shas.
         judge_prompt_sha=prompt_sha(outcome.rendered_prompt),
-        judge_sampling=dict(JUDGE_SAMPLING),
+        # See `_rubric_line`: as sent on THIS backend, never the constant.
+        judge_sampling=dict(judge_sampling),
+        judge_harness=harness_of(),
         rubric_version=RUBRIC_VERSION,
         kind="pairwise",
         task_id=task.task_id,
@@ -982,10 +1088,13 @@ def _gate_decided_line(task, sample_index: int, run_id_a: str, run_id_b: str,
 
     * `position_assignment`, `vote_index`, `input_payload_path` and
       `input_payload_sha` are `None`, per the schema's own contract.
-    * `judge_prompt_sha` is `""` because no prompt was rendered, and
-      `judge_sampling` is `{}` because nothing was sent. Both are the
-      as-sent evidence fields; a sha or a sampling block copied in from the
-      constants would attest to a request that was never made.
+    * `judge_prompt_sha` is `""` because no prompt was rendered,
+      `judge_sampling` is `{}` because nothing was sent, and `judge_harness`
+      is `None` because nothing carried it. All three are as-sent evidence
+      fields; a sha, a sampling block or a harness block copied in from the
+      batch would attest to a request that was never made -- and on the codex
+      backend building the harness would additionally resolve a credential
+      for a line that needs none.
     * `full_reasoning_text` is `""`. Driver-authored prose in the field
       reserved for a model's own words is indistinguishable from a verdict when
       the file is read in bulk, and `verdict == "gate_decided"` beside
@@ -1069,7 +1178,8 @@ def _unit_label(kind: str, task_id: str, sample_index: int,
     )
 
 
-def _abort_message(failure_run: list[tuple[str, bool]]) -> str:
+def _abort_message(failure_run: list[tuple[str, bool]],
+                   backend: str = "mantle") -> str:
     """The abort, built out of the run of failures that caused it.
 
     `failure_run` is `(label, is_auth_failure(exc))` per unit, oldest first.
@@ -1109,6 +1219,16 @@ def _abort_message(failure_run: list[tuple[str, bool]]) -> str:
     unreadable -- and the honest report is that both were seen, in the counts
     they were seen in.
 
+    `backend` CHOOSES THE FIX, not the diagnosis. `is_auth_failure` still
+    decides which paragraph prints -- that stays one classifier answering for
+    both backends, which is why `CodexAuthFailure` carries a `status_code` --
+    but the two backends are answered by opposite actions and a paragraph that
+    named the wrong one would be worse than a vague one. A mantle 401 is
+    answered by a mint the harness already attempted; a codex 401 cannot be
+    answered by any process at all, because `codex login` is a browser flow a
+    person has to complete. Telling a codex operator to check their `aws sso`
+    session sends them to a credential this pass never used.
+
     The list is capped at `_MAX_NAMED`, for that constant's reason and because
     the limit is now an operator flag: `--max-consecutive-errors 500` would
     otherwise print a 500-line warning above a 500-line error list saying the
@@ -1130,7 +1250,20 @@ def _abort_message(failure_run: list[tuple[str, bool]]) -> str:
         f"with units left unattempted. The units that failed, oldest first:\n"
         f"{named}"
     ]
-    if auth:
+    if auth and backend == "codex":
+        parts.append(
+            f"{len(auth)} of them failed authentication (HTTP 401/403). "
+            "NOTHING HERE CAN FIX THAT and nothing tried to: unlike the "
+            "mantle bearer there is no credential to mint, so the call was "
+            "not retried. Log the judge home in again -- "
+            "`CODEX_HOME=$BAKEOFF_CODEX_HOME <codex> login`, then confirm "
+            "with `... login status` -- and check that BAKEOFF_CODEX_HOME "
+            "still points at the attested seat's home rather than a personal "
+            "one. Nothing is lost: judgments are append-only and the resume "
+            "is keyed on units already bought, so resume with the same "
+            "command once the login works."
+        )
+    elif auth:
         parts.append(
             f"{len(auth)} of them failed authentication (HTTP 401/403). One "
             "auth failure per call already buys a freshly minted credential "
@@ -1149,7 +1282,12 @@ def _abort_message(failure_run: list[tuple[str, bool]]) -> str:
             "and quota errors are transient -- throttling answers with a 429, "
             "not a 401, and the transport retries behind each call have "
             "already lost -- so wait for the window to clear and resume with "
-            "the same command. Data-shaped errors (malformed verdicts, "
+            + ("the same command. On the codex backend a 429 reaching this "
+               "point means the backend's OWN backoff was exhausted first, so "
+               "the window is a long one: wait longer than you would for a "
+               "transport blip. " if backend == "codex" else "the same "
+               "command. ")
+            + "Data-shaped errors (malformed verdicts, "
             "secret-bearing payloads, unjudgeable runs) will fail again on "
             "resume, in the same order and in the same place, until something "
             "about the collection or the command changes. Judge past them by "
@@ -1332,6 +1470,7 @@ def judge_event_log(event_log_root, tasks, *,
                     rubric: bool = True,
                     re_judge: bool = False,
                     max_consecutive_errors: int = MAX_CONSECUTIVE_ERRORS,
+                    reasoning_effort: str | None = None,
                     ) -> dict:
     """Judge every selected unit in one event log. Returns the batch.
 
@@ -1416,6 +1555,12 @@ def judge_event_log(event_log_root, tasks, *,
     # this function would refuse, which is what keeps a re-judge from
     # inheriting the first pass's model by accident.
     non_neutral = assert_neutral_judge(judge_model_id)
+
+    # Immediately after the guard and before the collection is read: the
+    # backend is a property of the id the guard just admitted, and both facts
+    # below are needed by the first line this pass writes.
+    backend = _judge_backend(judge_model_id)
+    judge_sampling, harness_of = judge_facts(judge_model_id, reasoning_effort)
 
     event_log_root = Path(event_log_root)
     if not (event_log_root / "runs").is_dir():
@@ -1566,7 +1711,15 @@ def judge_event_log(event_log_root, tasks, *,
     judge_usage: dict[str, int] | None = None
     if complete is None:
         judge_usage = new_usage_totals()
-        complete = lazy_live_completion(judge_model_id, judge_usage)
+        # SELECTED BY THE ID, never by a flag -- see `_judge_backend`. Both
+        # sides are lazy in the same way and for the same reason: a batch the
+        # ladder decides entirely must not require either backend's credential
+        # to exist.
+        complete = (
+            lazy_codex_completion(judge_model_id, judge_usage)
+            if backend == "codex"
+            else lazy_live_completion(judge_model_id, judge_usage)
+        )
 
     judged: list[JudgeRecord] = []
     gate_decided: list[JudgeRecord] = []
@@ -1682,7 +1835,7 @@ def judge_event_log(event_log_root, tasks, *,
         failure_run.append((label, is_auth_failure(exc)))
         _finish(f"ERROR {type(exc).__name__}")
         if len(failure_run) >= max_consecutive_errors:
-            raise _BatchAborted(_abort_message(failure_run))
+            raise _BatchAborted(_abort_message(failure_run, backend))
 
     def _unit_failed_fatally(exc: BaseException) -> None:
         """A `StorageFailure`: the disk stopped, so the batch stops with it.
@@ -1935,6 +2088,7 @@ def judge_event_log(event_log_root, tasks, *,
                 judged.append(_rubric_line(
                     records[run_id], grade, unit.task, unit_inputs,
                     payloads, path, complete, judge_model_id,
+                    judge_sampling, harness_of,
                 ))
             except StorageFailure as exc:
                 _unit_failed_fatally(exc)
@@ -1981,6 +2135,7 @@ def judge_event_log(event_log_root, tasks, *,
                 inputs_a, inputs_b,
                 unit.vote_index, unit.position, grade_a, grade_b,
                 payloads, path, complete, judge_model_id,
+                judge_sampling, harness_of,
             ))
         except StorageFailure as exc:
             _unit_failed_fatally(exc)
@@ -3853,7 +4008,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--judge-model", default=JUDGE_MODEL_ID_DEFAULT,
         help="PINNED model id, never an alias -- a floating alias is a moving "
-             f"oracle (default: {JUDGE_MODEL_ID_DEFAULT})",
+             f"oracle (default: {JUDGE_MODEL_ID_DEFAULT}). A `codex:<model>` "
+             "id selects the Codex-CLI backend instead of the mantle "
+             "endpoint, and needs BAKEOFF_CODEX_HOME pointing at a home "
+             "holding only the attested seat's auth.json. There is no "
+             "separate backend flag: the id IS the identity every resume key "
+             "and every generation partition carries, so the two backends can "
+             "never be pooled into one number",
+    )
+    parser.add_argument(
+        "--reasoning-effort", default=None, metavar="LEVEL",
+        help="codex backend only: the ONE sampling knob it has, recorded into "
+             "judge_sampling as sent. There is no temperature -- `codex exec` "
+             "cannot send one -- so a codex pass is not exactly reproducible "
+             "the way a mantle pass at temperature 0 is",
     )
     # No `--votes`. Under forced positions a comparison is exactly one vote per
     # entry in `VOTE_POSITIONS`, so the only thing a count could express is a
@@ -3917,6 +4085,12 @@ def main(argv: list[str] | None = None) -> int:
         f"judge      {args.judge_model}, prompt v{JUDGE_PROMPT_VERSION}, "
         f"rubric {RUBRIC_VERSION}"
     )
+    # The backend is printed even though the id already implies it, because
+    # the implication runs the wrong way for a reader: `codex:` is easy to
+    # mistype as part of a model name, and an operator who meant the seat and
+    # got the mantle endpoint would find out from the bill rather than from
+    # the header. It prints before anything is read or spent.
+    _print_ascii_safe(f"backend    {_judge_backend(args.judge_model)}")
 
     try:
         result = judge_event_log(
@@ -3927,6 +4101,7 @@ def main(argv: list[str] | None = None) -> int:
             rubric=not args.no_rubric,
             re_judge=args.re_judge,
             max_consecutive_errors=args.max_consecutive_errors,
+            reasoning_effort=args.reasoning_effort,
         )
     # Three refusals, one exit path. All three mean the batch never ran, all
     # three print no numbers, and none is something a flag can talk past -- so
