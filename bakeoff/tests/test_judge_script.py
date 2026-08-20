@@ -5385,9 +5385,17 @@ def test_the_reasoning_effort_reaches_the_record_as_sent(tmp_path, monkeypatch):
 
 
 def test_mantle_lines_still_carry_the_pinned_sampling_block_unchanged(tmp_path):
-    """The swap must not move the mantle path by one byte: a collection judged
-    before and after this change has to produce identical lines, or every
-    stored mantle verdict becomes a different generation for no reason."""
+    """The mantle path's IDENTITY must not move, which is not the same as its
+    bytes not moving.
+
+    Its bytes do move: every mantle line now also carries
+    `judge_harness: {"backend": "litellm-mantle"}` and
+    `judge_schema_version: "1.1.0"`, both deliberate and both additive. What
+    must not move is anything `_judge_generation` reads -- judge model id,
+    prompt version, rubric version -- because a mantle verdict that changed
+    generation would be re-bought on the next resume and would stop pooling
+    with every mantle verdict already on disk.
+    """
     root = _two_arms(tmp_path)
 
     _run(root)
@@ -5398,6 +5406,9 @@ def test_mantle_lines_still_carry_the_pinned_sampling_block_unchanged(tmp_path):
         assert line.judge_sampling == dict(JUDGE_SAMPLING)
         assert line.judge_sampling["temperature"] == 0.0
         assert line.judge_harness == {"backend": "litellm-mantle"}
+        assert judge_script._judge_generation(line) == (
+            JUDGE_MODEL_ID_DEFAULT, JUDGE_PROMPT_VERSION, RUBRIC_VERSION
+        )
 
 
 def test_a_gate_decided_line_records_no_harness_because_nothing_carried_it(
@@ -5698,6 +5709,35 @@ def test_a_gate_decided_pair_commits_inline_and_does_not_occupy_the_window(
     (line,) = _lines(root)
     assert line.verdict == "gate_decided"
     assert result["errors"] == []
+
+
+def test_the_reasoning_effort_reaches_the_backend_and_not_only_the_record(
+    tmp_path, monkeypatch
+):
+    """The driver has to hand the effort to the closure it builds.
+
+    `judge_facts` puts the same value into every line's `judge_sampling`, so a
+    driver that recorded it without sending it would run the whole pass at the
+    model's default effort while every record claimed otherwise -- and every
+    test that drives an injected seam would stay green, because none of them
+    can see the argv. This one watches the seam get BUILT.
+    """
+    seen: dict = {}
+    monkeypatch.setattr(
+        judge_script, "lazy_codex_completion",
+        lambda model, usage=None, effort=None: seen.update(
+            model=model, effort=effort
+        ) or FakeComplete(),
+    )
+    _fake_harness(monkeypatch, tmp_path)
+    root = _two_arms(tmp_path)
+
+    judge_event_log(
+        root, [_task()], judge_model_id=CODEX_JUDGE,
+        rubric=False, reasoning_effort="high",
+    )
+
+    assert seen == {"model": CODEX_JUDGE, "effort": "high"}
 
 
 def test_the_concurrency_flag_is_validated_at_one_or_more(monkeypatch, tmp_path):

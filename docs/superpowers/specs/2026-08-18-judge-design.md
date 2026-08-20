@@ -635,7 +635,8 @@ prompt is a fresh draw rather than a re-ask of a settled question.
 
 Codex wraps every prompt in its own agent system prompt and tool schemas.
 Measured 2026-08-20 against `codex-cli 0.145.0-alpha.18`: **14,591 input
-tokens for a nine-word prompt.** None of it passes through `prompt_sha`, so
+tokens for a nine-word prompt** (a second, longer prompt measured 14,606 — the
+floor is the wrapper, not the question). None of it passes through `prompt_sha`, so
 `judge_prompt_sha` proves what the harness sent and not the whole of what the
 model read, and `judge_harness.codex_cli_version` is the only identity that
 wrapper has. Two further consequences worth recording rather than discovering:
@@ -647,12 +648,15 @@ the two backends are separate generations; and at ~9,600 calls that floor is
 Hermeticism is therefore two layers, and the load-bearing one is not a flag: a
 purpose-built `CODEX_HOME` holding **only** `auth.json`. The flag set
 (`--ignore-user-config --ignore-rules --skip-git-repo-check --ephemeral -s
-read-only -C <empty dir>`) is real and measured — the same prompt costs 18,042
-input tokens with a populated user config and 14,606 without — but an absent
-file cannot be injected regardless of what a flag means next release. Measured
-alongside: the model's own answer to "were you told about X" was **unreliable**
-at both token counts, so the token count is the evidence and the self-report is
-not.
+read-only -C <empty dir>`) is real and measured — one prompt asked twice cost
+18,042 input tokens with a populated user config and 14,606 without — but an
+absent file cannot be injected regardless of what a flag means next release.
+
+Two honesties about that measurement. What the ~3.4k delta *is* — the
+operator's `AGENTS.md`, the tool schemas their `config.toml` pulls in, or some
+of each — is inference: one aggregate delta cannot separate them. And the
+model's own answer to "were you told about X" was **unreliable**, saying yes at
+both token counts. The token count is the evidence; the self-report is not.
 
 ### Model pinning is weaker than mantle's
 
@@ -676,7 +680,12 @@ is nondeterministic; commit order is the worklist's, so a batch aborts at the
 same unit on every run and the abort message's promise about a resume stays
 true. The bounded price: an abort or a Ctrl-C discards up to `concurrency − 1`
 in-flight calls unwritten — the same shape the sequential walk already accepted
-for its one in-flight unit.
+for its one in-flight unit. The summary prints immediately rather than after
+the slowest of them, but `concurrent.futures`' own atexit join means a worker
+still inside a `codex exec` can keep the process alive *after* the report is on
+the terminal. That is a lingering process, not a hidden one: nothing further is
+written, and killing those children would need this driver to track the
+backend's subprocesses through a seam the `CompleteFn` contract does not have.
 
 `--concurrency` defaults to **1**, and 1 runs the original sequential walk
 rather than a window of width one. The two are not the same: a window submits

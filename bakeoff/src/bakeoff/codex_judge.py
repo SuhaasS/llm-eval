@@ -96,6 +96,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -402,11 +403,13 @@ def _read_last_message(output_file: Path) -> str:
 def parse_events(stdout: str) -> tuple[dict[str, Any], ...]:
     """The `--json` stream, one object per line, unparsable lines DROPPED.
 
-    Tolerant on purpose. The event stream is diagnostic -- the verdict comes
-    from the `-o` file -- so a line this version of codex emits in a shape
-    this parser has never seen must not cost a paid verdict. What is lost by
-    dropping it is a token count or an error message, and both failure paths
-    below already have a fallback that says so.
+    Tolerant on purpose, and `failure_message` is what makes the tolerance
+    safe: success is the exit code rather than any event, so a line this
+    version of codex emits in a shape this parser has never seen costs a
+    token count or an error message and never a paid verdict. Dropping the
+    usage event leaves `calls_without_usage` saying the total is short;
+    dropping a `turn.failed` leaves the exit code and stderr to say the run
+    failed, without the status that would have classified it.
     """
     events: list[dict[str, Any]] = []
     for line in stdout.splitlines():
@@ -431,12 +434,29 @@ def _status_in(text: str) -> int | None:
 
 
 def failure_message(run: CodexRun) -> str | None:
-    """The message of a failed turn, or `None` when the turn completed.
+    """Why this run failed, or `None` when it did not.
 
-    Reads the STRUCTURED event rather than the exit code alone, because the
-    exit code says only that something went wrong. `turn.completed` present is
-    the success signal; its absence, or a `turn.failed`, is the failure -- and
-    `turn.failed.error.message` is where the HTTP status is spelled out.
+    TWO SIGNALS, and their asymmetry is deliberate. A `turn.failed` event is
+    taken as authoritative because it is the only place the HTTP status is
+    spelled out, and the status is what tells auth from rate limiting from
+    everything else. Success, though, is the EXIT CODE plus the absence of
+    that event -- NOT the presence of `turn.completed`.
+
+    That asymmetry is the whole content of this function. Requiring
+    `turn.completed` would make the harness depend on a diagnostic event's
+    NAME: a codex release that renamed or reshaped it would turn every
+    successful call -- `-o` file written, verdict inside it, exit 0 -- into a
+    failure, which is then retried (a second paid spawn) and finally recorded
+    as a per-unit error. A paid verdict thrown away because the telemetry
+    moved is the most expensive way this module can be wrong, and it would
+    happen to every unit at once. The `-o` file is the authority on the
+    answer; the event stream is the authority only on the failure.
+
+    An exit-0 run whose `-o` file is empty is therefore NOT a failure here.
+    It returns `""` upstream, the strict parser refuses it as a
+    `MalformedVerdict`, and `_ask_and_parse` re-asks the identical prompt --
+    which is the right answer to an empty completion and is what the mantle
+    path does with a `None` content.
 
     Falls back to stderr when no event survived parsing, so a codex that died
     before emitting anything still produces a message an operator can read.
@@ -447,16 +467,10 @@ def failure_message(run: CodexRun) -> str | None:
         message = error.get("message") if isinstance(error, dict) else None
         return str(message) if message else "codex reported a failed turn"
 
-    completed = any(event.get("type") == "turn.completed" for event in run.events)
-    if completed and run.exit_code == 0:
+    if run.exit_code == 0:
         return None
-    if completed:
-        return (
-            f"codex exec exited {run.exit_code} after a completed turn; "
-            f"stderr: {_tail(run.stderr)}"
-        )
     return (
-        f"codex exec exited {run.exit_code} without completing a turn; "
+        f"codex exec exited {run.exit_code} and reported no failed turn; "
         f"stderr: {_tail(run.stderr)}"
     )
 
@@ -552,6 +566,14 @@ def _fold_usage(usage_totals: dict[str, int] | None, run: CodexRun) -> None:
     serialise against the same object.
     """
     if usage_totals is None:
+        return
+    # A run that never completed a turn is not a run whose usage was
+    # UNREADABLE -- it is one that has no usage to read. Counting it here
+    # would make every auth failure and every dead endpoint raise
+    # `calls_without_usage`, and that counter's whole job is to tell an
+    # operator their token TOTAL is an under-count. Buried under failures it
+    # stops meaning that. `calls` already counts the attempt.
+    if not any(event.get("type") == "turn.completed" for event in run.events):
         return
     counts = usage_from_events(run.events)
     with USAGE_LOCK:
@@ -720,12 +742,27 @@ def codex_completion(
     waits minutes.
     """
     resolved: dict[str, str] = {}
+    # A LOCK AROUND THE RESOLUTION, not a bare `if not resolved`. Under
+    # `--concurrency` the first prompts of a batch arrive together, and the
+    # unguarded version fills the dict key by key: a second thread sees a
+    # non-empty dict, decides the work is done, and reads `resolved["home"]`
+    # one statement before it exists. That unit dies on a `KeyError: 'home'`
+    # -- a nonsense error that charges the breaker -- while nothing about the
+    # seat or the collection is actually wrong.
+    #
+    # The lock covers ONLY the fill. Holding it across the call would
+    # serialise every paid call in the batch onto one thread, which is the
+    # whole of what `--concurrency` buys.
+    resolve_lock = threading.Lock()
 
     def complete(prompt: str) -> str:
-        if not resolved:
-            resolved["bin"] = _resolve_codex_bin(codex_bin)
-            resolved["home"] = _resolve_codex_home(codex_home)
-            resolved["model"] = codex_model_name(judge_model_id)
+        with resolve_lock:
+            if not resolved:
+                resolved.update(
+                    bin=_resolve_codex_bin(codex_bin),
+                    home=_resolve_codex_home(codex_home),
+                    model=codex_model_name(judge_model_id),
+                )
 
         env = codex_environment(resolved["home"])
 
@@ -739,17 +776,21 @@ def codex_completion(
             if isinstance(run, CodexRateLimited) and attempt < CODEX_RATE_LIMIT_RETRIES:
                 # Jittered so a concurrent pool does not resynchronise every
                 # worker onto the same wake-up and hit the window together.
-                wait = min(
-                    CODEX_RATE_LIMIT_BASE_S * (2 ** attempt), CODEX_RATE_LIMIT_CAP_S
-                )
-                sleep(wait * (0.5 + random.random()))
+                # Jittered so a concurrent pool does not resynchronise
+                # every worker onto one wake-up and hit the window together,
+                # and the cap is applied AFTER the jitter: capping first lets
+                # the multiplier carry the wait half again past the ceiling
+                # the constant advertises.
+                wait = CODEX_RATE_LIMIT_BASE_S * (2 ** attempt)
+                sleep(min(wait * (0.5 + random.random()), CODEX_RATE_LIMIT_CAP_S))
                 continue
+            # The last classified failure, raised with its own message. There
+            # is deliberately no summarising raise after this loop: every path
+            # above returns, continues or raises, so one would be unreachable
+            # code claiming to describe an outcome it can never see.
             raise run
 
-        raise CodexRateLimited(
-            f"the codex seat stayed rate limited across "
-            f"{CODEX_RATE_LIMIT_RETRIES} backoffs"
-        )
+        raise AssertionError("unreachable: the retry loop always exits")
 
     return complete
 

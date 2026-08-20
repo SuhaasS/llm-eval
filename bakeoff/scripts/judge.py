@@ -714,7 +714,8 @@ def lazy_live_completion(judge_model_id: str,
 
 
 def lazy_codex_completion(judge_model_id: str,
-                          usage_totals: dict[str, int] | None = None
+                          usage_totals: dict[str, int] | None = None,
+                          reasoning_effort: str | None = None,
                           ) -> CompleteFn:
     """`codex_completion`, built on the first prompt that needs it.
 
@@ -745,7 +746,16 @@ def lazy_codex_completion(judge_model_id: str,
                 from bakeoff.codex_judge import codex_completion
 
                 built["fn"] = codex_completion(
-                    judge_model_id, usage_totals=usage_totals
+                    judge_model_id,
+                    usage_totals=usage_totals,
+                    # PASSED, not defaulted. `judge_facts` puts this same
+                    # value into every line's `judge_sampling`, so a closure
+                    # built without it would run at the model's default
+                    # effort while every record claimed the effort was sent
+                    # -- a false statement in the one field whose whole job
+                    # is to be true about the request, and one nothing
+                    # downstream could detect because the value parses.
+                    reasoning_effort=reasoning_effort,
                 )
         return built["fn"](prompt)
 
@@ -1747,7 +1757,7 @@ def judge_event_log(event_log_root, tasks, *,
         # ladder decides entirely must not require either backend's credential
         # to exist.
         complete = (
-            lazy_codex_completion(judge_model_id, judge_usage)
+            lazy_codex_completion(judge_model_id, judge_usage, reasoning_effort)
             if backend == "codex"
             else lazy_live_completion(judge_model_id, judge_usage)
         )
@@ -2292,7 +2302,20 @@ def judge_event_log(event_log_root, tasks, *,
         queue: deque[tuple[_Unit, Any, dict]] = deque()
         cursor = 0
 
-        with ThreadPoolExecutor(max_workers=width) as pool:
+        # NOT `with ThreadPoolExecutor(...)`. That context manager's `__exit__`
+        # calls `shutdown(wait=True)` unconditionally, which JOINS every
+        # worker -- so an abort or a Ctrl-C would sit waiting for calls it has
+        # already decided to discard. On this backend that wait is not
+        # theoretical: a worker can be inside a `codex exec` with a
+        # twenty-minute timeout, its own transport retry and up to five
+        # rate-limit backoffs, and `start_new_session=True` means the
+        # terminal's Ctrl-C never reached that child either. The operator
+        # would watch an interrupted pass hang for tens of minutes, and a
+        # second Ctrl-C during the join escapes as a traceback with no
+        # summary -- exactly the failure `_finish`'s docstring says this
+        # section exists to remove.
+        pool = ThreadPoolExecutor(max_workers=width)
+        try:
             def _top_up() -> None:
                 nonlocal cursor
                 in_flight = sum(1 for _, future, _ in queue if future is not None)
@@ -2307,32 +2330,44 @@ def judge_event_log(event_log_root, tasks, *,
                     queue.append((unit, pool.submit(_timed, clock, call), clock))
                     in_flight += 1
 
-            try:
-                for index in range(1, len(worklist) + 1):
-                    _top_up()
-                    unit, future, clock = queue.popleft()
-                    if future is None:
-                        _begin(index, unit)
-                        _attempt(unit)
-                        continue
-                    # Block on THIS unit even if later ones finished
-                    # first: commit order is the whole point. `futures_wait`
-                    # and not `future.result()`, because the duration has to
-                    # be read out of the clock BEFORE `_begin` opens the line
-                    # -- and a `result()` here would raise the worker's
-                    # exception one frame OUTSIDE `_attempt`'s try, where the
-                    # per-unit handler cannot catch it and a single bad diff
-                    # would end the batch. The bound method is handed on
-                    # unevaluated instead, so the raise happens inside.
-                    futures_wait([future])
-                    _begin(index, unit, clock.get("seconds"))
-                    _attempt(unit, future.result)
-            finally:
-                # Nothing in flight is worth waiting for once the walk has
-                # stopped: an abort, an interrupt and a clean finish all leave
-                # results nobody will commit. `cancel_futures` keeps the
-                # not-yet-started ones from being bought at all.
-                pool.shutdown(wait=False, cancel_futures=True)
+            for index in range(1, len(worklist) + 1):
+                _top_up()
+                unit, future, clock = queue.popleft()
+                if future is None:
+                    _begin(index, unit)
+                    _attempt(unit)
+                    continue
+
+                # Block on THIS unit even if later ones finished first:
+                # commit order is the whole point. `futures_wait` and not
+                # `future.result()`, because the duration has to be read out
+                # of the clock BEFORE `_begin` opens the line -- and a
+                # `result()` here would raise the worker's exception one frame
+                # OUTSIDE `_attempt`'s try, where the per-unit handler cannot
+                # catch it and a single bad diff would end the batch. The
+                # bound method is handed on unevaluated instead, so the raise
+                # happens inside.
+                futures_wait([future])
+                _begin(index, unit, clock.get("seconds"))
+                _attempt(unit, future.result)
+        finally:
+            # Nothing in flight is worth waiting for once the walk has
+            # stopped: an abort, an interrupt and a clean finish all leave
+            # results nobody will commit. `cancel_futures` keeps the
+            # not-yet-started ones from being bought at all, and
+            # `wait=False` means the SUMMARY PRINTS NOW rather than after the
+            # slowest in-flight call.
+            #
+            # Honest about what this does not fix: `concurrent.futures`
+            # registers its own atexit join, so a worker still inside a
+            # `codex exec` can keep the interpreter alive after the report is
+            # on the terminal. That is a lingering process rather than a
+            # hidden one -- the operator has their numbers, their warnings and
+            # their exit-shaped report, and nothing further will be written.
+            # Killing those children would mean this driver tracking the
+            # backend's subprocesses, which is a seam the `CompleteFn`
+            # contract deliberately does not have.
+            pool.shutdown(wait=False, cancel_futures=True)
 
     try:
         if concurrency <= 1:

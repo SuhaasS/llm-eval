@@ -305,13 +305,33 @@ def test_a_failure_with_no_readable_status_is_generic_rather_than_guessed_auth()
     assert not is_auth_failure(failure)
 
 
-def test_a_turn_that_never_completed_is_a_failure_even_on_exit_zero():
-    run = CodexRun(0, _events({"type": "turn.started"}), "boom", "")
+def test_exit_zero_is_success_even_when_no_completion_event_survived():
+    """Success is the EXIT CODE, deliberately -- not the presence of an event.
 
-    assert failure_message(run) is not None
+    Requiring `turn.completed` would make the harness depend on a diagnostic
+    event's NAME: a codex release that renamed it would turn every successful
+    call -- verdict written to the `-o` file, exit 0 -- into a failure, get it
+    retried at a second paid spawn, and record it as an error. That is the
+    most expensive way this module can be wrong, and it would happen to every
+    unit at once.
+    """
+    run = CodexRun(0, _events({"type": "turn.started"}), "", '{"verdict": "A"}')
+
+    assert failure_message(run) is None
 
 
-def test_a_completed_turn_on_exit_zero_is_the_only_success():
+def test_a_non_zero_exit_with_no_failed_turn_still_reports_the_stderr():
+    """The status is gone, so the message has to carry something actionable.
+    Classified generically rather than guessed at -- see the auth rule."""
+    run = CodexRun(3, _events({"type": "turn.started"}), "boom", "")
+
+    message = failure_message(run)
+
+    assert message is not None and "boom" in message
+    assert isinstance(classify_failure(message), CodexCallFailed)
+
+
+def test_a_completed_turn_on_exit_zero_is_success():
     assert failure_message(CodexRun(0, _events(_completed()), "", "ok")) is None
 
 
@@ -449,6 +469,110 @@ def test_calls_count_before_the_wire_and_missing_usage_is_counted_not_dropped(
     assert totals["calls_without_usage"] == 1
     # Nothing is ever minted on this backend.
     assert totals["auth_refreshes"] == 0
+
+
+def test_a_run_that_never_completed_a_turn_is_not_counted_as_unreadable_usage(
+    monkeypatch, judge_home: Path, codex_bin: Path
+):
+    """`calls_without_usage` means "your token TOTAL is short", and nothing else.
+
+    A 401 has no usage to read rather than usage that could not be read, so
+    counting it here would bury the one signal this counter carries under
+    every auth failure and every dead endpoint. `calls` already counts the
+    attempt.
+    """
+    totals = new_usage_totals()
+    _install(
+        monkeypatch,
+        [CodexRun(1, _events(_failed("unexpected status 401 Unauthorized")), "", "")],
+    )
+    complete = codex_completion(
+        PINNED, codex_bin=str(codex_bin), codex_home=str(judge_home),
+        usage_totals=totals,
+    )
+
+    with pytest.raises(CodexAuthFailure):
+        complete("prompt")
+
+    assert totals["calls"] == 1
+    assert totals["calls_without_usage"] == 0
+
+
+def test_the_reasoning_effort_reaches_the_argv_and_not_only_the_record(
+    monkeypatch, judge_home: Path, codex_bin: Path
+):
+    """The record claims what was SENT, so the effort has to actually go out.
+
+    A closure built without it runs at the model's default while every line
+    says `model_reasoning_effort: high` -- and the value parses, so nothing
+    downstream can tell. This asserts the wire, which is the half a test
+    driving an injected seam can never see.
+    """
+    fake = _install(monkeypatch, [CodexRun(0, _events(_completed()), "", "ok")])
+    complete = codex_completion(
+        PINNED, codex_bin=str(codex_bin), codex_home=str(judge_home),
+        reasoning_effort="high",
+    )
+
+    complete("prompt")
+
+    (call,) = fake.calls
+    assert 'model_reasoning_effort="high"' in call["argv"]
+
+
+def test_the_first_concurrent_calls_cannot_read_a_half_filled_resolution(
+    monkeypatch, judge_home: Path, codex_bin: Path
+):
+    """Resolution is atomic, not key-by-key.
+
+    Unguarded, a second thread sees a non-empty dict, concludes the work is
+    done, and reads `resolved["home"]` one statement before it exists -- one
+    paid unit dying on a `KeyError` that says nothing true about the seat or
+    the collection, and charging the breaker for it. `--concurrency` submits
+    the first prompts of a batch together, so this is the ordinary first wave
+    rather than an exotic race.
+    """
+    run = CodexRun(0, _events(_completed(1, 1)), "", "ok")
+    monkeypatch.setattr(codex_judge, "_run_codex", lambda *a, **k: run)
+    complete = codex_completion(
+        PINNED, codex_bin=str(codex_bin), codex_home=str(judge_home)
+    )
+    errors: list[BaseException] = []
+
+    def hammer():
+        try:
+            for _ in range(40):
+                complete("p")
+        except BaseException as exc:  # noqa: BLE001 - the point of the test
+            errors.append(exc)
+
+    threads = [threading.Thread(target=hammer) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+
+
+def test_the_backoff_never_waits_longer_than_the_cap_it_advertises(
+    monkeypatch, judge_home: Path, codex_bin: Path
+):
+    """The cap is applied AFTER the jitter. Capping first lets the multiplier
+    carry the wait half again past the ceiling the constant names."""
+    limited = CodexRun(1, _events(_failed("unexpected status 429")), "", "")
+    _install(monkeypatch, [limited] * (CODEX_RATE_LIMIT_RETRIES + 1))
+    waits: list[float] = []
+    complete = codex_completion(
+        PINNED, codex_bin=str(codex_bin), codex_home=str(judge_home),
+        sleep=waits.append,
+    )
+
+    with pytest.raises(CodexRateLimited):
+        complete("prompt")
+
+    assert waits
+    assert max(waits) <= codex_judge.CODEX_RATE_LIMIT_CAP_S
 
 
 def test_a_failed_call_still_counts_because_it_may_have_been_billed(
