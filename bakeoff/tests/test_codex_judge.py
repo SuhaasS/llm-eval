@@ -103,7 +103,11 @@ class _FakeCodex:
         self.calls.append(
             {"argv": argv, "prompt": prompt, "env": env, "timeout_s": timeout_s}
         )
-        if isinstance(outcome, Exception):
+        # `BaseException`, not `Exception`: a scripted `KeyboardInterrupt` is
+        # not an `Exception`, and the narrower test RETURNED it as if it were
+        # a CodexRun -- a fake that answers the interrupt path with an object
+        # the code under test then reads token counts off.
+        if isinstance(outcome, BaseException):
             raise outcome
         return outcome
 
@@ -965,6 +969,38 @@ def test_a_timeout_still_folds_the_usage_the_stream_already_reported(
     assert totals["completion_tokens"] == 30
 
 
+def test_an_interrupted_call_folds_the_spend_before_the_exception_propagates(
+    monkeypatch, judge_home: Path, codex_bin: Path
+):
+    """Ctrl-C is the timeout defect on the adjacent escape.
+
+    A turn that completed and reported its usage was billed for it; a
+    KeyboardInterrupt out of `communicate` re-raised with nothing folded, so
+    the operator's own Ctrl-C silently shortened the total it was about to
+    print. The exception itself must reach the caller unchanged -- an
+    interrupt that got swallowed into a per-unit failure would keep the pass
+    running.
+    """
+    totals = new_usage_totals()
+    interrupted = KeyboardInterrupt()
+    interrupted.events = _events(_completed(900, 40))
+    _install(monkeypatch, [interrupted])
+    complete = codex_completion(
+        PINNED, codex_bin=str(codex_bin), codex_home=str(judge_home),
+        usage_totals=totals,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        complete("prompt")
+
+    assert totals["calls"] == 1
+    assert totals["prompt_tokens"] == 900
+    assert totals["completion_tokens"] == 40
+    # An interrupted run is a FAILED one: it has no usage to read rather than
+    # usage that could not be read, so the under-count marker stays down.
+    assert totals["calls_without_usage"] == 0
+
+
 # --- cooperative shutdown ----------------------------------------------------
 
 
@@ -1148,6 +1184,97 @@ def test_any_escape_from_communicate_kills_the_process_group(
     else:
         os.kill(child_pid, signal.SIGKILL)
         pytest.fail("the child survived the escape from communicate")
+
+
+def test_an_interrupt_recovers_the_stdout_the_child_already_wrote(
+    tmp_path: Path,
+):
+    """The kill is not the end of the obligation -- the pipe still holds spend.
+
+    A child that reported a completed turn and was then interrupted has
+    already billed for it. The timeout path recovers that stdout; this one
+    re-raised with the pipe unread, so the tokens went nowhere. Recovery is
+    BOUNDED, because `_kill_group`'s fallback kills only the leader and a
+    surviving codex helper holding the pipe would hang an unbounded
+    `communicate` on a thread the interpreter joins at exit.
+    """
+    import subprocess as _subprocess
+
+    marker = tmp_path / "child-wrote"
+    binary = tmp_path / "codex"
+    binary.write_text(
+        "#!/bin/sh\n"
+        f"echo '{json.dumps(_completed(900, 40))}'\n"
+        f"touch {marker}\n"
+        "sleep 300\n"
+    )
+    binary.chmod(0o755)
+
+    timeouts: list = []
+    real_communicate = _subprocess.Popen.communicate
+
+    def interrupted(self, *args, **kwargs):
+        if timeouts:
+            # The recovery call, which must be bounded.
+            timeouts.append(kwargs.get("timeout"))
+            return real_communicate(self, **kwargs)
+        deadline = time.monotonic() + 5.0
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        timeouts.append(kwargs.get("timeout"))
+        raise KeyboardInterrupt
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(_subprocess.Popen, "communicate", interrupted)
+        with pytest.raises(KeyboardInterrupt) as caught:
+            codex_judge._run_codex(
+                [str(binary)], "prompt", dict(os.environ), 60.0,
+                tmp_path / "out.txt",
+            )
+
+    assert usage_from_events(getattr(caught.value, "events", ())).counts == {
+        "prompt_tokens": 900,
+        "completion_tokens": 40,
+        "total_tokens": 940,
+    }
+    recovery_timeout = timeouts[-1]
+    assert recovery_timeout is not None, "the recovery communicate was unbounded"
+    assert recovery_timeout <= 30, "the recovery must be seconds, not the call's"
+
+
+def test_a_failed_recovery_still_propagates_the_original_interrupt(
+    tmp_path: Path,
+):
+    """The recovery may never mask what it was recovering from.
+
+    Whatever the killed child's pipes do next, the operator asked for a
+    Ctrl-C: an `OSError` from the recovery read reaching the caller in its
+    place would report a plumbing fault for a deliberate act, and the pass
+    would abort on the wrong story.
+    """
+    import subprocess as _subprocess
+
+    binary = tmp_path / "codex"
+    binary.write_text("#!/bin/sh\nsleep 300\n")
+    binary.chmod(0o755)
+
+    calls: list[int] = []
+
+    def interrupted(self, *args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise KeyboardInterrupt
+        raise OSError("the pipe is gone")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(_subprocess.Popen, "communicate", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            codex_judge._run_codex(
+                [str(binary)], "prompt", dict(os.environ), 60.0,
+                tmp_path / "out.txt",
+            )
+
+    assert len(calls) == 2, "the recovery was never attempted"
 
 
 def test_undecodable_output_never_discards_a_paid_verdict(tmp_path: Path):

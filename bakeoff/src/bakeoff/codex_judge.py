@@ -158,6 +158,13 @@ CODEX_RATE_LIMIT_RETRIES = 5
 CODEX_RATE_LIMIT_BASE_S = 30.0
 CODEX_RATE_LIMIT_CAP_S = 480.0
 
+#: How long a KILLED child's pipes are read for before the escaping exception
+#: is re-raised. SECONDS, because the escape it exists for is a Ctrl-C: the
+#: operator asked for this to end, and the tokens being recovered are an
+#: accounting detail rather than a reason to keep them waiting. The timeout
+#: path affords 30s for the same read because nobody is standing there.
+CODEX_INTERRUPT_RECOVERY_S = 5.0
+
 #: The sandbox the judge runs under, recorded into `judge_harness`. Read-only
 #: rather than `danger-full-access`: the scratch dir is empty and the judge has
 #: nothing to do with a filesystem, so anything the agent layer tries to read
@@ -254,13 +261,18 @@ class CodexRateLimited(RuntimeError):
 class CodexCallFailed(RuntimeError):
     """Any other non-zero exit, timeout, or failed turn. Per-unit.
 
-    The TIMEOUT path attaches an `events` tuple: that raise is the one place
-    a paid stream is carried out of `_run_codex` without a `CodexRun` around
-    it, and the usage block in it has to survive the raise or the total goes
-    wrong in the low direction. Set on the instance rather than through
-    `__init__` because every other raise site has no stream to offer, so the
-    reader takes `getattr(exc, "events", ())` and an absent attribute means
-    "nothing was recovered" rather than a parameter each site must repeat.
+    The TIMEOUT path attaches an `events` tuple: a paid stream carried out of
+    `_run_codex` without a `CodexRun` around it, whose usage block has to
+    survive the raise or the total goes wrong in the low direction. Set on the
+    instance rather than through `__init__` because every other raise site has
+    no stream to offer, so the reader takes `getattr(exc, "events", ())` and an
+    absent attribute means "nothing was recovered" rather than a parameter each
+    site must repeat.
+
+    The INTERRUPT path attaches the same attribute to whatever escaped
+    `communicate` -- a `KeyboardInterrupt` is not a `CodexCallFailed` and never
+    becomes one, so the convention rather than this class is what the reader
+    keys on.
     """
 
 
@@ -470,6 +482,12 @@ def _run_codex(
     leave a detached `codex exec` billing the seat with nothing left enforcing
     the timeout, because `Popen.__exit__` assumes the SIGINT was delivered and
     waits a quarter of a second on that assumption.
+
+    EVERY escape also recovers the pipe before it re-raises, and attaches what
+    it parsed as `exc.events`. Killing the child does not un-bill the turn it
+    already reported, so an escape that dropped that block would leave the
+    pass's total short -- the one direction it may never be wrong in. Both
+    recoveries are bounded; see `CODEX_INTERRUPT_RECOVERY_S`.
     """
     with subprocess.Popen(
         argv,
@@ -512,7 +530,7 @@ def _run_codex(
             # total wrong in the one direction a spend figure must never be.
             exc.events = parse_events(stdout)
             raise exc from None
-        except BaseException:
+        except BaseException as exc:
             # Ctrl-C above all. The child is in its own session, so the
             # terminal's SIGINT never reached it -- and Popen.__exit__
             # assumes it did: on KeyboardInterrupt it waits a fraction of a
@@ -521,6 +539,28 @@ def _run_codex(
             # blocks in an untimed wait(). Killing the group here is the only
             # thing that makes either path end.
             _kill_group(process)
+            try:
+                # The pipe can already hold a turn.completed block: a turn
+                # that finished and reported its spend before the operator hit
+                # Ctrl-C. Those tokens were billed, so re-raising with the pipe
+                # unread is the timeout path's dropped-spend defect on the
+                # adjacent escape. Bounded for the timeout path's reason --
+                # `_kill_group`'s fallback kills only the leader, and a
+                # surviving helper holding the pipe would hang an unbounded
+                # `communicate()` on a thread the interpreter joins at exit.
+                #
+                # `BaseException` on the inner handler, not `Exception`: a
+                # SECOND Ctrl-C landing inside the recovery is exactly the
+                # thing that would otherwise replace the interrupt the caller
+                # is being told about. Nothing here may change what propagates
+                # -- the recovery is a best effort at an accounting detail,
+                # and the exception is the operator's actual request.
+                stdout, _ = process.communicate(
+                    timeout=CODEX_INTERRUPT_RECOVERY_S
+                )
+                exc.events = parse_events(stdout)
+            except BaseException:  # noqa: BLE001 - see above; never masks
+                pass
             raise
         exit_code = process.returncode
 
@@ -1137,6 +1177,24 @@ def _attempt_once(
                 ))
                 last = exc
                 continue
+            except BaseException as exc:  # the interrupt path
+                # Same rule, adjacent escape: `_run_codex` recovered whatever
+                # the killed child had already reported, and those tokens were
+                # billed. The exception is NOT converted into a failure -- a
+                # Ctrl-C swallowed into a per-unit error would leave the pass
+                # running -- so this folds and re-raises unchanged.
+                _fold_usage(usage_totals, CodexRun(
+                    # 130 is SIGINT's conventional exit code, and any non-zero
+                    # value marks the run FAILED for `_fold_usage`'s outcome
+                    # test: the fold takes the tokens and never the
+                    # calls_without_usage bump, because an interrupted run has
+                    # no usage to read rather than usage that could not be read.
+                    exit_code=130,
+                    events=getattr(exc, "events", ()),
+                    stderr="",
+                    last_message="",
+                ))
+                raise
 
             _fold_usage(usage_totals, run)
             message = failure_message(run)
