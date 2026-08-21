@@ -1795,7 +1795,7 @@ def judge_event_log(event_log_root, tasks, *,
 
     # The two selection filters, read HERE rather than at the worklist walk,
     # because the read loop below is the first thing that can be narrowed by
-    # them. `wanted_samples` cannot narrow it -- see the boundary comment there.
+    # them. `wanted_samples` cannot narrow it -- see the boundary comment.
     wanted_tasks = None if only_tasks is None else set(only_tasks)
     wanted_samples = None if sample_indices is None else set(sample_indices)
 
@@ -1867,7 +1867,7 @@ def judge_event_log(event_log_root, tasks, *,
     # because the refusal covers every unit of the task and a task spreads over
     # as many cells as it has samples -- a check made per cell would refuse the
     # cells it had reached and judge the rest. See `_digest_check`.
-    refused: dict[str, str] = {}
+    refused: set[str] = set()
     for task_id in sorted({task_id for task_id, _ in cells}):
         task = by_task.get(task_id)
         if task is None:
@@ -1886,7 +1886,7 @@ def judge_event_log(event_log_root, tasks, *,
             warnings.append(unknown)
         if refusal is not None:
             errors.append(refusal)
-            refused[task_id] = refusal
+            refused.add(task_id)
 
     if wanted_tasks is not None:
         absent = sorted(wanted_tasks - {task_id for task_id, _ in cells})
@@ -2751,6 +2751,13 @@ def _inputs_for(cache: dict[str, PayloadInputs], record, grade: GradeRecord,
     return cache[record.run_id]
 
 
+def _named(values: list[str]) -> str:
+    if len(values) <= _MAX_NAMED:
+        return ", ".join(values)
+    rest = len(values) - _MAX_NAMED
+    return ", ".join(values[:_MAX_NAMED]) + f", and {rest} more"
+
+
 def _digest_check(task, graded: Sequence[tuple[str, GradeRecord]],
                   ) -> tuple[str | None, str | None]:
     """Was every gating grade for this task taken against the manifest THIS
@@ -2774,11 +2781,12 @@ def _digest_check(task, graded: Sequence[tuple[str, GradeRecord]],
     numbers says which side moved, and BOTH remedies, because either end can
     be brought back to the other.
 
-    AN ABSENT DIGEST IS UNKNOWN, NOT A MISMATCH. `graded_against_manifest_digest`
-    defaults to `""`, so a grade written before the field existed carries none,
-    and a task stand-in can carry none either -- refusing on that would refuse
-    a collection over a fact nobody recorded, while judging on it silently
-    would claim a check that never ran. It warns and proceeds, and the two
+    AN ABSENT DIGEST IS UNKNOWN, NOT A MISMATCH. The grade's
+    `graded_against_manifest_digest` defaults to `""`, so a grade written
+    before the field existed carries none, and a task can carry none either --
+    refusing on that would refuse a collection over a fact nobody recorded,
+    while judging on it silently would claim a check that never ran. It warns
+    and proceeds on either absence, and the two
     absences are worded apart: which SIDE could not answer is the whole content
     of the warning, and one phrase over both would send an operator to the
     wrong file.
@@ -2788,9 +2796,13 @@ def _digest_check(task, graded: Sequence[tuple[str, GradeRecord]],
     unchecked: list[str] = []
     for run_id, grade in graded:
         seen = getattr(grade, "graded_against_manifest_digest", "") or ""
-        if not seen:
+        # EITHER side absent is unchecked. A missing `expected` with a digest
+        # on every grade line is the same "do not know" as the reverse, and
+        # counting it in neither list is how a check reports a clean pass
+        # over a comparison it never made.
+        if not seen or not expected:
             unchecked.append(run_id)
-        elif expected and seen != expected:
+        elif seen != expected:
             mismatched.setdefault(seen, []).append(run_id)
 
     refusal = None
@@ -2836,13 +2848,6 @@ def _digest_check(task, graded: Sequence[tuple[str, GradeRecord]],
             "Re-grading under the current grader records it."
         )
     return refusal, unknown
-
-
-def _named(values: list[str]) -> str:
-    if len(values) <= _MAX_NAMED:
-        return ", ".join(values)
-    rest = len(values) - _MAX_NAMED
-    return ", ".join(values[:_MAX_NAMED]) + f", and {rest} more"
 
 
 def _judge_generation(judgment: JudgeRecord) -> tuple:

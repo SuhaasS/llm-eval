@@ -1216,6 +1216,37 @@ def test_a_grade_line_naming_no_manifest_digest_is_unknown_and_not_a_mismatch(
     assert fake.calls == 4
 
 
+def test_a_task_carrying_no_digest_is_the_other_unknown_and_says_so(tmp_path):
+    """The absence on the OTHER side, which the first draft counted in
+    neither bucket and therefore reported as a clean check.
+
+    A task with no `manifest_digest` cannot be compared against, whatever the
+    grade lines carry -- and the warning has to say which side could not
+    answer, because the two absences send an operator to different files.
+    """
+    root = _two_tasks(
+        tmp_path,
+        [
+            _grade("run-a", task_id="calc-1", model="model-one"),
+            _grade("run-b", task_id="calc-1", model="model-two"),
+            _grade("run-c", task_id="calc-2", model="model-one"),
+            _grade("run-d", task_id="calc-2", model="model-two"),
+        ],
+    )
+
+    result = _run(
+        root,
+        [_task("calc-1", manifest_digest=""), _task("calc-2")],
+        rubric=False,
+    )
+
+    (warning,) = [w for w in result["warnings"] if "digest" in w]
+    assert "calc-1" in warning
+    assert "the loaded task carries no" in warning
+    assert result["errors"] == []
+    assert {j.task_id for j in _lines(root)} == {"calc-1", "calc-2"}
+
+
 def test_a_grade_taken_against_the_loaded_manifest_says_nothing_at_all(
     tmp_path,
 ):
