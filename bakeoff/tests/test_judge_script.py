@@ -3805,6 +3805,76 @@ def test_a_vote_supersedes_the_gate_line_for_its_pair_inside_its_own_block():
     assert summary["superseded_gate_decided"] == 1
 
 
+def _superseded_in_two_blocks() -> list[JudgeRecord]:
+    """ONE gate-decided line on disk, superseded by votes in each of the two
+    effort blocks it joins under rule 4."""
+    return [
+        _codex_gate("run-a", "run-b", "b"),
+        _codex_vote("run-a", "run-b", "a", vote_index=0),
+        _codex_vote("run-a", "run-b", "a", vote_index=1),
+        _codex_vote("run-a", "run-b", "a", vote_index=0, effort={}),
+        _codex_vote("run-a", "run-b", "a", vote_index=1, effort={}),
+    ]
+
+
+def test_a_gate_decided_line_superseded_in_two_blocks_is_still_one_line():
+    """`superseded_gate_decided` is counted in LINES, because that is the word
+    the printout uses and the number a reader checks against the file.
+
+    Rule 4 hands the same gate-decided line to every effort block sharing its
+    oracle triple, so a per-block tally reported 2 for a collection holding
+    exactly one such line -- a surplus with the same arithmetic as the
+    39-served/42-captured wire surplus and, like it, a different cause than
+    the printed sentence claims. An operator who greps the judgment file for
+    gate-decided lines finds one.
+
+    The double-counting in the BLOCKS is correct and stays: they are two
+    readings reported side by side. This counter is not a block figure; it is
+    a census of the file, and it says how many of its lines were set aside.
+    """
+    summary = summarize(_superseded_in_two_blocks(), MODEL_OF)
+
+    high = _judge_gen(CODEX_JUDGE, effort="high")
+    default = _judge_gen(CODEX_JUDGE)
+    assert set(summary["comparisons"]) == {high, default}
+    for generation in (high, default):
+        row = summary["comparisons"][generation][("model-one", "model-two")]
+        assert row["voted"] == 1, generation
+        assert row["gate_decided"] == 0, generation
+    assert summary["lines"]["gate_decided"] == 1, "one line in the file"
+    assert summary["superseded_gate_decided"] == 1
+
+
+def test_superseded_votes_counts_every_line_the_newer_gate_line_outdates():
+    """The other counter is in lines too, and it needs no de-duplication: a
+    vote line carries its own effort, so it lands in exactly ONE block and is
+    tallied once wherever the walk meets it.
+
+    The asymmetry is the whole reason the two counters are computed
+    differently -- summing per block is right for votes and wrong for gate
+    lines -- so the vote side is pinned at the line count of a two-effort
+    collection rather than left to be read off the gate side's rule.
+    """
+    old = {"run-a": "1", "run-b": "1"}
+    judgments = [
+        _codex_vote("run-a", "run-b", "a", vote_index=0,
+                    grade_version_seen=dict(old)),
+        _codex_vote("run-a", "run-b", "a", vote_index=1,
+                    grade_version_seen=dict(old)),
+        _codex_vote("run-a", "run-b", "a", vote_index=0, effort={},
+                    grade_version_seen=dict(old)),
+        _codex_vote("run-a", "run-b", "a", vote_index=1, effort={},
+                    grade_version_seen=dict(old)),
+        _codex_gate("run-a", "run-b", "b",
+                    grade_version_seen={"run-a": "2", "run-b": "2"}),
+    ]
+
+    summary = summarize(judgments, MODEL_OF)
+
+    assert summary["superseded_votes"] == 4, "four lines, four paid calls"
+    assert summary["superseded_gate_decided"] == 0
+
+
 def test_a_collection_the_ladder_settled_entirely_is_one_block_not_none():
     """The other end of the same rule: with no vote line anywhere carrying
     that judge, prompt and rubric, the gate lines are the only reading there
@@ -5786,6 +5856,22 @@ def test_the_summary_mentions_a_superseded_gate_decided_line_when_there_is_one(
     out = capsys.readouterr().out
     assert "superseded" in out.lower()
     assert "1 gate-decided line" in out
+
+
+def test_the_printed_gate_decided_count_is_lines_not_block_incidences(capsys):
+    """The printed sentence says "gate-decided line(s)", so the number beside
+    it has to be lines. A collection judged at two efforts holds ONE such line
+    and used to print 2 -- a figure describing block incidences under a
+    sentence describing the file, which is the shape of surplus a reader
+    reconciles against `grep -c` and cannot explain."""
+    result = _empty_result()
+    result["summary"] = summarize(_superseded_in_two_blocks(), MODEL_OF)
+
+    print_summary(result)
+
+    out = capsys.readouterr().out
+    assert "1 gate-decided line" in out
+    assert "2 gate-decided line" not in out
 
 
 def test_the_summary_mentions_superseded_votes_when_the_gate_line_is_newer(

@@ -3677,6 +3677,11 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
        `superseded_gate_decided` one way, `superseded_votes` the other. The
        file is append-only, so the disagreement is the finding, and votes left
        out of a rate are paid calls missing from a denominator.
+
+       Both tallies are in LINES, which is the word the printout uses, and the
+       gate side is deduplicated across the effort blocks rule 4 hands one
+       gate-decided line to: counted per block, a collection judged at two
+       efforts reported two supersessions of the one line it holds.
     3. **`gate_decided` never enters the vote verdict distribution.** It is the
        one verdict no model produced. Inside the distribution it is a fourth
        thing the judge said, and every rate off that denominator is wrong by
@@ -3829,7 +3834,22 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
              _grade_generation(judgment))
         )
 
-    superseded = 0
+    # BOTH COUNTERS ARE IN LINES, because "line(s)" is the word the printout
+    # puts beside each of them and a census figure a reader cannot reconcile
+    # against the file is worse than no figure.
+    #
+    # They are accumulated differently, and the asymmetry is rule 4's: a vote
+    # line carries its own effort and lands in exactly ONE block, so summing
+    # per block already counts it once; a gate-decided line joins every block
+    # sharing its oracle triple, so the same sum reported 2 for a collection
+    # judged at two efforts that holds exactly one such line on disk. The gate
+    # side is therefore a SET of buckets -- one entry per line -- and a line
+    # superseded in any block it joins is a line that was set aside.
+    #
+    # The blocks themselves still double-count that line, which is correct and
+    # is rule 4's whole point: they are readings reported side by side and are
+    # never summed. These counters are not block figures.
+    superseded_gate_lines: set[tuple] = set()
     superseded_votes = 0
     # Rule 4: keyed on the generation FIRST. Both walks below stay inside one
     # oracle's verdicts, so neither a comparison count nor a rating fit can
@@ -3896,7 +3916,9 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
         )
         if vote_lines and not outdated:
             if gate is not None:
-                superseded += 1
+                # The BUCKET, not a counter: one entry per gate-decided line,
+                # however many effort blocks that line joined.
+                superseded_gate_lines.add(_gate_bucket(key))
             # `majority` cannot see an empty sequence here: the bucket exists
             # only because a vote line landed in it.
             winner = majority([
@@ -3908,7 +3930,9 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
             if outdated:
                 # PER LINE, matching the phrase the printout uses: these are
                 # paid calls left out of a rate, and a comparison count would
-                # understate what the reader is missing.
+                # understate what the reader is missing. Summing per block is
+                # safe HERE and only here -- a vote line carries its own
+                # effort, so it sits in one block and is met once.
                 superseded_votes += len(vote_lines)
             winner = gate.gate_decided_by
             settled = "gate_decided"
@@ -4142,7 +4166,9 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
             )
             for generation in _deterministic(consistency)
         },
-        "superseded_gate_decided": superseded,
+        # Gate-decided LINES set aside by votes, counted once each however
+        # many effort blocks the line joined -- see `superseded_gate_lines`.
+        "superseded_gate_decided": len(superseded_gate_lines),
         # Rule 2's other direction, in vote LINES: paid calls the newer ladder
         # result left out of every rate above.
         "superseded_votes": superseded_votes,
