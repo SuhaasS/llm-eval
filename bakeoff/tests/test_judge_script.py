@@ -3467,6 +3467,100 @@ def test_a_superseded_gate_decided_line_is_reported_even_when_it_agrees():
     assert summarize(judgments, MODEL_OF)["superseded_gate_decided"] == 1
 
 
+def test_a_gate_decided_line_from_a_newer_grade_beats_the_votes_it_outdates():
+    """Rule 2 is a claim about DIRECTION, and the direction is not free.
+
+    The votes are usually the later, richer verdict -- a re-grade flips the
+    losing side, the pair becomes judgeable, and the votes are bought against
+    the newer grade. But the arrow reverses: re-grade a passing side to
+    FAILED and the pair the judge voted on becomes one the ladder settles, so
+    the newer line is the gate-decided one and the votes on disk were bought
+    against a grade that no longer stands. Preferring votes unconditionally
+    ranked an arm on a verdict about a submission the ladder now rejects.
+
+    So the comparison is settled by the ladder, and the discarded votes are
+    TALLIED rather than dropped in silence -- `superseded_gate_decided`'s
+    argument, in the other direction.
+    """
+    judgments = [
+        _vote("run-a", "run-b", "a", vote_index=0,
+              grade_version_seen={"run-a": "1", "run-b": "1"}),
+        _vote("run-a", "run-b", "a", vote_index=1,
+              grade_version_seen={"run-a": "1", "run-b": "1"}),
+        _gate("run-a", "run-b", "b",
+              grade_version_seen={"run-a": "2", "run-b": "2"}),
+    ]
+
+    summary = summarize(judgments, MODEL_OF)
+
+    row = summary["comparisons"][_judge_gen()][("model-one", "model-two")]
+    assert row["comparisons"] == 1
+    assert row["gate_decided"] == 1
+    assert row["voted"] == 0
+    # The ladder said b, the stale votes said a. The ladder is what stands.
+    assert (row["wins_x"], row["wins_y"], row["ties"]) == (0, 1, 0)
+    assert summary["superseded_votes"] == 2
+    assert summary["superseded_gate_decided"] == 0
+
+
+def test_votes_gated_on_the_same_grade_generation_still_beat_a_gate_line():
+    """The ordinary case, pinned so the new direction cannot swallow it.
+
+    Same grade generation on both lines means the gate-decided line is not
+    newer, and a tie goes to the votes: they are the richer verdict and the
+    only one a judge produced. This is the re-grade that flipped a FAILED
+    side to passing -- the pair became judgeable and was voted on, under the
+    same grader as the gate line before it.
+    """
+    judgments = [
+        _gate("run-a", "run-b", "b",
+              grade_version_seen={"run-a": "2", "run-b": "2"}),
+        _vote("run-a", "run-b", "a", vote_index=0,
+              grade_version_seen={"run-a": "2", "run-b": "2"}),
+        _vote("run-a", "run-b", "a", vote_index=1,
+              grade_version_seen={"run-a": "2", "run-b": "2"}),
+    ]
+
+    summary = summarize(judgments, MODEL_OF)
+
+    row = summary["comparisons"][_judge_gen()][("model-one", "model-two")]
+    assert row["voted"] == 1
+    assert row["gate_decided"] == 0
+    assert (row["wins_x"], row["wins_y"], row["ties"]) == (1, 0, 0)
+    assert summary["superseded_gate_decided"] == 1
+    assert summary["superseded_votes"] == 0
+
+
+def test_grade_generations_that_cannot_be_compared_leave_the_votes_in_front():
+    """`grade_version_seen` is empty on every line written before it existed,
+    and a `grader_version` is a string nothing constrains to a number. An
+    unreadable or absent generation is not evidence the gate line is newer,
+    so the preference falls back to the votes rather than to whichever side
+    the parse happened to fail on.
+
+    `judged_at` is deliberately NOT the fallback. It orders wall clocks, not
+    grade generations: a gate line appended later against an older grade file
+    -- a resume beside a copied `grades.jsonl`, a second machine -- would read
+    as newer and discard votes nothing outdated.
+    """
+    judgments = [
+        _gate("run-a", "run-b", "b", judged_at="2027-01-01T00:00:00Z",
+              grade_version_seen={"run-a": "2.1", "run-b": "2.1"}),
+        _vote("run-a", "run-b", "a", vote_index=0,
+              judged_at="2026-01-01T00:00:00Z"),
+        _vote("run-a", "run-b", "a", vote_index=1,
+              judged_at="2026-01-01T00:00:00Z"),
+    ]
+
+    summary = summarize(judgments, MODEL_OF)
+
+    row = summary["comparisons"][_judge_gen()][("model-one", "model-two")]
+    assert row["voted"] == 1
+    assert row["gate_decided"] == 0
+    assert summary["superseded_gate_decided"] == 1
+    assert summary["superseded_votes"] == 0
+
+
 #: What `codex_sampling("high")` writes on a vote line. A gate-decided line
 #: carries `{}` -- nothing was sent -- which is the whole of what F2 was about.
 HIGH_EFFORT = {"model_reasoning_effort": "high"}
@@ -5569,6 +5663,31 @@ def test_the_summary_mentions_a_superseded_gate_decided_line_when_there_is_one(
     out = capsys.readouterr().out
     assert "superseded" in out.lower()
     assert "1 gate-decided line" in out
+
+
+def test_the_summary_mentions_superseded_votes_when_the_gate_line_is_newer(
+    capsys,
+):
+    """The other direction is a finding too, and a louder one: it means paid
+    votes were left out of the numbers. Counted in the summary and silent on
+    the terminal, an operator would see a smaller voted denominator with
+    nothing saying where it went."""
+    result = _empty_result()
+    result["summary"] = summarize(
+        [
+            _vote("run-a", "run-b", "a", vote_index=0,
+                  grade_version_seen={"run-a": "1", "run-b": "1"}),
+            _gate("run-a", "run-b", "b",
+                  grade_version_seen={"run-a": "2", "run-b": "2"}),
+        ],
+        MODEL_OF,
+    )
+
+    print_summary(result)
+
+    out = capsys.readouterr().out
+    assert "1 vote line" in out
+    assert "re-grade" in out.lower()
 
 
 def test_the_summary_says_nothing_about_superseding_when_nothing_was(capsys):

@@ -2940,6 +2940,58 @@ def _comparison_key(judgment: JudgeRecord) -> tuple:
     ) + _judge_generation(judgment)
 
 
+def _grade_generation(judgment: JudgeRecord) -> dict[str, int] | None:
+    """WHICH GRADE GENERATION a line was gated on, as `run_id -> int`, or
+    `None` when this line cannot answer.
+
+    `grade_version_seen` is the field a verdict names its gate by, and
+    `GRADER_VERSION` is a monotonic counter kept as a string ("1" -> "2" when
+    `_refresh_index` changed what check 5 MEANS). Read as an integer, two
+    lines' generations are ordered; read as strings they are not -- "10" sorts
+    before "9" -- which is why this parses rather than compares.
+
+    `None` for three real states, all of them "do not know": no map at all (a
+    hand-edited `null`, or any line written before the field existed), an
+    empty map, and a version this reader cannot order (a future
+    `grader_version` of "2.1", or a commit). Every one of them must leave the
+    preference where it was rather than pick a side, because a parse failure
+    is not evidence about which line is newer -- see `_supersedes`.
+    """
+    seen = judgment.grade_version_seen or {}
+    if not seen:
+        return None
+    versions: dict[str, int] = {}
+    for run_id, version in seen.items():
+        try:
+            versions[run_id] = int(str(version).strip())
+        except (TypeError, ValueError):
+            return None
+    return versions
+
+
+def _supersedes(gate: dict[str, int] | None,
+                votes: dict[str, int] | None) -> bool:
+    """Is the gate-decided line's grade generation STRICTLY NEWER than the
+    generation these votes were bought under?
+
+    The whole content of rule 2's direction. Both maps must name the same two
+    runs -- they describe one comparison, so a different key set is a line
+    from somewhere else and is not comparable -- neither run may have gone
+    BACKWARDS, and at least one must have moved forward. Equal generations are
+    not newer, and the tie goes to the votes: they are the richer verdict and
+    the only one a judge produced.
+
+    `False` on every unknown, which is the safe direction and not an arbitrary
+    one: the votes are what the collection paid for, and discarding them needs
+    positive evidence that the grade under them no longer stands.
+    """
+    if not gate or not votes or set(gate) != set(votes):
+        return False
+    if any(gate[run_id] < votes[run_id] for run_id in gate):
+        return False
+    return any(gate[run_id] > votes[run_id] for run_id in gate)
+
+
 def _gate_bucket(key: tuple) -> tuple:
     """The bucket a GATE-DECIDED line is filed in: its comparison key with the
     reasoning effort dropped.
@@ -3569,14 +3621,37 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
        re-judge appends rather than replaces, so one vote can hold two lines
        under one identity. Aggregating both counts that vote twice, in whichever
        direction the earlier generation happened to point.
-    2. **Within one comparison, vote lines supersede a gate-decided line.** A
-       re-grade that flips the losing side turns a gate-decided pair into a
-       judgeable one, and the old gate-decided line stays on disk beside the
-       votes that came later. Counting both enters one comparison twice,
-       once for each side. The votes win -- they are the later, richer verdict
-       -- and the disagreement is TALLIED in `superseded_gate_decided` rather
-       than quietly resolved: the file is append-only, so the disagreement is
-       the finding.
+    2. **Within one comparison, the line gated on the NEWER grade wins, and a
+       tie goes to the votes.** A comparison can hold both kinds of line at
+       once, because the file is append-only and a re-grade changes which pairs
+       are judgeable. Counting both enters one comparison twice, once for each
+       side, so one of them has to give way -- and which one is a question
+       about the GRADES, not about the kinds of line.
+
+       Both directions happen. A re-grade that flips a failed side to passing
+       turns a gate-decided pair into a judgeable one, and the votes bought
+       afterwards are the later, richer verdict: they win. A re-grade that
+       flips a PASSING side to failed does the reverse -- the pair the judge
+       voted on becomes one the ladder settles, and the votes on disk were
+       bought against a grade that no longer stands. Preferring votes
+       unconditionally ranked an arm on a verdict about a submission the ladder
+       now rejects, under a docstring that asserted the direction rather than
+       checking it.
+
+       So the direction is MEASURED, off `grade_version_seen` -- the field
+       every line carries for exactly this purpose, mapping each run to the
+       `grader_version` that gated it (see `_grade_generation`, `_supersedes`).
+       The gate-decided line wins only when its grade generation is strictly
+       newer than the one the votes were bought under; equal, unreadable or
+       absent generations leave the votes in front. `judged_at` is deliberately
+       not consulted: it orders wall clocks rather than grade generations, and
+       a gate line appended later against an older grade file would read as
+       newer.
+
+       Whichever side gives way is TALLIED rather than quietly resolved --
+       `superseded_gate_decided` one way, `superseded_votes` the other. The
+       file is append-only, so the disagreement is the finding, and votes left
+       out of a rate are paid calls missing from a denominator.
     3. **`gate_decided` never enters the vote verdict distribution.** It is the
        one verdict no model produced. Inside the distribution it is a fourth
        thing the judge said, and every rate off that denominator is wrong by
@@ -3677,8 +3752,13 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
     }
 
     rubric_lines: list[JudgeRecord] = []
-    votes_by: dict[tuple, list[tuple[int, str]]] = {}
-    gate_by: dict[tuple, str] = {}
+    votes_by: dict[
+        tuple, list[tuple[int, str, str | None, dict[str, int] | None]]
+    ] = {}
+    # THE LINE, not its winner: rule 2 reads the grade generation off it as
+    # well as the side the ladder picked, and two structures holding one line's
+    # two fields drift apart on the day one of them is filled somewhere else.
+    gate_by: dict[tuple, JudgeRecord] = {}
     vote_verdicts: Counter = Counter()
 
     for judgment in deduped:
@@ -3694,7 +3774,7 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
             if judgment.gate_decided_by in ("a", "b"):
                 # Filed WITHOUT the effort -- see `_gate_bucket`. The line
                 # itself is unchanged on disk and resumes exactly as it did.
-                gate_by[_gate_bucket(key)] = judgment.gate_decided_by
+                gate_by[_gate_bucket(key)] = judgment
             else:
                 # A gate-decided line naming no winner settles nothing.
                 dropped["unreadable_verdict"] += 1
@@ -3712,12 +3792,20 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
         # `position_assignment` is nullable, and `sorted` over a tuple mixing
         # `None` with a string raises `TypeError`, which would take down the
         # summary of a paid batch over a field the ordering does not use.
+        #
+        # The GRADE GENERATION travels with it too, per line rather than per
+        # bucket: rule 2's direction is a question about the grade each vote
+        # was bought under, and a re-judge can leave one comparison holding
+        # votes from either side of a re-grade. Parsed here, once per line,
+        # where an unreadable one is already `None` by the time the walk asks.
         votes_by.setdefault(key, []).append(
             (judgment.vote_index if judgment.vote_index is not None else -1,
-             judgment.verdict, judgment.position_assignment)
+             judgment.verdict, judgment.position_assignment,
+             _grade_generation(judgment))
         )
 
     superseded = 0
+    superseded_votes = 0
     # Rule 4: keyed on the generation FIRST. Both walks below stay inside one
     # oracle's verdicts, so neither a comparison count nor a rating fit can
     # cross from one generation into another's numbers. Every structure filled
@@ -3770,18 +3858,34 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
     for key in _deterministic(walk):
         vote_lines = votes_by.get(key)
         gate = gate_by.get(_gate_bucket(key))
-        if vote_lines:
+        # Rule 2's direction, measured rather than assumed. The gate-decided
+        # line takes the comparison only when its grade generation is strictly
+        # newer than EVERY vote's: newer than the newest of them is newer than
+        # all, and `all` over the list says so without a max over values that
+        # need not be comparable. `False` whenever the gate line is absent,
+        # equal or unreadable, which is the direction the votes keep.
+        gate_versions = None if gate is None else _grade_generation(gate)
+        outdated = bool(vote_lines) and gate is not None and all(
+            _supersedes(gate_versions, versions)
+            for *_, versions in vote_lines
+        )
+        if vote_lines and not outdated:
             if gate is not None:
                 superseded += 1
             # `majority` cannot see an empty sequence here: the bucket exists
             # only because a vote line landed in it.
             winner = majority([
-                verdict for _, verdict, _ in
+                verdict for _, verdict, _, _ in
                 sorted(vote_lines, key=lambda line: line[:2])
             ])
             settled = "voted"
         else:
-            winner = gate
+            if outdated:
+                # PER LINE, matching the phrase the printout uses: these are
+                # paid calls left out of a rate, and a comparison count would
+                # understate what the reader is missing.
+                superseded_votes += len(vote_lines)
+            winner = gate.gate_decided_by
             settled = "gate_decided"
 
         run_id_a, run_id_b = key[2], key[3]
@@ -3838,6 +3942,11 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
         # happened to split, and three views of one position agreeing says
         # nothing about position at all. A gate-decided comparison has no
         # votes and so no positions, and is counted in no column.
+        #
+        # A comparison whose votes were superseded by a newer gate line still
+        # counts here, and deliberately: the probe asks whether the judge said
+        # the same thing in both orders, and it did or it did not. Which line
+        # settled the comparison is a different question, answered above.
         counts = consistency.setdefault(
             generation,
             {"measurable": 0, "consistent": 0, "single_position": 0,
@@ -3852,7 +3961,7 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
             # recorded -- a comparison marked inconsistent on the strength of a
             # line the measurable test had already excluded.
             placed = [
-                (verdict, position) for _, verdict, position in vote_lines
+                (verdict, position) for _, verdict, position, _ in vote_lines
                 if position in VOTE_POSITIONS
             ]
             positions = {position for _, position in placed}
@@ -4009,6 +4118,9 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
             for generation in _deterministic(consistency)
         },
         "superseded_gate_decided": superseded,
+        # Rule 2's other direction, in vote LINES: paid calls the newer ladder
+        # result left out of every rate above.
+        "superseded_votes": superseded_votes,
         "dropped": dropped,
     }
 
@@ -4635,6 +4747,18 @@ def _print_reading(result: dict) -> None:
             "losing side, making a pair the ladder had settled judgeable; the "
             "judgment file is append-only, so the older line stays on disk and "
             "the disagreement is the finding."
+        )
+    if summary["superseded_votes"]:
+        # THE OTHER DIRECTION, and the louder one: these are paid calls
+        # missing from a voted denominator. Reported in lines rather than in
+        # comparisons for exactly that reason.
+        print(
+            f"\n{summary['superseded_votes']} vote line(s) were SUPERSEDED by "
+            "a gate-decided line gated on a NEWER grade generation and left "
+            "out of the numbers above. The cause is a re-grade that flipped a "
+            "passing side to failed: a pair the judge had voted on is one the "
+            "ladder now settles, and those votes were bought against a grade "
+            "that no longer stands."
         )
     for reason, count in sorted(summary["dropped"].items()):
         if count:
