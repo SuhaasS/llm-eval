@@ -3021,6 +3021,19 @@ def _supersedes(gate: dict[str, int] | None,
     `False` on every unknown, which is the safe direction and not an arbitrary
     one: the votes are what the collection paid for, and discarding them needs
     positive evidence that the grade under them no longer stands.
+
+    THE BLIND SPOT, stated because it covers the most common deliberate
+    re-grade: the only signal here is `grade_version_seen` -> `GRADER_VERSION`,
+    and `GRADER_VERSION` does not move on a `--re-grade` at the same version.
+    `scripts/grade.py` skips an already-graded run unless `--re-grade` is
+    passed, and the re-grade it then performs APPENDS at the same
+    `GRADER_VERSION` -- so a re-grade run to pick up a fixed oracle, a rebuilt
+    image or a repaired environment, without a `GRADER_VERSION` bump, is
+    INVISIBLE to this check and leaves the votes in front even when the newer
+    grade flipped the pair. Closing it needs an orderable stamp on the
+    judgment line itself (a `graded_at`, which is a stored-shape change and a
+    `JUDGE_SCHEMA_VERSION` bump); it is filed in `TASKS.md` and is not fixed
+    here.
     """
     if not gate or not votes or set(gate) != set(votes):
         return False
@@ -3687,15 +3700,26 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
        now rejects, under a docstring that asserted the direction rather than
        checking it.
 
-       So the direction is MEASURED, off `grade_version_seen` -- the field
-       every line carries for exactly this purpose, mapping each run to the
-       `grader_version` that gated it (see `_grade_generation`, `_supersedes`).
-       The gate-decided line wins only when its grade generation is strictly
-       newer than the one the votes were bought under; equal, unreadable or
-       absent generations leave the votes in front. `judged_at` is deliberately
-       not consulted: it orders wall clocks rather than grade generations, and
-       a gate line appended later against an older grade file would read as
-       newer.
+       So the direction is READ OFF THE LINES rather than asserted -- from
+       `grade_version_seen`, the field every line carries for exactly this
+       purpose, mapping each run to the `grader_version` that gated it (see
+       `_grade_generation`, `_supersedes`). The gate-decided line wins only
+       when its grade generation is strictly newer than the one the votes were
+       bought under; equal, unreadable or absent generations leave the votes in
+       front. `judged_at` is deliberately not consulted: it orders wall clocks
+       rather than grade generations, and a gate line appended later against an
+       older grade file would read as newer.
+
+       What that measures is a `GRADER_VERSION` MOVE, and only that. It does
+       not measure "the grade changed": `scripts/grade.py` skips an
+       already-graded run unless `--re-grade`, and the re-grade then appends at
+       the SAME `GRADER_VERSION` -- so the most common deliberate re-grade, one
+       run to pick up a repaired oracle or image without a version bump, is
+       invisible to this check and leaves the votes in front. The direction
+       above is therefore correct whenever the grader version moved and silent
+       whenever it did not. Making a same-version re-grade orderable needs a
+       `graded_at` on the judgment line, which is a stored-shape change; it is
+       filed in `TASKS.md`.
 
        Whichever side gives way is TALLIED rather than quietly resolved --
        `superseded_gate_decided` one way, `superseded_votes` the other. The
@@ -4815,25 +4839,45 @@ def _print_reading(result: dict) -> None:
             )
 
     if summary["superseded_gate_decided"]:
+        # NOT "left out of the numbers above", which is what this said. A
+        # gate-decided line joins every effort block sharing its oracle triple
+        # (rule 4), and supersession is decided per block: the block whose
+        # votes cover the pair sets the line aside, and a block with no votes
+        # for that pair still settles it on this same line. The count is
+        # deduplicated across blocks, so one line met in two blocks is one
+        # here whether it lost one of them or both.
         print(
             f"\n{summary['superseded_gate_decided']} gate-decided line(s) were "
-            "SUPERSEDED by real votes for the same comparison and left out of "
-            "the numbers above. The usual cause is a re-grade that flipped the "
-            "losing side, making a pair the ladder had settled judgeable; the "
-            "judgment file is append-only, so the older line stays on disk and "
-            "the disagreement is the finding."
+            "SUPERSEDED by real votes for the same comparison and set aside in "
+            "at least one block above; a line the ladder settled for a pair no "
+            "block voted on still counts there. The usual cause is a re-grade "
+            "that flipped the losing side, making a pair the ladder had settled "
+            "judgeable; the judgment file is append-only, so the older line "
+            "stays on disk and the disagreement is the finding."
         )
     if summary["superseded_votes"]:
         # THE OTHER DIRECTION, and the louder one: these are paid calls
         # missing from a voted denominator. Reported in lines rather than in
         # comparisons for exactly that reason.
+        #
+        # And "left out of the numbers above" was too broad here too. What a
+        # superseded vote loses is the OUTCOME: the comparison is settled by
+        # the gate line, so the vote enters neither the win-rate matrix nor
+        # either Elo fit. The censuses that count lines rather than
+        # comparisons keep it -- `vote_verdicts` is tallied before this rule
+        # runs, and the position-consistency probe deliberately still reads
+        # these votes, because whether the judge said the same thing in both
+        # orders is a fact about the votes and not about which line settled
+        # the pair.
         print(
             f"\n{summary['superseded_votes']} vote line(s) were SUPERSEDED by "
-            "a gate-decided line gated on a NEWER grade generation and left "
-            "out of the numbers above. The cause is a re-grade that flipped a "
-            "passing side to failed: a pair the judge had voted on is one the "
-            "ladder now settles, and those votes were bought against a grade "
-            "that no longer stands."
+            "a gate-decided line gated on a NEWER grade generation: their "
+            "comparisons are settled by the ladder above, so those votes enter "
+            "no win rate and no Elo fit. They are still counted in the vote "
+            "verdict distribution and in the position-consistency probe. The "
+            "cause is a re-grade that flipped a passing side to failed: a pair "
+            "the judge had voted on is one the ladder now settles, and those "
+            "votes were bought against a grade that no longer stands."
         )
     for reason, count in sorted(summary["dropped"].items()):
         if count:

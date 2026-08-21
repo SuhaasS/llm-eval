@@ -2409,3 +2409,94 @@ real-process tests cover the kill and decode paths, but the seat, the real
 `codex exec` flag set, and whether `codex login` writes a `config.toml` into
 a fresh home (which would now refuse, loudly) are still live-run questions —
 V1–V9 of the codex-judge plan remain the gate before a paid pass.
+
+---
+
+## 2026-08-20 — Judge review round 2 (branch judge-review-fixes, 2698b08..HEAD)
+
+A 7-finder + adversarial-verify review of the judge implementation confirmed 10
+defects; all 10 were fixed across 4 plan tasks
+(`docs/superpowers/plans/2026-08-20-judge-review-round2.md`), each TDD'd and
+per-task reviewed, plus one whole-branch final review and its fix wave.
+
+- [x] **F1** `assert_neutral_judge`'s vendor rule was anchored
+      (`startswith("anthropic.")`), so `us.anthropic.opus-6` and
+      `bedrock/anthropic.opus-6` — the shapes Bedrock actually hands out — walked
+      past it. Now a substring test, and `sonnet`/`opus`/`haiku` joined the family
+      tokens so a re-host under a product name is refused too. The guard errs
+      toward refusal; `BAKEOFF_ALLOW_NON_NEUTRAL_JUDGE` is the escape.
+- [x] **F6** The verdict extractor took the FIRST balanced brace group and raised
+      `MalformedVerdict` if it was not JSON. At temperature 0 every retry
+      reproduces the reply, so braced prose in front of a valid verdict burned the
+      unit deterministically. It now rescans for the next balanced object on a
+      decode failure and raises only when none parses.
+- [x] **F7** `usage_from_events` returned on the LAST `turn.completed` only, so
+      earlier turns' tokens were dropped and an unreadable last block reported
+      `None` over readable earlier ones — spend wrong in the low direction, which
+      the module's own comments forbid. It now folds every readable block.
+- [x] **F9** `codex_environment` popped only `OPENAI_API_KEY`, so an inherited
+      `OPENAI_BASE_URL` rerouted judge calls while the record went on attesting
+      the seat. Every codex-honored provider variable is scrubbed.
+- [x] **F10** `_run_codex`'s Ctrl-C branch killed the process group and re-raised
+      with no recovery, discarding usage the stream had already reported — the
+      same low-direction defect the timeout branch had already been fixed for.
+      The interrupt path now folds recovered spend.
+- [x] **F5** `similarity`: `allow_extra_paths` files were not dropped from
+      `_kept_chunks`, inflating `file_overlap` and `diff_size_ratio` in every
+      payload the judge sees — a lexical path is never the path the manifest
+      drops, and the path feeds a filter, so it moved numbers rather than only
+      prose.
+- [x] **F8** The run-read loop read every graded run before `--only-task` /
+      `--samples` filtering, so one corrupt record forced exit 1 on passes that
+      never selected it. Reads are filtered first; a run no filter selected does
+      not decide the pass's exit code.
+- [x] **F4** `graded_against_manifest_digest` and `TaskManifest.manifest_digest`
+      were both held and never compared, so a task edited between grading and
+      judging silently anchored the payload to a different manifest than the gate.
+      Compared now — and the fix round closed the second half: a digest check with
+      nothing on one side used to report a clean pass.
+- [x] **F2** Gate-decided lines write `judge_sampling={}` (correct — nothing was
+      sent), so `_judge_generation` read their effort as `None` and a codex pass at
+      `--reasoning-effort high` split itself into two blocks. A gate-decided pair
+      now belongs to every block its oracle triple gates, and the fix round
+      deduplicated the supersession count across those blocks — one line printed as
+      two the moment a second effort existed.
+- [x] **F3** The vote-over-gate-decided preference was unconditional and its
+      docstring asserted the direction rather than checking it, so a NEWER
+      gate-decided line was discarded after a re-grade flipped a passing side to
+      failed. The direction is now read off `grade_version_seen`, both
+      supersessions are tallied, and the votes keep the tie.
+
+Final-review fix wave (this section's own commits): `_gate_bucket` /`_oracle_of`
+hand-counted the slice `_GENERATION_FIELDS` exists to stop — `_EFFORT_FIELDS`
+now holds both ends, with a pin that the effort is the LAST generation field
+(mutation-checked against both a widened slice and a reordered generation).
+`_gate_bucket`'s docstring cited a test that is not that pin, and now says so.
+`_supersedes` and rule 2 name the blind spot they have — a `--re-grade` at the
+same `GRADER_VERSION` is invisible to the direction check — and the
+over-claiming "MEASURED" phrasing is gone. `_print_reading`'s two supersession
+sentences both said "left out of the numbers above"; a gate line superseded in
+one block can still settle a pair in another, and superseded votes stay in
+`vote_verdicts` and in the position-consistency probe, so both now say what
+happens.
+
+Parked with reasons, filed in `TASKS.md` (P2 subsection plus one P3 decision):
+the bare `assert` in `_stored_payload_path` under `python -O`; the split
+key/value secret shape that passes both payload scans; the pre-append gate
+re-assert `_rubric_line` has and the two pairwise writers do not; the mantle
+401-refresh minting outside `build_lock`; six reuse duplications; the κ caveat
+not travelling with the returned summary; a JSON-shaped-but-wrong preamble
+still burning a unit at temperature 0; `--only-task` filtering on
+`grade.task_id` while cells key `record.task_id`; and `graded_at` on the
+judgment line, which needs a `JUDGE_SCHEMA_VERSION` bump and so is a decision.
+
+Review: full offline suite **1129 passed, 46 deselected** — 1128 at the end of
+the four plan tasks, plus the one layout pin the fix wave added; 1091 on the
+codex-judge branch this one started from. Every task diff reviewed against its
+brief, plus a whole-branch final review. Not verified, and the reason to say so: **no live
+judge pass ran on this branch.** Every fix is pinned offline — the neutrality
+guard against synthetic ids, the extractor against synthetic replies, the codex
+paths against a faked `_run_codex`, and the supersession rules against
+hand-built judgment lines. Whether a real pass reproduces the two-block split
+F2 fixed, and whether a real codex reply exercises the extractor's rescan, are
+still live-run questions.

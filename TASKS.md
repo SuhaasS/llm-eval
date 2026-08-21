@@ -1011,6 +1011,86 @@ size. Two exceptions are marked CAPTURE and should ride along with Gate 1.
   depends on which model gets entitled — a non-gpt-5 neutral judge (deepseek,
   qwen, mistral, grok) hits no such guard and needs no change at all.
 
+### The judge channel — parked by the round-2 review (2026-08-20)
+
+Ten defects were fixed on `judge-review-fixes`; these are what the same review
+found and left. All of them are offline and none blocks a collection — the
+judge runs after one — which is why they sit here rather than above.
+
+- [ ] **`_stored_payload_path`'s check is a bare `assert` and `python -O`
+  deletes it.** `scripts/judge.py:568`. The check is load-bearing: it is what
+  keeps "the line stores the file that was written" true by construction, and
+  under `-O` a driver run would file relative paths naming files nobody can
+  find, silently, on every line. Give it a dedicated exception in the shape of
+  `GateInvariantError` and raise it. The same sweep should look for other bare
+  asserts on the judge's write path.
+
+- [ ] **A split key/value secret passes BOTH payload scans.**
+  `judge_schema.scan_payload` walks raw strings and then canonical JSON, and
+  `scanners._SECRET_PATTERNS["generic_api_key"]` needs the value to follow the
+  key through `[:=]\s*['"]?` with nothing in between. A payload dict
+  `{"AWS_SECRET_ACCESS_KEY": "<40 chars>"}` yields the key and the value as two
+  separate strings on the raw walk, and `json.dumps` puts the key's closing
+  quote between them on the canonical one — so neither layer matches, and the
+  redundancy that exists so neither scan is the only one agrees. Both scans
+  fail in the same direction, which is the direction that sends the credential.
+
+- [ ] **`_vote_line` and `_gate_decided_line` have no pre-append gate
+  re-assert.** `_rubric_line` re-asserts its gate immediately before the append
+  (`scripts/judge.py:1000`); the two pairwise writers do not
+  (`:1082`, `:1159`). The gate is checked earlier for all three, so nothing is
+  wrong today — what is missing is the guarantee that a future edit moving work
+  between the check and the append cannot write a line the gate would refuse.
+  Cheap, and it makes the three writers say the same thing.
+
+- [ ] **The mantle 401-refresh mints outside `build_lock`.**
+  `src/bakeoff/judge.py:1691-1723`. The router rebuild takes the lock; the
+  `derive_mantle_token` call above it does not. At expiry every concurrent
+  worker 401s within the same second, and each mints its own token and bumps
+  `auth_refreshes` — a thundering herd at the credential endpoint, and a
+  counter documented as "credentials this pass replaced" reporting one per
+  worker instead of one. Single-flight it (mint under the lock, or a
+  `token_generation` counter each caller checks after acquiring), and the
+  count becomes the thing its docstring claims.
+
+- [ ] **Six reuse duplications in the judge channel.** Each is one fact spelled
+  twice, and the failure mode is the copies drifting apart: `_AUTH_STATUS`
+  declared in both `judge.py:1380` and `codex_judge.py:212`; the two backends'
+  lazy call wrappers built from near-identical scaffolding; the reasoning-effort
+  normalization rule spelled in three places; the persist block copied between
+  `_rubric_line` and `_vote_line`; the resume-key layout written out in two
+  places; and `append_judgment`/`load_judgments` (`judge_schema.py:397,419`) a
+  copy of `append_grade`/`load_grades` (`grade_schema.py:390,411`). None is a
+  bug now. Fold them where a shared helper does not couple two modules that are
+  deliberately independent — the two schema files are the case to think about
+  rather than merge on sight.
+
+- [ ] **The κ caveat is print-only and does not travel with the summary.**
+  `_print_kappa_caveat` puts OPEN-5's "no number here is calibrated" on the
+  terminal (`scripts/judge.py:4913`), but `summarize`'s returned dict carries
+  no `kappa_in_force`. A library caller — anything that consumes the summary
+  and renders its own report — gets every rate and none of the caveat, which is
+  precisely the reading the caveat exists to prevent. Put the flag in the dict
+  beside the numbers it qualifies; the printout keeps reading it from there.
+
+- [ ] **M2. A JSON-SHAPED preamble still burns the unit at temperature 0.** The
+  extractor now rescans after a `json.JSONDecodeError`, which covers braced
+  prose. It does not cover a brace group that parses and is the wrong shape —
+  an example object, an echoed schema — because that path raises on the shape
+  rather than on the decode, and the scan never resumes. At temperature 0 every
+  retry reproduces the reply, so a valid verdict later in the same text is lost
+  on every attempt. Continue the scan on a shape refusal too, and raise only
+  when no group in the reply yields a verdict.
+
+- [ ] **M3. `--only-task` filters on `grade.task_id`; cells key on
+  `record.task_id`.** `scripts/judge.py:1830` vs `:1858`. The two agree on
+  every collection anything has produced, and nothing pins that they must — so
+  a grade line whose `task_id` diverges from its record's would be selected
+  under one id and filed under another, and the pass would judge a task the
+  operator did not name while reporting the one they did. Assert the agreement
+  where the record is read, or filter on the record's field and let the grade
+  line's be the cross-check.
+
 ---
 
 ## P3 — Decisions to settle before numbers are published
@@ -1021,6 +1101,19 @@ size. Two exceptions are marked CAPTURE and should ride along with Gate 1.
   the per-model rows (printout only — nothing stored is wrong). Filter rows
   to the current version and warn with the other-version count, or key rows
   by `(model, grader_version)`. Found at final branch review, parked.
+
+- **A same-version re-grade is invisible to the judge's supersession rule.**
+  `summarize`'s rule 2 decides which of a comparison's two kinds of line wins
+  by reading `grade_version_seen` → `GRADER_VERSION` (`_supersedes`,
+  `scripts/judge.py`). That moves only when the grader version moves, and
+  `grade.py` skips an already-graded run unless `--re-grade`, whose re-grade
+  then appends at the SAME version — so the most common deliberate re-grade,
+  one run to pick up a repaired oracle or image, leaves the votes in front even
+  when the newer grade flipped the pair. The fix is a `graded_at` (or a
+  per-line grade-line ordinal) on the judgment line, which makes two lines at
+  one version orderable — a stored-shape change and a `JUDGE_SCHEMA_VERSION`
+  bump, hence a decision rather than a patch. The blind spot is named in
+  `_supersedes`'s docstring and in rule 2's prose until it is closed.
 
 These need a call, not code. Most are cheap to make and expensive to make late.
 
