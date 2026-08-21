@@ -2940,6 +2940,41 @@ def _comparison_key(judgment: JudgeRecord) -> tuple:
     ) + _judge_generation(judgment)
 
 
+def _gate_bucket(key: tuple) -> tuple:
+    """The bucket a GATE-DECIDED line is filed in: its comparison key with the
+    reasoning effort dropped.
+
+    A gate-decided line records `judge_sampling={}` -- nothing was sent, and
+    filling it would attest to a request that was never made -- so
+    `_judge_generation` reads its effort as `None`. That is honest about the
+    line and wrong about the FACT: which pair the deterministic ladder settled
+    is a property of the grades, not of a sampling knob no call used. Filed
+    under the full key, one codex pass at `--reasoning-effort high` split
+    itself in two, its votes in the effort block and its own ladder results in
+    a phantom `None` one. See the bucket walk in `summarize`, which is where
+    the buckets are joined back up.
+
+    `key[:-1]` and not a rebuild, because the effort is the LAST element of
+    `_judge_generation` and therefore of `_comparison_key` -- pinned by
+    `test_the_comparison_key_carries_the_generation_the_matrix_partitions_on`.
+    """
+    return key[:-1]
+
+
+def _oracle_of(bucket: tuple) -> tuple:
+    """The judge, prompt and rubric a gate bucket names -- everything about the
+    oracle except the effort it was sampled at.
+
+    The triple whose blocks a gate-decided line joins. A change to any of the
+    three IS a different oracle and the ladder result is not shared across it:
+    the versions gate resume, so two lines under two prompt versions are two
+    units of work whose disagreement the file exists to keep. The effort is the
+    one element a gate-decided line cannot carry, which is why it is the one
+    element dropped.
+    """
+    return bucket[-3:]
+
+
 def _deterministic(keys) -> list:
     """`sorted`, over keys that may hold a `None` beside an `int` or a `str`.
 
@@ -3556,6 +3591,28 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
        two oracles nobody asked for a joint opinion -- silently, and with the
        right shape. This is `_comparison_key`'s partition and
        `_rubric_profile`'s, carried into the report they feed.
+
+       **A gate-decided line belongs to no generation, and so joins every
+       block that shares its `(judge_model_id, judge_prompt_version,
+       rubric_version)` triple -- whatever that block's effort.** It is a
+       LADDER fact: no call was made for it, `judge_sampling` is `{}` because
+       nothing was sent, and the effort `_judge_generation` reads off that
+       empty block is the absence of a call rather than a reading. Partitioned
+       on it, one codex pass at `--reasoning-effort high` reported itself as
+       two blocks -- the effort block with every ladder-settled pair missing
+       from its win rates and its Elo under a `gate_decided: 0`, and a phantom
+       effort-`None` block holding only the ladder results -- and rule 2 could
+       never fire, because the votes and the gate line for one pair sat in
+       different buckets. Blocks are opened by VOTES; a triple with no vote
+       line anywhere reports its ladder results under the `None` they carry.
+       When a collection holds two effort generations the same gate line is
+       counted in both blocks, which is correct precisely because rule 4 never
+       sums them: they are two readings reported side by side, and a pair
+       present in one and absent from the other would make them readings of
+       two different collections. This is an AGGREGATION rule only -- no line
+       on disk changes shape, and a gate-decided line still resumes at effort
+       `None`, since nothing was sent for it and a flag change must not
+       re-append it.
     5. **Every rate is decomposed into what the judge said and what the ladder
        decided.** A gate-decided comparison is a TIER A result, and counting it
        in a Tier B win rate -- which is correct, see below -- means a row with
@@ -3635,7 +3692,9 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
         key = _comparison_key(judgment)
         if judgment.verdict == "gate_decided":
             if judgment.gate_decided_by in ("a", "b"):
-                gate_by[key] = judgment.gate_decided_by
+                # Filed WITHOUT the effort -- see `_gate_bucket`. The line
+                # itself is unchanged on disk and resumes exactly as it did.
+                gate_by[_gate_bucket(key)] = judgment.gate_decided_by
             else:
                 # A gate-decided line naming no winner settles nothing.
                 dropped["unreadable_verdict"] += 1
@@ -3685,9 +3744,32 @@ def summarize(judgments: list[JudgeRecord], model_of: dict[str, str]) -> dict:
     gate_share: dict[tuple, dict[str, dict[str, int]]] = {}
     consistency: dict[tuple, dict[str, int]] = {}
 
-    for key in _deterministic(set(votes_by) | set(gate_by)):
+    # WHICH BLOCKS EACH GATE-DECIDED LINE JOINS, and it is every block that
+    # shares its oracle triple -- whatever effort that block was sampled at.
+    # The blocks a collection has are the ones its VOTES opened: a gate-decided
+    # line opens none of its own, because the effort it stores is the absence
+    # of a call rather than a reading. A triple with no vote line anywhere is
+    # the exception and the only one: the ladder results are then the whole
+    # reading, and they report under the `None` they honestly carry.
+    #
+    # A collection judged at two efforts therefore counts the SAME gate line in
+    # both blocks. That is correct and it is the only place double-counting is:
+    # the blocks are two readings reported side by side and are never summed,
+    # and a ladder-settled pair present in one and missing from the other would
+    # make the two blocks readings of different collections.
+    vote_efforts: dict[tuple, set] = {}
+    for key in votes_by:
+        vote_efforts.setdefault(_oracle_of(_gate_bucket(key)), set()).add(
+            key[-1]
+        )
+    walk = set(votes_by)
+    for bucket in gate_by:
+        for effort in vote_efforts.get(_oracle_of(bucket)) or {None}:
+            walk.add(bucket + (effort,))
+
+    for key in _deterministic(walk):
         vote_lines = votes_by.get(key)
-        gate = gate_by.get(key)
+        gate = gate_by.get(_gate_bucket(key))
         if vote_lines:
             if gate is not None:
                 superseded += 1

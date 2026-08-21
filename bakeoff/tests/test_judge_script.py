@@ -3467,6 +3467,144 @@ def test_a_superseded_gate_decided_line_is_reported_even_when_it_agrees():
     assert summarize(judgments, MODEL_OF)["superseded_gate_decided"] == 1
 
 
+#: What `codex_sampling("high")` writes on a vote line. A gate-decided line
+#: carries `{}` -- nothing was sent -- which is the whole of what F2 was about.
+HIGH_EFFORT = {"model_reasoning_effort": "high"}
+
+
+def _codex_vote(run_id_a, run_id_b, verdict, *, effort=HIGH_EFFORT, **kw):
+    return _vote(run_id_a, run_id_b, verdict, judge_model_id=CODEX_JUDGE,
+                 judge_sampling=dict(effort), **kw)
+
+
+def _codex_gate(run_id_a, run_id_b, by, **kw):
+    """A gate-decided line as the driver writes one: `judge_sampling={}`,
+    because nothing was sent and a sampling block copied in from the batch
+    would attest to a request that was never made."""
+    return _gate(run_id_a, run_id_b, by, judge_model_id=CODEX_JUDGE,
+                 judge_sampling={}, **kw)
+
+
+def test_a_gate_decided_pair_is_read_inside_the_effort_block_it_belongs_to():
+    """A gate-decided line is an EFFORT-AGNOSTIC ladder fact, and the effort
+    is read off stored sampling -- which a gate line correctly leaves empty.
+
+    So one codex pass at `--reasoning-effort high` used to split itself in
+    two: its votes landed in generation `(judge, prompt, rubric, "high")` and
+    its own gate-decided lines in `(..., None)`. Measured on a real pass, the
+    printout carried two blocks -- the effort block reporting `gate_decided:
+    0` with every ladder-settled pair missing from its win rates and its Elo,
+    and a phantom effort-`None` block holding nothing but the ladder results.
+    Neither block is a reading of the collection, and the pair of them reads
+    as two oracles that were never asked.
+
+    The fix is aggregation-side only: nothing on disk changes shape, and the
+    resume key still keys a gate-decided line at effort `None`, because
+    nothing was sent for it and a flag change must not re-append it.
+    """
+    judgments = [
+        _codex_vote("run-a", "run-b", "a", vote_index=0, sample_index=0),
+        _codex_vote("run-a", "run-b", "a", vote_index=1, sample_index=0),
+        _codex_vote("run-a1", "run-b1", "b", vote_index=0, sample_index=1),
+        _codex_vote("run-a1", "run-b1", "b", vote_index=1, sample_index=1),
+        _codex_gate("run-a2", "run-b2", "a", sample_index=2),
+    ]
+
+    summary = summarize(judgments, MODEL_OF)
+
+    high = _judge_gen(CODEX_JUDGE, effort="high")
+    assert set(summary["comparisons"]) == {high}, "no phantom None block"
+    row = summary["comparisons"][high][("model-one", "model-two")]
+    assert row["gate_decided"] == 1
+    assert row["voted"] == 2
+    assert row["comparisons"] == 3
+    assert (row["wins_x"], row["wins_y"], row["ties"]) == (2, 1, 0)
+    assert row["win_rate_x"] == pytest.approx(2 / 3)
+    # The judge-voted rate is the half that excludes the ladder -- rule 5 --
+    # and it is the number the split silently turned the combined rate into.
+    assert row["win_rate_x_voted"] == pytest.approx(0.5)
+    assert set(summary["elo"]) == {high}
+    assert summary["gate_decided_share"][high]["model-one"] == {
+        "comparisons": 3, "gate_decided": 1,
+    }
+
+
+def test_one_gate_decided_line_is_read_in_every_effort_block_it_gates():
+    """Two efforts over one collection are two READINGS of it, reported side
+    by side and never pooled -- so the ladder fact they share belongs in both.
+
+    The same line counted twice is correct here and only here: the two blocks
+    are never summed, and a gate-decided pair missing from one of them would
+    make that block a reading of a smaller collection than the other, with no
+    line on the printout saying which pairs it lost.
+    """
+    judgments = [
+        _codex_vote("run-a", "run-b", "a", vote_index=0),
+        _codex_vote("run-a", "run-b", "a", vote_index=1),
+        # The same collection judged again with no --reasoning-effort.
+        _codex_vote("run-a", "run-b", "b", vote_index=0, effort={}),
+        _codex_vote("run-a", "run-b", "b", vote_index=1, effort={}),
+        _codex_gate("run-a2", "run-b2", "a", sample_index=2),
+    ]
+
+    summary = summarize(judgments, MODEL_OF)
+
+    high = _judge_gen(CODEX_JUDGE, effort="high")
+    default = _judge_gen(CODEX_JUDGE)
+    assert set(summary["comparisons"]) == {high, default}
+    for generation in (high, default):
+        row = summary["comparisons"][generation][("model-one", "model-two")]
+        assert row["gate_decided"] == 1, generation
+        assert row["comparisons"] == 2, generation
+    # ONE line in the file. The census counts lines; the blocks are readings.
+    assert summary["lines"]["gate_decided"] == 1
+
+
+def test_a_vote_supersedes_the_gate_line_for_its_pair_inside_its_own_block():
+    """Rule 2 across the split, which is the second thing the split broke.
+
+    A re-grade that flips the losing side turns a gate-decided pair into a
+    judgeable one, and the append-only file keeps both lines. With the gate
+    line stranded in its own block the two never met: the comparison was
+    counted once as a ladder result and once as a voted one, in two blocks
+    that both claimed to describe the collection, and `superseded_gate_decided`
+    -- the counter whose whole job is to surface that disagreement -- stayed
+    at zero.
+    """
+    judgments = [
+        _codex_gate("run-a", "run-b", "b"),
+        _codex_vote("run-a", "run-b", "a", vote_index=0),
+        _codex_vote("run-a", "run-b", "a", vote_index=1),
+    ]
+
+    summary = summarize(judgments, MODEL_OF)
+
+    high = _judge_gen(CODEX_JUDGE, effort="high")
+    assert set(summary["comparisons"]) == {high}
+    row = summary["comparisons"][high][("model-one", "model-two")]
+    assert row["comparisons"] == 1
+    assert row["voted"] == 1
+    assert row["gate_decided"] == 0
+    assert summary["superseded_gate_decided"] == 1
+
+
+def test_a_collection_the_ladder_settled_entirely_is_one_block_not_none():
+    """The other end of the same rule: with no vote line anywhere carrying
+    that judge, prompt and rubric, the gate lines are the only reading there
+    is and they report under the effort they were stored at -- `None`, which
+    is what a line that sent nothing honestly carries. Inventing an effort
+    block for a pass that bought no calls would name a sampling knob nothing
+    was sampled at."""
+    judgments = [
+        _codex_gate("run-a", "run-b", "a"),
+        _codex_gate("run-a1", "run-b1", "b", sample_index=1),
+    ]
+
+    summary = summarize(judgments, MODEL_OF)
+
+    assert set(summary["comparisons"]) == {_judge_gen(CODEX_JUDGE)}
+
+
 def test_gate_decided_is_counted_apart_from_the_vote_verdict_distribution():
     """`gate_decided` is the one verdict no model produced. Inside the
     distribution it is a fourth thing the judge said, and every rate computed
@@ -5804,6 +5942,46 @@ def test_two_efforts_in_one_file_summarize_and_print_and_stay_told_apart(
     # with no trailing `effort None` for a reader to learn to skip.
     assert f"{plain}\n" in printed
     assert "effort None" not in printed
+
+
+def test_one_codex_pass_at_one_effort_reports_one_block_gate_pairs_included(
+    tmp_path, monkeypatch, capsys
+):
+    """The end-to-end shape F2 was reproduced in: ONE pass, ONE block.
+
+    A single `--reasoning-effort high` pass over a cell the ladder decided in
+    part used to print two blocks -- the votes under `effort high` with
+    `gate_decided: 0`, and a second block, labelled like a mantle one, holding
+    nothing but the pairs the ladder settled. Every rate in each was computed
+    over a collection neither pass judged.
+
+    Driven through the driver rather than through `summarize` alone because
+    that is where the two halves are written by the same code: the vote lines
+    carry the batch's sampling block and the gate-decided lines carry `{}`,
+    and no fixture chooses that for them.
+    """
+    _fake_harness(monkeypatch, tmp_path)
+    root = _three_arms(tmp_path, resolved_three=False)
+
+    result = _run(root, judge_model_id=CODEX_JUDGE, rubric=False,
+                  reasoning_effort="high")
+
+    summary = result["summary"]
+    high = (CODEX_JUDGE, JUDGE_PROMPT_VERSION, RUBRIC_VERSION, "high")
+    assert set(summary["comparisons"]) == {high}
+    # model-three failed the gate, so both of its pairs are ladder results and
+    # the one judgeable pair is model-one against model-two.
+    block = summary["comparisons"][high]
+    assert sum(row["gate_decided"] for row in block.values()) == 2
+    assert sum(row["voted"] for row in block.values()) == 1
+    assert set(summary["elo"]) == {high}
+
+    print_summary(result)
+    printed = capsys.readouterr().out
+    assert printed.count("judge codex:") == printed.count(", effort high"), (
+        "every block label carries the effort; a second, unlabelled one is "
+        "the phantom"
+    )
 
 
 def test_a_line_whose_judge_sampling_is_null_still_keys_and_partitions():
