@@ -1270,6 +1270,98 @@ def test_a_grade_taken_against_the_loaded_manifest_says_nothing_at_all(
     assert {j.task_id for j in _lines(root)} == {"calc-1", "calc-2"}
 
 
+def _two_samples(tmp_path, grades) -> Path:
+    """One task, two samples, two arms in each -- the shape `--samples`
+    exists to cut in half."""
+    return _collection(
+        tmp_path,
+        [
+            _record("run-a0", model="model-one", sample_index=0),
+            _record("run-b0", model="model-two", sample_index=0,
+                    final_diff=DIFF_B),
+            _record("run-a1", model="model-one", sample_index=1,
+                    final_diff=DIFF_C),
+            _record("run-b1", model="model-two", sample_index=1,
+                    final_diff=DIFF_D),
+        ],
+        grades,
+    )
+
+
+#: A digest no fixture task carries: the manifest a grade was taken against
+#: before somebody edited `task.yaml`.
+FOREIGN_DIGEST = "0123456789abcdef"
+
+
+def test_a_digest_mismatch_in_a_sample_this_pass_never_selected_is_silent(
+    tmp_path,
+):
+    """The digest check gates the units THIS pass selects, and `--samples`
+    decides which those are.
+
+    Computed over every sample of the task, the check re-opened the hole the
+    read-loop filter had just closed one step upstream: a collection whose
+    sample-1 grades straddle a `task.yaml` edit and whose sample-0 grades do
+    not would refuse a coherent `--samples 0` pass and exit 1, on the strength
+    of grade lines gating units no filter selected. A run nobody selected does
+    not get to decide this pass's exit code.
+
+    No coverage is lost by narrowing it. An unselected unit gates nothing
+    here, and the pass that does select it takes the refusal then.
+    """
+    root = _two_samples(
+        tmp_path,
+        [
+            _grade("run-a0", model="model-one"),
+            _grade("run-b0", model="model-two"),
+            _grade("run-a1", model="model-one",
+                   manifest_digest=FOREIGN_DIGEST),
+            _grade("run-b1", model="model-two",
+                   manifest_digest=FOREIGN_DIGEST),
+        ],
+    )
+    fake = FakeComplete()
+
+    result = _run(root, [_task("calc-1")], complete=fake, rubric=False,
+                  sample_indices=[0])
+
+    assert result["errors"] == []
+    assert not [w for w in result["warnings"] if "digest" in w]
+    assert {
+        (j.sample_index, j.run_id_a, j.run_id_b) for j in _lines(root)
+    } == {(0, "run-a0", "run-b0")}
+
+
+def test_a_digest_mismatch_in_the_sample_this_pass_did_select_still_refuses(
+    tmp_path,
+):
+    """The other half of the boundary, pinned so narrowing the check cannot
+    quietly become removing it. Select the straddling sample and the refusal
+    fires exactly as before, naming both digests."""
+    root = _two_samples(
+        tmp_path,
+        [
+            _grade("run-a0", model="model-one"),
+            _grade("run-b0", model="model-two"),
+            _grade("run-a1", model="model-one",
+                   manifest_digest=FOREIGN_DIGEST),
+            _grade("run-b1", model="model-two",
+                   manifest_digest=FOREIGN_DIGEST),
+        ],
+    )
+    fake = FakeComplete()
+
+    result = _run(root, [_task("calc-1")], complete=fake, rubric=False,
+                  sample_indices=[1])
+
+    (error,) = result["errors"]
+    assert "calc-1" in error
+    assert FOREIGN_DIGEST in error, "the digest the grades were taken at"
+    assert MANIFEST_DIGEST in error, "the digest the loaded task carries"
+    assert result["judged"] == []
+    assert fake.calls == 0, "nothing was bought for a refused task"
+
+
 # --------------------------------------------------------------------------
 # 3. the vote protocol as the driver drives it
 # --------------------------------------------------------------------------

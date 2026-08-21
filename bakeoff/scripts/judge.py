@@ -1795,7 +1795,9 @@ def judge_event_log(event_log_root, tasks, *,
 
     # The two selection filters, read HERE rather than at the worklist walk,
     # because the read loop below is the first thing that can be narrowed by
-    # them. `wanted_samples` cannot narrow it -- see the boundary comment.
+    # them. `wanted_samples` cannot narrow THAT -- see the boundary comment --
+    # but it narrows the digest check at step 5b, which is the other place a
+    # unit nobody selected could otherwise decide this pass's exit code.
     wanted_tasks = None if only_tasks is None else set(only_tasks)
     wanted_samples = None if sample_indices is None else set(sample_indices)
 
@@ -1867,6 +1869,17 @@ def judge_event_log(event_log_root, tasks, *,
     # because the refusal covers every unit of the task and a task spreads over
     # as many cells as it has samples -- a check made per cell would refuse the
     # cells it had reached and judge the rest. See `_digest_check`.
+    #
+    # THE SAME SELECTION BOUNDARY the read loop draws, and for the same reason:
+    # over every sample of the task, this check re-opened the hole the filter
+    # above had just closed. A collection whose sample-1 grades straddle a
+    # `task.yaml` edit and whose sample-0 grades do not would refuse a coherent
+    # `--samples 0` pass and exit 1 -- grade lines gating units no filter
+    # selected deciding this pass's exit code. So the grades compared here are
+    # the ones gating SELECTED cells only. `wanted_tasks` needs no term: a task
+    # outside it has no record read and therefore no cell. No coverage is lost
+    # -- an unselected unit gates nothing this pass, and the pass that selects
+    # it takes the refusal then.
     refused: set[str] = set()
     for task_id in sorted({task_id for task_id, _ in cells}):
         task = by_task.get(task_id)
@@ -1876,7 +1889,9 @@ def judge_event_log(event_log_root, tasks, *,
             continue
         graded_runs = sorted(
             record.run_id
-            for (cell_task, _), cell in cells.items() if cell_task == task_id
+            for (cell_task, sample_index), cell in cells.items()
+            if cell_task == task_id
+            and (wanted_samples is None or sample_index in wanted_samples)
             for record in cell.values()
         )
         refusal, unknown = _digest_check(
@@ -2771,6 +2786,11 @@ def _digest_check(task, graded: Sequence[tuple[str, GradeRecord]],
     gate never gated -- silently, with the right shape, and with no
     `task_version` bump needed, which is exactly why `GradeRecord` stores the
     digest beside the version rather than trusting the version to follow it.
+
+    `graded` is the gating grades of the cells THIS pass selected, never the
+    task's whole census -- the caller applies `--samples` before it asks. A
+    check over unselected units files errors about units nobody chose, which
+    is the exit contract's own complaint one step further in.
 
     A MISMATCH REFUSES THE WHOLE TASK, into the errors bucket. It is a hole in
     the reading rather than a verdict, and holes are what that bucket counts;
