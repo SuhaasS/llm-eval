@@ -2480,6 +2480,14 @@ one block can still settle a pair in another, and superseded votes stay in
 `vote_verdicts` and in the position-consistency probe, so both now say what
 happens.
 
+One off-list defect the verification runs found and this wave fixed:
+`test_an_interrupt_recovers_the_stdout_the_child_already_wrote` (from F10's
+commit) waits 5.0 s for its stub child's marker and then interrupts whatever
+happened. Under parallel load the shell misses that deadline about one run in
+32, the interrupt lands on an empty pipe, and the usage assertion fails as
+`None == {...}` — a scheduling delay reading as "the interrupt path dropped
+the spend". The bound stays and now asserts, named, at 30 s.
+
 Parked with reasons, filed in `TASKS.md` (P2 subsection plus one P3 decision):
 the bare `assert` in `_stored_payload_path` under `python -O`; the split
 key/value secret shape that passes both payload scans; the pre-append gate
