@@ -2917,6 +2917,18 @@ def _judge_generation(judgment: JudgeRecord) -> tuple:
 #: which is a pooling nothing would report.
 _GENERATION_FIELDS = 4
 
+#: How many of those trailing elements name the SAMPLING rather than the
+#: oracle -- the reasoning effort, and it is the last of them. The one field a
+#: gate-decided line cannot carry, so `_gate_bucket` drops exactly this many
+#: from the tail and `_oracle_of` keeps the `_GENERATION_FIELDS -
+#: _EFFORT_FIELDS` in front of it. Both slices were hand-counted (`key[:-1]`,
+#: `bucket[-3:]`) until this constant existed, which is the same defect
+#: `_GENERATION_FIELDS` was introduced to close one layer up: a fifth
+#: generation field would make the hand-counted `_gate_bucket` drop the NEW
+#: field and leave the effort in the bucket, re-splitting one codex pass into
+#: two blocks with every count still the right shape.
+_EFFORT_FIELDS = 1
+
 
 def _generation_of(key: tuple) -> tuple:
     """The generation back out of a `_comparison_key` -- its last elements.
@@ -3031,11 +3043,18 @@ def _gate_bucket(key: tuple) -> tuple:
     a phantom `None` one. See the bucket walk in `summarize`, which is where
     the buckets are joined back up.
 
-    `key[:-1]` and not a rebuild, because the effort is the LAST element of
+    A tail slice and not a rebuild, because the effort is the LAST element of
     `_judge_generation` and therefore of `_comparison_key` -- pinned by
-    `test_the_comparison_key_carries_the_generation_the_matrix_partitions_on`.
+    `test_the_reasoning_effort_is_the_last_field_of_a_judge_generation`, which
+    is the only test that asserts the LAYOUT.
+    `test_the_comparison_key_carries_the_generation_the_matrix_partitions_on`
+    was cited as that pin and is not one: what it asserts is that the tail of
+    the key IS the generation, and it checks the tuple against a fixture
+    helper that spells the same layout the implementation does -- so the two
+    move together -- over a line whose effort is `None`, which is the one
+    value a slice off either end reads back identically.
     """
-    return key[:-1]
+    return key[:-_EFFORT_FIELDS]
 
 
 def _oracle_of(bucket: tuple) -> tuple:
@@ -3048,8 +3067,13 @@ def _oracle_of(bucket: tuple) -> tuple:
     units of work whose disagreement the file exists to keep. The effort is the
     one element a gate-decided line cannot carry, which is why it is the one
     element dropped.
+
+    Counted off `_GENERATION_FIELDS` rather than written `[-3:]` for
+    `_gate_bucket`'s reason: the two slices are one layout stated twice, and a
+    fifth generation field silently made this one return the oracle plus that
+    field while `_gate_bucket` returned a bucket the effort was still in.
     """
-    return bucket[-3:]
+    return bucket[-(_GENERATION_FIELDS - _EFFORT_FIELDS):]
 
 
 def _deterministic(keys) -> list:

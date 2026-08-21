@@ -101,8 +101,10 @@ from scripts.judge import (
     StorageFailure,
     _assert_rubric_gate,
     _comparison_key,
+    _gate_bucket,
     _generation_of,
     _judge_generation,
+    _oracle_of,
     _print_kappa_caveat,
     _recentred,
     _VOTE_VERDICTS,
@@ -4948,6 +4950,34 @@ def test_the_comparison_key_carries_the_generation_the_matrix_partitions_on():
 
     assert _generation_of(_comparison_key(vote)) == _judge_generation(vote)
     assert _judge_generation(vote) == _judge_gen("openai.gpt-5.6-luna")
+
+
+def test_the_reasoning_effort_is_the_last_field_of_a_judge_generation():
+    """`_gate_bucket` drops the effort by slicing the TAIL off a comparison
+    key, and `_oracle_of` keeps what that slice left. Both are claims about
+    WHERE the effort sits in `_judge_generation`, and the test above pins the
+    tuple's identity rather than its layout: it checks the tail of the key
+    against a fixture helper spelling the same order the implementation does,
+    so an edit that moves the effort moves both, and it does so over a line
+    whose effort is `None`. Unpinned, a fifth generation field makes
+    `_gate_bucket` drop the new field and leave the effort in the bucket,
+    re-splitting one codex pass into two blocks with every count still the
+    right shape.
+
+    Pinned against a codex line because it is the only shape that carries a
+    non-`None` effort: a mantle line and a gate-decided one both read `None`
+    there, so a slice off the wrong end still reads `None` and agrees."""
+    vote = _codex_vote("run-a", "run-b", "a", effort=HIGH_EFFORT)
+    generation = _judge_generation(vote)
+
+    assert generation[-1] == "high"
+    assert generation == (CODEX_JUDGE, JUDGE_PROMPT_VERSION, RUBRIC_VERSION,
+                          "high")
+
+    bucket = _gate_bucket(_comparison_key(vote))
+    assert "high" not in bucket
+    assert _oracle_of(bucket) == (CODEX_JUDGE, JUDGE_PROMPT_VERSION,
+                                  RUBRIC_VERSION)
 
 
 def test_rubric_profile_reports_per_dimension_means_and_never_a_sum():
