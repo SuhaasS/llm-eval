@@ -1218,9 +1218,23 @@ def test_an_interrupt_recovers_the_stdout_the_child_already_wrote(
             # The recovery call, which must be bounded.
             timeouts.append(kwargs.get("timeout"))
             return real_communicate(self, **kwargs)
-        deadline = time.monotonic() + 5.0
+        deadline = time.monotonic() + 30.0
         while not marker.exists() and time.monotonic() < deadline:
             time.sleep(0.01)
+        # The bound exists so a child that never starts cannot hang the suite.
+        # Its expiry is a FIXTURE failure and has to say so: interrupting
+        # before the stub wrote its completed turn leaves an empty pipe, the
+        # recovery correctly finds no events, and the assertion at the bottom
+        # then reads as "the interrupt path dropped the spend" -- an accusation
+        # against the code under test, over a scheduling delay. Measured
+        # 2026-08-20 at a 5.0 s bound: one failure in ~32 runs under parallel
+        # load, exactly this shape. Raised here, named, and the bound widened
+        # to a length no scheduler delay reaches.
+        assert marker.exists(), (
+            "the stub child did not write its completed turn within 30s: the "
+            "interrupt below would exercise an empty pipe rather than the "
+            "recovery, and this test's usage assertion would blame the code"
+        )
         timeouts.append(kwargs.get("timeout"))
         raise KeyboardInterrupt
 
