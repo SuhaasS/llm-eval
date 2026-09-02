@@ -819,11 +819,15 @@ place both figures live.
 
 ### Usable once a dependency is declared
 
-Measured 2026-09-02: re-screening the *Excluded* candidates and the
-undiagnosed rows below at `python:3.11-slim-bookworm` and
-`python:3.13-slim-bookworm` reopened **zero** repositories — every blocker in
-this table and the next reproduces identically on 3.11, 3.12 and 3.13
-(`~/.cache/bakeoff-probe/reports/r2-19-rescreen.md`); `image.python` alone
+Measured 2026-09-02: re-screening at `python:3.11-slim-bookworm` and
+`python:3.13-slim-bookworm` reopened **zero** repositories: the three
+*Excluded* rows below with a version-shaped exclusion (`pyftpdlib`,
+`tornado`, `pytest-localserver`) and the five rows in this table that were
+not already gated (`pygments`, `rich`, `humanize`, `attrs`, `cattrs`) show
+the identical blocker — or, for pygments, the identical green — on 3.11,
+3.12 and 3.13 (`~/.cache/bakeoff-probe/reports/r2-19-rescreen.md`). The
+already-gated rows (`sqlglot`, `tomlkit`, `bidict`, `pytest`, `chimera`) were
+measured at one version each and were not re-screened; `image.python` alone
 has not yet been shown to grow the corpus.
 
 | repo | what it needs | result | PRs |
@@ -832,8 +836,8 @@ has not yet been shown to grow the corpus.
 | pygments/pygments | `pip: ["wcag_contrast_ratio"]` | 1 collection error without it; re-screened 2026-09-02 — green (5330 passed, 16 skipped) identically on 3.11/3.12/3.13 | 64 |
 | Textualize/rich | `pip: ["attrs"]` | 1 collection error without it; re-screened 2026-09-02 — 8 failures, identical on 3.11/3.12/3.13, all Pygments-syntax-highlighting snapshot mismatches driven by which Pygments release is on PyPI, not by the interpreter | 40 |
 | python-humanize/humanize | `SETUPTOOLS_SCM_PRETEND_VERSION` (the editable install produces no `humanize._version`) plus `image.pip: ["freezegun"]` | diagnosed 2026-09-02 — the "6 import errors" are two ordinary shapes, identical on 3.11/3.12/3.13, neither version-dependent; not yet measured with either lever declared | 21 |
-| python-attrs/attrs | `image.env: {CI: "1", HYPOTHESIS_STORAGE_DIRECTORY: "/tmp/bakeoff-hypothesis"}` for the property-based suite | measured 2026-09-02 — installed alone, **no** site-packages collision (`attr.__file__` resolves under the clone on 3.11/3.12/3.13); 1398–1402 passed, 2 failures, both `test_packaging.py::TestLegacyMetadataHack::test_version_info`, the same `SETUPTOOLS_SCM_PRETEND_VERSION` shape as humanize | — |
-| python-attrs/cattrs | same `image.env`, plus the site-packages collision below | **not measured** — the collision is confirmed real but a bare screen never reaches it (see below) | — |
+| python-attrs/attrs | `image.env: {CI: "1", HYPOTHESIS_STORAGE_DIRECTORY: "/tmp/bakeoff-hypothesis"}` for the property-based suite, `image.pip: ["hypothesis"]` (the editable install pulls no test-only extra — a bare screen dies at collection without it), and a `SETUPTOOLS_SCM_PRETEND_VERSION` lever for the two `test_packaging.py` failures below | measured 2026-09-02, Pass 2 — hypothesis and the CI env declared, installed alone, **no** site-packages collision (`attr.__file__` resolves under the clone on 3.11/3.12/3.13); 1398–1402 passed, 2 failures, both `test_packaging.py::TestLegacyMetadataHack::test_version_info`, the same `SETUPTOOLS_SCM_PRETEND_VERSION` shape as humanize — that lever itself not yet declared or measured | — |
+| python-attrs/cattrs | same `image.env`, plus `image.pip: ["hypothesis"]` and, by the same argument as attrs, a `SETUPTOOLS_SCM_PRETEND_VERSION` lever (unmeasured for cattrs — the benchmark usage error masks collection before either would matter), plus the site-packages collision below | **not measured** — the collision is confirmed real but a bare screen never reaches it (see below) | — |
 | python-poetry/tomlkit | nothing declared — the submodule (`tests/toml-test`) is derived, not declared (broadening 6) | measured 2026-09-02, cut and gated (`tomlkit-514-inline-table-comment-separator`): 1,002 passed, ~1.2 s at `base_sha` with the submodule initialised; without it the whole run is **interrupted** (`FileNotFoundError` at collection, not a partial pass) | — |
 | jab/bidict | `image.env: {CI: "1", HYPOTHESIS_STORAGE_DIRECTORY: "/tmp/bakeoff-hypothesis"}`; `tests.runner` needs `--override-ini=addopts=`, never `-c /dev/null` (the addopts-bypass trap below); `image.pip: ["pytest-xdist"]` so the bare `pytest tests/` an agent would actually type does not itself exit 4 | measured 2026-09-02, cut and gated (`bidict-389-putall-rollback-clean`): 130 passed, ~1.7 s | — |
 | pytest-dev/pytest | its own suite as source: `SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PYTEST` inlined into the `image.build` command (the build context is `git archive base_sha` and never has `.git`); `tests.runner` regenerates `src/_pytest/_version.py` at the start of every invocation (the image-build copy is discarded by the runtime bind mount over `/repo`); one baked-in `--deselect` for the one self-test that asserts a `.pyc` got written, which the image's own `PYTHONDONTWRITEBYTECODE=1` defeats permanently | measured 2026-09-02, cut and gated (`pytest-10210-approx-nested-container`): 106.34 s single-process at `base_sha` — see the `-p no:cacheprovider` note below | — |
@@ -852,10 +856,10 @@ excludes a `160000`-mode gitlink under a declared test prefix from both the
 `git rm` and the `git checkout`, so the submodule's working tree is never
 removed in the first place. tomlkit needs nothing further.
 
-**attrs is reopened; cattrs is still half-reopened.** They were excluded for
-two reasons and this broadening lifts one for both — but the other,
-`pip install -e .` resolving `attr` against site-packages instead of the run
-tree, measures differently per repository. Measured 2026-09-02
+**attrs' *collision* reason is lifted; both repos are still ungated.** They
+were excluded for two reasons and this broadening lifts one for both — but
+the other, `pip install -e .` resolving `attr` against site-packages instead
+of the run tree, measures differently per repository. Measured 2026-09-02
 (`~/.cache/bakeoff-probe/reports/r2-19-rescreen.md`): installed alone, attrs
 shows **no** collision — `attr.__file__` resolves under the clone on
 3.11/3.12/3.13 alike, so this reason no longer applies to it. cattrs'
@@ -864,10 +868,15 @@ collision is real — it declares `attrs` as a runtime dependency, so
 into site-packages ahead of any editable attrs checkout — but a bare screen
 never reaches it: cattrs' own `pyproject.toml` addopts name `pytest-benchmark`
 flags a bare `pytest` install rejects with a usage error (exit 4) before a
-single test collects. The bare-runner probe (`PREFLIGHT_VERSION` 13) would
-name the collision directly, since it runs the repo's own `addopts` with none
-of `tests.runner`'s bypasses. Nobody has run that probe against cattrs yet. Do
-not cut a task from cattrs without doing so first.
+single test collects. The bare-runner probe added at `PREFLIGHT_VERSION` 13
+would name the pytest-benchmark usage error that currently masks the
+collision; the collision itself is silent — imports resolve past `/repo`,
+nothing the agent writes takes effect, every arm fails identically, and
+preflight's green-after check is what catches it. Neither has been run
+against cattrs. attrs' own re-screen leaves 2 failures needing the
+`SETUPTOOLS_SCM_PRETEND_VERSION` lever above, undeclared and unmeasured, and
+no preflight run has been made against it either. Do not cut a task from
+attrs or cattrs without doing so first.
 
 **pytest-dev/pytest's own suite is structurally in tension with the harness's
 `-p no:cacheprovider` convention, because pytest's own suite legitimately
@@ -945,8 +954,8 @@ preflight to catch the omission.
 | repo | why |
 |---|---|
 | un33k/python-slugify | no harvestable PRs |
-| giampaolo/pyftpdlib | genuinely breaks on Python 3.12 (asyncore/asynchat removed, PEP 594), but no PR in its history is simultaneously a real bug-fix closing a formal issue and one whose added test actually reproduces the bug on the version boundary — measured 2026-09-02 across every candidate through 2023-08. Re-screened 2026-09-02 at HEAD: `ImportError: Error importing plugin "instafail": No module named 'instafail'`, identical on 3.11/3.12/3.13 — a different, HEAD-only blocker (the repo's own PR #605 already fixed the asyncore/asynchat removal this repo was excluded for) |
-| tornadoweb/tornado | its whole suite is built on a custom `unittest.TestCase` subclass architecture (`AsyncTestCase`) that does not collect under pytest 9 regardless of interpreter (`AttributeError: 'CookieTest' object has no attribute 'runTest'`, measured 2026-09-02) — a bad fit for `tests.framework: pytest` independent of any candidate PR. Re-screened 2026-09-02 at HEAD: `ModuleNotFoundError: No module named 'cythonapp'` (then `'redbot'`), identical on 3.11/3.12/3.13, from an unscoped collection into `maint/`'s local helper packages — the `AsyncTestCase` failure quoted above did not reproduce at HEAD at all |
+| giampaolo/pyftpdlib | genuinely breaks on Python 3.12 at the historical candidate `base_sha`s screened (asyncore/asynchat removed, PEP 594), but no PR in its history is simultaneously a real bug-fix closing a formal issue and one whose added test actually reproduces the bug on the version boundary — measured 2026-09-02 across every candidate through 2023-08. Re-screened 2026-09-02 at HEAD: `ImportError: Error importing plugin "instafail": No module named 'instafail'`, identical on 3.11/3.12/3.13 — a different, HEAD-only blocker (the repo's own PR #605 already fixed the asyncore/asynchat removal this repo was screened in for) |
+| tornadoweb/tornado | its whole suite is built on a custom `unittest.TestCase` subclass architecture (`AsyncTestCase`) that does not collect under pytest 9 regardless of interpreter (`AttributeError: 'CookieTest' object has no attribute 'runTest'`, measured at the candidate `base_sha` in `d5-python-version.md`, a 2023-era commit) — a bad fit for `tests.framework: pytest` independent of any candidate PR. Re-screened 2026-09-02 at HEAD: `ModuleNotFoundError: No module named 'cythonapp'` (then `'redbot'`), identical on 3.11/3.12/3.13, from an unscoped collection into `maint/`'s local helper packages — the `AsyncTestCase` failure quoted above did not reproduce at HEAD at all, and the exclusion now rests on this `maint/` collection blocker, not on `AsyncTestCase` |
 | pytest-dev/pytest-localserver | its own Python-3.12 breakage (`smtpd` removal) is real, but every issue closed before the fix commit is either non-code or touches no file under `tests/` — `tests.paths` would produce an empty test half, which the loader refuses outright. Re-screened 2026-09-02 at HEAD: `ModuleNotFoundError: No module named 'pytest_localserver._version'`, identical on 3.11/3.12/3.13 — the same setuptools_scm shape as humanize/attrs, fatal at plugin load before the suite ever reaches the `smtpd` break quoted above |
 
 **`mahmoud/boltons` is excluded for broadening 2 (collection-error f2p)

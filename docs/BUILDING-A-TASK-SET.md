@@ -223,9 +223,10 @@ newer syntax, a removed stdlib module, a C extension with no wheel — re-run
 the screen against `python:3.11-slim-bookworm` or `python:3.13-slim-bookworm`
 and, if it passes there, declare `image.python: "3.11"` (quoted) in the
 manifest. Only those three are accepted; see `taskset/HARVESTING.md` for how
-the set grows. Measured 2026-09-02: re-screening the whole excluded corpus at
-3.11 and 3.13 reopened zero repositories — every blocker found there
-reproduces identically across all three versions
+the set grows. Measured 2026-09-02: re-screening the eight candidates whose
+exclusion or open diagnosis could plausibly be a version problem at 3.11 and
+3.13 reopened zero repositories — every blocker found there reproduces
+identically across all three versions
 (`~/.cache/bakeoff-probe/reports/r2-19-rescreen.md`). Treat this key's yield
 as unmeasured upside, not a measured gain, until a candidate is actually
 reopened by it.

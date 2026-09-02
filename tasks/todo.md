@@ -3467,3 +3467,71 @@ not caught by it. `CLAUDE.md` is unedited per the round's constraint; the
 three sentences it should gain are in the plan's §6.
 
 Unit suite: 1585 passed, 63 deselected.
+
+---
+
+## Round 2 item 19 — re-screening the corpus at 3.11 and 3.13 — 2026-09-02
+
+Report: `~/.cache/bakeoff-probe/reports/r2-19-rescreen.md` (outside the repo,
+not committed).
+
+Broadening 5 gave a manifest `image.python` key, closed and enforced at load
+time, but no candidate had ever actually been re-run against 3.11 or 3.13 —
+the whole `docs/BUILDING-A-TASK-SET.md` §2 screen only ever ran under
+`python:3.12-slim-bookworm`. This item is that measurement, not a reversal
+of the item's own premise ("no repository has been shown to be reopened by
+this key today"): it still stands.
+
+**Eight repos, not the whole excluded-or-undiagnosed set.** The three
+*Excluded* rows whose reason is version-shaped (`giampaolo/pyftpdlib`,
+`tornadoweb/tornado`, `pytest-dev/pytest-localserver`) plus the five rows in
+*Usable once a dependency is declared* that were not already gated
+(`pygments/pygments`, `Textualize/rich`, `python-humanize/humanize`,
+`python-attrs/attrs`, `python-attrs/cattrs`). `un33k/python-slugify` (no
+harvestable PRs) and the five already-gated rows (`sqlglot`, `tomlkit`,
+`bidict`, `pytest`, `chimera`) were out of scope and were not touched.
+
+**Result: zero reopened.** Every one of the eight shows the identical
+blocker — or, for pygments, the identical green — on `python:3.11-`,
+`3.12-` and `3.13-slim-bookworm`. Every cross-version diff in the report is
+either cold-container wall-clock noise or a `sys.version_info`-gated
+`SKIPPED` count shifting by a handful, never a pass/fail verdict.
+
+**The attrs/cattrs Pass-1/Pass-2 split.** A bare `pip install -e .` pulls no
+test-only extra, so Pass 1 (the bare §2 command) died at collection on both
+repos with `ModuleNotFoundError: No module named 'hypothesis'` on all three
+versions — before the site-packages-collision question the item exists to
+answer could even be asked. Pass 2 added `pip install -q pytest hypothesis`
+plus the `CI`/`HYPOTHESIS_STORAGE_DIRECTORY` env this file already names for
+this row, then ran `python -c "import attr, sys; print(attr.__file__)"`
+right after that install chain and before the suite. That is the run
+reported as the row's primary result.
+
+**Three diagnoses that changed a row's story, not just its version-count:**
+
+- **humanize**'s "6 import errors, undiagnosed" is now two ordinary,
+  already-catalogued shapes — a missing `humanize._version`
+  (`SETUPTOOLS_SCM_PRETEND_VERSION`-shaped) and a missing `image.pip:
+  ["freezegun"]` — neither version-dependent.
+- **pyftpdlib**'s exclusion reason (the asyncore/asynchat PEP 594 removal)
+  no longer manifests at HEAD at all — the repo's own PR #605 (2023-08)
+  already fixed it. The re-screen's blocker is unrelated: a bare screen
+  doesn't install `pytest-instafail`, which the repo's own addopts name.
+- **tornado**'s originally-measured blocker
+  (`d5-python-version.md`'s `AsyncTestCase`/pytest-9 incompatibility, at a
+  2023-era candidate `base_sha`) did not reproduce at HEAD at all; the
+  re-screen's blocker is unscoped collection into `maint/`'s local helper
+  packages, unrelated to any of the three interpreters.
+
+**cattrs remains the one open question.** Its site-packages `attr`/`attrs`
+collision is real (measured: `attr.__file__` resolves to site-packages, not
+the clone, on all three versions) but is masked in every screen so far by an
+earlier `pytest-benchmark` addopts usage error (exit 4) the repo's own
+`pyproject.toml` triggers against a bare `pytest` install — the suite never
+reaches a single test. See `HARVESTING.md`'s attrs/cattrs paragraph for what
+would actually catch it (the green-after gate, not the bare-runner probe) and
+why nobody has run it yet.
+
+No manifest, `HARVESTING.md`, or `docs/BUILDING-A-TASK-SET.md` change was
+made by the measurement itself; folding the findings in was a separate docs
+commit.
