@@ -1113,12 +1113,15 @@ judge runs after one — which is why they sit here rather than above.
   Broadening 3's `image_env_*` / `hypothesis_*` keys are written on *every*
   path — `declared` with a value, the rest as explicit `null` — on the
   pre-container early return at `preflight.py:469-497`. `stripped_paths` and
-  `stripped_paths_present`, added by broadening 1, are simply **absent** there.
-  Both encode "the gate did not look"; only one of them says so, and a reader
-  of a cached `preflight.json` cannot tell an absent `stripped_paths` from a
-  verdict written by a gate too old to have the key. Make them consistent by
-  moving the strip's two keys before the guard as `null`s — the new family is
-  the shape to copy, not the other way round. Cheap, and it needs a
+  `stripped_paths_present`, added by broadening 1, are simply **absent**
+  there — and so is `suite_timeout_s`, added by broadening 4: no suite ran
+  under any bound on this path, but that is indistinguishable from a gate too
+  old to have the key. Both encode "the gate did not look"; only one family
+  says so, and a reader of a cached `preflight.json` cannot tell an absent
+  key from a verdict written by an older gate. Make them consistent by moving
+  the strip's two keys (and `suite_timeout_s`) before the guard as `null`s —
+  the new family is the shape to copy, not the other way round. Cheap, and it
+  needs a
   `PREFLIGHT_VERSION` bump because it changes what a cached verdict contains.
 
 ---
@@ -1280,6 +1283,28 @@ These need a call, not code. Most are cheap to make and expensive to make late.
 
 - [ ] **`Checkpoint.tests_pass` stays `None`** by design — §5.5 requires offline
   grading. Lands with the scoring plan.
+
+- [ ] **`max_turns` and `wall_clock_timeout_s` still parse with a bare
+  `int(...)`.** `int("forty")` raises a `ValueError` out of `load_task` with no
+  manifest path in it, and `wall_clock_timeout_s: true` becomes 1 (`bool` is an
+  `int` in Python). `tasks._positive_int`, added for broadening 4, exists and is
+  applied to `suite_timeout_s` only; extending it to the other two could refuse
+  a manifest that loads today, so it is its own change.
+
+- [ ] **Preflight's observed suite duration is not recorded, and it is the
+  figure two separate readings need.** (a) `budget.suite_timeout_s` multiplies
+  through up to 8× per task at the gate, all of it before the proxy starts and
+  inside the one-hour SSO window, and nothing records how long the gate
+  actually took — so the interaction with `credential_window` can only be
+  documented (`HARVESTING.md`), never checked; a gate on the worst case would
+  refuse task sets that run fine. (b) A `timed_out` grade is a `GradeFailure`
+  stamped on the model, and `GradeRecord.suite_timeout_s` says only which bound
+  was hit — the **headroom**, the gap between what the suite needs and what it
+  was given, is the thing a reader actually wants, and it is unrecorded on both
+  sides. `GradeRecord` also carries no host or contention block
+  (`RunRecord.host` does), so nothing on the line can say the grader's host was
+  busier than the gate's. One measurement — preflight's per-run elapsed suite
+  time in the evidence — answers both.
 
 ---
 

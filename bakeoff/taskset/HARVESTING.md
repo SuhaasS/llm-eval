@@ -363,9 +363,34 @@ rather than by reasoning:
   cause: `git archive` leaves no `.git`, and `setuptools_scm` refuses with
   *"unable to detect version"*. Measured across 12 candidates, only
   `setuptools_scm` is strict about this — `hatch-vcs` builds fine without it.
-- **The suite is fast enough.** Preflight runs it four times, each under a 600 s
-  timeout, and the agent re-runs it inside `wall_clock_timeout_s`. ~40 s is the
-  practical ceiling; `click`'s 1.4 s is what comfortable looks like.
+- **The suite is fast enough — or the manifest says how slow.** Preflight runs
+  the suite **five** times (f2p before, p2p before, f2p after, p2p after, and
+  the scoped p2p the grader will make — four when `tests.p2p` is declared
+  explicitly, which skips the scoped run), plus once per declared `grading.*`
+  argv. The oracle then runs it twice more at grade time and the ladder up to
+  five times per graded record. Each of those carries a coreutils `timeout`
+  prefix whose value is `budget.suite_timeout_s`, default **600 s** — the same
+  number on the gate's side and the grader's, which is the point of the key:
+  a suite that fits one bound and is killed under the other stamps `timed_out`
+  on the model.
+
+  **~40 s is still the practical ceiling, and raising the key is not a way
+  around it.** `click`'s 1.4 s is what comfortable looks like. Raising
+  `suite_timeout_s` multiplies through: the worst case is 8 × the value for
+  one task's gate, all of it spent **before the proxy starts** and inside the
+  same one-hour SSO session the matrix itself needs (measured twice — the
+  window is one hour, not the eight an earlier note claimed). A task set of
+  slow suites can therefore burn the credential window on the gate and leave
+  nothing for the cells.
+
+  `budget.suite_timeout_s` may not exceed `budget.wall_clock_timeout_s`, and
+  `load_task` refuses the manifest with the arithmetic when it does: the agent
+  re-runs this suite inside its wall clock with no per-command bound, so a
+  longer one describes a task no arm could verify even once — spec §3.3
+  measures a loop that ends in "runs tests, sees failures, self-corrects", and
+  a run terminated mid-suite is that loop truncated with an unchecked diff.
+  Raising `wall_clock_timeout_s` is the other escape and is not a §5.4
+  divergence: the budget is per task, identical across arms.
 
 One consequence of the run tree being pruned to `base_sha`'s history, since it
 shows up in exactly the repos the second bullet is about: **tags that are

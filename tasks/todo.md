@@ -2770,3 +2770,96 @@ backslash and `$` but not `\r`. Verified: full unit suite; the integration leg
 including `task_image` (the env-merge test at
 `tests/test_integration_grader.py` had never run); a fresh `--preflight-only`
 GO on `click-3360-write-usage-empty-args`; and `mutation_check.py` run solo.
+
+## Broadening 4 — a per-task suite timeout — 2026-09-01
+
+The 600 s bound wrapping every in-container command preflight, the oracle and
+the offline grader run was a constant three consumers each held their own
+copy of. `budget.suite_timeout_s` (default 600, same number) moves it into the
+manifest, so a task whose suite legitimately needs more than 600 s can be
+gated and graded under a bound the author actually declared, instead of being
+refused by the gate or stamped `timed_out` by the grader on a number nobody
+chose. One key, not two: it bounds the suite invocations **and** every
+declared `grading.*` argv (build / typecheck / lint), because a second key
+for the grading commands would be a second number that can diverge between
+the gate and the grader — the exact defect being closed, for a distinction
+nobody asked for.
+
+- **The parameters are deleted, not defaulted.** `preflight()` and
+  `ensure_oracle()` both already take `task`, so a `timeout_s: int = 600`
+  parameter beside it would be a second source for one number whose
+  divergence is invisible: a suite that fits one bound and is killed under
+  the other stamps `timed_out` — a `GradeFailure`, i.e. `resolved: False` — on
+  a number the model never saw. Deleting the parameter makes "a consumer left
+  on the constant" unrepresentable rather than merely tested for. **Neither
+  driver needed a line changed as a result** — `run_matrix.py` and
+  `grade.py` call both functions with `task` and never passed a bound today —
+  which is the evidence the seam (`task.budget.suite_timeout_s`, read at each
+  call site) was the right one rather than a parameter threaded through two
+  more layers.
+
+- **`suite_timeout_s > wall_clock_timeout_s` is a `load_task` refusal, not a
+  preflight problem and not author advice.** The agent re-runs this suite
+  *inside* its wall clock with no per-command bound (`claude_runner`'s
+  container backend wraps the whole `claude -p` in one `timeout`, fed
+  `wall_clock_timeout_s`), so a longer `suite_timeout_s` describes a task no
+  arm could verify even once — spec §3.3 measures a loop that ends in "runs
+  tests, sees failures, self-corrects", and a run SIGTERMed mid-suite is that
+  loop truncated with an unchecked diff, indistinguishable on the record from
+  an honest `BUDGET_EXHAUSTED`. It is a *load* error rather than a preflight
+  one because it is settled by arithmetic over two manifest numbers — no
+  container, no daemon, no measurement needed to see the contradiction — and
+  pushing it to preflight would pay an image build to discover what is
+  already visible in the YAML.
+
+- **Versions.** `PREFLIGHT_VERSION` "5" → "6" (broadening 3 had already moved
+  it off "4"), `ORACLE_VERSION` "1" → "2", `GRADER_VERSION` "3" → "4",
+  `GRADE_SCHEMA_VERSION` "1.0.0" → "1.1.0". `SCHEMA_VERSION` **unmoved** — the
+  bound never touches the agent's container, so no `RunRecord` field changes.
+  `click-3360`'s `start_sha` **unmoved** — `suite_timeout_s` is a `budget:`
+  key, not an input to `materialize`. `manifest_digest` **does** move on any
+  manifest that adds the YAML comment or an actual value, because it is
+  `sha256(manifest bytes + reference bytes)`.
+
+- **Operator cost, and why it is intended rather than swallowed.** The
+  `GRADER_VERSION` bump makes `scripts/grade.py`'s `(run_id, grader_version)`
+  resume key treat every stored run as ungraded, so the next grading pass
+  re-grades everything into a fresh `v4` artifacts directory beside the
+  existing `v3` one — on today's corpus this changes **no verdict** (no
+  stored manifest declares the key, so every ladder still runs at 600), and
+  it still cannot wait: `grade.py`'s resume key never consults
+  `manifest_digest`, so the first manifest edit that raises the bound would
+  otherwise find every affected run already marked graded under the old
+  behaviour, with nothing on either line saying they were measured against
+  different bounds. The bump has to land with the code that makes the
+  divergence possible, not with the manifest that first exercises it — so
+  it's schedulable rather than urgent, but it is on purpose, the same shape
+  as broadening 2 and 3's version bumps. `PREFLIGHT_VERSION` and
+  `ORACLE_VERSION` moving invalidates every cached verdict and quarantine the
+  same way, deliberately: a warm cache would otherwise serve a verdict
+  computed under a bound the manifest no longer asks for.
+
+- **`GRADE_TIMEOUT_S` → `SCAN_TIMEOUT_S`.** The gitleaks secret scan is a
+  fixed-size scan of one diff on the *host*, not the task's suite —
+  `_ContainerEnv.scan_secrets` has no `task` in scope — so it keeps a
+  constant rather than reading the manifest. Renamed because leaving it
+  called "the grade timeout" was the trap: a constant with that name invites
+  the next consumer to reach for it instead of `task.budget.suite_timeout_s`.
+
+- **The doc correction found on the way.** `HARVESTING.md` said preflight
+  runs the suite "four times." It is **five** on the branch every task
+  actually takes — f2p-before, p2p-before, f2p-after, p2p-after, and the
+  scoped p2p-after the grader will also make — and only four when
+  `tests.p2p` is declared explicitly, which skips the scoped run
+  (`if not tests.p2p`). On top of that it runs one command per declared
+  `grading.*` argv, so the worst case is 8 × `suite_timeout_s` per task at
+  the gate, all of it before the proxy starts and inside the one-hour SSO
+  session the matrix itself needs. No new gate is added on that worst case —
+  it is a bound, not a duration, and nothing yet measures preflight's actual
+  elapsed time per task to check it against. That measurement is named as a
+  follow-up in `TASKS.md`, alongside the still-bare `int(...)` parse on
+  `max_turns` and `wall_clock_timeout_s`.
+
+Unit suite: 1256 passed, 50 deselected (docs-only task; the count reflects
+Tasks 1-5's plumbing and test pins, not this task, which touched no `.py`
+file).

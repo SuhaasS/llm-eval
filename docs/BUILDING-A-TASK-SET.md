@@ -221,8 +221,8 @@ What you are looking for, and what each answer disqualifies:
 
 | observation | verdict |
 |---|---|
-| suite green, under ~40 s | usable. Preflight runs it four times per task and the agent re-runs it inside its own timeout |
-| suite green but slow (minutes) | expensive; every task from this repo pays it repeatedly |
+| suite green, under ~40 s | usable. Preflight runs it five times per task (four with an explicit `tests.p2p`) plus once per declared `grading.*` argv, the oracle twice more, and the agent re-runs it inside its own timeout |
+| suite green but slow | usable only with `budget.suite_timeout_s` raised — and it must stay ≤ `budget.wall_clock_timeout_s`, or `load_task` refuses the manifest. Costs up to 8× the value per task at the gate, before the proxy starts and inside the one-hour SSO window |
 | collection errors | usually one missing test dependency. Fixable by declaring it in `image.pip` — note which |
 | `git status` dirty after the suite | the suite writes into the tree. Every submission diff then carries the droppings and diff size measures the interpreter rather than the agent. Fixable with `gitignore_extra` |
 | needs a git submodule | **excluded.** The build context is `git archive base_sha`, which drops submodules; the directory arrives empty |
@@ -415,6 +415,9 @@ image:
 budget:
   max_turns: 40
   wall_clock_timeout_s: 900
+  # suite_timeout_s: 600   # the timeout on every command preflight, the
+  #                        # oracle and the grader run in the container.
+  #                        # Must not exceed wall_clock_timeout_s.
 
 provenance:
   repo: <owner>/<repo>
