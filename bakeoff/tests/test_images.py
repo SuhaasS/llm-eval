@@ -20,6 +20,7 @@ import tarfile
 
 import pytest
 
+import bakeoff.images as images
 from bakeoff.images import (
     ImageError,
     _strip_build_context,
@@ -33,6 +34,7 @@ def _lines(**kwargs) -> list[str]:
     kwargs.setdefault("apt", [])
     kwargs.setdefault("pip", [])
     kwargs.setdefault("build", [])
+    kwargs.setdefault("env", {})
     return [line.strip() for line in render_dockerfile(**kwargs).splitlines()]
 
 
@@ -228,6 +230,7 @@ def test_build_task_image_strips_the_context_it_unpacks(tmp_path, monkeypatch):
         apt = ()
         pip = ()
         build = ()
+        env = {}
 
     class _Task:
         task_id = "t"
@@ -244,3 +247,111 @@ def test_build_task_image_strips_the_context_it_unpacks(tmp_path, monkeypatch):
     assert (unpacked / "calc.py").exists(), "the archive was unpacked at all"
     assert not (unpacked / "CLAUDE.md").exists()
     assert not (unpacked / ".claude").exists()
+
+
+def test_env_lines_come_after_every_build_step():
+    """Placement does not change the final image config -- an ENV anywhere in
+    the file lands in it -- but it decides whether the BUILD sees the value,
+    and it must not.
+
+    `image.build` is arbitrary shell (`pip install -e .` on the click task).
+    CI=1 changes pip's own behaviour and is read by a great many build
+    scripts, so a build that succeeded when the author measured it could start
+    failing, or succeeding differently, for a variable declared to make a test
+    runner deterministic. Nothing in image.build is measured by preflight's
+    ladder, so a value that leaked into it would be an unmeasured difference
+    in an artifact every arm shares.
+    """
+    lines = _lines(build=["pip install -e ."], env={"CI": "1"})
+    last_run = max(i for i, line in enumerate(lines) if line.startswith("RUN "))
+    env_index = next(i for i, line in enumerate(lines)
+                     if line.startswith("ENV CI="))
+
+    assert env_index > last_run
+    # ...and still before the USER switch, so the file reads top-to-bottom as
+    # root-setup then eval-runtime.
+    assert env_index < lines.index("USER eval")
+
+
+def test_env_lines_are_sorted_so_the_image_id_is_a_function_of_the_manifest():
+    """One ENV line per key, in sorted order. Dict insertion order would make
+    the Dockerfile text -- and therefore the built image id, which is what
+    Versions.container_image_digest records -- depend on YAML key order rather
+    than on the manifest's content."""
+    forward = _lines(env={"CI": "1", "HYPOTHESIS_STORAGE_DIRECTORY": "/tmp/h"})
+    reverse = _lines(env={"HYPOTHESIS_STORAGE_DIRECTORY": "/tmp/h", "CI": "1"})
+
+    assert forward == reverse
+    assert [line for line in forward if line.startswith("ENV ")] == [
+        'ENV CI="1"',
+        'ENV HYPOTHESIS_STORAGE_DIRECTORY="/tmp/h"',
+    ]
+
+
+def test_a_task_with_no_env_emits_no_env_line():
+    """The degenerate manifest is the common one -- click declares no env --
+    and an empty `ENV` line is a build error, not a no-op."""
+    assert not [line for line in _lines() if line.startswith("ENV ")]
+
+
+def test_build_task_image_passes_the_manifests_env_through(tmp_path,
+                                                           monkeypatch):
+    """The wiring, not the rendering. Dropping `env=dict(task.image.env)` from
+    the call in `build_task_image` leaves every render_dockerfile test above
+    green while no task image carries any environment at all -- and the
+    failure is silent, because a hypothesis suite whose determinism lever
+    never applied is simply a suite that sometimes passes.
+
+    Faked exactly the way `test_build_task_image_strips_the_context_it_unpacks`
+    fakes it, and for its stated reasons: `git archive` runs through
+    `subprocess.run` DIRECTLY (images.py:252), not through `_run`, so patching
+    `_run` alone leaves it shelling out to a mirror that does not exist and
+    raising `ImageError: git archive ... failed`. `real_run`, captured before
+    the patch, keeps every other caller honest -- the patch lands on the
+    shared `subprocess` module and is process-wide for its duration.
+    """
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "calc.py").write_text("x = 1\n")
+    archive = _archive_bytes(source)
+    real_run = subprocess.run
+
+    def fake_run(args, **kwargs):
+        if list(args)[:2] == ["git", "archive"]:
+            return subprocess.CompletedProcess(args, 0, stdout=archive,
+                                               stderr=b"")
+        return real_run(args, **kwargs)
+
+    rendered = {}
+    real_render = images.render_dockerfile
+
+    def capture(*args, **kwargs):
+        rendered.update(kwargs)
+        return real_render(*args, **kwargs)
+
+    monkeypatch.setattr("bakeoff.tasks.ensure_mirror",
+                        lambda url, sha, cache: tmp_path / "mirror")
+    monkeypatch.setattr("bakeoff.images.subprocess.run", fake_run)
+    # `_run` covers `docker build` AND `image_id`, which calls it -- there is
+    # no separate `image_id` to patch.
+    monkeypatch.setattr("bakeoff.images._run", lambda *a, **k: "sha256:fake")
+    monkeypatch.setattr("bakeoff.images.render_dockerfile", capture)
+
+    class _Image:
+        apt = ()
+        pip = ()
+        build = ()
+        env = {"CI": "1"}
+
+    class _Task:
+        task_id = "envwiring"
+        task_version = 1
+        repo_url = "file:///nowhere"
+        base_sha = "0" * 40
+        image = _Image()
+        strip_paths = ()
+
+    build_task_image(_Task(), "sha256:base", tmp_path / "build",
+                     tmp_path / "cache")
+
+    assert rendered["env"] == {"CI": "1"}
