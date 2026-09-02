@@ -31,50 +31,33 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 from bakeoff.container import RunContainer
 from bakeoff.tasks import _DEFAULT_PYTHON
 
-# pytest's exit codes, which are the whole reason this module can tell "the
-# bug is present" from "the environment is broken". Both are non-zero, and an
-# `assert returncode != 0` passes on the second -- which is precisely the
-# Phase 0c failure. See https://docs.pytest.org/en/stable/reference/exit-codes
-EXIT_ALL_PASSED = 0
-EXIT_TESTS_FAILED = 1
-#: Collection was interrupted. Reached by a run that collects a DIRECTORY or a
-#: MODULE PATH -- not by the f2p selection, which is positional node ids. See
-#: EXIT_USAGE_ERROR.
-EXIT_COLLECTION_INTERRUPTED = 2
-#: Two causes, and telling them apart is the whole of broadening 2. Measured
-#: 2026-09-01 against pytest 9.1.1 and 8.3.5: selecting `mod.py::test` when
-#: `mod.py` raises on import exits 4 with an `ERROR mod.py` summary line, and
-#: selecting a node id that does not exist in a module that imports fine ALSO
-#: exits 4 -- with `ERROR: not found:` (colon), which `_FAILED_LINE` does not
-#: match, so the reported set is empty. The first is a task shape to accept;
-#: the second is a manifest typo that must keep stopping the matrix.
-EXIT_USAGE_ERROR = 4
-#: The scoped run's failure mode, and the whole of its detection. No "collected
-#: 0 items" summary matching: the pinned runners carry `-q`, which suppresses
-#: that line (measured), so a guard on the string could not fire under the
-#: configuration actually used -- the dead-guard shape a mutation cannot catch.
-#: `-q` does NOT suppress "Interrupted: N error during collection" (also
-#: measured); nothing parses that line and nothing should.
-EXIT_NOTHING_COLLECTED = 5
-#: The two codes a collection error can arrive as. 4 first, because that is the
-#: one preflight's own f2p run produces.
-EXIT_COLLECTION_FAILURES = (EXIT_USAGE_ERROR, EXIT_COLLECTION_INTERRUPTED)
-_EXIT_MEANING = {
-    2: "collection was interrupted (an import error in a test module, most "
-       "often a dependency the image does not ship)",
-    3: "pytest hit an internal error",
-    4: "usage error -- a selected node id does not exist, OR the module it "
-       "names could not be imported",
-    5: "no tests were collected",
-    124: "the command hit the suite timeout (budget.suite_timeout_s)",
-}
-
-_FAILED_LINE = re.compile(r"^(?:FAILED|ERROR)\s+(\S+)", re.MULTILINE)
+# Re-exported, not re-defined. These moved to `bakeoff.runners.pytest_adapter`
+# when the exit-code judgement became per-framework (broadening 7), and they
+# are imported back under their EXACT bare names because four modules, twelve
+# tests and six `scripts/mutation_check.py` anchors reference them that way. A
+# namespaced re-spelling (`adapter.f2p_modules(...)`) would rot every one of
+# those anchors silently -- `mutation_check` fails a missing anchor with STALE
+# ANCHOR, but only on a run somebody makes.
+from bakeoff.runners.pytest_adapter import (  # noqa: F401
+    EXIT_ALL_PASSED,
+    EXIT_COLLECTION_FAILURES,
+    EXIT_COLLECTION_INTERRUPTED,
+    EXIT_NOTHING_COLLECTED,
+    EXIT_TESTS_FAILED,
+    EXIT_USAGE_ERROR,
+    _EXIT_MEANING,
+    _FAILED_LINE,
+    _PYTHON_BASENAME,
+    _runner_python,
+    collection_error_modules,
+    f2p_modules,
+    failed_node_ids,
+)
 
 #: What this gate asserts, as a version. It joins `run_matrix`'s preflight
 #: cache key and the grader's, because none of the other three components
@@ -302,35 +285,6 @@ def _declared_python(task) -> str:
     return getattr(getattr(task, "image", None), "python", "") or _DEFAULT_PYTHON
 
 
-#: Basenames that mean "this argv element is a Python interpreter".
-#: `python`, `python3`, and `pythonX.Y` -- the three shapes a `tests.runner`
-#: actually carries. Matched on the BASENAME so an absolute
-#: `/usr/local/bin/python3.12` counts, and anchored so `pythonish-wrapper`
-#: does not.
-_PYTHON_BASENAME = re.compile(r"^python(?:\d+(?:\.\d+)?)?$")
-
-
-def _runner_python(runner: tuple[str, ...]) -> str:
-    """The interpreter this task's suite runs under, or "python".
-
-    The availability probe has to ask the interpreter the RUNNER uses, not
-    whichever `python` is first on PATH: a task whose runner is
-    `["/opt/venv/bin/python", "-m", "pytest", ...]` resolves imports against
-    that venv's site-packages, and probing the system interpreter would answer
-    a question about a different environment. `click-3360`'s runner is
-    `["python", "-m", "pytest", ...]`, so the common case is unchanged.
-
-    Falls back to "python" when `runner[0]` is not an interpreter at all --
-    `["pytest", "-q", ...]` is a legal runner, and the console script gives no
-    interpreter path to reuse. The fallback is a guess and is allowed to be:
-    this probe decides whether to ASK for `CI`, and preflight's runner check
-    has already established that `pytest` is in the argv.
-    """
-    if runner and _PYTHON_BASENAME.match(PurePosixPath(runner[0]).name):
-        return runner[0]
-    return "python"
-
-
 def _existing_prefixes(container, prefixes: tuple[str, ...]) -> tuple[str, ...]:
     """The declared prefixes that exist in the tree, in declared order.
 
@@ -476,74 +430,6 @@ def _declared_grading(task) -> list[tuple[str, tuple[str, ...]]]:
         for spec in dataclass_fields(grading)
         if getattr(grading, spec.name)
     ]
-
-
-def failed_node_ids(output: str) -> set[str]:
-    """Node ids pytest reported as FAILED or ERROR, from `-q` output.
-
-    Parsed from the summary lines rather than from a JUnit report. The report
-    would need `classname` mapped back to a node id, and that mapping is
-    ambiguous -- a dotted segment is a package or a class and the XML does
-    not say which -- so the parser becomes a second thing that can be wrong
-    about what happened, sitting inside the check that exists to be right
-    about it.
-    """
-    return {match.group(1) for match in _FAILED_LINE.finditer(output)}
-
-
-def collection_error_modules(output: str) -> frozenset[str] | None:
-    """The test modules pytest could not COLLECT -- or `None` for anything else.
-
-    Section 3.3's loop ends in "runs tests, sees failures, self-corrects", and
-    a PR that ADDS a symbol hands the agent an `ImportError` instead of an
-    assertion. That is a real task shape, and it is one preflight refused
-    outright until broadening 2, because both of its exit codes (4 for a
-    selection, 2 for a directory sweep) are also what a broken image gives.
-
-    The discriminator is `::`, and it is the whole parser. Measured 2026-09-01
-    against pytest 9.1.1 and 8.3.5, under the pinned `-q -p no:cacheprovider`:
-
-    * a module that raised on import          -> `ERROR tests/new.py`
-    * a test that failed                      -> `FAILED tests/new.py::test_x`
-    * a test whose fixture raised             -> `ERROR tests/new.py::test_x`
-    * a node id that does not exist           -> `ERROR: not found: ...`
-    * a path that does not exist              -> `ERROR: file or directory ...`
-    * a broken `tests/conftest.py`            -> no `short test summary info`
-      section at all -- exit 4 with the reported set EMPTY, so the run is
-      UNCONFINED (measured 2026-09-01, pytest 9.1.1 and 8.3.5)
-
-    The last three carry no `ERROR <path>` line matching `_FAILED_LINE` --
-    the first two are prefixed with a colon `_FAILED_LINE` does not match, the
-    third prints no summary section for the parser to find at all -- so they
-    arrive here as an empty set, which is refused: a manifest naming a renamed
-    test, or a task whose conftest cannot even import, must keep stopping the
-    matrix rather than being read as "the module could not be collected".
-
-    `None` rather than an empty frozenset for the refusal: "no collection
-    errors" and "collection errors mixed with test results" are different
-    facts, and a caller comparing an empty set against the declared modules
-    would silently accept the second on a task that declares no f2p ids.
-
-    The comparison against `f2p_modules` is deliberately NOT made here. The two
-    callers need different ones -- preflight equality, the grader containment
-    (see the offline-grader spec, check 5) -- and folding both behind a flag
-    would make each call site unreadable about which claim it is making.
-    """
-    reported = failed_node_ids(output)
-    if not reported or any("::" in item for item in reported):
-        return None
-    return frozenset(reported)
-
-
-def f2p_modules(f2p: tuple[str, ...]) -> frozenset[str]:
-    """The module half of each declared f2p node id.
-
-    Split once, from the LEFT: a parametrized id can carry `::` inside its
-    brackets (`tests/a.py::test_one[x::y]`) and a class-scoped id carries two,
-    so `rsplit` or an unbounded `split` would name something that is not a
-    module and the equality in `preflight` would never hold.
-    """
-    return frozenset(node_id.split("::", 1)[0] for node_id in f2p)
 
 
 class _Runner:

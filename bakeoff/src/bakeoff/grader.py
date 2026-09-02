@@ -98,6 +98,16 @@ from bakeoff.preflight import (
     failed_node_ids,
 )
 from bakeoff.runner import harness_commit
+# `_SUMMARY_LINE`, `_DESELECTED` and `parse_deselected` are re-exported, not
+# re-defined: they moved to `bakeoff.runners.pytest_adapter` when the suite
+# judgement became per-framework (broadening 7). They keep their EXACT bare
+# names, because `test_grader.py` and `scripts/mutation_check.py` reference
+# them that way and a rotted anchor fails only on a run somebody makes.
+from bakeoff.runners.pytest_adapter import (  # noqa: F401
+    _DESELECTED,
+    _SUMMARY_LINE,
+    parse_deselected,
+)
 from bakeoff.schema import Outcome, RunRecord, Severity
 from bakeoff.tasks import (
     TaskError,
@@ -239,31 +249,6 @@ _REPLACEMENT_CHAR = "�"
 #: an input preflight deliberately lets through (`SCOPE_PREFIX_MISSING` is
 #: evidence, not a problem), so the grader has to survive it.
 _EMPTY_PATHSPEC = "did not match any file"
-
-#: The `-q` summary line: the FINAL non-empty line of pytest's stdout, ending
-#: in a duration. Measured against the eval image's pytest 9.1.1 on
-#: 2026-08-17 (the image pins `PYTEST_VERSION=9.1.1`; an earlier draft of this
-#: module said 8.3.5, which is not what is installed):
-#:
-#:     4 passed in 0.00s
-#:     1 passed, 3 deselected in 0.00s
-#:     4 deselected in 0.00s                      (and exit 5)
-#:     no tests ran in 0.00s                      (and exit 5)
-#:     4 passed, 1 deselected, 1 warning in 0.00s
-#:     1 failed, 4 passed in 0.01s
-#:
-#: The optional trailing `(H:MM:SS)` is what pytest appends past 60 seconds
-#: (`_pytest.terminal.format_session_duration`), and without it every p2p run
-#: over a minute would read as "no summary line" -- which is `None`, which is
-#: "not measured", on the majority of real suites.
-#:
-#: A wrong discriminator inverts the 0-vs-None distinction in one direction or
-#: the other, which is why it is pinned here rather than inferred: too loose
-#: and a stray tail line reads as a summary with no `deselected` token, so a
-#: total quarantine loss renders as a measured zero; too tight and a measured
-#: zero renders as "nobody counted".
-_SUMMARY_LINE = re.compile(r"\bin \d+(?:\.\d+)?s(?: \(\d+:\d{2}:\d{2}\))?$")
-_DESELECTED = re.compile(r"(\d+) deselected")
 
 #: Exit codes that mean the COMMAND did not run, never that it ran and
 #: disagreed. 127 is "command not found" and must never be stamped on the
@@ -724,30 +709,6 @@ def _added_lines(chunk: str) -> str:
     return "\n".join(
         line[1:] for line in lines[first_hunk + 1:] if line.startswith("+")
     )
-
-
-def parse_deselected(stdout: str) -> int | None:
-    """How many items pytest said it deselected. `None` means no summary line.
-
-    TWO ABSENCES, KEPT APART. A summary line with no `deselected` token is
-    `0`, an OBSERVATION -- pytest prints no token at zero (measured), and on
-    the explicit-p2p branch a wholly stale quarantine produces exactly that,
-    which is the total loss most worth seeing. `None` is reserved for "no
-    summary line was found", which is the grader not having counted.
-
-    Read off stdout alone. `RunContainer.exec` demuxes, pytest writes its
-    summary to stdout, and a stderr tail concatenated on the end would
-    displace the final-line discriminator.
-    """
-    for line in reversed(stdout.split("\n")):
-        line = line.strip()
-        if not line:
-            continue
-        if not _SUMMARY_LINE.search(line):
-            return None
-        found = _DESELECTED.search(line)
-        return int(found.group(1)) if found else 0
-    return None
 
 
 # ---------------------------------------------------------------------------
