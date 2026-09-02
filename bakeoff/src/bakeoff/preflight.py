@@ -107,7 +107,12 @@ _FAILED_LINE = re.compile(r"^(?:FAILED|ERROR)\s+(\S+)", re.MULTILINE)
 #: by a gate that never asked which interpreter the container runs, so a task
 #: built against a stale or mismatched base keeps serving a PASS while its
 #: suite runs under an interpreter the task was not cut for.
-PREFLIGHT_VERSION: str = "7"
+#: 8 reads every submodule's state back out of the container. A verdict cached
+#: under 7 was written by a gate that never asked whether the tree's gitlinks
+#: are populated -- and `git status --porcelain` reports a superproject whose
+#: submodule directory is empty as CLEAN, so no other assertion in this file
+#: can see it either.
+PREFLIGHT_VERSION: str = "8"
 
 
 def preflight_cache_key(task, image: str, start_sha: str) -> str:
@@ -339,6 +344,91 @@ def _existing_prefixes(container, prefixes: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(_present(container, prefixes))
 
 
+def _parse_submodule_status(
+    out: str, paths: tuple[str, ...]
+) -> tuple[list[dict], list[str]]:
+    """`git submodule status`, one dict per line, paths taken from `paths`.
+
+    The FIRST CHARACTER is the verdict and the other two values are context.
+    Measured 2026-09-01 (git 2.50.1, and confirmed at 2.54.0 inside the
+    container): a leading space means the submodule is initialised AND its HEAD
+    equals the index gitlink; `-` means uninitialised, which includes the empty
+    directory `git clone --local` leaves behind and the state a transient
+    `-c submodule.<name>.url=` produces; `+` means initialised at a different
+    commit.
+
+    `paths` is the AUTHORITATIVE path set, from `git ls-files -s -z`'s 160000
+    entries. The status line is human-readable -- `<char><sha> <path>[
+    (describe)]` -- with no `-z` form and no escaping, so splitting it on `" ("`
+    mis-parses any path containing those bytes. Same rule as `_chunk_path`:
+    paths come from git, never from a regex over a display line. The line is
+    used for its FIRST CHARACTER and nothing else.
+
+    Measured 2026-09-01 on the run tree `materialize` builds: the describe
+    suffix is `(heads/main)`, not a detached-HEAD sha, because the pruned
+    mirror publishes `refs/heads/main` at the gitlink. Nothing here reads it.
+
+    This is an OBSERVATION, not a restatement of the manifest: the expected sha
+    is never passed in, it is the index gitlink git compares against on its own.
+    That is what makes the check catch a tree emptied after `materialize`'s own
+    post-condition passed.
+
+    Returns `(parsed, unmatched)`. An `unmatched` line is one `git ls-files`
+    has no gitlink for, which means the two readers disagree about this tree --
+    a state nothing here can interpret. It is reported as a problem rather than
+    resolved by falling back to `tail.strip()`: that fallback would put a
+    DISPLAY-derived path back into the evidence, which is the exact thing
+    taking paths from `ls-files` exists to prevent.
+    """
+    parsed, unmatched = [], []
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        marker, rest = line[0], line[1:]
+        sha, _, tail = rest.partition(" ")
+        match = [path for path in paths if tail.startswith(path)]
+        if not match:
+            unmatched.append(line)
+            continue
+        parsed.append({
+            # The LONGEST match, because `startswith` is satisfied by every
+            # prefix: a tree carrying both `vendor/lib` and `vendor/libdep`
+            # would otherwise record the second line under the first name.
+            "path": max(match, key=len),
+            "sha": sha,
+            "initialised": marker == " ",
+        })
+    return parsed, unmatched
+
+
+def _gitlink_paths(container) -> tuple[str, ...] | None:
+    """Every 160000 entry in the container's index. `None` if it could not be read.
+
+    `container.exec` and an explicit `exit_code` branch, NOT `_checked_exec` --
+    and the reason is the gate's contract, not a style preference.
+    `_checked_exec` raises `ContainerError`, and `preflight` COLLECTS problems
+    and returns a `PreflightResult`; `run_matrix`'s `preflight(...)` call is not
+    wrapped, so a raise from in here would surface as a traceback instead of the
+    NO-GO the driver knows how to handle. (It also returns an `ExecResult`, not
+    a `str`, so `.split` on it would be an `AttributeError` rather than the read
+    this needs.)
+
+    The exit code still has to be looked at, for the reason `_checked_exec`
+    exists at all: an empty stdout from a failed `ls-files` is byte-identical
+    to a repository with no submodules. `None` here means "not read"; the
+    caller turns that into a problem plus `None` evidence, the same shape the
+    `git submodule status` branch uses.
+    """
+    result = container.exec(["git", "ls-files", "-s", "-z"])
+    if result.exit_code != 0:
+        return None
+    paths = []
+    for record in result.stdout.split("\0"):
+        if record.startswith("160000 "):
+            paths.append(record.split("\t", 1)[1])
+    return tuple(paths)
+
+
 def _declared_grading(task) -> list[tuple[str, tuple[str, ...]]]:
     """The non-empty `grading.*` argvs, keyed by check name.
 
@@ -568,6 +658,13 @@ def preflight(
     #: different absence than never having looked, and the two must not
     #: render identically.
     evidence["python_observed"] = None
+    #: `None`, not `[]`: nothing was measured. `[]` is the observation "this
+    #: tree has no submodules", which is what the check below writes for the
+    #: ordinary task -- and a key absent from this branch and present on that
+    #: one is the same defect one layer down, since a reader diffing two
+    #: evidence files could not tell the two apart.
+    evidence["submodules"] = None
+    evidence["submodules_orphaned"] = None
 
     if not any("pytest" in part for part in tests.runner):
         # The red/green distinction is built on pytest's exit codes. Another
@@ -717,6 +814,98 @@ def preflight(
                 "everything, so an un-stripped path is both a context this "
                 "task has and the others do not, and a file in every "
                 "submission diff."
+            )
+
+        # The submodules, read back out of the container the suite will run
+        # in. `materialize` has its own post-condition on the host and it is
+        # not this one: a tree can be emptied, re-copied or rebuilt between
+        # there and here, and the image is built by a separate `git archive`.
+        #
+        # This is the failure this whole broadening exists to make loud.
+        # Measured 2026-09-01, git 2.50.1: a superproject whose submodule
+        # directory has zero entries reports `git status --porcelain` EMPTY --
+        # so the tree is clean, the strip check is silent, the dirty-after
+        # check is silent, and the only symptom is a suite that cannot import
+        # its dependency. That is the Phase 0c shape arriving through the
+        # dataset instead of through the image, and it is scored as capability
+        # on every arm.
+        submodules: list[dict] = []
+        status = container.exec(["git", "submodule", "status"])
+        if status.exit_code != 0:
+            # `None`, not `[]`. A non-zero exit returns empty stdout, which
+            # parses to `[]` -- a positive observation of "there are none"
+            # manufactured out of a failure, with no problem raised. The two
+            # absences must not render identically.
+            evidence["submodules"] = None
+            evidence["submodules_orphaned"] = None
+            problems.append(
+                "`git submodule status` failed (exit "
+                f"{status.exit_code}): {(status.stdout or status.stderr)[:500]}. "
+                "Whether this tree's submodules are initialised is unknown, and "
+                "an uninitialised one is invisible in `git status`."
+            )
+        gitlinks = None if status.exit_code != 0 else _gitlink_paths(container)
+        if status.exit_code == 0 and gitlinks is None:
+            # Same shape as the branch above, different cause: the index could
+            # not be read, so there is no authoritative path set and nothing
+            # below can be trusted to name a submodule.
+            evidence["submodules"] = None
+            evidence["submodules_orphaned"] = None
+            problems.append(
+                "`git ls-files -s -z` failed, so the tree's gitlinks could not "
+                "be read and no submodule claim can be made about it."
+            )
+        elif status.exit_code == 0:
+            submodules, unmatched = _parse_submodule_status(status.stdout,
+                                                            gitlinks)
+            evidence["submodules"] = submodules
+            if unmatched:
+                # NOT resolved by falling back to the display line's own text:
+                # that would put a display-derived path into the evidence,
+                # which is what taking paths from `ls-files` exists to prevent.
+                problems.append(
+                    "`git submodule status` named submodules the index has no "
+                    "gitlink for: " + "; ".join(unmatched[:5])
+                    + ". The two readers disagree about this tree."
+                )
+            # Inert, therefore recorded rather than refused (measured: git
+            # drives submodules off the index, so a stanza with no gitlink is
+            # never listed, never fetched and creates no directory). Recorded
+            # HERE because in the container it is an observation of the tree
+            # the suite will run against.
+            declared_subs = container.exec(
+                ["git", "config", "-f", ".gitmodules", "--get-regexp",
+                 r"^submodule\..*\.path$"]
+            )
+            if declared_subs.exit_code in (0, 1):
+                # 1 is git config's ORDINARY "no key matched" -- a repository
+                # with no .gitmodules at all, or one whose stanzas all have
+                # gitlinks. Collapsing it with >1 would report a genuine
+                # failure (an unreadable or malformed .gitmodules) as the
+                # measured claim "there are no orphans".
+                evidence["submodules_orphaned"] = sorted(
+                    {line.split(" ", 1)[1]
+                     for line in declared_subs.stdout.splitlines() if " " in line}
+                    - set(gitlinks)
+                )
+            else:
+                evidence["submodules_orphaned"] = None
+                problems.append(
+                    "reading .gitmodules failed (exit "
+                    f"{declared_subs.exit_code}): "
+                    f"{(declared_subs.stdout or declared_subs.stderr)[:500]}"
+                )
+        stale = [entry["path"] for entry in submodules
+                 if not entry["initialised"]]
+        if stale:
+            problems.append(
+                "submodules are not initialised at their gitlink: "
+                + ", ".join(stale)
+                + ". The directory is empty or at the wrong commit, and "
+                "`git status --porcelain` reports a tree in that state as "
+                "CLEAN -- so the suite would simply fail to collect and every "
+                "arm would be scored on an environment defect. Materialization "
+                "should have populated it from the submodule's pruned mirror."
             )
 
         # The environment, checked against the CONTAINER rather than against

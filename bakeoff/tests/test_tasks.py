@@ -2452,6 +2452,39 @@ def test_a_gitlink_with_no_gitmodules_url_is_refused(tmp_path,
         tasks.derive_submodules(task, mirror)
 
 
+def test_a_gitmodules_stanza_with_a_path_and_no_url_is_refused(
+        tmp_path, upstream_submodule):
+    """A THIRD shape, between the two neighbouring tests: `.gitmodules` is
+    readable and the stanza names this exact path, so both the set difference
+    and the "no readable .gitmodules" refusal are satisfied and neither fires.
+    What is missing is the url alone, which leaves `Submodule.url` an empty
+    string -- and an empty string is not a url, it is a stanza someone
+    hand-edited or a `git submodule add` that never finished.
+
+    Deliberately WITHOUT the `local_urls` fixture. That fixture empties
+    `_SUBMODULE_URL_PREFIX` so `startswith` is vacuously true, and `""` starts
+    with `""` -- so under it this refusal cannot fire at all, and a test that
+    used it would pass with the check deleted.
+    """
+    up = upstream_submodule
+    (up["path"] / ".gitmodules").write_text(
+        '[submodule "vendor/libdep"]\n\tpath = vendor/libdep\n'
+    )
+    _sh("git", "add", ".gitmodules", cwd=up["path"])
+    _sh("git", "-c", "user.email=t@t.test", "-c", "user.name=t",
+        "commit", "-q", "-m", "drop the url", cwd=up["path"])
+    base = _sh("git", "rev-parse", "HEAD", cwd=up["path"])
+    task = _sub_task(tmp_path, {**up, "base": base})
+    mirror = tasks.ensure_mirror(str(up["path"]), base, tmp_path / "cache")
+
+    with pytest.raises(TaskError, match="declares no url") as excinfo:
+        tasks.derive_submodules(task, mirror)
+
+    # `no url`, never `url ''`: an empty value reads as a url that is present
+    # and strange rather than one that was never written.
+    assert "vendor/libdep" in str(excinfo.value)
+
+
 def test_a_gitmodules_entry_with_no_gitlink_is_NOT_refused(tmp_path,
                                                            upstream_submodule,
                                                            local_urls):

@@ -29,6 +29,7 @@ from bakeoff.preflight import (
     EXIT_TESTS_FAILED,
     EXIT_USAGE_ERROR,
     _parse_python_version,
+    _parse_submodule_status,
     collection_error_modules,
     f2p_modules,
     failed_node_ids,
@@ -395,6 +396,14 @@ def test_a_real_task_passes_every_check(tmp_path, agent_image):
     assert result.evidence["f2p_before_exit"] == EXIT_TESTS_FAILED
     assert result.evidence["f2p_after_exit"] == EXIT_ALL_PASSED
     assert result.evidence["uid"] != "0"
+    # A repository with no submodules, measured in the real container rather
+    # than through the scripted one: `git submodule status` exits 0 with empty
+    # stdout, and `git config -f .gitmodules` exits 1 because the file is not
+    # there. Both are observations of NONE and both must reach the evidence as
+    # `[]` -- the scripted default asserts the same pair, and this is what says
+    # the two agree about the tree every ordinary task is in.
+    assert result.evidence["submodules"] == []
+    assert result.evidence["submodules_orphaned"] == []
 
 
 @pytest.mark.integration
@@ -850,7 +859,9 @@ class _ScriptedContainer:
                  f2p_before=None, f2p_after=None, p2p_before=None,
                  env=None, hypothesis_importable=False,
                  hypothesis_in_suite=False, rg_exit=None,
-                 python="Python 3.12.13"):
+                 python="Python 3.12.13",
+                 submodule_status="", submodule_status_exit=0,
+                 gitlinks=(), gitmodules_declared=None, gitmodules_exit=None):
         self.commands = []
         self.start_sha = start_sha
         self.tests = tests
@@ -866,6 +877,28 @@ class _ScriptedContainer:
         #: What `python --version` answers, verbatim; `None` for an image with
         #: no interpreter on PATH at all.
         self.python = python
+        #: `git submodule status`'s stdout, verbatim. Real lines carry the
+        #: describe suffix -- ` <sha> <path> (heads/main)` -- because after
+        #: `materialize`'s init the submodule HEAD sits on the pruned mirror's
+        #: `refs/heads/main`; the parser must survive it without reading it.
+        self.submodule_status = submodule_status
+        #: Scripted SEPARATELY from the text above, because that pair is what
+        #: the gate has to tell apart: a non-zero `git submodule status`
+        #: returns EMPTY stdout, which parses to `[]` -- an observation of
+        #: "there are none" manufactured out of a failure.
+        self.submodule_status_exit = submodule_status_exit
+        #: The index's 160000 entries, the AUTHORITATIVE path set. `None` is
+        #: an `ls-files` that could not be read at all, which is a different
+        #: absence than `()` -- a tree with no gitlinks in it.
+        self.gitlinks = gitlinks
+        #: `.gitmodules`' declared paths; `None` derives them from `gitlinks`,
+        #: which is the tree every other test in this module is already in.
+        self.gitmodules_declared = gitmodules_declared
+        #: `git config --get-regexp`'s exit code. `None` picks git's own: 0
+        #: when something matched, 1 when nothing did. An explicit value is
+        #: how a test reaches the >1 branch, where the file exists and could
+        #: not be read -- the answer that must not be reported as "no orphans".
+        self.gitmodules_exit = gitmodules_exit
         self.scoped_exit = scoped_exit
         self.grading_exits = dict(grading_exits or {})
         self.f2p_runs = 0
@@ -927,6 +960,40 @@ class _ScriptedContainer:
             if self.rg_exit is not None:
                 return _Exec(exit_code=self.rg_exit)
             return _Exec(exit_code=0 if self.hypothesis_in_suite else 1)
+        # The three submodule probes come BEFORE every other `git` branch:
+        # the catch-all `cmd[0] == "git"` below would swallow all three and
+        # answer each of them exit 0 with empty stdout -- which is the
+        # healthy-and-empty answer, so nothing would fail.
+        if cmd[:2] == ["git", "submodule"]:
+            return _Exec(exit_code=self.submodule_status_exit,
+                         stdout=self.submodule_status)
+        if cmd[:3] == ["git", "ls-files", "-s"]:
+            if self.gitlinks is None:
+                return _Exec(exit_code=128,
+                             stderr="fatal: not a git repository\n")
+            # `-z` emits `<mode> <sha> <stage>\t<path>` NUL-TERMINATED, so the
+            # last record is empty. Written out rather than joined, because
+            # that trailing empty is what the parser has to survive.
+            return _Exec(stdout="".join(
+                f"160000 {'a' * 40} 0\t{path}\0" for path in self.gitlinks
+            ))
+        if cmd[:4] == ["git", "config", "-f", ".gitmodules"]:
+            declared = (self.gitlinks or ()
+                        if self.gitmodules_declared is None
+                        else self.gitmodules_declared)
+            if self.gitmodules_exit is not None and self.gitmodules_exit > 1:
+                return _Exec(exit_code=self.gitmodules_exit,
+                             stderr="fatal: bad config line 1\n")
+            return _Exec(
+                # 1 is git config's ORDINARY "no key matched": no .gitmodules
+                # at all, or one whose stanzas all have gitlinks.
+                exit_code=(self.gitmodules_exit if self.gitmodules_exit
+                           is not None else (0 if declared else 1)),
+                stdout="".join(
+                    f"submodule.{path.rsplit('/', 1)[-1]}.path {path}\n"
+                    for path in declared
+                ),
+            )
         if cmd[:2] == ["git", "rev-parse"]:
             return _Exec(stdout=self.start_sha + "\n")
         if cmd[:2] == ["git", "status"]:
@@ -1918,10 +1985,309 @@ def test_the_preflight_version_moved_with_the_new_assertion():
     the older loader, so manifest_digest does not move and a warm cache would
     serve a verdict gated at 600; 6 -> 7 is the image.python read-back, and a
     verdict cached under 6 was written by a gate that never asked which
-    interpreter the container runs."""
+    interpreter the container runs; 7 -> 8 is the submodule read-back, and a
+    verdict cached under 7 was written by a gate that never asked whether the
+    tree's submodules are populated -- which `git status --porcelain` reports
+    as CLEAN when they are not."""
     from bakeoff.preflight import PREFLIGHT_VERSION
 
-    assert PREFLIGHT_VERSION == "7"
+    assert PREFLIGHT_VERSION == "8"
+
+
+# --- every submodule is initialised at its gitlink ---------------------------
+
+
+def test_the_submodule_status_parse_reads_the_leading_character():
+    """Measured 2026-09-01, git 2.50.1: `-` uninitialised (which is also what a
+    transient `-c submodule.<n>.url=` leaves behind), `+` initialised at a
+    different commit than the gitlink, and a leading SPACE the one acceptable
+    state. The prefix is the whole verdict -- an empty submodule directory
+    leaves `git status --porcelain` clean, so nothing else reports it.
+
+    The describe suffix is on the healthy lines because that is the shape
+    `materialize` actually leaves behind: the pruned mirror publishes
+    `refs/heads/main` at the gitlink sha, so the initialised submodule's HEAD
+    sits on `heads/main` rather than detached, and git says so.
+    """
+    out = (
+        " 942c381d88cecca36be86b2e902f554ad145ec44 vendor/libdep (heads/main)\n"
+        "-0000000000000000000000000000000000000000 vendor/other\n"
+        "+1111111111111111111111111111111111111111 vendor/third (heads/x)\n"
+    )
+
+    parsed, unmatched = _parse_submodule_status(
+        out, ("vendor/libdep", "vendor/other", "vendor/third"))
+
+    assert unmatched == []
+    assert parsed == [
+        {"path": "vendor/libdep",
+         "sha": "942c381d88cecca36be86b2e902f554ad145ec44",
+         "initialised": True},
+        {"path": "vendor/other",
+         "sha": "0" * 40, "initialised": False},
+        {"path": "vendor/third", "sha": "1" * 40, "initialised": False},
+    ]
+
+
+def test_a_status_line_whose_path_contains_a_paren_is_parsed_from_the_index():
+    """The status line is human-readable and has no `-z` form, so splitting it
+    on `" ("` mis-parses. The path set comes from `git ls-files -s -z`; the
+    line contributes its first character and nothing else.
+    """
+    out = " 942c381d88cecca36be86b2e902f554ad145ec44 ven (dor)/lib (a)\n"
+
+    parsed, unmatched = _parse_submodule_status(out, ("ven (dor)/lib",))
+
+    assert unmatched == []
+    assert parsed == [{"path": "ven (dor)/lib",
+                       "sha": "942c381d88cecca36be86b2e902f554ad145ec44",
+                       "initialised": True}]
+
+
+def test_a_status_line_the_index_has_no_gitlink_for_is_a_problem():
+    """The two readers disagreeing is not resolvable here, and it must not be
+    papered over with the display line's own text -- a display-derived path in
+    the evidence is what taking paths from `ls-files` exists to prevent.
+    """
+    out = " 942c381d88cecca36be86b2e902f554ad145ec44 vendor/ghost\n"
+
+    parsed, unmatched = _parse_submodule_status(out, ("vendor/libdep",))
+
+    assert parsed == []
+    assert unmatched == [out.rstrip("\n")]
+
+
+def test_a_nested_gitlink_prefix_does_not_claim_the_longer_path():
+    """`startswith` matches BOTH `vendor/lib` and `vendor/libdep` against a
+    line naming the second, and the shorter one would silently rename the
+    submodule in the evidence. The longest match is the only one that can be
+    right, because the tail begins with the path.
+    """
+    out = " 942c381d88cecca36be86b2e902f554ad145ec44 vendor/libdep (heads/main)\n"
+
+    parsed, _ = _parse_submodule_status(out, ("vendor/lib", "vendor/libdep"))
+
+    assert [entry["path"] for entry in parsed] == ["vendor/libdep"]
+
+
+def test_an_initialised_submodule_at_its_gitlink_is_a_GO(monkeypatch, tmp_path):
+    """The pass direction, and the shape `materialize` leaves: a leading space
+    and a `(heads/main)` suffix the parser never reads."""
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=_FakeTests(), present=("tests/",),
+        gitlinks=("vendor/libdep",),
+        submodule_status=(
+            " 942c381d88cecca36be86b2e902f554ad145ec44 vendor/libdep"
+            " (heads/main)\n"
+        ),
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, _FakeTask(), container)
+
+    assert result.ok, result.problems
+    assert result.evidence["submodules"] == [
+        {"path": "vendor/libdep",
+         "sha": "942c381d88cecca36be86b2e902f554ad145ec44",
+         "initialised": True}
+    ]
+    assert result.evidence["submodules_orphaned"] == []
+
+
+def test_an_uninitialised_submodule_is_a_preflight_problem(monkeypatch,
+                                                           tmp_path):
+    """NO-GO, not evidence. An empty submodule directory leaves
+    `git status --porcelain` clean, so the suite would simply fail to collect
+    and every arm would be scored on an environment defect -- the Phase 0c
+    shape, arriving through the dataset instead of the image.
+    """
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=_FakeTests(), gitlinks=("vendor/libdep",),
+        submodule_status=(
+            "-0000000000000000000000000000000000000000 vendor/libdep\n"
+        ),
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, _FakeTask(), container)
+
+    assert not result.ok
+    assert any("vendor/libdep" in p for p in result.problems)
+    assert result.evidence["submodules"] == [
+        {"path": "vendor/libdep", "sha": "0" * 40, "initialised": False}
+    ]
+
+
+def test_a_submodule_at_the_wrong_commit_is_a_preflight_problem(monkeypatch,
+                                                                tmp_path):
+    """`+`, not `-`: the directory is populated and the suite imports SOMETHING
+    -- a different revision of the dependency than the task was cut against.
+    Louder than empty and no less fatal, and `git status --porcelain` in the
+    superproject is the only place it shows at all.
+    """
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=_FakeTests(), gitlinks=("vendor/libdep",),
+        submodule_status=("+" + "1" * 40 + " vendor/libdep (heads/main)\n"),
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, _FakeTask(), container)
+
+    assert not result.ok
+    assert any("not initialised at their gitlink" in p for p in result.problems)
+    assert result.evidence["submodules"] == [
+        {"path": "vendor/libdep", "sha": "1" * 40, "initialised": False}
+    ]
+
+
+def test_a_task_with_no_submodules_records_an_empty_list(monkeypatch, tmp_path):
+    """Absence is recorded, never implied. `[]` is an observation of NONE; a
+    missing key reads as "not measured", and the two must not render alike.
+
+    This is the state every other test in this module is already in, which is
+    what makes the "adds no problem" half load-bearing: a check that fired on
+    the ordinary task would take the whole task set down with it.
+    """
+    container = _ScriptedContainer(start_sha="s" * 40, tests=_FakeTests(),
+                                   submodule_status="")
+
+    result = _run_preflight(monkeypatch, tmp_path, _FakeTask(), container)
+
+    assert result.evidence["submodules"] == []
+    assert result.evidence["submodules_orphaned"] == []
+    assert not any("submodule" in p for p in result.problems)
+
+
+def test_a_failed_submodule_status_records_None_and_a_problem(monkeypatch,
+                                                              tmp_path):
+    """A null says which kind of null it is.
+
+    A non-zero `git submodule status` returns EMPTY stdout, which parses to
+    `[]` -- a positive observation of "there are none" manufactured out of a
+    failure. `None` is "the measurement did not happen", and the two must not
+    render identically. This is the same silent zero `container._checked_exec`
+    exists for: a failed `git diff` returns output byte-identical to a clean
+    tree.
+    """
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=_FakeTests(), submodule_status_exit=128,
+        submodule_status="fatal: not a git repository\n",
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, _FakeTask(), container)
+
+    assert not result.ok
+    assert result.evidence["submodules"] is None
+    assert result.evidence["submodules_orphaned"] is None
+    assert any("git submodule status" in p for p in result.problems)
+
+
+def test_an_unreadable_index_records_None_and_a_problem(monkeypatch, tmp_path):
+    """Same shape, different cause: `git submodule status` answered and the
+    index did not, so there is no authoritative path set and every path in the
+    display lines would have to be trusted -- which is the one thing this
+    check refuses to do.
+    """
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=_FakeTests(), gitlinks=None,
+        submodule_status=(
+            " 942c381d88cecca36be86b2e902f554ad145ec44 vendor/libdep"
+            " (heads/main)\n"
+        ),
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, _FakeTask(), container)
+
+    assert not result.ok
+    assert result.evidence["submodules"] is None
+    assert result.evidence["submodules_orphaned"] is None
+    assert any("ls-files" in p for p in result.problems)
+
+
+def test_a_status_line_with_no_gitlink_is_reported_as_a_problem(monkeypatch,
+                                                                tmp_path):
+    """The parse's `unmatched` reaching the gate. Not a fabricated path in the
+    evidence and not silence: the two readers disagree about this tree, which
+    is a state nothing here can interpret.
+    """
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=_FakeTests(), gitlinks=("vendor/libdep",),
+        submodule_status=(
+            " 942c381d88cecca36be86b2e902f554ad145ec44 vendor/ghost\n"
+        ),
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, _FakeTask(), container)
+
+    assert not result.ok
+    assert any("no gitlink for" in p for p in result.problems)
+    assert result.evidence["submodules"] == []
+
+
+def test_an_orphaned_gitmodules_stanza_is_recorded_and_not_refused(monkeypatch,
+                                                                   tmp_path):
+    """Inert, therefore recorded rather than refused. Measured 2026-09-01: git
+    drives submodules off the INDEX, so a stanza whose path has no gitlink is
+    never listed, never fetched and creates no directory -- the shape a
+    `git rm --cached` with the stanza left behind produces. `derive_submodules`
+    accepts it on the host for that reason; this is the same fact observed in
+    the tree the suite will actually run against.
+    """
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=_FakeTests(), present=("tests/",),
+        gitlinks=("vendor/libdep",),
+        gitmodules_declared=("vendor/libdep", "vendor/gone"),
+        submodule_status=(
+            " 942c381d88cecca36be86b2e902f554ad145ec44 vendor/libdep"
+            " (heads/main)\n"
+        ),
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, _FakeTask(), container)
+
+    assert result.ok, result.problems
+    assert result.evidence["submodules_orphaned"] == ["vendor/gone"]
+
+
+def test_an_unreadable_gitmodules_is_not_reported_as_no_orphans(monkeypatch,
+                                                                tmp_path):
+    """git config exits 1 for "no key matched" and >1 for "I could not read
+    it". Collapsing them makes an unreadable or malformed `.gitmodules` render
+    as the measured claim `[]` -- an answer, from a probe that gave none.
+    """
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=_FakeTests(), gitlinks=("vendor/libdep",),
+        gitmodules_exit=3,
+        submodule_status=(
+            " 942c381d88cecca36be86b2e902f554ad145ec44 vendor/libdep"
+            " (heads/main)\n"
+        ),
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, _FakeTask(), container)
+
+    assert not result.ok
+    assert result.evidence["submodules_orphaned"] is None
+    # The submodule reading itself still happened and is still recorded: one
+    # probe failing does not un-observe the other.
+    assert result.evidence["submodules"] == [
+        {"path": "vendor/libdep",
+         "sha": "942c381d88cecca36be86b2e902f554ad145ec44",
+         "initialised": True}
+    ]
+    assert any(".gitmodules" in p for p in result.problems)
+
+
+def test_the_submodule_keys_are_written_on_the_early_return(tmp_path):
+    """The non-pytest guard returns before a container ever starts. A key
+    absent there and present on the normal path is the same defect one layer
+    down -- a reader diffing two evidence files cannot tell "no submodules"
+    from "this gate stopped before it looked".
+    """
+    task = _FakeTask(tests=_FakeTests(runner=("nose",)))
+
+    result = preflight(task, image="sha256:x", repo_path=tmp_path,
+                       start_sha="s" * 40)
+
+    assert result.evidence["submodules"] is None
+    assert result.evidence["submodules_orphaned"] is None
 
 
 @pytest.mark.integration
