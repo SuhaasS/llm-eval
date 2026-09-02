@@ -1682,6 +1682,19 @@ MUTATIONS = [
         "not integration",
     ),
     (
+        # Major.minor EQUALITY, not a prefix test. Measured:
+        # "Python 3.13.15".startswith("Python 3.1") is True, so a prefix
+        # comparison accepts 3.13 for a declared 3.1 -- a green gate over an
+        # interpreter the task was not cut for, which no later stage
+        # re-derives.
+        "preflight: accept a prefixing interpreter as the declared one",
+        "src/bakeoff/preflight.py",
+        "            if _parse_python_version(observed_python) != declared_python:",
+        '            if not observed_python.startswith(f"Python {declared_python}"):',
+        "tests/test_preflight.py -k prefixes_another_version_is_still_refused",
+        "not integration",
+    ),
+    (
         # A mis-scoped task and a task that fails its red-before assertion are
         # different author errors with different remedies. Genericizing the
         # first sends the author looking for a bug in a task whose only defect

@@ -446,6 +446,12 @@ def test_every_allowlisted_version_is_a_tag_this_module_can_name():
 
 
 @pytest.mark.integration
+# `task_image` as well, even though no TASK image is built here: the section
+# 6.6 gate selects `integration and not task_image` and is documented as
+# needing no network, and a real base build pulls from Docker Hub and runs
+# apt. A gate that quietly grew a network dependency would change what it
+# needs without changing what it is called.
+@pytest.mark.task_image
 def test_a_non_default_base_really_builds_and_carries_the_pins():
     """The claim this broadening rests on, checked against a daemon rather
     than against a rendered string. Measured 2026-09-01: 3.11 gives Python

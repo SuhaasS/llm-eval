@@ -28,6 +28,7 @@ from bakeoff.preflight import (
     EXIT_NOTHING_COLLECTED,
     EXIT_TESTS_FAILED,
     EXIT_USAGE_ERROR,
+    _parse_python_version,
     collection_error_modules,
     f2p_modules,
     failed_node_ids,
@@ -848,7 +849,8 @@ class _ScriptedContainer:
                  scoped_exit=0, grading_exits=None,
                  f2p_before=None, f2p_after=None, p2p_before=None,
                  env=None, hypothesis_importable=False,
-                 hypothesis_in_suite=False, rg_exit=None):
+                 hypothesis_in_suite=False, rg_exit=None,
+                 python="Python 3.12.13"):
         self.commands = []
         self.start_sha = start_sha
         self.tests = tests
@@ -861,6 +863,9 @@ class _ScriptedContainer:
         #: above cannot express the third answer -- "the probe could not
         #: answer" -- which is the one a quiet False would swallow.
         self.rg_exit = rg_exit
+        #: What `python --version` answers, verbatim; `None` for an image with
+        #: no interpreter on PATH at all.
+        self.python = python
         self.scoped_exit = scoped_exit
         self.grading_exits = dict(grading_exits or {})
         self.f2p_runs = 0
@@ -886,6 +891,13 @@ class _ScriptedContainer:
             return _Exec(stdout="1000\n")
         if cmd[0] == "claude":
             return _Exec(stdout="2.1.220\n")
+        if cmd == ["python", "--version"]:
+            # Measured 2026-09-01: CPython writes this to STDOUT, not stderr
+            # (`docker run ... python --version 2>&1 >/dev/null` is empty).
+            # Python 2 wrote it to stderr; 3.4+ does not.
+            if self.python is None:
+                return _Exec(exit_code=127, stderr="python: not found\n")
+            return _Exec(stdout=self.python + "\n")
         if cmd[0] == "sh":
             return _Exec()
         if cmd[:2] == ["test", "-e"]:
@@ -959,6 +971,7 @@ class _FakeTests:
 @dataclass(frozen=True)
 class _FakeImage:
     env: dict = field(default_factory=dict)
+    python: str = "3.12"
 
 
 @dataclass(frozen=True)
@@ -1769,6 +1782,129 @@ def test_the_env_evidence_says_which_absence_it_is_on_the_early_return(
     assert result.evidence["hypothesis_imported_by_suite"] is None
 
 
+# --- image.python read-back ---------------------------------------------------
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("Python 3.11.16", "3.11"),
+    ("Python 3.12.13", "3.12"),
+    ("Python 3.13.15", "3.13"),
+    ("Python 3.13.0rc1", "3.13"),
+    ("", ""),
+    ("nonsense", ""),
+])
+def test_the_version_is_parsed_to_major_minor(raw, expected):
+    assert _parse_python_version(raw) == expected
+
+
+def test_a_declaration_that_prefixes_another_version_is_still_refused(
+    monkeypatch, tmp_path
+):
+    """The shape M6 measured, driven through the GATE rather than the parser,
+    because this is the one a `startswith` revert survives everywhere else:
+    `"Python 3.13.15".startswith("Python 3.11")` is False, so the 3.11-vs-3.13
+    test above stays green under the mutant. `"Python 3.13.15".startswith(
+    "Python 3.1")` is True, and this is the test that goes red.
+
+    `_FakeImage(python="3.1")` deliberately carries a value `load_task` would
+    refuse: preflight does not re-validate the allowlist -- `tasks`'s loader is
+    the single gate for that (D2) -- so the comparison inside preflight has to
+    stand on its own arithmetic, and this is what says it does.
+    """
+    task = _FakeTask(image=_FakeImage(python="3.1"))
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=("tests/",), python="Python 3.13.15")
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert not result.ok
+    assert any("3.1" in p and "3.13" in p for p in result.problems)
+
+
+def test_a_prefix_match_would_accept_the_wrong_interpreter():
+    """Why the comparison is equality on the parsed pair and not a startswith.
+    Measured: "3.13.15".startswith("3.1") is True, and so is
+    "Python 3.13.15".startswith("Python 3.1"). A read-back written that way
+    accepts 3.13 for a manifest declaring 3.1 -- green gate, wrong
+    interpreter, and no later stage re-derives it."""
+    assert "Python 3.13.15".startswith("Python 3.1")
+    assert _parse_python_version("Python 3.13.15") != "3.1"
+
+
+def test_the_declared_interpreter_is_read_back_out_of_the_container(
+    monkeypatch, tmp_path
+):
+    task = _FakeTask(image=_FakeImage(python="3.11"))
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=("tests/",), python="Python 3.11.16")
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert result.ok, result.problems
+    assert result.evidence["python_declared"] == "3.11"
+    # The FULL string: the patch level is information the manifest cannot
+    # carry, and preflight.json outlives the run.
+    assert result.evidence["python_observed"] == "Python 3.11.16"
+
+
+def test_an_interpreter_that_is_not_the_declared_one_is_refused(
+    monkeypatch, tmp_path
+):
+    """The tag is mutable and local. A stale bakeoff-eval-agent:base-3.11, a
+    task image built against the wrong entry of the bases map, or an
+    image.build step that puts another python earlier on PATH all leave every
+    unit and rendering test green -- and the suite then runs, and goes green,
+    under an interpreter the task was not cut for."""
+    task = _FakeTask(image=_FakeImage(python="3.11"))
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=("tests/",), python="Python 3.13.15")
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert not result.ok
+    assert any("3.11" in p and "3.13" in p for p in result.problems)
+    assert result.evidence["python_observed"] == "Python 3.13.15"
+
+
+def test_a_patch_level_difference_is_not_a_mismatch(monkeypatch, tmp_path):
+    """The manifest carries no patch level and must not have to: the upstream
+    tag is republished with security fixes and a task pinned to 3.11.16 would
+    NO-GO the day 3.11.17 ships."""
+    task = _FakeTask(image=_FakeImage(python="3.11"))
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=("tests/",), python="Python 3.11.99")
+
+    assert _run_preflight(monkeypatch, tmp_path, task, container).ok
+
+
+def test_an_image_with_no_python_at_all_is_a_named_problem(monkeypatch, tmp_path):
+    task = _FakeTask(image=_FakeImage(python="3.12"))
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=("tests/",), python=None)
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert not result.ok
+    assert any("python --version" in p for p in result.problems)
+    assert result.evidence["python_observed"] is None
+
+
+def test_the_evidence_keys_exist_on_the_path_that_never_starts_a_container(
+    tmp_path
+):
+    """`observed: ""` from a gate that never looked is a CLAIM. Two absences
+    that render identically are the same defect one layer down -- the reason
+    image_env_observed is pre-written as None."""
+    task = _FakeTask(tests=_FakeTests(runner=("nose",)),
+                     image=_FakeImage(python="3.11"))
+
+    result = preflight(task, image="sha256:x", repo_path=tmp_path,
+                       start_sha="s" * 40)
+
+    assert result.evidence["python_declared"] == "3.11"
+    assert result.evidence["python_observed"] is None
+
+
 def test_the_preflight_version_moved_with_the_new_assertion():
     """It is in the cache key, and it is the only component that moves when
     THIS file changes -- a manifest digest describes the task, an image id the
@@ -1777,10 +1913,12 @@ def test_the_preflight_version_moved_with_the_new_assertion():
     to look at image.env; 5 -> 6 is the gate's bound becoming
     budget.suite_timeout_s -- a manifest already carrying the key loads under
     the older loader, so manifest_digest does not move and a warm cache would
-    serve a verdict gated at 600."""
+    serve a verdict gated at 600; 6 -> 7 is the image.python read-back, and a
+    verdict cached under 6 was written by a gate that never asked which
+    interpreter the container runs."""
     from bakeoff.preflight import PREFLIGHT_VERSION
 
-    assert PREFLIGHT_VERSION == "6"
+    assert PREFLIGHT_VERSION == "7"
 
 
 @pytest.mark.integration

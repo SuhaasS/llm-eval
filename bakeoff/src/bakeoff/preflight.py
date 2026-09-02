@@ -34,6 +34,7 @@ from dataclasses import fields as dataclass_fields
 from pathlib import Path, PurePosixPath
 
 from bakeoff.container import RunContainer
+from bakeoff.tasks import _DEFAULT_PYTHON
 
 # pytest's exit codes, which are the whole reason this module can tell "the
 # bug is present" from "the environment is broken". Both are non-zero, and an
@@ -102,7 +103,11 @@ _FAILED_LINE = re.compile(r"^(?:FAILED|ERROR)\s+(\S+)", re.MULTILINE)
 #: which ignores unknown `budget` sub-keys, so its digest does not move when
 #: this code lands and every warm cache would serve a verdict gated at 600
 #: against a manifest that asks for something else.
-PREFLIGHT_VERSION: str = "6"
+#: 7 adds the `image.python` read-back: a verdict cached under 6 was written
+#: by a gate that never asked which interpreter the container runs, so a task
+#: built against a stale or mismatched base keeps serving a PASS while its
+#: suite runs under an interpreter the task was not cut for.
+PREFLIGHT_VERSION: str = "7"
 
 
 def preflight_cache_key(task, image: str, start_sha: str) -> str:
@@ -244,6 +249,52 @@ def _declared_env(task) -> dict[str, str]:
     key must not crash the gate.
     """
     return dict(getattr(getattr(task, "image", None), "env", {}) or {})
+
+
+#: `Python 3.11.16` -> the leading two components. Anchored, and the trailing
+#: group is deliberately not required to be numeric-only: measured shapes
+#: include `3.13.0rc1`.
+_PYTHON_VERSION_LINE = re.compile(r"^Python\s+(\d+)\.(\d+)(?:\.|\s|$)")
+
+
+def _parse_python_version(raw: str) -> str:
+    """`"Python 3.11.16"` -> `"3.11"`. `""` when it cannot be read.
+
+    Major.minor, compared for EQUALITY, and both halves of that are load
+    bearing.
+
+    Not a prefix test: measured, `"3.13.15".startswith("3.1")` is True and so
+    is `"Python 3.13.15".startswith("Python 3.1")`, so a `startswith`
+    read-back accepts 3.13 for a manifest declaring 3.1 -- a green gate over
+    the wrong interpreter, which no later stage re-derives.
+
+    Not the whole string either: the manifest carries no patch level and must
+    not have to. The upstream tag is republished with security fixes, so a
+    task pinned to 3.11.16 would NO-GO the day 3.11.17 ships.
+
+    `""` rather than a raise: this is a gate that COLLECTS problems, and an
+    unparseable answer is reported as the mismatch it is alongside whatever
+    else is wrong, not as a traceback that hides the other four.
+    """
+    match = _PYTHON_VERSION_LINE.match(raw.strip())
+    return f"{match.group(1)}.{match.group(2)}" if match else ""
+
+
+def _declared_python(task) -> str:
+    """The manifest's `image.python`, or the base Dockerfile's default.
+
+    `getattr` twice, like `_declared_env`'s: this module's entry point takes an
+    untyped `task`, and a manifest object predating the key must not crash the
+    gate.
+
+    The fallback is IMPORTED, never restated. Three copies of the default
+    already exist (the Dockerfile's ARG, `tasks._DEFAULT_PYTHON`,
+    `images._DEFAULT_PYTHON`) and are pinned equal to each other by
+    tests/test_images.py; a fourth one here would be the only unpinned copy,
+    and it sits in the gate that exists to catch exactly this class of
+    disagreement.
+    """
+    return getattr(getattr(task, "image", None), "python", "") or _DEFAULT_PYTHON
 
 
 #: Basenames that mean "this argv element is a Python interpreter".
@@ -509,6 +560,10 @@ def preflight(
     evidence["image_env_mismatch"] = None
     evidence["hypothesis_importable"] = None
     evidence["hypothesis_imported_by_suite"] = None
+    evidence["python_declared"] = declared_python = _declared_python(task)
+    #: `None`, not `""`. A gate that never started a container has not
+    #: observed an empty version -- it has not observed anything.
+    evidence["python_observed"] = None
 
     if not any("pytest" in part for part in tests.runner):
         # The red/green distinction is built on pytest's exit codes. Another
@@ -554,6 +609,45 @@ def preflight(
                 f"{expected_claude_version!r}: two tasks would run different "
                 "agents and the comparison across them is not one"
             )
+
+        # The interpreter, read back out of the container rather than trusted
+        # from the manifest. `image.python` selects which base the drivers
+        # build, and the tag they build it under is MUTABLE and LOCAL: a stale
+        # `bakeoff-eval-agent:base-3.11` left by an earlier Dockerfile, a task
+        # image built against the wrong entry of the bases map, or an
+        # `image.build` step that puts another interpreter earlier on PATH all
+        # leave every rendering and unit test green. The failure is then the
+        # worst shape this repository knows -- the suite runs, the gate is
+        # green, and the interpreter is not the one the task was cut for.
+        #
+        # Plain `python`, deliberately, and NOT the runner's interpreter.
+        # `image.python` is a claim about the BASE image, and `python` is what
+        # the Dockerfile's ARG selects; a task whose `tests.runner` names
+        # /opt/venv/bin/python is describing a different environment the key
+        # makes no claim about.
+        #
+        # Measured 2026-09-01: `python --version` writes to STDOUT (Python 2
+        # wrote it to stderr; 3.4+ does not), so `.stdout` is the right field.
+        python = container.exec(["python", "--version"])
+        if python.exit_code != 0:
+            problems.append(
+                "`python --version` failed inside the image: the base this "
+                f"task declares (image.python: {declared_python!r}) either was "
+                "not the one it was built on, or its interpreter is no longer "
+                "first on PATH. Every check below runs the suite through it"
+            )
+        else:
+            evidence["python_observed"] = observed_python = python.stdout.strip()
+            if _parse_python_version(observed_python) != declared_python:
+                problems.append(
+                    f"the container runs {observed_python!r} but the manifest "
+                    f"declares image.python: {declared_python!r}. The base tag "
+                    "is local and mutable, so this is a stale or mismatched "
+                    "base rather than a manifest error: rebuild the bases "
+                    "(`run_matrix.py --preflight-only` builds the set the task "
+                    "set needs) and rebuild this task's image against the "
+                    "right one"
+                )
 
         for tool in ("git", "rg"):
             if container.exec(["sh", "-c", f"command -v {tool}"]).exit_code != 0:
