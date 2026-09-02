@@ -1789,6 +1789,109 @@ MUTATIONS = [
         "tests/test_preflight.py -k longest_match",
         "not integration",
     ),
+    (
+        # Measured: a broken CONFIG exits 1 and writes NO report file, on both
+        # frameworks, and so does a runner that could not start. Reading that
+        # silence as anything but "the command did not say what it did" is the
+        # Phase 0c failure one runtime over -- and the report lives at a FIXED
+        # path, so a leftover file from the previous invocation is exactly what
+        # would stand in as this run's evidence.
+        #
+        # The anchor text also occurs in `parse_deselected` and in
+        # `executed_names`; `run` replaces the FIRST occurrence, which is the
+        # classifier's, and both of those are defined below it for that reason.
+        "runners: read a report that was never written as a clean run",
+        "src/bakeoff/runners/node_adapter.py",
+        "        if report is None:",
+        "        if False:",
+        "tests/test_runners.py -k never_written",
+        "not integration",
+    ),
+    (
+        # Measured: one good file plus one unloadable file reports three
+        # PASSING tests and zero failing ones. Taking the failure branch first
+        # grades a task whose f2p file stopped importing as SOLVED.
+        "runners: let a passing file hide a file that did not load",
+        "src/bakeoff/runners/node_adapter.py",
+        "        if errored:",
+        "        if False:",
+        "tests/test_runners.py -k beats_a_passing_file",
+        "not integration",
+    ),
+    (
+        # M1's silent hole. A `-t` pattern matching no test exits **0** with
+        # every test reported skipped, so without this branch a manifest naming
+        # a renamed test -- and an oracle quarantine that swallowed the whole
+        # p2p list -- both read as a pass.
+        "runners: read a run that executed nothing as a pass",
+        "src/bakeoff/runners/node_adapter.py",
+        "        if ran == 0:",
+        "        if False:",
+        "tests/test_runners.py -k matched_nothing_is_nothing_ran",
+        "not integration",
+    ),
+    (
+        # The whole reason `p2p_args` owns the argv rather than composing it.
+        # Measured 2026-09-02: vitest REJECTS a second `-t` (exit 1, and no
+        # report file, so it classifies as an environment problem) and jest
+        # comma-joins the two into a pattern matching neither, running nothing
+        # at exit 0. Reverting the guard emits no `-t` at all instead.
+        "runners: emit selection and deselection as two -t flags",
+        "src/bakeoff/runners/node_adapter.py",
+        "        if not pattern:",
+        "        if True:",
+        "tests/test_runners.py -k ONE_pattern",
+        "not integration",
+    ),
+    (
+        # Both node frameworks answer a `-t` pattern that matches nothing with
+        # exit **0** and a report of every test skipped, so a manifest naming a
+        # renamed f2p test gates GREEN and then scores every arm as having
+        # solved it. pytest answers the same input with exit 4.
+        "preflight: accept an f2p id that never ran",
+        "src/bakeoff/preflight.py",
+        "        if not_run and red_outcome.kind != KIND_LOAD_ERROR:",
+        "        if False:",
+        "tests/test_preflight.py -k never_RAN",
+        "not integration",
+    ),
+    (
+        # Measured: `vitest run tests/` matched `/repo/jtests/fail.test.cjs` --
+        # the positional is a substring filter over the absolute path, not a
+        # path. The scoped p2p run exists to keep the agent's scratch files out
+        # of the regression check, and an over-matching filter restores exactly
+        # what it was added to remove.
+        "preflight: grade files the declared scope never named",
+        "src/bakeoff/preflight.py",
+        "                    if outside:",
+        "                    if False:",
+        "tests/test_preflight.py -k left_the_declared_paths",
+        "not integration",
+    ),
+    (
+        # `-t` matches `fullName` and no flag scopes a name pattern to a file,
+        # so a quarantine of one of two same-named tests silently deselects
+        # both -- with `p2p_deselected` AGREEING, because two tests really were
+        # skipped. This is the half no loader can see: the collision is with a
+        # test the manifest never mentions.
+        "preflight: let one quarantine silently deselect two tests",
+        "src/bakeoff/preflight.py",
+        "                    if duplicates:",
+        "                    if False:",
+        "tests/test_preflight.py -k share_a_full_name",
+        "not integration",
+    ),
+    (
+        # The half a loader CAN see, and the one an author creates. Two
+        # declared ids sharing a full name across files are indistinguishable
+        # to a selection and to a deselection alike.
+        "tasks: accept two declared ids that share a full name",
+        "src/bakeoff/runners/node_adapter.py",
+        "            if first != path:",
+        "            if False:",
+        "tests/test_tasks.py -k sharing_a_full_name",
+        "not integration",
+    ),
 ]
 
 

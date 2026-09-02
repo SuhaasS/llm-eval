@@ -28,6 +28,7 @@ daemon nor a network.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 from dataclasses import dataclass, field
@@ -35,8 +36,15 @@ from dataclasses import fields as dataclass_fields
 from pathlib import Path
 
 from bakeoff.container import RunContainer
-from bakeoff.runners import KIND_FAILED, KIND_PASSED, Outcome, for_framework
-from bakeoff.tasks import _DEFAULT_PYTHON
+from bakeoff.runners import (
+    KIND_FAILED,
+    KIND_LOAD_ERROR,
+    KIND_PASSED,
+    Outcome,
+    for_framework,
+)
+from bakeoff.runners.node_adapter import verify_selected
+from bakeoff.tasks import _DEFAULT_PYTHON, _under
 
 # Re-exported, not re-defined. These moved to `bakeoff.runners.pytest_adapter`
 # when the exit-code judgement became per-framework (broadening 7), and they
@@ -112,7 +120,24 @@ _PYTEST_ADAPTER = for_framework("pytest")
 #: positive empty list; and the orphan read moved to `--get-regexp -z`, so a
 #: submodule whose NAME contains a space is no longer reported as an orphan
 #: under a path that is not a path.
-PREFLIGHT_VERSION: str = "9"
+#: 10 adds the runner adapter (broadening 7). A verdict cached under 9 was
+#: written by a gate whose every red/green branch read a pytest EXIT CODE,
+#: which classifies a vitest or jest run by rules those frameworks do not
+#: follow -- measured, both answer a failing test, an unresolvable import, a
+#: syntax error, a nonexistent file argument and a broken config with 1 alike
+#: -- and which made none of the three node assertions: that every declared
+#: f2p id actually RAN (a `-t` pattern matching nothing exits 0 with every
+#: test reported skipped), that the scoped p2p run stayed inside tests.paths
+#: (a positional is a substring filter over the absolute path, not a path),
+#: and that the framework's cache flags are in tests.runner (vitest writes
+#: node_modules/.vite, which every JavaScript .gitignore hides from the
+#: dirty-tree check). It also covers `evidence["framework"]`, which landed
+#: earlier in the same broadening with no bump of its own: this is the first
+#: commit that changes what the gate ASSERTS, and the ones before it were a
+#: refactor whose argv is byte-identical on both branches -- so a warm verdict
+#: served across them describes a gate that would return the same verdict,
+#: which is the property this version exists to protect.
+PREFLIGHT_VERSION: str = "10"
 
 
 def preflight_cache_key(task, image: str, start_sha: str) -> str:
@@ -479,16 +504,18 @@ class _Runner:
         #: copy of the branch logic is a second thing that can be wrong about
         #: what happened, inside the check that exists to be right about it.
         self.last_argv: list[str] = []
-        #: Reserved for what an invocation asks for BY ID, so `classify` can
-        #: report which of those ids never ran -- only the caller knows this,
-        #: because a report cannot tell a test that was SKIPPED from one that
-        #: was never selected.
+        #: What the last invocation asked for BY ID, so `classify` can report
+        #: which of those ids never ran -- only the caller knows this, because
+        #: a report cannot tell a test that was SKIPPED from one that was never
+        #: selected.
         #:
-        #: NOTHING WRITES IT YET. `select` and `pass_to_pass` leave it at `()`,
-        #: and the node adapter's `not_run` is broadening 7 Task 6's; until
-        #: then this is a declared-but-unwritten field and the docstring says
-        #: so rather than describing a behaviour that does not exist. It is
-        #: initialised HERE, at construction, for the reason the rest of this
+        #: Written by `select` and by `pass_to_pass`'s explicit branch, and
+        #: reset to `()` by its DESELECT branch. That reset is load-bearing
+        #: rather than tidy: a leftover value there would make a correct scoped
+        #: run report the f2p ids as "did not run", which is exactly what a
+        #: correct p2p run does to them.
+        #:
+        #: Initialised HERE, at construction, for the reason the rest of this
         #: file initialises its absences: a field that appears on first use
         #: raises `AttributeError` out of `classify` on the deselect branch,
         #: which never selects by id -- a crash on the path that is meant to
@@ -545,11 +572,26 @@ class _Runner:
         unresolvable import, a syntax error, a nonexistent file argument and a
         broken config alike. Never a comparison against the manifest -- the
         confinement equality below is preflight's own claim to make.
+
+        `not_run` is filled HERE and not by the adapter, because only the
+        caller knows what it asked for: in the report a test that was skipped
+        and a test that was never selected are the same shape. `Outcome` is
+        frozen, so the answer is a replaced copy. It stays empty on pytest --
+        `report_path()` is `None` there, so `last_report` never leaves `None`
+        -- which is honest, because pytest answers this with exit 4 and an
+        `ERROR: not found:` line rather than with the 0 and the all-skipped
+        report both node frameworks give (measured).
         """
-        return self.adapter.classify(
+        outcome = self.adapter.classify(
             exit_code=result.exit_code, stdout=result.stdout,
             stderr=result.stderr, report=self.last_report,
         )
+        if self._selected and self.last_report is not None:
+            missing = verify_selected(
+                self.last_report, self._selected, self.adapter)
+            if missing:
+                outcome = dataclasses.replace(outcome, not_run=missing)
+        return outcome
 
     @property
     def last_timeout_s(self) -> int | None:
@@ -572,7 +614,15 @@ class _Runner:
         return None
 
     def select(self, node_ids: tuple[str, ...]):
-        return self.run(self.adapter.select_args(node_ids))
+        """Run exactly these ids, and remember that it was them.
+
+        `_selected` is written AFTER the invocation and never before: `run`
+        does not read it, and writing it first would leave a failed exec
+        claiming a selection the container never saw.
+        """
+        result = self.run(self.adapter.select_args(node_ids))
+        self._selected = tuple(node_ids)
+        return result
 
     def pass_to_pass(self, tests, extra_deselect: tuple[str, ...] = (),
                      scope: tuple[str, ...] = (),
@@ -623,15 +673,26 @@ class _Runner:
         at exit 0. The BRANCH -- explicit `tests.p2p` or the deselect default
         -- stays here, because it is a statement about the manifest rather
         than about the framework.
+
+        `_selected` follows that branch and the DESELECT one resets it to
+        `()`. A leftover selection there would make a correct scoped run
+        report the f2p ids as "did not run" -- which is precisely what a
+        correct p2p run does to them. On the explicit branch it is the p2p
+        list, so a renamed entry in it is answered by the same rule that
+        answers a renamed f2p id.
         """
         if tests.p2p:
-            return self.run(self.adapter.p2p_args(
+            result = self.run(self.adapter.p2p_args(
                 selected=tuple(tests.p2p), scope=(),
                 deselected=tuple(extra_deselect), ignored=tuple(ignore)))
-        return self.run(self.adapter.p2p_args(
+            self._selected = tuple(tests.p2p)
+            return result
+        result = self.run(self.adapter.p2p_args(
             selected=(), scope=tuple(scope),
             deselected=tuple(tests.f2p) + tuple(extra_deselect),
             ignored=tuple(ignore)))
+        self._selected = ()
+        return result
 
 
 def preflight(
@@ -695,6 +756,54 @@ def preflight(
     #: evidence files could not tell the two apart.
     evidence["submodules"] = None
     evidence["submodules_orphaned"] = None
+
+    # Written here, before any container starts, for the reason
+    # `image_env_observed` is: three of these are measured inside the scoped
+    # p2p branch, which an explicit `tests.p2p` skips entirely, and a key that
+    # is present on one task shape and missing on another cannot be read
+    # across a set of cached verdicts. `None` is "not measured on this path";
+    # `[]` is "measured, nothing found".
+    #
+    # `runner_cache_flags` and `f2p_before_not_run` start as `[]` rather than
+    # `None` because both are measured on EVERY path that reaches them -- the
+    # cache flags before the container, the not-run set on every f2p run -- so
+    # a `None` there would be a third state nothing can produce.
+    evidence["runner_cache_flags"] = []
+    evidence["runner_cache_flags_missing"] = []
+    evidence["f2p_before_not_run"] = []
+    evidence["duplicate_full_names"] = None
+    evidence["scope_files_run"] = None
+    evidence["scope_files_outside"] = None
+
+    # BEFORE the runner gate, so a manifest refused for a bad runner still
+    # records what its declared framework wanted. Needs no container: both
+    # values are a function of the adapter and of `tests.runner`.
+    missing_cache_flags = [
+        flag for flag in adapter.no_cache_args
+        if flag not in tests.runner
+    ]
+    evidence["runner_cache_flags"] = list(adapter.no_cache_args)
+    evidence["runner_cache_flags_missing"] = missing_cache_flags
+    # The `!= "pytest"` comparison is the one string test in this file and it
+    # is deliberate: pytest's failure is already loud and node's is not, and
+    # putting that behind a boolean on the adapter would be a second thing to
+    # keep in sync with a rule whose whole content is that sentence. Without
+    # `-p no:cacheprovider` pytest writes `.pytest_cache/` and the dirty-tree
+    # check below fires; a new refusal on that branch could only refuse a
+    # manifest that loads today.
+    if missing_cache_flags and adapter.name != "pytest":
+        problems.append(
+            "tests.runner is missing "
+            + ", ".join(missing_cache_flags)
+            + f", which {adapter.name} needs so the suite writes nothing "
+            "into the tree. Measured 2026-09-01: vitest creates "
+            "<cwd>/node_modules/.vite and `--no-cache` prevents it "
+            "entirely. Section 5.6 stages everything, so the artifact "
+            "would land in every submission diff -- and unlike pytest's "
+            ".pytest_cache this one is INVISIBLE to the dirty-tree check "
+            "below, because every JavaScript repository's .gitignore "
+            "carries node_modules/."
+        )
 
     if not any(adapter.runner_marker in part for part in tests.runner):
         # The DECLARED framework and the declared argv are cross-checked
@@ -1196,6 +1305,26 @@ def preflight(
         evidence["f2p_before_exit"] = red.exit_code
         red_outcome = runner.classify(red)
 
+        # Every declared f2p id must have RUN, not merely not-passed. Node
+        # only in effect -- `not_run` is empty for pytest, which answers a
+        # selection that matches nothing with exit 4 -- and skipped on a load
+        # error, where a file that did not load holds no assertions, nothing
+        # "ran" by construction, and the branch below already names it.
+        not_run = sorted(red_outcome.not_run)
+        evidence["f2p_before_not_run"] = not_run
+        if not_run and red_outcome.kind != KIND_LOAD_ERROR:
+            problems.append(
+                "these declared f2p tests did not RUN at the start state: "
+                + ", ".join(not_run)
+                + ". Measured 2026-09-01 against vitest 3.2.7 and jest 30.5.0: "
+                "a `-t` pattern matching no test exits **0** and reports every "
+                "test skipped, so a renamed test makes an unsatisfiable task "
+                "read as a green gate and then as a solved run for every arm "
+                "of it. pytest answers the same input with exit 4 and an "
+                "`ERROR: not found:` line, which is why this check has no "
+                "pytest equivalent."
+            )
+
         collected = red_outcome.errored_files
         # EQUALITY, in both directions. A module erroring that no f2p id names
         # is a broken environment; a declared f2p module that did NOT error is
@@ -1296,8 +1425,21 @@ def preflight(
                 + (red.stdout or red.stderr)[-2000:]
             )
         else:
-            reported = failed_node_ids(red.stdout + red.stderr)
-            missing = set(tests.f2p) - reported
+            # Off the OUTCOME, never off a re-parse of stdout. Byte-identical
+            # on pytest: this branch is reached only at KIND_FAILED, which is
+            # exit 1, and the adapter fills `failed_ids` from exactly the
+            # `failed_node_ids(stdout + stderr)` this line used to call.
+            #
+            # On node it is the difference between a gate and a NO-GO on every
+            # task. vitest and jest report their failures as a human summary --
+            # to stdout and to STDERR respectively, measured -- and neither
+            # writes a `FAILED <id>` line for pytest's regex to find, so the
+            # reported set came back EMPTY and every declared f2p id read as
+            # "did not fail at the start state" on a run in which it failed.
+            # Caught by `scripts/mutation_check.py`, not by a test: the two
+            # scoped-run anchors reported MISSED because this problem was
+            # already keeping `result.ok` false on a healthy node task.
+            missing = set(tests.f2p) - set(red_outcome.failed_ids)
             if missing:
                 problems.append(
                     "declared f2p tests did not fail at the start state: "
@@ -1434,7 +1576,79 @@ def preflight(
                 else:
                     scoped = runner.pass_to_pass(tests, scope=scope)
                     evidence["p2p_scoped_after_exit"] = scoped.exit_code
-                    if runner.classify(scoped).kind != KIND_PASSED:
+                    # Classified IMMEDIATELY after its own invocation, and
+                    # bound to a name: three assertions read this one run, and
+                    # `classify` reads `_Runner.last_report`, which the next
+                    # `run` overwrites.
+                    scoped_outcome = runner.classify(scoped)
+
+                    # No two EXECUTED tests under the scope share a full name.
+                    # The half a LOADER cannot see: its rule covers a
+                    # collision between two DECLARED ids, and this one is
+                    # between a declared id and a test the manifest never
+                    # mentions, which only the real report shows.
+                    seen: dict[str, str] = {}
+                    duplicates: list[str] = []
+                    for path, name in adapter.executed_names(runner.last_report):
+                        first = seen.setdefault(name, path)
+                        if first != path:
+                            duplicates.append(f"{name!r} in {first} and {path}")
+                    # Overwrites the `None` set before the container block.
+                    # On an explicit-`tests.p2p` task this branch never runs
+                    # and the key stays `None` -- "no scoped run was made",
+                    # which is a different fact from "no duplicates were
+                    # found", and the two must not render identically.
+                    evidence["duplicate_full_names"] = duplicates
+                    if duplicates:
+                        problems.append(
+                            "two or more tests under tests.paths share a full "
+                            "name: " + "; ".join(duplicates) + ". "
+                            f"{adapter.name} selects and deselects by name "
+                            "alone -- `-t` matches fullName and no flag scopes "
+                            "a name pattern to a file -- so a quarantine of "
+                            "one silently removes the other from the "
+                            "regression check, and p2p_deselected AGREES, "
+                            "because two tests really were skipped. The loader "
+                            "already refuses a collision between two DECLARED "
+                            "ids; this is the one it cannot see, between a "
+                            "declared id and a test the manifest never "
+                            "mentions. Narrow tests.paths, or rename one of "
+                            "the titles in the task repo; see "
+                            "taskset/HARVESTING.md."
+                        )
+
+                    files_run = scoped_outcome.files_run
+                    # Overwrites the `None`s above; stays `None` on the
+                    # explicit-p2p branch, which makes no scoped run, and on
+                    # pytest, whose adapter reports no file list at all.
+                    evidence["scope_files_run"] = (
+                        list(files_run) if files_run is not None else None)
+                    # `_under` from `bakeoff.tasks` -- the same component-wise
+                    # matcher the diff split uses, never `startswith`, which
+                    # is the mistake the runner's own filter already makes
+                    # (`tests_helpers/x` starts with `tests` and is not under
+                    # `tests/`).
+                    outside = (
+                        [] if files_run is None
+                        else [p for p in files_run if not _under(p, scope)])
+                    evidence["scope_files_outside"] = outside
+                    if outside:
+                        problems.append(
+                            "the scoped p2p run executed files outside "
+                            f"tests.paths ({', '.join(scope)}): "
+                            + ", ".join(outside)
+                            + ". Measured 2026-09-01: a positional argument is "
+                            "a SUBSTRING FILTER over the absolute file path on "
+                            "vitest and a REGEX on jest, not a path -- `vitest "
+                            "run tests/` matched `/repo/jtests/fail.test.cjs`. "
+                            "The scoped run exists to keep the agent's scratch "
+                            "files out of the regression check, and a filter "
+                            "that over-matches restores exactly what it was "
+                            "added to remove. Narrow tests.paths, or rename "
+                            "the sibling directory in the task repo."
+                        )
+
+                    if scoped_outcome.kind != KIND_PASSED:
                         if scoped.exit_code == EXIT_NOTHING_COLLECTED:
                             problem_codes.append(SCOPE_COLLECTS_NOTHING)
                         problems.append(

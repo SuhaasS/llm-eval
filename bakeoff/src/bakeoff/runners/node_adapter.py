@@ -143,12 +143,12 @@ def verify_selected(report: dict | None, requested: tuple[str, ...],
     """
     if report is None:
         return frozenset(requested)
-    seen = set()
-    for suite in report.get("testResults") or []:
-        path = adapter._relpath(suite.get("name") or "")
-        for item in suite.get("assertionResults") or []:
-            if item.get("status") in _TERMINAL_STATUSES:
-                seen.add(f"{path}::{item.get('fullName', '')}")
+    # Through `executed_names` rather than beside it: "which tests reached a
+    # verdict" is one rule with two readers (this one, and preflight's
+    # duplicate-`fullName` assertion), and a second copy of it is a second
+    # thing that can be wrong about what ran -- inside the two checks that
+    # exist to be right about it.
+    seen = {f"{path}::{name}" for path, name in adapter.executed_names(report)}
     return frozenset(node_id for node_id in requested if node_id not in seen)
 
 
@@ -362,6 +362,28 @@ class _NodeFlavour:
         if report is None:
             return None
         return report.get("numPendingTests")
+
+    def executed_names(self, report):
+        """Every assertion that reached a verdict, as `(relpath, fullName)`.
+
+        Defined AFTER `classify` on purpose: `scripts/mutation_check.py`
+        anchors that classifier's `if report is None:` by its exact text and
+        replaces the FIRST occurrence, so a second one earlier in the file
+        would silently move the mutation to a different guard.
+
+        `passed` OR `failed`, the same rule `verify_selected` reads through
+        this method: a test that was skipped and a test that was never
+        selected are the same shape in the report, and preflight's
+        duplicate-name assertion is a claim about what actually RAN under
+        `tests.paths`.
+        """
+        if report is None:
+            return
+        for suite in report.get("testResults") or []:
+            path = self._relpath(suite.get("name") or "")
+            for item in suite.get("assertionResults") or []:
+                if item.get("status") in _TERMINAL_STATUSES:
+                    yield path, item.get("fullName", "")
 
     def module_of(self, node_id):
         # Split once, from the LEFT. A JavaScript test title may itself

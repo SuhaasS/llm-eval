@@ -14,6 +14,7 @@ diffs in this file are genuine git diffs and a change that broke the parse
 would fail here rather than in the image.
 """
 
+import json
 import subprocess
 import tempfile
 from pathlib import Path
@@ -1095,10 +1096,12 @@ def test_the_grader_version_moved_with_what_check_5_means():
     `task.budget.suite_timeout_s`, where a longer bound turns a `timed_out`
     fail into a pass on the same stored input; 4 -> 5 is the gitlink refusal,
     which takes a submission the ladder used to grade `False` out of the
-    denominator entirely."""
+    denominator entirely; 5 -> 6 routes checks 5 and 6 through the runner
+    adapter and adds check 5's `did not run` environment branch, so what a
+    check MEANS changed even though no stored pytest verdict does."""
     from bakeoff.grader import GRADER_VERSION
 
-    assert GRADER_VERSION == "5"
+    assert GRADER_VERSION == "6"
 
 
 def test_p2p_rides_the_quarantine_and_the_scope():
@@ -2099,3 +2102,68 @@ def test_a_confined_load_error_is_still_an_f2p_failure():
 
     assert state.grade_failure == "f2p_failed"
     assert state.f2p_failed_node_ids == ("tests/new.py",)
+
+
+def _node_task(f2p=("tests/a.test.js::does a thing",)):
+    task = _task(f2p=f2p)
+    task.tests.framework = "vitest"
+    task.tests.runner = ("/node_modules/.bin/vitest", "run", "--no-cache")
+    return task
+
+
+def _run_node_f2p_with(*, report_shape,
+                       f2p=("tests/a.test.js::does a thing",)):
+    """One ladder run whose f2p invocation left this report behind.
+
+    The report is handed back the way the container hands it back -- the
+    runner writes the file, `_Runner` reads it with `cat <path>` -- because
+    that read is part of what is under test. `t_nomatch` is M1's shape
+    verbatim: a `-t` pattern matching no test exits **0** with every test
+    reported skipped, which is what a manifest naming a RENAMED test produces
+    and which no exit code anywhere would catch.
+    """
+    from bakeoff.runners.node_adapter import REPORT_PATH
+
+    shapes = {
+        "t_nomatch": [{"status": "skipped", "fullName": "does a thing"}],
+        "ran": [{"status": "failed", "fullName": "does a thing"}],
+    }
+    report = {
+        "testResults": [{
+            "name": "/repo/" + f2p[0].partition("::")[0],
+            "status": "passed" if report_shape == "t_nomatch" else "failed",
+            "assertionResults": shapes[report_shape],
+        }],
+    }
+    env = FakeEnv(rules=[
+        (lambda argv: argv[:1] == ["cat"] and argv[-1] == REPORT_PATH,
+         (0, json.dumps(report), "")),
+    ])
+    return _ladder(task=_node_task(f2p=f2p), env=env)
+
+
+def test_an_f2p_id_that_never_ran_is_the_graders_problem_not_the_models():
+    """Check 2 restores the test half, so the f2p names in the graded tree are
+    the MANIFEST's, not whatever the model wrote. An id that stopped matching
+    is therefore an environment fact, and stamping F2P_FAILED for it is an
+    accusation the model did not earn -- permanently, in an append-only store.
+
+    It has to be tested BEFORE the KIND_PASSED branch, and this shape is why:
+    the report the id never ran in is a report with nothing failing in it, at
+    exit 0, which a green-first ladder would absorb as a solved task."""
+    state = _run_node_f2p_with(report_shape="t_nomatch")
+
+    assert state.grade_failure is None
+    assert state.not_graded_reason == "environment_error"
+    assert "did not run" in state.environment_error
+
+
+def test_a_node_f2p_id_that_DID_run_and_failed_is_still_the_models_failure():
+    """The other half, so the branch above cannot be a blanket refusal of
+    every node run. A declared id that ran and failed is what the task exists
+    to measure."""
+    state = _run_node_f2p_with(report_shape="ran")
+
+    assert state.not_graded_reason is None
+    assert state.grade_failure == "f2p_failed"
+    assert state.f2p_failed_node_ids == ("tests/a.test.js::does a thing",)

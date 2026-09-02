@@ -299,6 +299,15 @@ class PytestAdapter:
     def parse_deselected(self, *, stdout, report):
         return parse_deselected(stdout)
 
+    def executed_names(self, report):
+        # Nothing, and it is a claim rather than an omission. A pytest node id
+        # carries the FILE, so `--deselect a.py::test_x` cannot reach
+        # `b.py::test_x` and the duplicate-`fullName` hazard the node adapters
+        # have does not exist here. preflight writes its evidence key from
+        # this anyway -- as `[]`, "measured, nothing found", which is a
+        # different fact from the `None` an explicit-p2p task leaves.
+        return ()
+
     def module_of(self, node_id):
         return node_id.split("::", 1)[0]
 

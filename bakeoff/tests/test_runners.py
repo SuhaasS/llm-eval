@@ -969,3 +969,67 @@ def test_the_node_repo_mount_constant_does_not_drift():
     from bakeoff.tasks import _REPO_MOUNT as _TASKS_REPO_MOUNT
 
     assert _REPO_MOUNT == _TASKS_REPO_MOUNT
+
+
+# --- executed_names, the channel preflight's duplicate-name rule reads --------
+
+
+@pytest.mark.parametrize("framework", ("vitest", "jest"))
+def test_executed_names_reports_only_the_tests_that_reached_a_verdict(framework):
+    """`passed` OR `failed`, made rootdir-relative.
+
+    Not "every assertion in the report": vitest reports a deselected test as
+    `skipped` and jest reports it as `pending`, and preflight's
+    duplicate-`fullName` assertion is a claim about what actually RAN under
+    `tests.paths`. Counting a skipped test would refuse a task over a
+    collision between two names that never appear in one run.
+    """
+    adapter = for_framework(framework)
+    report = {"testResults": [
+        {"name": "/repo/tests/a.test.js", "status": "failed",
+         "assertionResults": [
+             {"status": "passed", "fullName": "works"},
+             {"status": "failed", "fullName": "does not"},
+             {"status": "skipped", "fullName": "deselected"},
+             {"status": "pending", "fullName": "also deselected"},
+         ]},
+        {"name": "/repo/tests/b.test.js", "status": "passed",
+         "assertionResults": [{"status": "passed", "fullName": "works"}]},
+    ]}
+
+    assert list(adapter.executed_names(report)) == [
+        ("tests/a.test.js", "works"),
+        ("tests/a.test.js", "does not"),
+        ("tests/b.test.js", "works"),
+    ]
+
+
+@pytest.mark.parametrize("framework", ("vitest", "jest"))
+def test_executed_names_of_a_report_that_does_not_exist_is_empty(framework):
+    """A run that wrote no report ran nothing this can name. It is NOT the
+    caller's cue that nothing collided: preflight only reaches the duplicate
+    rule off a scoped run it classified, and `report=None` classifies as an
+    environment problem before that."""
+    assert list(for_framework(framework).executed_names(None)) == []
+
+
+def test_pytest_executed_names_is_empty_and_that_is_a_claim():
+    """Not an omission. A pytest node id carries the FILE, so `--deselect
+    a.py::test_x` cannot reach `b.py::test_x` and the duplicate-`fullName`
+    hazard does not exist. preflight still writes its evidence key from this
+    -- as `[]`, "measured, nothing found", which is a different fact from the
+    `None` an explicit-p2p task leaves."""
+    assert list(for_framework("pytest").executed_names({"testResults": []})) == []
+
+
+def test_verify_selected_and_executed_names_read_ONE_rule():
+    """`verify_selected` is defined over `executed_names` rather than beside
+    it. "Which tests reached a verdict" has two readers -- the not-run check
+    and the duplicate-name check -- and a second copy of the rule is a second
+    thing that can be wrong about what ran, inside the two checks that exist
+    to be right about it."""
+    import inspect
+
+    from bakeoff.runners import node_adapter
+
+    assert "executed_names" in inspect.getsource(node_adapter.verify_selected)

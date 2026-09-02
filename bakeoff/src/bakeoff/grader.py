@@ -188,7 +188,18 @@ from bakeoff.tasks import (
 #: the code that makes the divergence possible, not with the first run that
 #: exercises it, because the resume gate in `scripts/grade.py` keys on
 #: (run_id, GRADER_VERSION) alone.
-GRADER_VERSION: str = "5"
+#:
+#: 5 -> 6: checks 5 and 6 are routed through the runner adapter, and check 5
+#: gains the `did not run` environment branch. Under 5 the whole ladder read
+#: pytest's exit codes, which are not the node frameworks' -- measured, both
+#: answer a failing test, an unresolvable import, a syntax error and a broken
+#: config with 1 alike -- and a declared f2p id that stopped matching arrived
+#: at exit **0** with a report that reads like a pass. That is a change to
+#: what a check MEANS, so the version moves whether or not anything was
+#: graded under 5. It costs a full re-grade into a fresh `v6` artifacts
+#: directory; no verdict on today's corpus changes, because every stored run
+#: is a pytest one and the pytest adapter reproduces 5's judgement exactly.
+GRADER_VERSION: str = "6"
 
 #: Wall clock for the HOST-side gitleaks scan, and for nothing else.
 #: `_ContainerEnv.scan_secrets` shells out to `docker run` rather than through
@@ -1041,6 +1052,22 @@ def _check_f2p(state: _State, task, env) -> None:
     # that framework thinks 137 means.
     code = result.exit_code
     outcome = runner.classify(result)
+
+    if outcome.not_run:
+        # The test half is restored by check 2, so the f2p names in this tree
+        # are the MANIFEST's and not whatever the model wrote. An id that
+        # stopped matching is therefore an environment fact -- and on node it
+        # arrives at exit 0 with a report that reads like a pass, so nothing
+        # else would catch it. BEFORE the KIND_PASSED branch for exactly that
+        # reason: a green report would absorb it. Stamping F2P_FAILED here
+        # would be an accusation the model did not earn, permanently, in an
+        # append-only store.
+        state.environment(
+            "f2p",
+            "these declared f2p ids did not run: "
+            + ", ".join(sorted(outcome.not_run)),
+            result,
+        )
 
     if outcome.kind == KIND_PASSED:
         state.f2p_failed_node_ids = ()

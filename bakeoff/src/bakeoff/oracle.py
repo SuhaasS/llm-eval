@@ -85,7 +85,16 @@ from bakeoff.tasks import materialize
 #: under the older loader, which ignores unknown `budget` sub-keys -- so
 #: without this every cached quarantine would be one derived at 600 against a
 #: manifest asking for something else.
-ORACLE_VERSION: str = "2"
+#: 2 -> 3: `_classify` reads an `Outcome` rather than an exit code. A
+#: quarantine cached under 2 was derived by rules that could not classify a
+#: node run at all -- vitest and jest answer a failing test, an unresolvable
+#: import, a syntax error and a broken config with exit 1 alike -- and whose
+#: "the quarantine swallowed the whole p2p list" guard depended on pytest's
+#: exit 5, which those frameworks answer with 0 and a report of every test
+#: skipped. No quarantine on today's corpus changes: every stored task is a
+#: pytest one and the pytest adapter maps each exit code onto the kind this
+#: derivation already branched on.
+ORACLE_VERSION: str = "3"
 
 #: preflight's pytest exit meanings plus the codes the `timeout` wrapper and
 #: the shell contribute. Non-{0,1} is refused whatever the code, but the

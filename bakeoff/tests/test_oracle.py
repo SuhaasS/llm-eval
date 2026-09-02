@@ -67,8 +67,12 @@ def test_the_oracle_version_moved_with_what_derivation_means():
     default, where a manifest that already declares the key loads fine under
     the older loader (which ignores unknown `budget` sub-keys) and would
     otherwise go on being derived at 600 against a bound it does not ask
-    for."""
-    assert ORACLE_VERSION == "2"
+    for. 2 -> 3 is `_classify` reading an `Outcome` rather than an exit code:
+    a quarantine cached under 2 was derived by rules that could not classify a
+    node run at all, and whose "the quarantine swallowed the whole p2p list"
+    guard depended on pytest's exit 5 -- which vitest and jest answer with 0
+    and a report of every test reported skipped."""
+    assert ORACLE_VERSION == "3"
 
 
 def test_both_runs_green_yields_empty_quarantine():

@@ -14,10 +14,13 @@ see it.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -863,8 +866,28 @@ class _ScriptedContainer:
                  hypothesis_in_suite=False, rg_exit=None,
                  python="Python 3.12.13",
                  submodule_status="", submodule_status_exit=0,
-                 gitlinks=(), gitmodules_declared=None, gitmodules_exit=None):
+                 gitlinks=(), gitmodules_declared=None, gitmodules_exit=None,
+                 reports=None):
         self.commands = []
+        #: The JSON report each suite invocation writes, keyed by which run it
+        #: is: `f2p_before`, `f2p_after`, `p2p_before`, `p2p_after`, `scoped`.
+        #: `None` -- the default -- keeps the pytest scripting below EXACTLY
+        #: as it was: a pytest adapter's `report_path()` is `None`, so nothing
+        #: is deleted, nothing is read back, and every existing test's argv is
+        #: byte-identical to what it was.
+        #:
+        #: The report is handed back the way the real container hands it back:
+        #: the run writes it, and `_Runner` reads it with `cat <path>`. There
+        #: is no side channel, because the thing under test includes `run`'s
+        #: `rm -f`-then-`cat` bracket -- measured, a config error writes NO
+        #: file, so a stale report standing in for this run's evidence is the
+        #: defect that bracket exists to prevent.
+        self.reports = reports
+        #: What the LAST suite invocation left at the report path. `None` is a
+        #: run that wrote no file at all, which `cat` answers with exit 1.
+        self._report_text = None
+        self.report_reads = 0
+        self.report_removals = 0
         self.start_sha = start_sha
         self.tests = tests
         self.present = set(present)
@@ -922,6 +945,18 @@ class _ScriptedContainer:
 
     def exec(self, cmd, env=None):
         self.commands.append(list(cmd))
+        if cmd[:2] == ["rm", "-f"]:
+            self.report_removals += 1
+            self._report_text = None
+            return _Exec()
+        if cmd[:1] == ["cat"]:
+            self.report_reads += 1
+            if self._report_text is None:
+                # What a config error leaves: no file. `cat` exits 1 and
+                # `_Runner._read_report` answers `None`, which the node
+                # adapter classifies as an ENVIRONMENT outcome.
+                return _Exec(exit_code=1, stderr="No such file or directory\n")
+            return _Exec(stdout=self._report_text)
         if cmd[:2] == ["id", "-u"]:
             return _Exec(stdout="1000\n")
         if cmd[0] == "claude":
@@ -1020,6 +1055,8 @@ class _ScriptedContainer:
         if argv[: len(runner)] != runner:
             return _Exec(exit_code=self.grading_exits.get(tuple(argv), 0))
         rest = argv[len(runner):]
+        if self.reports is not None:
+            return self._node_timeout(rest)
         if rest == list(self.tests.f2p):
             self.f2p_runs += 1
             if self.f2p_runs == 1:  # red before the reference fix
@@ -1036,6 +1073,48 @@ class _ScriptedContainer:
         if self.p2p_runs == 1 and self.p2p_before is not None:
             return self.p2p_before
         return _Exec()
+
+    def _node_timeout(self, rest):
+        """The same five runs, told apart by a node argv rather than a pytest one.
+
+        A separate branch rather than a widened one: the pytest scripting
+        above is what `test_grading_p2p_with_no_extras_is_the_argv_preflight_
+        validated` -- the argv-identity gate on this whole refactor -- runs
+        through, and a discriminator rewritten to cover both is a gate
+        rewritten to accommodate the change it gates.
+
+        The f2p run is recognised by asking the ADAPTER what a selection of
+        the declared ids looks like, rather than by re-deriving it here: a
+        second copy of the argv rule is a second thing that can be wrong about
+        which run a report belongs to, and it would then hand the f2p report
+        to the p2p check. The scoped run is the one carrying a declared prefix
+        as a positional, exactly as on the pytest branch; everything else is
+        a p2p run.
+        """
+        from bakeoff.runners import for_framework
+
+        adapter = for_framework(self.tests.framework)
+        select = adapter.select_args(tuple(self.tests.f2p))
+        if select and rest[:len(select)] == select:
+            self.f2p_runs += 1
+            key = "f2p_before" if self.f2p_runs == 1 else "f2p_after"
+        elif any(arg in self.tests.paths for arg in rest):
+            self.scoped_runs += 1
+            key = "scoped"
+        else:
+            self.p2p_runs += 1
+            self.p2p_argvs.append(list(rest))
+            key = "p2p_before" if self.p2p_runs == 1 else "p2p_after"
+        report = self.reports.get(key)
+        self._report_text = None if report is None else json.dumps(report)
+        # The exit code is DERIVED from the report and is never what a test
+        # scripts, because the whole reason this adapter exists is that the
+        # number carries no information: measured, both frameworks answer a
+        # failing test, an unresolvable import, a syntax error, a nonexistent
+        # file argument and a broken config with 1 alike, and a `-t` matching
+        # nothing with 0. A test that could set it independently could pin a
+        # classification the real runner cannot produce.
+        return _Exec(exit_code=_node_exit(report))
 
 
 @dataclass(frozen=True)
@@ -2011,10 +2090,21 @@ def test_the_preflight_version_moved_with_the_new_assertion():
     `startswith`), an index gitlink that no `git submodule status` line names
     is now a problem rather than a silently shorter list, and the orphan read
     moved to `--get-regexp -z` so a submodule name containing a space stops
-    being reported as an orphan under a path that is not a path."""
+    being reported as an orphan under a path that is not a path.
+
+    9 -> 10 is the runner adapter (broadening 7). A verdict cached under 9 was
+    written by a gate whose every red/green branch read a pytest EXIT CODE,
+    which classifies a vitest or jest run by rules those frameworks do not
+    follow, and which made none of the three node assertions: that every
+    declared f2p id actually RAN, that the scoped p2p run stayed inside
+    tests.paths, and that the framework's cache flags are in tests.runner. It
+    is the first commit of that broadening to change what the gate ASSERTS --
+    the ones before it are a refactor whose argv is byte-identical on both
+    branches -- so it is the first that must invalidate a cache, and it
+    carries `evidence["framework"]` with it."""
     from bakeoff.preflight import PREFLIGHT_VERSION
 
-    assert PREFLIGHT_VERSION == "9"
+    assert PREFLIGHT_VERSION == "10"
 
 
 # --- every submodule is initialised at its gitlink ---------------------------
@@ -2554,16 +2644,19 @@ def test_the_runner_routes_every_argv_and_verdict_through_its_adapter():
     assert outcome.explain == "the adapter answered"
 
 
-def test_the_runner_starts_with_no_selection_recorded_and_nothing_writes_it():
-    """`_selected` exists from CONSTRUCTION, and is still unwritten.
+def test_the_runner_records_what_it_selected_and_the_deselect_branch_clears_it():
+    """`_selected` exists from CONSTRUCTION, and is now written.
 
-    The earlier version of this test asserted only the `()` at construction,
-    under a docstring claiming the field held "what the last invocation asked
-    for by id" -- which `select` does not assign and `pass_to_pass` does not
-    assign either. Pinning the true half of a false claim is how the claim
-    survives, so this pins the ACTUAL state: a selection run leaves it empty.
-    It is the test that will fail when broadening 7 Task 6 makes `classify`
-    report `not_run` and something finally has to write it.
+    The earlier version of this test pinned the field's UNWRITTEN state, under
+    a docstring saying in as many words that it would fail once `classify` had
+    to report `not_run`. This is that failure, taken up: `select` records what
+    it asked for, the explicit-p2p branch records the p2p list, and the
+    DESELECT branch clears it.
+
+    That clear is the load-bearing third assertion. A leftover selection there
+    would make a correct scoped run report the f2p ids as "did not run" --
+    which is exactly what a correct p2p run does to them -- so preflight would
+    refuse every healthy node task for the one thing it was built to do.
 
     Initialised at construction rather than on first use because an unset
     attribute raises `AttributeError` out of `classify` on the deselect
@@ -2576,6 +2669,12 @@ def test_the_runner_starts_with_no_selection_recorded_and_nothing_writes_it():
     assert runner._selected == ()
 
     runner.select(("tests/a.py::test_one",))
+    assert runner._selected == ("tests/a.py::test_one",)
+
+    runner.pass_to_pass(_Tests(p2p=("tests/b.py::test_two",)))
+    assert runner._selected == ("tests/b.py::test_two",)
+
+    runner.pass_to_pass(_Tests())
     assert runner._selected == ()
 
 
@@ -2698,3 +2797,307 @@ def test_an_adapter_that_declines_the_probe_leaves_both_keys_absent(
     assert result.evidence["hypothesis_importable"] is None
     assert result.evidence["hypothesis_imported_by_suite"] is None
     assert not any("hypothesis" in problem for problem in result.problems)
+
+
+# --- the node-only assertions -------------------------------------------------
+#
+# Three shapes that read as a GREEN GATE on vitest and jest and have no pytest
+# analogue, plus the cache flag whose absence the dirty-tree check cannot see.
+# Every one of them is a fact about the framework rather than about the model,
+# and each would otherwise be scored as capability on every arm of the task.
+
+
+#: The node report, reduced to the fields this codebase reads: `testResults[]`
+#: with an ABSOLUTE `name` under the bind mount, a suite `status`, and
+#: `assertionResults[]` carrying `status` and `fullName`. Written out here
+#: rather than loaded from `tests/fixtures/node_reports/` because these tests
+#: are about preflight's assertions over a report, not about the eight captured
+#: shapes -- those are `test_runners.py`'s subject and are replayed there.
+def _node_report(entries, *, status="passed"):
+    """`[(relpath, [(status, fullName), ...])]` -> one report document."""
+    return {
+        "testResults": [
+            {
+                "name": "/repo/" + path,
+                "status": status,
+                "assertionResults": [
+                    {"status": state, "title": name, "fullName": name}
+                    for state, name in assertions
+                ],
+            }
+            for path, assertions in entries
+        ],
+    }
+
+
+def _node_exit(report):
+    """What the frameworks measurably return for a report of this shape.
+
+    0 when nothing failed -- INCLUDING the all-skipped report a `-t` pattern
+    matching nothing produces, which is the whole hazard -- and 1 otherwise.
+    `None` (no file at all) is the broken-config shape, which also exits 1.
+    """
+    if report is None:
+        return 1
+    for suite in report["testResults"]:
+        if suite["status"] == "failed":
+            return 1
+        if any(a["status"] == "failed" for a in suite["assertionResults"]):
+            return 1
+    return 0
+
+
+_NODE_F2P = "tests/a.test.js::does a thing"
+
+
+def _node_container(*, f2p_ran=True, scope_names=None, scope_files=None,
+                    p2p=(), runner=("/node_modules/.bin/vitest", "run",
+                                    "--no-cache")):
+    """A vitest task and the container that answers its five suite runs.
+
+    `f2p_ran=False` is M1's shape verbatim: the declared f2p test is reported
+    SKIPPED at exit 0, which is what both frameworks do with a `-t` pattern
+    that matches nothing -- a renamed test, most often.
+
+    `scope_names` and `scope_files` both describe the scoped p2p run's report,
+    from the two directions the two assertions read it: `scope_names` names
+    `(file, fullName)` pairs directly, and `scope_files` names files and gives
+    each a distinct title so the duplicate-name rule stays quiet and the scope
+    rule is the only thing under test.
+    """
+    tests = _FakeTests(paths=("tests/",), runner=runner, f2p=(_NODE_F2P,),
+                       p2p=tuple(p2p), framework="vitest")
+    task = _FakeTask(tests=tests)
+
+    if scope_names is not None:
+        scoped = list(scope_names)
+    elif scope_files is not None:
+        scoped = [(path, f"keeps working {index}")
+                  for index, path in enumerate(scope_files)]
+    else:
+        scoped = [("tests/b.test.js", "keeps working")]
+    # One suite per distinct file, in first-seen order -- the shape the
+    # reporters emit, and the shape `files_run` is derived from.
+    by_file: dict[str, list] = {}
+    for path, name in scoped:
+        by_file.setdefault(path, []).append(("passed", name))
+
+    p2p_ids = tuple(p2p) or ("tests/b.test.js::keeps working",)
+    p2p_report = _node_report([
+        (node_id.partition("::")[0],
+         [("passed", node_id.partition("::")[2])]) for node_id in p2p_ids
+    ])
+    reports = {
+        "f2p_before": _node_report(
+            [("tests/a.test.js",
+              [("failed" if f2p_ran else "skipped", "does a thing")])],
+            status="failed" if f2p_ran else "passed",
+        ),
+        "f2p_after": _node_report(
+            [("tests/a.test.js", [("passed", "does a thing")])]),
+        "p2p_before": p2p_report,
+        "p2p_after": p2p_report,
+        "scoped": _node_report(list(by_file.items())),
+    }
+    container = _ScriptedContainer(start_sha="s" * 40, tests=tests,
+                                   present=tests.paths, reports=reports)
+    return container, task
+
+
+def _pytest_container(*, runner=("python", "-m", "pytest", "-q")):
+    """The pytest task, at whatever runner a test wants to state something about."""
+    tests = _FakeTests(runner=runner)
+    task = _FakeTask(tests=tests)
+    container = _ScriptedContainer(start_sha="s" * 40, tests=tests,
+                                   present=tests.paths)
+    return container, task
+
+
+def _preflight_over(scripted):
+    """One preflight over a scripted container, with no fixture plumbing.
+
+    `mock.patch` rather than `monkeypatch` so a test that is about the
+    evidence can take no arguments at all, and a real temporary directory
+    because `preflight` writes the reference patch into `repo_path` before
+    handing it to the container.
+    """
+    container, task = scripted
+    with tempfile.TemporaryDirectory() as repo:
+        with mock.patch("bakeoff.preflight.RunContainer",
+                        lambda **kwargs: container):
+            return preflight(task, image="sha256:x", repo_path=Path(repo),
+                             start_sha="s" * 40)
+
+
+def test_a_declared_f2p_id_that_never_RAN_is_a_problem(monkeypatch):
+    """`-t` with a pattern matching no test exits **0** on both vitest and jest
+    (measured 2026-09-01), with `Tests 3 skipped (3)`. So a manifest naming a
+    renamed test makes an unsatisfiable task read as a green gate, and then as
+    a solved run for every arm of it. pytest answers the same input with exit 4
+    and needs no such check.
+
+    The assertion is on `did not RUN` and not on the lower-case phrase the
+    plan first wrote: an f2p run that executed nothing ALSO trips the older
+    "the f2p tests did not run at the start state" refusal, so the loose
+    substring would have been satisfied by a message this check did not
+    write -- and the mutation anchor is what said so."""
+    result = _preflight_over(_node_container(f2p_ran=False))
+
+    assert not result.ok
+    assert any("did not RUN" in p for p in result.problems)
+    assert result.evidence["f2p_before_not_run"] == [
+        "tests/a.test.js::does a thing"]
+
+
+def test_f2p_before_not_run_is_recorded_even_when_everything_ran():
+    """Absence is recorded, never implied: "nothing failed to run" and "the
+    gate did not look" render identically as a missing key, and a cached
+    verdict outlives the code that wrote it."""
+    result = _preflight_over(_node_container(f2p_ran=True))
+
+    assert result.evidence["f2p_before_not_run"] == []
+
+
+def test_two_executed_tests_that_share_a_full_name_are_a_problem():
+    """The half the loader cannot see. Its rule covers a collision between two
+    DECLARED ids; this one is between a declared id and a test the manifest
+    never mentions, which only the real report shows. A quarantine of one then
+    silently removes the other from the regression check -- and
+    `p2p_deselected` agrees, because two tests really were skipped."""
+    result = _preflight_over(_node_container(
+        scope_names=[("tests/a.test.js", "works"), ("tests/b.test.js", "works")]
+    ))
+
+    assert not result.ok
+    assert result.evidence["duplicate_full_names"] == [
+        "'works' in tests/a.test.js and tests/b.test.js"]
+
+
+def test_duplicate_full_names_is_recorded_when_there_are_none():
+    result = _preflight_over(_node_container())
+
+    assert result.evidence["duplicate_full_names"] == []
+
+
+def test_a_healthy_node_task_passes_the_whole_gate():
+    """The assertion the three node refusals are measured against, and it is
+    not decoration: without it each of them is "some problem was raised", and
+    the two scoped-run mutation anchors reported MISSED for exactly that
+    reason -- `declared f2p tests did not fail at the start state` was firing
+    on every node task, because that check re-parsed pytest's `FAILED <id>`
+    summary out of stdout and neither node framework writes one."""
+    result = _preflight_over(_node_container())
+
+    assert result.ok, result.problems
+    assert result.problem_codes == ()
+
+
+def test_every_new_evidence_key_is_present_on_an_explicit_p2p_task():
+    """Three of the four are measured inside `if not tests.p2p:`, which an
+    explicit p2p list skips entirely -- so written only where they are
+    measured, they would be ABSENT from every explicit-p2p verdict. A key
+    present on one task shape and missing on another cannot be read across a
+    set of cached verdicts, which outlive the code that wrote them.
+
+    `None` here is "no scoped run was made", not "nothing was found"; the two
+    must not render identically."""
+    result = _preflight_over(_node_container(p2p=("tests/a.test.js::other",)))
+
+    assert result.evidence["runner_cache_flags"] == ["--no-cache"]
+    assert result.evidence["f2p_before_not_run"] == []
+    assert result.evidence["duplicate_full_names"] is None
+    assert result.evidence["scope_files_run"] is None
+    assert result.evidence["scope_files_outside"] is None
+
+
+def test_the_new_evidence_keys_survive_the_early_return():
+    """The runner-gate refusal returns before any container starts. The two
+    keys knowable without one are still written; the rest stay `None`."""
+    result = _preflight_over(_node_container(runner=("python", "-m", "pytest")))
+
+    assert not result.ok
+    assert result.evidence["scope_files_run"] is None
+    assert result.evidence["runner_cache_flags"] == ["--no-cache"]
+    assert result.evidence["f2p_before_not_run"] == []
+
+
+def test_a_scoped_run_that_left_the_declared_paths_is_a_problem():
+    """Measured 2026-09-01: `vitest run tests/` matched `/repo/jtests/
+    fail.test.cjs` -- the positional is a SUBSTRING FILTER over the absolute
+    path, not a path. The scoped p2p run exists to keep the agent's scratch
+    files out of the regression check (eight of them in one stored record); a
+    filter that over-matches restores exactly what it was added to remove."""
+    result = _preflight_over(
+        _node_container(scope_files=("tests/a.test.js", "jtests/b.test.cjs"))
+    )
+
+    assert not result.ok
+    assert result.evidence["scope_files_outside"] == ["jtests/b.test.cjs"]
+
+
+def test_the_scope_check_matches_by_path_component_not_by_prefix_string():
+    """`startswith` is the bug the runner already has. `tests_helpers/x` starts
+    with `tests` and is not under `tests/`."""
+    from bakeoff.tasks import _under
+
+    assert _under("tests/a.test.js", ("tests/",))
+    assert not _under("tests_helpers/a.test.js", ("tests/",))
+
+
+def test_a_vitest_runner_without_no_cache_is_a_problem():
+    """Asymmetric on purpose. For pytest an absent `-p no:cacheprovider`
+    writes .pytest_cache/ and preflight's existing dirty-tree check fires
+    loudly. For vitest the artifact is node_modules/.vite, and every JavaScript
+    repository's .gitignore carries node_modules/ -- so that check is BLIND and
+    the flag's absence is invisible. Measured: with `--no-cache` the tree stays
+    clean; without it, `?? node_modules/`."""
+    result = _preflight_over(
+        _node_container(runner=("/node_modules/.bin/vitest", "run"))
+    )
+
+    assert not result.ok
+    assert any("--no-cache" in p for p in result.problems)
+    assert result.evidence["runner_cache_flags"] == ["--no-cache"]
+    assert result.evidence["runner_cache_flags_missing"] == ["--no-cache"]
+
+
+def test_a_pytest_runner_without_no_cacheprovider_is_NOT_newly_refused():
+    """Backwards compatibility as a rule: a new assertion on the pytest branch
+    could refuse a manifest that loads today, and the failure it would catch
+    is already loud."""
+    result = _preflight_over(_pytest_container(runner=("python", "-m", "pytest")))
+
+    assert not any("no:cacheprovider" in p for p in result.problems)
+    assert result.evidence["runner_cache_flags_missing"] == [
+        "-p", "no:cacheprovider"]
+
+
+def test_a_pytest_task_records_the_node_keys_as_measured_absences():
+    """`[]` where the gate looked and found nothing, `None` where the
+    framework cannot answer. `scope_files_run` is `None` because the pytest
+    adapter reports no file list at all -- not because no scoped run was made
+    -- and `duplicate_full_names` is `[]` because the scoped run DID happen
+    and pytest's ids carry their file, so the hazard does not exist."""
+    result = _preflight_over(_pytest_container())
+
+    assert result.ok, result.problems
+    assert result.evidence["duplicate_full_names"] == []
+    assert result.evidence["scope_files_run"] is None
+    assert result.evidence["scope_files_outside"] == []
+
+
+def test_the_report_is_deleted_before_every_node_run_and_read_back_after():
+    """A config error writes NO file (measured, both frameworks), so a stale
+    report from the previous invocation would stand in as this run's evidence
+    -- a passing report for a run that never happened. The path is fixed
+    because it is an argv element and the gated argv must equal the graded
+    one; the `rm` is what makes a fixed name safe."""
+    container, _ = _node_container()
+
+    _preflight_over((container, _FakeTask(tests=container.tests)))
+
+    assert container.report_removals == 5
+    assert container.report_reads == 5
+    for command in container.commands:
+        if command[:1] == ["timeout"]:
+            assert "--reporter=json" in command, command

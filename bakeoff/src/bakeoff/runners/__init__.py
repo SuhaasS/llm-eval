@@ -31,6 +31,7 @@ comparison either.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
@@ -170,6 +171,22 @@ class RunnerAdapter(Protocol):
     def parse_deselected(self, *, stdout: str,
                          report: dict | None) -> int | None:
         """How many items the runner did not run. `None` = nobody counted."""
+
+    def executed_names(self, report: dict | None
+                       ) -> Iterable[tuple[str, str]]:
+        """Every test that reached a verdict, as `(relpath, name)` pairs.
+
+        The channel for preflight's duplicate-`fullName` assertion, which is
+        the half of D2's rule a LOADER cannot make: the collision that breaks
+        a quarantine is between a declared id and a test the manifest never
+        mentions, and only the real report of the scoped run holds both.
+
+        EMPTY for pytest, and that is a claim rather than a gap -- a pytest
+        node id carries the file, so `--deselect a.py::test_x` cannot reach
+        `b.py::test_x` and the hazard does not exist there. preflight writes
+        the evidence key either way, as `[]`, which is "measured, nothing
+        found" and not "not measured".
+        """
 
     def module_of(self, node_id: str) -> str:
         """The FILE half of a node id."""
