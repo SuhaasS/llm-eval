@@ -524,6 +524,31 @@ asserting against `America/New_York` and similar) is a task, not a rejection
 — see the loader table above and the hypothesis bullet under *The oracle* for
 the value-shape and §6.4 detail.
 
+**`-c /dev/null` is not a safe way to discard a repo's own `addopts`, and
+`--override-ini=addopts=` is.** Both zero the `[tool.pytest]`/`pytest.ini`
+`addopts` block, but an explicit `-c <path>` argument also retargets pytest's
+**rootdir** to that path's dirname — measured 2026-09-02 (`bidict`): every
+node id pytest then reports comes out relative to `/dev` instead of `/repo`
+(`../dev/test_bidict.py::...`), so preflight's exact-string `FAILED <id>`
+match against the declared f2p id never fires, and a genuinely-red test gates
+NO-GO as "did not fail at the start state." Collection **count** stays
+correct, which is why this is easy to miss by hand — only the reported node-id
+strings are corrupted. `--override-ini=addopts=` drops the same `addopts`
+block without moving rootdir.
+
+**Narrowing `tests.paths` does not narrow the p2p sweep when `tests.p2p` is
+left empty.** An empty `tests.p2p` means "everything the runner collects",
+and that sweep is scoped by the repo's **rootdir**, not by the declared
+`tests.paths` prefix — measured 2026-09-02 (`yaml-474-single-newline-empty-value`),
+where `tests.paths: ["tests/doc/stringify.ts"]` still pulled
+`tests/properties.ts` (a `fast-check` property suite elsewhere in the tree)
+into the p2p-before/after checks and NO-GO'd on a missing dependency a
+host-side simulation scoped to `tests/doc/` never exercised. A task author
+narrowing `tests.paths` to dodge a submodule or a duplicate-`fullName`
+problem still has to make the **entire** suite's dependencies installable,
+not just the scoped file's — narrowing `tests.p2p` itself (leaf ids only, per
+the rule above) is the only lever that actually shrinks what gets swept.
+
 Three ways a task image fails at build time, silently, all found by screening
 rather than by reasoning:
 
@@ -701,11 +726,41 @@ preflight remains the gate. The PR column counts merged pull requests linked to
 an issue and created after 2024-01-01; it is an availability proxy only, since
 each candidate still needs the Layer 2 read.
 
-**No JavaScript or TypeScript repository has been screened yet.** The table
-below is Python-only because that is what the screen in
-`docs/BUILDING-A-TASK-SET.md` §2 has run against. An empty section is not a
-finding — it says the corpus has not been reached, not that nothing in it
-would pass.
+Everything from *Clean* through *Excluded* below is Python-only, because that
+is what the screen in `docs/BUILDING-A-TASK-SET.md` §2 has run against. The
+JavaScript/TypeScript section immediately below is the first pass at a
+corpus that screen has no recipe for yet.
+
+### JavaScript / TypeScript
+
+Measured 2026-09-02 against real clones on the host (node v24.18.0, npm
+11.16.0) and, for the jest task, additionally against a simulated container
+`node_modules` layout standing in for the base image.
+
+| repo | framework | result | notes |
+|---|---|---|---|
+| unjs/ufo | vitest | cut and gated (`ufo-214-without-trailing-slash-query`): 461 passed / 1 failed at `base_sha` → 462 passed after the fix, 16 s | zero runtime dependencies — no `image.build` needed at all; `/node_modules/.bin` **is** on `PATH` for the `eval` user in the node-22 base image (measured, corrects an earlier assumption written into this task's own dispatch notes) |
+| eemeli/yaml | jest | cut and gated (`yaml-474-single-newline-empty-value`): 216 passed / 1 failed at `base_sha` → 217 passed after the fix, 62 s | four `https://` submodules (`tests/yaml-test-suite`, `tests/json-test-suite`, `docs-slate`, `playground`), all populated by the harness's own submodule derivation (broadening 6); `image.build` must install `babel-jest@30` + the `@babel/*` transform chain + a custom resolver **and** `fast-check`, because an unscoped p2p sweep (`tests.p2p` empty) is not narrowed by a narrow `tests.paths` and still collects `tests/properties.ts`; cross-file duplicate `fullName`s under `tests/doc/` (four, all under `describe('circular references', ...)`) force `tests.paths` down to one file |
+| moment/luxon | jest | rejected at first screen (2026-09-01): 31 unrelated failures without `TZ=America/New_York` set, 1 (the real f2p) with it — `TZ` was not in the `image.env` allowlist | **usable now**: `git log --oneline` in this worktree carries "feat: a suite that pins TZ is a task, not a rejection" (`TZ` added to `tasks._IMAGE_ENV_ALLOWED`); not yet re-screened against a live gate |
+
+Two things worth carrying into any future node task, neither specific to one
+repo:
+
+- **The tagged task image (`bakeoff-task-<id>:v{task_version}`) is
+  `base_sha`-only by design** — it is built from `git archive base_sha` and
+  never carries the committed test half, which is applied to a separately
+  materialized run tree at run time and bind-mounted over `/repo`. Inspecting
+  the image directly with `docker run` and no bind mount reads as "suite fully
+  green, bug not present" (measured: 456/456 vs. the real 461/462), which
+  looks like a stale or wrong image and is not one.
+- **`npm ci --prefix /` in `image.build` deletes the base image's
+  `/node_modules`** — including whatever that same `image.build` line just
+  installed there — before jest or vitest can even boot, because `npm ci`'s
+  documented contract is to remove `node_modules` before installing. Measured
+  again here against a task with a real custom-resolver dependency
+  (`jest-ts-webcompat-resolver`): `npm install`, never `npm ci`, at that
+  prefix (already in the loader table and the JavaScript screening
+  subsection above).
 
 ### Clean — pass every mechanical gate
 
@@ -735,14 +790,22 @@ would pass.
 | Textualize/rich | `pip: ["attrs"]` | 1 collection error without it | 40 |
 | python-humanize/humanize | 6 import errors, undiagnosed | — | 21 |
 | python-attrs/attrs, python-attrs/cattrs | `image.env: {CI: "1", HYPOTHESIS_STORAGE_DIRECTORY: "/tmp/bakeoff-hypothesis"}` for the property-based suite | **not measured** — the editable install collides with a site-packages `attr`, and that is now the only known blocker | — |
-| python-poetry/tomlkit | nothing — the submodule is derived, not declared (broadening 6) | **not measured** beyond the submodule shape itself | — |
+| python-poetry/tomlkit | nothing declared — the submodule (`tests/toml-test`) is derived, not declared (broadening 6) | measured 2026-09-02, cut and gated (`tomlkit-514-inline-table-comment-separator`): 1,002 passed, ~1.2 s at `base_sha` with the submodule initialised; without it the whole run is **interrupted** (`FileNotFoundError` at collection, not a partial pass) | — |
+| pallets/werkzeug | nothing extra — the collection-error f2p shape (broadening 2) | measured 2026-09-02, cut and gated (`werkzeug-3037-duplicate-rule-error`): 958 passed at `base_sha`, exit 4 confined to the one PR-added test module, 964 passed after the fix | 36 |
+| jab/bidict | `image.env: {CI: "1", HYPOTHESIS_STORAGE_DIRECTORY: "/tmp/bakeoff-hypothesis"}`; `tests.runner` needs `--override-ini=addopts=`, never `-c /dev/null` (the addopts-bypass trap below); `image.pip: ["pytest-xdist"]` so the bare `pytest tests/` an agent would actually type does not itself exit 4 | measured 2026-09-02, cut and gated (`bidict-389-putall-rollback-clean`): 130 passed, ~1.7 s | — |
+| pytest-dev/pytest | its own suite as source: `SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PYTEST` inlined into the `image.build` command (the build context is `git archive base_sha` and never has `.git`); `tests.runner` regenerates `src/_pytest/_version.py` at the start of every invocation (the image-build copy is discarded by the runtime bind mount over `/repo`); one baked-in `--deselect` for the one self-test that asserts a `.pyc` got written, which the image's own `PYTHONDONTWRITEBYTECODE=1` defeats permanently | measured 2026-09-02, cut and gated (`pytest-10210-approx-nested-container`): 106.34 s single-process at `base_sha` — see the `-p no:cacheprovider` note below | — |
+| astroufsc/chimera | `image.python: "3.13"` (`requires-python >= 3.13`); `image.apt: ["libatomic1"]` (a transitive `pynng` import fails without it); `tests.runner` needs `-o addopts=` against the repo's own `--cov=...` block, and an explicit `tests.p2p` narrowed to 30 measured-clean leaf ids — the wider tree is pre-existing bit rot, not this PR (see below) | measured 2026-09-02, cut and gated (`chimera-228-equinox-numeric`): 14 s (pinned `start_sha`) | — |
 
-**tomlkit is unblocked on its submodule, not screened.**
-`python-poetry/tomlkit` — one submodule, `tests/toml-test` at
-`https://github.com/BurntSushi/toml-test.git`, non-nested. Measured 2026-09-01
-at `HEAD` via a blobless shallow clone; re-check at the chosen `base_sha`,
-which the derivation does anyway. Its other screening criteria are
-unmeasured — being unblocked on submodules is not the same as being usable.
+**tomlkit's submodule needs one more thing at grade time, not at gate time.**
+`tests/toml-test` sits under the declared `tests.paths` prefix (`tests/`), the
+ordinary layout for a submodule holding test fixtures — and the grader's own
+test-restore step used to `git rm -r -f -- tests/` then `git checkout
+<start_sha> -- tests/`, which deletes the submodule's working tree and
+restores only the gitlink, never its content. That turned the genuine
+reference fix into `not_graded_reason: environment_error` at the p2p check.
+Fixed this session (`git log --oneline` in this worktree: "fix: the test
+restore removed a submodule it had no reason to touch") — `_check_test_restore`
+now re-populates gitlinks under the declared prefixes after the restore.
 
 **attrs/cattrs are half-reopened, not reopened.** They were excluded for two
 reasons and this broadening lifts one. The other — `pip install -e .`
@@ -752,20 +815,70 @@ so nothing the agent writes takes effect, every arm fails identically, and
 preflight's green-after check is what catches it. Nobody has run that gate on
 these repositories. Do not cut a task from either without doing so first.
 
-**sqlglot carries a date constraint.** `CLAUDE.md` was added 2026-02-02
-(`a65c8701a306`, PR #6899); `AGENTS.md` followed on 2026-03-19
-(`7f0dd47f60a3`), and a later commit made `CLAUDE.md` a symlink to it. Both are
-present at HEAD and preflight's `test -e` follows symlinks, so **`base_sha` must
-predate 2026-02-02**. That leaves 680 clean candidates (301 of them from 2025),
-against 116 after the cutoff — the constraint costs almost nothing, and sqlglot
-remains the richest source by an order of magnitude. A SQL transpiler is also
-close to the ideal bug shape: input SQL, exact expected output, tests that
-assert rendered strings rather than internal names.
+**pytest-dev/pytest's own suite is structurally in tension with the harness's
+`-p no:cacheprovider` convention, because pytest's own suite legitimately
+exercises the plugin that flag disables.** At HEAD, `-p no:cacheprovider`
+leaves `testing/test_legacypath.py::test_cache_makedir` erroring (`fixture
+'cache' not found`) alongside 4,504 passed — the exact fixture that flag turns
+off. The fix is not to fight the flag but to use the mechanism that already
+exists for "the suite writes into the tree": drop `-p no:cacheprovider` from
+`tests.runner` and declare `gitignore_extra: [".pytest_cache"]` instead.
+Verified 2026-09-02: with the flag dropped, `git status --porcelain` stays
+empty after a full run and the fixture error is gone. This is a property of
+the repository, not of the one PR cut from it, and should be checked against
+any other task cut from this source.
 
-`strip_paths: ["CLAUDE.md", "AGENTS.md"]` lifts that floor — both are agent
-files and neither is touched by a bug-fix PR — which reopens the 116
-post-cutoff candidates. List **both** names: `CLAUDE.md` is a symlink to
-`AGENTS.md` there, and preflight does NOT catch a target-only strip.
+**chimera's own `tests/` tree is bit-rotted independent of Python version or
+of this PR.** An unscoped p2p sweep at `base_sha` collection-errors on 7
+modules importing names that three-plus PRs' worth of drift removed
+(`tests/chimera/instruments/base.py` does not exist anywhere in the repo's
+history; `SlewRate` was never added to `chimera.interfaces.telescope`), and a
+further eight files raise or hang under a shared `manager` fixture — none of
+it caused by the reference PR, which touches only `telescope.py`'s
+`get_metadata` and one new test file. `tests.p2p` narrowed to leaf ids (per
+the Layer 2 rule below) is the documented remedy for exactly this shape, not
+a special case: the 30 ids are the leaf tests of the six files that collect
+and run 100% clean, individually verified, with the two involving real thread
+joins or heavy imports re-run twice to confirm determinism.
+
+**sqlglot carries a date constraint, and the window has a close as well as an
+open now.** `CLAUDE.md` was added 2026-02-02 (`a65c8701a306`, PR #6899);
+`AGENTS.md` followed on 2026-03-19 (`7f0dd47f60a3`), and a later commit made
+`CLAUDE.md` a symlink to it. Both are present at HEAD and preflight's `test -e`
+follows symlinks, so **`base_sha` must predate 2026-02-02**. That leaves 680
+clean candidates (301 of them from 2025), against 116 after the cutoff — the
+constraint costs almost nothing, and sqlglot remains the richest source by an
+order of magnitude. A SQL transpiler is also close to the ideal bug shape:
+input SQL, exact expected output, tests that assert rendered strings rather
+than internal names.
+
+Measured 2026-09-02: a **second**, harder floor closes the window again.
+`.gitmodules` naming an ssh url (`git@github.com:fivetran/sqlglot-integration-tests`)
+was added in `3a930dad6` ("Chore: add integration test automations", PR #7167,
+merged 2026-02-27) and is present at HEAD — refused by the submodule-url rule
+before preflight ever runs, and `strip_paths` cannot lift this floor the way
+it lifts the agent-file one (a strip cannot touch a submodule path; see the
+submodule bullets under *The image* below). So a plain (non-submodule-aware)
+`strip_paths` task from this repo is only usable with `base_sha` strictly
+**between** `a65c8701a306` (2026-02-02) and `3a930dad6` (2026-02-27) — at
+which point `AGENTS.md` does not exist yet and `CLAUDE.md` is a plain file, so
+`strip_paths: ["CLAUDE.md"]` alone suffices. Cutting after 2026-02-27 needs the
+manifest lever in `TASKS.md` (a submodule declared unneeded) that does not
+exist yet.
+
+Also measured 2026-09-02: sqlglot's dialect tests wrap every assertion in
+`unittest.TestCase.subTest()` via the shared `validate_all` helper — pervasive
+across the dialect suite, not incidental to one PR — so any f2p id cut from
+this repo needs the `SUBFAILED` fix above (`git log --oneline` in this
+worktree: "fix: SUBFAILED never matched, so a subtest-only failure read as no
+failure") to gate correctly. Cut against an older preflight, a genuinely-red
+`subTest`-only f2p test reads as "did not fail at the start state" and the
+task cannot pass the gate as authored.
+
+`strip_paths: ["CLAUDE.md", "AGENTS.md"]` lifts the first floor — both are agent
+files and neither is touched by a bug-fix PR — which reopens candidates in the
+window above, up to the submodule commit. List **both** names: `CLAUDE.md` is a
+symlink to `AGENTS.md` there, and preflight does NOT catch a target-only strip.
 `strip_paths: ["AGENTS.md"]` alone removes the target and leaves `CLAUDE.md` a
 dangling link an agent's `ls` still shows — the strip probe only looks at the
 paths this task DECLARED, and the context-file probe that checks for a
@@ -778,6 +891,26 @@ preflight to catch the omission.
 | repo | why |
 |---|---|
 | un33k/python-slugify | no harvestable PRs |
+| giampaolo/pyftpdlib | genuinely breaks on Python 3.12 (asyncore/asynchat removed, PEP 594), but no PR in its history is simultaneously a real bug-fix closing a formal issue and one whose added test actually reproduces the bug on the version boundary — measured 2026-09-02 across every candidate through 2023-08 |
+| tornadoweb/tornado | its whole suite is built on a custom `unittest.TestCase` subclass architecture (`AsyncTestCase`) that does not collect under pytest 9 regardless of interpreter (`AttributeError: 'CookieTest' object has no attribute 'runTest'`, measured 2026-09-02) — a bad fit for `tests.framework: pytest` independent of any candidate PR |
+| pytest-dev/pytest-localserver | its own Python-3.12 breakage (`smtpd` removal) is real, but every issue closed before the fix commit is either non-code or touches no file under `tests/` — `tests.paths` would produce an empty test half, which the loader refuses outright |
+
+**`mahmoud/boltons` is excluded for broadening 2 (collection-error f2p)
+specifically, not in general** — it stays in *Clean* above for an ordinary
+exit-1 task. Its `tests/conftest.py` defines a `pytest_ignore_collect` hook,
+which is a **firstresult** hookspec: the first plugin to return non-`None`
+wins, and boltons' own implementation (skipping `_pyN`-suffixed files) returns
+a definitive `False` for every other file, including an erroring one — so
+pytest's own `--ignore` handling is never reached. Measured 2026-09-02: with
+the hook intact, `pytest --ignore=tests/test_statsutils.py` still reports
+`ERROR collecting tests/test_statsutils.py` and exits 2, even though the item
+count proves the file genuinely was excluded from collection; with the hook
+renamed, the same command exits 0. Preflight's collection-error p2p baseline
+needs `--ignore=<module>` to actually exclude that module, so no
+broadening-2 task can pass preflight against this repository while the hook
+exists — not fixable at the manifest level, since the hook is load-bearing
+test infrastructure (Python-version skipping), not an agent file or a
+vendored tree `strip_paths` could remove.
 
 ### Internal repositories
 

@@ -1043,6 +1043,79 @@ size. Two exceptions are marked CAPTURE and should ride along with Gate 1.
   depends on which model gets entitled — a non-gpt-5 neutral judge (deepseek,
   qwen, mistral, grok) hits no such guard and needs no change at all.
 
+- [ ] **A cross-file duplicate `fullName` is refused even though
+  `<file>::<fullName>` is unambiguous.** The quarantine works off `fullName`
+  alone because vitest's/jest's `-t` matches name and not file, and neither
+  framework offers a flag that scopes a name pattern to one file — but the
+  *node id* a manifest actually declares already carries the file
+  (`tests/doc/stringify.ts::maps ...`), so passing the file as a positional
+  filter beside `-t` would let the runner disambiguate what the id already
+  disambiguates, and the exclusion could lift. Measured 2026-09-02 on
+  `eemeli/yaml`: four collisions under `describe('circular references', ...)`,
+  shared verbatim between `tests/doc/stringify.ts` and `tests/doc/createNode.ts`,
+  forced `tests.paths` down from `tests/` to one file — a real yield cost on a
+  real task, not a hypothetical one.
+
+- [ ] **`load_task_set` validates every manifest in the task-set root before
+  `--tasks` filters, so one broken sibling manifest blocks every other task's
+  gate and grade.** Measured 2026-09-02, twice independently: a sibling's
+  `image.env` key typo (an unrelated in-progress manifest in the same
+  directory) blocked `run_matrix.py --preflight-only --tasks <unrelated-task>`
+  and `grade.py --taskset ...` entirely, with the printed error naming the
+  broken sibling rather than the task that was actually asked for. Plausibly
+  intentional for a committed, curated task set — every manifest there should
+  always be valid — but a sharp edge for concurrent drafting in one shared
+  directory. Either a `--tasks` selection should load only the named
+  manifests, or the error should name the offending sibling AND say
+  explicitly that it is not the selected task.
+
+- [ ] **`run_matrix.py --preflight-only` rebuilds every base image
+  unconditionally before `resolve_tasks` runs, so `preflight.py`'s
+  base-tag-mismatch refusal cannot be exercised through the one command the
+  docs name for running the gate.** `prepare_bases` calls
+  `images.build_base_image` with no existence check, and a cache-hit
+  `docker build -t <tag>` silently retags the correct image back onto a
+  manually mutated tag before preflight's own `python --version` read-back
+  ever runs inside it. Measured 2026-09-02: mutating
+  `bakeoff-eval-agent:base-python-3.13` to point at the 3.11 image, then
+  running the documented gate command, printed `preflight PASS` with
+  `python_observed: Python 3.13.15` — the mutation was undone before the
+  read-back could see it. The refusal code itself is real and was verified
+  working when it was written; record this as "defence exists, not reachable
+  via the driver," not as dead code — exercising it needs either mutating
+  between `prepare_bases` and `resolve_tasks` inside one process (not
+  triggerable from outside) or calling `preflight()` directly.
+
+- [ ] **The sqlglot ssh-submodule refusal blocks a suite that never reads the
+  submodule, and there is no manifest lever to say so.** `tobymao/sqlglot`
+  added `.gitmodules` naming an ssh url on 2026-02-27 (`3a930dad6`, #7167);
+  every `base_sha` at or after it is refused before preflight ever runs, even
+  for a task whose suite never touches the submodule's content at all. A
+  manifest key to declare a submodule as unneeded — leave the gitlink in the
+  index, never populate it, never refuse on its url scheme — would reopen
+  post-2026-02-27 sqlglot (and any repository shaped like it) without
+  weakening the existing rule that a task whose *fix* touches submodule
+  content is refused. Not already expressible: the strip_paths-over-submodule
+  refusal (`HARVESTING.md`, "The image") exists precisely because a strip
+  cannot safely remove a submodule path without leaving `.gitmodules` naming
+  a directory that was never created, and the same reasoning is why no
+  existing lever routes around this one either.
+
+- [ ] **Files an `image.build` step writes INTO `/repo` are discarded by the
+  runtime bind mount, and which side should own the fix is still an open
+  decision, not a bug to patch quietly.** Measured 2026-09-02
+  (`pytest-dev/pytest`, whose editable install generates
+  `src/_pytest/_version.py` at build time via setuptools_scm): the generated
+  file exists only in the image's build-time scaffold copy of `/repo`, because
+  at run time the materialized run tree — built separately by `materialize()`,
+  which never sees anything `image.build` wrote — is bind-mounted over `/repo`
+  in full. A runner that needs such a file has to regenerate it itself every
+  invocation (this task's `tests.runner` does, via a heredoc reproducing the
+  build-time content verbatim). Decide whether `image.build` should instead
+  run against the materialized tree (which would invert the current
+  build-before-materialize order), or whether the scaffold/tree split should
+  simply be documented as the contract every such task has to work around.
+
 ### The judge channel — parked by the round-2 review (2026-08-20)
 
 Ten defects were fixed on `judge-review-fixes`; these are what the same review
