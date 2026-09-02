@@ -954,13 +954,16 @@ def _check_test_restore(state: _State, task, env, start_sha: str,
             )
 
     for prefix in paths:
-        if prefix in submodules:
-            # `prefix` is nothing but a gitlink -- the exclusion above already
-            # left it untouched and `excludes` empties this pathspec, so a
-            # `git checkout` here can only fail with the same message the
-            # "absent at the start state" branch below uses for a genuinely
-            # missing prefix. Skip it rather than file a note that misnames
-            # the cause: this path was not absent, it was excluded.
+        # `.rstrip("/")`: `submodules` comes from `git ls-tree`, which never
+        # reports a trailing slash, while `prefix` is the manifest's own
+        # `tests.paths` entry and nothing upstream normalises a
+        # `"tests/toml-test/"` declaration down to `"tests/toml-test"`. An
+        # exact compare on the raw strings misses that manifest and falls
+        # through to the `git checkout` below, which fails on a pathspec the
+        # `git rm` above already excluded -- the same message the genuinely
+        # "absent at the start state" branch uses, for a path that was not
+        # absent, only excluded.
+        if prefix.rstrip("/") in submodules:
             continue
         restored = env.exec(
             ["git", "checkout", start_sha, "--", prefix, *excludes]

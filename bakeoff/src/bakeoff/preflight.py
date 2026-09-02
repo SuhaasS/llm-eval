@@ -63,6 +63,7 @@ from bakeoff.runners.pytest_adapter import (  # noqa: F401
     EXIT_USAGE_ERROR,
     _EXIT_MEANING,
     _FAILED_LINE,
+    _PROCESS_EXIT_MEANING,
     _PYTHON_BASENAME,
     _runner_python,
     collection_error_modules,
@@ -1165,15 +1166,21 @@ def preflight(
                 EXIT_NOTHING_COLLECTED,
             ):
                 # Everything else used to fall through here in silence: 3
-                # (pytest internal error) and 127 (the interpreter this
-                # probe resolved is not on PATH) both land in `_EXIT_MEANING`
-                # already, and 127 in particular is "the agent cannot run the
-                # command it will naturally type" -- the exact failure this
-                # probe exists to catch, not a code to let through unnamed.
+                # (pytest internal error) and 127 (the interpreter this probe
+                # resolved is not on PATH) both land in `_PROCESS_EXIT_MEANING`
+                # -- NOT `adapter.explain`, whose own `_EXIT_MEANING` has no
+                # 127 entry and falls back to the bare digits -- and 127 in
+                # particular is "the agent cannot run the command it will
+                # naturally type", the exact failure this probe exists to
+                # catch, not a code to let through unnamed.
+                meaning = (
+                    _PROCESS_EXIT_MEANING.get(bare.exit_code)
+                    or adapter.explain(bare.exit_code)
+                )
                 problems.append(
                     "the bare pytest collection "
                     f"(`{' '.join(bare_argv)}`) exited "
-                    f"{bare.exit_code} ({adapter.explain(bare.exit_code)})"
+                    f"{bare.exit_code} ({meaning})"
                 )
             # 0, 2, 5 are not a problem: 2 is a collection error the task
             # may legitimately carry at the start state (broadening 2), 5 is

@@ -66,11 +66,11 @@ from pathlib import Path
 
 from bakeoff.container import RunContainer
 from bakeoff.preflight import (
-    _EXIT_MEANING,
     _Runner,
     _existing_prefixes,
 )
 from bakeoff.runners import KIND_FAILED, KIND_PASSED, for_framework
+from bakeoff.runners.pytest_adapter import _PROCESS_EXIT_MEANING
 from bakeoff.tasks import materialize
 
 #: What this derivation asserts, as a version, and it is in the fingerprint for
@@ -114,14 +114,10 @@ ORACLE_VERSION: str = "4"
 #: message has to name a cause an operator can act on: 127 is a runner that is
 #: not on PATH, 137 is the container being killed (OOM, most often), and each
 #: of those reads as "no tests failed" to a classifier that only checks for
-#: exit 1.
-_ORACLE_EXIT_MEANING = {
-    **_EXIT_MEANING,
-    125: "the `timeout` wrapper itself failed",
-    126: "the runner was found but could not be executed",
-    127: "the runner is not on PATH in this image",
-    137: "the command was killed (SIGKILL -- usually the container OOM)",
-}
+#: exit 1. Imported rather than re-defined -- `preflight.py`'s own bare-probe
+#: gate wants the exact same codes and this module already imports from
+#: `preflight.py`, so a second copy here would be the thing that drifts.
+_ORACLE_EXIT_MEANING = _PROCESS_EXIT_MEANING
 
 
 class OracleError(RuntimeError):

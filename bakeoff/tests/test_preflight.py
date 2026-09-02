@@ -2288,7 +2288,12 @@ def test_a_bare_exit_code_outside_the_accepted_set_is_a_problem(
     result = _run_preflight(monkeypatch, tmp_path, task, container)
 
     assert not result.ok
-    assert any("127" in p for p in result.problems), result.problems
+    # Not just the digits: "exited 127 (exit code 127)" is `adapter.explain`'s
+    # fallback for a code its own `_EXIT_MEANING` does not carry, and it would
+    # satisfy a bare "127" in p check while naming no cause at all.
+    assert any(
+        "127" in p and "not on PATH" in p for p in result.problems
+    ), result.problems
     assert result.evidence["bare_runner_exit"] == 127
 
 

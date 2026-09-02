@@ -831,6 +831,30 @@ def test_a_prefix_that_is_nothing_but_a_gitlink_skips_its_own_checkout():
     assert "did not match any file" not in restore.detail
 
 
+def test_a_trailing_slash_on_the_declared_prefix_still_skips_its_checkout():
+    """`git ls-tree` never reports a trailing slash, but nothing upstream
+    strips one from a manifest's own `tests.paths` entry -- a declared prefix
+    of `tests/toml-test/` is the same gitlink as `tests/toml-test`, and an
+    exact string compare between the two would miss it: `prefix in
+    submodules` is False, the skip above never fires, and the per-prefix
+    `git checkout` runs against a pathspec `excludes` has already emptied,
+    landing in the "absent at the start state" branch and misattributing an
+    excluded gitlink as one that never existed. `.rstrip("/")` on the
+    manifest side is what keeps the two comparable.
+    """
+    gitlink_sha = "c" * 40
+    ls_tree_stdout = f"160000 commit {gitlink_sha}\ttests/toml-test\x00"
+    env = FakeEnv(rules=[(["git", "ls-tree"], (0, ls_tree_stdout, ""))])
+    result = _ladder(env=env, task=_task(paths=("tests/toml-test/",)))
+
+    assert not any(a[:2] == ["git", "checkout"] for a in env.argvs)
+
+    restore = _check(result, "test_restore")
+    assert restore.status == "pass"
+    assert "left submodule tests/toml-test in place" in restore.detail
+    assert "did not match any file" not in restore.detail
+
+
 def test_no_gitlink_leaves_the_rm_and_checkout_argv_byte_for_byte_unchanged():
     """The fix must be invisible to every task in today's corpus: with no
     `160000` entry under the declared prefixes, `excludes` is empty and the

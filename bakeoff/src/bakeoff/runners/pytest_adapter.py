@@ -69,6 +69,24 @@ _EXIT_MEANING = {
     124: "the command hit the suite timeout (budget.suite_timeout_s)",
 }
 
+#: `_EXIT_MEANING` plus the codes the `timeout` wrapper and the shell
+#: contribute on top of pytest's own process -- 127 in particular is "the
+#: interpreter this probe resolved is not on PATH", the exact "the agent
+#: cannot run the command it will naturally type" failure both `preflight.py`
+#: and `oracle.py` need to name a cause for. Lives here, not in either of
+#: those two, because `oracle.py` already imports from `preflight.py`
+#: (`_EXIT_MEANING`, `_Runner`, `_existing_prefixes`) -- defining this dict in
+#: either one and importing it back into the other would be a cycle. Both
+#: modules already import from `bakeoff.runners.pytest_adapter` directly, so
+#: this is the one place both can reach without one.
+_PROCESS_EXIT_MEANING = {
+    **_EXIT_MEANING,
+    125: "the `timeout` wrapper itself failed",
+    126: "the runner was found but could not be executed",
+    127: "the runner is not on PATH in this image",
+    137: "the command was killed (SIGKILL -- usually the container OOM)",
+}
+
 #: `SUBFAILED` joins the alternation for the same reason `ERROR` is already
 #: in it: pytest 9's core-integrated subtests (subtests were folded into core
 #: in 9.0) print one `SUBFAILED<label> <node id> - <msg>` line per FAILING
