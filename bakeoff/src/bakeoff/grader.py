@@ -87,17 +87,24 @@ from bakeoff.grade_schema import (
 from bakeoff.oracle import Oracle
 from bakeoff.preflight import (
     EXIT_ALL_PASSED,
-    EXIT_COLLECTION_FAILURES,
-    EXIT_NOTHING_COLLECTED,
-    EXIT_TESTS_FAILED,
     PREFLIGHT_VERSION,
     _existing_prefixes,
     _Runner,
-    collection_error_modules,
     f2p_modules,
-    failed_node_ids,
 )
 from bakeoff.runner import harness_commit
+# Checks 5 and 6 read what the run DID, off the adapter, rather than what
+# number the process exited with -- see `_check_f2p`. `EXIT_ALL_PASSED` stays
+# imported because `_run_check` still grades a plain shell command (build,
+# typecheck, lint), where zero is the whole of the contract and no framework
+# has an opinion.
+from bakeoff.runners import (
+    KIND_FAILED,
+    KIND_LOAD_ERROR,
+    KIND_NOTHING_RAN,
+    KIND_PASSED,
+    for_framework,
+)
 # `_SUMMARY_LINE`, `_DESELECTED` and `parse_deselected` are re-exported, not
 # re-defined: they moved to `bakeoff.runners.pytest_adapter` when the suite
 # judgement became per-framework (broadening 7). They keep their EXACT bare
@@ -1011,21 +1018,35 @@ def _check_f2p(state: _State, task, env) -> None:
     `f2p_failed_node_ids`, which is observation.
     """
     state.f2p_declared = len(task.tests.f2p)
-    runner = _Runner(env, task.tests.runner, task.budget.suite_timeout_s)
+    # The adapter is passed EXPLICITLY. `_Runner`'s pytest default exists only
+    # so the untouched argv-identity gate keeps constructing one with three
+    # positional arguments; a production call site left on it would classify a
+    # jest run with pytest's exit codes -- where 1 is what a config error, an
+    # import error and a failing assertion all return alike -- and stamp
+    # F2P_FAILED on an environment defect, permanently, in an append-only
+    # store. `getattr` with a default because the manifest key is broadening 7
+    # Task 4's and a task object predating it must not crash the ladder.
+    adapter = for_framework(getattr(task.tests, "framework", "pytest"))
+    runner = _Runner(env, task.tests.runner, task.budget.suite_timeout_s,
+                     adapter)
     result = runner.select(tuple(task.tests.f2p))
     # Off the argv, like preflight's evidence -- see `_Runner.last_timeout_s`.
     state.suite_timeout_s = runner.last_timeout_s
     _capture(state, env, "f2p", result)
+    # `code` stays, and is deliberately not folded into the outcome: the two
+    # branches that read it below are a coreutils fact (124 is `timeout`) and a
+    # message naming the number an operator will see in the artifact. Putting
+    # those behind a framework's opinion would file a docker OOM under whatever
+    # that framework thinks 137 means.
     code = result.exit_code
+    outcome = runner.classify(result)
 
-    if code == EXIT_ALL_PASSED:
+    if outcome.kind == KIND_PASSED:
         state.f2p_failed_node_ids = ()
         state.passed("f2p", result)
         return
-    if code == EXIT_TESTS_FAILED:
-        state.f2p_failed_node_ids = tuple(
-            sorted(failed_node_ids(result.stdout + result.stderr))
-        )
+    if outcome.kind == KIND_FAILED:
+        state.f2p_failed_node_ids = tuple(sorted(outcome.failed_ids))
         state.fail("f2p", GradeFailure.F2P_FAILED, result,
                    detail=", ".join(state.f2p_failed_node_ids))
     if code == _TIMEOUT_EXIT:
@@ -1051,8 +1072,8 @@ def _check_f2p(state: _State, task, env) -> None:
     # at grade time is a submission that broke an import preflight already
     # proved importable after the reference fix, not a stranger dependency
     # loss the task never claimed.
-    if code in EXIT_COLLECTION_FAILURES:
-        modules = collection_error_modules(result.stdout + result.stderr)
+    if outcome.kind == KIND_LOAD_ERROR:
+        modules = outcome.errored_files
         if modules is not None and modules <= f2p_modules(tuple(task.tests.f2p)):
             # Observation, verbatim: pytest reported MODULES, and a module is a
             # node id -- the collector node. A reader tells them from test ids
@@ -1124,14 +1145,21 @@ def _check_p2p(state: _State, task, env, oracle: Oracle | None) -> None:
     else:
         state.p2p_deselect_requested = len(task.tests.f2p) + len(quarantined)
 
-    runner = _Runner(env, task.tests.runner, task.budget.suite_timeout_s)
+    # Explicit adapter, for the reason `_check_f2p` states: a call site left on
+    # the pytest default reads a jest config error as P2P_REGRESSION.
+    adapter = for_framework(getattr(task.tests, "framework", "pytest"))
+    runner = _Runner(env, task.tests.runner, task.budget.suite_timeout_s,
+                     adapter)
     result = runner.pass_to_pass(
         task.tests, extra_deselect=quarantined, scope=scope
     )
     # Off the argv, like preflight's evidence -- see `_Runner.last_timeout_s`.
     state.suite_timeout_s = runner.last_timeout_s
     _capture(state, env, "p2p", result)
+    # Kept beside the outcome for the timeout branch and the message; see
+    # `_check_f2p`.
     code = result.exit_code
+    outcome = runner.classify(result)
 
     # Before the exit branch, so the counts are set on the fail branches too.
     #
@@ -1152,29 +1180,29 @@ def _check_p2p(state: _State, task, env, oracle: Oracle | None) -> None:
     # two sources is not observable from the summary line -- and the offline
     # view, which can see one task's numbers across every arm, is where a
     # constant surplus is readable as configuration rather than as drift.
-    state.p2p_deselected = parse_deselected(result.stdout)
+    state.p2p_deselected = adapter.parse_deselected(
+        stdout=result.stdout, report=runner.last_report)
 
-    if code == EXIT_ALL_PASSED:
+    if outcome.kind == KIND_PASSED:
         state.p2p_failed_node_ids = ()
         state.passed("p2p", result)
         return
-    if code == EXIT_TESTS_FAILED:
-        state.p2p_failed_node_ids = tuple(
-            sorted(failed_node_ids(result.stdout + result.stderr))
-        )
+    if outcome.kind == KIND_FAILED:
+        state.p2p_failed_node_ids = tuple(sorted(outcome.failed_ids))
         state.fail("p2p", GradeFailure.P2P_REGRESSION, result,
                    detail=", ".join(state.p2p_failed_node_ids))
     if code == _TIMEOUT_EXIT:
         state.fail("p2p", GradeFailure.P2P_REGRESSION, result, timed_out=True,
                    detail=f"hit the {runner.last_timeout_s}s grading timeout")
-    if code == EXIT_NOTHING_COLLECTED:
+    if outcome.kind == KIND_NOTHING_RAN:
         # NOT the environment path. `test -e` passes an existing-but-EMPTY
         # directory (measured), pytest then exits 5, and that is a fact about
         # the task's configuration rather than about the grader's environment.
         # With `PREFLIGHT_VERSION` 2 or later in place both routes to
         # SCOPE_COLLECTED_NOTHING should be unreachable -- preflight's scoped
         # assertion proves collection first -- and they are kept as defence in
-        # depth.
+        # depth. And on the node frameworks this is also where a quarantine
+        # that deselected everything lands, which exits 0 there rather than 5.
         state.refuse(
             "p2p",
             NotGradedReason.SCOPE_COLLECTED_NOTHING,

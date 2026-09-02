@@ -479,10 +479,20 @@ class _Runner:
         #: copy of the branch logic is a second thing that can be wrong about
         #: what happened, inside the check that exists to be right about it.
         self.last_argv: list[str] = []
-        #: What the last invocation asked for BY ID, so `classify` can report
-        #: which of them never ran. Only the caller knows this; the report
-        #: cannot tell a test that was skipped from one that was never
-        #: selected. `()` when the last run selected nothing by id.
+        #: Reserved for what an invocation asks for BY ID, so `classify` can
+        #: report which of those ids never ran -- only the caller knows this,
+        #: because a report cannot tell a test that was SKIPPED from one that
+        #: was never selected.
+        #:
+        #: NOTHING WRITES IT YET. `select` and `pass_to_pass` leave it at `()`,
+        #: and the node adapter's `not_run` is broadening 7 Task 6's; until
+        #: then this is a declared-but-unwritten field and the docstring says
+        #: so rather than describing a behaviour that does not exist. It is
+        #: initialised HERE, at construction, for the reason the rest of this
+        #: file initialises its absences: a field that appears on first use
+        #: raises `AttributeError` out of `classify` on the deselect branch,
+        #: which never selects by id -- a crash on the path that is meant to
+        #: report an absence.
         self._selected: tuple[str, ...] = ()
         #: The report the last invocation wrote, parsed, or `None`. Read back
         #: through `cat` because the file lives in the container's /tmp, which
@@ -698,9 +708,9 @@ def preflight(
             f"{adapter.name!r}, and no argument contains "
             f"{adapter.runner_marker!r}: preflight can only distinguish "
             "'tests failed' from 'the environment is broken' through the "
-            "adapter the manifest DECLARED, so a runner that adapter cannot "
-            "read would be classified by the wrong rules -- which for the "
-            "node frameworks means exit 1 for a config error graded as a "
+            "adapter the manifest DECLARED, so a runner the declared adapter "
+            "cannot read would be classified by the wrong rules -- which for "
+            "the node frameworks means exit 1 for a config error graded as a "
             "test failure -- and without that distinction the gate is "
             "worthless"
         )

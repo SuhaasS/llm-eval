@@ -10,6 +10,8 @@ This file pins the adapter contract. `test_preflight.py`, `test_oracle.py` and
 `test_grader.py` keep pinning what the CONSUMERS do with it.
 """
 
+from pathlib import Path
+
 import pytest
 
 from bakeoff.runners import (
@@ -103,10 +105,21 @@ def test_pytest_p2p_args_keeps_scope_then_f2p_then_quarantine_then_ignore():
 
 
 def test_pytest_p2p_args_matches_the_live_runner_on_both_branches():
-    """Identity against the REAL `_Runner.pass_to_pass`, not against a literal
-    transcribed from it. A transcription is a second copy of the thing under
-    test, and it agrees with the adapter for exactly as long as both are wrong
-    in the same way."""
+    """The live argv against the PRE-REFACTOR LITERALS, spelled out here.
+
+    An earlier draft compared `_Runner.pass_to_pass`'s argv against
+    `adapter.p2p_args(...)` called with the same arguments -- which, now that
+    `pass_to_pass` delegates to exactly that method, is `f(x) == f(x)`. It is
+    symmetric, it holds whatever the body emits, and it would stay green
+    through an inserted flag or a reordered segment: the two changes the
+    property exists to catch.
+
+    So the expectations below are the argv from BEFORE the adapter existed --
+    the same literals `test_preflight.py`'s identity tests carry -- and they
+    are the gate. A transcription of the code under test is worth nothing; a
+    transcription of what that code emitted before the refactor is the whole
+    claim this refactor makes.
+    """
     from bakeoff.preflight import _Runner
 
     class _Recorder:
@@ -122,36 +135,40 @@ def test_pytest_p2p_args_matches_the_live_runner_on_both_branches():
             self.f2p = f2p
             self.p2p = p2p
 
-    adapter = for_framework("pytest")
-
     cases = [
+        # The deselect branch with every keyword supplied: the scope
+        # positional, then one `--deselect` per (f2p + extra) id in that
+        # order, then one `--ignore=` per path.
         (_Tests(("tests/a.py::test_one",), ()),
-         ("tests/c.py::test_flaky",), ("tests/",), ("tests/broken.py",)),
-        (_Tests(("tests/a.py::test_one",), ()), (), (), ()),
-        (_Tests((), ("tests/b.py::test_two",)), (), (), ()),
+         ("tests/c.py::test_flaky",), ("tests/",), ("tests/broken.py",),
+         ["tests/", "--deselect", "tests/a.py::test_one",
+          "--deselect", "tests/c.py::test_flaky",
+          "--ignore=tests/broken.py"]),
+        # The deselect branch with nothing supplied -- the argv the GRADER
+        # makes, and the one preflight validated.
+        (_Tests(("tests/a.py::test_one",), ()), (), (), (),
+         ["--deselect", "tests/a.py::test_one"]),
+        # The explicit branch: the declared p2p ids and nothing else.
+        (_Tests((), ("tests/b.py::test_two",)), (), (), (),
+         ["tests/b.py::test_two"]),
+        # The explicit branch with extras. `scope` is IGNORED there and the
+        # f2p ids are NOT deselected -- selecting node ids never collects them.
         (_Tests(("tests/a.py::test_one",), ("tests/b.py::test_two",)),
-         ("tests/c.py::test_flaky",), ("tests/",), ("tests/broken.py",)),
+         ("tests/c.py::test_flaky",), ("tests/",), ("tests/broken.py",),
+         ["tests/b.py::test_two", "--deselect", "tests/c.py::test_flaky",
+          "--ignore=tests/broken.py"]),
     ]
 
-    for tests, extra_deselect, scope, ignore in cases:
+    for tests, extra_deselect, scope, ignore, expected in cases:
         recorder = _Recorder()
-        runner = _Runner(recorder, ("python", "-m", "pytest", "-q"), 600)
+        runner = _Runner(recorder, ("python", "-m", "pytest", "-q"), 600,
+                         for_framework("pytest"))
         runner.pass_to_pass(tests, extra_deselect=extra_deselect, scope=scope,
                             ignore=ignore)
-        live = recorder.argv[len(["timeout", "600", "python", "-m", "pytest",
-                                 "-q"]):]
 
-        if tests.p2p:
-            through_adapter = adapter.p2p_args(
-                selected=tuple(tests.p2p), scope=(),
-                deselected=tuple(extra_deselect), ignored=tuple(ignore))
-        else:
-            through_adapter = adapter.p2p_args(
-                selected=(), scope=tuple(scope),
-                deselected=tuple(tests.f2p) + tuple(extra_deselect),
-                ignored=tuple(ignore))
-
-        assert through_adapter == live
+        assert recorder.argv == [
+            "timeout", "600", "python", "-m", "pytest", "-q", *expected
+        ]
 
 
 def test_pytest_select_args_are_the_bare_node_ids():
@@ -159,11 +176,18 @@ def test_pytest_select_args_are_the_bare_node_ids():
 
 
 def test_pytest_select_args_match_the_live_runner():
-    """Identity against the REAL `_Runner.select`, for the reason the p2p
-    identity test gives: a literal transcribed from the code under test is a
-    second copy of it, and it agrees for exactly as long as both are wrong in
-    the same way. The f2p selection is the run the whole red-before verdict
-    is read off, so this is the argv least able to afford a drift."""
+    """The live `_Runner.select` argv against the PRE-REFACTOR LITERAL.
+
+    Comparing it against `adapter.select_args(node_ids)` was `f(x) == f(x)`
+    once `select` came to call exactly that -- symmetric, and green through
+    any flag the method might insert. The f2p selection is the run the whole
+    red-before verdict is read off, so this is the argv least able to afford a
+    drift, and the literal is what pins it.
+
+    The second id carries `::` inside its brackets on purpose: a parametrized
+    id must reach pytest verbatim, and any splitting or quoting on the way
+    through would show up here.
+    """
     from bakeoff.preflight import _Runner
 
     class _Recorder:
@@ -174,16 +198,16 @@ def test_pytest_select_args_match_the_live_runner():
             self.argv = argv
             return None
 
-    adapter = for_framework("pytest")
     node_ids = ("tests/a.py::test_one", "tests/a.py::Klass::test_two[x::y]")
 
     recorder = _Recorder()
     _Runner(recorder, ("python", "-m", "pytest", "-q"), 600,
-            adapter).select(node_ids)
-    live = recorder.argv[len(["timeout", "600", "python", "-m", "pytest",
-                             "-q"]):]
+            for_framework("pytest")).select(node_ids)
 
-    assert adapter.select_args(node_ids) == live
+    assert recorder.argv == [
+        "timeout", "600", "python", "-m", "pytest", "-q",
+        "tests/a.py::test_one", "tests/a.py::Klass::test_two[x::y]",
+    ]
 
 
 def test_pytest_writes_no_report_and_asks_for_no_reporter_flags():
@@ -384,3 +408,50 @@ def test_the_moved_names_are_the_same_objects_the_adapter_holds():
 
     for name in ("_SUMMARY_LINE", "_DESELECTED", "parse_deselected"):
         assert getattr(grader, name) is getattr(pytest_adapter, name), name
+
+
+def test_no_production_call_site_leaves_the_runner_on_its_pytest_default():
+    """The enforcement `_Runner`'s default gave up, put back as a source rule.
+
+    The plan asked for NO default on `_Runner(..., adapter)`, so that a call
+    site which forgot it would not compile. It has one anyway, because
+    `test_grading_p2p_with_no_extras_is_the_argv_preflight_validated` is the
+    argv-identity gate on this refactor, constructs a `_Runner` with three
+    positional arguments, and may not be edited -- a gate rewritten to
+    accommodate the change it gates has stopped gating anything.
+
+    What the default costs is exactly this: a production call site can now be
+    left on pytest silently. Under jest, exit 1 is what a config error, an
+    unresolvable import and a failing assertion all return alike, so such a
+    site stamps a model failure on an environment defect -- permanently, in an
+    append-only store. Parsed rather than grepped because `_Runner(env, argv,
+    t)` and `_Runner(env, argv, t,\n adapter)` are the same string prefix.
+
+    Scoped to `src/bakeoff/` on purpose: the tests' own three-argument
+    constructions are the ones the default exists for.
+    """
+    import ast
+
+    import bakeoff
+
+    src = Path(bakeoff.__file__).parent
+    sites = []
+    for path in sorted(src.rglob("*.py")):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else (
+                func.attr if isinstance(func, ast.Attribute) else None)
+            if name != "_Runner":
+                continue
+            supplied = len(node.args) >= 4 or any(
+                kw.arg == "adapter" for kw in node.keywords)
+            sites.append((f"{path.relative_to(src)}:{node.lineno}", supplied))
+
+    # Not vacuous: preflight's gate, the oracle's derivation and the grader's
+    # two checks are four, and a refactor that inlined one of them away would
+    # otherwise make this test pass by finding nothing.
+    assert len(sites) >= 4, sites
+    assert [where for where, ok in sites if not ok] == []

@@ -281,6 +281,26 @@ def _check(result, name):
     return next(c for c in result.checks if c.name == name)
 
 
+def _run_f2p_with(*, exit_code, stdout="", stderr="", report=None,
+                  f2p=("tests/new.py::test_x",)):
+    """One ladder run whose f2p invocation answered with exactly this.
+
+    `report` is accepted and unused on pytest -- the adapter reads the exit
+    code and the `-q` summary lines and writes no machine-readable report
+    (`report_path()` is `None`, so `_Runner` never reads one). It is in the
+    signature because the thing under test is the SEAM: the same three shapes
+    below are what a node adapter answers from a report instead, and a helper
+    that could not express one would have to be rewritten to state the same
+    claim one framework over.
+
+    `f2p` defaults to a module the confinement predicate can contain, so the
+    accepted-shape branch and the fall-through branch are distinguished by
+    what the runner said rather than by which task the test happened to build.
+    """
+    env = FakeEnv(rules=[(is_f2p, (exit_code, stdout, stderr))])
+    return _ladder(task=_task(f2p=f2p), env=env)
+
+
 # --------------------------------------------------------------------------
 # 1. the not-graded gates
 # --------------------------------------------------------------------------
@@ -2035,3 +2055,46 @@ def test_a_pass_that_captured_nothing_claims_no_artifacts_directory(
     assert second.artifacts_dir is None
     # And the refusal to claim one did not cost the earlier pass its evidence.
     assert (Path(first.artifacts_dir) / "f2p.out.gz").exists()
+
+
+# --- the runner adapter seam --------------------------------------------------
+
+
+def test_the_graders_runner_is_built_with_the_tasks_adapter():
+    """Both `_Runner` constructions in the grader take the adapter for the
+    task's declared framework. A pytest adapter on a jest task reads exit 1 --
+    which jest returns for a broken config -- as F2P_FAILED, and that is an
+    accusation against the model for the task author's error, permanently, in
+    an append-only store."""
+    import inspect
+
+    from bakeoff import grader
+
+    source = inspect.getsource(grader._check_f2p) + inspect.getsource(
+        grader._check_p2p)
+    assert source.count("_Runner(") == 2
+    assert "for_framework(" in source or "adapter=" in source
+
+
+def test_a_run_that_did_not_say_what_it_did_is_never_stamped_on_the_model():
+    """KIND_ENVIRONMENT reaches `state.environment`, never `state.fail`. This
+    is the Phase 0c failure stated over the new seam: a broken environment is
+    also a non-zero exit, and on vitest and jest it is the SAME non-zero exit
+    as a test failure."""
+    state = _run_f2p_with(exit_code=3, stdout="INTERNALERROR", report=None)
+
+    assert state.grade_failure is None
+    assert state.not_graded_reason == "environment_error"
+    assert state.environment_error_check == "f2p"
+
+
+def test_a_confined_load_error_is_still_an_f2p_failure():
+    """Broadening 2's rule, restated over the adapter. An arm that changed
+    nothing leaves the f2p module not importing; reading that as an environment
+    error made the do-nothing arm NOT GRADED while the arm that half-fixed it
+    graded False -- so in any view counting False the arm that did nothing
+    looked better than the one that tried."""
+    state = _run_f2p_with(exit_code=4, stdout="ERROR tests/new.py", report=None)
+
+    assert state.grade_failure == "f2p_failed"
+    assert state.f2p_failed_node_ids == ("tests/new.py",)

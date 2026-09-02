@@ -2553,15 +2553,29 @@ def test_the_runner_routes_every_argv_and_verdict_through_its_adapter():
     assert outcome.explain == "the adapter answered"
 
 
-def test_the_runner_starts_with_no_selection_recorded():
-    """`()` is "the last run selected nothing by id", which is what a scope
-    sweep does. Only the CALLER knows what was asked for -- a report cannot
-    tell a test that was skipped from one that was never selected -- so the
-    field exists from construction rather than appearing on first use, where
-    an unset attribute would raise out of `classify` on the deselect branch."""
+def test_the_runner_starts_with_no_selection_recorded_and_nothing_writes_it():
+    """`_selected` exists from CONSTRUCTION, and is still unwritten.
+
+    The earlier version of this test asserted only the `()` at construction,
+    under a docstring claiming the field held "what the last invocation asked
+    for by id" -- which `select` does not assign and `pass_to_pass` does not
+    assign either. Pinning the true half of a false claim is how the claim
+    survives, so this pins the ACTUAL state: a selection run leaves it empty.
+    It is the test that will fail when broadening 7 Task 6 makes `classify`
+    report `not_run` and something finally has to write it.
+
+    Initialised at construction rather than on first use because an unset
+    attribute raises `AttributeError` out of `classify` on the deselect
+    branch, which never selects by id -- a crash on the path whose whole job
+    is to report an absence.
+    """
     from bakeoff.preflight import _Runner
 
-    assert _Runner(_Recorder(), ("python", "-m", "pytest"), 60)._selected == ()
+    runner = _Runner(_Recorder(), ("python", "-m", "pytest"), 60)
+    assert runner._selected == ()
+
+    runner.select(("tests/a.py::test_one",))
+    assert runner._selected == ()
 
 
 def test_the_runner_adapter_default_is_pytest_and_nothing_may_rely_on_it():

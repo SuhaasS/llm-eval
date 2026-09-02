@@ -21,6 +21,7 @@ from bakeoff.oracle import (
     ensure_oracle,
     oracle_fingerprint,
 )
+from bakeoff.runners.pytest_adapter import ADAPTER
 
 
 class FakeRunner:
@@ -34,6 +35,20 @@ class FakeRunner:
         self.calls.append({"scope": scope})
         code, out = self._results.pop(0)
         return SimpleNamespace(exit_code=code, stdout=out, stderr="")
+
+    def classify(self, result):
+        """Delegated to the REAL pytest adapter rather than stubbed.
+
+        `_Runner.classify` does exactly this, and every pair queued above is a
+        pytest exit code with pytest `-q` output -- so a hand-written mapping
+        here would be a second opinion about what pytest's numbers mean,
+        sitting inside the fixtures that exist to pin what the oracle does
+        with them.
+        """
+        return ADAPTER.classify(
+            exit_code=result.exit_code, stdout=result.stdout,
+            stderr=result.stderr, report=None,
+        )
 
 
 TESTS = SimpleNamespace(f2p=("tests/test_x.py::test_a",), p2p=())
@@ -345,8 +360,12 @@ def _stub_derive_environment(monkeypatch, tmp_path, existing, results):
         lambda image, repo_path, base_sha: _FakeContainer(existing),
     )
 
-    def _make_runner(container, argv, timeout_s):
+    def _make_runner(container, argv, timeout_s, adapter=None):
         runner.timeout_s = timeout_s
+        # Recorded, not ignored: `_derive` must pass the task's adapter rather
+        # than leave `_Runner` on its pytest default, and a stub that swallowed
+        # the argument would hide the day it stopped.
+        runner.adapter = adapter
         return runner
 
     monkeypatch.setattr("bakeoff.oracle._Runner", _make_runner)
@@ -464,10 +483,59 @@ def test_the_quarantine_still_refuses_a_run_that_could_not_collect():
 
     from bakeoff.oracle import OracleError, _classify
 
+    result = SimpleNamespace(
+        exit_code=4, stdout="ERROR tests/a.py\n1 error in 0.01s\n", stderr="",
+    )
+    # The outcome comes from the real adapter, and the raw result is threaded
+    # through beside it for the output tail. `_classify` stopped reading the
+    # exit code directly when the judgement became per-framework (broadening
+    # 7); the claim this test makes is unchanged.
     with pytest.raises(OracleError) as excinfo:
-        _classify(SimpleNamespace(
-            exit_code=4, stdout="ERROR tests/a.py\n1 error in 0.01s\n",
-            stderr="",
-        ))
+        _classify(ADAPTER.classify(exit_code=result.exit_code,
+                                   stdout=result.stdout,
+                                   stderr=result.stderr, report=None), result)
 
     assert "exited 4" in str(excinfo.value)
+
+
+def test_the_oracle_refuses_every_kind_that_is_not_passed_or_failed():
+    """A quarantine is derived from which tests failed, and a run that did not
+    happen reports none -- indistinguishable from a clean run, and it would
+    quarantine nothing. `load_error`, `nothing_ran` and `environment` all reach
+    the raise, and `nothing_ran` is the one that matters most on node: a
+    quarantine that swallows the whole p2p list exits 0 there (measured), so
+    the exit code cannot carry this any more."""
+    from bakeoff.oracle import OracleError, _classify
+    from bakeoff.runners import (
+        KIND_ENVIRONMENT, KIND_LOAD_ERROR, KIND_NOTHING_RAN, Outcome,
+    )
+
+    result = SimpleNamespace(stdout="the tail an operator needs", stderr="")
+    for kind, code in (
+        (KIND_LOAD_ERROR, 4), (KIND_NOTHING_RAN, 5), (KIND_ENVIRONMENT, 127),
+    ):
+        with pytest.raises(OracleError) as excinfo:
+            _classify(Outcome(kind=kind, exit_code=code, explain="x"), result)
+        # The tail is not decoration: every path through here is a broken
+        # oracle, and a refusal with no output is one an operator cannot act on.
+        assert "the tail an operator needs" in str(excinfo.value)
+
+
+def test_the_derivation_hands_the_runner_the_tasks_adapter(
+    tmp_path, monkeypatch
+):
+    """`_derive` builds its `_Runner` with the adapter for the task's declared
+    framework, never leaving it on the pytest default. Under jest, exit 1 is
+    what a config error, an import error and a failing assertion all return
+    alike -- so a default here would read a broken reference run as "these
+    tests failed" and quarantine them, shrinking the regression check on every
+    submission of that task, forever."""
+    from bakeoff.runners import for_framework
+
+    runner = _stub_derive_environment(
+        monkeypatch, tmp_path, existing={"tests/"}, results=[(0, ""), (0, "")]
+    )
+
+    _derive(_derive_task(paths=("tests/",)), "sha256:img", tmp_path)
+
+    assert runner.adapter is for_framework("pytest")

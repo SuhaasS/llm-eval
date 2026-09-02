@@ -66,13 +66,11 @@ from pathlib import Path
 
 from bakeoff.container import RunContainer
 from bakeoff.preflight import (
-    EXIT_ALL_PASSED,
-    EXIT_TESTS_FAILED,
     _EXIT_MEANING,
     _Runner,
     _existing_prefixes,
-    failed_node_ids,
 )
+from bakeoff.runners import KIND_FAILED, KIND_PASSED, for_framework
 from bakeoff.tasks import materialize
 
 #: What this derivation asserts, as a version, and it is in the fingerprint for
@@ -151,7 +149,7 @@ def oracle_fingerprint(task, image: str) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-def _classify(result) -> set[str]:
+def _classify(outcome, result) -> set[str]:
     """What failed in one p2p run, or a refusal that the run did not happen.
 
     The whole point of reading pytest's exit code rather than `!= 0` is the
@@ -161,19 +159,30 @@ def _classify(result) -> set[str]:
     classifier that only asked "did anything fail?" would read a suite that
     never collected as a clean run and derive an empty quarantine from two of
     them.
+
+    Stated over `Outcome.kind` rather than over an exit code, because on vitest
+    and jest there is no exit code to state it over: measured 2026-09-01, both
+    return 1 for a failing test and for a broken config, and BOTH return 0 for
+    a `-t` pattern that matched nothing -- which is exactly what a quarantine
+    covering the whole p2p list produces. `KIND_NOTHING_RAN` is what carries
+    that now; the exit code used to.
     """
-    code = result.exit_code
-    if code == EXIT_ALL_PASSED:
+    if outcome.kind == KIND_PASSED:
         return set()
-    if code == EXIT_TESTS_FAILED:
-        return failed_node_ids(result.stdout + result.stderr)
-    meaning = _ORACLE_EXIT_MEANING.get(code)
+    if outcome.kind == KIND_FAILED:
+        return set(outcome.failed_ids)
+    meaning = _ORACLE_EXIT_MEANING.get(outcome.exit_code) or outcome.explain
     detail = f" -- {meaning}" if meaning else ""
+    # `result` is carried alongside the outcome solely for this tail, which the
+    # exit-code version already had. Every path through here is a BROKEN
+    # ORACLE, which is the failure an operator has to debug from the message
+    # alone -- so dropping the output would be the one regression this refactor
+    # could make that no test would see.
     raise OracleError(
-        f"the p2p run at the reference state exited {code}{detail}. The "
-        "quarantine is derived from which tests failed, and a run that did "
-        "not happen reports none -- so this would be indistinguishable from a "
-        "clean run and would quarantine nothing.\n"
+        f"the p2p run at the reference state exited {outcome.exit_code} "
+        f"({outcome.kind}){detail}. The quarantine is derived from which tests "
+        "failed, and a run that did not happen reports none -- so this would "
+        "be indistinguishable from a clean run and would quarantine nothing.\n"
         + (result.stdout or result.stderr)[-2000:]
     )
 
@@ -191,8 +200,10 @@ def derive_quarantine(runner, tests, scope: tuple[str, ...] = ()) -> tuple[str, 
     uses. See the module docstring: an id derived outside the graded scope
     deselects nothing and does it silently.
     """
-    first = _classify(runner.pass_to_pass(tests, scope=scope))
-    second = _classify(runner.pass_to_pass(tests, scope=scope))
+    first_result = runner.pass_to_pass(tests, scope=scope)
+    first = _classify(runner.classify(first_result), first_result)
+    second_result = runner.pass_to_pass(tests, scope=scope)
+    second = _classify(runner.classify(second_result), second_result)
 
     both = first & second
     if both:
@@ -216,6 +227,13 @@ def derive_quarantine(runner, tests, scope: tuple[str, ...] = ()) -> tuple[str, 
         # grade-time surface is a NAMED scope_collected_nothing / exit-5
         # record, not silence, and the leaf-shape requirement on `tests.p2p`
         # goes into HARVESTING.md (Task 7) where the set is authored.
+        #
+        # On pytest this surfaces because deselecting every selected id makes
+        # pytest exit 5. On vitest and jest it exits **0** with every test
+        # reported skipped (measured 2026-09-01) -- so what carries it there is
+        # `classify`'s rule that zero assertions with a terminal status is
+        # `KIND_NOTHING_RAN` whatever the exit code was. The guard's claim is
+        # unchanged; the mechanism behind it is no longer the exit code.
         raise OracleError(
             "the quarantine covers the entire declared p2p list ("
             + ", ".join(sorted(tests.p2p))
@@ -283,8 +301,22 @@ def _derive(task, image: str, cache_root: Path) -> tuple[str, ...]:
             # reference run then exits 124, `_classify` raises, and the task
             # becomes ungradable -- silently, since the cache stores only the
             # verdict.
+            #
+            # The adapter is passed EXPLICITLY, never left on `_Runner`'s
+            # pytest default: this derivation's every refusal is stated over
+            # what the run DID, and under jest exit 1 is what a config error,
+            # an import error and a failing assertion all return alike. A call
+            # site left on the default would read a broken jest run as "these
+            # tests failed" and quarantine them -- shrinking the regression
+            # check on every submission of that task, forever.
+            #
+            # `getattr` with a default, like `preflight._gate`'s: the manifest
+            # key is broadening 7 Task 4's, and a `task` object predating it
+            # must not crash the derivation.
             runner = _Runner(container, task.tests.runner,
-                             task.budget.suite_timeout_s)
+                             task.budget.suite_timeout_s,
+                             for_framework(
+                                 getattr(task.tests, "framework", "pytest")))
             # Filtered through preflight's own existence check rather than
             # passed raw, because that is the filter the grader's check 6
             # applies. A declared prefix absent at the post-fix state is an
