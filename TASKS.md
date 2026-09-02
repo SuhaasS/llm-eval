@@ -1201,7 +1201,7 @@ judge runs after one — which is why they sit here rather than above.
   needs a
   `PREFLIGHT_VERSION` bump because it changes what a cached verdict contains.
 
-- [ ] **Re-screen the `HARVESTING.md` corpus at 3.11 and 3.13.** Broadening 5
+- [x] **Re-screen the `HARVESTING.md` corpus at 3.11 and 3.13.** Broadening 5
   gave a manifest `image.python: "3.11" | "3.12" | "3.13"`, closed and
   enforced at load time, but the whole screen at `docs/BUILDING-A-TASK-SET.md`
   §2 was run in `python:3.12-slim-bookworm` only — so a candidate excluded for
@@ -1213,6 +1213,10 @@ judge runs after one — which is why they sit here rather than above.
   candidates `HARVESTING.md` already excluded, and report which pass — the key
   is built and gated, but claiming a yield improvement without this
   measurement would be the "report the gap, never estimate it" rule broken.
+  **Result:** measured 2026-09-02, zero repositories reopened — all eight
+  re-screened candidates show the identical blocker (or, for pygments, the
+  identical green) on 3.11, 3.12 and 3.13; see
+  `~/.cache/bakeoff-probe/reports/r2-19-rescreen.md` and `HARVESTING.md`.
 
 - [ ] **No property-based determinism check exists for the node frameworks.**
   Broadening 3 refuses a pytest task whose declared tests import `hypothesis`
