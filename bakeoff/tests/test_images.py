@@ -18,7 +18,14 @@ import io
 import subprocess
 import tarfile
 
-from bakeoff.images import _strip_build_context, build_task_image, render_dockerfile
+import pytest
+
+from bakeoff.images import (
+    ImageError,
+    _strip_build_context,
+    build_task_image,
+    render_dockerfile,
+)
 
 
 def _lines(**kwargs) -> list[str]:
@@ -120,6 +127,26 @@ def test_a_stripped_symlink_is_removed_rather_than_followed(tmp_path):
     assert (repo / "real" / "a.md").exists(), "the link's target is not the target"
 
 
+def test_a_strip_through_an_intermediate_symlink_does_not_escape_repo_dir(tmp_path):
+    """`git archive` preserves symlinks, and only the FINAL path component is
+    ever checked with `is_symlink()` -- an upstream `docs -> /elsewhere` plus
+    a strip path of `docs/secret` would resolve outside `repo_dir` and delete
+    there if nothing else guarded it. This pins the guard, not just the
+    docstring that explains it."""
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "secret").write_text("keep me\n")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "docs").symlink_to(outside)
+
+    with pytest.raises(ImageError):
+        _strip_build_context(repo, ["docs/secret"])
+
+    assert (outside / "secret").exists(), "escaping the guard must not delete outside repo_dir"
+    assert (repo / "docs").is_symlink(), "context is untouched by the refusal"
+
+
 def test_a_path_missing_from_the_build_context_is_not_an_error(tmp_path):
     """`materialize` raises on exactly this, and `run_matrix` builds the image
     BEFORE materializing -- raising in both places means one typo is reported
@@ -128,6 +155,8 @@ def test_a_path_missing_from_the_build_context_is_not_an_error(tmp_path):
     repo.mkdir()
 
     _strip_build_context(repo, ["nope", "also/nope"])
+
+    assert list(repo.iterdir()) == [], "a missing path must not create or touch anything"
 
 
 def _archive_bytes(source) -> bytes:

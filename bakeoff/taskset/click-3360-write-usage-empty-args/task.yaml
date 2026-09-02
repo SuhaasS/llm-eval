@@ -123,9 +123,12 @@ tests:
 # does not imply exclusion: silently dropping the chunk would make
 # solution_diff something other than the merged PR.
 #
-# Symlinks: list the link AND its target. Stripping only the target leaves a
-# dangling link the agent still sees; preflight's strip probe is `-e` or `-L`,
-# so that is a NO-GO rather than a silent confound.
+# Symlinks: list the link AND its target -- preflight does NOT catch a
+# target-only strip. Stripping only the target leaves a dangling link the
+# agent's `ls` still shows: the strip probe checks only the paths THIS task
+# declared, and the context-file probe that would otherwise flag a leftover
+# CLAUDE.md/AGENTS.md is `-e` only, which calls a dangling link absent. The
+# gate passes clean on the mistake, so list both names.
 #
 # Section 6.4 confound, to be recorded here by any task that uses it: the
 # humans who wrote the PR had the stripped file.

@@ -344,10 +344,13 @@ assert rendered strings rather than internal names.
 `strip_paths: ["CLAUDE.md", "AGENTS.md"]` lifts that floor — both are agent
 files and neither is touched by a bug-fix PR — which reopens the 116
 post-cutoff candidates. List **both** names: `CLAUDE.md` is a symlink to
-`AGENTS.md` there, and stripping only the target leaves a dangling link that an
-agent's `ls` still shows. Preflight catches that (its strip probe is `-e` or
-`-L`), so the mistake is a NO-GO rather than a silent confound — but it is
-cheaper to list both than to iterate on the gate.
+`AGENTS.md` there, and preflight does NOT catch a target-only strip.
+`strip_paths: ["AGENTS.md"]` alone removes the target and leaves `CLAUDE.md` a
+dangling link an agent's `ls` still shows — the strip probe only looks at the
+paths this task DECLARED, and the context-file probe that checks for a
+leftover `CLAUDE.md` is `-e` only, which calls a dangling link absent. The
+gate passes clean on the mistake, so list both names rather than relying on
+preflight to catch the omission.
 
 ### Excluded
 

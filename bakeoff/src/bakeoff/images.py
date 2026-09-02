@@ -181,14 +181,36 @@ def _strip_build_context(repo_dir: Path, strip_paths: list[str]) -> None:
     is why taskset/HARVESTING.md records that repository's date floor as
     covering both names.
 
-    Escaping `repo_dir` is impossible by construction rather than by a check
-    here: `tasks._validate_strip_paths` refuses an absolute entry, one
-    carrying `..`, and one carrying pathspec magic.
+    Escaping `repo_dir` through the DECLARED path itself is refused upstream:
+    `tasks._validate_strip_paths` rejects an absolute entry, one carrying
+    `..`, and one carrying pathspec magic. That does not cover an
+    INTERMEDIATE symlink -- `git archive` preserves symlinks, so an upstream
+    `docs -> /elsewhere` plus a strip path of `docs/x` resolves outside
+    `repo_dir` and would unlink there, since only the final path component is
+    ever checked with `is_symlink()`. Refused here too, before anything is
+    touched: the resolved parent of `target` must stay under `repo_dir`, or
+    this raises rather than deleting outside it. (`tasks.materialize` would
+    also refuse the same manifest afterward -- `git ls-files` sees nothing
+    tracked through the escaped path -- but only after this step already
+    deleted the wrong file.)
+
+    A case-insensitive host filesystem is a second, unrelated way for this
+    step and `tasks._strip_paths_from_tree` to disagree: `strip_paths:
+    ["claude.md"]` against a tracked `CLAUDE.md` deletes it here, because
+    APFS resolves the differently-cased path to the same file, while `git
+    ls-files` treats the pathspec as case-sensitive, finds no tracked match,
+    and `materialize` raises. Same outcome as the symlink case -- the
+    manifest is refused, but by the later stage, after this one already
+    mutated the build context.
     """
     import shutil
 
+    repo_root = Path(repo_dir).resolve()
     for path in strip_paths:
         target = Path(repo_dir) / path
+        parent = target.parent.resolve()
+        if repo_root != parent and repo_root not in parent.parents:
+            raise ImageError(f"strip path {path!r} escapes repo_dir via a symlink")
         if target.is_symlink() or target.is_file():
             target.unlink()
         elif target.is_dir():
