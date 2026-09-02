@@ -48,6 +48,27 @@ def test_from_dict_drops_unknown_keys_instead_of_crashing():
     assert GradeRecord.from_dict(data).run_id == "r1"
 
 
+def test_a_1_0_0_line_loads_with_no_bound_rather_than_a_fabricated_one(
+    tmp_path: Path,
+):
+    """`suite_timeout_s` arrived in 1.1.0, and every line written before it
+    predates the field. `_build` filters to the dataclass's own fields, so
+    such a line loads and the field defaults to `None` -- which is the same
+    thing `None` means on a fresh line: no bounded command ran, nobody
+    counted. Defaulting to 600 instead would turn "this writer had no such
+    field" into the claim that this grade was measured against 600 s, which
+    is exactly the read a version bump exists to prevent."""
+    data = _record().to_dict()
+    data["grade_schema_version"] = "1.0.0"
+    del data["suite_timeout_s"]
+    p = tmp_path / "grades.jsonl"
+    p.write_text(json.dumps(data) + "\n", encoding="utf-8")
+
+    records, malformed = load_grades(p)
+    assert malformed == 0
+    assert records[0].suite_timeout_s is None
+
+
 def test_append_then_load_returns_both_records(tmp_path: Path):
     p = tmp_path / "grades" / "grades.jsonl"
     append_grade(p, _record("a"))

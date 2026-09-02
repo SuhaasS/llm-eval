@@ -126,13 +126,43 @@ from bakeoff.tasks import (
 #: `False` -- so the do-nothing arm was invisible in every view that counts
 #: `False`. That is a change to what a check MEANS, so the version moves
 #: whether or not anything was graded under 2.
-GRADER_VERSION: str = "3"
+#:
+#: 3 -> 4: every bounded check reads `task.budget.suite_timeout_s` instead of
+#: a module constant, so the ladder's behaviour on the SAME input can change
+#: -- a longer bound turns a `timed_out` fail into a pass.
+#:
+#: No verdict on today's corpus changes: no stored manifest declares the key,
+#: so every ladder still runs at 600. It moves anyway because the resume gate
+#: in `scripts/grade.py` keys on (run_id, GRADER_VERSION) ALONE and never on
+#: `manifest_digest` -- so the first manifest edit that raises the bound would
+#: find every affected run already marked graded and keep serving the 600 s
+#: verdict, with neither line saying they were measured against different
+#: bounds. The bump has to land with the code that makes the divergence
+#: possible, not with the manifest that first exercises it.
+#:
+#: Operator note: as with 2 -> 3, this re-grades EVERY stored run into a fresh
+#: `v4` artifacts directory beside the existing one. That is intended -- a
+#: verdict under a different ladder is a new line whose disagreement with the
+#: old one is the finding -- and it costs a full grading pass per event log.
+#: Schedulable rather than urgent, precisely because no verdict changes until
+#: a manifest raises the key.
+GRADER_VERSION: str = "4"
 
-#: Wall clock for one graded command, applied by coreutils `timeout` INSIDE
-#: the container. `RunContainer.exec` blocks with no timeout of its own and
-#: Docker offers no way to kill a running exec from outside, so a suite that
-#: hangs would hang the whole batch.
-GRADE_TIMEOUT_S: int = 600
+#: Wall clock for the HOST-side gitleaks scan, and for nothing else.
+#: `_ContainerEnv.scan_secrets` shells out to `docker run` rather than through
+#: `env.exec`, so it is the one graded command the container's own `timeout`
+#: prefix does not cover, and without a bound a wedged daemon hangs the batch
+#: forever rather than costing one named row.
+#:
+#: Every command that runs INSIDE the container -- the suite invocations and
+#: the declared `grading.*` argvs -- is bounded by
+#: `task.budget.suite_timeout_s` instead, because preflight bounds the same
+#: commands by the same manifest value and a suite that fits one bound and is
+#: killed under the other stamps `timed_out` on the model. Renamed from
+#: `GRADE_TIMEOUT_S` for that reason: a constant called "the grade timeout" is
+#: what invites the next consumer to reach for it instead of the manifest.
+#: The scan is a fixed-size read of one diff and has no task in scope.
+SCAN_TIMEOUT_S: int = 600
 
 #: gitleaks, digest-pinned. A tag is not an identity, and a grade names every
 #: input it was derived from -- a scanner that silently moved between two
@@ -254,6 +284,7 @@ class LadderResult:
     p2p_deselect_requested: int | None = None
     p2p_deselected: int | None = None
     p2p_failed_node_ids: tuple[str, ...] | None = None
+    suite_timeout_s: int | None = None
 
 
 class _Stop(Exception):
@@ -290,6 +321,16 @@ class _State:
     p2p_deselect_requested: int | None = None
     p2p_deselected: int | None = None
     p2p_failed_node_ids: tuple[str, ...] | None = None
+    #: The bound the LAST bounded command carried, read off its own argv.
+    #: Last-writer-wins across checks 3-7 rather than "every command": all of
+    #: them read one manifest value, so the three writes agree -- but the
+    #: field says what one argv carried, and claiming more of it than that
+    #: would be a claim the code does not check.
+    #:
+    #: `None` until a bounded command runs, which is what a record refused at
+    #: the gate or at check 1 looks like -- writing the configured number
+    #: there would be a claim about a command that never happened.
+    suite_timeout_s: int | None = None
 
     # -- recording ---------------------------------------------------------
 
@@ -373,6 +414,7 @@ class _State:
             p2p_deselect_requested=self.p2p_deselect_requested,
             p2p_deselected=self.p2p_deselected,
             p2p_failed_node_ids=self.p2p_failed_node_ids,
+            suite_timeout_s=self.suite_timeout_s,
         )
 
 
@@ -828,7 +870,21 @@ def _check_command(state: _State, name: str, task, env) -> None:
         state.not_configured(name)
         return
 
-    result = env.exec(["timeout", str(GRADE_TIMEOUT_S), *argv])
+    # The gate ran this same argv under this same number
+    # (`preflight._declared_grading`). A build that fits preflight's bound and
+    # is killed under the grader's stamps `build_failed` -- a GradeFailure, so
+    # `resolved: False` -- on every arm of the task, permanently, over an
+    # environment difference the model never saw.
+    #
+    # `state.suite_timeout_s` is read back off `cmd`, not off the manifest --
+    # the same rule `_check_f2p` and `_check_p2p` follow through
+    # `_Runner.last_timeout_s`. `build` is check 3 and terminal on failure, so
+    # on a build-timeout record this is the ONLY place the bound is ever
+    # written; taking it from the manifest there would make the one field that
+    # explains a `timed_out` grade configuration reported as observation.
+    cmd = ["timeout", str(task.budget.suite_timeout_s), *argv]
+    result = env.exec(cmd)
+    state.suite_timeout_s = int(cmd[1])
     _capture(state, env, name, result)
     code = result.exit_code
 
@@ -837,7 +893,7 @@ def _check_command(state: _State, name: str, task, env) -> None:
         return
     if code == _TIMEOUT_EXIT:
         state.fail(name, _GRADING_FAILURES[name], result, timed_out=True,
-                   detail=f"hit the {GRADE_TIMEOUT_S}s grading timeout")
+                   detail=f"hit the {cmd[1]}s grading timeout")
     if code in _INFRA_EXITS:
         state.environment(
             name,
@@ -856,8 +912,10 @@ def _check_f2p(state: _State, task, env) -> None:
     `f2p_failed_node_ids`, which is observation.
     """
     state.f2p_declared = len(task.tests.f2p)
-    runner = _Runner(env, task.tests.runner, GRADE_TIMEOUT_S)
+    runner = _Runner(env, task.tests.runner, task.budget.suite_timeout_s)
     result = runner.select(tuple(task.tests.f2p))
+    # Off the argv, like preflight's evidence -- see `_Runner.last_timeout_s`.
+    state.suite_timeout_s = runner.last_timeout_s
     _capture(state, env, "f2p", result)
     code = result.exit_code
 
@@ -873,7 +931,7 @@ def _check_f2p(state: _State, task, env) -> None:
                    detail=", ".join(state.f2p_failed_node_ids))
     if code == _TIMEOUT_EXIT:
         state.fail("f2p", GradeFailure.F2P_FAILED, result, timed_out=True,
-                   detail=f"hit the {GRADE_TIMEOUT_S}s grading timeout")
+                   detail=f"hit the {runner.last_timeout_s}s grading timeout")
 
     # A collection error CONFINED to this task's own f2p modules. Preflight
     # (version 4 or later) accepts a task whose f2p module does not import at
@@ -967,10 +1025,12 @@ def _check_p2p(state: _State, task, env, oracle: Oracle | None) -> None:
     else:
         state.p2p_deselect_requested = len(task.tests.f2p) + len(quarantined)
 
-    runner = _Runner(env, task.tests.runner, GRADE_TIMEOUT_S)
+    runner = _Runner(env, task.tests.runner, task.budget.suite_timeout_s)
     result = runner.pass_to_pass(
         task.tests, extra_deselect=quarantined, scope=scope
     )
+    # Off the argv, like preflight's evidence -- see `_Runner.last_timeout_s`.
+    state.suite_timeout_s = runner.last_timeout_s
     _capture(state, env, "p2p", result)
     code = result.exit_code
 
@@ -1007,7 +1067,7 @@ def _check_p2p(state: _State, task, env, oracle: Oracle | None) -> None:
                    detail=", ".join(state.p2p_failed_node_ids))
     if code == _TIMEOUT_EXIT:
         state.fail("p2p", GradeFailure.P2P_REGRESSION, result, timed_out=True,
-                   detail=f"hit the {GRADE_TIMEOUT_S}s grading timeout")
+                   detail=f"hit the {runner.last_timeout_s}s grading timeout")
     if code == EXIT_NOTHING_COLLECTED:
         # NOT the environment path. `test -e` passes an existing-but-EMPTY
         # directory (measured), pytest then exits 5, and that is a fact about
@@ -1379,13 +1439,13 @@ class _ContainerEnv:
                 # gitleaks verdict (`--exit-code 42` is), so both failures fall
                 # through to the environment branch in `_check_secret_scan`.
                 proc = subprocess.run(argv, capture_output=True, text=True,
-                                      timeout=GRADE_TIMEOUT_S)
+                                      timeout=SCAN_TIMEOUT_S)
             except OSError as exc:
                 return _ExecResult(1, "", f"could not run gitleaks: {exc}")
             except subprocess.TimeoutExpired:
                 return _ExecResult(
                     1, "",
-                    f"gitleaks hit the {GRADE_TIMEOUT_S}s grading timeout",
+                    f"gitleaks hit the {SCAN_TIMEOUT_S}s grading timeout",
                 )
 
             written = report_dir / "report.json"
@@ -1516,6 +1576,7 @@ def build_grade_record(record: RunRecord, task, image: str,
         p2p_deselect_requested=ladder.p2p_deselect_requested,
         p2p_deselected=ladder.p2p_deselected,
         p2p_failed_node_ids=ladder.p2p_failed_node_ids,
+        suite_timeout_s=ladder.suite_timeout_s,
         artifacts_dir=artifacts_dir,
     )
 
@@ -1661,8 +1722,8 @@ def grade_run(record: RunRecord, task, image: str, oracle: Oracle | None,
 
 __all__ = [
     "GRADER_VERSION",
-    "GRADE_TIMEOUT_S",
     "GITLEAKS_IMAGE",
+    "SCAN_TIMEOUT_S",
     "LadderResult",
     "build_grade_record",
     "grade_run",

@@ -202,6 +202,7 @@ def _task(
     build=(),
     typecheck=(),
     lint=(),
+    suite_timeout_s=600,
 ):
     return SimpleNamespace(
         task_id="calc-1",
@@ -218,6 +219,11 @@ def _task(
             allow_extra_paths=(),
         ),
         grading=SimpleNamespace(build=build, typecheck=typecheck, lint=lint),
+        budget=SimpleNamespace(
+            suite_timeout_s=suite_timeout_s,
+            wall_clock_timeout_s=900,
+            max_turns=40,
+        ),
     )
 
 
@@ -701,6 +707,89 @@ def test_a_grading_timeout_is_a_model_verdict():
     assert check.exit_code is None
 
 
+def test_every_graded_command_is_bounded_by_the_manifests_number():
+    """Checks 3, 4, 5, 6 and 7 all carry the `timeout` prefix, and all five
+    must carry the SAME number the gate used. A build that fits preflight's
+    bound and is killed under the grader's stamps `build_failed` -- a
+    GradeFailure, so `resolved: False` -- on every arm of the task,
+    permanently, in an append-only store, over an environment difference the
+    model never saw. That is the same shape as the `--index` stat-cache defect
+    one layer up."""
+    task = _task(
+        suite_timeout_s=1234,
+        build=("make", "build"),
+        typecheck=("mypy", "."),
+        lint=("ruff", "check", "."),
+    )
+    env = FakeEnv()
+    _ladder(task=task, env=env)
+
+    bounded = [argv for argv in env.argvs if argv[0] == "timeout"]
+    assert len(bounded) == 5, bounded
+    assert {argv[1] for argv in bounded} == {"1234"}
+
+
+def test_the_grade_records_the_bound_the_ladder_actually_used():
+    """`timed_out: True` alone stopped being readable the moment the bound
+    became per-task: a reader cannot tell a suite that blew 600 s from one
+    that blew 1800 s, and a re-grade under an edited manifest is a NEW line
+    whose disagreement with the old one is the finding. The bound has to be
+    on the line."""
+    task = _task(suite_timeout_s=1234)
+    ladder = _ladder(task=task)
+
+    assert ladder.suite_timeout_s == 1234
+    grade = build_grade_record(_record(), task, "sha256:image", None, ladder)
+    assert grade.suite_timeout_s == 1234
+
+
+def test_a_grade_where_no_bounded_command_ran_records_no_bound():
+    """`None`, not the manifest value. A record refused at the gate or at
+    check 1 ran nothing under any bound, and writing the configured number
+    there would be configuration reported as observation -- a claim about a
+    command that never happened."""
+    task = _task(suite_timeout_s=1234)
+    # `_record(diff="   \n")` is this file's empty-patch shape: the ladder
+    # stops at check 1 with EMPTY_PATCH, before anything is bounded.
+    ladder = _ladder(record=_record(diff="   \n"), task=task)
+
+    assert ladder.suite_timeout_s is None
+
+
+@pytest.mark.parametrize("check, matcher", [
+    ("typecheck", ["mypy"]),
+    ("f2p", is_f2p),
+    ("p2p", is_p2p),
+])
+def test_a_timeout_detail_names_the_bound_that_was_hit(check, matcher):
+    """The detail beside `timed_out: True` names the bound that killed the
+    command, and a stale module constant there is what this catches -- the
+    string said 600 while the argv carried 1234.
+
+    It does NOT distinguish argv-read from manifest-read: `cmd[1]` and
+    `runner.last_timeout_s` cannot differ from `task.budget.suite_timeout_s`
+    while `_Runner.run` is the only thing that builds the prefix, so that half
+    of the rule is a convention the code states and no test can falsify.
+    Said here rather than claimed, because a docstring that overclaims is the
+    reason the next reader trusts a check that is not making it."""
+    env = FakeEnv(rules=[(matcher, (124, "", ""))])
+    result = _ladder(
+        task=_task(suite_timeout_s=1234, typecheck=("mypy", ".")), env=env)
+
+    assert "hit the 1234s grading timeout" in _check(result, check).detail
+
+
+def test_the_gitleaks_bound_is_not_the_tasks_bound():
+    """The secret scan is a fixed-size scan of one diff, on the HOST, and
+    `_ContainerEnv.scan_secrets` has no task in scope. It keeps a constant --
+    renamed, because a constant called GRADE_TIMEOUT_S is precisely what
+    invites the next consumer to reach for it instead of the manifest."""
+    import bakeoff.grader as grader_module
+
+    assert not hasattr(grader_module, "GRADE_TIMEOUT_S")
+    assert grader_module.SCAN_TIMEOUT_S == 600
+
+
 # --------------------------------------------------------------------------
 # 5-6. f2p and p2p
 # --------------------------------------------------------------------------
@@ -840,10 +929,16 @@ def test_check_6_still_reads_a_collection_error_as_an_environment_error():
 def test_the_grader_version_moved_with_what_check_5_means():
     """It gates resume -- a run already graded under the current grader is
     skipped -- so a stored grade the gate skipped for agreeing with "the
-    current grader" would otherwise be one this grader disagrees with."""
+    current grader" would otherwise be one this grader disagrees with.
+
+    Pinned to a literal so a bump is a DELIBERATE edit rather than a side
+    effect: 2 -> 3 was check 5 reading a confined collection error as
+    `f2p_failed`; 3 -> 4 is checks 3-7 reading their `timeout` bound off
+    `task.budget.suite_timeout_s`, where a longer bound turns a `timed_out`
+    fail into a pass on the same stored input."""
     from bakeoff.grader import GRADER_VERSION
 
-    assert GRADER_VERSION == "3"
+    assert GRADER_VERSION == "4"
 
 
 def test_p2p_rides_the_quarantine_and_the_scope():
@@ -1659,13 +1754,13 @@ def test_the_gitleaks_run_is_bounded_by_the_grading_timeout(monkeypatch,
     row instead of costing one named, re-runnable line.
     """
     import bakeoff.grader as grader
-    from bakeoff.grader import GRADE_TIMEOUT_S, _ContainerEnv
+    from bakeoff.grader import SCAN_TIMEOUT_S, _ContainerEnv
 
     seen = {}
 
     def fake_run(argv, **kw):
         seen.update(kw)
-        raise subprocess.TimeoutExpired(argv, GRADE_TIMEOUT_S)
+        raise subprocess.TimeoutExpired(argv, SCAN_TIMEOUT_S)
 
     monkeypatch.setattr(grader.subprocess, "run", fake_run)
 
@@ -1673,7 +1768,7 @@ def test_the_gitleaks_run_is_bounded_by_the_grading_timeout(monkeypatch,
                         scan_root=tmp_path / "grade-scan")
     result = env.scan_secrets({"src/calc.py": "x = 1"})
 
-    assert seen.get("timeout") == GRADE_TIMEOUT_S
+    assert seen.get("timeout") == SCAN_TIMEOUT_S
     # Exit 1 is gitleaks' "leaks OR error", which `--exit-code 42` exists to
     # make unreadable as a verdict -- so this lands in the environment branch
     # rather than being scored against the model.

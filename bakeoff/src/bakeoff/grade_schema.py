@@ -62,7 +62,9 @@ from typing import Any
 # The grade file's own schema, independent of the run record's. A reader that
 # cannot tell grade schema versions apart reads an absent field as a positive
 # negative claim -- the same reason `SCHEMA_VERSION` moves for additive bumps.
-GRADE_SCHEMA_VERSION = "1.0.0"
+# 1.1.0 adds `suite_timeout_s`: with the bound per task, `timed_out` alone
+# does not say what was blown.
+GRADE_SCHEMA_VERSION = "1.1.0"
 
 # The oldest `RunRecord` schema whose fields mean what `from_dict` and the
 # ladder were written to assume. Below it the run is not graded and
@@ -350,6 +352,26 @@ class GradeRecord:
     p2p_deselect_requested: int | None = None
     p2p_deselected: int | None = None
     p2p_failed_node_ids: tuple[str, ...] | None = None
+
+    #: The `timeout` bound every command in this ladder carried, from
+    #: `task.budget.suite_timeout_s`. `None` when no bounded command ran.
+    #:
+    #: `CheckResult.timed_out` alone stopped being readable the moment the
+    #: bound became per task: a reader cannot tell a suite that blew 600 s
+    #: from one that blew 1800 s, and a re-grade under an edited manifest is a
+    #: NEW line whose disagreement with the old one is the finding -- which it
+    #: cannot be if neither line says what it was measured against.
+    #:
+    #: It is the bound and NOT the headroom. A `timed_out` check is a
+    #: `GradeFailure` stamped on the model, and nothing on this record says
+    #: whether the grader's host was busier than the gate's: there is no host
+    #: or contention block here (`RunRecord.host` has one; a grade does not),
+    #: and `duration_s` at a timeout is just this number again. The figure
+    #: that would settle it -- preflight's OBSERVED suite duration, against
+    #: which this is the margin -- is not recorded anywhere yet (`TASKS.md`).
+    #: So read a `timed_out` grade as "this bound was hit", never as "this
+    #: suite needs more than this bound".
+    suite_timeout_s: int | None = None
 
     # Where this grade's captured output lives. `None` when nothing was kept.
     artifacts_dir: str | None = None
