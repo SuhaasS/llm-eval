@@ -207,6 +207,16 @@ class TaskImage:
     python: str = _DEFAULT_PYTHON
 
 
+#: The keys `image:` accepts, derived from the dataclass for the same reason
+#: `_GRADING_KEYS` is. This one guards the typo NOTHING downstream can see:
+#: preflight reads `python --version` back out of the finished container and
+#: compares it against `task.image.python`, so a misspelled `pyhton:` loads as
+#: the default, builds the default base, and the read-back agrees with the
+#: field it was compared to -- every gate green under an interpreter the author
+#: did not ask for.
+_IMAGE_KEYS = tuple(f.name for f in dataclass_fields(TaskImage))
+
+
 @dataclass(frozen=True)
 class TaskBudget:
     # Section 5.4: generous caps, measure actuals. These are placeholders
@@ -1036,6 +1046,18 @@ def load_task(task_dir: Path, set_commit: str = "") -> TaskManifest:
     image_raw = data.get("image") or {}
     if not isinstance(image_raw, dict):
         raise TaskError(f"{where}: image must be a mapping")
+    # The same guard `grading:` has below, needed here for a sharper reason: a
+    # misspelled `image:` key is the one failure preflight's read-back cannot
+    # see. It asks the container which interpreter it runs and compares that
+    # against `task.image.python` -- but `pyhton: "3.11"` loads as the default,
+    # so the base that was built and the field it is compared to are the same
+    # wrong value, and they agree.
+    unknown = sorted(str(k) for k in set(image_raw) - set(_IMAGE_KEYS))
+    if unknown:
+        raise TaskError(
+            f"{where}: unknown image key(s) {unknown}; allowed: "
+            f"{list(_IMAGE_KEYS)}"
+        )
     budget_raw = data.get("budget") or {}
     if not isinstance(budget_raw, dict):
         raise TaskError(f"{where}: budget must be a mapping")
@@ -1396,7 +1418,9 @@ def derive_submodules(task: TaskManifest, mirror: Path) -> tuple[Submodule, ...]
     # --init` (exit 0) and creates no directory, because git drives everything
     # off the index. Refusing it would refuse a real, working shape -- a
     # submodule `git rm --cached`'d with its stanza left behind. Preflight
-    # records those names as `submodules_orphaned` instead.
+    # records those names as `submodules_orphaned` instead -- a key with no
+    # producer until Task 4 computes it inside the container, where it is an
+    # observation of the tree rather than a re-derivation on the host.
     unfetchable = sorted(set(gitlinks) - set(by_path))
     if unfetchable:
         raise TaskError(
@@ -1426,10 +1450,17 @@ def _refuse_submodule_conflicts(task: TaskManifest, subs: tuple[Submodule, ...],
     """The four refusals that are not about the two readers agreeing.
 
     `mirrors` maps a submodule path to its pruned mirror, and is `{}` wherever
-    no mirror exists yet -- `derive_submodules` runs with no cache root, so the
-    one refusal that needs a clone (nested submodules, added in Task 2) is
-    skipped there and runs again from `_init_submodules`, where a clone was
-    going to happen anyway.
+    no mirror exists yet -- `derive_submodules` runs with no cache root, and
+    `images.build_task_image` and `grader.grade_run` reach it through
+    `task_submodules`, which has none either. So the one refusal that needs a
+    clone (nested submodules) is skipped there and runs again from
+    `_init_submodules`, which calls this function a SECOND time with the real
+    mapping once the mirrors exist -- where a clone was going to happen anyway.
+    The second call is a strict superset of the first: the cheap refusals run
+    wherever the derivation runs, and re-running them costs three comparisons
+    over tuples already in hand. One function owning every refusal beats
+    splitting them across two so that a reader has to know which half ran
+    where.
 
     Four refusals here, not five: the gitlink-with-no-url check is
     `derive_submodules`' own, because it is a property of the pair of readers
@@ -1445,12 +1476,29 @@ def _refuse_submodule_conflicts(task: TaskManifest, subs: tuple[Submodule, ...],
     for it -- the checkpoint diff is zero bytes).
     """
     for sub in subs:
+        # `no url` rather than `url ''`: an empty value is what a `.gitmodules`
+        # stanza carrying a `path` and nothing else yields, and quoting the
+        # empty string reads as a url that is present and strange rather than
+        # as a field the author never wrote.
+        stated = f"url {sub.url!r}" if sub.url else "no url"
         if not sub.url.startswith(_SUBMODULE_URL_PREFIX):
             raise TaskError(
-                f"{task.task_id}: submodule {sub.path} declares url "
-                f"{sub.url!r}, which is not {_SUBMODULE_URL_PREFIX}. A relative "
-                "url resolves against a remote the run tree does not have, and "
-                "ssh/file urls cannot be fetched by this eval."
+                f"{task.task_id}: submodule {sub.path} declares {stated}; only "
+                f"{_SUBMODULE_URL_PREFIX} urls can be fetched by this eval. A "
+                "relative url resolves against a remote the run tree does not "
+                "have, and ssh/file urls cannot be fetched at all."
+            )
+        # FIRST after the url check, and the only refusal that needs an
+        # artifact rather than a comparison -- hence `mirrors`, and hence the
+        # skip wherever no mirror exists.
+        mirror_for = mirrors.get(sub.path)
+        if mirror_for is not None and _has_gitmodules(mirror_for, sub.sha):
+            raise TaskError(
+                f"{task.task_id}: submodule {sub.path} at {sub.sha} declares "
+                "submodules of its own. `git submodule update --init` does not "
+                "recurse, so the inner directory would arrive empty -- and an "
+                "empty submodule directory leaves `git status --porcelain` "
+                "clean, so nothing downstream would say so."
             )
         # `_under` is `PurePosixPath.is_relative_to`, so it already matches
         # the path itself; an `or p == sub.path` conjunct would be dead.
@@ -1479,12 +1527,18 @@ def _refuse_submodule_conflicts(task: TaskManifest, subs: tuple[Submodule, ...],
 def task_submodules(task: TaskManifest, cache_root: Path) -> tuple[Submodule, ...]:
     """`ensure_mirror` then `derive_submodules`. THE entry point.
 
-    Three callers -- `materialize`, `images.build_task_image` and
-    `grader.grade_run` -- and each of them already needs the mirror. Deriving
-    three times costs two git reads against a warm cache; threading one value
-    through three signatures would make each caller depend on a neighbour
-    having run the refusals in `derive_submodules`, which is the failure this
-    module's every other check is shaped to avoid.
+    Two callers, neither of which holds a mirror at the point it needs the
+    answer: `images.build_task_image` (wired in Task 3) and
+    `grader.grade_run` (Task 5). `materialize` deliberately does NOT come
+    through here -- it already holds the PRUNED superproject mirror, which
+    carries `base_sha`'s history and answers both reads, so it calls
+    `derive_submodules` against that and takes no second trip through
+    `ensure_mirror`.
+
+    Deriving per caller costs two git reads against a warm cache; threading
+    one value through three signatures would make each caller depend on a
+    neighbour having run the refusals in `derive_submodules`, which is the
+    failure this module's every other check is shaped to avoid.
     """
     mirror = ensure_mirror(task.repo_url, task.base_sha, cache_root)
     return derive_submodules(task, mirror)
@@ -2044,6 +2098,106 @@ def _strip_paths_from_tree(
     return True
 
 
+def _init_submodules(task: TaskManifest, dest: Path,
+                     subs: tuple[Submodule, ...], cache_root: Path) -> None:
+    """Populate every submodule from a PRUNED mirror, with no network.
+
+    Three things are load-bearing and each was measured on 2026-09-01 against
+    git 2.50.1.
+
+    THE MIRROR IS PRUNED. `git submodule update --init` against the declared
+    url clones the submodule's whole history, `remotes/origin/main` included,
+    so the run tree would carry submodule content NEWER than the gitlink --
+    `ensure_pruned_mirror`'s founding leak, one level down, and differential in
+    the same way, since only an arm that looks inside `vendor/.../.git`
+    collects it. `ensure_pruned_mirror` is reused UNCHANGED: it is already
+    generic over (url, sha), so the submodule gets its own cache entry, its own
+    repo lock, and its own `_verify_pruned` post-condition. Do not add a term
+    to `_pack_fingerprint` for this; see HANDOFF.md.
+
+    THE REFLOG EXPIRE IS A LEAK GUARD. `logs/HEAD` and `logs/refs/heads/main`
+    both record `clone: from <host cache path>`, and nothing else removes them
+    -- the config files are clean without it, so a check that greps only those
+    passes with the leak in place. It runs `check=True`.
+
+    THE URL IS PERSISTED, THEN REWRITTEN. A transient `-c submodule.<n>.url=`
+    populates the tree but leaves `git submodule status` reading `-<sha>` --
+    uninitialised -- because `submodule init` skips its registration step when
+    the value is already visible, so `.git/config` never gets it. Preflight
+    reads exactly that character. The value is then rewritten to the
+    `.gitmodules` url, and `origin` removed from the submodule, for the same
+    reason `materialize` removes the superproject's: a host cache path inside
+    the container is both an unresolvable error surface for the agent and a
+    leak of the operator's cache layout.
+
+    That first sentence is stated as the reason for the shape and is NOT
+    independently anchored, which is worth saying rather than leaving for the
+    next reader to discover. Measured 2026-09-01 against this function: with
+    the trailing rewrite in place, a transient `-c` reaches the SAME end state
+    -- the rewrite is itself a `git config` write, so it performs the
+    registration `submodule init` skipped, and `git submodule status` reads a
+    leading space either way. The measurement the sentence comes from was
+    taken with no trailing write. The persisted form is kept because it puts
+    the url git clones from and the url the run tree carries in one place, in
+    that order; it is a legibility choice here, not a behavioural one.
+
+    `protocol.file.allow=always` stays TRANSIENT and is REQUIRED in production,
+    not only in tests: git has refused the file transport for submodules since
+    the CVE-2022-39253 hardening, and a local pruned mirror is a file
+    transport. Without it the update exits 1 with `transport 'file' not
+    allowed`.
+
+    The post-condition is the point of the function. An empty submodule
+    directory leaves `git status --porcelain` EMPTY -- byte-identical to a
+    healthy tree -- so a silent failure here reads as a suite that cannot
+    import, on every arm, and is scored as capability.
+    """
+    if not subs:
+        return
+    # `materialize`'s own `_repo_lock` critical section has long exited by the
+    # time this runs (it wraps the clone only), so `ensure_pruned_mirror`'s
+    # acquisitions here are never nested inside it -- which flock would punish
+    # with a same-process deadlock on the same slug.
+    mirrors = {
+        sub.path: ensure_pruned_mirror(sub.url, sub.sha, cache_root)
+        for sub in subs
+    }
+    _refuse_submodule_conflicts(task, subs, mirrors=mirrors)
+    for sub in subs:
+        key = f"submodule.{sub.name}.url"
+        _git("config", key, str(mirrors[sub.path]), cwd=dest)
+        _git("-c", "protocol.file.allow=always",
+             "submodule", "update", "--init", "--", sub.path, cwd=dest)
+        _git("config", key, sub.url, cwd=dest)
+        _git("remote", "remove", "origin", cwd=dest / sub.path, check=False)
+        # check=True (the default). This is a LEAK GUARD, not tidiness:
+        # measured 2026-09-01, the submodule's `logs/HEAD` AND
+        # `logs/refs/heads/main` each carry `clone: from <host cache path>`
+        # after the two rewrites above -- the pruned mirror publishes
+        # `refs/heads/main`, so the clone creates a local branch and logs the
+        # source twice -- and this expire is the only thing that removes them.
+        # `.git/modules/<name>/config` is clean either way, which is why a
+        # config-only check sees nothing.
+        _git("reflog", "expire", "--expire=now", "--all", cwd=dest / sub.path)
+
+        checked = dest / sub.path
+        head = _git("rev-parse", "HEAD", cwd=checked, check=False)
+        if head.returncode != 0 or head.stdout.strip() != sub.sha:
+            raise TaskError(
+                f"{task.task_id}: submodule {sub.path} is not at its gitlink "
+                f"{sub.sha} after initialisation (got "
+                f"{head.stdout.strip() or 'nothing'}). An empty or wrong "
+                "submodule leaves `git status --porcelain` clean, so the suite "
+                "would simply fail to collect and every arm would be scored on "
+                "an environment defect."
+            )
+        if not any(checked.iterdir()):
+            raise TaskError(
+                f"{task.task_id}: submodule {sub.path} is empty after "
+                "initialisation."
+            )
+
+
 def materialize(task: TaskManifest, dest: Path, cache_root: Path) -> str:
     """Build the run's start state on disk and return its commit SHA.
 
@@ -2068,6 +2222,16 @@ def materialize(task: TaskManifest, dest: Path, cache_root: Path) -> str:
     gitignore_extra) and `start_sha` remains pinnable. A strip that did not
     move `start_sha` would be a change to what every arm was asked to do that
     no stored record could distinguish.
+
+    Submodules are initialised LAST, after `start_sha` is settled and compared
+    against its pin, and each from its own PRUNED mirror rather than from the
+    url `.gitmodules` declares (spec section 5.1; see `_init_submodules`). The
+    ordering is the guarantee, not an observation about what `git add -A`
+    stages: the tree `start_sha` is computed over has never seen a submodule
+    checkout, so initialising cannot move it. Deriving here rather than through
+    `task_submodules` reuses the pruned mirror this function already holds --
+    it carries `base_sha`'s history, so both reads answer from it and no second
+    lock is taken.
     """
     dest = Path(dest)
     if dest.exists():
@@ -2155,4 +2319,12 @@ def materialize(task: TaskManifest, dest: Path, cache_root: Path) -> str:
             "-- a re-cut patch, an edited manifest, or a different git. Every "
             "record written against the old SHA describes a different task."
         )
+    # LAST. `start_sha` is computed from a tree that has never seen a submodule
+    # checkout, which is what makes "initialising cannot move the pin" a
+    # property of the ordering rather than a coincidence about what `git add -A`
+    # happens to stage. Failing fast on a moved start state also avoids paying a
+    # clone per submodule for a task that is already refused. Measured: `git
+    # clean -xfd` above does NOT wipe an initialised submodule (that needs
+    # `-ffd`), so the order is safe in the other direction too.
+    _init_submodules(task, dest, derive_submodules(task, mirror), cache_root)
     return start_sha

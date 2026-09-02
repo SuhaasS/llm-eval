@@ -567,6 +567,27 @@ def test_a_misspelled_grading_key_is_refused_rather_than_dropped(
     assert "typecheck" in str(excinfo.value), "the message must name the allowed set"
 
 
+def test_a_misspelled_image_key_is_refused_rather_than_dropped(
+    tmp_path, upstream
+):
+    """The `image:` twin of the check above, and the one typo NOTHING
+    downstream can see. Preflight reads `python --version` back out of the
+    finished container and compares it against `task.image.python` -- so a
+    manifest asking for `pyhton: "3.11"` loads as the 3.12 default, builds a
+    3.12 base, and the read-back agrees with the field it was compared to.
+    Every gate goes green while the suite runs under an interpreter the author
+    did not ask for. `grading:` has had this guard since it shipped; the same
+    four lines were simply never written for `image:`."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream, extra_yaml='image:\n  pyhton: "3.11"'
+    )
+
+    with pytest.raises(TaskError, match="unknown image key") as excinfo:
+        load_task(task_dir)
+    assert "pyhton" in str(excinfo.value)
+    assert "python" in str(excinfo.value), "the message must name the allowed set"
+
+
 def test_strip_paths_loads_and_is_exposed(tmp_path, upstream):
     """A manifest key nothing can read is configuration nobody can report.
     `materialize`, `build_task_image` and preflight all need this list."""
@@ -2505,3 +2526,209 @@ def test_a_reference_diff_touching_a_submodule_path_is_refused(
 
     with pytest.raises(TaskError, match="reference diff"):
         tasks.derive_submodules(task, mirror)
+
+
+def test_a_gitlink_whose_only_gitmodules_stanza_names_another_path_is_refused(
+        tmp_path, upstream_submodule, local_urls):
+    """The set difference, with a READABLE `.gitmodules` on the other side.
+
+    The neighbouring refusal covers "no .gitmodules at all"; this one covers
+    the shape that actually happens -- a stanza edited to a path the tree does
+    not carry, leaving the real gitlink with nothing to fetch from while every
+    other check still passes. Both directions are exercised at once: the
+    orphaned name is inert (it is not what the message names) and the
+    url-less gitlink is fatal.
+    """
+    up = upstream_submodule
+    (up["path"] / ".gitmodules").write_text(
+        '[submodule "vendor/gone"]\n\tpath = vendor/gone\n'
+        '\turl = https://example.invalid/gone.git\n'
+    )
+    _sh("git", "add", ".gitmodules", cwd=up["path"])
+    _sh("git", "-c", "user.email=t@t.test", "-c", "user.name=t",
+        "commit", "-q", "-m", "point the only stanza elsewhere", cwd=up["path"])
+    base = _sh("git", "rev-parse", "HEAD", cwd=up["path"])
+    task = _sub_task(tmp_path, {**up, "base": base})
+    mirror = tasks.ensure_mirror(str(up["path"]), base, tmp_path / "cache")
+
+    with pytest.raises(TaskError, match="no .gitmodules url") as excinfo:
+        tasks.derive_submodules(task, mirror)
+    assert "vendor/libdep" in str(excinfo.value)
+    assert "vendor/gone" not in str(excinfo.value)
+
+
+def _materialize_sub(tmp_path, up, **overrides):
+    """Materialize a submodule task. Requires the `local_urls` fixture."""
+    task = _sub_task(tmp_path, up, **overrides)
+    start = materialize(task, tmp_path / "run", tmp_path / "cache")
+    return task, tmp_path / "run", start
+
+
+def test_materialize_populates_the_submodule_at_the_gitlink(
+        tmp_path, upstream_submodule, local_urls):
+    up = upstream_submodule
+    _, run, _ = _materialize_sub(tmp_path, up)
+
+    assert (run / "vendor" / "libdep" / "libdep" / "__init__.py").read_text() \
+        == SUB_LIB
+    assert _sh("git", "-C", "vendor/libdep", "rev-parse", "HEAD", cwd=run) \
+        == up["pinned"]
+
+
+def test_the_run_trees_submodule_cannot_reach_the_future(
+        tmp_path, upstream_submodule, local_urls):
+    """The leak argument one level down. Measured 2026-09-01: `git submodule
+    update --init` against the REAL url clones the whole submodule history,
+    so without the pruned mirror `git -C vendor/libdep log main` hands the
+    agent content newer than the pin -- differentially, since only an arm
+    that looks collects it.
+    """
+    up = upstream_submodule
+    _, run, _ = _materialize_sub(tmp_path, up)
+    sub = run / "vendor" / "libdep"
+
+    found = subprocess.run(["git", "cat-file", "-e", up["future"]],
+                           cwd=sub, capture_output=True)
+
+    assert found.returncode != 0
+
+
+def test_initialising_a_submodule_does_not_move_start_sha(
+        tmp_path, upstream_submodule, local_urls):
+    """`materialize` initialises AFTER `start_sha` is settled, so the pin is a
+    property of the ordering rather than of `git add -A` happening not to
+    stage a gitlink.
+    """
+    up = upstream_submodule
+    task, run, start = _materialize_sub(tmp_path, up)
+    head_tree = _sh("git", "rev-parse", "HEAD^{tree}", cwd=run)
+
+    assert start == _sh("git", "rev-parse", "HEAD", cwd=run)
+    assert head_tree == _sh("git", "rev-parse", f"{start}^{{tree}}", cwd=run)
+
+
+def test_the_materialized_tree_is_clean_after_initialisation(
+        tmp_path, upstream_submodule, local_urls):
+    """The leading SPACE is the whole assertion. Measured: `-` is
+    uninitialised (and is what a transient `-c submodule.<n>.url=` leaves
+    behind), `+` is initialised at the wrong commit, and a space is the one
+    acceptable state. Preflight gates on the same character in Task 4.
+    """
+    up = upstream_submodule
+    _, run, _ = _materialize_sub(tmp_path, up)
+    # NOT `_sh`, which strips -- and the leading space is the whole assertion,
+    # so a stripped read cannot tell the acceptable state from the two
+    # unacceptable ones.
+    status = subprocess.run(["git", "submodule", "status"], cwd=run,
+                            check=True, capture_output=True, text=True).stdout
+
+    assert _sh("git", "status", "--porcelain", cwd=run) == ""
+    assert status.startswith(f" {up['pinned']}")
+
+
+def test_the_run_tree_carries_no_host_cache_path_for_the_submodule(
+        tmp_path, upstream_submodule, local_urls):
+    """The WHOLE `.git/modules` subtree, not the config files.
+
+    Measured 2026-09-01, git 2.50.1: after `remote remove origin` and the url
+    rewrite the config files are already clean, and the cache path survives in
+    `logs/HEAD` and `logs/refs/heads/main` as `clone: from /…/cache/repos/…`.
+    A config-only assertion therefore passes with the leak present -- which is
+    exactly what the first draft of this test did. The `reflog expire` in
+    `_init_submodules` is what clears both, so this test is what makes that
+    call load-bearing rather than deletable.
+    """
+    up = upstream_submodule
+    _, run, _ = _materialize_sub(tmp_path, up)
+    cache = str(tmp_path / "cache")
+
+    leaking = [
+        path for path in (run / ".git" / "modules").rglob("*")
+        if path.is_file() and cache in path.read_text(errors="replace")
+    ]
+
+    assert leaking == []
+    assert cache not in (run / ".git" / "config").read_text()
+    assert str(up["lib"]) in (run / ".git" / "config").read_text()
+
+
+def test_an_unreachable_submodule_mirror_is_a_task_error(
+        tmp_path, upstream_submodule, local_urls):
+    """Loud, not empty. Measured: `git submodule update --init` exits 1 both
+    when the url does not resolve and when the file transport is refused, and
+    an empty submodule directory leaves `git status --porcelain` clean.
+    """
+    up = upstream_submodule
+    shutil.rmtree(up["lib"])
+
+    with pytest.raises(TaskError):
+        _materialize_sub(tmp_path, up)
+
+
+def test_a_nested_submodule_is_refused(tmp_path, upstream_submodule,
+                                       local_urls):
+    """`submodule update --init` without `--recursive` leaves the inner one
+    empty, which is the same silence one level further down.
+
+    Two details this test got wrong once and is now pinned against. The
+    superproject is detached back to `up["base"]` before the gitlink moves, so
+    the new base still carries the pre-fix tree and the reference diff still
+    applies -- otherwise `materialize` raises out of `git apply --index` long
+    before a submodule is touched. And `match=` names the message rather than
+    the word "nested": `pytest.raises(match=...)` searches the whole exception
+    string, this test's own tmp_path contains "nested", and the loose pattern
+    therefore matched that `git apply` failure -- green against a tree with no
+    refusal in it at all.
+    """
+    up = upstream_submodule
+    inner = tmp_path / "inner"
+    inner.mkdir()
+    (inner / "x.py").write_text("X = 1\n")
+    _sh("git", "init", "-q", cwd=inner)
+    _sh("git", "config", "user.email", "t@t.test", cwd=inner)
+    _sh("git", "config", "user.name", "t", cwd=inner)
+    _sh("git", "add", "-A", cwd=inner)
+    _sh("git", "commit", "-q", "-m", "inner", cwd=inner)
+    _sh("git", "-c", "protocol.file.allow=always", "submodule", "add", "-q",
+        str(inner), "inner", cwd=up["lib"])
+    _sh("git", "commit", "-q", "-m", "nest", cwd=up["lib"])
+    nested = _sh("git", "rev-parse", "HEAD", cwd=up["lib"])
+    _sh("git", "checkout", "-q", "--detach", up["base"], cwd=up["path"])
+    _sh("git", "-c", "protocol.file.allow=always", "-C", "vendor/libdep",
+        "fetch", "-q", "origin", cwd=up["path"])
+    _sh("git", "-C", "vendor/libdep", "checkout", "-q", nested, cwd=up["path"])
+    _sh("git", "add", "-A", cwd=up["path"])
+    _sh("git", "-c", "user.email=t@t.test", "-c", "user.name=t",
+        "commit", "-q", "-m", "repin at the nested commit", cwd=up["path"])
+    base = _sh("git", "rev-parse", "HEAD", cwd=up["path"])
+
+    with pytest.raises(TaskError, match="submodules of its own"):
+        _materialize_sub(tmp_path, {**up, "base": base})
+
+
+def test_a_submodule_the_update_left_unpopulated_is_refused(
+        tmp_path, upstream_submodule, local_urls, monkeypatch):
+    """The post-condition, against a `submodule update` that exits 0 and does
+    nothing -- which is the shape the whole function exists for, because an
+    empty submodule directory leaves `git status --porcelain` clean and reads
+    downstream as a suite that cannot import.
+
+    The sha comparison is what catches it, and the emptiness check never runs.
+    Measured 2026-09-01: `git -C vendor/libdep rev-parse HEAD` inside an EMPTY
+    gitlink directory succeeds and answers with the SUPERPROJECT's HEAD --
+    git walks up to the enclosing repository. So `head.returncode != 0` alone
+    would pass here; comparing against `sub.sha` is the load-bearing half.
+    """
+    up = upstream_submodule
+    real_git = tasks._git
+
+    def a_git_whose_update_does_nothing(*args, **kwargs):
+        if "submodule" in args and "update" in args:
+            return subprocess.CompletedProcess(list(args), 0, "", "")
+        return real_git(*args, **kwargs)
+
+    monkeypatch.setattr(tasks, "_git", a_git_whose_update_does_nothing)
+
+    with pytest.raises(TaskError, match="not at its gitlink") as excinfo:
+        _materialize_sub(tmp_path, up)
+    assert up["pinned"] in str(excinfo.value)
