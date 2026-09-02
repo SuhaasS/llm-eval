@@ -33,8 +33,13 @@ def test_the_grade_schema_version_moved_with_what_the_record_means():
     the bound now per task, `timed_out: True` alone cannot say what the
     check actually blew; 1.1.0 -> 1.2.0 adds
     `NotGradedReason.SUBMODULE_GITLINK_UNGRADABLE`, which is a value a reader
-    of the `not_graded_reason` field can now meet and could not before."""
-    assert GRADE_SCHEMA_VERSION == "1.2.0"
+    of the `not_graded_reason` field can now meet and could not before;
+    1.2.0 -> 1.3.0 adds `GradeRecord.framework`, because `p2p_deselected`,
+    `f2p_failed_node_ids` and `p2p_failed_node_ids` have framework-dependent
+    shapes and units and a reader summing them across a mixed task set with
+    no way to tell pytest's numbers from a node adapter's gets a total that
+    is not a count of anything."""
+    assert GRADE_SCHEMA_VERSION == "1.3.0"
 
 
 def test_the_gitlink_refusal_is_a_not_graded_reason_and_not_a_failure():
@@ -112,6 +117,27 @@ def test_a_1_1_0_line_loads_unchanged_under_1_2_0(tmp_path: Path):
     assert malformed == 0
     assert records[0].grade_schema_version == "1.1.0"
     assert records[0].suite_timeout_s == data["suite_timeout_s"]
+
+
+def test_a_1_2_0_line_loads_with_no_framework_rather_than_a_fabricated_one(
+    tmp_path: Path,
+):
+    """`framework` arrived in 1.3.0, and every line written before it predates
+    the field. `_build` filters to the dataclass's own fields, so such a line
+    loads and the field defaults to `""` -- which is the same thing `""`
+    means on a fresh line: nobody measured which adapter produced it.
+    Defaulting to "pytest" instead would turn "this writer had no such field"
+    into the claim that this grade's numbers came from pytest, which is
+    exactly the read a version bump exists to prevent."""
+    data = _record().to_dict()
+    data["grade_schema_version"] = "1.2.0"
+    del data["framework"]
+    p = tmp_path / "grades.jsonl"
+    p.write_text(json.dumps(data) + "\n", encoding="utf-8")
+
+    records, malformed = load_grades(p)
+    assert malformed == 0
+    assert records[0].framework == ""
 
 
 def test_append_then_load_returns_both_records(tmp_path: Path):

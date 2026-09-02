@@ -313,6 +313,10 @@ class LadderResult:
     p2p_deselected: int | None = None
     p2p_failed_node_ids: tuple[str, ...] | None = None
     suite_timeout_s: int | None = None
+    #: Which runner adapter produced this ladder's numbers. `None` when the
+    #: ladder was refused before it read `task.tests.framework` at all -- the
+    #: pre-container gate. See `GradeRecord.framework`.
+    framework: str | None = None
 
 
 class _Stop(Exception):
@@ -359,6 +363,12 @@ class _State:
     #: the gate or at check 1 looks like -- writing the configured number
     #: there would be a claim about a command that never happened.
     suite_timeout_s: int | None = None
+    #: Set from `for_framework(task.tests.framework).name` before check 1 --
+    #: unlike `suite_timeout_s`, a record refused at check 1 still names it,
+    #: because the adapter is known the moment the task is, not the moment a
+    #: bounded command runs. `None` only for a record refused at the
+    #: pre-container gate, before `task.tests` is ever read.
+    framework: str | None = None
 
     # -- recording ---------------------------------------------------------
 
@@ -443,6 +453,7 @@ class _State:
             p2p_deselected=self.p2p_deselected,
             p2p_failed_node_ids=self.p2p_failed_node_ids,
             suite_timeout_s=self.suite_timeout_s,
+            framework=self.framework,
         )
 
 
@@ -761,6 +772,13 @@ def run_ladder(record: RunRecord, task, oracle: Oracle | None, env,
         if gate is not None:
             reason, detail = gate
             state.refuse(None, reason, detail)
+
+        # Before the first check, so a record refused at check 1
+        # (EMPTY_PATCH) still names which adapter would have graded it --
+        # unlike `suite_timeout_s`, which stays `None` on that same path
+        # because no bounded command ran. `task.tests.framework` is
+        # validated at manifest load time, so this cannot raise here.
+        state.framework = for_framework(task.tests.framework).name
 
         diff = record.artifacts.final_diff or ""
         _check_patch_non_empty(state, diff)
@@ -1234,7 +1252,7 @@ def _check_p2p(state: _State, task, env, oracle: Oracle | None) -> None:
         state.refuse(
             "p2p",
             NotGradedReason.SCOPE_COLLECTED_NOTHING,
-            "the scoped p2p run collected nothing (pytest exit 5)"
+            f"the scoped p2p run collected nothing ({outcome.explain})"
             + (f" although {', '.join(scope)} exist(s)" if scope else ""),
             result,
         )
@@ -1732,6 +1750,7 @@ def build_grade_record(record: RunRecord, task, image: str,
         p2p_deselected=ladder.p2p_deselected,
         p2p_failed_node_ids=ladder.p2p_failed_node_ids,
         suite_timeout_s=ladder.suite_timeout_s,
+        framework=ladder.framework or "",
         artifacts_dir=artifacts_dir,
     )
 

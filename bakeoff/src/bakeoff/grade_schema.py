@@ -69,7 +69,12 @@ from typing import Any
 # earlier writer could produce, and a reader that cannot tell the versions
 # apart has no way to know whether its absence on a line is a measurement or
 # a vocabulary it did not have.
-GRADE_SCHEMA_VERSION = "1.2.0"
+# 1.3.0 adds `GradeRecord.framework`. `p2p_deselected`, `f2p_failed_node_ids`
+# and `p2p_failed_node_ids` have framework-dependent shapes and units (see the
+# field's own docstring), and a reader that cannot tell this version apart
+# from 1.2.0 has no way to know whether a line's numbers came from pytest or
+# a node adapter -- the same reason `SCHEMA_VERSION` moves for additive bumps.
+GRADE_SCHEMA_VERSION = "1.3.0"
 
 # The oldest `RunRecord` schema whose fields mean what `from_dict` and the
 # ladder were written to assume. Below it the run is not graded and
@@ -356,6 +361,19 @@ class GradeRecord:
     # rate's numerator-adjacent bucket.
     environment_error: str | None = None
     environment_error_check: str | None = None
+
+    #: Which runner adapter produced this record's numbers. `""` means the
+    #: grade predates the field, never "pytest" -- a default naming a real
+    #: framework would be this field claiming a fact nobody measured.
+    #:
+    #: It is an OBSERVATION rather than configuration echoed back: it names the
+    #: adapter that produced `f2p_failed_node_ids`, `p2p_failed_node_ids` and
+    #: `p2p_deselected`, whose id SHAPES and whose UNITS differ per framework.
+    #: pytest's `p2p_deselected` counts deselections pytest was asked to make;
+    #: the node adapters' counts every test that did not run, `it.skip`
+    #: included. Summed across a mixed task set without this field, the total
+    #: is not a count of anything.
+    framework: str = ""
 
     # Config (what was asked) beside observation (what pytest reported). See
     # the module docstring.

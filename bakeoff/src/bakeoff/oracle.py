@@ -247,8 +247,8 @@ def derive_quarantine(runner, tests, scope: tuple[str, ...] = ()) -> tuple[str, 
             "the quarantine covers the entire declared p2p list ("
             + ", ".join(sorted(tests.p2p))
             + "), so the graded run would deselect every node id it selects "
-            "and pytest would exit 5. That surfaces as an ungraded record "
-            "rather than as the broken oracle it is."
+            "and the suite would report nothing collected. That surfaces as "
+            "an ungraded record rather than as the broken oracle it is."
         )
 
     return quarantine

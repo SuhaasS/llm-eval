@@ -26,6 +26,7 @@ import bakeoff.grader as grader
 from bakeoff.grade_schema import CHECK_ORDER, GradeFailure, NotGradedReason
 from bakeoff.grader import (
     GRADER_VERSION,
+    LadderResult,
     build_grade_record,
     grade_run,
     parse_deselected,
@@ -277,6 +278,17 @@ def _ladder(record=None, task=None, env=None, oracle=None):
         env if env is not None else FakeEnv(),
         START_SHA,
     )
+
+
+def _grade_record_for(framework: str):
+    """A `GradeRecord` built straight from a `LadderResult` carrying
+    `framework`, bypassing `run_ladder` -- the threading `build_grade_record`
+    does (`framework=ladder.framework or ""`) does not depend on which
+    adapter actually classified anything, so this exercises the schema-level
+    join without needing a node-shaped `FakeEnv`."""
+    ladder = LadderResult(checks=(), resolved=True, framework=framework)
+    return build_grade_record(_record(), _task(), "sha256:image", None,
+                              ladder)
 
 
 def _check(result, name):
@@ -1102,6 +1114,46 @@ def test_the_grader_version_moved_with_what_check_5_means():
     from bakeoff.grader import GRADER_VERSION
 
     assert GRADER_VERSION == "6"
+
+
+def test_the_grade_says_which_runner_produced_its_numbers():
+    """`p2p_deselected`, `f2p_failed_node_ids` and `p2p_failed_node_ids` all
+    have framework-dependent shapes and units -- pytest's `p2p_deselected`
+    counts deselections it was asked to make; node's counts every test that
+    did not run, `it.skip` included. A reader summing across a mixed task set
+    adds those together and gets a number that is not a count of anything --
+    the defect `Versions.pricing_basis` exists to prevent one subsystem
+    over."""
+    record = _grade_record_for(framework="vitest")
+
+    assert record.framework == "vitest"
+    assert record.grade_schema_version.startswith("1.")
+
+
+def test_a_grade_written_before_the_field_existed_reads_as_unknown():
+    """`""`, not `"pytest"`. A default naming a real framework would be this
+    field claiming a fact about a record nobody measured."""
+    from bakeoff.grade_schema import GradeRecord
+
+    assert GradeRecord.__dataclass_fields__["framework"].default == ""
+
+
+def test_the_ladder_names_its_framework_off_the_manifest():
+    result = _ladder(task=_task())
+    assert result.framework == "pytest"
+    grade = build_grade_record(_record(), _task(), "sha256:image", None,
+                               result)
+    assert grade.framework == "pytest"
+
+
+def test_framework_survives_a_refusal_at_check_one():
+    """Set before the first check runs, so a record refused at EMPTY_PATCH
+    still names which adapter would have graded it -- unlike
+    `suite_timeout_s`, which stays `None` on this same path because no
+    bounded command ran."""
+    result = _ladder(record=_record(diff="   \n"))
+    assert result.grade_failure == GradeFailure.EMPTY_PATCH.value
+    assert result.framework == "pytest"
 
 
 def test_p2p_rides_the_quarantine_and_the_scope():
