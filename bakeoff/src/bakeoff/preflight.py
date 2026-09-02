@@ -161,7 +161,19 @@ _PYTEST_ADAPTER = for_framework("pytest")
 #: rather than the image. A cached v11 PASS is unaffected (a v11 gate that
 #: passed still passed for the right reason); a cached v11 NO-GO on a subtest
 #: task is stale and must be re-run under 12 to be believed.
-PREFLIGHT_VERSION: str = "12"
+#:
+#: 12 -> 13: the bare-runner probe (fix 2, 2026-09-02). A v12 verdict never
+#: asked whether the repo's OWN pytest configuration -- its pyproject.toml
+#: addopts, read with none of `tests.runner`'s extra arguments -- is itself a
+#: usage error in this image. `bidict-389-putall-rollback-clean`'s gated
+#: runner bypasses this with `--override-ini=addopts=` and passes, while the
+#: bare command an agent naturally types (`python -m pytest tests/`) exits 4
+#: from turn one, bug fixed and unfixed alike: the loop truncates after
+#: "edits" and every arm is scored on an unverified guess, exactly the
+#: failure mode this file's module docstring names. A cached v12 PASS on a
+#: pytest task must be re-run under 13 to be believed; a v12 NO-GO is
+#: unaffected (nothing this version adds can turn a NO-GO into a GO).
+PREFLIGHT_VERSION: str = "13"
 
 
 def preflight_cache_key(task, image: str, start_sha: str) -> str:
@@ -202,6 +214,43 @@ SCOPE_COLLECTS_NOTHING = "scope_collects_nothing"
 # would do it invisibly: section 5.2 pins the session config precisely because
 # CLAUDE.md and friends substantially change agent behaviour.
 _CONTEXT_FILES = ("CLAUDE.md", "AGENTS.md", ".claude", ".cursorrules")
+
+#: Fix 2's four known addopts flags, mapped to the plugin `image.pip` is
+#: missing when a bare pytest invocation cannot even parse them. Deliberately
+#: not a general flag-to-plugin parser -- that would be a second, private
+#: copy of pytest's own plugin registry, going stale the moment a task's
+#: addopts names a fifth plugin. Matched as a substring rather than as a
+#: token, because argparse's own message quotes the flag WITH its `=value`
+#: (`unrecognized arguments: --numprocesses=auto`).
+_BARE_RUNNER_PLUGIN_HINTS = (
+    ("--numprocesses", "pytest-xdist"),
+    ("--cov", "pytest-cov"),
+    ("--timeout", "pytest-timeout"),
+    ("--hypothesis-profile", "hypothesis"),
+)
+
+
+def _bare_runner_plugin_hint(stderr: str) -> str:
+    """Which package `image.pip` is missing, or the honest fallback.
+
+    Takes the WHOLE stderr, not one line -- measured against the real image
+    2026-09-02, argparse's own `error()` prints the usage banner as line 1
+    and the flag it actually choked on as line 2
+    (`python -m pytest: error: unrecognized arguments: --numprocesses=auto`),
+    so a lookup keyed on line 1 alone finds nothing on the exact task fix-2
+    was measured against.
+
+    Named after the one flag fix-2 was measured against
+    (`bidict-389-putall-rollback-clean`'s `--numprocesses=auto`, pytest-xdist)
+    and widened to the three other addopts flags whose absence gives the
+    identical usage-error shape. Anything else is real but unmapped, and
+    "a pytest plugin" says that honestly rather than guessing a package name
+    this function has no way to know.
+    """
+    for flag, package in _BARE_RUNNER_PLUGIN_HINTS:
+        if flag in stderr:
+            return package
+    return "a pytest plugin"
 
 
 @dataclass(frozen=True)
@@ -826,6 +875,16 @@ def preflight(
     evidence["duplicate_full_names"] = None
     evidence["scope_files_run"] = None
     evidence["scope_files_outside"] = None
+    #: `None`, not `0`: the same rule as `f2p_before_not_run` applies here
+    #: identically. The runner-gate early return below starts no container at
+    #: all, and fix 2's own framework guard (beside the context-file probe)
+    #: skips a node task without ever calling `container.exec` -- neither
+    #: path has MEASURED "no usage error", and `0` would claim it had.
+    #: `bare_runner_argv` is `None` for the same two paths, and stays `None`
+    #: on the node one even once a container starts: the argv a reader would
+    #: see there is the one this probe never ran.
+    evidence["bare_runner_exit"] = None
+    evidence["bare_runner_argv"] = None
 
     # BEFORE the runner gate, so a manifest refused for a bad runner still
     # records what its declared framework wanted. Needs no container: both
@@ -999,6 +1058,87 @@ def preflight(
                 f"the start state carries {', '.join(present)}: section 5.2 "
                 "pins the session config, and a task-local agent file gives "
                 "this task a context the others do not have"
+            )
+
+        # Fix 2: prove the repo's OWN pytest configuration is not itself a
+        # usage error, independent of whatever tests.runner adds. Measured
+        # gap (`w3-bidict-389.md`, finding 3): `bidict-389-putall-rollback-
+        # clean`'s gated runner is `python -m pytest -q -p no:cacheprovider
+        # --override-ini=addopts= tests/` and PASSES, because
+        # `--override-ini=addopts=` throws away the repo's own
+        # pyproject.toml addopts (`--numprocesses=auto`, pytest-xdist --
+        # which the image does not install) -- while the command an agent
+        # naturally types, `python -m pytest tests/`, exits 4 from turn one,
+        # bug fixed and unfixed alike. This is CLAUDE.md's "the agent must be
+        # able to check its own work" with the bypass hiding inside the
+        # GATE's own argv rather than in the image.
+        #
+        # `--co` (collect-only): this asks "does the repo's config parse",
+        # not "do the tests pass" -- a real run would double the suite cost
+        # for a question the f2p/p2p runs below already answer. NO
+        # `--override-ini`, no paths: omitting every argument `tests.runner`
+        # adds is the whole point, so the repo's own ini/addopts apply
+        # exactly as they would for an agent that never read task.yaml.
+        #
+        # Only for pytest. The node frameworks have no addopts analogue --
+        # vitest and jest answer a broken config, a failing test and an
+        # unresolvable import all with exit 1 alike (measured, see the
+        # runner-adapter note under `PREFLIGHT_VERSION` 10 above), so there is
+        # nothing a bare invocation could tell apart there. `bare_runner_exit`
+        # stays `None` and `bare_runner_skipped` names why, rather than
+        # running a probe that could only ever answer "1".
+        if adapter.name == "pytest":
+            interpreter = _runner_python(tests.runner)
+            bare_argv = [
+                "timeout", str(timeout_s), interpreter, "-m", "pytest",
+                "--co", "-q", "-p", "no:cacheprovider",
+            ]
+            evidence["bare_runner_argv"] = bare_argv
+            bare = container.exec(bare_argv)
+            evidence["bare_runner_exit"] = bare.exit_code
+            if bare.exit_code == EXIT_USAGE_ERROR:
+                # NOT literally line 1. Measured against the real image
+                # (2026-09-02): argparse's own `error()` prints the usage
+                # banner ("usage: python -m pytest [options] ...") as line 1
+                # and the flag it actually choked on ("python -m pytest:
+                # error: unrecognized arguments: --numprocesses=auto") as
+                # line 2 -- so quoting line 1 would name no flag at all on
+                # the exact task this probe exists for. `": error:"` is
+                # argparse's own separator between the program name and its
+                # message, so it selects that line wherever it lands; a
+                # report carrying neither shape falls back to line 1, which
+                # is still the best available summary of what pytest said.
+                stderr_lines = bare.stderr.strip().splitlines()
+                quoted_line = next(
+                    (line for line in stderr_lines if ": error:" in line),
+                    stderr_lines[0] if stderr_lines else "",
+                )
+                hint = _bare_runner_plugin_hint(bare.stderr)
+                problems.append(
+                    "the repository's own pytest configuration is a usage "
+                    f"error in this image: {quoted_line}. The gated "
+                    "runner's own argv can hide this (an "
+                    "--override-ini=addopts= bypass, most often) while the "
+                    "bare command an agent naturally types does not -- "
+                    f"image.pip needs {hint}"
+                )
+            elif bare.exit_code == 124:
+                problems.append(
+                    "the bare pytest collection "
+                    f"(`{' '.join(bare_argv)}`) timed out after "
+                    f"{timeout_s}s: this task's own configuration cannot "
+                    "be trusted to even collect in this image"
+                )
+            # 0, 1, 2, 5 are not a problem: 2 is a collection error the task
+            # may legitimately carry at the start state (broadening 2), 5 is
+            # "no tests collected", which the f2p checks judge on their own,
+            # and 1 cannot happen with --co.
+        else:
+            evidence["bare_runner_skipped"] = (
+                f"{adapter.name} has no addopts analogue: a broken config, "
+                "a failing test and an unresolvable import all exit 1 "
+                "alike (measured), so a bare invocation could not tell any "
+                "of them apart from the others"
             )
 
         # The strip, checked against the TREE rather than against the manifest

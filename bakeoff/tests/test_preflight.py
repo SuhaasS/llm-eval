@@ -878,7 +878,7 @@ class _ScriptedContainer:
                  python="Python 3.12.13",
                  submodule_status="", submodule_status_exit=0,
                  gitlinks=(), gitmodules_declared=None, gitmodules_exit=None,
-                 reports=None):
+                 reports=None, bare_runner=None):
         self.commands = []
         #: The JSON report each suite invocation writes, keyed by which run it
         #: is: `f2p_before`, `f2p_after`, `p2p_before`, `p2p_after`, `scoped`.
@@ -947,6 +947,16 @@ class _ScriptedContainer:
         self.p2p_before = p2p_before
         self.p2p_runs = 0
         self.p2p_argvs = []
+        #: Fix 2's bare-runner probe. `None` -- the default -- answers the
+        #: healthy exit 0, since the probe's argv (`--co` present) never
+        #: matches `tests.runner` as a prefix and so would otherwise fall
+        #: through `_timeout`'s `grading_exits` branch, which can express an
+        #: exit code but not the stderr line the problem message is built
+        #: from. Scripted separately, like `f2p_before`, for the same reason:
+        #: a test about this probe states only the one thing it is about.
+        self.bare_runner = bare_runner
+        self.bare_runner_calls = 0
+        self.bare_runner_argvs = []
 
     def __enter__(self):
         return self
@@ -1057,6 +1067,16 @@ class _ScriptedContainer:
             return _Exec(stdout="")
         if cmd[0] == "git":
             return _Exec()
+        # Recognised on `--co`, which appears in no OTHER argv this container
+        # answers -- not the gated f2p/p2p/scoped runs (their `tests.runner`
+        # never carries it) and not a grading argv. Matched BEFORE the
+        # generic `timeout` branch below so a test can script this probe's
+        # exit code and stderr independently of `grading_exits`, which can
+        # only express the former.
+        if cmd[0] == "timeout" and "--co" in cmd:
+            self.bare_runner_calls += 1
+            self.bare_runner_argvs.append(list(cmd))
+            return self.bare_runner if self.bare_runner is not None else _Exec()
         if cmd[0] == "timeout":
             return self._timeout(cmd[2:])
         raise AssertionError(f"unscripted exec: {cmd!r}")
@@ -1558,7 +1578,10 @@ def test_the_gate_bounds_every_command_by_the_manifests_number(
 
     EVERY command, not just the suite: the declared grading.* argvs go through
     the same prefix, because the grader runs those too and a second key for
-    them would be a second thing that can diverge."""
+    them would be a second thing that can diverge. The bare-runner probe
+    (fix 2) is one more: it is a `container.exec` like any other, and a bare
+    collect-only run that hung with no bound would hang the gate exactly as
+    an unbounded suite run would."""
     task = _FakeTask(
         budget=_FakeBudget(suite_timeout_s=1234, wall_clock_timeout_s=3600),
         grading=TaskGrading(lint=("ruff", "check", ".")),
@@ -1571,7 +1594,8 @@ def test_the_gate_bounds_every_command_by_the_manifests_number(
     assert result.ok, result.problems
     bounded = [cmd for cmd in container.commands if cmd[0] == "timeout"]
     # five suite runs on the deselect branch + one declared grading argv
-    assert len(bounded) == 6, bounded
+    # + one bare-runner probe (fix 2)
+    assert len(bounded) == 7, bounded
     assert {cmd[1] for cmd in bounded} == {"1234"}
 
 
@@ -1782,7 +1806,13 @@ def test_an_unset_variable_is_recorded_as_null_and_an_empty_one_as_empty(
 def test_the_env_is_read_before_the_suite_runs(monkeypatch, tmp_path):
     """Order, not presence. A broken environment produces five downstream
     suite failures, and reporting them instead of the cause sends the task
-    author round the loop for the wrong reason."""
+    author round the loop for the wrong reason.
+
+    `"--co" not in cmd` excludes the bare-runner probe (fix 2): it is ALSO a
+    `timeout`-prefixed command, and it runs earlier still (beside the
+    context-file probe), so the naive first `timeout` call is now this
+    probe's own rather than the suite's -- this test's claim is about the
+    suite specifically, so it must look past it."""
     task = _FakeTask(image=_FakeImage(env={"CI": "1"}))
     container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
                                    env={"CI": "1"})
@@ -1792,7 +1822,7 @@ def test_the_env_is_read_before_the_suite_runs(monkeypatch, tmp_path):
     printenv = next(i for i, cmd in enumerate(container.commands)
                     if cmd[:1] == ["printenv"])
     first_suite = next(i for i, cmd in enumerate(container.commands)
-                       if cmd[:1] == ["timeout"])
+                       if cmd[:1] == ["timeout"] and "--co" not in cmd)
 
     assert printenv < first_suite
 
@@ -1802,7 +1832,10 @@ def test_the_hypothesis_import_probe_runs_before_the_suite(monkeypatch,
     """Same ordering claim as the env read-back, for the other reason a bad
     environment must be reported as itself: a task whose author never
     declared CI is a NO-GO, and that has to be decided before five downstream
-    suite failures bury the cause."""
+    suite failures bury the cause.
+
+    `"--co" not in cmd` excludes the bare-runner probe (fix 2), the same
+    reason `test_the_env_is_read_before_the_suite_runs` needs it."""
     task = _FakeTask(image=_FakeImage(env={"CI": "1"}))
     container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
                                    env={"CI": "1"}, hypothesis_importable=True)
@@ -1814,14 +1847,15 @@ def test_the_hypothesis_import_probe_runs_before_the_suite(monkeypatch,
         if len(cmd) >= 3 and cmd[1] == "-c" and "import hypothesis" in cmd[2]
     )
     first_suite = next(i for i, cmd in enumerate(container.commands)
-                       if cmd[:1] == ["timeout"])
+                       if cmd[:1] == ["timeout"] and "--co" not in cmd)
 
     assert import_probe < first_suite
 
 
 def test_the_rg_probe_runs_before_the_suite(monkeypatch, tmp_path):
     """Same ordering claim, for the probe that decides whether an undeclared
-    property-based suite is a NO-GO."""
+    property-based suite is a NO-GO. `"--co" not in cmd` excludes the
+    bare-runner probe (fix 2), the same reason the two tests above need it."""
     task = _FakeTask(image=_FakeImage(env={"CI": "1"}))
     container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
                                    present=("tests/",), env={"CI": "1"},
@@ -1833,7 +1867,7 @@ def test_the_rg_probe_runs_before_the_suite(monkeypatch, tmp_path):
     rg_probe = next(i for i, cmd in enumerate(container.commands)
                     if cmd[:1] == ["rg"])
     first_suite = next(i for i, cmd in enumerate(container.commands)
-                       if cmd[:1] == ["timeout"])
+                       if cmd[:1] == ["timeout"] and "--co" not in cmd)
 
     assert rg_probe < first_suite
 
@@ -2164,10 +2198,142 @@ def test_the_preflight_version_moved_with_the_new_assertion():
     that produced no report, so it claimed a measurement it never made. A blob
     cached before and one written after would otherwise share a version string
     with `[]` meaning two different things in them, which is the one thing
-    this number exists to let a reader rule out."""
+    this number exists to let a reader rule out.
+
+    12 -> 13 is the bare-runner probe (fix 2). A verdict cached under 12 was
+    written by a gate that never asked whether the repo's OWN pytest
+    configuration -- its addopts, read with none of `tests.runner`'s extra
+    arguments -- is itself a usage error in this image: `bidict-389-putall-
+    rollback-clean`'s gated runner bypasses that with
+    `--override-ini=addopts=` and passes, while the bare command an agent
+    naturally types exits 4 from turn one, bug fixed and unfixed alike."""
     from bakeoff.preflight import PREFLIGHT_VERSION
 
-    assert PREFLIGHT_VERSION == "12"
+    assert PREFLIGHT_VERSION == "13"
+
+
+# --- fix 2: the bare-runner probe ---------------------------------------------
+
+
+def test_a_bare_usage_error_names_the_plugin_and_the_flag(monkeypatch, tmp_path):
+    """bidict-389's measured shape: the gated runner's --override-ini=addopts=
+    throws away the repo's own pytest-xdist requirement (--numprocesses=auto
+    in pyproject.toml), and the command an agent naturally types exits 4 from
+    turn one, bug fixed and unfixed alike. The problem must name both the
+    addopts flag pytest reported and the plugin `image.pip` is missing, and
+    the evidence must carry the exit code and the argv that produced it.
+
+    stderr is the REAL two-line shape (docker run against the actual task
+    image, 2026-09-02): argparse's `error()` prints the usage banner as line
+    1 and the flag it choked on as line 2, so a lookup keyed on only the
+    first line -- which is what the message quotes -- would find nothing on
+    this exact task."""
+    task = _FakeTask()
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=task.tests, present=("tests/",),
+        bare_runner=_Exec(
+            exit_code=EXIT_USAGE_ERROR,
+            stderr=(
+                "ERROR: usage: python -m pytest [options] [file_or_dir] "
+                "[file_or_dir] [...]\n"
+                "python -m pytest: error: unrecognized arguments: "
+                "--numprocesses=auto\n"
+                "  inifile: /repo/pyproject.toml\n"
+                "  rootdir: /repo\n"
+            ),
+        ),
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert not result.ok
+    assert any(
+        "--numprocesses" in p and "pytest-xdist" in p for p in result.problems
+    ), result.problems
+    assert result.evidence["bare_runner_exit"] == EXIT_USAGE_ERROR
+    assert result.evidence["bare_runner_argv"] == container.bare_runner_argvs[0]
+
+
+def test_a_bare_collection_error_is_not_a_problem(monkeypatch, tmp_path):
+    """Exit 2 is a collection error the task may legitimately carry at the
+    start state (broadening 2) -- the f2p/p2p checks judge that, not this
+    probe, which only asks whether the repo's own config parses at all.
+    Evidence still records what was measured."""
+    task = _FakeTask()
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=task.tests, present=("tests/",),
+        bare_runner=_Exec(exit_code=EXIT_COLLECTION_INTERRUPTED),
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert result.ok, result.problems
+    assert result.evidence["bare_runner_exit"] == EXIT_COLLECTION_INTERRUPTED
+
+
+def test_a_node_task_never_runs_a_bare_pytest_at_all(monkeypatch, tmp_path):
+    """vitest and jest have no addopts analogue -- both exit 1 for a broken
+    config, a failing test and an unresolvable import alike (measured), so a
+    bare invocation could tell none of them apart. The probe must not even be
+    attempted on a node task, and the evidence must say why it was skipped
+    rather than recording a false 'no problem'."""
+    container, task = _node_container()
+
+    result = _preflight_over((container, task))
+
+    assert result.ok, result.problems
+    assert container.bare_runner_calls == 0
+    assert result.evidence["bare_runner_exit"] is None
+    assert result.evidence["bare_runner_skipped"]
+
+
+def test_the_bare_argv_carries_none_of_tests_runners_extra_arguments(
+    monkeypatch, tmp_path
+):
+    """The whole point of the probe: an addopts-bypass runner
+    (--override-ini=addopts=) must not leak into the bare invocation, or the
+    probe would just be re-running the gated command under a new name and
+    would never SEE the usage error bidict-389 hides."""
+    task = _FakeTask(tests=_FakeTests(
+        runner=("python", "-m", "pytest", "-q", "-p", "no:cacheprovider",
+                "--override-ini=addopts=", "tests/"),
+    ))
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=task.tests, present=("tests/",),
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert result.ok, result.problems
+    argv = result.evidence["bare_runner_argv"]
+    assert "--override-ini=addopts=" not in argv
+    assert "tests/" not in argv
+    assert argv == ["timeout", "600", "python", "-m", "pytest",
+                    "--co", "-q", "-p", "no:cacheprovider"]
+
+
+def test_the_bare_probe_runs_before_the_reference_is_applied(
+    monkeypatch, tmp_path
+):
+    """The start state, not the fixed-up one: a bare probe run after the
+    reference patch lands would prove nothing about what an agent sees on
+    turn one, which is the whole question this probe exists to answer."""
+    task = _FakeTask()
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=task.tests, present=("tests/",),
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert result.ok, result.problems
+    bare_index = next(
+        i for i, cmd in enumerate(container.commands) if "--co" in cmd
+    )
+    apply_index = next(
+        i for i, cmd in enumerate(container.commands)
+        if cmd[:2] == ["git", "apply"]
+    )
+    assert bare_index < apply_index
 
 
 # --- every submodule is initialised at its gitlink ---------------------------

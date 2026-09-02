@@ -92,6 +92,20 @@ tests:
   # section 5.6 stages everything, so anything the test run drops lands in
   # every submission diff.
   runner: ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider"]
+  # An addopts-bypass runner -- one carrying `--override-ini=addopts=`, which
+  # throws away this repo's own pyproject.toml/pytest.ini addopts rather than
+  # satisfying them -- does NOT excuse `image.pip` from installing whatever
+  # those addopts name. Preflight's bare-runner probe (fix 2) reads the
+  # repo's OWN config with none of this argv's extra arguments, exactly as an
+  # agent typing a bare `pytest` would, and refuses a task whose gated runner
+  # passes only because it bypassed a plugin requirement the image never
+  # installed (measured on bidict-389-putall-rollback-clean:
+  # --numprocesses=auto / pytest-xdist).
+  #
+  # `-c /dev/null` is NOT a safe alternative bypass -- measured 2026-09-02 on
+  # jab/bidict, it retargets pytest's rootdir to /dev and every reported node
+  # id no longer matches the declared f2p ids, so the gate reports "declared
+  # f2p tests did not fail at the start state" for tests that, in fact, did.
   # Measured, not guessed: these are exactly the tests that fail at the start
   # state and pass after the reference fix. They assert rendered output rather
   # than any internal name, so a different-but-correct fix passes -- which is

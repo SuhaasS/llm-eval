@@ -73,6 +73,23 @@ Runs inside the pinned image, before the proxy starts.
   state.** §5.2 pins the session config precisely because agent files
   substantially change behaviour; a task-local one gives this task a context
   the others do not have.
+- **The repo's OWN pytest configuration is not itself a usage error.** Runs
+  the manifest's interpreter with none of `tests.runner`'s extra arguments —
+  `python -m pytest --co -q -p no:cacheprovider`, collection only — so the
+  repo's own `pyproject.toml`/`pytest.ini` addopts apply exactly as they
+  would for an agent that never read `task.yaml`. Pytest only; vitest and
+  jest have no addopts analogue and exit 1 for a broken config and a real
+  failure alike, so there is nothing this probe could tell apart there, and
+  it does not run — `bare_runner_exit` stays `null` and `bare_runner_skipped`
+  names why. Exit 4 is a NO-GO naming the flag pytest reported and, for
+  `--numprocesses`/`--cov`/`--timeout`/`--hypothesis-profile`, the plugin
+  `image.pip` is missing (`pytest-xdist`/`pytest-cov`/`pytest-timeout`/
+  `hypothesis` respectively) — measured on
+  `bidict-389-putall-rollback-clean`, whose GATED runner passes by bypassing
+  the repo's own addopts with `--override-ini=addopts=` while the bare
+  command an agent naturally types exits 4 from turn one, bug fixed and
+  unfixed alike. A timeout (124) is also a NO-GO; exit 2 or 5 is not — see
+  `bakeoff/src/bakeoff/preflight.py`'s `PREFLIGHT_VERSION` 13 comment.
 - **Every `strip_paths` entry is absent from the start state.** Checked in the
   container against the tree, not against the manifest: a strip that silently
   did not happen puts the file in every arm's context and in every submission

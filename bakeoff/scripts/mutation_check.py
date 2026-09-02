@@ -1749,6 +1749,21 @@ MUTATIONS = [
         "not integration",
     ),
     (
+        # Fix 2's whole point: bidict-389's GATED runner passes by bypassing
+        # its own pyproject.toml addopts (--override-ini=addopts=) while the
+        # bare command an agent types exits 4 from turn one. Reverting this
+        # branch away makes the bare-runner probe measure the exit code and
+        # say nothing about it -- exactly the Phase 0c shape where the loop
+        # truncates after "edits" and every arm is scored on an unverified
+        # guess.
+        "preflight: measure the bare usage error and stop refusing it",
+        "src/bakeoff/preflight.py",
+        "            if bare.exit_code == EXIT_USAGE_ERROR:",
+        "            if False:",
+        "tests/test_preflight.py -k bare_usage_error_names_the_plugin",
+        "not integration",
+    ),
+    (
         # The whole point of D3. Reverting to the FULL mirror leaves every
         # unit test green -- the tree materializes, the suite collects, the
         # gate passes -- while `git -C <path> log --all` in the run tree hands
