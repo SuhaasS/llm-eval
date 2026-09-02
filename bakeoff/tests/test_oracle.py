@@ -75,8 +75,13 @@ def test_the_oracle_version_moved_with_what_derivation_means():
     `pytest_adapter._FAILED_LINE` learning `SUBFAILED` (fix 3, 2026-09-02): a
     p2p node that flakes only through `unittest.subTest` was invisible to
     `_classify`'s set on both reference runs under 3 and could never land in
-    the quarantine."""
-    assert ORACLE_VERSION == "4"
+    the quarantine. 4 -> 5 is the node per-file selection (round 2 item 1,
+    2026-09-03): `_derive`'s two reference runs are now the per-file argv
+    sequence, so a quarantine cached under 4 for a NODE task was derived from
+    runs in which one file's deselection removed another file's
+    identically-titled test -- it can name an id that never needed
+    quarantining and miss one that did."""
+    assert ORACLE_VERSION == "5"
 
 
 def test_both_runs_green_yields_empty_quarantine():

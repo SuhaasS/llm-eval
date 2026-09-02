@@ -119,13 +119,21 @@ class RunnerAdapter(Protocol):
     #: agent.
     no_cache_args: tuple[str, ...]
 
-    def select_args(self, node_ids: tuple[str, ...]) -> list[str]:
-        """Argv that runs exactly these ids and nothing else."""
+    def select_argvs(self, node_ids: tuple[str, ...]) -> list[list[str]]:
+        """Argvs that run exactly these ids and nothing else.
 
-    def p2p_args(self, *, selected: tuple[str, ...], scope: tuple[str, ...],
-                 deselected: tuple[str, ...],
-                 ignored: tuple[str, ...]) -> list[str]:
-        """The WHOLE p2p argv, in one call, because it cannot be composed.
+        One per FILE, not one per call: measured 2026-09-02, two positionals
+        plus one union `-t` executed a test declared for neither pairing --
+        the positionals and the name pattern are ANDed across the whole
+        invocation, never zipped. Empty ids give an EMPTY LIST, not an argv
+        with no filter; `_Runner.run` raises on it rather than falling
+        through to running the whole suite as the selection.
+        """
+
+    def p2p_argvs(self, *, selected: tuple[str, ...], scope: tuple[str, ...],
+                  deselected: tuple[str, ...],
+                  ignored: tuple[str, ...]) -> list[list[str]]:
+        """The WHOLE p2p argv sequence, in one call, because it cannot be composed.
 
         vitest and jest express both selection and deselection through a
         single `-t <regex>`, and emitting two is NOT "last one wins" -- the two
@@ -137,11 +145,19 @@ class RunnerAdapter(Protocol):
         and exits **0** having run nothing. One method that owns the whole
         argv cannot be composed wrongly.
 
-        It also matches by NAME only: `-t` knows nothing about which file a
-        test came from, so two tests sharing a `fullName` across files are
-        indistinguishable to a selection or a deselection. The loader's
-        duplicate-name refusal and preflight's report-level assertion are what
-        make that safe; see the plan's D2.
+        What `-t` cannot do is name a file, so the FILE half is carried by
+        the grouping instead: one argv per file, each pairing that file's
+        positional with a pattern over only that file's titles. The deselect
+        branch is 1 + K commands -- group 0 is the declared scope with every
+        file holding a deselection excluded and no `-t` at all, then one
+        group per such file carrying only its own deselected titles. That is
+        what keeps a quarantine of `a::works` off `b::works`.
+
+        The EXCLUSION channel differs per framework and it is not cosmetic:
+        jest's `--testPathIgnorePatterns` REPLACES the repository's own value
+        while vitest's `--exclude` adds to it, so jest excludes through
+        negative lookaheads folded into the positional and emits that flag
+        nowhere. See the round-2 item 1 plan's D3b.
 
         `selected` is the manifest's explicit `tests.p2p`; when it is empty the
         run is the deselect branch and `scope` is the declared `tests.paths`.
@@ -149,6 +165,27 @@ class RunnerAdapter(Protocol):
         quarantine alone on the explicit branch. `ignored` has exactly one
         caller -- preflight's p2p run at the START state on a task whose f2p
         module does not import there.
+        """
+
+    def merge_reports(self, reports: list[dict | None]) -> dict | None:
+        """One report per argv group, folded into the one a check reads.
+
+        `None` for an EMPTY list and for any list holding a `None`: nobody
+        ran and nobody counted, versus a group that produced no evidence at
+        all. Never a partial merge -- that would report a green suite for a
+        run half of which said nothing.
+        """
+
+    def file_filter_matches(self, declared_path: str,
+                            candidate_path: str) -> bool:
+        """Would this framework's filter for `declared_path` also pull in
+        `candidate_path`?
+
+        Both arguments are rootdir-relative. The channel for preflight's
+        `ambiguous_file_filters` refusal: on vitest the positional is a
+        SUBSTRING filter that no anchoring reaches, so a per-file group
+        carries its name pattern into a second file. Every other framework
+        answers plain equality and the refusal can never fire.
         """
 
     def report_args(self, report_path: str) -> list[str]:
@@ -199,10 +236,9 @@ class RunnerAdapter(Protocol):
         """Raise `TaskError` if the declared ids are unselectable TOGETHER.
 
         Separate from `validate_node_id` because the defect is a property of
-        the SET: no id in it is wrong on its own. It is empty for pytest,
-        whose selection carries the path, and it is where the node adapters
-        refuse two ids sharing a `fullName` across files -- `-t` matches by
-        name alone and no flag pairs a name pattern with a file.
+        the SET: no id in it is wrong on its own. Empty on every adapter
+        today; kept as a seam because a set-level refusal is not expressible
+        anywhere else in the loader.
         """
 
     def hypothesis_interpreter(self, runner: tuple[str, ...]) -> str | None:

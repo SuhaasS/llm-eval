@@ -75,9 +75,11 @@ def test_no_adapter_method_is_a_stub_any_more():
         adapter = for_framework(name)
         assert adapter.classify(
             exit_code=1, stdout="", stderr="", report=None).kind, name
-        assert adapter.select_args(()) == []
-        assert adapter.p2p_args(selected=(), scope=("tests/",),
-                                deselected=(), ignored=()) == ["tests/"]
+        assert adapter.select_argvs(()) == []
+        assert adapter.p2p_argvs(selected=(), scope=("tests/",),
+                                 deselected=(), ignored=()) == [["tests/"]]
+        assert adapter.merge_reports([]) is None
+        assert adapter.file_filter_matches("a", "a") is True
         assert adapter.explain(1)
         assert adapter.validate_id_set((), "tests.f2p") is None
         assert adapter.parse_deselected(stdout="", report=None) is None
@@ -93,44 +95,83 @@ def test_no_adapter_method_is_a_stub_any_more():
 # --- the pytest adapter reproduces today's behaviour -------------------------
 
 
-def test_pytest_p2p_args_deselect_branch_is_byte_identical_to_todays_argv():
+def test_pytest_p2p_argvs_deselect_branch_is_byte_identical_to_todays_argv():
     """The whole reason the refactor is safe. `_Runner.pass_to_pass` used to
     build this list inline; if the adapter emits anything else -- a reordered
     segment, an inserted flag -- the gated command stops being the graded one
-    and the oracle stops describing the thing being graded."""
+    and the oracle stops describing the thing being graded.
+
+    The identity property is now stated over a SEQUENCE of argvs, because a
+    node check is one command per file. pytest emits exactly one group and
+    its element is the literal below, so the property is unchanged in
+    content: a second group here would be a second suite run for nothing.
+    """
     adapter = for_framework("pytest")
 
-    assert adapter.p2p_args(
+    assert adapter.p2p_argvs(
         selected=(), scope=(), deselected=("tests/a.py::test_one",), ignored=()
-    ) == ["--deselect", "tests/a.py::test_one"]
+    ) == [["--deselect", "tests/a.py::test_one"]]
 
 
-def test_pytest_p2p_args_explicit_branch_is_byte_identical_to_todays_argv():
+def test_pytest_p2p_argvs_explicit_branch_is_byte_identical_to_todays_argv():
+    """One group, and its element is the pre-grouping literal."""
     adapter = for_framework("pytest")
 
-    assert adapter.p2p_args(
+    assert adapter.p2p_argvs(
         selected=("tests/b.py::test_two",), scope=(), deselected=(), ignored=()
-    ) == ["tests/b.py::test_two"]
+    ) == [["tests/b.py::test_two"]]
 
 
-def test_pytest_p2p_args_keeps_scope_then_f2p_then_quarantine_then_ignore():
+def test_pytest_p2p_argvs_keep_scope_then_f2p_then_quarantine_then_ignore():
     """The ORDER is the argv. Today `pass_to_pass` emits scope, then one
     --deselect per f2p id, then one per quarantined id, then the --ignores; the
     combined `deselected` tuple is (f2p + quarantine) precisely so that this
-    stays true."""
+    stays true. One group, as every pytest check is."""
     adapter = for_framework("pytest")
 
-    assert adapter.p2p_args(
+    assert adapter.p2p_argvs(
         selected=(),
         scope=("tests/",),
         deselected=("tests/a.py::test_one", "tests/c.py::test_flaky"),
         ignored=("tests/broken.py",),
-    ) == [
+    ) == [[
         "tests/",
         "--deselect", "tests/a.py::test_one",
         "--deselect", "tests/c.py::test_flaky",
         "--ignore=tests/broken.py",
-    ]
+    ]]
+
+
+def test_pytest_select_argvs_and_p2p_argvs_are_exactly_one_group_each():
+    """One group on both branches, and never two.
+
+    The node adapters emit one argv per FILE; pytest's node id carries its
+    own file, so a second group would be a second suite invocation buying
+    nothing -- and the gated-equals-graded byte identity is stated over this
+    sequence now.
+    """
+    adapter = for_framework("pytest")
+
+    assert adapter.select_argvs(("a.py::test_x", "b.py::test_y")) == [
+        ["a.py::test_x", "b.py::test_y"]]
+    assert len(adapter.p2p_argvs(
+        selected=(), scope=("tests/",),
+        deselected=("tests/a.py::test_one",), ignored=())) == 1
+    assert len(adapter.p2p_argvs(
+        selected=("tests/b.py::test_two",), scope=(),
+        deselected=("tests/b.py::test_flaky",), ignored=())) == 1
+
+
+def test_pytest_merge_reports_is_None_and_that_is_a_claim():
+    """pytest writes no machine-readable report at all -- `report_path()` is
+    `None` -- so there is nothing to fold and never will be. `None` here is
+    the claim "this framework reports nothing", not the gap "a group produced
+    no evidence" that the node adapters' `None` names."""
+    adapter = for_framework("pytest")
+
+    assert adapter.report_path() is None
+    assert adapter.merge_reports([]) is None
+    assert adapter.merge_reports([{"testResults": []}]) is None
 
 
 def test_pytest_p2p_args_matches_the_live_runner_on_both_branches():
@@ -200,8 +241,9 @@ def test_pytest_p2p_args_matches_the_live_runner_on_both_branches():
         ]
 
 
-def test_pytest_select_args_are_the_bare_node_ids():
-    assert for_framework("pytest").select_args(("a::b", "c::d")) == ["a::b", "c::d"]
+def test_pytest_select_argvs_are_the_bare_node_ids():
+    assert for_framework("pytest").select_argvs(
+        ("a::b", "c::d")) == [["a::b", "c::d"]]
 
 
 def test_pytest_select_args_match_the_live_runner():
@@ -766,34 +808,189 @@ def test_a_failing_assertion_counts_as_having_run(framework):
 # --- node argv ----------------------------------------------------------------
 
 
-def test_node_select_args_are_the_files_plus_one_anchored_name_alternation():
-    adapter = for_framework("vitest")
+def test_node_select_argvs_pair_each_file_with_only_its_own_names():
+    """The measurement this whole design turns on.
 
-    assert adapter.select_args(
-        ("tests/a.test.js::outer adds", "tests/a.test.js::top level")
-    ) == ["tests/a.test.js", "-t", "^(?:outer adds|top level)$"]
+    2026-09-02, in the pinned node base, jest 30.5.0 and vitest 3.2.7 alike:
+    two file positionals plus ONE union `-t` over one title from each file
+    executed THREE tests -- the third being the second file's copy of the
+    first file's title. `-t` matches `fullName` and the positionals are ANDed
+    across the whole invocation, never zipped, so the pairing has to be the
+    invocation. One argv per file is that pairing.
+    """
+    for framework in ("vitest", "jest"):
+        adapter = for_framework(framework)
 
+        groups = adapter.select_argvs(
+            ("tests/a.test.js::works", "tests/b.test.js::other"))
 
-def test_node_select_args_name_each_file_once_and_in_order():
-    """The file half is a positional filter, and repeating it is not harmless:
-    on jest a positional is a REGEX over the absolute path, so a duplicate is a
-    second pattern that has to agree with the first, and on both frameworks the
-    argv is what the byte-identity property is stated over."""
-    assert for_framework("jest").select_args(
-        ("tests/b.test.js::two", "tests/a.test.js::one", "tests/b.test.js::three")
-    ) == ["tests/b.test.js", "tests/a.test.js", "-t", "^(?:two|one|three)$"]
-
-
-def test_node_select_args_on_nothing_is_an_empty_argv_not_a_match_all():
-    """`^(?:)$` matches the empty name and nothing else -- which is M1's silent
-    hole with the pattern the adapter itself wrote. An empty selection has no
-    argv, and the caller's own branch is what decides whether that is legal."""
-    assert for_framework("vitest").select_args(()) == []
+        assert len(groups) == 2, framework
+        assert "other" not in groups[0][-1], framework
+        assert "works" not in groups[1][-1], framework
 
 
-def test_node_p2p_args_compose_selection_and_deselection_into_ONE_pattern():
-    """Emitting two `-t` flags is not "last one wins" -- the frameworks
-    disagree and neither answer is usable. Measured 2026-09-02:
+def test_node_select_argvs_group_each_file_once_and_in_first_seen_order():
+    """One group per FILE, not one per id: a repeated positional is a second
+    pattern that has to agree with the first, and the argv is what the
+    gated-equals-graded byte identity is stated over."""
+    assert for_framework("vitest").select_argvs(
+        ("tests/a.test.js::x", "tests/b.test.js::y", "tests/a.test.js::z")
+    ) == [
+        ["tests/a.test.js", "-t", "^(?:x|z)$"],
+        ["tests/b.test.js", "-t", "^(?:y)$"],
+    ]
+
+
+def test_node_select_argvs_on_nothing_are_no_groups_not_a_match_all():
+    """`[]` used to be ONE argv with no filter -- which `_Runner.run` handed
+    to the bare runner, running the WHOLE SUITE as the selection and
+    classifying it as one. It is now NO GROUPS, and `run` raises on it."""
+    for framework in ("vitest", "jest"):
+        assert for_framework(framework).select_argvs(()) == [], framework
+
+
+def test_jest_file_filter_is_mount_anchored_and_vitest_is_a_bare_substring():
+    r"""Measured 2026-09-02, and the two frameworks needed different strings.
+
+    jest's positional is a JS `RegExp` tested against BOTH the repo-relative
+    path and the absolute one: bare `tests/doc/stringify.test.js` and
+    `$`-only `tests/doc/stringify\.test\.js$` each ALSO matched
+    `/repo/pkg/tests/doc/stringify.test.js`, while
+    `^/repo/tests/doc/stringify\.test\.js$` matched exactly one file.
+
+    vitest's is a substring filter no anchoring reaches: both the relative and
+    the absolute spelling pulled the tail-colliding file in, so the bare
+    relative path is the honest spelling and preflight refuses the trees it
+    cannot separate.
+    """
+    jest = for_framework("jest").select_argvs(
+        ("tests/doc/stringify.test.js::x",))
+    vitest = for_framework("vitest").select_argvs(
+        ("tests/doc/stringify.test.js::x",))
+
+    assert jest[0][0] == "^/repo/tests/doc/stringify\\.test\\.js$"
+    assert vitest[0][0] == "tests/doc/stringify.test.js"
+
+
+def test_a_tail_colliding_path_is_matched_by_vitests_filter_and_not_by_jests():
+    """`file_filter_matches` is the predicate preflight refuses on, and it is
+    the adapter's because only the adapter knows what its positional is.
+
+    The vitest branch OVER-APPROXIMATES on purpose: `a in b` fires for
+    `tests/a.test.js` against `src/tests/a.test.js`, which is a genuine vitest
+    collision, and does not fire for `tests/foo.test.js` against
+    `tests/xfoo.test.js`, which is not one. jest's branch is equality and can
+    never fire; pytest's is equality for a second reason -- its positional IS
+    a path.
+    """
+    assert for_framework("vitest").file_filter_matches(
+        "tests/doc/a.test.js", "pkg/tests/doc/a.test.js") is True
+    assert for_framework("jest").file_filter_matches(
+        "tests/doc/a.test.js", "pkg/tests/doc/a.test.js") is False
+    assert for_framework("pytest").file_filter_matches(
+        "tests/doc/a.test.js", "pkg/tests/doc/a.test.js") is False
+
+
+def test_the_jest_file_filter_escapes_a_regex_character_in_a_directory_component():
+    r"""Measured 2026-09-02, and the earlier example for this was wrong.
+
+    A `foo.test.js` / `foo_test.js` pair is NOT the hazard: jest's default
+    `testMatch` never collects `foo_test.js` at all, and the positional is
+    applied AFTER `testMatch`, so the unescaped `.` never sees it. The real
+    collision is between two files that both match `testMatch`, and it lives
+    in the DIRECTORY components:
+
+        jest '^/repo/tests/v1.2/a.test.js$'    -> ran tests/v1.2/ AND tests/v1X2/
+        jest '^/repo/tests/v1\.2/a\.test\.js$' -> ran tests/v1.2/ only
+    """
+    import re
+
+    from bakeoff.runners.node_adapter import _REPO_MOUNT
+
+    pattern = for_framework("jest").select_argvs(
+        ("tests/v1.2/a.test.js::x",))[0][0]
+    unescaped = "^" + _REPO_MOUNT + "/tests/v1.2/a.test.js$"
+
+    assert re.search(pattern, "/repo/tests/v1.2/a.test.js")
+    assert not re.search(pattern, "/repo/tests/v1X2/a.test.js")
+    assert re.search(unescaped, "/repo/tests/v1X2/a.test.js")
+
+
+def test_node_p2p_argvs_deselect_branch_puts_each_deselected_file_in_its_own_group():
+    """1 + K commands. Group 0 is the scope with every file holding a
+    deselection EXCLUDED and no `-t` at all; then one group per such file,
+    carrying only that file's own deselected titles.
+
+    That is what keeps a quarantine of `a::works` off `b::works`. Under the
+    single-invocation argv it removed both, silently, with `p2p_deselected`
+    agreeing because two tests really were skipped."""
+    from bakeoff.runners.node_adapter import _js_escape
+
+    for framework in ("vitest", "jest"):
+        spelling = _js_escape if framework == "jest" else (lambda path: path)
+        groups = for_framework(framework).p2p_argvs(
+            selected=(), scope=("tests/",),
+            deselected=("tests/a.test.js::works", "tests/b.test.js::works"),
+            ignored=())
+
+        assert len(groups) == 3, framework
+        # Group 0 names BOTH deselected files -- as exclusions, a lookahead on
+        # jest and an `--exclude=` on vitest, never as positionals that
+        # collect. Under the pre-grouping argv it named neither and ran both
+        # under one global negative pattern.
+        assert "-t" not in groups[0], framework
+        assert spelling("tests/a.test.js") in " ".join(groups[0]), framework
+        assert spelling("tests/b.test.js") in " ".join(groups[0]), framework
+        assert groups[0][0].startswith(
+            "^(?!" if framework == "jest" else "tests/"), framework
+        # Groups 1 and 2 pair one file with only its own title.
+        assert groups[1][-1] == "^(?!(?:works)$)", framework
+        assert groups[2][-1] == "^(?!(?:works)$)", framework
+        assert "b.test.js" not in groups[1][0], framework
+        assert "a.test.js" not in groups[2][0], framework
+
+
+def test_node_p2p_argvs_deselect_group_zero_carries_no_dash_t():
+    """No `-t` at all, and not `-t ''`: an empty pattern matches every name,
+    which is what this group wants and is also exactly what a builder that
+    failed to fill the pattern in would emit."""
+    for framework in ("vitest", "jest"):
+        group_zero = for_framework(framework).p2p_argvs(
+            selected=(), scope=("tests/",),
+            deselected=("tests/a.test.js::works",), ignored=())[0]
+
+        assert "-t" not in group_zero, framework
+        assert "" not in group_zero, framework
+
+
+def test_node_p2p_argvs_explicit_branch_pairs_selection_and_deselection_per_file():
+    """One group per selected file, and a quarantine reaches only the group
+    whose file it names."""
+    groups = for_framework("jest").p2p_argvs(
+        selected=("tests/a.test.js::x", "tests/b.test.js::y"), scope=(),
+        deselected=("tests/a.test.js::q",), ignored=())
+
+    assert len(groups) == 2
+    assert groups[0][-1] == "^(?!(?:q)$)(?:x)$"
+    assert groups[1][-1] == "^(?:y)$"
+
+
+def test_a_quarantined_id_naming_an_uncollected_file_emits_no_pattern_for_it():
+    """On the explicit branch a deselection whose file is not in `selected` is
+    DROPPED rather than emitted: no group collects that file, so a pattern for
+    it would be a no-op that reads like a deselection."""
+    groups = for_framework("vitest").p2p_argvs(
+        selected=("tests/a.test.js::x",), scope=(),
+        deselected=("tests/z.test.js::q",), ignored=())
+
+    assert len(groups) == 1
+    assert not any("q" in arg for arg in groups[0])
+    assert not any("z.test.js" in arg for arg in groups[0])
+
+
+def test_no_node_argv_group_ever_carries_two_dash_t():
+    """The ONE-`-t` rule is per ARGV and was never about one invocation.
+    Measured 2026-09-02:
 
         $ vitest run -t 'a' -t 'b' tests/pass.test.js
         Error: Expected a single value for option
@@ -805,35 +1002,240 @@ def test_node_p2p_args_compose_selection_and_deselection_into_ONE_pattern():
         -> exit 0, zero tests run
 
     vitest's refusal is loud and classifies as KIND_ENVIRONMENT; jest's
-    comma-join is M1's silent hole reached by an argv nobody meant to write.
-    Hence one method owning the whole argv, and hence this count."""
+    comma-join is the silent hole, reached by an argv nobody meant to write.
+    """
+    for framework in ("vitest", "jest"):
+        adapter = for_framework(framework)
+        sequences = [
+            adapter.select_argvs(("a.test.js::x", "b.test.js::y")),
+            adapter.p2p_argvs(selected=(), scope=("tests/",),
+                              deselected=("tests/a.test.js::x",
+                                          "tests/b.test.js::y"),
+                              ignored=()),
+            adapter.p2p_argvs(selected=("a.test.js::x",), scope=(),
+                              deselected=("a.test.js::q",), ignored=()),
+        ]
+        for groups in sequences:
+            for argv in groups:
+                assert argv.count("-t") <= 1, (framework, argv)
+
+
+def test_an_ignored_file_gets_no_group_of_its_own_and_is_excluded_from_the_scope_group():
+    """preflight's p2p-BEFORE shape: the f2p module does not import at the
+    start state, so it must not be collected at all. A file in `ignored` is
+    excluded from group 0 and gets no group of its own, even when it also
+    holds a deselection -- a group for it would collect exactly the module the
+    ignore exists to keep out."""
+    from bakeoff.runners.node_adapter import _js_escape
+
+    for framework in ("vitest", "jest"):
+        spelling = _js_escape if framework == "jest" else (lambda path: path)
+        groups = for_framework(framework).p2p_argvs(
+            selected=(), scope=("tests/",),
+            deselected=("tests/f.test.js::red",), ignored=("tests/f.test.js",))
+
+        assert len(groups) == 1, framework
+        assert "-t" not in groups[0], framework
+        assert spelling("tests/f.test.js") in " ".join(groups[0]), framework
+
+
+def test_jest_excludes_through_the_positional_with_both_path_spellings():
+    """jest emits NO `--testPathIgnorePatterns`, and that is a measurement.
+
+    The flag REPLACES the repository's own `testPathIgnorePatterns` rather
+    than adding to it, and re-emitting `/node_modules/` beside it restores
+    jest's BUILT-IN default rather than anything the repository declared.
+    `eemeli/yaml` -- the corpus's only node task -- reports
+    `["tests/_utils", "tests/json-test-suite/"]` and no `/node_modules/`
+    through its own `--showConfig`, and `tests/_utils` matches its
+    `testMatch`, so the flag would pull its helper modules into the
+    regression check at gate time and at grade time alike.
+
+    Two lookaheads per file, because jest tests a positional against BOTH
+    spellings and collects if either matches. Measured 2026-09-02: a lookahead
+    naming only the absolute spelling did not exclude, and one naming only the
+    relative spelling did not either.
+    """
+    groups = for_framework("jest").p2p_argvs(
+        selected=(), scope=("tests/",),
+        deselected=("tests/a.test.js::gone",), ignored=())
+
+    assert groups[0] == [
+        "^(?!tests/a\\.test\\.js$)(?!/repo/tests/a\\.test\\.js$).*tests/"]
+    assert not any("--testPathIgnorePatterns" in arg
+                   for group in groups for arg in group)
+
+
+def test_vitest_excludes_through_the_bare_exclude_flag_not_a_glob():
+    """Measured 2026-09-02: on vitest the SAME string is a substring filter as
+    a positional and a GLOB as `--exclude`.
+
+        --exclude=tests/doc/a.test.js       -> pkg/tests/doc/a.test.js STILL RAN
+        --exclude='**/tests/doc/a.test.js'  -> pkg/tests/doc/a.test.js EXCLUDED
+
+    The bare spelling is what this design wants: group 0 must lose exactly the
+    deselected file, never a second file whose path ends the same way."""
+    groups = for_framework("vitest").p2p_argvs(
+        selected=(), scope=("tests/",),
+        deselected=("tests/a.test.js::gone",), ignored=())
+
+    assert groups[0] == ["tests/", "--exclude=tests/a.test.js"]
+
+
+def test_the_jest_scope_segment_stays_unanchored_so_the_scope_check_can_still_fire():
+    """`scope_files_outside` is a claim about what the DECLARED prefix matches
+    -- measured, `vitest run tests/` matched `/repo/jtests/fail.test.cjs` and
+    jest's `tests/` matched `/repo/pkg/tests/doc/...`. Anchoring the scope
+    segment at the mount also works as an exclusion (measured) and would make
+    that check unable to fire: a check that looks like a measurement and
+    cannot be one. So the raw prefix stays, behind a `.*`."""
+    group_zero = for_framework("jest").p2p_argvs(
+        selected=(), scope=("tests/",),
+        deselected=("tests/a.test.js::gone",), ignored=())[0]
+
+    assert ".*tests/" in group_zero[0]
+    assert "/repo/tests/" not in group_zero[0].split(".*")[-1]
+
+
+def test_group_zero_is_byte_identical_to_todays_argv_when_nothing_is_excluded():
+    """The scoped p2p run of a task with no quarantine and no ignore is the
+    argv the grader has always made. Nothing about the grouping may move it."""
+    for framework in ("vitest", "jest"):
+        assert for_framework(framework).p2p_argvs(
+            selected=(), scope=("tests/", "src/"), deselected=(), ignored=()
+        ) == [["tests/", "src/"]], framework
+
+
+def test_the_scope_precedes_the_exclusions_and_the_pattern_follows_them():
+    """Measured 2026-09-02, and it is a correctness rule, not a style one.
+    jest's `--testPathIgnorePatterns` was a greedy yargs array: with the
+    positional LAST it swallowed `tests/` into the ignore list and ran NOTHING
+    -- exit 1, empty `testResults` -- so the p2p check reported a regression
+    suite that executed zero tests. jest emits no such flag any more, but
+    vitest's `--exclude` sits in the same place, so the scope still precedes
+    the flags. A trailing `-t` is safe on a greedy option because it starts
+    with `-`, which ends the array."""
+    group_zero = for_framework("vitest").p2p_argvs(
+        selected=(), scope=("tests/",),
+        deselected=("tests/a.test.js::gone",), ignored=("tests/x.js",))[0]
+
+    assert group_zero == ["tests/",
+                          "--exclude=tests/x.js",
+                          "--exclude=tests/a.test.js"]
+
+
+def test_a_scope_prefix_that_is_itself_the_deselected_file_gets_no_group_zero():
+    """`tests.paths` may name a FILE, not a directory prefix.
+
+    `yaml-474-single-newline-empty-value` declares
+    `["tests/doc/stringify.ts"]`, which is also its only f2p file, so group 0
+    would exclude the whole of its own scope and collect nothing -- measured
+    2026-09-02, both frameworks answer that with exit 1 and a report of ZERO
+    tests, which the gate reads as a regression suite that is not green on a
+    task that is fine. The check is then exactly one command, and it is the
+    one the pre-grouping argv made."""
+    for framework in ("vitest", "jest"):
+        groups = for_framework(framework).p2p_argvs(
+            selected=(), scope=("tests/doc/stringify.ts",),
+            deselected=("tests/doc/stringify.ts::maps x",), ignored=())
+
+        assert len(groups) == 1, framework
+        assert groups[0][-1] == "^(?!(?:maps x)$)", framework
+
+
+def test_group_zero_survives_when_it_is_the_only_group_there_could_be():
+    """The skip above is conditional on something ELSE running. With no
+    deselected file there is no other group, and an empty SEQUENCE is what
+    `_Runner.run` refuses -- so a loud empty invocation (exit 1, a report of
+    zero tests, KIND_NOTHING_RAN, a NO-GO naming the scope) is emitted
+    instead of a crash out of the middle of the gate."""
+    groups = for_framework("jest").p2p_argvs(
+        selected=(), scope=("tests/a.test.js",), deselected=(),
+        ignored=("tests/a.test.js",))
+
+    assert len(groups) == 1
+    assert "-t" not in groups[0]
+
+
+def test_node_merge_reports_concatenate_test_results_and_sum_pending():
+    """`Outcome.files_run` and the deselection count are read off the merged
+    report, so a check that ran three commands has to answer as one run."""
     adapter = for_framework("vitest")
 
-    argv = adapter.p2p_args(
-        selected=(), scope=("tests/",),
-        deselected=("tests/a.test.js::outer adds",), ignored=())
+    merged = adapter.merge_reports([
+        {"testResults": [{"name": "/repo/a.test.js"}], "numPendingTests": 1},
+        {"testResults": [{"name": "/repo/b.test.js"}], "numPendingTests": 2},
+    ])
 
-    assert argv.count("-t") == 1
-    assert argv == ["tests/", "-t", "^(?!(?:outer adds)$)"]
+    assert merged == {
+        "testResults": [{"name": "/repo/a.test.js"},
+                        {"name": "/repo/b.test.js"}],
+        "numPendingTests": 3,
+    }
 
 
-def test_node_p2p_args_on_the_explicit_branch_anchor_both_halves():
+def test_node_merge_reports_of_a_group_that_wrote_no_report_is_None():
+    """A partial merge would report a green suite for a run half of which
+    produced no evidence. `classify` reads the `None` as KIND_ENVIRONMENT,
+    which is what a group that did not say what it did actually is."""
     adapter = for_framework("jest")
 
-    assert adapter.p2p_args(
-        selected=("tests/b.test.js::keeps working",), scope=(),
-        deselected=("tests/b.test.js::flaky",), ignored=()
-    ) == ["tests/b.test.js", "-t", "^(?!(?:flaky)$)(?:keeps working)$"]
+    merged = adapter.merge_reports([{"testResults": []}, None])
+
+    assert merged is None
+    assert adapter.classify(exit_code=1, stdout="", stderr="",
+                            report=merged).kind == KIND_ENVIRONMENT
 
 
-def test_node_p2p_args_with_no_pattern_at_all_emit_no_dash_t():
-    """A bare scoped run with nothing to deselect. `-t ''` is not the same
-    argv: an empty pattern is a regex matching every name, which is what this
-    run wants and is also indistinguishable from a pattern the builder failed
-    to fill in."""
-    assert for_framework("vitest").p2p_args(
-        selected=(), scope=("tests/", "src/"), deselected=(), ignored=()
-    ) == ["tests/", "src/"]
+def test_node_merge_reports_of_nothing_is_None_not_an_empty_run():
+    """`{"testResults": []}` would be a CLAIM that a run happened and executed
+    nothing, which `classify` reads as KIND_NOTHING_RAN -- a statement about
+    the selection. An empty list of groups is "nobody ran and nobody counted",
+    which is the environment absence."""
+    adapter = for_framework("vitest")
+
+    assert adapter.merge_reports([]) is None
+    assert adapter.classify(exit_code=1, stdout="", stderr="",
+                            report={"testResults": []}
+                            ).kind == KIND_NOTHING_RAN
+
+
+def test_node_merge_reports_omit_the_pending_count_when_a_group_did_not_report_one():
+    """`parse_deselected` then answers `None` -- "nobody counted" -- rather
+    than a sum with a hole in it, which the staleness floor would read as a
+    real number."""
+    adapter = for_framework("jest")
+
+    merged = adapter.merge_reports([
+        {"testResults": [], "numPendingTests": 2},
+        {"testResults": []},
+    ])
+
+    assert "numPendingTests" not in merged
+    assert adapter.parse_deselected(stdout="", report=merged) is None
+
+
+def test_node_merge_reports_of_one_report_return_it_unchanged():
+    """Identity, not a rebuilt copy: a one-group check must leave the report
+    exactly as the framework wrote it, keys this merge drops included."""
+    adapter = for_framework("vitest")
+    report = {"testResults": [], "success": True, "numPendingTests": 0}
+
+    assert adapter.merge_reports([report]) is report
+
+
+def test_node_validate_id_set_no_longer_refuses_a_cross_file_duplicate():
+    """The refusal is gone because the hazard is. Measured 2026-09-02: one
+    positional plus one `-t` runs the named tests of that file only, so
+    `a.test.js::works` and `b.test.js::works` are as unambiguous to the
+    adapter as their id spelling already was.
+
+    The SAME-file case is untouched and is a different problem: two tests
+    sharing a full name in one file collapse to the identical node id string,
+    which no set-level check comparing `(fullName, path)` pairs can see."""
+    for framework in ("vitest", "jest"):
+        assert for_framework(framework).validate_id_set(
+            ("a.test.js::works", "b.test.js::works"), "tests.f2p") is None
 
 
 def test_a_test_name_with_regex_metacharacters_is_escaped_the_JS_way():
@@ -851,7 +1253,8 @@ def test_a_test_name_with_regex_metacharacters_is_escaped_the_JS_way():
     Python's `re.escape` escaped it through 3.6 and a `\\ ` reaching node is a
     pattern that means something different.
     """
-    argv = for_framework("vitest").select_args(("tests/m.test.js::a+b (x) y",))
+    argv = for_framework("vitest").select_argvs(
+        ("tests/m.test.js::a+b (x) y",))[0]
 
     assert argv[-1] == r"^(?:a\+b \(x\) y)$"
 
@@ -899,57 +1302,6 @@ def test_both_node_frameworks_agree_on_the_report_path():
     assert (for_framework("vitest").report_path()
             == for_framework("jest").report_path()
             == "/tmp/bakeoff-run-report.json")
-
-
-def test_node_ignore_flags_are_per_framework_and_jest_keeps_its_default():
-    """`ignored` has exactly ONE caller -- preflight's p2p run at the START
-    state, which the grader never makes -- so the two spellings cannot diverge
-    between a gated and a graded argv.
-
-    Measured 2026-09-02: vitest `--exclude=<path>` and jest
-    `--testPathIgnorePatterns=<path>` both drop the named file. jest's flag
-    REPLACES its built-in `/node_modules/` ignore rather than adding to it, so
-    emitted alone it makes jest collect test files out of node_modules --
-    which, with the runners installed at /node_modules, means jest's own
-    vendored fixtures. The default is therefore re-emitted alongside."""
-    assert for_framework("vitest").p2p_args(
-        selected=(), scope=("tests/",), deselected=(), ignored=("tests/x.js",)
-    ) == ["tests/", "--exclude=tests/x.js"]
-
-    assert for_framework("jest").p2p_args(
-        selected=(), scope=("tests/",), deselected=(), ignored=("tests/x.js",)
-    ) == ["tests/",
-          "--testPathIgnorePatterns=/node_modules/",
-          "--testPathIgnorePatterns=tests/x.js"]
-
-
-def test_jest_does_not_emit_its_default_ignore_when_there_is_nothing_to_ignore():
-    """Emitting it on every run would put a flag in both the gated and the
-    graded argv that changes what jest collects for EVERY task, for the benefit
-    of the one preflight run that uses `ignored`."""
-    assert for_framework("jest").p2p_args(
-        selected=(), scope=("tests/",), deselected=(), ignored=()
-    ) == ["tests/"]
-
-
-def test_the_scope_precedes_the_ignore_flags_and_the_pattern_follows_them():
-    """Measured 2026-09-02, and it is a correctness rule, not a style one.
-    `--testPathIgnorePatterns` is a greedy yargs array: with the positional
-    LAST, `jest --testPathIgnorePatterns=fail.test.js tests/` swallows `tests/`
-    into the ignore list and runs NOTHING -- exit 1, empty `testResults` -- so
-    the p2p check would report a regression suite that executed zero tests.
-    With the positional first it drops the named file and runs the rest.
-
-    The trailing `-t` is safe on the same greedy option because it starts with
-    `-`, which ends the array."""
-    argv = for_framework("jest").p2p_args(
-        selected=(), scope=("tests/",),
-        deselected=("tests/a.test.js::gone",), ignored=("tests/x.js",))
-
-    assert argv == ["tests/",
-                    "--testPathIgnorePatterns=/node_modules/",
-                    "--testPathIgnorePatterns=tests/x.js",
-                    "-t", "^(?!(?:gone)$)"]
 
 
 def test_node_no_cache_args_are_measured_per_framework():

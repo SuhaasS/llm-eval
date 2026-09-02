@@ -3337,3 +3337,133 @@ there does today; one concrete failure mode (a silent `rmtree` failure into
 `finalize_error`-style channel for that phase, which is its own change.
 
 Unit suite: 1554 passed, 62 deselected.
+
+## Round 2 item 1 — a node selection that carries the file half — 2026-09-03
+
+**The defect, measured.** A node id is `<file>::<fullName>` and is
+unambiguous; the selection built from it was not. `select_args` emitted every
+declared file as a positional and ONE `-t` alternation over every declared
+name, ANDed across the whole invocation and never zipped — measured
+2026-09-02 in `bakeoff-eval-agent:base-node-22`, two positionals plus one
+union `-t` over one title from each file executed a THIRD test, on jest and
+vitest alike. `p2p_args`' deselect branch was worse: one negative `-t` over
+the whole declared scope, so a quarantine of `a::works` removed `b::works`
+too, silently, with `p2p_deselected` agreeing because two tests really were
+skipped. Two guards existed to make that safe, and both refused task shapes
+the id spelling already disambiguated. The cost was real: widening
+`eemeli/yaml`'s `tests.paths` from one file to `tests/` gated NO-GO on four
+collisions under `describe('circular references', ...)`, none of them a test
+the manifest named.
+
+**The design.** The adapters now return a SEQUENCE of argvs and `_Runner`
+runs the sequence and merges the reports. A node selection is one argv per
+file; a node deselection is 1 + K — group 0 is the scope with every
+deselected file excluded and no `-t` at all, then one group per such file
+carrying only its own titles. pytest returns exactly one group whose element
+is byte-identical to the argv it always emitted, so
+`test_grading_p2p_with_no_extras_is_the_argv_preflight_validated` — the
+argv-identity gate — stayed green without being edited, which is the property
+that gate exists to have.
+
+**Two framework asymmetries decided the rest, and both are measurements.**
+jest's file positional is a JS `RegExp` tested against BOTH the repo-relative
+and the absolute path, so only `^/repo/<escaped path>$` names one file;
+vitest's is a substring filter no anchoring reaches, and the absolute form
+pulled a tail-colliding file in too. So the per-file filter is per flavour,
+and the vitest trees that cannot be separated are REFUSED per task rather
+than papered over — `ambiguous_file_filters`, computed over the union of
+`files_run` across every node run the gate makes, because `select_argvs`
+groups by file as well and an explicit-`tests.p2p` task makes no scoped run
+at all.
+
+**The jest ignore-flag finding, which changed the plan.**
+`--testPathIgnorePatterns` REPLACES a jest config's own value rather than
+adding to it, and re-emitting `/node_modules/` beside it restores jest's
+BUILT-IN default, never the repository's. `eemeli/yaml` — the corpus's only
+node task — reports `["tests/_utils", "tests/json-test-suite/"]` and no
+`/node_modules/` through its own `--showConfig`, and `tests/_utils` matches
+its `testMatch`. So the flag would have pulled that task's helper modules
+into the regression check at gate time and at grade time alike, where the
+result is `P2P_REGRESSION`, `resolved: False`, on every arm. jest therefore
+emits that flag NOWHERE now: it excludes through two negative lookaheads
+folded into the positional, one per path spelling, with the scope segment
+kept raw behind a `.*` so `scope_files_outside` keeps the semantics it was
+measured against. Reading the effective config back was rejected — the graded
+tree is the tree the model edited, so the argv would become a function of a
+file the model can rewrite.
+
+**What the refusals became.** `node_adapter.validate_id_set` is a no-op with
+a docstring saying why; preflight's `duplicate_full_names` keeps its exact
+string shape and its cross-file meaning as EVIDENCE and is no longer a
+problem; `ambiguous_file_filters` is the new, narrower refusal.
+`PREFLIGHT_VERSION` 14 → 15, `GRADER_VERSION` 9 → 10, `ORACLE_VERSION` 4 → 5,
+each with a changelog paragraph naming what a stored verdict of the older
+number could have been wrong about — including that
+`duplicate_full_names`' CONTENT grows for an unchanged task, because group 0
+now runs the f2p files' siblings unfiltered where the global deselection
+skipped them. `SCHEMA_VERSION` did not move.
+
+**One defect the plan did not have, found by its own verification step.**
+`tests.paths` may name a FILE rather than a directory prefix —
+`yaml-474-single-newline-empty-value` declares
+`["tests/doc/stringify.ts"]`, which is also its only f2p file. Group 0 then
+excluded the whole of its own scope and collected nothing, which both
+frameworks answer with exit 1 and a report of zero tests, and the gate read
+that as "the p2p run the GRADER will make is not green" — a NO-GO on the one
+node task in the corpus. Fixed by dropping scope prefixes that ARE an
+excluded file and omitting group 0 when nothing is left for it to run, but
+only while some other group will run: an empty sequence is what `_Runner.run`
+refuses, and a loud empty invocation is the better failure of the two. Pinned
+by two tests, and the task re-gates PASS in 47 s.
+
+**The K-invocation cost is filed, not hidden.** A node check is now 1 + K
+commands, each carrying its own `timeout <suite_timeout_s>` prefix, so
+`GradeRecord.suite_timeout_s: 600` is true of every command and is NOT the
+check's wall-clock bound. Nothing records K. Splitting the budget across
+groups was rejected for the opposite reason — it would make the gated bound a
+function of the quarantine, so two tasks declaring the same number would get
+different ones. New P2 item in `TASKS.md`.
+
+**Verification.**
+
+- Unit: `1585 passed, 63 deselected` (1554 baseline + 31).
+- `scripts/verify_logger.py`: **GATE PASSED**.
+- `scripts/mutation_check.py`, run solo: **165/165 caught** (164 baseline − 2
+  anchors whose guards are gone, + 3 new). The `if not pattern:` anchor is
+  kept verbatim; its selector moved with the test's name, to the argv-literal
+  assertion — the surviving `count("-t") <= 1` tests would not have failed
+  under it.
+- Integration: `-m integration`, 60 passed, 3 skipped, including a new
+  `task_image` test that builds a fixture with two files carrying the same
+  `fullName`, gates it green, and asserts the duplicate file's tests are in
+  the p2p run's executed set — the thing the global deselection silently
+  removed.
+- **The acceptance, on the task that measured the defect.**
+  `yaml-474-single-newline-empty-value` widened to `["tests/doc/"]`: **PASS**,
+  four collisions recorded under `duplicate_full_names`,
+  `ambiguous_file_filters: []`, 10 files in `scope_files_run`. Widened to
+  `["tests/"]` — the scope whose 2026-09-02 NO-GO is inherited verbatim:
+  **PASS**, the same four collisions, 25 files, nothing outside the scope.
+- No regression on the narrow gated node task (**PASS**, 47 s) or on the
+  vitest task `ufo-214-without-trailing-slash-query` (**PASS**).
+- No pytest verdict moves: `sqlglot-6927-dremio-trycast` re-gated PASS, and
+  the only evidence key this item adds to it is
+  `ambiguous_file_filters: None` — "pytest reports no file list, so nothing
+  was measured".
+- The grader still grades under the new versions: two lines at
+  `grader_version: "10"`, `oracle_version: "5"`,
+  `graded_under_preflight_version: "15"`, `framework: jest`, reference
+  `resolved: true` and empty-patch `grade_failure: empty_patch` — the same
+  verdicts the stored v6 lines carry.
+
+**Left open.** The same-file duplicate `fullName` (item 11) — a same-file
+pair collapses to the identical node id string, so it is a manifest
+REPRESENTATION problem while this was a selection-argv one, and
+`validate_id_set` becoming a no-op is the evidence: a loader comparing
+`(fullName, path)` pairs cannot see a pair whose `path` agrees. K is not
+recorded. `ambiguous_file_filters` is computed against the PREFLIGHT tree, so
+a submission that adds a test file whose path contains a declared one's is
+not caught by it. `CLAUDE.md` is unedited per the round's constraint; the
+three sentences it should gain are in the plan's §6.
+
+Unit suite: 1585 passed, 63 deselected.

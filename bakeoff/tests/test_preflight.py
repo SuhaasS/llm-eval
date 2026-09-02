@@ -608,20 +608,32 @@ def test_a_task_whose_tests_cannot_even_run_is_refused(tmp_path, agent_image):
 
 
 class _Recorder:
-    """Captures the argv preflight would run, without a container."""
+    """Captures the argv preflight would run, without a container.
 
-    def __init__(self):
+    `exits` scripts one exit code per exec, in order, so a test about the
+    MERGED exit code of a multi-command check can state what each command
+    did. The default -- every command exits 0 -- is what every older test
+    here expects. The returned object carries no `duration_ms` on purpose:
+    `_Runner`'s merge defaults it, and a stub that grew the field would hide
+    that.
+    """
+
+    def __init__(self, exits=None):
         self.commands = []
+        self.results = []
+        self._exits = list(exits or ())
 
     def exec(self, cmd, env=None):
         self.commands.append(cmd)
 
         class _R:
-            exit_code = 0
+            exit_code = self._exits.pop(0) if self._exits else 0
             stdout = ""
             stderr = ""
 
-        return _R()
+        result = _R()
+        self.results.append(result)
+        return result
 
 
 class _Tests:
@@ -939,6 +951,14 @@ class _ScriptedContainer:
         self.grading_exits = dict(grading_exits or {})
         self.f2p_runs = 0
         self.scoped_runs = 0
+        #: Which CHECK the node branch is in the middle of, since one node
+        #: check is 1 + K commands. `_f2p_open` is the selection's own flag
+        #: (its groups all carry a `-t` and cannot be told from a deselect
+        #: continuation by shape alone); `_open` names the deselect-branch
+        #: check whose group 0 was last seen. Both are node-only -- the pytest
+        #: scripting emits one command per check and never reads them.
+        self._f2p_open = False
+        self._open = None
         #: Override the default red-before / green-after / p2p-before answers.
         #: Defaults stay the healthy exit-1 task so a test states only the one
         #: thing it is about.
@@ -1106,7 +1126,16 @@ class _ScriptedContainer:
         return _Exec()
 
     def _node_timeout(self, rest):
-        """The same five runs, told apart by a node argv rather than a pytest one.
+        """The same five suite CHECKS, each of which is now one or more commands.
+
+        A node selection is one command per file and a node deselection is
+        1 + K of them, so a fixture keyed on an invocation ORDINAL breaks
+        silently: group 1 of the p2p-BEFORE check would increment `p2p_runs`
+        to 2 and be served the p2p_after report, and every assertion above
+        would still be green over the wrong evidence. Every group of a check
+        is therefore served the SAME report -- the adapter's `merge_reports`
+        is what turns them back into one -- and the counters move once per
+        check.
 
         A separate branch rather than a widened one: the pytest scripting
         above is what `test_grading_p2p_with_no_extras_is_the_argv_preflight_
@@ -1114,29 +1143,54 @@ class _ScriptedContainer:
         through, and a discriminator rewritten to cover both is a gate
         rewritten to accommodate the change it gates.
 
-        The f2p run is recognised by asking the ADAPTER what a selection of
-        the declared ids looks like, rather than by re-deriving it here: a
-        second copy of the argv rule is a second thing that can be wrong about
-        which run a report belongs to, and it would then hand the f2p report
-        to the p2p check. The scoped run is the one carrying a declared prefix
-        as a positional, exactly as on the pytest branch; everything else is
-        a p2p run.
+        The f2p check is recognised by asking the ADAPTER what a selection of
+        the declared ids looks like and matching ANY of its groups, rather
+        than by re-deriving the argv here: a second copy of that rule is a
+        second thing that can be wrong about which run a report belongs to.
+        The other two are told apart by a CHECK BOUNDARY rather than by a
+        count -- a group carrying no `-t` opens a new check, and a group
+        carrying a `-t` and a single file positional continues the open one.
         """
         from bakeoff.runners import for_framework
 
         adapter = for_framework(self.tests.framework)
-        select = adapter.select_args(tuple(self.tests.f2p))
-        if select and rest[:len(select)] == select:
-            self.f2p_runs += 1
+        select = adapter.select_argvs(tuple(self.tests.f2p))
+        if any(group and rest[:len(group)] == group for group in select):
+            # Every group of one selection belongs to the same check; the
+            # check opens on the FIRST of them.
+            opening = not self._f2p_open
+            if opening:
+                self.f2p_runs += 1
+                self._f2p_open = True
             key = "f2p_before" if self.f2p_runs == 1 else "f2p_after"
-        elif any(arg in self.tests.paths for arg in rest):
-            self.scoped_runs += 1
-            key = "scoped"
         else:
-            self.p2p_runs += 1
-            self.p2p_argvs.append(list(rest))
-            key = "p2p_before" if self.p2p_runs == 1 else "p2p_after"
-        report = self.reports.get(key)
+            self._f2p_open = False
+            # Group 0 of a deselect-branch check carries no `-t`; groups 1..K
+            # each carry one plus a single file positional and continue it.
+            opening = "-t" not in rest
+            if any(arg in self.tests.paths for arg in rest):
+                if opening:
+                    self.scoped_runs += 1
+                    self._open = "scoped"
+                key = "scoped"
+            elif not opening and self._open is not None:
+                key = self._open
+            else:
+                self.p2p_runs += 1
+                self.p2p_argvs.append(list(rest))
+                key = "p2p_before" if self.p2p_runs == 1 else "p2p_after"
+                self._open = key
+        #: The scripted report describes what the check's FIRST command ran.
+        #: A continuation group is served an EMPTY report rather than a copy:
+        #: the merge CONCATENATES `testResults`, so re-serving would file the
+        #: same file twice in `files_run` and double every count derived from
+        #: it. Empty is also what these fixtures' continuation groups really
+        #: produce -- each names one deselected file whose only test is the
+        #: one being deselected, so nothing reaches a terminal status. It is
+        #: a dict rather than `None` because `None` is the broken-config
+        #: shape and poisons the whole merge, which a test scripting `None`
+        #: for the key itself still gets.
+        report = self.reports.get(key) if opening else {"testResults": []}
         self._report_text = None if report is None else json.dumps(report)
         # The exit code is DERIVED from the report and is never what a test
         # scripts, because the whole reason this adapter exists is that the
@@ -1636,12 +1690,15 @@ def test_last_timeout_s_is_none_before_any_invocation():
     """`None` is "nobody bounded this", which is a different claim from any
     number -- the same distinction `wire_unattributed` and `cache_state.warm`
     make. A `0` or a fallback to the constructor argument would make "the
-    argv carried no timeout prefix" unrepresentable."""
+    argv carried no timeout prefix" unrepresentable.
+
+    The argument is now a SEQUENCE of argvs, and one empty argv is still one
+    invocation -- `[]` means no groups at all, which `run` refuses."""
     from bakeoff.preflight import _Runner
 
     runner = _Runner(_Recorder(), ("python", "-m", "pytest", "-q"), 1234)
     assert runner.last_timeout_s is None
-    runner.run([])
+    runner.run([[]])
     assert runner.last_timeout_s == 1234
 
 
@@ -2215,10 +2272,22 @@ def test_the_preflight_version_moved_with_the_new_assertion():
     `/repo` -- which on a vitest task is `No test files found` at exit 1, the
     shape a PASS cannot be told apart from (round 2 item 3, 2026-09-03). Both
     caches key through `preflight_cache_key`, so `preflight.json` and
-    `preflight-grade.json` invalidate together."""
+    `preflight-grade.json` invalidate together.
+
+    14 -> 15 is the node per-file selection (round 2 item 1, 2026-09-03), and
+    it moves a cached verdict in BOTH directions. A v14 NO-GO for a cross-file
+    duplicate `fullName` is stale, because that refusal is gone; a v14 PASS on
+    a VITEST task whose executed files include one path contained in another's
+    is stale the other way, because `ambiguous_file_filters` is a new refusal.
+    Between them, the jest positional gained its mount anchor and its escape
+    and jest stopped emitting `--testPathIgnorePatterns` at all. And
+    `duplicate_full_names`' CONTENT grows for an unchanged task -- group 0 now
+    runs the f2p files' siblings unfiltered where v14's global deselection
+    skipped them -- so a reader diffing two cached verdicts across this bump
+    must not read that growth as a regression."""
     from bakeoff.preflight import PREFLIGHT_VERSION
 
-    assert PREFLIGHT_VERSION == "14"
+    assert PREFLIGHT_VERSION == "15"
 
 
 # --- fix 2: the bare-runner probe ---------------------------------------------
@@ -2874,11 +2943,17 @@ def test_the_runner_routes_every_argv_and_verdict_through_its_adapter():
     class _Adapter:
         name = "fake"
 
-        def select_args(self, node_ids):
-            return ["--only", *node_ids]
+        def select_argvs(self, node_ids):
+            return [["--only", *node_ids]]
 
-        def p2p_args(self, *, selected, scope, deselected, ignored):
-            return ["--p2p", *selected, *scope, *deselected, *ignored]
+        def p2p_argvs(self, *, selected, scope, deselected, ignored):
+            return [["--p2p", *selected, *scope, *deselected, *ignored]]
+
+        def merge_reports(self, reports):
+            return None
+
+        def file_filter_matches(self, declared_path, candidate_path):
+            return declared_path == candidate_path
 
         def report_path(self):
             return None
@@ -3121,9 +3196,17 @@ _NODE_F2P = "tests/a.test.js::does a thing"
 
 
 def _node_container(*, f2p_ran=True, scope_names=None, scope_files=None,
-                    p2p=(), runner=("/node_modules/.bin/vitest", "run",
-                                    "--no-cache")):
-    """A vitest task and the container that answers its five suite runs.
+                    p2p=(), framework="vitest", runner=None):
+    """A node task and the container that answers its five suite CHECKS.
+
+    Each check is one or more commands now -- a node selection is one per
+    file and a node deselection is 1 + K -- and the container serves every
+    group of one check the same key. See `_ScriptedContainer._node_timeout`.
+
+    `framework` picks the flavour, and the default `runner` follows it: the
+    gate refuses a manifest whose declared framework and declared argv
+    disagree (`runner_marker`), so the two cannot be varied independently
+    here either.
 
     `f2p_ran=False` is M1's shape verbatim: the declared f2p test is reported
     SKIPPED at exit 0, which is what both frameworks do with a `-t` pattern
@@ -3135,8 +3218,11 @@ def _node_container(*, f2p_ran=True, scope_names=None, scope_files=None,
     each a distinct title so the duplicate-name rule stays quiet and the scope
     rule is the only thing under test.
     """
+    if runner is None:
+        runner = (("/node_modules/.bin/vitest", "run", "--no-cache")
+                  if framework == "vitest" else ("/node_modules/.bin/jest",))
     tests = _FakeTests(paths=("tests/",), runner=runner, f2p=(_NODE_F2P,),
-                       p2p=tuple(p2p), framework="vitest")
+                       p2p=tuple(p2p), framework=framework)
     task = _FakeTask(tests=tests)
 
     if scope_names is not None:
@@ -3228,17 +3314,25 @@ def test_f2p_before_not_run_is_recorded_even_when_everything_ran():
     assert result.evidence["f2p_before_not_run"] == []
 
 
-def test_two_executed_tests_that_share_a_full_name_are_a_problem():
-    """The half the loader cannot see. Its rule covers a collision between two
-    DECLARED ids; this one is between a declared id and a test the manifest
-    never mentions, which only the real report shows. A quarantine of one then
-    silently removes the other from the regression check -- and
-    `p2p_deselected` agrees, because two tests really were skipped."""
+def test_a_cross_file_duplicate_full_name_is_recorded_and_no_longer_a_problem():
+    """This was a NO-GO, and the refusal is gone (round 2 item 1).
+
+    It existed because a quarantine of one test silently removed the other
+    from the regression check: `-t` matched `fullName` and one invocation
+    carried every file. Selection and deselection are now one argv per FILE,
+    each pattern holding only that file's titles, so the hazard is
+    unreachable -- and the collision itself is still a fact about the task, so
+    it stays as EVIDENCE, in the same string shape a v14 verdict carries.
+
+    Measured cost of the old refusal: `eemeli/yaml` at `tests/` gated NO-GO on
+    four collisions under `describe('circular references')`, none of them a
+    test the manifest named, forcing `tests.paths` down to one file.
+    """
     result = _preflight_over(_node_container(
         scope_names=[("tests/a.test.js", "works"), ("tests/b.test.js", "works")]
     ))
 
-    assert not result.ok
+    assert result.ok, result.problems
     assert result.evidence["duplicate_full_names"] == [
         "'works' in tests/a.test.js and tests/b.test.js"]
 
@@ -3429,18 +3523,225 @@ def test_a_pytest_task_records_the_node_keys_as_measured_absences():
     assert result.evidence["scope_files_outside"] is None
 
 
+# --- ambiguous file filters (round 2 item 1) ---------------------------------
+
+
+def test_a_file_filter_that_selects_a_second_executed_file_is_refused():
+    """vitest's positional is a SUBSTRING filter that no anchoring reaches.
+
+    Measured 2026-09-02: `/repo/tests/doc/a.test.js` still matched
+    `/repo/pkg/tests/doc/a.test.js`. The per-file grouping this harness
+    selects and deselects with would then carry a name pattern into a file it
+    does not name -- so a quarantine of `tests/doc/a.test.js::works` would
+    also remove `works` from the colliding file, which is the defect the
+    grouping exists to close, reached one level down.
+
+    Both files are under `tests/`, so `scope_files_outside` stays `[]` and
+    this refusal is the only thing that can fire."""
+    result = _preflight_over(_node_container(scope_files=(
+        "tests/doc/a.test.js", "tests/vendor/tests/doc/a.test.js")))
+
+    assert not result.ok
+    assert result.evidence["scope_files_outside"] == []
+    assert result.evidence["ambiguous_file_filters"] == [
+        "'tests/doc/a.test.js' also selects tests/vendor/tests/doc/a.test.js"]
+    assert any("also selects another executed file" in problem
+               for problem in result.problems)
+
+
+def test_ambiguous_file_filters_cannot_fire_on_jest():
+    r"""jest's positional is a JS RegExp, and the per-file filter is anchored
+    at the mount and escaped -- `^/repo/tests/doc/a\.test\.js$` matched
+    exactly one file (measured 2026-09-02). The same report that refuses a
+    vitest task must therefore pass a jest one, or the refusal is a claim
+    about paths rather than about what a positional does."""
+    result = _preflight_over(_node_container(framework="jest", scope_files=(
+        "tests/doc/a.test.js", "tests/vendor/tests/doc/a.test.js")))
+
+    assert result.ok, result.problems
+    assert result.evidence["ambiguous_file_filters"] == []
+
+
+def test_ambiguous_file_filters_is_measured_off_the_f2p_run_too():
+    """The gap a scoped-only version left. `select_argvs` groups by file as
+    well, so the f2p check carries the same positional -- and a task with an
+    explicit `tests.p2p` makes NO scoped run at all, so a check reading the
+    scoped run alone would be covered by nothing on exactly those tasks."""
+    container, task = _node_container(p2p=("tests/b.test.js::keeps working",))
+    container.reports["f2p_before"] = _node_report(
+        [("tests/a.test.js", [("failed", "does a thing")]),
+         ("pkg/tests/a.test.js", [("passed", "unrelated")])],
+        status="failed",
+    )
+
+    result = _preflight_over((container, task))
+
+    # No scoped run was made at all, which is the whole point of the shape.
+    assert "p2p_scoped_after_exit" not in result.evidence
+    assert result.evidence["duplicate_full_names"] is None
+    assert result.evidence["ambiguous_file_filters"] == [
+        "'tests/a.test.js' also selects pkg/tests/a.test.js"]
+    assert not result.ok
+
+
+def test_ambiguous_file_filters_is_None_when_no_node_run_reported_files():
+    """Two absences, one key. pytest's adapter reports no file list at all,
+    and a node gate whose runs wrote no report measured nothing either --
+    `[]` would say "measured, no filter reaches a second file" for a gate
+    that never looked."""
+    pytest_result = _preflight_over(_pytest_container())
+    assert pytest_result.evidence["ambiguous_file_filters"] is None
+
+    container, task = _node_container()
+    for key in container.reports:
+        container.reports[key] = None
+    node_result = _preflight_over((container, task))
+
+    assert node_result.evidence["ambiguous_file_filters"] is None
+
+
+# --- one check, several commands ---------------------------------------------
+
+
+def test_every_argv_group_carries_the_suite_timeout_prefix():
+    """The bound is PER INVOCATION, so a check that is 1 + K commands is
+    bounded by `suite_timeout_s` x (1 + K) of wall clock. That is the true
+    statement and `GradeRecord.suite_timeout_s` still says what bound each
+    command carried; dividing the budget by K would make the gated bound a
+    function of the quarantine, so two tasks declaring the same number would
+    get different ones."""
+    container, task = _node_container()
+
+    _preflight_over((container, task))
+
+    suite = [cmd for cmd in container.commands
+             if cmd[:1] == ["timeout"] and "--reporter=json" in cmd]
+    assert len(suite) > 5
+    for command in suite:
+        assert command[:2] == ["timeout", "600"], command
+
+
+def test_a_problem_message_names_every_argv_group_that_ran():
+    """A message showing one command of a check that ran three names a
+    command that is not the whole of what happened -- the reconstruction
+    `last_argvs` exists to avoid."""
+    container, task = _node_container()
+    container.reports["scoped"] = _node_report(
+        [("tests/b.test.js", [("failed", "keeps working")])], status="failed")
+
+    result = _preflight_over((container, task))
+
+    problem = next(p for p in result.problems if "the p2p run the GRADER" in p)
+    assert problem.count("\n  timeout 600 ") == 2
+
+
+def test_running_no_argv_groups_raises_rather_than_running_the_bare_runner():
+    """`select_argvs(())` is `[]`. Falling through to the bare runner would
+    execute the WHOLE SUITE as the selection and classify it as one -- green
+    f2p at the start state, or a p2p check over tests nobody selected."""
+    from bakeoff.preflight import _Runner
+
+    runner = _Runner(_Recorder(), ("python", "-m", "pytest", "-q"), 600)
+
+    with pytest.raises(ValueError):
+        runner.run([])
+
+
+def test_running_a_flat_argv_raises_rather_than_splatting_it():
+    """The old signature's shape reaching the new one iterates a list of
+    STRINGS and splats each character into a command made of letters -- which
+    does not fail loudly on either node framework, since both accept an
+    unknown positional by running nothing."""
+    from bakeoff.preflight import _Runner
+
+    runner = _Runner(_Recorder(), ("python", "-m", "pytest", "-q"), 600)
+
+    with pytest.raises(TypeError):
+        runner.run(["--config", "/tmp/nope.mjs"])
+
+
+def test_the_merged_exit_code_prefers_a_timeout_over_an_ordinary_failure():
+    """`grader._TIMEOUT_EXIT` (124) is branched on BEFORE a failure is read,
+    and `timed_out` is a distinct recorded fact. Group 0 of a node deselect
+    run exits 1 whenever its post-exclusion scope is empty (measured), so a
+    "first non-zero wins" merge would report 1 for a check whose second
+    command was killed at the bound."""
+    from bakeoff.preflight import _Runner
+
+    recorder = _Recorder(exits=[1, 124])
+    runner = _Runner(recorder, ("run",), 600)
+
+    assert runner.run([["a"], ["b"]]).exit_code == 124
+
+
+def test_the_merged_exit_code_prefers_an_infra_code_over_an_ordinary_failure():
+    """`grader._INFRA_EXITS` (125/126/127/137) is read before a failure for
+    the same reason: 127 is "no such command", which is an environment
+    problem and not a statement about the code under test."""
+    from bakeoff.preflight import _Runner
+
+    recorder = _Recorder(exits=[1, 127])
+    runner = _Runner(recorder, ("run",), 600)
+
+    assert runner.run([["a"], ["b"]]).exit_code == 127
+
+
+def test_the_merged_exit_code_is_the_first_non_zero_when_none_outrank():
+    """Ordinary codes keep group order, so the first thing that went wrong is
+    what the check reports."""
+    from bakeoff.preflight import _Runner
+
+    recorder = _Recorder(exits=[0, 1, 2])
+    runner = _Runner(recorder, ("run",), 600)
+
+    assert runner.run([["a"], ["b"], ["c"]]).exit_code == 1
+
+
+def test_a_single_group_returns_the_containers_own_result_object():
+    """Identity, so no existing single-command path changes shape: every
+    pytest check is one group, and a rebuilt result there would drop whatever
+    fields the container's own object carries."""
+    from bakeoff.preflight import _Runner
+
+    recorder = _Recorder(exits=[0])
+    runner = _Runner(recorder, ("run",), 600)
+
+    result = runner.run([["a"]])
+
+    assert result is recorder.results[0]
+
+
+def test_last_timeout_s_reads_the_first_group():
+    """`last_argv` is `last_argvs[0]`, derived rather than stored, so the two
+    cannot drift. Every group of one check carries the same prefix, which is
+    what lets the first answer for the check."""
+    from bakeoff.preflight import _Runner
+
+    runner = _Runner(_Recorder(), ("python", "-m", "pytest", "-q"), 1234)
+    runner.run([["a"], ["b"]])
+
+    assert runner.last_argv == runner.last_argvs[0]
+    assert runner.last_timeout_s == 1234
+
+
 def test_the_report_is_deleted_before_every_node_run_and_read_back_after():
     """A config error writes NO file (measured, both frameworks), so a stale
     report from the previous invocation would stand in as this run's evidence
     -- a passing report for a run that never happened. The path is fixed
     because it is an argv element and the gated argv must equal the graded
-    one; the `rm` is what makes a fixed name safe."""
+    one; the `rm` is what makes a fixed name safe.
+
+    PER GROUP, not per check. The five suite checks are eight commands on this
+    task -- the p2p-before, p2p-after and scoped checks each carry a group for
+    the one file holding a deselection -- and group 1 inheriting group 0's
+    report is the same defect one command down: the merge would fold a
+    duplicate of the previous group's evidence in as this group's."""
     container, _ = _node_container()
 
     _preflight_over((container, _FakeTask(tests=container.tests)))
 
-    assert container.report_removals == 5
-    assert container.report_reads == 5
+    assert container.report_removals == 8
+    assert container.report_reads == 8
     for command in container.commands:
         if command[:1] == ["timeout"]:
             assert "--reporter=json" in command, command

@@ -562,7 +562,7 @@ either one catches a typo in the other. `image.node` and `image.python` are
 mutually exclusive — the runtime comes from `tests.framework`, and declaring
 the key belonging to the other one is refused at load. See
 `HARVESTING.md`'s JavaScript screening subsection before cutting one of
-these: the `npm install`/`npm ci` and duplicate-`fullName` rules there are
+these: the `npm install`/`npm ci` and contained-test-path rules there are
 screening decisions, not manifest keys, and nothing downstream catches them.
 
 ### 3.6 Run the gate
@@ -793,7 +793,7 @@ raise.
 | a node task's f2p run exits 0 and reports every test skipped | a `-t` pattern matching no test. vitest and jest have no pytest-style exit 4 for this — measured, both exit **0** with a summary that reads like success. An f2p id typed from the source rather than read from a run (§3.4) is a silent no-op the gate will not catch |
 | a node task's dependency is missing in every arm, and `image.build` reported success | `node_modules` was installed under `/repo`. It is erased by the bind mount at run time — measured — the same way an editable pytest install avoids and a node one has no equivalent escape from; install at the container root instead (`npm install --prefix / --omit=dev <deps>`, HARVESTING.md) |
 | a node task's runner is exit 127 on every arm after a build that reported success | `npm ci` ran at the `/` prefix and deleted the pinned vitest/jest. Its documented contract is to remove `node_modules` before installing, and whether it fires depends on which `package.json`/`package-lock.json` pair npm resolves for the prefix and cwd — a convention that is right only under an unstated cwd. Use `npm install`, never `npm ci`, in `image.build` |
-| a node quarantine removes a test you never named, and `p2p_deselected` agrees | two tests share a `fullName` across files. `-t` matches the name alone and no flag scopes it to a file, so a quarantine of one silently deselects the other too — and the deselection count is not a check, because both really were skipped. Narrow `tests.paths`, or rename one of the titles in the task repo (HARVESTING.md's JavaScript screening subsection) |
+| a node quarantine removes a test you never named, and `p2p_deselected` agrees | on **vitest**, one executed file's repo-relative path is contained in another's. The per-file positional is a substring filter no anchoring reaches, so the group carries its name pattern into the second file. Preflight refuses it as `ambiguous_file_filters`; rename or move one of the files, narrow `tests.paths`, or cut the task on jest (HARVESTING.md's JavaScript screening subsection). A plain cross-file duplicate `fullName` is no longer this failure — since 2026-09-03 a node selection is one invocation per file — and is recorded rather than refused |
 
 ---
 

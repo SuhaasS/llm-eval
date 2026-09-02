@@ -361,22 +361,48 @@ rules, not instead of them.
 
   Anything installed under `/repo` is **erased by the bind mount at run time**
   — measured — and will look like a missing dependency in every arm.
-- **No two tests under `tests.paths` may share a full name.** `-t` matches
-  `fullName` and knows nothing about which file a test came from, and there is
-  no flag that scopes a name pattern to a file. Two `it('works', …)` in two
-  files means a quarantine of one silently removes the other from the
-  regression check — and `p2p_deselected` agrees, because two tests really were
-  skipped. The loader refuses a collision between two *declared* ids; preflight
-  refuses a collision between any two *executed* ones. A repository whose suite
-  genuinely carries duplicate titles within one scope is **excluded**, unless a
-  narrower `tests.paths` separates them. Check before you cut:
+- **Two tests may share a full name across *different* files.** They could not
+  until 2026-09-03: `-t` matches `fullName`, and one invocation carrying every
+  declared file meant a quarantine of `a::works` also removed `b::works`,
+  silently, with `p2p_deselected` agreeing. A node selection is now one
+  invocation **per file**, each pattern holding only that file's titles
+  (measured: one positional plus one `-t` runs the named tests of that file
+  only), so the file half of the id is carried into the argv and the collision
+  is unambiguous. Preflight still **records** every cross-file collision under
+  `duplicate_full_names`; it no longer refuses one.
+
+  Two rules replace that exclusion.
+- **No two test *files* under `tests.paths` may have one repo-relative path
+  contained in another's — on vitest only.** jest's per-file positional is a JS
+  `RegExp` anchored at the mount and escaped, so it names exactly one file;
+  vitest's is a **substring filter no anchoring reaches** — measured
+  2026-09-02, `/repo/tests/doc/a.test.js` still matched
+  `/repo/pkg/tests/doc/a.test.js`. On such a tree the per-file group carries
+  its name pattern into a file it does not name. Preflight refuses it as
+  `ambiguous_file_filters`. Rename or move one of the files, narrow
+  `tests.paths`, or cut the task on jest.
+- **Two tests with the same full name in the *same* file cannot be named as two
+  ids at all.** A node id is `<file>::<fullName>` with no positional index, so
+  the two collapse to one identical string — invisible to the loader and to
+  `duplicate_full_names` alike. Open work, tracked in `TASKS.md`; such a
+  repository is still **excluded**. Check both before you cut:
 
       vitest run --reporter=json --outputFile=/tmp/r.json tests/
-      node -e 'const r=require("/tmp/r.json"),s=new Map();
-        for (const f of r.testResults) for (const a of (f.assertionResults||[]))
-          { if (s.has(a.fullName) && s.get(a.fullName)!==f.name)
-              console.log("DUP:", a.fullName, s.get(a.fullName), f.name);
-            s.set(a.fullName, f.name); }'
+      node -e 'const r=require("/tmp/r.json"),f=r.testResults.map(x=>x.name);
+        for (const t of r.testResults) { const s=new Set();
+          for (const a of (t.assertionResults||[]))
+            { if (s.has(a.fullName))
+                console.log("SAME-FILE DUP:", t.name, a.fullName);
+              s.add(a.fullName); } }
+        for (const a of f) for (const b of f)
+          if (a!==b && b.includes(a)) console.log("CONTAINED PATH:", a, "<", b);'
+- **A jest task’s own `testPathIgnorePatterns` is honoured.** Under
+  `GRADER_VERSION` 10 the harness emits that flag nowhere, so the repository’s
+  configuration decides what jest collects. This is a change from 9, where the
+  one run that used it **replaced** the repository’s list with jest’s built-in
+  default — measured on `eemeli/yaml`, whose config declares `tests/_utils` and
+  `tests/json-test-suite/` and no `/node_modules/` at all, and whose
+  `tests/_utils` helpers match its own `testMatch`.
 - **`tests.runner` must carry the framework's cache flags.** `--no-cache` for
   vitest. Preflight refuses a manifest without them, because vitest writes
   `node_modules/.vite` into the tree and your repo's `.gitignore` hides that
@@ -544,8 +570,8 @@ where `tests.paths: ["tests/doc/stringify.ts"]` still pulled
 `tests/properties.ts` (a `fast-check` property suite elsewhere in the tree)
 into the p2p-before/after checks and NO-GO'd on a missing dependency a
 host-side simulation scoped to `tests/doc/` never exercised. A task author
-narrowing `tests.paths` to dodge a submodule or a duplicate-`fullName`
-problem still has to make the **entire** suite's dependencies installable,
+narrowing `tests.paths` to dodge a submodule still has to make the **entire**
+suite's dependencies installable,
 not just the scoped file's — narrowing `tests.p2p` itself (leaf ids only, per
 the rule above) is the only lever that actually shrinks what gets swept.
 
@@ -740,7 +766,7 @@ Measured 2026-09-02 against real clones on the host (node v24.18.0, npm
 | repo | framework | result | notes |
 |---|---|---|---|
 | unjs/ufo | vitest | cut and gated (`ufo-214-without-trailing-slash-query`): 461 passed / 1 failed at `base_sha` → 462 passed after the fix, 16 s | zero runtime dependencies — no `image.build` needed at all; `/node_modules/.bin` **is** on `PATH` for the `eval` user in the node-22 base image (measured, corrects an earlier assumption written into this task's own dispatch notes) |
-| eemeli/yaml | jest | cut and gated (`yaml-474-single-newline-empty-value`): 216 passed / 1 failed at `base_sha` → 217 passed after the fix, 62 s | four `https://` submodules (`tests/yaml-test-suite`, `tests/json-test-suite`, `docs-slate`, `playground`), all populated by the harness's own submodule derivation (broadening 6); `image.build` must install `babel-jest@30` + the `@babel/*` transform chain + a custom resolver **and** `fast-check`, because an unscoped p2p sweep (`tests.p2p` empty) is not narrowed by a narrow `tests.paths` and still collects `tests/properties.ts`; cross-file duplicate `fullName`s under `tests/doc/` (four, all under `describe('circular references', ...)`) force `tests.paths` down to one file |
+| eemeli/yaml | jest | cut and gated (`yaml-474-single-newline-empty-value`): 216 passed / 1 failed at `base_sha` → 217 passed after the fix, 62 s | four `https://` submodules (`tests/yaml-test-suite`, `tests/json-test-suite`, `docs-slate`, `playground`), all populated by the harness's own submodule derivation (broadening 6); `image.build` must install `babel-jest@30` + the `@babel/*` transform chain + a custom resolver **and** `fast-check`, because an unscoped p2p sweep (`tests.p2p` empty) is not narrowed by a narrow `tests.paths` and still collects `tests/properties.ts`; cross-file duplicate `fullName`s under `tests/doc/` (four, all under `describe('circular references', ...)`) **forced** `tests.paths` down to one file until 2026-09-03, when node selection became per-file and that refusal was removed — they are recorded as `duplicate_full_names` evidence now, and a wider `tests.paths` is admissible |
 | moment/luxon | jest | rejected at first screen: 31 unrelated failures without `TZ=America/New_York` set, 1 (the real f2p) with it — `TZ` was not in the `image.env` allowlist | **usable now**: "feat: a suite that pins TZ is a task, not a rejection" added `TZ` to `tasks._IMAGE_ENV_ALLOWED`; not yet re-screened against a live gate |
 
 Two things worth carrying into any future node task, neither specific to one

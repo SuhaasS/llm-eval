@@ -300,15 +300,34 @@ class PytestAdapter:
     #: .gitignore already hides from that check.
     no_cache_args = ("-p", "no:cacheprovider")
 
-    def select_args(self, node_ids):
-        return list(node_ids)
+    def select_argvs(self, node_ids):
+        # EXACTLY ONE group, and its element is byte-identical to the argv
+        # this adapter emitted before the node grouping landed. The node
+        # adapters need one invocation per file because `-t` matches by name
+        # alone; a pytest node id carries its own file, so a second group
+        # here would be a second suite run for nothing.
+        return [list(node_ids)] if node_ids else []
 
-    def p2p_args(self, *, selected, scope, deselected, ignored):
+    def p2p_argvs(self, *, selected, scope, deselected, ignored):
         out = list(selected) if selected else list(scope)
         for node_id in deselected:
             out += ["--deselect", node_id]
         out += [f"--ignore={path}" for path in ignored]
-        return out
+        return [out]
+
+    def merge_reports(self, reports):
+        # `None`, and it is a CLAIM rather than a gap: pytest writes no
+        # machine-readable report at all (`report_path()` is `None`), so
+        # there is nothing to fold and never will be. `_Runner` reads this
+        # only when `report_path()` is set, so this branch answers direct
+        # callers and the protocol's own test.
+        return None
+
+    def file_filter_matches(self, declared_path, candidate_path):
+        # pytest's positional IS a path, so two distinct paths never collide
+        # and this can never fire. It exists so the ambiguity check reads one
+        # rule for every framework.
+        return declared_path == candidate_path
 
     def report_args(self, report_path):
         # pytest's evidence is its exit code and its `-q` summary lines. A

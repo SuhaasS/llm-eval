@@ -245,7 +245,17 @@ from bakeoff.tasks import (
 #: that, and `scripts/grade.py`'s resume key is (run_id, GRADER_VERSION)
 #: ALONE -- so without the bump those lines are never revisited and the
 #: accusation stands permanently in an append-only file.
-GRADER_VERSION: str = "9"
+#: 9 -> 10: the GRADED ARGV changed for a node task, in three ways (round 2
+#: item 1, 2026-09-03). The deselect branch is now 1 + K commands whose
+#: deselections no longer cross files; the jest per-file positional is
+#: mount-anchored and escaped, where before it could match a second file; and
+#: jest no longer emits `--testPathIgnorePatterns` at all, which under 9
+#: REPLACED the repository's own ignore list on the one run that used it. A
+#: grade produced under 9 for a node task was made against a regression check
+#: from which identically-titled tests in other files had been silently
+#: removed, so `p2p_failed_node_ids` and `resolved` can both differ. No pytest
+#: grade changes: that adapter emits one group whose argv is the v9 argv.
+GRADER_VERSION: str = "10"
 
 #: Wall clock for the HOST-side gitleaks scan, and for nothing else.
 #: `_ContainerEnv.scan_secrets` shells out to `docker run` rather than through

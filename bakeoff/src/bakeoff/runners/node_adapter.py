@@ -34,15 +34,33 @@ would be a second thing that can be wrong about what happened. `testExecError`
 is documented by jest and did NOT appear in any measured report, so nothing
 here depends on it either.
 
-THE FILE HALF OF A NODE ID IS THROWN AWAY when a name pattern is built, and two
-guards elsewhere are what make that safe. `-t` matches `fullName` and no flag
-scopes a name pattern to a file, so two tests sharing a name across files are
-indistinguishable to a selection or a deselection: a quarantine of one silently
-removes the other, with the deselection count agreeing because two tests really
-were skipped. `validate_id_set` refuses a manifest whose declared ids collide,
-and preflight asserts against the real report that no two EXECUTED tests under
-`tests.paths` share a name -- which is the half a loader cannot see, and the
-half where the collision is with a test the manifest never mentions.
+THE FILE HALF OF A NODE ID IS CARRIED BY THE GROUPING, because it cannot be
+carried by the pattern. `-t` matches `fullName` and no flag scopes a name
+pattern to a file: measured 2026-09-02, two positionals plus one union `-t`
+over one title from each file executed a THIRD test -- the positionals and the
+name pattern are ANDed across the whole invocation, never zipped, on jest and
+vitest alike. So a selection is one argv PER FILE, each pairing that file's
+positional with a pattern over only that file's titles, and a deselection is
+1 + K argvs: group 0 is the scope with every file holding a deselection
+excluded and no `-t` at all, then one group per such file carrying only its own
+deselected titles. Measured, one positional plus one `-t` pairs exactly.
+
+TWO FRAMEWORK ASYMMETRIES DECIDE THE ARGV, and both were measured rather than
+assumed. First, the per-file positional: jest's is a JavaScript `RegExp` tested
+against BOTH the repo-relative path and the absolute one, so a mount-anchored,
+escaped, `$`-terminated pattern names exactly one file -- while vitest's is a
+substring filter no anchoring reaches (`/repo/tests/doc/a.test.js` still
+matched `/repo/pkg/tests/doc/a.test.js`). Preflight refuses the vitest trees
+that cannot be separated; `file_filter_matches` is that predicate. Second, the
+exclusion channel: jest's `--testPathIgnorePatterns` REPLACES the repository's
+own value while vitest's `--exclude` adds to it, so jest excludes through two
+negative lookaheads folded into the positional -- one per path spelling -- and
+this module emits that flag nowhere.
+
+What a LOADER can still not see is a collision between a declared id and a test
+the manifest never mentions; preflight records those as `duplicate_full_names`
+against the real report, as evidence rather than as a refusal, since the
+per-file grouping is what made the hazard they named unreachable.
 
 The eight report shapes this module branches on are committed under
 `tests/fixtures/node_reports/` with the argv each came from; see the README
@@ -52,7 +70,7 @@ one needs a Docker daemon, a network and 73 MB of npm.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from bakeoff.runners import (
     KIND_ENVIRONMENT,
@@ -166,10 +184,10 @@ class _NodeFlavour:
     """One node framework. The classifier is shared; only the argv differs.
 
     A dataclass rather than two subclasses because everything that differs
-    between vitest and jest is a string: the report flag, the ignore flag, and
-    whether that flag needs jest's built-in `/node_modules/` rule re-emitted
-    beside it. A second class would be a second place for the classification to
-    drift, on frameworks whose report shapes were measured to agree.
+    between vitest and jest is a string or a flag: the report flag, the
+    exclusion flag, and whether the file positional is a regex. A second class
+    would be a second place for the classification to drift, on frameworks
+    whose report shapes were measured to agree.
     """
 
     name: str
@@ -180,12 +198,17 @@ class _NodeFlavour:
     no_cache_args: tuple[str, ...]
     #: The flag that turns the machine-readable report on.
     _report_flag: str
-    #: The per-file exclusion flag. One caller: preflight's p2p run at the
-    #: START state, which the grader never makes -- so the two spellings
-    #: cannot diverge between a gated and a graded argv.
-    _ignore_flag: str
-    #: Emitted before the ignored paths, and only when there are any.
-    _ignore_prefix: tuple[str, ...] = field(default=())
+    #: The per-file exclusion flag, VITEST ONLY, and empty on jest -- whose own
+    #: `--testPathIgnorePatterns` REPLACES the repository's configuration rather
+    #: than adding to it (measured; see `_exclude_args`). Defaulted because jest
+    #: no longer carries one; `_exclude_args` guards on the flavour and never on
+    #: the emptiness of this string, so a flavour that forgot to set it emits
+    #: nothing rather than `=<path>`.
+    _ignore_flag: str = ""
+    #: Whether the file positional is a JS RegExp (jest) or a substring filter
+    #: (vitest). AFTER every field without a default, or the dataclass raises at
+    #: import.
+    _file_filter_is_regex: bool = False
 
     # -- argv --------------------------------------------------------------
 
@@ -206,75 +229,188 @@ class _NodeFlavour:
         prefix = _REPO_MOUNT + "/"
         return name[len(prefix):] if name.startswith(prefix) else name
 
-    def _files(self, node_ids: tuple[str, ...]) -> list[str]:
-        """The distinct file halves, in first-seen order.
+    def _file_filter(self, path: str) -> str:
+        # jest: a JS RegExp tested against BOTH the repo-relative and the
+        # absolute path, so only a mount-anchored, escaped, `$`-terminated
+        # pattern names one file. Measured 2026-09-02: `tests/doc/a.test.js$`
+        # also matched `/repo/pkg/tests/doc/a.test.js`, and an unescaped
+        # `^/repo/tests/v1.2/a.test.js$` also matched `tests/v1X2/a.test.js`.
+        # vitest: a substring filter no anchoring reaches -- the absolute form
+        # matched the tail-colliding file too -- so the bare relative path is
+        # the honest spelling and preflight refuses the trees it cannot
+        # separate.
+        if self._file_filter_is_regex:
+            return "^" + _js_escape(_REPO_MOUNT + "/" + path) + "$"
+        return path
 
-        Deduplicated because a repeated positional is not harmless: jest's
-        positional is a REGEX over the absolute path and vitest's is a
-        substring filter, so a duplicate is a second pattern that has to agree
-        with the first -- and because the argv is what the gated/graded
-        byte-identity property is stated over.
+    def file_filter_matches(self, declared_path: str, candidate_path: str) -> bool:
+        if self._file_filter_is_regex:
+            return candidate_path == declared_path
+        return declared_path in candidate_path
+
+    def _group_by_file(self, node_ids) -> list[tuple[str, list[str]]]:
+        """`(file, titles)` in first-seen order, split once from the LEFT.
+
+        A JavaScript title may itself contain `::`, which is why this is
+        `partition` and not `rsplit` -- the same rule `module_of` states.
         """
-        seen, out = set(), []
+        groups: dict[str, list[str]] = {}
         for node_id in node_ids:
-            path = node_id.partition("::")[0]
-            if path not in seen:
-                seen.add(path)
-                out.append(path)
-        return out
+            path, _, title = node_id.partition("::")
+            groups.setdefault(path, []).append(title)
+        return list(groups.items())
 
-    def _names(self, node_ids: tuple[str, ...]) -> list[str]:
-        # The FILE half is thrown away here, and two guards elsewhere are what
-        # make that safe: `-t` matches `fullName` and no flag scopes a name
-        # pattern to a file, so two tests sharing a name across files are
-        # indistinguishable to a selection or a deselection. The loader refuses
-        # a manifest whose declared ids collide (`validate_id_set`), and
-        # preflight asserts against the real report that no two EXECUTED tests
-        # under `tests.paths` share a name -- which is the half a loader cannot
-        # see. See the plan's D2.
-        return [_js_escape(node_id.partition("::")[2]) for node_id in node_ids]
+    def _titles_in(self, node_ids, path: str) -> list[str]:
+        """The ESCAPED titles of `node_ids` that live in `path`, in order."""
+        return [_js_escape(title)
+                for other, titles in self._group_by_file(node_ids)
+                if other == path
+                for title in titles]
 
-    def select_args(self, node_ids):
-        if not node_ids:
-            # NOT `^(?:)$`, which matches the empty name and nothing else --
-            # M1's silent hole, reached with a pattern this adapter wrote
-            # itself. An empty selection has no argv; the caller's own branch
-            # decides whether that is legal.
+    def _exclude_args(self, paths) -> list[str]:
+        # vitest ONLY. Measured 2026-09-02: vitest's `--exclude` is additive to
+        # the config's `test.exclude`, while jest's `--testPathIgnorePatterns`
+        # REPLACES the config's -- and `eemeli/yaml`, the corpus's only node
+        # task, declares `["tests/_utils", "tests/json-test-suite/"]` and no
+        # `/node_modules/`, so the flag would pull its helper modules (which
+        # match its own `testMatch`) into the regression check at gate time and
+        # at grade time alike. The bare relative path, never `**/<path>`:
+        # measured, the glob form also drops a second file whose path ends the
+        # same way, which is the defect this module exists to close.
+        if self._file_filter_is_regex or not paths:
             return []
-        return [*self._files(node_ids), "-t",
-                "^(?:" + "|".join(self._names(node_ids)) + ")$"]
+        return [f"{self._ignore_flag}={path}" for path in paths]
 
-    def p2p_args(self, *, selected, scope, deselected, ignored):
-        # ONE `-t`, always, and never two. Measured 2026-09-02: vitest
-        # REJECTS a second occurrence (`Expected a single value for option
-        # "-t, --testNamePattern <pattern>", received ["a", "b"]`, exit 1, and
-        # no report file), while jest COMMA-JOINS them into `adds,subs` -- a
-        # regex matching neither test -- and exits 0 having run nothing. So
-        # emitting a selection pattern and a deselection pattern separately is
-        # a hard failure on one framework and a silent empty run on the other.
-        #
-        # The ORDER below is a correctness rule too, not a style one. jest's
-        # `--testPathIgnorePatterns` is a greedy yargs array: measured, with
-        # the positional LAST it swallows `tests/` into the ignore list and
-        # runs NOTHING at exit 1 with an empty `testResults`, which is the p2p
-        # check reporting a regression suite that executed zero tests. The
-        # scope therefore precedes the flags. The trailing `-t` is safe on the
-        # same greedy option because it starts with `-`, which ends the array.
-        head = self._files(selected) if selected else list(scope)
-        if ignored:
-            head += list(self._ignore_prefix)
-            head += [f"{self._ignore_flag}={path}" for path in ignored]
-        pattern = ""
-        if deselected:
-            pattern += "(?!(?:" + "|".join(self._names(deselected)) + ")$)"
-        if selected:
-            pattern += "(?:" + "|".join(self._names(selected)) + ")$"
+    def _scope_positionals(self, scope, excluded) -> list[str]:
+        """Group 0's positionals: the declared prefixes, minus these files.
+
+        `scope` arrives already stripped of any prefix that IS an excluded
+        file, because such a prefix collects nothing at all (see `p2p_argvs`).
+        Byte-identical to `list(scope)` whenever nothing is excluded, and on
+        vitest always -- there the exclusion is `_exclude_args`' job.
+
+        On jest the exclusion is a negative lookahead folded in here, TWO per
+        file, because jest tests a positional against the repo-relative path
+        AND the absolute one and collects the file if either matches: measured
+        2026-09-02, a lookahead naming only the absolute spelling did not
+        exclude, and one naming only the relative spelling did not either.
+
+        The scope segment stays the RAW declared prefix behind a `.*`, never
+        anchored at the mount, because `scope_files_outside` is a claim about
+        what that exact string matches -- measured, `vitest run tests/` matched
+        `/repo/jtests/fail.test.cjs` and jest's `tests/` matched
+        `/repo/pkg/tests/doc/...`. Measured both ways here too:
+        `^(?!<rel>$)(?!<abs>$).*tests/` excludes the named file and still runs
+        `pkg/tests/doc/...`, while `^(?!<abs>$)/repo/tests/` excludes both and
+        would make that check unable to fire.
+        """
+        if not excluded or not self._file_filter_is_regex:
+            return list(scope)
+        guard = "^" + "".join(
+            f"(?!{_js_escape(path)}$)"
+            f"(?!{_js_escape(_REPO_MOUNT + '/' + path)}$)"
+            for path in excluded
+        )
+        return [guard + ".*" + prefix for prefix in scope] or [guard + ".*"]
+
+    def _argv(self, head, pattern) -> list[str]:
+        # `-t ''` is not the same argv. An empty pattern matches every name,
+        # which is what group 0 of the deselect branch wants -- and is also
+        # exactly what a builder that failed to fill the pattern in would emit.
         if not pattern:
-            # `-t ''` is not the same argv. An empty pattern matches every
-            # name, which is what this run wants -- and is also exactly what a
-            # builder that failed to fill the pattern in would emit.
-            return head
+            return list(head)
         return [*head, "-t", "^" + pattern]
+
+    def select_argvs(self, node_ids):
+        # ONE ARGV PER FILE. Measured 2026-09-02: two positionals plus one
+        # union `-t` executed a third test, declared for neither pairing --
+        # `-t` matches `fullName` and the positionals are ANDed across the
+        # whole invocation, never zipped. An empty selection is NO GROUPS, not
+        # an argv with no filter: `_Runner.run` raises on it, because falling
+        # through would run the whole suite as the selection.
+        return [self._argv([self._file_filter(path)],
+                           "(?:" + "|".join(_js_escape(t) for t in titles) + ")$")
+                for path, titles in self._group_by_file(node_ids)]
+
+    def p2p_argvs(self, *, selected, scope, deselected, ignored):
+        # The ORDER inside group 0 is a correctness rule, not a style one.
+        # jest's `--testPathIgnorePatterns` was a greedy yargs array: measured,
+        # with the positional LAST it swallowed `tests/` into the ignore list
+        # and ran NOTHING at exit 1 with an empty `testResults`. jest emits no
+        # such flag any more, but vitest's `--exclude` sits in the same place
+        # and the scope therefore still precedes the flags. The trailing `-t`
+        # is safe on a greedy option because it starts with `-`, which ends
+        # the array.
+        if selected:
+            groups = []
+            for path, titles in self._group_by_file(selected):
+                # A file in `ignored` gets no group at all -- that flag's one
+                # caller is preflight's p2p run at the START state, whose whole
+                # point is that the f2p module must not be collected.
+                if path in ignored:
+                    continue
+                pattern = ""
+                drop = self._titles_in(deselected, path)
+                if drop:
+                    pattern += "(?!(?:" + "|".join(drop) + ")$)"
+                pattern += "(?:" + "|".join(_js_escape(t) for t in titles) + ")$"
+                groups.append(self._argv([self._file_filter(path)], pattern))
+            return groups
+        dfiles = [path for path, _ in self._group_by_file(deselected)
+                  if path not in ignored]
+        excluded = [*ignored, *dfiles]
+        # A `tests.paths` entry may be a FILE rather than a directory prefix
+        # -- `yaml-474-single-newline-empty-value` declares
+        # `["tests/doc/stringify.ts"]`, which is also its only f2p file. Group
+        # 0 then excludes the whole of its own scope and collects nothing:
+        # measured 2026-09-02, both frameworks answer that with exit 1 and a
+        # report of ZERO tests, so a check that emitted it would report the
+        # regression suite as not green on a task that is fine. Those prefixes
+        # are dropped, and group 0 with them when nothing is left for it to
+        # run -- but only while some other group will run, because an empty
+        # SEQUENCE is what `_Runner.run` refuses, and a loud empty invocation
+        # is the better failure of the two.
+        remaining = [prefix for prefix in scope if prefix not in excluded]
+        # Group 0: everything under scope EXCEPT the files holding a
+        # deselection, and no `-t` at all. Then one group per such file,
+        # carrying only that file's own deselected titles -- which is what
+        # keeps a quarantine of `a::works` off `b::works`.
+        groups = []
+        if remaining or not scope or not dfiles:
+            head = [*self._scope_positionals(remaining, excluded),
+                    *self._exclude_args(excluded)]
+            groups.append(self._argv(head, ""))
+        for path in dfiles:
+            drop = self._titles_in(deselected, path)
+            groups.append(self._argv([self._file_filter(path)],
+                                     "(?!(?:" + "|".join(drop) + ")$)"))
+        return groups
+
+    def merge_reports(self, reports):
+        """One report per argv group, folded into one. See the plan's D5.
+
+        `None` for an EMPTY list and for any list holding a `None`: nobody ran
+        and nobody counted, versus a group that produced no evidence at all. A
+        `{"testResults": []}` would be a CLAIM that a run happened and executed
+        nothing, which `classify` reads as KIND_NOTHING_RAN rather than as the
+        environment problem a missing report is.
+
+        Only `testResults` and `numPendingTests` survive. `success` most of all
+        is dropped: `classify` already refuses to consult it (jest reports
+        `success: true` while exiting 1 on "no test files matched", and vitest
+        reports `false` for the same run), and a scalar carried over from one
+        group is a value no invocation produced.
+        """
+        if not reports or any(report is None for report in reports):
+            return None
+        if len(reports) == 1:
+            return reports[0]
+        merged = {"testResults": [entry for report in reports
+                                  for entry in (report.get("testResults") or [])]}
+        pending = [report.get("numPendingTests") for report in reports]
+        if all(isinstance(count, int) for count in pending):
+            merged["numPendingTests"] = sum(pending)
+        return merged
 
     def report_args(self, report_path):
         return [self._report_flag, f"--outputFile={report_path}"]
@@ -477,43 +613,23 @@ class _NodeFlavour:
             )
 
     def validate_id_set(self, node_ids, where):
-        """No two declared ids may share a full name across different files.
+        """Nothing, and the emptiness is the finding rather than a gap.
 
-        `-t` matches `fullName` and knows nothing about which file a test came
-        from: the file positionals and the name pattern are ANDed across the
-        whole run, never paired, and no flag scopes a name to a file. So a
-        quarantine of `a.test.js::works` ALSO deselects `b.test.js::works` --
-        silently, with `p2p_deselected` agreeing, because two tests really were
-        skipped -- and a selection of `a.test.js::works` plus
-        `b.test.js::other` also runs `b.test.js::works`.
+        This is where two declared ids sharing a `fullName` across different
+        files were refused, because `-t` matches by name alone. They are not
+        refused any more: a selection is one argv per FILE and each pattern
+        holds only that file's titles, so `a.test.js::works` and
+        `b.test.js::works` are as unambiguous to this adapter as their id
+        spelling already was. Measured 2026-09-02: one positional plus one
+        `-t` runs the named tests of that file only.
 
-        This is the half an author can create. The half that matters more is a
-        collision between a declared id and a test the manifest never mentions,
-        which no loader can see; preflight asserts that against the real report
-        of the scoped run.
-
-        Per-file invocations would pair them exactly and are rejected: they
-        multiply every gated and graded suite run by the number of distinct
-        files, change what the framework collects, and turn the gated argv into
-        a LIST of argvs, which the byte-identity property is not stated over.
+        The same-file case is a different problem and is NOT this method's:
+        two tests sharing a full name in ONE file collapse to the identical
+        node id string, so a set-level check comparing `(fullName, path)`
+        pairs cannot see them at all. That is a manifest-representation gap,
+        tracked in `TASKS.md`.
         """
-        from bakeoff.tasks import TaskError
-
-        by_name: dict[str, str] = {}
-        for node_id in node_ids:
-            path, _, title = node_id.partition("::")
-            first = by_name.setdefault(title, path)
-            if first != path:
-                raise TaskError(
-                    f"{where}: {title!r} is the full name of a test in both "
-                    f"{first!r} and {path!r}. {self.name} selects and "
-                    "deselects by name alone -- there is no flag that scopes a "
-                    "name pattern to a file -- so a quarantine of one would "
-                    "silently remove the other from the regression check, and "
-                    "the deselection count would agree. Rename one of them in "
-                    "the task repo, or narrow tests.paths so only one is in "
-                    "scope; see taskset/HARVESTING.md"
-                )
+        return None
 
     def hypothesis_interpreter(self, runner):
         # `None`, so preflight skips the whole block and leaves both evidence
@@ -552,19 +668,23 @@ VITEST = _NodeFlavour(
     _ignore_flag="--exclude",
 )
 
-#: jest's `--testPathIgnorePatterns` REPLACES its built-in `/node_modules/`
-#: ignore rather than adding to it, so emitted alone it makes jest collect test
-#: files out of `node_modules` -- which, with the runners installed at
-#: `/node_modules` (D4), means jest's own vendored fixtures. The default is
-#: re-emitted alongside, and only when `ignored` is non-empty: emitting it on
-#: every run would put a flag in both the gated and the graded argv that
-#: changes what jest collects for EVERY task, for the benefit of the one
-#: preflight run that uses `ignored`.
+#: jest carries NO exclusion flag, and that is a measurement rather than an
+#: omission. `--testPathIgnorePatterns` REPLACES the repository's own value
+#: instead of adding to it (measured 2026-09-02), and re-emitting
+#: `/node_modules/` beside it restores jest's BUILT-IN default rather than
+#: anything the repository declared -- `eemeli/yaml`, the corpus's only node
+#: task, reports `testPathIgnorePatterns: ["tests/_utils",
+#: "tests/json-test-suite/"]` and no `/node_modules/` at all through its own
+#: `--showConfig`, and `tests/_utils` matches its `testMatch`. So the flag
+#: would pull that task's helper modules into the regression check on every
+#: gated and graded p2p run. jest excludes through negative lookaheads folded
+#: into the positional instead (`_scope_positionals`), which touches no
+#: configuration. `_file_filter_is_regex` is jest's other half: its positional
+#: is a JS RegExp over the file path, so it can be anchored exactly.
 JEST = _NodeFlavour(
     name="jest",
     runner_marker="jest",
     no_cache_args=(),
     _report_flag="--json",
-    _ignore_flag="--testPathIgnorePatterns",
-    _ignore_prefix=("--testPathIgnorePatterns=/node_modules/",),
+    _file_filter_is_regex=True,
 )

@@ -1870,7 +1870,10 @@ MUTATIONS = [
         "src/bakeoff/runners/node_adapter.py",
         "        if not pattern:",
         "        if True:",
-        "tests/test_runners.py -k ONE_pattern",
+        # The selector moved with the test's name in round 2 item 1: the
+        # argv-literal assertion is what fails when `-t` stops being emitted
+        # at all, and the surviving `count("-t") <= 1` tests would not.
+        "tests/test_runners.py -k first_seen_order",
         "not integration",
     ),
     (
@@ -1899,27 +1902,44 @@ MUTATIONS = [
         "not integration",
     ),
     (
-        # `-t` matches `fullName` and no flag scopes a name pattern to a file,
-        # so a quarantine of one of two same-named tests silently deselects
-        # both -- with `p2p_deselected` AGREEING, because two tests really were
-        # skipped. This is the half no loader can see: the collision is with a
-        # test the manifest never mentions.
-        "preflight: let one quarantine silently deselect two tests",
-        "src/bakeoff/preflight.py",
-        "                    if duplicates:",
-        "                    if False:",
-        "tests/test_preflight.py -k share_a_full_name",
+        # Measured 2026-09-02: jest's positional is a JS RegExp tested against
+        # BOTH the repo-relative path and the absolute one, so only a
+        # mount-anchored, escaped, `$`-terminated pattern names one file --
+        # `tests/doc/a.test.js$` also matched `/repo/pkg/tests/doc/a.test.js`.
+        # The mutant is the vitest spelling on jest: the group's name pattern
+        # then reaches a second file, which is the defect the per-file
+        # grouping exists to close, one level down.
+        "runners: spell the jest file filter so it can match a second file",
+        "src/bakeoff/runners/node_adapter.py",
+        '            return "^" + _js_escape(_REPO_MOUNT + "/" + path) + "$"',
+        "            return path",
+        "tests/test_runners.py -k mount_anchored",
         "not integration",
     ),
     (
-        # The half a loader CAN see, and the one an author creates. Two
-        # declared ids sharing a full name across files are indistinguishable
-        # to a selection and to a deselection alike.
-        "tasks: accept two declared ids that share a full name",
+        # Group 0 of a deselect-branch run is the scope MINUS every file
+        # holding a deselection; each such file then gets its own group with
+        # only its own titles. Drop the files from `excluded` and group 0 runs
+        # them unfiltered beside their own group -- every deselected test runs
+        # after all, in a check whose whole purpose is to leave it out.
+        "runners: let a deselected file also run unfiltered in the scope group",
         "src/bakeoff/runners/node_adapter.py",
-        "            if first != path:",
-        "            if False:",
-        "tests/test_tasks.py -k sharing_a_full_name",
+        "        excluded = [*ignored, *dfiles]",
+        "        excluded = [*ignored]",
+        "tests/test_runners.py -k own_group",
+        "not integration",
+    ),
+    (
+        # vitest's positional is a SUBSTRING filter no anchoring reaches, so
+        # one executed file's path contained in another's makes the per-file
+        # group select both -- and the group's negative `-t` then deselects
+        # the colliding file's same-named tests. Refused per task, because it
+        # cannot be closed in the argv.
+        "preflight: accept a file filter that selects a second executed file",
+        "src/bakeoff/preflight.py",
+        "    if ambiguous:",
+        "    if False:",
+        "tests/test_preflight.py -k selects_a_second_executed_file",
         "not integration",
     ),
     (

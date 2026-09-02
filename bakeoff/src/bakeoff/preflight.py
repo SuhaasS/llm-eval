@@ -187,7 +187,28 @@ _PYTEST_ADAPTER = for_framework("pytest")
 #: `preflight.json` (run_matrix) and `preflight-grade.json` (grade.py)
 #: invalidate together -- one offline re-gate per task per driver, no
 #: credentials and no spend.
-PREFLIGHT_VERSION: str = "14"
+#: 14 -> 15: node selection and deselection became per-file (round 2 item 1,
+#: 2026-09-03), and four things about a cached v14 verdict follow from it.
+#: (1) A v14 NO-GO for a cross-file duplicate `fullName` is STALE: that
+#: refusal is gone, because `-t` now runs paired with one file's positional
+#: and a quarantine of `a::works` cannot reach `b::works`. (2) The jest
+#: per-file positional gained its mount anchor and its escape, and jest
+#: stopped emitting `--testPathIgnorePatterns` at all -- so a v14 verdict was
+#: taken with a filter that could match a second file, and on the one run that
+#: used `ignored`, with the repository's own ignore list REPLACED by the
+#: flag. (3) `ambiguous_file_filters` is a new refusal, so a v14 PASS on a
+#: VITEST task whose executed files include one path contained in another's is
+#: stale in the other direction. (4) `duplicate_full_names`' CONTENT grows for
+#: an unchanged task: under v14 the scoped run deselected every f2p title
+#: globally, so an identically-titled test in another file never reached a
+#: terminal status and never entered `executed_names`; under v15 group 0 runs
+#: those files unfiltered and the key lists collisions the v14 verdict for the
+#: identical task did not. The key's shape and meaning are unchanged -- what
+#: changed is what the gate could see -- so a reader diffing two cached
+#: verdicts across this bump must not read that growth as a regression.
+#: No pytest verdict moves: `pytest_adapter` emits one group whose argv is the
+#: v14 argv, and `file_filter_matches` cannot fire there.
+PREFLIGHT_VERSION: str = "15"
 
 
 def preflight_cache_key(task, image: str, start_sha: str) -> str:
@@ -557,6 +578,64 @@ def _declared_grading(task) -> list[tuple[str, tuple[str, ...]]]:
     ]
 
 
+#: Exit codes that OUTRANK an ordinary test failure when one check is several
+#: commands. `grader._check_f2p`, `_check_p2p` and `_check_command` branch on
+#: 124 (`grader._TIMEOUT_EXIT`) and on 125/126/127/137 (`grader._INFRA_EXITS`)
+#: BEFORE they read a failure -- and group 0 of a node deselect-branch run
+#: exits 1 whenever its post-exclusion scope is empty (measured 2026-09-02,
+#: both frameworks, with a report of zero tests). A "first non-zero wins"
+#: merge would therefore report 1 for a check whose SECOND command was killed
+#: at the bound, and `timed_out` -- a distinct recorded fact -- becomes
+#: unrepresentable for every multi-group node check. Spelled here rather than
+#: imported: preflight importing grader.py would be a dependency in the wrong
+#: direction, and the two consumers are named above so a reader can check the
+#: pair.
+_OUTRANKING_EXITS: tuple[int, ...] = (124, 137, 127, 126, 125)
+
+
+def _argv_lines(runner: "_Runner") -> str:
+    """Every command that check ran, one per line, indented.
+
+    Every group, not just the first: a node p2p check is 1 + K commands and a
+    message showing one of them names a command that is not the whole of what
+    happened -- which is the reconstruction `last_argvs` exists to avoid.
+    """
+    return "".join(f"  {' '.join(argv)}\n" for argv in runner.last_argvs)
+
+
+def _merge_exit_codes(codes: list[int]) -> int:
+    """One check's exit code, out of its groups', by RANK and not by position.
+
+    An outranking code anywhere wins, in `_OUTRANKING_EXITS` order; then the
+    first non-zero in group order; then 0. Position alone would report the
+    ordinary 1 that an emptied group-0 scope produces for a check whose
+    second command was killed at the suite bound.
+    """
+    for outranking in _OUTRANKING_EXITS:
+        if outranking in codes:
+            return outranking
+    for code in codes:
+        if code != 0:
+            return code
+    return 0
+
+
+@dataclass(frozen=True)
+class _MergedResult:
+    """Several commands' results, as the one result a check reads.
+
+    Shaped like `container.ExecResult` and deliberately not that class: this
+    is a value no invocation produced, and a reader who finds it in a
+    traceback should be told so by its name. Built only when a check ran more
+    than one command; a single group returns the container's own object.
+    """
+
+    exit_code: int
+    stdout: str
+    stderr: str
+    duration_ms: int
+
+
 class _Runner:
     """Test invocations inside the container, always under a timeout.
 
@@ -586,11 +665,18 @@ class _Runner:
         #: may not be edited -- a gate that is rewritten to accommodate the
         #: change it gates has stopped gating anything.
         self.adapter = adapter
-        #: The argv of the most recent invocation, so a problem can name what
-        #: was actually run rather than a reconstruction of it -- a second
-        #: copy of the branch logic is a second thing that can be wrong about
-        #: what happened, inside the check that exists to be right about it.
-        self.last_argv: list[str] = []
+        #: Every argv of the most recent CHECK, in group order, so a problem
+        #: can name what was actually run rather than a reconstruction of it
+        #: -- a second copy of the branch logic is a second thing that can be
+        #: wrong about what happened, inside the check that exists to be right
+        #: about it. A list of lists since a node check is 1 + K commands;
+        #: `last_argv` below is the first of them.
+        #:
+        #: Initialised HERE, at construction, for the reason the rest of this
+        #: file initialises its absences: a field that appears on first use
+        #: raises `AttributeError` out of `last_timeout_s` on a path where no
+        #: command ever ran.
+        self.last_argvs: list[list[str]] = []
         #: What the last invocation asked for BY ID, so `classify` can report
         #: which of those ids never ran -- only the caller knows this, because
         #: a report cannot tell a test that was SKIPPED from one that was never
@@ -614,22 +700,67 @@ class _Runner:
         #: submission diff.
         self.last_report: dict | None = None
 
-    def run(self, extra: list[str]):
+    def run(self, argv_groups: list[list[str]]):
+        """Run every group of ONE check, and answer as that check.
+
+        A node selection is one command per file and a node deselection is
+        1 + K of them, because `-t` matches `fullName` and no flag pairs a
+        name pattern with a file. pytest emits exactly one group, whose argv
+        is the one it always emitted.
+
+        An EMPTY sequence raises rather than falling through to the bare
+        runner: `select_argvs(())` is `[]`, and running the runner with no
+        filter at all would execute the WHOLE SUITE as the selection and
+        classify it as one. A FLAT argv raises too -- the old signature's
+        shape reaching this one iterates a list of strings and splats each
+        into a command made of letters, which does not fail loudly.
+        """
+        if not argv_groups:
+            raise ValueError(
+                "a suite check needs at least one argv group; an empty "
+                "sequence is what an empty selection produces, and running "
+                "the bare runner for it would execute the whole suite as the "
+                "selection"
+            )
+        if any(isinstance(group, str) for group in argv_groups):
+            raise TypeError(
+                "run() takes a SEQUENCE of argvs, not one argv: a flat list "
+                "of strings would be splatted character by character into a "
+                "command made of letters"
+            )
         report_path = self.adapter.report_path()
-        if report_path:
-            # Deleted BEFORE the measured command, as a separate exec, because
-            # a config error writes no report at all (measured 2026-09-01,
-            # vitest 3.2.7 and jest 30.5.0 both) -- so a leftover file from the
-            # previous invocation would stand in as this run's evidence. The
-            # path is FIXED rather than per-invocation because it is an argv
-            # element and the gated argv must equal the graded argv; the rm is
-            # what makes a fixed name safe.
-            self.container.exec(["rm", "-f", report_path])
-            extra = [*extra, *self.adapter.report_args(report_path)]
-        self.last_argv = ["timeout", str(self.timeout_s), *self.runner, *extra]
-        result = self.container.exec(self.last_argv)
-        self.last_report = self._read_report(report_path)
-        return result
+        self.last_argvs = []
+        results, reports = [], []
+        for extra in argv_groups:
+            if report_path:
+                # Deleted BEFORE the measured command, as a separate exec,
+                # because a config error writes no report at all (measured
+                # 2026-09-01, vitest 3.2.7 and jest 30.5.0 both) -- so a
+                # leftover file from the previous invocation would stand in as
+                # this run's evidence. The path is FIXED rather than
+                # per-invocation because it is an argv element and the gated
+                # argv must equal the graded argv; the rm is what makes a
+                # fixed name safe. Per GROUP, not per check: group 1 must not
+                # inherit group 0's report either.
+                self.container.exec(["rm", "-f", report_path])
+                extra = [*extra, *self.adapter.report_args(report_path)]
+            argv = ["timeout", str(self.timeout_s), *self.runner, *extra]
+            self.last_argvs.append(argv)
+            results.append(self.container.exec(argv))
+            reports.append(self._read_report(report_path))
+        self.last_report = (
+            self.adapter.merge_reports(reports) if report_path else None)
+        if len(results) == 1:
+            return results[0]
+        return _MergedResult(
+            exit_code=_merge_exit_codes([r.exit_code for r in results]),
+            stdout="\n".join(r.stdout for r in results),
+            stderr="\n".join(r.stderr for r in results),
+            # `getattr` with a default because a test double may answer a
+            # result object without it, and a missing duration may not take
+            # the classification of a real suite run down with it.
+            duration_ms=sum(getattr(r, "duration_ms", 0) for r in results),
+        )
 
     def _read_report(self, report_path: str | None) -> dict | None:
         """The parsed report, or `None` -- which is a measurement, not a gap.
@@ -681,6 +812,19 @@ class _Runner:
         return outcome
 
     @property
+    def last_argv(self) -> list[str]:
+        """The FIRST group's argv, or `[]` when nothing has run.
+
+        Read-only and derived, so the two cannot drift: every group of one
+        check carries the same `timeout` prefix and the same runner, which is
+        what lets `last_timeout_s` read the first and answer for the check.
+        A problem message that wants to show the command prints every group
+        instead -- `last_argvs` -- because on a node check one of them is not
+        the whole story.
+        """
+        return self.last_argvs[0] if self.last_argvs else []
+
+    @property
     def last_timeout_s(self) -> int | None:
         """The bound the last invocation actually CARRIED, off its own argv.
 
@@ -707,7 +851,7 @@ class _Runner:
         does not read it, and writing it first would leave a failed exec
         claiming a selection the container never saw.
         """
-        result = self.run(self.adapter.select_args(node_ids))
+        result = self.run(self.adapter.select_argvs(node_ids))
         self._selected = tuple(node_ids)
         return result
 
@@ -769,12 +913,12 @@ class _Runner:
         answers a renamed f2p id.
         """
         if tests.p2p:
-            result = self.run(self.adapter.p2p_args(
+            result = self.run(self.adapter.p2p_argvs(
                 selected=tuple(tests.p2p), scope=(),
                 deselected=tuple(extra_deselect), ignored=tuple(ignore)))
             self._selected = tuple(tests.p2p)
             return result
-        result = self.run(self.adapter.p2p_args(
+        result = self.run(self.adapter.p2p_argvs(
             selected=(), scope=tuple(scope),
             deselected=tuple(tests.f2p) + tuple(extra_deselect),
             ignored=tuple(ignore)))
@@ -799,6 +943,22 @@ def preflight(
     problems: list[str] = []
     problem_codes: list[str] = []
     evidence: dict = {}
+    #: Every rootdir-relative file ANY node run in this gate loaded or
+    #: executed. Accumulated at each classification site rather than read at
+    #: the end, because `_Runner.last_report` is overwritten by the next `run`
+    #: -- and over EVERY run rather than the scoped one alone, because
+    #: `select_argvs` is per-file too (the f2p check carries the same
+    #: positional) and an explicit-`tests.p2p` task makes no scoped run at all.
+    seen_files: set[str] = set()
+    files_measured = False
+
+    def _note(outcome):
+        nonlocal files_measured
+        if outcome.files_run is not None:
+            files_measured = True
+            seen_files.update(outcome.files_run)
+        return outcome
+
     tests = task.tests
     # `getattr` with a default, like `_declared_grading`'s and the strip's:
     # this function takes an untyped `task`, and a manifest object predating
@@ -889,6 +1049,11 @@ def preflight(
     evidence["duplicate_full_names"] = None
     evidence["scope_files_run"] = None
     evidence["scope_files_outside"] = None
+    #: `None` is "not measured on this path" here too: pytest reports no file
+    #: list at all, and a node gate whose every run wrote no report measured
+    #: nothing. `[]` is "measured, no declared file's filter reaches another
+    #: executed one".
+    evidence["ambiguous_file_filters"] = None
     #: `None`, not `0`: the same rule as `f2p_before_not_run` applies here
     #: identically. The runner-gate early return below starts no container at
     #: all, and fix 2's own framework guard (beside the context-file probe)
@@ -1584,7 +1749,7 @@ def preflight(
         # of a cached verdict can tell that from a run that was bounded.
         evidence["suite_timeout_s"] = runner.last_timeout_s
         evidence["f2p_before_exit"] = red.exit_code
-        red_outcome = runner.classify(red)
+        red_outcome = _note(runner.classify(red))
 
         # Every declared f2p id must have RUN, not merely not-passed. Node
         # only in effect -- `not_run` is empty for pytest, which answers a
@@ -1656,7 +1821,7 @@ def preflight(
         evidence["p2p_before_exit"] = green.exit_code
         # Classified IMMEDIATELY after its own invocation: `classify` reads
         # `_Runner.last_report`, which the next `run` overwrites.
-        p2p_green = runner.classify(green).kind == KIND_PASSED
+        p2p_green = _note(runner.classify(green)).kind == KIND_PASSED
 
         if red_outcome.kind == KIND_PASSED:
             problems.append(
@@ -1682,7 +1847,7 @@ def preflight(
                 "--ignore resolves against the working directory, and an "
                 "--ignore naming a path that does not exist is accepted "
                 "silently (measured).\n"
-                f"  {' '.join(runner.last_argv)}\n"
+                + _argv_lines(runner)
                 + (green.stdout or green.stderr)[-2000:]
             )
         elif red_outcome.kind != KIND_FAILED:
@@ -1788,7 +1953,7 @@ def preflight(
         else:
             after_f2p = runner.select(tests.f2p)
             evidence["f2p_after_exit"] = after_f2p.exit_code
-            if runner.classify(after_f2p).kind != KIND_PASSED:
+            if _note(runner.classify(after_f2p)).kind != KIND_PASSED:
                 problems.append(
                     f"the f2p tests do NOT pass after the reference fix -- "
                     f"{adapter.explain(after_f2p.exit_code)}. A solved run "
@@ -1801,7 +1966,7 @@ def preflight(
                 )
             after_p2p = runner.pass_to_pass(tests)
             evidence["p2p_after_exit"] = after_p2p.exit_code
-            if runner.classify(after_p2p).kind != KIND_PASSED:
+            if _note(runner.classify(after_p2p)).kind != KIND_PASSED:
                 problems.append(
                     "the reference fix regresses the rest of the suite -- "
                     f"{adapter.explain(after_p2p.exit_code)}. The reference "
@@ -1873,13 +2038,24 @@ def preflight(
                     # bound to a name: three assertions read this one run, and
                     # `classify` reads `_Runner.last_report`, which the next
                     # `run` overwrites.
-                    scoped_outcome = runner.classify(scoped)
+                    scoped_outcome = _note(runner.classify(scoped))
 
-                    # No two EXECUTED tests under the scope share a full name.
-                    # The half a LOADER cannot see: its rule covers a
-                    # collision between two DECLARED ids, and this one is
-                    # between a declared id and a test the manifest never
-                    # mentions, which only the real report shows.
+                    # Which EXECUTED tests under the scope share a full name
+                    # across files. EVIDENCE, not a problem: a node selection
+                    # and a node deselection are now one argv per FILE, each
+                    # carrying only that file's own titles, so a quarantine of
+                    # `a::works` no longer reaches `b::works` and the hazard
+                    # this list named is unreachable. It is kept because the
+                    # collision is still a fact about the task worth having in
+                    # a stored verdict -- and because it is what a reader of an
+                    # older NO-GO comes here to look up.
+                    #
+                    # CROSS-FILE ONLY, by construction: `seen` keys on the name
+                    # and reports a collision only when the paths differ. Two
+                    # tests sharing a full name in ONE file collapse to the
+                    # identical node id string and are invisible to this loop
+                    # and to the loader alike; that half is tracked in
+                    # `TASKS.md` and is not this key's.
                     seen: dict[str, str] = {}
                     duplicates: list[str] = []
                     for path, name in adapter.executed_names(runner.last_report):
@@ -1916,23 +2092,6 @@ def preflight(
                         or runner.last_report is not None
                         else None
                     )
-                    if duplicates:
-                        problems.append(
-                            "two or more tests under tests.paths share a full "
-                            "name: " + "; ".join(duplicates) + ". "
-                            f"{adapter.name} selects and deselects by name "
-                            "alone -- `-t` matches fullName and no flag scopes "
-                            "a name pattern to a file -- so a quarantine of "
-                            "one silently removes the other from the "
-                            "regression check, and p2p_deselected AGREES, "
-                            "because two tests really were skipped. The loader "
-                            "already refuses a collision between two DECLARED "
-                            "ids; this is the one it cannot see, between a "
-                            "declared id and a test the manifest never "
-                            "mentions. Narrow tests.paths, or rename one of "
-                            "the titles in the task repo; see "
-                            "taskset/HARVESTING.md."
-                        )
 
                     files_run = scoped_outcome.files_run
                     # Overwrites the `None`s above; stays `None` on the
@@ -1998,7 +2157,7 @@ def preflight(
                             f"{adapter.explain(scoped.exit_code)}. Scoping to "
                             "tests.paths changes what is collected, so a green "
                             "rootdir run does not settle this one.\n"
-                            f"  {' '.join(runner.last_argv)}\n"
+                            + _argv_lines(runner)
                             + (scoped.stdout or scoped.stderr)[-2000:]
                         )
 
@@ -2012,6 +2171,32 @@ def preflight(
         # for the next caller and for anyone who inspects it by hand.
         container.exec(["git", "checkout", "--force", "--detach", start_sha])
         container.exec(["git", "clean", "-xfd"])
+
+    # Every node run this gate made, together: `select_argvs` groups by file
+    # too, and an explicit-`tests.p2p` task makes no scoped run at all, so a
+    # check reading the scoped run alone would be covered by nothing on those
+    # tasks. At the function's own indentation because both branches have
+    # rejoined here and it needs no container.
+    ambiguous = (
+        [f"{a!r} also selects {b}"
+         for a in sorted(seen_files) for b in sorted(seen_files)
+         if a != b and adapter.file_filter_matches(a, b)]
+        if files_measured else None
+    )
+    evidence["ambiguous_file_filters"] = ambiguous
+    if ambiguous:
+        problems.append(
+            "one declared test file's selection filter also selects another "
+            "executed file: " + ", ".join(ambiguous)
+            + ". Measured 2026-09-02: vitest's positional is a SUBSTRING filter "
+            "that no anchoring reaches -- `/repo/tests/doc/a.test.js` still "
+            "matched `/repo/pkg/tests/doc/a.test.js` -- so the per-file grouping "
+            "this harness selects and deselects with would carry a name pattern "
+            "into a file it does not name, and a quarantine would silently "
+            "remove a test from the regression check. jest anchors at the mount "
+            "and cannot hit this. Rename or move one of the files in the task "
+            "repo, or narrow tests.paths; see taskset/HARVESTING.md."
+        )
 
     return PreflightResult(
         task_id=task.task_id,

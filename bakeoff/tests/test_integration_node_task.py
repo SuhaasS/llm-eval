@@ -232,6 +232,87 @@ def node_tree(task_dir):
     shutil.rmtree(tree, ignore_errors=True)
 
 
+@pytest.fixture(scope="module")
+def duplicate_task_dir(tmp_path_factory):
+    """The same fixture plus a SECOND file whose test has the p2p test's title.
+
+    The cross-file duplicate `fullName` that preflight used to refuse. The
+    shared `fixtures/node_task/` template is deliberately not modified -- one
+    task dir per shape, so the healthy gate above keeps measuring the healthy
+    tree.
+    """
+    root = tmp_path_factory.mktemp("node-task-dup")
+    upstream = root / "upstream"
+    shutil.copytree(FIXTURE, upstream)
+    (upstream / "src" / "calc.js").write_text(
+        "export function add(a, b) { return a - b; }\n")
+    (upstream / "tests" / "calc.test.js").write_text(
+        "import { it, expect } from 'vitest';\n"
+        "it('keeps subtracting elsewhere', () => { expect(3 - 1).toBe(2); });\n")
+    # Passes on BOTH sides of the reference fix, so the only thing it can move
+    # is the duplicate-name evidence -- and, under the pre-item-1 argv, whether
+    # the p2p check silently lost it to a name-only deselection.
+    (upstream / "tests" / "calc_dup.test.js").write_text(
+        "import { it, expect } from 'vitest';\n"
+        "it('keeps subtracting elsewhere', () => { expect(9 - 1).toBe(8); });\n")
+    for args in (["init", "-q"], ["config", "user.email", "t@t.test"],
+                 ["config", "user.name", "t"], ["add", "-A"],
+                 ["commit", "-q", "-m", "base"]):
+        subprocess.run(["git", *args], cwd=upstream, check=True,
+                       capture_output=True)
+    base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=upstream,
+                          check=True, capture_output=True,
+                          text=True).stdout.strip()
+
+    task_dir = root / "task"
+    task_dir.mkdir()
+    (task_dir / "reference.diff").write_text(_REFERENCE)
+    (task_dir / "task.yaml").write_text(
+        _manifest(upstream, base).replace("task_id: node-smoke",
+                                          "task_id: node-smoke-dup"))
+    return task_dir
+
+
+def test_a_cross_file_duplicate_full_name_gates_and_selects_only_its_own_file(
+    duplicate_task_dir
+):
+    """The yield cost this item removes, measured against a real container.
+
+    Two files under `tests/` carry a test whose `fullName` is `keeps
+    subtracting elsewhere`. Until round 2 item 1 that gated NO-GO, because one
+    invocation carried every file and `-t` matched by name alone -- so a
+    quarantine of the p2p id would have removed BOTH, silently, with
+    `p2p_deselected` agreeing.
+
+    Three assertions, and the third is the one that could not be made before:
+    the gate passes, the collision is recorded as evidence, and the duplicate
+    file's test is still in the p2p run's executed set.
+    """
+    base = build_base_image(REPO_ROOT, "node", "22")
+    task = load_task(duplicate_task_dir)
+    image = build_task_image(task, base, CACHE_ROOT / "build-dup", CACHE_ROOT)
+    tree = fresh_tree(CACHE_ROOT / "tree")
+    try:
+        start_sha = materialize(task, tree / "repo", CACHE_ROOT)
+
+        result = preflight(task, image=image, repo_path=tree / "repo",
+                           start_sha=start_sha)
+
+        assert result.ok, result.problems
+        # `calc_dup` is named FIRST, and the order is a fact about the new
+        # argv rather than an accident: group 0 of the scoped run is the
+        # scope MINUS the file holding a deselection, so it reports
+        # `calc_dup.test.js` alone, and `calc.test.js` arrives with group 1.
+        assert result.evidence["duplicate_full_names"] == [
+            "'keeps subtracting elsewhere' in tests/calc_dup.test.js and "
+            "tests/calc.test.js"]
+        assert result.evidence["ambiguous_file_filters"] == []
+        assert sorted(result.evidence["scope_files_run"]) == [
+            "tests/calc.test.js", "tests/calc_dup.test.js"]
+    finally:
+        shutil.rmtree(tree, ignore_errors=True)
+
+
 @contextlib.contextmanager
 def _mounted(image: str, repo: Path, start_sha: str):
     """A `RunContainer` whose bind mount is PROVEN to have landed.
@@ -398,7 +479,10 @@ def test_the_report_lands_outside_the_tree_and_a_stale_one_cannot_be_read(
             ["git", "status", "--porcelain"]).stdout.strip() == ""
 
         # A run whose command cannot start must not inherit that report.
-        result = runner.run(["--config", "/tmp/does-not-exist.mjs"])
+        # A SEQUENCE of argvs: one group is still one invocation, and a flat
+        # argv here would be splatted character by character (`run` raises on
+        # it, which is what keeps the next one of these loud).
+        result = runner.run([["--config", "/tmp/does-not-exist.mjs"]])
         assert runner.last_report is None
         assert runner.classify(result).kind == KIND_ENVIRONMENT
 

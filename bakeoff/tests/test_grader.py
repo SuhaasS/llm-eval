@@ -1237,10 +1237,21 @@ def test_the_grader_version_moved_with_what_check_5_means():
     the submission (round 2 item 3, 2026-09-03): `grade-tree/<run_id>` was
     reused across passes, the Docker VM served the cached empty directory, and
     `scripts/grade.py`'s resume key is `(run_id, GRADER_VERSION)` alone, so
-    without the bump those lines are never revisited."""
+    without the bump those lines are never revisited.
+
+    `9 -> 10` IS a change to what checks 5 and 6 run, on node tasks only
+    (round 2 item 1, 2026-09-03). The graded argv moved three ways: the
+    deselect branch became 1 + K commands whose deselections no longer cross
+    files; the jest per-file positional became mount-anchored and escaped,
+    where before it could match a second file; and jest stopped emitting
+    `--testPathIgnorePatterns`, which under 9 REPLACED the repository's own
+    ignore list on the one run that used it. A node grade produced under 9 was
+    made against a regression check with identically-titled tests silently
+    removed from it, so `p2p_failed_node_ids` and `resolved` can both
+    differ."""
     from bakeoff.grader import GRADER_VERSION
 
-    assert GRADER_VERSION == "9"
+    assert GRADER_VERSION == "10"
 
 
 def test_the_grade_says_which_runner_produced_its_numbers():

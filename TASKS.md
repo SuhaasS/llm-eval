@@ -466,20 +466,21 @@ pass-to-pass, 1.4 s suite. **What remains for Gate 1 is the dataset itself**
   harness.** Harvest the remaining tasks (§3.5's ~80) and decide the prompt
   policy below. Everything above runs against as many tasks as exist.
 
-- [ ] **A cross-file duplicate `fullName` is refused even though
-  `<file>::<fullName>` is unambiguous.** The quarantine works off `fullName`
-  alone because vitest's/jest's `-t` matches name and not file, and neither
-  framework offers a flag that scopes a name pattern to one file — but the
-  *node id* a manifest actually declares already carries the file
-  (`tests/doc/stringify.ts::maps ...`), so passing the file as a positional
-  filter beside `-t` would let the runner disambiguate what the id already
-  disambiguates, and the exclusion could lift. Measured 2026-09-02 on
-  `eemeli/yaml`: four collisions under `describe('circular references', ...)`,
-  shared verbatim between `tests/doc/stringify.ts` and `tests/doc/createNode.ts`,
-  forced `tests.paths` down from `tests/` to one file — a real yield cost on a
-  real task, not a hypothetical one. Filed here rather than under the P2
-  derivation gaps below because it decides what can be *harvested* at all, not
-  something safe to leave open after a collection has already run.
+- [x] **A cross-file duplicate `fullName` was refused even though
+  `<file>::<fullName>` is unambiguous.** Closed 2026-09-03 (round 2 item 1).
+  A node selection and a node deselection are now one argv **per file** —
+  measured, one positional plus one `-t` runs the named tests of that file
+  only, while two positionals plus one union `-t` ran a test declared for
+  neither pairing — so the file half of the id reaches the runner. Both
+  refusals are gone: `validate_id_set` is a no-op and preflight's
+  `duplicate_full_names` is evidence rather than a problem. Two narrower
+  rules replaced them: a **vitest** tree whose executed files include one
+  repo-relative path contained in another's is refused as
+  `ambiguous_file_filters` (that positional is a substring filter no
+  anchoring reaches), and the same-file case below stays open. jest also
+  stopped emitting `--testPathIgnorePatterns` at all, which replaced a
+  repository's own ignore list on the one run that used it.
+  `PREFLIGHT_VERSION` 15, `GRADER_VERSION` 10, `ORACLE_VERSION` 5.
 
 - [ ] **The sqlglot ssh-submodule refusal blocks a suite that never reads the
   submodule, and there is no manifest lever to say so.** `tobymao/sqlglot`
@@ -495,8 +496,9 @@ pass-to-pass, 1.4 s suite. **What remains for Gate 1 is the dataset itself**
   cannot safely remove a submodule path without leaving `.gitmodules` naming
   a directory that was never created, and the same reasoning is why no
   existing lever routes around this one either. Filed here for the same
-  reason as the duplicate-`fullName` item above: it bounds which `base_sha`s
-  are harvestable, not a gap safe to close once collection is underway.
+  reason the duplicate-`fullName` item above was filed here: it bounds which
+  `base_sha`s are harvestable, not a gap safe to close once collection is
+  underway.
 
 - [ ] **The test half is applied at setup, and that is a methodology choice.**
   A real bug-fix PR carries the test that proves the fix, so at `base_sha` the
@@ -1230,18 +1232,33 @@ judge runs after one — which is why they sit here rather than above.
   broadening 3 closed it there.
 
 - [ ] **Two node ids with the same `fullName` in the SAME file are unguarded,
-  and it is a different gap from the cross-file one broadening 7 closed.**
-  `-t` matches `fullName` alone, so a JS/TS suite that genuinely has two
+  and it is a different gap from the cross-file one — whose refusal round 2
+  item 1 REMOVED rather than kept.** `-t` matches `fullName` alone, so a
+  JS/TS suite that genuinely has two
   identically-titled tests in one file is indistinguishable to a selection or
   a deselection targeting either one — but there is no way to *represent* that
   as two different declared ids in the first place, since a node id is exactly
   `<file>::<fullName>` with no positional index: both same-file duplicates
   collapse to the identical string. `node_adapter.validate_id_set` (the
-  loader) and preflight's `duplicate_full_names` check (the real report) both
-  compare `(fullName, path)` pairs and only flag a collision when the `path`
-  differs — a same-file pair, where `path` agrees, passes both by
-  construction. A repo with this shape reads as clean at every gate and
-  silently over-selects or over-deselects whichever test the manifest names.
+  loader, now a no-op) and preflight's `duplicate_full_names` check (the real
+  report, now evidence) both compare `(fullName, path)` pairs and only flag a
+  collision when the `path` differs — a same-file pair, where `path` agrees,
+  passes both by construction. The per-file grouping does not help here
+  either: both tests live in the one file that one argv names. A repo with
+  this shape reads as clean at every gate and silently over-selects or
+  over-deselects whichever test the manifest names.
+
+- [ ] **A node check is several commands and the record does not say how
+  many.** Since round 2 item 1 a node p2p deselect run is 1 + K invocations
+  (K = files holding a deselection) and a node selection is one per file, each
+  carrying its own `timeout <suite_timeout_s>` prefix. So
+  `GradeRecord.suite_timeout_s: 600` is true of every command and is NOT the
+  check's wall-clock bound, which is 600 × (1 + K) — and K is a function of
+  the f2p set and of the quarantine, so two runs of the same task can differ.
+  Nothing in `RunRecord` or `GradeRecord` records K. Splitting the budget
+  across groups was rejected for the opposite reason: it would make the gated
+  bound a function of the quarantine, so two tasks declaring the same number
+  would get different ones. `SCHEMA_VERSION` did not move for this.
 
 - [ ] **`_check_p2p` has no `not_run` branch, and the data it would need is
   structurally absent too.** `grader.py`'s `_check_f2p` reads

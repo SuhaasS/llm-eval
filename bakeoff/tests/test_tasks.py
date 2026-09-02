@@ -3034,28 +3034,31 @@ def test_a_node_f2p_id_outside_tests_paths_is_refused(tmp_path, upstream):
     assert "tests/" in str(excinfo.value)
 
 
-def test_two_declared_ids_sharing_a_full_name_across_files_are_refused(
+def test_two_declared_ids_sharing_a_full_name_across_files_now_load(
     tmp_path, upstream
 ):
-    """`-t` matches `fullName` and knows nothing about which file a test came
-    from, and there is no flag that pairs them -- the file positionals and the
-    name pattern are ANDed across the whole run. So a quarantine of
-    `a.test.js::works` also deselects `b.test.js::works`, silently, with
-    `p2p_deselected` agreeing because two tests really were skipped.
+    """This refusal is GONE, and its removal is the point of round 2 item 1.
 
-    This is the half the author created and it costs no daemon. The half that
-    matters more -- a collision between a declared id and a test the manifest
-    never mentions -- is preflight's, against the real report."""
+    It existed because `-t` matches `fullName` and knew nothing about which
+    file a test came from: the positionals and the name pattern were ANDed
+    across the whole run, so a quarantine of `a.test.js::works` also
+    deselected `b.test.js::works`. The file half is now carried into the argv
+    -- one invocation per file, each pattern holding only that file's titles
+    -- and measured 2026-09-02 one positional plus one `-t` runs the named
+    tests of that file only. So the manifest loads.
+
+    The SAME-file half is a different problem and is still open (`TASKS.md`):
+    two tests sharing a full name in one file collapse to the identical node
+    id string, which no check comparing `(fullName, path)` pairs can see."""
     task_dir = _write_node_task(
         tmp_path / "set", upstream,
         f2p=["tests/a.test.js::works"], p2p=["tests/b.test.js::works"],
     )
 
-    with pytest.raises(TaskError) as excinfo:
-        load_task(task_dir)
+    task = load_task(task_dir)
 
-    assert "works" in str(excinfo.value)
-    assert "tests/a.test.js" in str(excinfo.value)
+    assert task.tests.f2p == ("tests/a.test.js::works",)
+    assert task.tests.p2p == ("tests/b.test.js::works",)
 
 
 def test_two_names_in_the_ONE_file_are_not_refused(tmp_path, upstream):

@@ -107,7 +107,16 @@ from bakeoff.tasks import materialize
 #: No quarantine on today's corpus changes retroactively without a re-run:
 #: the fix widens what the SAME two reference runs can report, so a cached
 #: verdict must be re-derived, not merely re-read, to pick it up.
-ORACLE_VERSION: str = "4"
+#:
+#: 4 -> 5: node selection and deselection became per-file (round 2 item 1,
+#: 2026-09-03). `_derive`'s two reference runs are now the per-file argv
+#: sequence, so a quarantine cached under 4 for a NODE task was derived from
+#: runs in which a deselection crossed files -- it can name an id that never
+#: needed quarantining, and miss one whose own file's run was distorted by
+#: another file's deselection. No pytest quarantine changes: that adapter
+#: emits one group whose argv is the v4 argv. A cached node verdict must be
+#: re-derived rather than re-read.
+ORACLE_VERSION: str = "5"
 
 #: preflight's pytest exit meanings plus the codes the `timeout` wrapper and
 #: the shell contribute. Non-{0,1} is refused whatever the code, but the
