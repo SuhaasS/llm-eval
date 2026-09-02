@@ -1383,8 +1383,13 @@ def test_an_unset_variable_is_recorded_as_null_and_an_empty_one_as_empty(
     result = _run_preflight(monkeypatch, tmp_path, task, container)
 
     assert not result.ok
+    # "does not match the manifest's image.env" is unique to the mismatch
+    # message -- plain "image.env" also appears in the hypothesis NO-GO's
+    # remedy text ("Add `image.env: {CI: ...`"), so filtering on that alone
+    # would pass even if this scenario silently grew a second, unrelated
+    # problem.
     assert result.problems == tuple(
-        p for p in result.problems if "image.env" in p
+        p for p in result.problems if "does not match the manifest's image.env" in p
     )  # the mismatch is the ONLY reason this is a NO-GO
     assert result.evidence["image_env_observed"] == {"CI": ""}
 
@@ -1411,6 +1416,47 @@ def test_the_env_is_read_before_the_suite_runs(monkeypatch, tmp_path):
                        if cmd[:1] == ["timeout"])
 
     assert printenv < first_suite
+
+
+def test_the_hypothesis_import_probe_runs_before_the_suite(monkeypatch,
+                                                            tmp_path):
+    """Same ordering claim as the env read-back, for the other reason a bad
+    environment must be reported as itself: a task whose author never
+    declared CI is a NO-GO, and that has to be decided before five downstream
+    suite failures bury the cause."""
+    task = _FakeTask(image=_FakeImage(env={"CI": "1"}))
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   env={"CI": "1"}, hypothesis_importable=True)
+
+    _run_preflight(monkeypatch, tmp_path, task, container)
+
+    import_probe = next(
+        i for i, cmd in enumerate(container.commands)
+        if len(cmd) >= 3 and cmd[1] == "-c" and "import hypothesis" in cmd[2]
+    )
+    first_suite = next(i for i, cmd in enumerate(container.commands)
+                       if cmd[:1] == ["timeout"])
+
+    assert import_probe < first_suite
+
+
+def test_the_rg_probe_runs_before_the_suite(monkeypatch, tmp_path):
+    """Same ordering claim, for the probe that decides whether an undeclared
+    property-based suite is a NO-GO."""
+    task = _FakeTask(image=_FakeImage(env={"CI": "1"}))
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=("tests/",), env={"CI": "1"},
+                                   hypothesis_importable=True,
+                                   hypothesis_in_suite=True)
+
+    _run_preflight(monkeypatch, tmp_path, task, container)
+
+    rg_probe = next(i for i, cmd in enumerate(container.commands)
+                    if cmd[:1] == ["rg"])
+    first_suite = next(i for i, cmd in enumerate(container.commands)
+                       if cmd[:1] == ["timeout"])
+
+    assert rg_probe < first_suite
 
 
 def test_a_suite_that_imports_hypothesis_with_no_CI_is_refused(monkeypatch,
@@ -1482,15 +1528,24 @@ def test_an_rg_probe_that_could_not_answer_is_None_and_not_False(monkeypatch,
 
     rg exits 0 for a match and 1 for none; anything else -- an unreadable
     path, a bad pattern, no rg -- is a probe that did not answer. Two absences
-    that render identically as `false` are the same defect one layer down."""
+    that render identically as `false` are the same defect one layer down.
+
+    And the ambiguity is not swallowed. `scanned` is non-empty here -- the
+    probe RAN and could not answer, which is a controller ruling and not the
+    "never ran" shape `test_no_declared_test_path_exists_so_the_probe_never_ran`
+    covers -- so it must become a NO-GO naming the exit code and the argv,
+    not a silent None that lets the task through on an environment defect
+    preflight could not see through."""
     task = _FakeTask()
     container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
                                    present=("tests/",), rg_exit=2)
 
     result = _run_preflight(monkeypatch, tmp_path, task, container)
 
+    assert not result.ok
     assert result.evidence["hypothesis_imported_by_suite"] is None
-    assert not any("hypothesis" in problem for problem in result.problems)
+    assert any("rg" in problem and "exited 2" in problem
+               for problem in result.problems)
 
 
 def test_no_declared_test_path_exists_so_the_probe_never_ran(monkeypatch,
@@ -1498,7 +1553,11 @@ def test_no_declared_test_path_exists_so_the_probe_never_ran(monkeypatch,
     """`_present` filters the prefixes, for `_existing_prefixes`' reason: a
     declared path absent at the start state is an input this gate tolerates,
     and handing rg a path that does not exist makes it exit 2. With nothing to
-    scan the answer is None -- not False."""
+    scan the answer is None -- not False.
+
+    And it is a QUIET None, unlike the controller-ruling ambiguity in
+    `test_an_rg_probe_that_could_not_answer_is_None_and_not_False`: no exec
+    ran, so there is nothing to be a problem about."""
     task = _FakeTask()
     container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
                                    present=(),  # tests/ is not there
@@ -1508,6 +1567,8 @@ def test_no_declared_test_path_exists_so_the_probe_never_ran(monkeypatch,
 
     assert result.evidence["hypothesis_imported_by_suite"] is None
     assert not any(cmd[:1] == ["rg"] for cmd in container.commands)
+    assert not any("rg" in problem or "hypothesis-import probe" in problem
+                   for problem in result.problems)
 
 
 @pytest.mark.parametrize("runner,expected", [

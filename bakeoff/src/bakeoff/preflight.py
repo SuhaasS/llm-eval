@@ -670,15 +670,37 @@ def preflight(
         scanned = _present(container, tests.paths)
         used: bool | None = None
         if scanned:
-            probe = container.exec(
-                ["rg", "-q", r"^\s*(from|import)\s+hypothesis\b", *scanned]
-            )
+            probe_argv = ["rg", "-q", r"^\s*(from|import)\s+hypothesis\b",
+                          *scanned]
+            probe = container.exec(probe_argv)
             # Three-valued on purpose. 0 is a match, 1 is no match, and
             # anything else (an unreadable path, a bad pattern, no rg) is
             # UNKNOWN -- a quiet False there would silently disarm the only
             # check that catches an undeclared property-based suite.
-            used = (True if probe.exit_code == 0
-                    else False if probe.exit_code == 1 else None)
+            #
+            # UNKNOWN is not silent either. `scanned` is non-empty here, so
+            # the probe RAN and did not answer -- a controller-ruling
+            # ambiguity, not the "never ran" shape below where `scanned` is
+            # empty and no exec happens at all. The two render identically as
+            # `None` in `evidence`, which is exactly the pair this repo's
+            # "a null says which kind of null it is" rule exists for, so the
+            # exit-code case gets a problem naming what was run and what came
+            # back, and the never-ran case stays a quiet `None`.
+            if probe.exit_code == 0:
+                used = True
+            elif probe.exit_code == 1:
+                used = False
+            else:
+                problems.append(
+                    "the hypothesis-import probe could not answer: `"
+                    + " ".join(probe_argv) + f"` exited {probe.exit_code}, "
+                    "not 0 (match) or 1 (no match). rg exits 2 on an "
+                    "unreadable path or a bad pattern and it is asserted "
+                    "present above, so this names an environment problem "
+                    "preflight cannot see through -- silently reading it as "
+                    "'not imported' would disarm the one check that catches "
+                    "an undeclared property-based suite."
+                )
         evidence["hypothesis_imported_by_suite"] = used
 
         if used and "CI" not in declared:

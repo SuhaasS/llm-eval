@@ -268,6 +268,24 @@ def test_the_run_id_header_still_reaches_the_agent():
     assert "ANTHROPIC_CUSTOM_HEADERS" not in container_env(make_config())
 
 
+def test_the_agents_env_names_no_key_a_task_image_may_set():
+    """The offline half of "the agent sees the same suite the gate does".
+
+    Docker merges an exec's environment into the image's with the EXEC's keys
+    winning (measured 2026-09-01, Docker 29.5.2), so the only way an image.env
+    value fails to reach the agent's `claude` process is `container_env`
+    naming the same key. This is that claim, over the whole allowed set rather
+    than over one example, and it is the assertion that turns a careless
+    future allowlist entry into a red suite instead of a task whose
+    determinism lever applies to the gate and not to the agent.
+    """
+    from bakeoff.tasks import _IMAGE_ENV_ALLOWED
+
+    env = container_env(make_config(custom_headers="X-Bakeoff-Run-Id: r-1"))
+
+    assert not (_IMAGE_ENV_ALLOWED & set(env))
+
+
 def test_config_digest_excludes_the_auth_token():
     """The digest lands in the run record, which is written to disk and
     shared. A secret must not be derivable from it, and the token does not
