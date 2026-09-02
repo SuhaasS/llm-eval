@@ -1773,7 +1773,11 @@ def test_the_preflight_version_moved_with_the_new_assertion():
     """It is in the cache key, and it is the only component that moves when
     THIS file changes -- a manifest digest describes the task, an image id the
     environment, a start sha the tree. Without the bump every warm cache
-    serves a verdict written by a gate that never looked at image.env."""
+    serves a verdict written by an older gate. 4 -> 5 was the gate starting
+    to look at image.env; 5 -> 6 is the gate's bound becoming
+    budget.suite_timeout_s -- a manifest already carrying the key loads under
+    the older loader, so manifest_digest does not move and a warm cache would
+    serve a verdict gated at 600."""
     from bakeoff.preflight import PREFLIGHT_VERSION
 
     assert PREFLIGHT_VERSION == "6"

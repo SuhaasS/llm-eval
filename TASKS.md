@@ -1112,7 +1112,7 @@ judge runs after one — which is why they sit here rather than above.
 - **Two evidence families disagree about what an unreachable check writes.**
   Broadening 3's `image_env_*` / `hypothesis_*` keys are written on *every*
   path — `declared` with a value, the rest as explicit `null` — on the
-  pre-container early return at `preflight.py:469-497`. `stripped_paths` and
+  pre-container early return at `preflight.py:507-523`. `stripped_paths` and
   `stripped_paths_present`, added by broadening 1, are simply **absent**
   there — and so is `suite_timeout_s`, added by broadening 4: no suite ran
   under any bound on this path, but that is indistinguishable from a gate too

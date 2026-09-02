@@ -367,8 +367,9 @@ rather than by reasoning:
   the suite **five** times (f2p before, p2p before, f2p after, p2p after, and
   the scoped p2p the grader will make — four when `tests.p2p` is declared
   explicitly, which skips the scoped run), plus once per declared `grading.*`
-  argv. The oracle then runs it twice more at grade time and the ladder up to
-  five times per graded record. Each of those carries a coreutils `timeout`
+  argv. The oracle then runs it twice more at grade time, and the ladder runs up
+  to five bounded commands per graded record — two suite runs plus one per
+  declared `grading.*` argv. Each of those carries a coreutils `timeout`
   prefix whose value is `budget.suite_timeout_s`, default **600 s** — the same
   number on the gate's side and the grader's, which is the point of the key:
   a suite that fits one bound and is killed under the other stamps `timed_out`
