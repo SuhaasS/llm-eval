@@ -10,6 +10,7 @@ This file pins the adapter contract. `test_preflight.py`, `test_oracle.py` and
 `test_grader.py` keep pinning what the CONSUMERS do with it.
 """
 
+import json
 from pathlib import Path
 
 import pytest
@@ -59,16 +60,33 @@ def test_the_three_frameworks_resolve_and_nothing_else_does():
         for_framework("mocha")
 
 
-def test_the_node_adapters_are_stubs_until_task_6():
-    """`FRAMEWORKS` and `tasks._FRAMEWORKS` must agree from the first commit,
-    so the registry is complete now and the behaviour arrives later. A
-    registry that GROWS later is a registry the loader's allowlist can
-    disagree with, and that disagreement surfaces as a KeyError out of the
-    middle of preflight."""
-    for name in ("vitest", "jest"):
+def test_no_adapter_method_is_a_stub_any_more():
+    """`FRAMEWORKS` and `tasks._FRAMEWORKS` had to agree from the first commit,
+    so the registry was complete before the node behaviour existed and every
+    node method raised `NotImplementedError("broadening 7 Task 6")`. Task 6
+    filled them in, and this is that test inverted: a method left raising would
+    be found by a task that declared that framework, after the image was built
+    and the container was up.
+
+    The Protocol check above pins that the methods EXIST; only calling one pins
+    that it does something."""
+    for name in FRAMEWORKS:
         adapter = for_framework(name)
-        with pytest.raises(NotImplementedError, match="broadening 7 Task 6"):
-            adapter.classify(exit_code=1, stdout="", stderr="", report=None)
+        assert adapter.classify(
+            exit_code=1, stdout="", stderr="", report=None).kind, name
+        assert adapter.select_args(()) == []
+        assert adapter.p2p_args(selected=(), scope=("tests/",),
+                                deselected=(), ignored=()) == ["tests/"]
+        assert adapter.explain(1)
+        assert adapter.validate_id_set((), "tests.f2p") is None
+        assert adapter.parse_deselected(stdout="", report=None) is None
+
+    for name in ("vitest", "jest"):
+        # No report is the config-error signal on these two, and it is the one
+        # branch a stub could most plausibly have been left returning.
+        assert for_framework(name).classify(
+            exit_code=1, stdout="", stderr="", report=None
+        ).kind == KIND_ENVIRONMENT, name
 
 
 # --- the pytest adapter reproduces today's behaviour -------------------------
@@ -465,3 +483,489 @@ def test_no_production_call_site_leaves_the_runner_on_its_pytest_default():
     # otherwise make this test pass by finding nothing.
     assert len(sites) >= 4, sites
     assert [where for where, ok in sites if not ok] == []
+
+
+# --- the node adapters --------------------------------------------------------
+
+_REPORTS = Path(__file__).resolve().parent / "fixtures" / "node_reports"
+
+
+def _report(shape: str, framework: str) -> dict:
+    """One of the eight measured report shapes, replayed from disk.
+
+    Captured once in `node:22-bookworm-slim` against vitest 3.2.7 and jest
+    30.5.0; see the README beside them for the argv each came from and for the
+    exit code each run produced. They are replayed rather than re-measured
+    because regenerating one needs a Docker daemon, a network and 73 MB of npm
+    -- and because the whole point of these tests is that the exit code is not
+    what the classification rests on.
+    """
+    return json.loads((_REPORTS / f"{shape}.{framework}.json").read_text())
+
+
+@pytest.mark.parametrize("framework", ["vitest", "jest"])
+def test_a_report_that_was_never_written_is_an_environment_problem(framework):
+    """Measured 2026-09-02: a broken config exits 1 and writes NO report file,
+    on both frameworks. So does a runner that could not start. Reading silence
+    as anything but "the command did not say what it did" is the Phase 0c
+    failure, and here it would stamp a config error on the model."""
+    outcome = for_framework(framework).classify(
+        exit_code=1, stdout="", stderr="Validation Error", report=None
+    )
+
+    assert outcome.kind == KIND_ENVIRONMENT
+    assert outcome.errored_files is None
+
+
+@pytest.mark.parametrize("framework", ["vitest", "jest"])
+def test_all_passing_is_passed(framework):
+    outcome = for_framework(framework).classify(
+        exit_code=0, stdout="", stderr="", report=_report("pass", framework)
+    )
+
+    assert outcome.kind == KIND_PASSED
+    assert outcome.failed_ids == frozenset()
+    assert outcome.files_run == ("tests/pass.test.js",)
+
+
+@pytest.mark.parametrize("framework", ["vitest", "jest"])
+def test_a_failing_assertion_is_failed_with_the_id_the_manifest_uses(framework):
+    outcome = for_framework(framework).classify(
+        exit_code=1, stdout="", stderr="", report=_report("fail", framework)
+    )
+
+    assert outcome.kind == KIND_FAILED
+    assert outcome.failed_ids == {"tests/fail.test.js::will fail"}
+
+
+@pytest.mark.parametrize("framework", ["vitest", "jest"])
+@pytest.mark.parametrize("shape", ["import_error", "syntax_error"])
+def test_a_file_that_could_not_load_is_a_load_error(framework, shape):
+    """The portable discriminator is a testResults entry with status 'failed'
+    and an EMPTY assertionResults -- true on both frameworks and on both
+    shapes. jest's numRuntimeErrorTestSuites says the same thing and vitest has
+    no such key, so it is deliberately not consulted: one classifier, not two."""
+    outcome = for_framework(framework).classify(
+        exit_code=1, stdout="", stderr="", report=_report(shape, framework)
+    )
+
+    assert outcome.kind == KIND_LOAD_ERROR
+    assert outcome.errored_files == {
+        "import_error": frozenset({"tests/broken.test.js"}),
+        "syntax_error": frozenset({"tests/syntax.test.js"}),
+    }[shape]
+
+
+@pytest.mark.parametrize("framework", ["vitest", "jest"])
+def test_a_load_error_beats_a_passing_file_in_the_same_run(framework):
+    """Measured: one good file plus one unloadable file reports THREE PASSING
+    tests and zero failing ones. Classified in the other order that grades as
+    `passed`, and a task whose f2p file stopped importing is scored as solved."""
+    outcome = for_framework(framework).classify(
+        exit_code=1, stdout="", stderr="", report=_report("mixed", framework)
+    )
+
+    assert outcome.kind == KIND_LOAD_ERROR
+    assert "tests/broken.test.js" in outcome.errored_files
+
+
+@pytest.mark.parametrize("framework", ["vitest", "jest"])
+def test_an_unloadable_file_is_still_a_file_the_run_touched(framework):
+    """`files_run` is every suite LOADED or executed, the unloadable one
+    included. D7c's scope check asks whether the run left `tests.paths`, and a
+    file a substring filter pulled in and then failed to parse is exactly such
+    a file -- dropping it would make the over-match invisible in the one place
+    that looks for it."""
+    outcome = for_framework(framework).classify(
+        exit_code=1, stdout="", stderr="", report=_report("mixed", framework)
+    )
+
+    assert outcome.files_run == ("tests/broken.test.js", "tests/pass.test.js")
+
+
+@pytest.mark.parametrize("framework", ["vitest", "jest"])
+def test_no_files_matched_is_nothing_ran_whatever_success_says(framework):
+    """jest reports `success: true` while exiting 1 on 'no test files matched'
+    (measured). Reading `success` would call a run that executed nothing a
+    pass, which on the p2p check is a regression suite that ran zero tests."""
+    outcome = for_framework(framework).classify(
+        exit_code=1, stdout="", stderr="", report=_report("no_files", framework)
+    )
+
+    assert outcome.kind == KIND_NOTHING_RAN
+
+
+def test_the_no_files_fixtures_really_do_disagree_about_success():
+    """Not decoration. The rule above is only load-bearing because jest and
+    vitest answer the SAME run with opposite `success` values, and a fixture
+    regenerated against a future jest that agreed with vitest would make the
+    test above pass for a reason that no longer holds."""
+    assert _report("no_files", "jest")["success"] is True
+    assert _report("no_files", "vitest")["success"] is False
+
+
+@pytest.mark.parametrize("framework", ["vitest", "jest"])
+def test_a_name_pattern_that_matched_nothing_is_nothing_ran_despite_exit_zero(
+    framework
+):
+    """The single most dangerous measured behaviour in this broadening. `-t`
+    with a pattern matching no test exits **0** on both frameworks, with every
+    test reported skipped and a summary that reads like success. pytest answers
+    the same input with exit 4 and `ERROR: not found:`.
+
+    Two things land here: a manifest naming a renamed f2p test, and an oracle
+    quarantine that swallowed the entire p2p list -- which `derive_quarantine`'s
+    guard used to catch through pytest's exit 5."""
+    outcome = for_framework(framework).classify(
+        exit_code=0, stdout="", stderr="", report=_report("t_nomatch", framework)
+    )
+
+    assert outcome.kind == KIND_NOTHING_RAN
+    assert outcome.exit_code == 0
+
+
+@pytest.mark.parametrize("framework", ["vitest", "jest"])
+def test_verify_selected_names_the_requested_ids_that_did_not_run(framework):
+    """Separate from `classify`, because only the caller knows what it asked
+    for. A skipped test and a test that was never selected are the same shape
+    in the report."""
+    from bakeoff.runners.node_adapter import verify_selected
+
+    report = _report("t_nomatch", framework)
+    adapter = for_framework(framework)
+
+    assert verify_selected(
+        report, ("tests/pass.test.js::outer adds",), adapter
+    ) == {"tests/pass.test.js::outer adds"}
+    assert verify_selected(
+        _report("t_match", framework),
+        ("tests/pass.test.js::outer adds",), adapter
+    ) == frozenset()
+
+
+@pytest.mark.parametrize("framework", ["vitest", "jest"])
+def test_verify_selected_reads_a_missing_report_as_nothing_having_run(framework):
+    """`report=None` is the config-error signal, and `classify` calls it
+    KIND_ENVIRONMENT. This helper must not answer the same input with an empty
+    set -- "nothing was requested that did not run" is the one reading a run
+    that produced no evidence cannot support."""
+    from bakeoff.runners.node_adapter import verify_selected
+
+    assert verify_selected(
+        None, ("tests/pass.test.js::outer adds",), for_framework(framework)
+    ) == {"tests/pass.test.js::outer adds"}
+
+
+@pytest.mark.parametrize("framework", ["vitest", "jest"])
+def test_a_failing_assertion_counts_as_having_run(framework):
+    """`verify_selected` asks whether a test reached a TERMINAL status, not
+    whether it passed. An f2p id is expected to FAIL at the start state, so a
+    helper that only counted passes would report every f2p test as not-run and
+    turn preflight's own red half into an environment problem."""
+    from bakeoff.runners.node_adapter import verify_selected
+
+    assert verify_selected(
+        _report("fail", framework), ("tests/fail.test.js::will fail",),
+        for_framework(framework)
+    ) == frozenset()
+
+
+# --- node argv ----------------------------------------------------------------
+
+
+def test_node_select_args_are_the_files_plus_one_anchored_name_alternation():
+    adapter = for_framework("vitest")
+
+    assert adapter.select_args(
+        ("tests/a.test.js::outer adds", "tests/a.test.js::top level")
+    ) == ["tests/a.test.js", "-t", "^(?:outer adds|top level)$"]
+
+
+def test_node_select_args_name_each_file_once_and_in_order():
+    """The file half is a positional filter, and repeating it is not harmless:
+    on jest a positional is a REGEX over the absolute path, so a duplicate is a
+    second pattern that has to agree with the first, and on both frameworks the
+    argv is what the byte-identity property is stated over."""
+    assert for_framework("jest").select_args(
+        ("tests/b.test.js::two", "tests/a.test.js::one", "tests/b.test.js::three")
+    ) == ["tests/b.test.js", "tests/a.test.js", "-t", "^(?:two|one|three)$"]
+
+
+def test_node_select_args_on_nothing_is_an_empty_argv_not_a_match_all():
+    """`^(?:)$` matches the empty name and nothing else -- which is M1's silent
+    hole with the pattern the adapter itself wrote. An empty selection has no
+    argv, and the caller's own branch is what decides whether that is legal."""
+    assert for_framework("vitest").select_args(()) == []
+
+
+def test_node_p2p_args_compose_selection_and_deselection_into_ONE_pattern():
+    """Emitting two `-t` flags is not "last one wins" -- the frameworks
+    disagree and neither answer is usable. Measured 2026-09-02:
+
+        $ vitest run -t 'a' -t 'b' tests/pass.test.js
+        Error: Expected a single value for option
+        "-t, --testNamePattern <pattern>", received ["a", "b"]
+        -> exit 1, and NO report file
+
+        $ jest -t 'adds' -t 'subs'
+        Ran all test suites with tests matching "adds,subs".
+        -> exit 0, zero tests run
+
+    vitest's refusal is loud and classifies as KIND_ENVIRONMENT; jest's
+    comma-join is M1's silent hole reached by an argv nobody meant to write.
+    Hence one method owning the whole argv, and hence this count."""
+    adapter = for_framework("vitest")
+
+    argv = adapter.p2p_args(
+        selected=(), scope=("tests/",),
+        deselected=("tests/a.test.js::outer adds",), ignored=())
+
+    assert argv.count("-t") == 1
+    assert argv == ["tests/", "-t", "^(?!(?:outer adds)$)"]
+
+
+def test_node_p2p_args_on_the_explicit_branch_anchor_both_halves():
+    adapter = for_framework("jest")
+
+    assert adapter.p2p_args(
+        selected=("tests/b.test.js::keeps working",), scope=(),
+        deselected=("tests/b.test.js::flaky",), ignored=()
+    ) == ["tests/b.test.js", "-t", "^(?!(?:flaky)$)(?:keeps working)$"]
+
+
+def test_node_p2p_args_with_no_pattern_at_all_emit_no_dash_t():
+    """A bare scoped run with nothing to deselect. `-t ''` is not the same
+    argv: an empty pattern is a regex matching every name, which is what this
+    run wants and is also indistinguishable from a pattern the builder failed
+    to fill in."""
+    assert for_framework("vitest").p2p_args(
+        selected=(), scope=("tests/", "src/"), deselected=(), ignored=()
+    ) == ["tests/", "src/"]
+
+
+def test_a_test_name_with_regex_metacharacters_is_escaped_the_JS_way():
+    """Measured 2026-09-02: `-t '^(?:handles a\\+b \\(x\\) \\[y\\])$'` selects
+    exactly the test named `handles a+b (x) [y]` and skips
+    `handles a+b (x) [y] EXTRA`. Unescaped, the `+` and the groups change what
+    the pattern means.
+
+    `re.escape` is NOT usable here and the difference is not cosmetic: Python
+    escapes characters JavaScript treats as IDENTITY ESCAPES, and an identity
+    escape of a non-syntax character is a SyntaxError in a Unicode-mode
+    RegExp. The pattern is compiled by node, not by Python, so the escape set
+    has to be JavaScript's -- exactly the fourteen characters `. * + ? ^ $ { }
+    ( ) | [ ] \\` -- and nothing else. A space in particular must NOT be escaped;
+    Python's `re.escape` escaped it through 3.6 and a `\\ ` reaching node is a
+    pattern that means something different.
+    """
+    argv = for_framework("vitest").select_args(("tests/m.test.js::a+b (x) y",))
+
+    assert argv[-1] == r"^(?:a\+b \(x\) y)$"
+
+
+def test_the_escape_set_is_javascripts_and_not_pythons():
+    from bakeoff.runners.node_adapter import _js_escape
+
+    assert _js_escape("a+b") == r"a\+b"
+    assert _js_escape("a b") == "a b"          # a space is NOT escaped
+    assert _js_escape("a-b") == "a-b"          # nor a hyphen, outside a class
+    assert _js_escape("[x]") == r"\[x\]"
+
+
+def test_the_escape_set_is_exactly_javascripts_syntax_characters():
+    """Pinned as a set rather than by example, because both directions are
+    defects and neither shows up in a passing run: an unescaped `(` silently
+    changes which tests a quarantine removes, and an escaped `-` or `/` or `#`
+    is a SyntaxError node raises instead of running the suite."""
+    from bakeoff.runners.node_adapter import _js_escape
+
+    escaped = {ch for ch in map(chr, range(32, 127)) if _js_escape(ch) != ch}
+
+    assert escaped == set(".*+?^${}()|[]\\")
+    assert all(_js_escape(ch) == "\\" + ch for ch in escaped)
+
+
+def test_node_report_args_write_to_a_fixed_path_outside_repo():
+    """FIXED because it is an argv element and the gated argv must equal the
+    graded argv; outside /repo because section 5.6 stages everything and a
+    report inside the tree lands in every submission diff. Staleness is handled
+    by deleting the file before each run, which `_Runner.run` does as a
+    separate exec."""
+    for framework, flag in (("vitest", "--reporter=json"), ("jest", "--json")):
+        adapter = for_framework(framework)
+        path = adapter.report_path()
+
+        assert path.startswith("/tmp/")
+        assert adapter.report_args(path) == [flag, f"--outputFile={path}"]
+
+
+def test_both_node_frameworks_agree_on_the_report_path():
+    """One path, so `_Runner`'s `rm -f` before the run and `cat` after it are
+    the same two execs whatever the manifest declared. Two would be a second
+    place for a stale report to survive."""
+    assert (for_framework("vitest").report_path()
+            == for_framework("jest").report_path()
+            == "/tmp/bakeoff-run-report.json")
+
+
+def test_node_ignore_flags_are_per_framework_and_jest_keeps_its_default():
+    """`ignored` has exactly ONE caller -- preflight's p2p run at the START
+    state, which the grader never makes -- so the two spellings cannot diverge
+    between a gated and a graded argv.
+
+    Measured 2026-09-02: vitest `--exclude=<path>` and jest
+    `--testPathIgnorePatterns=<path>` both drop the named file. jest's flag
+    REPLACES its built-in `/node_modules/` ignore rather than adding to it, so
+    emitted alone it makes jest collect test files out of node_modules --
+    which, with the runners installed at /node_modules, means jest's own
+    vendored fixtures. The default is therefore re-emitted alongside."""
+    assert for_framework("vitest").p2p_args(
+        selected=(), scope=("tests/",), deselected=(), ignored=("tests/x.js",)
+    ) == ["tests/", "--exclude=tests/x.js"]
+
+    assert for_framework("jest").p2p_args(
+        selected=(), scope=("tests/",), deselected=(), ignored=("tests/x.js",)
+    ) == ["tests/",
+          "--testPathIgnorePatterns=/node_modules/",
+          "--testPathIgnorePatterns=tests/x.js"]
+
+
+def test_jest_does_not_emit_its_default_ignore_when_there_is_nothing_to_ignore():
+    """Emitting it on every run would put a flag in both the gated and the
+    graded argv that changes what jest collects for EVERY task, for the benefit
+    of the one preflight run that uses `ignored`."""
+    assert for_framework("jest").p2p_args(
+        selected=(), scope=("tests/",), deselected=(), ignored=()
+    ) == ["tests/"]
+
+
+def test_the_scope_precedes_the_ignore_flags_and_the_pattern_follows_them():
+    """Measured 2026-09-02, and it is a correctness rule, not a style one.
+    `--testPathIgnorePatterns` is a greedy yargs array: with the positional
+    LAST, `jest --testPathIgnorePatterns=fail.test.js tests/` swallows `tests/`
+    into the ignore list and runs NOTHING -- exit 1, empty `testResults` -- so
+    the p2p check would report a regression suite that executed zero tests.
+    With the positional first it drops the named file and runs the rest.
+
+    The trailing `-t` is safe on the same greedy option because it starts with
+    `-`, which ends the array."""
+    argv = for_framework("jest").p2p_args(
+        selected=(), scope=("tests/",),
+        deselected=("tests/a.test.js::gone",), ignored=("tests/x.js",))
+
+    assert argv == ["tests/",
+                    "--testPathIgnorePatterns=/node_modules/",
+                    "--testPathIgnorePatterns=tests/x.js",
+                    "-t", "^(?!(?:gone)$)"]
+
+
+def test_node_no_cache_args_are_measured_per_framework():
+    """vitest creates <cwd>/node_modules/.vite -- inside the bind-mounted tree
+    -- and `--no-cache` prevents it entirely (measured). jest's DEFAULT
+    cacheDirectory is /tmp/jest_0, already outside the tree, and jest wrote
+    nothing into the tree in any measured run."""
+    assert for_framework("vitest").no_cache_args == ("--no-cache",)
+    assert for_framework("jest").no_cache_args == ()
+
+
+def test_node_parse_deselected_counts_pending_tests():
+    report = _report("t_nomatch", "vitest")
+
+    assert for_framework("vitest").parse_deselected(stdout="", report=report) == 3
+    assert for_framework("vitest").parse_deselected(stdout="", report=None) is None
+
+
+def test_node_module_of_is_the_file_half_of_an_id_whose_name_carries_colons():
+    """Split once from the LEFT. A JavaScript test title may itself contain
+    `::` -- nothing forbids it -- and an rsplit would name a file that does not
+    exist, which reaches preflight as a confinement equality that can never
+    hold."""
+    assert for_framework("jest").module_of(
+        "tests/a.test.js::parses a::b as one token") == "tests/a.test.js"
+
+
+def test_the_node_adapters_ask_for_no_hypothesis_probe():
+    """A recorded absence, never a claim that the suite is deterministic. The
+    hypothesis block is a Python-ecosystem check; fast-check and jest-fuzz have
+    their own seed mechanisms and no such check exists yet (TASKS.md)."""
+    for framework in ("vitest", "jest"):
+        assert for_framework(framework).hypothesis_interpreter(
+            ("/node_modules/.bin/vitest", "run")) is None
+
+
+def test_node_explain_never_claims_an_exit_code_means_anything():
+    """The one sentence this adapter exists to be able to say. Every measured
+    failure shape returns 1 and a `-t` matching nothing returns 0, so a phrase
+    that named a cause would be inventing one."""
+    phrase = for_framework("vitest").explain(1)
+
+    assert "1" in phrase
+    assert for_framework("jest").explain(0) != phrase
+
+
+def test_a_report_entry_with_no_name_does_not_lose_the_other_entries():
+    """`_relpath` must never raise: a malformed entry is still evidence about
+    the entries beside it, and a classifier that died here would report a
+    passing suite as KIND_ENVIRONMENT through `_Runner`'s own error path."""
+    outcome = for_framework("vitest").classify(
+        exit_code=0, stdout="", stderr="", report={"testResults": [
+            {"assertionResults": [{"status": "passed", "fullName": "ok"}]},
+            {"name": "/repo/tests/a.test.js",
+             "assertionResults": [{"status": "passed", "fullName": "fine"}]},
+        ]})
+
+    assert outcome.kind == KIND_PASSED
+    assert "tests/a.test.js" in outcome.files_run
+
+
+def test_a_relative_report_name_is_left_alone():
+    """`_relpath` strips the container's /repo mount and nothing else. A name
+    that is already relative is passed through rather than guessed at -- the
+    alternative is a path this code invented appearing in `failed_ids`, which
+    the grader publishes as the id the model failed."""
+    from bakeoff.runners.node_adapter import VITEST
+
+    assert VITEST._relpath("/repo/tests/a.test.js") == "tests/a.test.js"
+    assert VITEST._relpath("tests/a.test.js") == "tests/a.test.js"
+    assert VITEST._relpath("/elsewhere/a.test.js") == "/elsewhere/a.test.js"
+    assert VITEST._relpath("") == ""
+
+
+# --- node id validation, which runs at LOAD time -------------------------------
+
+
+@pytest.mark.parametrize("framework", ["vitest", "jest"])
+@pytest.mark.parametrize("node_id", [
+    "tests/../../etc/passwd.test.js::does a thing",
+    "tests/../src/a.test.js::does a thing",
+    "/repo/tests/a.test.js::does a thing",
+])
+def test_a_traversing_or_absolute_file_half_is_refused_at_load(framework, node_id):
+    """`_under` is `is_relative_to`, which is PURELY LEXICAL: it does not
+    normalise `..`, so `tests/../../etc/x.test.js` is "under" `tests/` and
+    loads clean. The runner then resolves it against the real filesystem and
+    selects nothing -- which on both frameworks exits 0 with every test
+    skipped, so the id is a silent no-op and no downstream check says so.
+
+    An absolute path is refused for the same reason one component over: the
+    positional is matched against the absolute path inside the container, and a
+    host-shaped or mount-shaped prefix in a manifest names a file the scope
+    check cannot reason about."""
+    from bakeoff.tasks import TaskError
+
+    with pytest.raises(TaskError, match="tests.f2p"):
+        for_framework(framework).validate_node_id(
+            node_id, ("tests/",), "tests.f2p")
+
+
+def test_the_node_repo_mount_constant_does_not_drift():
+    """Three copies of `/repo` now exist -- `container.REPO_MOUNT`,
+    `tasks._REPO_MOUNT` and this one -- because container.py imports `docker`
+    at module level and both the loader and this adapter run without a daemon.
+    Drift is silent: a stale prefix here means `_relpath` strips nothing, and
+    every `failed_ids` entry the grader publishes carries a `/repo/` prefix no
+    manifest uses, so the confinement comparison can never hold."""
+    from bakeoff.runners.node_adapter import _REPO_MOUNT
+    from bakeoff.tasks import _REPO_MOUNT as _TASKS_REPO_MOUNT
+
+    assert _REPO_MOUNT == _TASKS_REPO_MOUNT

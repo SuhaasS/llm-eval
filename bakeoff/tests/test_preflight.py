@@ -2649,16 +2649,16 @@ def test_preflight_evidence_names_the_framework_it_judged_under():
 
 def test_the_hypothesis_probe_is_asked_of_the_adapter():
     """It is a Python-ecosystem check, so the adapter owns it. pytest reads
-    the interpreter off `tests.runner`; the node adapters will answer `None`
-    (Task 6 -- today they raise, which is the loud shape a stub has to take)
-    and preflight then skips the block entirely."""
+    the interpreter off `tests.runner`; the node adapters answer `None` and
+    preflight then skips the block entirely, leaving both evidence keys `None`
+    -- a recorded ABSENCE, never a claim that the suite is deterministic."""
     from bakeoff.runners import for_framework
 
     assert for_framework("pytest").hypothesis_interpreter(
         ("python", "-m", "pytest")) == "python"
-    with pytest.raises(NotImplementedError, match="broadening 7 Task 6"):
-        for_framework("vitest").hypothesis_interpreter(
-            ("/node_modules/.bin/vitest", "run"))
+    for framework in ("vitest", "jest"):
+        assert for_framework(framework).hypothesis_interpreter(
+            ("/node_modules/.bin/vitest", "run")) is None, framework
 
 
 def test_an_adapter_that_declines_the_probe_leaves_both_keys_absent(

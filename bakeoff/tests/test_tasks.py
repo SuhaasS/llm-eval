@@ -3001,17 +3001,41 @@ def test_two_declared_ids_sharing_a_full_name_across_files_are_refused(
     assert "tests/a.test.js" in str(excinfo.value)
 
 
-def test_the_same_full_name_in_the_same_file_is_not_refused(tmp_path, upstream):
-    """Two entries with the same left AND right half are a duplicate, which
-    `tests.f2p contains duplicates` already refuses. The new rule is about
-    DIFFERENT files, and a rule that also fired on the same file would be a
-    second, worse message for a case that already has one."""
+def test_two_names_in_the_ONE_file_are_not_refused(tmp_path, upstream):
+    """The duplicate-name rule is about DIFFERENT files, and it must not fire
+    on the ordinary case of one test file declaring several tests.
+
+    The case the rule's own wording invites -- the same full name TWICE in the
+    same file -- is not constructible in a manifest and so is not tested here:
+    identical left and right halves are one identical string, which the f2p
+    duplicate check and the f2p/p2p overlap check already refuse, each with a
+    message about the thing that is actually wrong."""
     task_dir = _write_node_task(
         tmp_path / "set", upstream,
         f2p=["tests/a.test.js::works"], p2p=["tests/a.test.js::other"],
     )
 
     assert load_task(task_dir).tests.framework == "vitest"
+
+
+def test_a_pytest_manifest_whose_runner_does_not_invoke_pytest_is_refused(
+    tmp_path, upstream
+):
+    """The framework and the runner are CROSS-CHECKED, never derived from each
+    other, and the check has teeth on the default framework too -- not only on
+    the node ones it was added for.
+
+    `["make", "test"]` is a legal command and an illegal declaration: nothing
+    in the argv says pytest, so the adapter reading its exit codes would be
+    reading whatever `make` returned. It is the same rule preflight applies at
+    gate time, made at LOAD time, where the message can carry the manifest
+    path and no image has been built yet."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream, runner=json.dumps(["make", "test"]),
+    )
+
+    with pytest.raises(TaskError, match="tests.runner contains 'pytest'"):
+        load_task(task_dir)
 
 
 def test_a_pytest_manifest_may_share_node_names_across_modules(

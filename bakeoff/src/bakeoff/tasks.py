@@ -621,6 +621,7 @@ def _framework(value: Any, where: str) -> str:
         )
     return value
 
+
 #: Python versions the base Dockerfile is KNOWN to build, because someone
 #: built it. A closed set rather than a free string, for two reasons that are
 #: each silent without it:
