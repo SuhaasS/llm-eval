@@ -1043,6 +1043,10 @@ class _FakeTests:
     runner: tuple = ("python", "-m", "pytest", "-q")
     f2p: tuple = ("tests/a.py::test_one",)
     p2p: tuple = ()
+    #: `tests.framework` (broadening 7). Defaulted here for the same reason
+    #: `preflight` reads it with `getattr`: the manifest key itself lands in
+    #: Task 4, and until it does every task in the set is a pytest one.
+    framework: str = "pytest"
 
 
 @dataclass(frozen=True)
@@ -2495,3 +2499,187 @@ def test_a_strip_that_did_not_happen_is_refused_by_the_real_gate(
     assert not result.ok
     assert any("strip_paths" in problem for problem in result.problems)
     assert result.evidence["stripped_paths_present"] == ["vendor"]
+
+
+# --- the runner adapter seam -------------------------------------------------
+
+
+def test_the_runner_routes_every_argv_and_verdict_through_its_adapter():
+    """`_Runner` builds no argv of its own and reads no exit code of its own.
+
+    That is the whole of Task 2: every branch in the gate used to interpret
+    pytest's numbers inline, so the gate could only ever gate pytest. A
+    `_Runner` that still spelled a selection or a deselection itself would
+    keep one framework's grammar in a class that now serves three -- and it
+    fails silently, because vitest and jest accept an unknown flag shape by
+    running nothing at exit 0.
+    """
+    from bakeoff.preflight import _Runner
+    from bakeoff.runners import KIND_NOTHING_RAN, Outcome
+
+    class _Adapter:
+        name = "fake"
+
+        def select_args(self, node_ids):
+            return ["--only", *node_ids]
+
+        def p2p_args(self, *, selected, scope, deselected, ignored):
+            return ["--p2p", *selected, *scope, *deselected, *ignored]
+
+        def report_path(self):
+            return None
+
+        def report_args(self, report_path):
+            return []
+
+        def classify(self, *, exit_code, stdout, stderr, report):
+            return Outcome(kind=KIND_NOTHING_RAN, exit_code=exit_code,
+                           explain="the adapter answered")
+
+    recorder = _Recorder()
+    runner = _Runner(recorder, ("run",), 60, _Adapter())
+
+    result = runner.select(("a::b",))
+    runner.pass_to_pass(_Tests(), extra_deselect=("q::r",), scope=("tests/",),
+                        ignore=("tests/broken.py",))
+
+    assert recorder.commands == [
+        ["timeout", "60", "run", "--only", "a::b"],
+        ["timeout", "60", "run", "--p2p", "tests/", "tests/a.py::test_one",
+         "q::r", "tests/broken.py"],
+    ]
+    outcome = runner.classify(result)
+    assert outcome.kind == KIND_NOTHING_RAN
+    assert outcome.explain == "the adapter answered"
+
+
+def test_the_runner_starts_with_no_selection_recorded():
+    """`()` is "the last run selected nothing by id", which is what a scope
+    sweep does. Only the CALLER knows what was asked for -- a report cannot
+    tell a test that was skipped from one that was never selected -- so the
+    field exists from construction rather than appearing on first use, where
+    an unset attribute would raise out of `classify` on the deselect branch."""
+    from bakeoff.preflight import _Runner
+
+    assert _Runner(_Recorder(), ("python", "-m", "pytest"), 60)._selected == ()
+
+
+def test_the_runner_adapter_default_is_pytest_and_nothing_may_rely_on_it():
+    """The plan asked for NO default: `oracle._derive` and the grader's two
+    checks each build a `_Runner`, and a default lets one of the three go on
+    classifying a jest run with pytest's exit codes -- where 1 is what a
+    config error, an import error and a failing assertion all return alike --
+    stamping a model failure on an environment defect, permanently, in an
+    append-only store.
+
+    It has one anyway, because a harder constraint pulls the other way:
+    `test_grading_p2p_with_no_extras_is_the_argv_preflight_validated` is the
+    argv-identity gate on this refactor, it constructs a `_Runner` with three
+    positional arguments, and a gate rewritten to accommodate the change it
+    gates has stopped gating anything. So the default stays and every call
+    site passes the adapter EXPLICITLY instead -- `preflight` does below;
+    `oracle` and the grader are Task 3's.
+    """
+    import inspect
+
+    from bakeoff.preflight import _Runner
+    from bakeoff.runners import for_framework
+
+    default = inspect.signature(_Runner.__init__).parameters["adapter"].default
+    assert default is for_framework("pytest")
+
+
+def test_the_runner_gate_names_the_declared_framework_and_the_marker():
+    """The gate used to be `any("pytest" in part)`, which could only ever mean
+    one framework. It now asserts the DECLARED framework and the argv agree --
+    each catching the other's typo, which is why neither is derived from the
+    other. A manifest declaring vitest whose runner invokes jest would
+    otherwise be classified by the wrong adapter."""
+    from bakeoff.runners import for_framework
+
+    assert for_framework("pytest").runner_marker == "pytest"
+    assert for_framework("vitest").runner_marker == "vitest"
+    assert for_framework("jest").runner_marker == "jest"
+
+
+def test_preflight_refuses_a_runner_that_does_not_match_the_framework(tmp_path):
+    """The early return, before any container is started -- the same shape the
+    old `pytest`-substring gate had, so a bad manifest costs no daemon. The
+    message names BOTH sides, because the fix is either one: the framework is
+    wrong for this runner, or the runner is wrong for this framework."""
+    task = _FakeTask(tests=_FakeTests(runner=("python", "-m", "unittest")))
+
+    result = preflight(task, image="sha256:x", repo_path=tmp_path,
+                       start_sha="s" * 40)
+
+    assert not result.ok
+    assert "'pytest'" in result.problems[0]
+    assert "unittest" in result.problems[0]
+    # No container was started, so the container-only evidence keys stay None.
+    assert result.evidence["image_env_observed"] is None
+
+
+def test_preflight_evidence_names_the_framework_it_judged_under():
+    """A cached verdict outlives the code that wrote it, and every other
+    evidence key now means something framework-dependent -- `f2p_before_exit`
+    most of all, since 1 means "a test failed" under pytest and means nothing
+    at all under vitest."""
+    task = _FakeTask(tests=_FakeTests(runner=("python", "-m", "unittest")))
+
+    result = preflight(task, image="sha256:x", repo_path=Path("/nonexistent"),
+                       start_sha="0" * 40)
+
+    assert result.evidence["framework"] == "pytest"
+
+
+def test_the_hypothesis_probe_is_asked_of_the_adapter():
+    """It is a Python-ecosystem check, so the adapter owns it. pytest reads
+    the interpreter off `tests.runner`; the node adapters will answer `None`
+    (Task 6 -- today they raise, which is the loud shape a stub has to take)
+    and preflight then skips the block entirely."""
+    from bakeoff.runners import for_framework
+
+    assert for_framework("pytest").hypothesis_interpreter(
+        ("python", "-m", "pytest")) == "python"
+    with pytest.raises(NotImplementedError, match="broadening 7 Task 6"):
+        for_framework("vitest").hypothesis_interpreter(
+            ("/node_modules/.bin/vitest", "run"))
+
+
+def test_an_adapter_that_declines_the_probe_leaves_both_keys_absent(
+    monkeypatch, tmp_path
+):
+    """`None` from `hypothesis_interpreter` skips both probes AND the CI
+    refusal, and the two evidence keys stay `None` -- a RECORDED ABSENCE,
+    never a claim that a JavaScript suite is deterministic. `False` there
+    would be the claim "this suite does not import hypothesis", asserted by a
+    gate that never ran a scan.
+
+    Driven through `preflight` rather than through the adapter, because the
+    thing under test is the GUARD: an adapter answering `None` into an
+    unguarded block runs `container.exec([None, "-c", ...])`.
+    """
+    from bakeoff.runners import for_framework
+
+    task = _FakeTask()
+
+    class _NoProbe:
+        def __getattr__(self, name):
+            return getattr(for_framework("pytest"), name)
+
+        def hypothesis_interpreter(self, runner):
+            return None
+
+    monkeypatch.setattr("bakeoff.preflight.for_framework",
+                        lambda name: _NoProbe())
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=("tests/",),
+                                   hypothesis_importable=True,
+                                   hypothesis_in_suite=True)
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert result.ok, result.problems
+    assert result.evidence["hypothesis_importable"] is None
+    assert result.evidence["hypothesis_imported_by_suite"] is None
+    assert not any("hypothesis" in problem for problem in result.problems)

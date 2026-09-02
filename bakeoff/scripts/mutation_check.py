@@ -731,9 +731,13 @@ MUTATIONS = [
         # in the f2p module: since PREFLIGHT_VERSION 4 a confined collection
         # error is an accepted task shape and is handled by an EARLIER branch,
         # so a fixture that is confined would leave this mutation inert.
+        # Stated over the adapter's OUTCOME since broadening 7: the number is
+        # still pytest's, but only the adapter is allowed to read it, and the
+        # branch has to keep working for a framework whose exit code carries
+        # nothing (vitest and jest both exit 1 for five different causes).
         "preflight: accept any non-zero exit as evidence the bug is present",
         "src/bakeoff/preflight.py",
-        "        elif red.exit_code != EXIT_TESTS_FAILED:",
+        "        elif red_outcome.kind != KIND_FAILED:",
         "        elif False:",
         "tests/test_preflight.py -k cannot_even_run",
         "integration",
@@ -1645,12 +1649,16 @@ MUTATIONS = [
         # The quarantine is derived and then has to RIDE. Dropping the flags
         # leaves a derivation that ran two full suites inside a container to
         # produce a list nothing subtracts -- and the record still reports
-        # `p2p_quarantine_requested`, so it reads as applied.
+        # `p2p_quarantine_requested`, so it reads as applied. The emission
+        # moved into the pytest adapter in broadening 7 Task 2; the selector
+        # did not, because `_Runner.pass_to_pass` is still what has to carry
+        # the flags through to the graded argv.
         "preflight: grade with the flake in the suite",
-        "src/bakeoff/preflight.py",
-        "        extra = [arg for node_id in extra_deselect\n"
-        '                 for arg in ("--deselect", node_id)]',
-        "        extra = []",
+        "src/bakeoff/runners/pytest_adapter.py",
+        "        for node_id in deselected:\n"
+        '            out += ["--deselect", node_id]',
+        "        for node_id in ():\n"
+        '            out += ["--deselect", node_id]',
         "tests/test_preflight.py -k quarantine_rides_as_deselect",
         "not integration",
     ),
@@ -1659,11 +1667,13 @@ MUTATIONS = [
         # ROOTDIR, which is whatever the agent left lying there -- measured,
         # eight scratch files in one stored record. Those become the
         # regression check, and a model that wrote a failing scratch test
-        # fails p2p on its own litter.
+        # fails p2p on its own litter. Emitted by the pytest adapter since
+        # broadening 7 Task 2; the selector is unchanged, because what must
+        # stay true is the argv `_Runner.pass_to_pass` hands the grader.
         "preflight: collect the agent's scratch files into p2p",
-        "src/bakeoff/preflight.py",
-        "        args: list[str] = [*scope]",
-        "        args: list[str] = []",
+        "src/bakeoff/runners/pytest_adapter.py",
+        "        out = list(selected) if selected else list(scope)",
+        "        out = list(selected) if selected else []",
         "tests/test_preflight.py -k scope_prefixes_lead",
         "not integration",
     ),

@@ -19,8 +19,14 @@ from bakeoff.runners import (
     KIND_LOAD_ERROR,
     KIND_NOTHING_RAN,
     KIND_PASSED,
+    RunnerAdapter,
     for_framework,
 )
+
+# TODO (broadening 7 Task 4): pin `tasks._FRAMEWORKS == FRAMEWORKS` here once
+# the manifest key and its closed allowlist exist. Until then the registry has
+# nothing to disagree with, and `for_framework` raises KeyError rather than
+# defaulting precisely so that disagreement can never be silent.
 
 
 def test_the_three_frameworks_resolve_and_nothing_else_does():
@@ -30,7 +36,13 @@ def test_the_three_frameworks_resolve_and_nothing_else_does():
     with no manifest path in it."""
     assert set(FRAMEWORKS) == {"pytest", "vitest", "jest"}
     for name in FRAMEWORKS:
-        assert for_framework(name).name == name
+        adapter = for_framework(name)
+        assert adapter.name == name
+        # The Protocol, not just the name. A registry entry missing a method
+        # is a `AttributeError` out of the middle of preflight, after the
+        # container is up and the suite has run -- and for the node adapters
+        # the missing method would be found only by a task that declared them.
+        assert isinstance(adapter, RunnerAdapter), name
     with pytest.raises(KeyError):
         for_framework("mocha")
 
@@ -144,6 +156,34 @@ def test_pytest_p2p_args_matches_the_live_runner_on_both_branches():
 
 def test_pytest_select_args_are_the_bare_node_ids():
     assert for_framework("pytest").select_args(("a::b", "c::d")) == ["a::b", "c::d"]
+
+
+def test_pytest_select_args_match_the_live_runner():
+    """Identity against the REAL `_Runner.select`, for the reason the p2p
+    identity test gives: a literal transcribed from the code under test is a
+    second copy of it, and it agrees for exactly as long as both are wrong in
+    the same way. The f2p selection is the run the whole red-before verdict
+    is read off, so this is the argv least able to afford a drift."""
+    from bakeoff.preflight import _Runner
+
+    class _Recorder:
+        def __init__(self):
+            self.argv = []
+
+        def exec(self, argv):
+            self.argv = argv
+            return None
+
+    adapter = for_framework("pytest")
+    node_ids = ("tests/a.py::test_one", "tests/a.py::Klass::test_two[x::y]")
+
+    recorder = _Recorder()
+    _Runner(recorder, ("python", "-m", "pytest", "-q"), 600,
+            adapter).select(node_ids)
+    live = recorder.argv[len(["timeout", "600", "python", "-m", "pytest",
+                             "-q"]):]
+
+    assert adapter.select_args(node_ids) == live
 
 
 def test_pytest_writes_no_report_and_asks_for_no_reporter_flags():

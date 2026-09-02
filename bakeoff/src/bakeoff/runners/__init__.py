@@ -214,7 +214,9 @@ def _build_registry() -> dict[str, RunnerAdapter]:
 FRAMEWORKS: tuple[str, ...] = ("pytest", "vitest", "jest")
 
 #: Built last, so a NameError here is a missing adapter rather than a module
-#: that half-imported. `tasks._FRAMEWORKS` must equal `FRAMEWORKS`; a test
-#: pins it, because `for_framework` raises KeyError rather than defaulting and
-#: that allowlist is the only thing keeping the raise unreachable.
+#: that half-imported. `tasks._FRAMEWORKS` must equal `FRAMEWORKS` -- nothing
+#: pins that yet, because the manifest key and its allowlist are broadening 7
+#: Task 4's; the pin lands with them, because `for_framework` raises KeyError
+#: rather than defaulting and that allowlist is the only thing keeping the
+#: raise unreachable.
 _REGISTRY = _build_registry()

@@ -28,12 +28,14 @@ daemon nor a network.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
 from pathlib import Path
 
 from bakeoff.container import RunContainer
+from bakeoff.runners import KIND_FAILED, KIND_PASSED, Outcome, for_framework
 from bakeoff.tasks import _DEFAULT_PYTHON
 
 # Re-exported, not re-defined. These moved to `bakeoff.runners.pytest_adapter`
@@ -58,6 +60,11 @@ from bakeoff.runners.pytest_adapter import (  # noqa: F401
     f2p_modules,
     failed_node_ids,
 )
+
+#: `_Runner`'s adapter default, and the ONLY thing that may ever use it. See
+#: `_Runner.__init__` for why a default exists at all and why no caller may
+#: rely on it.
+_PYTEST_ADAPTER = for_framework("pytest")
 
 #: What this gate asserts, as a version. It joins `run_matrix`'s preflight
 #: cache key and the grader's, because none of the other three components
@@ -185,10 +192,6 @@ class PreflightResult:
             "preflight_version": self.preflight_version,
             "ok": self.ok,
         }
-
-
-def _explain(code: int) -> str:
-    return _EXIT_MEANING.get(code, f"exit code {code}")
 
 
 def _present(container, names, *, dangling_counts: bool = False) -> list[str]:
@@ -452,19 +455,91 @@ class _Runner:
     """
 
     def __init__(self, container: RunContainer, runner: tuple[str, ...],
-                 timeout_s: int):
+                 timeout_s: int, adapter=_PYTEST_ADAPTER):
         self.container = container
         self.runner = list(runner)
         self.timeout_s = timeout_s
+        #: What "the tests failed" MEANS for this task's framework. Every
+        #: caller passes it explicitly and nothing may rely on the default:
+        #: once a manifest can declare `tests.framework` (broadening 7 Task
+        #: 4), a call site left on it classifies a jest run with pytest's
+        #: exit codes -- where 1 is what a config error, an import error and
+        #: a failing assertion all return alike -- and stamps a model failure
+        #: on an environment defect, permanently, in an append-only store.
+        #:
+        #: The default exists for exactly one reason, and it is not a
+        #: convenience: `test_grading_p2p_with_no_extras_is_the_argv_
+        #: preflight_validated` is the argv-identity gate on this refactor,
+        #: it constructs a `_Runner` with three positional arguments, and it
+        #: may not be edited -- a gate that is rewritten to accommodate the
+        #: change it gates has stopped gating anything.
+        self.adapter = adapter
         #: The argv of the most recent invocation, so a problem can name what
         #: was actually run rather than a reconstruction of it -- a second
         #: copy of the branch logic is a second thing that can be wrong about
         #: what happened, inside the check that exists to be right about it.
         self.last_argv: list[str] = []
+        #: What the last invocation asked for BY ID, so `classify` can report
+        #: which of them never ran. Only the caller knows this; the report
+        #: cannot tell a test that was skipped from one that was never
+        #: selected. `()` when the last run selected nothing by id.
+        self._selected: tuple[str, ...] = ()
+        #: The report the last invocation wrote, parsed, or `None`. Read back
+        #: through `cat` because the file lives in the container's /tmp, which
+        #: is never bind-mounted -- deliberately, so it cannot reach a
+        #: submission diff.
+        self.last_report: dict | None = None
 
     def run(self, extra: list[str]):
+        report_path = self.adapter.report_path()
+        if report_path:
+            # Deleted BEFORE the measured command, as a separate exec, because
+            # a config error writes no report at all (measured 2026-09-01,
+            # vitest 3.2.7 and jest 30.5.0 both) -- so a leftover file from the
+            # previous invocation would stand in as this run's evidence. The
+            # path is FIXED rather than per-invocation because it is an argv
+            # element and the gated argv must equal the graded argv; the rm is
+            # what makes a fixed name safe.
+            self.container.exec(["rm", "-f", report_path])
+            extra = [*extra, *self.adapter.report_args(report_path)]
         self.last_argv = ["timeout", str(self.timeout_s), *self.runner, *extra]
-        return self.container.exec(self.last_argv)
+        result = self.container.exec(self.last_argv)
+        self.last_report = self._read_report(report_path)
+        return result
+
+    def _read_report(self, report_path: str | None) -> dict | None:
+        """The parsed report, or `None` -- which is a measurement, not a gap.
+
+        `None` means the runner produced no machine-readable evidence, and
+        `classify` turns that into an ENVIRONMENT outcome. That is the correct
+        reading of a config error, of a runner that could not start, and of a
+        report this code could not parse: in all three the command did not say
+        what it did, and reading silence as success is the Phase 0c failure.
+        """
+        if not report_path:
+            return None
+        read = self.container.exec(["cat", report_path])
+        if read.exit_code != 0:
+            return None
+        try:
+            return json.loads(read.stdout)
+        except (ValueError, TypeError):
+            return None
+
+    def classify(self, result) -> Outcome:
+        """What that invocation did, in terms no framework owns.
+
+        Asked of the ADAPTER rather than read off the exit code, because the
+        exit code is pytest's answer and only pytest's: measured 2026-09-01,
+        vitest 3.2.7 and jest 30.5.0 both exit 1 for a failing test, an
+        unresolvable import, a syntax error, a nonexistent file argument and a
+        broken config alike. Never a comparison against the manifest -- the
+        confinement equality below is preflight's own claim to make.
+        """
+        return self.adapter.classify(
+            exit_code=result.exit_code, stdout=result.stdout,
+            stderr=result.stderr, report=self.last_report,
+        )
 
     @property
     def last_timeout_s(self) -> int | None:
@@ -487,7 +562,7 @@ class _Runner:
         return None
 
     def select(self, node_ids: tuple[str, ...]):
-        return self.run(list(node_ids))
+        return self.run(self.adapter.select_args(node_ids))
 
     def pass_to_pass(self, tests, extra_deselect: tuple[str, ...] = (),
                      scope: tuple[str, ...] = (),
@@ -529,16 +604,24 @@ class _Runner:
         hides -- a non-f2p test inside the ignored module -- is measured by
         that same p2p-after run, which collects the module once the reference
         lands and must exit 0.
+
+        The argv itself is now the adapter's, in ONE call rather than composed
+        from pieces: vitest and jest express selection and deselection through
+        a single `-t <regex>`, and emitting two is not "last one wins" --
+        measured 2026-09-02, vitest REJECTS the second (exit 1, no report) and
+        jest COMMA-JOINS them into a pattern matching neither, running nothing
+        at exit 0. The BRANCH -- explicit `tests.p2p` or the deselect default
+        -- stays here, because it is a statement about the manifest rather
+        than about the framework.
         """
-        extra = [arg for node_id in extra_deselect
-                 for arg in ("--deselect", node_id)]
-        extra += [f"--ignore={path}" for path in ignore]
         if tests.p2p:
-            return self.run([*tests.p2p, *extra])
-        args: list[str] = [*scope]
-        for node_id in tests.f2p:
-            args += ["--deselect", node_id]
-        return self.run([*args, *extra])
+            return self.run(self.adapter.p2p_args(
+                selected=tuple(tests.p2p), scope=(),
+                deselected=tuple(extra_deselect), ignored=tuple(ignore)))
+        return self.run(self.adapter.p2p_args(
+            selected=(), scope=tuple(scope),
+            deselected=tuple(tests.f2p) + tuple(extra_deselect),
+            ignored=tuple(ignore)))
 
 
 def preflight(
@@ -559,6 +642,16 @@ def preflight(
     problem_codes: list[str] = []
     evidence: dict = {}
     tests = task.tests
+    # `getattr` with a default, like `_declared_grading`'s and the strip's:
+    # this function takes an untyped `task`, and a manifest object predating
+    # the key must not crash the gate. Broadening 7 Task 4 adds the field.
+    #
+    # Recorded in `evidence` because a cached verdict outlives the code that
+    # wrote it and every other key here is now framework-dependent --
+    # `f2p_before_exit` most of all, since 1 means "a test failed" under
+    # pytest and means nothing at all under vitest.
+    adapter = for_framework(getattr(tests, "framework", "pytest"))
+    evidence["framework"] = adapter.name
     # NOT a parameter with a default. Both drivers call this with `task` and
     # neither passes a bound, so reading it here makes "a consumer left on the
     # constant" unrepresentable rather than merely tested for -- and that
@@ -593,15 +686,23 @@ def preflight(
     evidence["submodules"] = None
     evidence["submodules_orphaned"] = None
 
-    if not any("pytest" in part for part in tests.runner):
-        # The red/green distinction is built on pytest's exit codes. Another
-        # runner may be addable later, but silently accepting one now would
-        # mean `returncode != 0` again, which is the check that let Phase 0c
-        # through.
+    if not any(adapter.runner_marker in part for part in tests.runner):
+        # The DECLARED framework and the declared argv are cross-checked
+        # rather than derived from each other, so each catches the other's
+        # typo. The old gate was `any("pytest" in part)`, which could only
+        # ever mean one framework; a manifest declaring vitest whose runner
+        # invokes jest would be classified by the wrong adapter, and the
+        # red/green distinction is built on what THIS runner reports.
         problems.append(
-            f"tests.runner is {list(tests.runner)!r}; preflight can only "
-            "distinguish 'tests failed' from 'the environment is broken' for "
-            "pytest, and without that distinction the gate is worthless"
+            f"tests.runner is {list(tests.runner)!r} but tests.framework is "
+            f"{adapter.name!r}, and no argument contains "
+            f"{adapter.runner_marker!r}: preflight can only distinguish "
+            "'tests failed' from 'the environment is broken' through the "
+            "adapter the manifest DECLARED, so a runner that adapter cannot "
+            "read would be classified by the wrong rules -- which for the "
+            "node frameworks means exit 1 for a config error graded as a "
+            "test failure -- and without that distinction the gate is "
+            "worthless"
         )
         return PreflightResult(
             task_id=task.task_id, task_version=task.task_version,
@@ -959,76 +1060,88 @@ def preflight(
         # hardcoded: a runner of ["/opt/venv/bin/python", "-m", "pytest"]
         # resolves imports against that venv, so probing whichever `python` is
         # first on PATH would answer a question about a different environment.
-        importable = container.exec(
-            [_runner_python(tests.runner), "-c", "import hypothesis"]
-        ).exit_code == 0
-        evidence["hypothesis_importable"] = importable
+        # ASKED OF THE ADAPTER, because this is a Python-ecosystem check
+        # and nothing about it generalises. A node adapter answers `None`,
+        # the whole block below is skipped, and both evidence keys stay
+        # `None` -- a recorded absence, never a claim that a JavaScript
+        # suite is deterministic.
+        interpreter = adapter.hypothesis_interpreter(tests.runner)
+        if interpreter is not None:
+            importable = container.exec(
+                [interpreter, "-c", "import hypothesis"]
+            ).exit_code == 0
+            evidence["hypothesis_importable"] = importable
 
-        # `rg` is asserted present above, so this adds no dependency. Filtered
-        # through `_present` for the reason `_existing_prefixes` gives: a
-        # declared prefix absent at the start state is an input this gate
-        # tolerates, and handing rg a path that does not exist makes it exit 2
-        # -- which must read as "could not answer", not as "no match".
-        scanned = _present(container, tests.paths)
-        used: bool | None = None
-        if scanned:
-            # `--` before the paths: a `tests.paths` entry starting with `-`
-            # (e.g. a directory named `-tests/`) would otherwise parse as an
-            # rg flag rather than a path, turning a scan target into a
-            # silent argv change.
-            probe_argv = ["rg", "-q", r"^\s*(from|import)\s+hypothesis\b",
-                          "--", *scanned]
-            probe = container.exec(probe_argv)
-            # Three-valued on purpose. 0 is a match, 1 is no match, and
-            # anything else (an unreadable path, a bad pattern, no rg) is
-            # UNKNOWN -- a quiet False there would silently disarm the only
-            # check that catches an undeclared property-based suite.
-            #
-            # UNKNOWN is not silent either. `scanned` is non-empty here, so
-            # the probe RAN and did not answer -- a controller-ruling
-            # ambiguity, not the "never ran" shape below where `scanned` is
-            # empty and no exec happens at all. The two render identically as
-            # `None` in `evidence`, which is exactly the pair this repo's
-            # "a null says which kind of null it is" rule exists for, so the
-            # exit-code case gets a problem naming what was run and what came
-            # back, and the never-ran case stays a quiet `None`.
-            if probe.exit_code == 0:
-                used = True
-            elif probe.exit_code == 1:
-                used = False
-            else:
+            # `rg` is asserted present above, so this adds no dependency.
+            # Filtered through `_present` for the reason `_existing_prefixes`
+            # gives: a declared prefix absent at the start state is an input
+            # this gate tolerates, and handing rg a path that does not exist
+            # makes it exit 2 -- which must read as "could not answer", not
+            # as "no match".
+            scanned = _present(container, tests.paths)
+            used: bool | None = None
+            if scanned:
+                # `--` before the paths: a `tests.paths` entry starting
+                # with `-` (e.g. a directory named `-tests/`) would otherwise
+                # parse as an rg flag rather than a path, turning a scan
+                # target into a silent argv change.
+                probe_argv = ["rg", "-q", r"^\s*(from|import)\s+hypothesis\b",
+                              "--", *scanned]
+                probe = container.exec(probe_argv)
+                # Three-valued on purpose. 0 is a match, 1 is no match, and
+                # anything else (an unreadable path, a bad pattern, no rg) is
+                # UNKNOWN -- a quiet False there would silently disarm the only
+                # check that catches an undeclared property-based suite.
+                #
+                # UNKNOWN is not silent either. `scanned` is non-empty
+                # here, so the probe RAN and did not answer -- a
+                # controller-ruling ambiguity, not the "never ran" shape
+                # below where `scanned` is empty and no exec happens at all.
+                # The two render identically as `None` in `evidence`, which
+                # is exactly the pair this repo's "a null says which kind of
+                # null it is" rule exists for, so the exit-code case gets a
+                # problem naming what was run and what came back, and the
+                # never-ran case stays a quiet `None`.
+                if probe.exit_code == 0:
+                    used = True
+                elif probe.exit_code == 1:
+                    used = False
+                else:
+                    problems.append(
+                        "the hypothesis-import scan (rg over tests.paths) "
+                        "could not answer: `"
+                        + " ".join(probe_argv)
+                        + f"` exited {probe.exit_code}, "
+                        "not 0 (match) or 1 (no match). rg exits 2 on an "
+                        "unreadable path or a bad pattern and it is asserted "
+                        "present above, so this names an environment problem "
+                        "preflight cannot see through -- silently reading it "
+                        "as 'not imported' would disarm the one check that "
+                        "catches an undeclared property-based suite."
+                    )
+            evidence["hypothesis_imported_by_suite"] = used
+
+            if used and "CI" not in declared:
                 problems.append(
-                    "the hypothesis-import scan (rg over tests.paths) could "
-                    "not answer: `"
-                    + " ".join(probe_argv) + f"` exited {probe.exit_code}, "
-                    "not 0 (match) or 1 (no match). rg exits 2 on an "
-                    "unreadable path or a bad pattern and it is asserted "
-                    "present above, so this names an environment problem "
-                    "preflight cannot see through -- silently reading it as "
-                    "'not imported' would disarm the one check that catches "
-                    "an undeclared property-based suite."
+                    "the declared test paths import hypothesis and the "
+                    "manifest declares no image.env CI. A property-based "
+                    "suite without it is a coin flip -- measured, ten fresh "
+                    "runs of one property test over unchanged code gave "
+                    "`0 0 0 0 1 1 1 1 0 0`, and six under CI=1 gave "
+                    "`1 1 1 1 1 1` -- so the gate would be certifying a task "
+                    "whose red-before/green-after verdict is a draw. Add "
+                    "`image.env: {CI: \"1\", HYPOTHESIS_STORAGE_DIRECTORY: "
+                    "\"/tmp/bakeoff-hypothesis\"}` and read HARVESTING.md's "
+                    "Layer 2 bullet before doing so -- determinism makes "
+                    "this oracle reproducible, not correct. (This fires on "
+                    "an IMPORT in tests.paths, not on the package being "
+                    "installed: hypothesis arriving transitively through "
+                    "image.build in a suite that never uses it is fine and "
+                    "is recorded as hypothesis_importable without a "
+                    "problem.)"
                 )
-        evidence["hypothesis_imported_by_suite"] = used
 
-        if used and "CI" not in declared:
-            problems.append(
-                "the declared test paths import hypothesis and the manifest "
-                "declares no image.env CI. A property-based suite without it "
-                "is a coin flip -- measured, ten fresh runs of one property "
-                "test over unchanged code gave `0 0 0 0 1 1 1 1 0 0`, and six "
-                "under CI=1 gave `1 1 1 1 1 1` -- so the gate would be "
-                "certifying a task whose red-before/green-after verdict is a "
-                "draw. Add `image.env: {CI: \"1\", "
-                "HYPOTHESIS_STORAGE_DIRECTORY: \"/tmp/bakeoff-hypothesis\"}` "
-                "and read HARVESTING.md's Layer 2 bullet before doing so -- "
-                "determinism makes this oracle reproducible, not correct. "
-                "(This fires on an IMPORT in tests.paths, not on the package "
-                "being installed: hypothesis arriving transitively through "
-                "image.build in a suite that never uses it is fine and is "
-                "recorded as hypothesis_importable without a problem.)"
-            )
-
-        runner = _Runner(container, tests.runner, timeout_s)
+        runner = _Runner(container, tests.runner, timeout_s, adapter)
 
         # --- red before, and the p2p baseline it is judged against
         #
@@ -1071,11 +1184,9 @@ def preflight(
         # of a cached verdict can tell that from a run that was bounded.
         evidence["suite_timeout_s"] = runner.last_timeout_s
         evidence["f2p_before_exit"] = red.exit_code
+        red_outcome = runner.classify(red)
 
-        collected = (
-            collection_error_modules(red.stdout + red.stderr)
-            if red.exit_code in EXIT_COLLECTION_FAILURES else None
-        )
+        collected = red_outcome.errored_files
         # EQUALITY, in both directions. A module erroring that no f2p id names
         # is a broken environment; a declared f2p module that did NOT error is
         # a declared id nobody checked -- and measured, a partial collection
@@ -1093,8 +1204,8 @@ def preflight(
         # "absence is recorded, never implied" exists to prevent.
         evidence["f2p_red_kind"] = (
             "collection_error" if confined
-            else "failed" if red.exit_code == EXIT_TESTS_FAILED
-            else "passed" if red.exit_code == EXIT_ALL_PASSED
+            else "failed" if red_outcome.kind == KIND_FAILED
+            else "passed" if red_outcome.kind == KIND_PASSED
             else "unknown"
         )
 
@@ -1111,9 +1222,11 @@ def preflight(
         evidence["p2p_before_ignored"] = list(ignore)
         green = runner.pass_to_pass(tests, ignore=ignore)
         evidence["p2p_before_exit"] = green.exit_code
-        p2p_green = green.exit_code == EXIT_ALL_PASSED
+        # Classified IMMEDIATELY after its own invocation: `classify` reads
+        # `_Runner.last_report`, which the next `run` overwrites.
+        p2p_green = runner.classify(green).kind == KIND_PASSED
 
-        if red.exit_code == EXIT_ALL_PASSED:
+        if red_outcome.kind == KIND_PASSED:
             problems.append(
                 "the f2p tests PASS at the start state: the task is already "
                 "done, and every arm would be scored on work it did not do"
@@ -1126,7 +1239,8 @@ def preflight(
                 f"({', '.join(sorted(collected))}), which is an accepted task "
                 "shape ONLY while the rest of the suite is green there -- and "
                 "the p2p run exited "
-                f"{green.exit_code} ({_explain(green.exit_code)}). The f2p "
+                f"{green.exit_code} ({adapter.explain(green.exit_code)}). "
+                "The f2p "
                 "selection imports only the f2p modules, so a broken image "
                 "produces exactly this error set; p2p is what separates them. "
                 "If the run below collected nothing, this task's test tree "
@@ -1139,23 +1253,30 @@ def preflight(
                 f"  {' '.join(runner.last_argv)}\n"
                 + (green.stdout or green.stderr)[-2000:]
             )
-        elif red.exit_code != EXIT_TESTS_FAILED:
-            # `collected` is `None` for two different reasons, and the message
+        elif red_outcome.kind != KIND_FAILED:
+            # `collected` is absent for two different reasons, and the message
             # must not say "empty" for both: the parse ran and found nothing
-            # (exit code was a collection failure, but `collection_error_modules`
-            # saw no bare-module ERROR lines) versus the parse never ran at all
-            # (this exit code -- e.g. 5, EXIT_NOTHING_COLLECTED, or a timeout --
-            # is outside EXIT_COLLECTION_FAILURES). "empty" for the second case
-            # would read as "pytest reported nothing", when what actually
+            # (a collection failure whose output carried no bare-module ERROR
+            # lines) versus the parse never ran at all (an exit code -- e.g.
+            # 5, EXIT_NOTHING_COLLECTED, or a timeout -- this framework does
+            # not read as a collection failure). "empty" for the second case
+            # would read as "the runner reported nothing", when what actually
             # happened is that this branch never looked.
+            #
+            # The predicate is `collected is not None`, over the PARSE, rather
+            # than `red.exit_code in EXIT_COLLECTION_FAILURES`, over the code.
+            # Same claim on pytest -- `errored_files` is `None` on exactly the
+            # codes outside that tuple -- and it is the claim that survives a
+            # framework with no exit codes to consult.
             reported_desc = (
                 sorted(collected) if collected
-                else "empty" if red.exit_code in EXIT_COLLECTION_FAILURES
+                else "empty" if collected is not None
                 else f"not parsed (exit {red.exit_code} is not a collection failure)"
             )
             problems.append(
                 f"the f2p tests did not run at the start state -- "
-                f"{_explain(red.exit_code)}. This is the Phase 0c failure: a "
+                f"{adapter.explain(red.exit_code)}. This is the Phase 0c "
+                "failure: a "
                 "broken environment is also a non-zero exit, and an agent "
                 "reading the output cannot tell it from the bug. A collection "
                 "error IS accepted, but only when every reported ERROR names a "
@@ -1176,7 +1297,8 @@ def preflight(
         if not p2p_green:
             problems.append(
                 f"the rest of the suite is not green at the start state -- "
-                f"{_explain(green.exit_code)}. A p2p regression check against "
+                f"{adapter.explain(green.exit_code)}. A p2p regression "
+                "check against "
                 "an already-red suite cannot mean anything.\n"
                 + (green.stdout or green.stderr)[-2000:]
             )
@@ -1221,10 +1343,11 @@ def preflight(
         else:
             after_f2p = runner.select(tests.f2p)
             evidence["f2p_after_exit"] = after_f2p.exit_code
-            if after_f2p.exit_code != EXIT_ALL_PASSED:
+            if runner.classify(after_f2p).kind != KIND_PASSED:
                 problems.append(
                     f"the f2p tests do NOT pass after the reference fix -- "
-                    f"{_explain(after_f2p.exit_code)}. A solved run and an "
+                    f"{adapter.explain(after_f2p.exit_code)}. A solved run "
+                    "and an "
                     "idle run would leave identical evidence. The usual cause "
                     "is a non-editable install: imports resolve to "
                     "site-packages, so nothing the agent writes to /repo has "
@@ -1233,10 +1356,11 @@ def preflight(
                 )
             after_p2p = runner.pass_to_pass(tests)
             evidence["p2p_after_exit"] = after_p2p.exit_code
-            if after_p2p.exit_code != EXIT_ALL_PASSED:
+            if runner.classify(after_p2p).kind != KIND_PASSED:
                 problems.append(
                     "the reference fix regresses the rest of the suite -- "
-                    f"{_explain(after_p2p.exit_code)}. The reference is the "
+                    f"{adapter.explain(after_p2p.exit_code)}. The reference "
+                    "is the "
                     "oracle; if it cannot pass, no submission can.\n"
                     + (after_p2p.stdout or after_p2p.stderr)[-2000:]
                 )
@@ -1300,13 +1424,13 @@ def preflight(
                 else:
                     scoped = runner.pass_to_pass(tests, scope=scope)
                     evidence["p2p_scoped_after_exit"] = scoped.exit_code
-                    if scoped.exit_code != EXIT_ALL_PASSED:
+                    if runner.classify(scoped).kind != KIND_PASSED:
                         if scoped.exit_code == EXIT_NOTHING_COLLECTED:
                             problem_codes.append(SCOPE_COLLECTS_NOTHING)
                         problems.append(
                             "the p2p run the GRADER will make is not green "
                             f"after the reference fix -- "
-                            f"{_explain(scoped.exit_code)}. Scoping to "
+                            f"{adapter.explain(scoped.exit_code)}. Scoping to "
                             "tests.paths changes what is collected, so a green "
                             "rootdir run does not settle this one.\n"
                             f"  {' '.join(runner.last_argv)}\n"
