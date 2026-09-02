@@ -234,6 +234,19 @@ def pinned_env_keys() -> frozenset[str]:
     `custom_headers` is truthy and the dataclass default is "", so a default
     config would leave the set missing exactly the key that carries the run id
     -- the one whose loss makes every call unattributed.
+
+    TZ is the one PASSTHROUGH_ENV member carved back out, and it is a
+    carve-out rather than a hole in the derivation: PATH and HOME stay pinned
+    because `container_env` omitting them means the IMAGE's declared value
+    would apply unopposed -- a task-declared PATH would stop `claude`
+    resolving, which is exactly the "harness sets it" argument this function
+    exists to enforce. TZ is not that. `container_env`/`_eval_env` never emit
+    it either (measured beside PATH and HOME), so an image-declared TZ is
+    equally unopposed for every process that touches this image -- preflight,
+    the oracle, the grader AND the agent -- which is what `_IMAGE_ENV_ALLOWED`
+    now grants it for. PASSTHROUGH_ENV still forwards the HOST's TZ into
+    `build_env` for `HostBackend`, but that path runs no task image at all,
+    so nothing there collides with what a manifest declares.
     """
     sentinel = ClaudeCodeConfig(
         model="", base_url="", auth_token="", settings_path="",
@@ -242,7 +255,7 @@ def pinned_env_keys() -> frozenset[str]:
     )
     return (
         frozenset(_eval_env(sentinel))
-        | frozenset(PASSTHROUGH_ENV)
+        | (frozenset(PASSTHROUGH_ENV) - {"TZ"})
         | _BASE_IMAGE_ENV
     )
 

@@ -165,11 +165,15 @@ def test_container_env_does_not_forward_host_paths():
     directories that do not exist in the image, so `claude` would stop
     resolving -- and any path that did happen to exist would resolve to
     something the image never installed. HOME decides where the agent
-    writes state, with the same problem.
+    writes state, with the same problem. TZ is asserted absent for a
+    different reason: it is what makes an image-declared TZ safe to grant in
+    `_IMAGE_ENV_ALLOWED` -- unopposed here, it is unopposed on every process
+    that touches the image, the same as CI and HYPOTHESIS_STORAGE_DIRECTORY.
     """
     env = container_env(make_config())
     assert "PATH" not in env
     assert "HOME" not in env
+    assert "TZ" not in env
     assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:4000"
     assert env["CLAUDE_CONFIG_DIR"] == "/run/artifacts/r-001/claude-config"
 
@@ -207,6 +211,22 @@ def test_pinned_env_keys_includes_the_host_allowlist_and_the_base_image_pin():
     keys = pinned_env_keys()
 
     assert {"PATH", "HOME", "PYTHONDONTWRITEBYTECODE"} <= keys
+
+
+def test_pinned_env_keys_carves_out_tz_but_keeps_the_rest_of_the_passthrough():
+    """TZ is the one PASSTHROUGH_ENV member `tasks._IMAGE_ENV_ALLOWED` now
+    grants to a manifest, so it must NOT be pinned here or `_env_map` refuses
+    every declaration with "the harness sets itself" before the allowlist
+    check is ever reached -- measured, this was exactly what happened before
+    the carve-out. PATH and HOME stay pinned: `container_env` omits them the
+    same way it omits TZ, but a task-declared PATH would stop `claude`
+    resolving, which TZ cannot do."""
+    from bakeoff.claude_runner import pinned_env_keys
+
+    keys = pinned_env_keys()
+
+    assert "TZ" not in keys
+    assert {"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_FILE"} <= keys
 
 
 def test_config_digest_covers_environment_not_just_command():

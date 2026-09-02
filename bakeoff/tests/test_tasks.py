@@ -2331,6 +2331,38 @@ def test_a_storage_directory_inside_the_repo_is_refused(
     assert "/repo" in str(exc.value)
 
 
+@pytest.mark.parametrize("value", ["America/New_York", "UTC", "Etc/GMT+5"])
+def test_a_well_shaped_tz_value_loads(tmp_path, upstream, value):
+    """The allowlist admits TZ so a suite that pins a zone -- date/time
+    libraries do this routinely, e.g. moment/luxon asserting against
+    America/New_York -- is a task rather than a rejection. An IANA name, UTC,
+    and an Etc/GMT+N form must all load unchanged."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream,
+        extra_yaml=f'image:\n  env:\n    TZ: "{value}"\n',
+    )
+
+    assert load_task(task_dir).image.env == {"TZ": value}
+
+
+@pytest.mark.parametrize("value", [":/etc/localtime", ":America/New_York"])
+def test_a_leading_colon_tz_value_is_refused(tmp_path, upstream, value):
+    """A TZ value is consumed by libc's tzset, not by this harness: a value
+    starting with `:` makes glibc read the rest as a FILE PATH rather than a
+    zone name, and the newline/quote/backslash/`$` blacklist every key gets
+    does not catch a bare `:` on its own -- TZ needs a positive allowlist of
+    its own shape on top of it."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream,
+        extra_yaml=f'image:\n  env:\n    TZ: "{value}"\n',
+    )
+
+    with pytest.raises(TaskError) as exc:
+        load_task(task_dir)
+
+    assert "IANA zone" in str(exc.value)
+
+
 def test_the_repo_mount_constant_matches_the_container_it_describes():
     """tasks.py spells /repo itself rather than importing REPO_MOUNT, because
     container.py imports `docker` at module level and the loader deliberately

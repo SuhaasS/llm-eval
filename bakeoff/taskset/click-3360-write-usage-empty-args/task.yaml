@@ -219,12 +219,22 @@ image:
   #   env:
   #     CI: "1"
   #     HYPOTHESIS_STORAGE_DIRECTORY: "/tmp/bakeoff-hypothesis"
+  #     TZ: "America/New_York"
   #
-  # An ALLOWLIST of keys, not a free map: CI and HYPOTHESIS_STORAGE_DIRECTORY
-  # and nothing else. An unrestricted map would reopen the hole the harness's
-  # env allowlist exists to close -- CLAUDE_CODE_USE_BEDROCK here would make
-  # the CLI ignore ANTHROPIC_BASE_URL, bypass the proxy, and leave the
-  # mandatory wire log empty with the run still looking normal.
+  # An ALLOWLIST of keys, not a free map: CI, HYPOTHESIS_STORAGE_DIRECTORY and
+  # TZ, and nothing else. An unrestricted map would reopen the hole the
+  # harness's env allowlist exists to close -- CLAUDE_CODE_USE_BEDROCK here
+  # would make the CLI ignore ANTHROPIC_BASE_URL, bypass the proxy, and leave
+  # the mandatory wire log empty with the run still looking normal.
+  #
+  # TZ is for a suite that pins a zone (date/time libraries do this
+  # routinely, e.g. moment/luxon asserting against America/New_York). The
+  # value must be an IANA zone name or UTC/Etc/GMT+N -- letters, digits, `_`
+  # `+` `-` `/` only, refused otherwise, because it is consumed by libc's
+  # tzset rather than by this harness: a leading `:` makes glibc read the
+  # rest as a FILE PATH instead of a zone name, which the newline/quote/`$`
+  # blacklist below does not catch on its own. A task pinning TZ scores every
+  # arm on that zone's behaviour -- same class of section 6.4 confound as CI.
   #
   # CI=1 is what makes a hypothesis suite deterministic: hypothesis registers
   # a built-in `ci` profile (derandomize=True, database=None, deadline=None)

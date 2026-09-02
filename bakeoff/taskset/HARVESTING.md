@@ -39,7 +39,7 @@ Runs before anything builds.
 | no test-half or solution-half file lies under a `strip_paths` prefix | the patch would be applied onto a path that no longer exists — and dropping the chunk instead would make `solution_diff` something other than the merged PR, or shrink the oracle, with every gate still green |
 | every `strip_paths` entry matches a file TRACKED at `base_sha` (checked in `materialize`) | a typo strips nothing and leaves the file the task was cut to remove; the preflight context-file check knows four names, so a mistyped vendored tree passes every gate. It also means a strip cannot name a file the PR *creates* |
 | `task_id` is unique in the set | `run_id` is `sha256(task|model|sample|attempt)`, so two tasks sharing an id collide in the event log — discovered at the far end of a matrix, after the tokens are spent |
-| `image.env` keys are in the allowlist (`CI`, `HYPOTHESIS_STORAGE_DIRECTORY`) and are not a key the harness itself sets; values carry none of `\n` `\r` `"` `\\` `$`; `HYPOTHESIS_STORAGE_DIRECTORY` is an absolute path outside `/repo` | an allowlist because a denylist would have to anticipate `CLAUDE_CODE_USE_BEDROCK`, which bypasses the proxy and leaves the wire log empty with the run still looking normal; a harness-owned key applying to preflight and the grader but overridden on the agent's own process — two environments for one task; a value that does not survive a generated `ENV KEY="value"` Dockerfile line; hypothesis writing into the tree the §5.6 submission diff is taken against |
+| `image.env` keys are in the allowlist (`CI`, `HYPOTHESIS_STORAGE_DIRECTORY`, `TZ`) and are not a key the harness itself sets; values carry none of `\n` `\r` `"` `\\` `$`; `HYPOTHESIS_STORAGE_DIRECTORY` is an absolute path outside `/repo`; `TZ` matches an IANA-name/`UTC`/`Etc/GMT+N` shape | an allowlist because a denylist would have to anticipate `CLAUDE_CODE_USE_BEDROCK`, which bypasses the proxy and leaves the wire log empty with the run still looking normal; a harness-owned key applying to preflight and the grader but overridden on the agent's own process — two environments for one task; a value that does not survive a generated `ENV KEY="value"` Dockerfile line; hypothesis writing into the tree the §5.6 submission diff is taken against; a `TZ` value is read by libc, not by this harness, and a leading `:` makes glibc treat it as a file path instead of a zone name |
 | `image.python`, when declared, is a quoted string in `{"3.11", "3.12", "3.13"}` | an unquoted `3.10` is the float `3.1` and an unquoted `3.11` is `3.11` — the version that reaches the build is the parser's, not the manifest's. An unlisted value is either a floating tag (two collections months apart on different interpreters, with nothing in the record saying which) or one that fails at the `FROM` with a registry error mid-build |
 | `tests.framework`, when declared, is one of `pytest` (default), `vitest`, `jest` | an unrecognised value would reach `for_framework` and raise a bare `KeyError` out of the middle of preflight, with no manifest path in the message |
 | `tests.runner`'s argv contains the declared framework's marker (`pytest`/`vitest`/`jest`) | the two keys catch each other's typo; a runner read by the wrong adapter is classified by the wrong rules, and on the node side no exit code says so — vitest and jest both exit 1 for a failing test and for a broken config alike |
@@ -261,6 +261,18 @@ that passes Layer 1 and measures the wrong thing.
   are satisfied that *any* correct fix passes it and *no* wrong one does,
   which is the same judgment call as the "tests assert behaviour, not internal
   names" bullet above and is harder here, not easier.
+- **A suite that pins `TZ` is allowed, and it is a §6.4 confound to record.**
+  `image.env: {TZ: "America/New_York"}` (or any IANA name / `UTC` /
+  `Etc/GMT+N`) is the fix for a suite whose assertions are written against a
+  specific zone — date/time libraries do this routinely. Declaring it scores
+  every arm on that zone's behaviour rather than on a neutral one, same class
+  of confound as `CI`; record the zone in the manifest the way the `CI`
+  bullet below asks. The value is checked against an extra shape the other
+  keys do not need, because it is consumed by libc's `tzset` rather than by
+  this harness: a value starting with `:` makes glibc read the rest as a
+  file path, not a zone name, so `TZ` needs a positive allowlist
+  (`_TZ_VALUE` in `tasks.py`) on top of the newline/quote/`$` blacklist every
+  key gets.
 - **The suite is deterministic.** Preflight runs p2p twice; a flake makes the
   gate a coin flip and the eval unreproducible.
 - **An explicit `tests.p2p` lists LEAF node ids only** — `path::test_name`,
@@ -506,6 +518,11 @@ is *already in* the tree, and the difference is where this section lives.
   `rubric_items` instead — a free, human-authored list of what "done" required.
 
 ### The image
+
+`image.env` now also admits `TZ`, so a suite that pins a zone (moment/luxon
+asserting against `America/New_York` and similar) is a task, not a rejection
+— see the loader table above and the hypothesis bullet under *The oracle* for
+the value-shape and §6.4 detail.
 
 Three ways a task image fails at build time, silently, all found by screening
 rather than by reasoning:

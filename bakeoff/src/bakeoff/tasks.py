@@ -577,7 +577,22 @@ _REPO_MOUNT = "/repo"
 #:          running pytest from a subdirectory gets a second copy in a
 #:          directory whose self-written .gitignore guard never fired. This is
 #:          the only lever that keeps all of it out.
-_IMAGE_ENV_ALLOWED = frozenset({"CI", "HYPOTHESIS_STORAGE_DIRECTORY"})
+#:
+#:   TZ  -- Date/time libraries are a large, well-shaped slice of the corpus
+#:          (deterministic input, exact string output) and nearly all of them
+#:          pin a zone in CI. Measured 2026-09-01
+#:          (`~/.cache/bakeoff-probe/reports/d7-node.md`): `moment`/`luxon`
+#:          were rejected as jest candidates purely because their suites
+#:          assert against `TZ=America/New_York` (`test/zones/local.test.js`)
+#:          and this allowlist had no way to grant it. `_env_map` holds TZ to
+#:          an extra value shape the other two keys do not need
+#:          (`_TZ_VALUE = re.compile(r"\A[A-Za-z0-9_+\-/]+\Z")`): a `TZ` value
+#:          is consumed by libc, not by this harness, and a leading `:` makes
+#:          glibc read the rest as a FILE PATH rather than a zone name -- the
+#:          character-blacklist check above this constant does not catch a
+#:          bare `:/etc/localtime`, so TZ needs a positive allowlist of its
+#:          own on top of it.
+_IMAGE_ENV_ALLOWED = frozenset({"CI", "HYPOTHESIS_STORAGE_DIRECTORY", "TZ"})
 
 #: The test frameworks this harness can classify. Closed, and it must equal
 #: `bakeoff.runners.FRAMEWORKS` -- pinned from both files, because a reader of
@@ -770,11 +785,21 @@ _ENV_VALUE_REFUSED = ('\n', '\r', '"', '\\', '$')
 
 _ENV_KEY = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
 
+#: The extra shape a TZ value must have, on top of `_ENV_VALUE_REFUSED`. An
+#: IANA zone name (`America/New_York`) or `UTC`/`Etc/GMT+N` -- letters,
+#: digits, `_`, `+`, `-`, `/`. glibc's `tzset` reads a `TZ` value starting
+#: with `:` as a FILE PATH rather than a zone name, and the character
+#: blacklist above does not refuse a bare `:` -- so `:/etc/localtime` (or
+#: worse, a path into the image an agent's edits could reach) would pass that
+#: check and be handed to libc verbatim. This regex is a positive allowlist
+#: instead, precisely because the value is consumed outside this harness.
+_TZ_VALUE = re.compile(r"\A[A-Za-z0-9_+\-/]+\Z")
+
 
 def _env_map(value: Any, where: str) -> dict[str, str]:
     """`image.env`, validated. Empty when absent.
 
-    Four refusals, each naming a failure that is silent without it:
+    Five refusals, each naming a failure that is silent without it:
 
     * a key outside `_IMAGE_ENV_ALLOWED` -- see that constant;
     * a key the harness itself sets -- Docker's exec env wins over the image's
@@ -782,7 +807,8 @@ def _env_map(value: Any, where: str) -> dict[str, str]:
       to the agent, which is two environments for one task;
     * a value carrying `_ENV_VALUE_REFUSED`;
     * HYPOTHESIS_STORAGE_DIRECTORY inside /repo, which undoes the only thing
-      that key is for.
+      that key is for;
+    * a TZ value outside `_TZ_VALUE` -- see that constant.
     """
     from bakeoff.claude_runner import pinned_env_keys
 
@@ -844,6 +870,14 @@ def _env_map(value: Any, where: str) -> dict[str, str]:
                     "is taken against; pointed back inside it, it undoes "
                     "exactly that"
                 )
+        if key == "TZ" and not _TZ_VALUE.match(raw_value):
+            raise TaskError(
+                f"{where}: {key!r} value {raw_value!r} is not an IANA zone "
+                "name or UTC/Etc/GMT+N. A TZ value is consumed by libc, not "
+                "by this harness -- a leading `:` makes glibc read the rest "
+                "as a file path rather than a zone name, which the "
+                "character blacklist above does not catch on its own"
+            )
         env[key] = raw_value
     return env
 

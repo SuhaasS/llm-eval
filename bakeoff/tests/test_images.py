@@ -484,15 +484,20 @@ def test_env_lines_come_after_every_build_step():
     ladder, so a value that leaked into it would be an unmeasured difference
     in an artifact every arm shares.
     """
-    lines = _lines(build=["pip install -e ."], env={"CI": "1"})
+    lines = _lines(build=["pip install -e ."],
+                   env={"CI": "1", "TZ": "America/New_York"})
     last_run = max(i for i, line in enumerate(lines) if line.startswith("RUN "))
-    env_index = next(i for i, line in enumerate(lines)
-                     if line.startswith("ENV CI="))
+    ci_index = next(i for i, line in enumerate(lines)
+                    if line.startswith("ENV CI="))
+    tz_index = next(i for i, line in enumerate(lines)
+                    if line.startswith("ENV TZ="))
 
-    assert env_index > last_run
+    assert ci_index > last_run
+    assert tz_index > last_run
     # ...and still before the USER switch, so the file reads top-to-bottom as
     # root-setup then eval-runtime.
-    assert env_index < lines.index("USER eval")
+    assert ci_index < lines.index("USER eval")
+    assert tz_index < lines.index("USER eval")
 
 
 def test_env_lines_are_sorted_so_the_image_id_is_a_function_of_the_manifest():
@@ -500,13 +505,16 @@ def test_env_lines_are_sorted_so_the_image_id_is_a_function_of_the_manifest():
     the Dockerfile text -- and therefore the built image id, which is what
     Versions.container_image_digest records -- depend on YAML key order rather
     than on the manifest's content."""
-    forward = _lines(env={"CI": "1", "HYPOTHESIS_STORAGE_DIRECTORY": "/tmp/h"})
-    reverse = _lines(env={"HYPOTHESIS_STORAGE_DIRECTORY": "/tmp/h", "CI": "1"})
+    forward = _lines(env={"CI": "1", "HYPOTHESIS_STORAGE_DIRECTORY": "/tmp/h",
+                          "TZ": "UTC"})
+    reverse = _lines(env={"TZ": "UTC", "HYPOTHESIS_STORAGE_DIRECTORY": "/tmp/h",
+                          "CI": "1"})
 
     assert forward == reverse
     assert [line for line in forward if line.startswith("ENV ")] == [
         'ENV CI="1"',
         'ENV HYPOTHESIS_STORAGE_DIRECTORY="/tmp/h"',
+        'ENV TZ="UTC"',
     ]
 
 
