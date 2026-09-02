@@ -199,7 +199,24 @@ from bakeoff.tasks import (
 #: graded under 5. It costs a full re-grade into a fresh `v6` artifacts
 #: directory; no verdict on today's corpus changes, because every stored run
 #: is a pytest one and the pytest adapter reproduces 5's judgement exactly.
-GRADER_VERSION: str = "6"
+#:
+#: 6 -> 7: `_check_test_restore` excludes a `160000`-mode gitlink under a
+#: declared `tests.paths` prefix from both the `git rm` and the `git
+#: checkout` it performs. Under 6, a task whose submodule sits under `tests/`
+#: -- the normal layout, measured against `tomlkit-514-inline-table-comment-
+#: separator` on 2026-09-02 -- had its submodule's working tree removed by
+#: the restore and never repopulated, since `git checkout` only restores a
+#: gitlink to the index. A `p2p` test importing a file from inside it then
+#: raised `FileNotFoundError` and the run graded `not_graded_reason:
+#: environment_error` at `test_restore` for a submission that never touched
+#: the submodule -- `_gitlinks_touched` already refuses any that did, before
+#: this check runs. That is a change to what a NOT GRADED verdict MEANS on an
+#: input the ladder already accepted, so the version moves whether or not a
+#: stored run hits it. It costs a full re-grade into a fresh `v7` artifacts
+#: directory; a verdict changes only for a task with a submodule under a
+#: declared test prefix, which today's corpus does not carry outside the
+#: fixture this fix adds.
+GRADER_VERSION: str = "7"
 
 #: Wall clock for the HOST-side gitleaks scan, and for nothing else.
 #: `_ContainerEnv.scan_secrets` shells out to `docker run` rather than through
@@ -832,6 +849,25 @@ def _check_patch_non_empty(state: _State, diff: str) -> None:
     state.passed("patch_non_empty")
 
 
+def _ls_tree_gitlinks(stdout: str) -> tuple[str, ...]:
+    """The `160000`-mode paths in a `git ls-tree -r -z <tree> -- <paths>` reply.
+
+    One entry per NUL-terminated record, `<mode> <type> <sha>\\t<path>` --
+    `-z` only changes the terminator, so the tab still separates the metadata
+    from the path even for a path holding unusual bytes (the whole reason
+    `-z` was chosen over the default, which would quote it instead). A
+    `160000` mode IS a submodule gitlink; every other mode is ignored.
+    """
+    gitlinks = []
+    for entry in stdout.split("\0"):
+        if not entry:
+            continue
+        meta, _, path = entry.partition("\t")
+        if meta.split(" ")[0:1] == ["160000"]:
+            gitlinks.append(path)
+    return tuple(gitlinks)
+
+
 def _check_test_restore(state: _State, task, env, start_sha: str,
                         diff: str) -> None:
     """Apply the submission at `start_sha`, then put the test half back.
@@ -840,6 +876,27 @@ def _check_test_restore(state: _State, task, env, start_sha: str,
     start state -- `base_sha` plus the committed test half -- and applying it
     at `base_sha` would fail or, worse, half-apply against a tree missing the
     oracle.
+
+    A submodule declared under a `tests.paths` prefix -- the normal layout,
+    measured 2026-09-02 against `tomlkit-514-inline-table-comment-separator`
+    (`tests/toml-test`) -- must be excluded from both the `git rm` below and
+    the `git checkout` that follows it, spec section 5.6. `grade_run` refuses
+    any submission whose diff touches a `160000` mode line before this check
+    ever runs (`_gitlinks_touched` -> `SUBMODULE_GITLINK_UNGRADABLE`), so the
+    gitlink at every declared path still equals the start state's by the time
+    control reaches here -- there is nothing for the restore to put back
+    there, only a working tree for `git rm -r` to destroy. Left unguarded,
+    `git rm` removes the submodule's checkout and the following `git checkout
+    <start_sha> -- tests/` restores only the gitlink to the index, never the
+    submodule's contents; a `p2p` test that opens a file inside it at import
+    time then dies with `FileNotFoundError`, and a genuine fix grades
+    `not_graded_reason: environment_error` instead of being resolved.
+    `git ls-tree` reads the start state directly -- never the submission --
+    for exactly the paths this check is about to touch, so the exclusion list
+    exists before either destructive command runs. A failure to list is not
+    swallowed into a fallthrough: the fallback for a silent failure here is
+    the very accusation grading a broken restore already commits, so it takes
+    the `environment` path and stops instead of touching anything.
     """
     parsed, notes = _apply_submission(state, env, diff)
 
@@ -848,10 +905,26 @@ def _check_test_restore(state: _State, task, env, start_sha: str,
     # untracked path -- measured, so the agent's own copy of a test file
     # survives the restore and grades itself.
     paths = tuple(task.tests.paths)
+    excludes: tuple[str, ...] = ()
     if paths:
+        listed = env.exec(["git", "ls-tree", "-r", "-z", start_sha, "--",
+                            *paths])
+        if listed.exit_code != 0:
+            state.environment(
+                "test_restore",
+                f"could not list gitlinks under the declared test paths: "
+                f"{_head(listed)}",
+                listed,
+            )
+        submodules = _ls_tree_gitlinks(listed.stdout or "")
+        if submodules:
+            excludes = tuple(f":(exclude){p}" for p in submodules)
+            for link in submodules:
+                notes.append(f"left submodule {link} in place")
+
         removed = env.exec(
             ["git", "rm", "-r", "-f", "--quiet", "--ignore-unmatch", "--",
-             *paths]
+             *paths, *excludes]
         )
         if removed.exit_code != 0:
             state.environment(
@@ -861,7 +934,9 @@ def _check_test_restore(state: _State, task, env, start_sha: str,
             )
 
     for prefix in paths:
-        restored = env.exec(["git", "checkout", start_sha, "--", prefix])
+        restored = env.exec(
+            ["git", "checkout", start_sha, "--", prefix, *excludes]
+        )
         if restored.exit_code == 0:
             continue
         message = _head(restored)

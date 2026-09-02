@@ -772,6 +772,72 @@ def test_a_checkout_failure_that_is_not_an_empty_prefix_is_an_error():
     assert result.environment_error_check == "test_restore"
 
 
+def test_a_submodule_under_the_test_prefix_is_excluded_from_rm_and_checkout():
+    """Measured 2026-09-02 against `tomlkit-514-inline-table-comment-
+    separator`: `tests/toml-test` is a submodule sitting under `tests.paths`.
+    `_gitlinks_touched` already refuses any submission that MOVES a gitlink,
+    so by the time this check runs the gitlink at every declared path still
+    equals the start state's -- the restore has nothing to put back there,
+    only a working tree for a blind `git rm -r` to destroy. `git ls-tree`
+    must run before either destructive command, and both the `rm` and the
+    `checkout` must carry the exclusion.
+    """
+    gitlink_sha = "c" * 40
+    blob_sha = "d" * 40
+    ls_tree_stdout = (
+        f"160000 commit {gitlink_sha}\ttests/toml-test\x00"
+        f"100644 blob {blob_sha}\ttests/test_items.py\x00"
+    )
+    env = FakeEnv(rules=[(["git", "ls-tree"], (0, ls_tree_stdout, ""))])
+    result = _ladder(env=env)
+
+    joined = [" ".join(argv) for argv in env.argvs]
+    ls_tree_at = next(
+        i for i, a in enumerate(joined) if a.startswith("git ls-tree")
+    )
+    rm_at = next(i for i, a in enumerate(joined) if a.startswith("git rm"))
+    checkout_at = next(
+        i for i, a in enumerate(joined) if a.startswith("git checkout")
+    )
+    assert ls_tree_at < rm_at < checkout_at
+
+    assert ":(exclude)tests/toml-test" in env.argvs[rm_at]
+    assert ":(exclude)tests/toml-test" in env.argvs[checkout_at]
+
+    restore = _check(result, "test_restore")
+    assert restore.status == "pass"
+    assert "left submodule tests/toml-test in place" in restore.detail
+
+
+def test_no_gitlink_leaves_the_rm_and_checkout_argv_byte_for_byte_unchanged():
+    """The fix must be invisible to every task in today's corpus: with no
+    `160000` entry under the declared prefixes, `excludes` is empty and the
+    `rm`/`checkout` pathspecs are exactly what they were before this change.
+    """
+    env = FakeEnv()
+    _ladder(env=env)
+    rm = next(a for a in env.argvs if a[:2] == ["git", "rm"])
+    checkout = next(a for a in env.argvs if a[:2] == ["git", "checkout"])
+    assert rm == [
+        "git", "rm", "-r", "-f", "--quiet", "--ignore-unmatch", "--", "tests/",
+    ]
+    assert checkout == ["git", "checkout", START_SHA, "--", "tests/"]
+
+
+def test_a_failed_gitlink_listing_is_an_environment_error_before_any_rm():
+    """The fallback for a silent `git ls-tree` failure is the same
+    accusation grading a broken restore already commits -- so it must never
+    fall through to the destructive `git rm`.
+    """
+    env = FakeEnv(
+        rules=[(["git", "ls-tree"], (128, "", "fatal: not a valid object name"))]
+    )
+    result = _ladder(env=env)
+    assert result.not_graded_reason == NotGradedReason.ENVIRONMENT_ERROR.value
+    assert result.environment_error_check == "test_restore"
+    assert not any(a[:2] == ["git", "rm"] for a in env.argvs)
+
+
 def test_agent_modified_tests_rides_the_ladder_result():
     touched = _ladder(_record(diff=TEST_TOUCHING_DIFF))
     assert touched.agent_modified_tests is True
@@ -1110,10 +1176,14 @@ def test_the_grader_version_moved_with_what_check_5_means():
     which takes a submission the ladder used to grade `False` out of the
     denominator entirely; 5 -> 6 routes checks 5 and 6 through the runner
     adapter and adds check 5's `did not run` environment branch, so what a
-    check MEANS changed even though no stored pytest verdict does."""
+    check MEANS changed even though no stored pytest verdict does; 6 -> 7 is
+    `_check_test_restore` excluding a `160000`-mode gitlink under a declared
+    test prefix from the `git rm`/`git checkout` restore, so a submodule
+    task's `not_graded_reason: environment_error` at `test_restore` is no
+    longer what a genuine fix reads as."""
     from bakeoff.grader import GRADER_VERSION
 
-    assert GRADER_VERSION == "6"
+    assert GRADER_VERSION == "7"
 
 
 def test_the_grade_says_which_runner_produced_its_numbers():

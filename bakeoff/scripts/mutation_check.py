@@ -1547,8 +1547,8 @@ MUTATIONS = [
         # measures a suite that is not there.
         "grader: apply the submission to a state it was not diffed against",
         "src/bakeoff/grader.py",
-        '        restored = env.exec(["git", "checkout", start_sha, "--", prefix])',
-        '        restored = env.exec(["git", "checkout", task.base_sha, "--", prefix])',
+        '            ["git", "checkout", start_sha, "--", prefix, *excludes]',
+        '            ["git", "checkout", task.base_sha, "--", prefix, *excludes]',
         "tests/test_grader.py -k applied_where_it_was_diffed",
         "not integration",
     ),
@@ -1599,8 +1599,8 @@ MUTATIONS = [
         # behaviour scores `resolved`.
         "grader: let an agent-added test survive the restore",
         "src/bakeoff/grader.py",
-        "    paths = tuple(task.tests.paths)\n    if paths:\n        removed = env.exec(",
-        "    paths = tuple(task.tests.paths)\n    if False:\n        removed = env.exec(",
+        "    excludes: tuple[str, ...] = ()\n    if paths:\n        listed = env.exec(",
+        "    excludes: tuple[str, ...] = ()\n    if False:\n        listed = env.exec(",
         "tests/test_grader.py -k rm_then_checkout",
         "not integration",
     ),

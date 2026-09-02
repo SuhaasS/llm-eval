@@ -51,7 +51,16 @@ import pytest
 
 from bakeoff import tasks
 from bakeoff.images import build_base_images, build_task_image, image_entrypoint
+from bakeoff.oracle import ensure_oracle
 from bakeoff.preflight import preflight
+from bakeoff.schema import (
+    Artifacts,
+    Checkpoint,
+    Outcome,
+    RunRecord,
+    TerminationReason,
+    Versions,
+)
 from bakeoff.tasks import load_task, materialize, task_runtime
 
 pytestmark = [pytest.mark.integration, pytest.mark.task_image]
@@ -277,3 +286,210 @@ def test_the_image_and_the_run_tree_carry_the_same_submodule_blob(
         "is one commit PAST the gitlink -- the pruned mirror did not prune, "
         "or the clone came from somewhere else"
     )
+
+
+# ---------------------------------------------------------------------------
+# fix-1: the submodule sits UNDER the declared test prefix
+# ---------------------------------------------------------------------------
+#
+# The fixture above puts the submodule at `vendor/libdep`, outside
+# `tests.paths` -- `_check_test_restore`'s `git rm -r -f -- vendor/` never
+# touches `tests/`, so that layout is silent on the defect. Measured
+# 2026-09-02 against `tomlkit-514-inline-table-comment-separator`: its
+# submodule (`tests/toml-test`) sits INSIDE the declared prefix, which is the
+# normal layout, and grading its reference solution failed
+# `not_graded_reason: environment_error` at `test_restore` before this fix --
+# `git rm -r -f -- tests/` deleted the submodule's working tree and
+# `git checkout <start_sha> -- tests/` restored only the gitlink to the
+# index, never its content.
+
+SUB_PATH_UNDER_TESTS = "tests/vendor/libdep"
+
+#: The f2p member. Deliberately in a file that never touches the
+#: submodule -- tomlkit-514's own `tests/test_items.py` (the f2p home) does
+#: not import from `tests/toml-test` either, which is why the measured
+#: failure landed on `p2p`, not `f2p`: a version of this fixture that put both
+#: the f2p test and the submodule import in ONE file (an earlier draft) makes
+#: `f2p_failed` fire first and never exercises `p2p`'s environment-error
+#: branch at all.
+TEST_CALC_UNDER_PREFIX = """\
+from calc import add
+
+
+def test_add():
+    assert add(1, 1) == 0
+"""
+
+NEW_TEST_CALC_UNDER_PREFIX = TEST_CALC_UNDER_PREFIX.replace(
+    "assert add(1, 1) == 0", "assert add(1, 2) == 3"
+)
+
+#: The p2p member, in its OWN file -- tomlkit-514's `tests/test_toml_tests.py`
+#: shape. It reads the submodule AT IMPORT TIME (module-level `sys.path`
+#: insert then `import`), so an unpopulated submodule fails LOUDLY, at
+#: collection, rather than by a missed assertion; and it is NEVER EDITED
+#: between base and head, exactly like the real fixture's regression suite,
+#: so it never appears in the reference diff at all.
+TEST_SUBDATA_UNDER_PREFIX = """\
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "vendor" / "libdep"))
+
+from libdep import VALUE
+
+
+def test_submodule_is_populated():
+    assert VALUE == 1
+"""
+
+MANIFEST_UNDER_PREFIX = """\
+task_id: sub-int-002
+task_version: 1
+repo:
+  url: {url}
+  base_sha: {base_sha}
+prompt: |
+  fix add()
+tests:
+  paths: ["tests/"]
+  runner: ["python", "-m", "pytest", "-q"]
+  f2p: ["tests/test_calc.py::test_add"]
+"""
+
+
+@pytest.fixture(scope="module")
+def superproject_under_test_prefix(workspace) -> dict:
+    """The fix-1 regression fixture: same shape as `superproject`, but the
+    submodule is pinned INSIDE `tests/` instead of beside it.
+
+    A fresh submodule (`libdep2`), never the `superproject` fixture's --
+    module-scoped fixtures in this file run in an unspecified order and a
+    shared submodule mirror would make one test's clone the reason the
+    other's prune assertion holds.
+    """
+    lib = workspace / "libdep2"
+    (lib / "libdep").mkdir(parents=True)
+    (lib / "libdep" / "__init__.py").write_text(SUB_LIB)
+    _sh("git", "init", "-q", cwd=lib)
+    _sh("git", "config", "user.email", "t@t.test", cwd=lib)
+    _sh("git", "config", "user.name", "t", cwd=lib)
+    _sh("git", "add", "-A", cwd=lib)
+    _sh("git", "commit", "-q", "-m", "libdep v1", cwd=lib)
+
+    repo = workspace / "super2"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "calc.py").write_text(BUGGY)
+    (repo / "tests" / "test_calc.py").write_text(TEST_CALC_UNDER_PREFIX)
+    (repo / "tests" / "test_subdata.py").write_text(TEST_SUBDATA_UNDER_PREFIX)
+    (repo / ".gitignore").write_text("__pycache__/\n")
+    _sh("git", "init", "-q", cwd=repo)
+    _sh("git", "config", "user.email", "t@t.test", cwd=repo)
+    _sh("git", "config", "user.name", "t", cwd=repo)
+    _sh("git", "add", "-A", cwd=repo)
+    _sh("git", "commit", "-q", "-m", "base", cwd=repo)
+    _sh("git", "-c", "protocol.file.allow=always", "submodule", "add", "-q",
+        str(lib), SUB_PATH_UNDER_TESTS, cwd=repo)
+    _sh("git", "add", "-A", cwd=repo)
+    _sh("git", "commit", "-q", "-m", "pin the submodule under tests/",
+        cwd=repo)
+    base = _sh("git", "rev-parse", "HEAD", cwd=repo)
+
+    # `tests/test_subdata.py` is NOT touched here -- it stays identical from
+    # base to head, exactly like tomlkit-514's own regression suite, so the
+    # reference diff never carries it and the p2p failure this fixture is
+    # for cannot be blamed on the diff instead of the restore.
+    (repo / "calc.py").write_text(FIXED)
+    (repo / "tests" / "test_calc.py").write_text(NEW_TEST_CALC_UNDER_PREFIX)
+    _sh("git", "add", "-A", cwd=repo)
+    _sh("git", "commit", "-q", "-m", "fix", cwd=repo)
+    head = _sh("git", "rev-parse", "HEAD", cwd=repo)
+    reference = subprocess.run(
+        ["git", "diff", base, head], cwd=repo, check=True,
+        capture_output=True, text=True,
+    ).stdout
+
+    task_dir = workspace / "taskset" / "sub-int-002"
+    task_dir.mkdir(parents=True)
+    (task_dir / "task.yaml").write_text(
+        MANIFEST_UNDER_PREFIX.format(url=str(repo), base_sha=base))
+    (task_dir / "reference.diff").write_text(reference)
+    return {"task_dir": task_dir}
+
+
+def _record_with_diff(task, diff: str) -> RunRecord:
+    """Copied from `test_integration_node_task._record_with_diff` rather than
+    imported -- that one hardcodes the node fixture's task id. `run_id` is
+    namespaced to this fixture so a shared artifacts cache never collides
+    with `test_integration_node_task`'s rows.
+    """
+    return RunRecord(
+        run_id=f"sub-int-002-{'empty' if not diff else 'reference'}",
+        task_id=task.task_id,
+        task_version=task.task_version,
+        model="claude-sonnet-5",
+        harness="claude-code",
+        sample_index=0,
+        started_at="2026-09-02T00:00:00Z",
+        finished_at="2026-09-02T00:05:00Z",
+        # The harness never grades, so a real record of a successful run says
+        # FAILED here -- anything the grader concluded from this field would
+        # be concluding it from a placeholder.
+        outcome=Outcome.FAILED,
+        terminated_by=TerminationReason.AGENT_FINISH,
+        turns_used=4,
+        turns_streamed=4,
+        collection_id="integration-submodule-test-prefix",
+        checkpoints=[
+            Checkpoint(turn=4, diff_vs_base=diff, files_touched=[],
+                       elapsed_ms=0)
+        ],
+        artifacts=Artifacts(final_diff=diff),
+        versions=Versions(),
+    )
+
+
+def test_the_grader_resolves_a_reference_fix_whose_submodule_is_under_tests(
+    workspace, superproject_under_test_prefix, local_urls, tmp_path_factory,
+):
+    """Fix-1's regression case, graded end to end in a real container.
+
+    Under grader v6 this failed `not_graded_reason: environment_error` at
+    `test_restore`: `git rm -r -f -- tests/` deletes
+    `tests/vendor/libdep`'s working tree, `git checkout <start_sha> --
+    tests/` restores only the gitlink, and `tests/test_subdata.py`'s
+    module-level `sys.path`/`import` of the submodule then raises at
+    collection while `f2p` (a different file, never touching the submodule)
+    still passes -- byte-identical in shape to the tomlkit-514 measurement:
+    `not_graded_reason: environment_error` at `test_restore` for a submission
+    that never touched a gitlink. Grading the REFERENCE solution -- the
+    genuine fix -- must resolve `True`; anything else here is the defect
+    fix-1 exists to close.
+    """
+    task = load_task(superproject_under_test_prefix["task_dir"])
+    cache = workspace / "cache2"
+
+    base = build_base_images(REPO_ROOT, [task_runtime(task)])[task_runtime(task)]
+    image = build_task_image(task, base, workspace / "build2", cache)
+    assert image.startswith("sha256:"), (
+        f"{image!r} is not a content pin; RunContainer refuses a tag"
+    )
+    assert not image_entrypoint(image), (
+        "the task image declares an ENTRYPOINT; RunContainer's `sleep "
+        "infinity` would become an argument to it and the container would "
+        "exit immediately"
+    )
+
+    from bakeoff.grader import grade_run
+
+    oracle = ensure_oracle(task, image, cache)
+    record = _record_with_diff(task, task.solution_diff)
+
+    grade = grade_run(record, task, image, oracle, cache,
+                      tmp_path_factory.mktemp("artifacts-sub-int-002"))
+
+    assert grade.resolved is True, (
+        grade.not_graded_detail or grade.grade_failure
+    )
+    assert grade.framework == "pytest"
+    assert grade.f2p_failed_node_ids == ()
