@@ -466,6 +466,38 @@ pass-to-pass, 1.4 s suite. **What remains for Gate 1 is the dataset itself**
   harness.** Harvest the remaining tasks (§3.5's ~80) and decide the prompt
   policy below. Everything above runs against as many tasks as exist.
 
+- [ ] **A cross-file duplicate `fullName` is refused even though
+  `<file>::<fullName>` is unambiguous.** The quarantine works off `fullName`
+  alone because vitest's/jest's `-t` matches name and not file, and neither
+  framework offers a flag that scopes a name pattern to one file — but the
+  *node id* a manifest actually declares already carries the file
+  (`tests/doc/stringify.ts::maps ...`), so passing the file as a positional
+  filter beside `-t` would let the runner disambiguate what the id already
+  disambiguates, and the exclusion could lift. Measured 2026-09-02 on
+  `eemeli/yaml`: four collisions under `describe('circular references', ...)`,
+  shared verbatim between `tests/doc/stringify.ts` and `tests/doc/createNode.ts`,
+  forced `tests.paths` down from `tests/` to one file — a real yield cost on a
+  real task, not a hypothetical one. Filed here rather than under the P2
+  derivation gaps below because it decides what can be *harvested* at all, not
+  something safe to leave open after a collection has already run.
+
+- [ ] **The sqlglot ssh-submodule refusal blocks a suite that never reads the
+  submodule, and there is no manifest lever to say so.** `tobymao/sqlglot`
+  added `.gitmodules` naming an ssh url on 2026-02-27 (`3a930dad6`, #7167);
+  every `base_sha` at or after it is refused before preflight ever runs, even
+  for a task whose suite never touches the submodule's content at all. A
+  manifest key to declare a submodule as unneeded — leave the gitlink in the
+  index, never populate it, never refuse on its url scheme — would reopen
+  post-2026-02-27 sqlglot (and any repository shaped like it) without
+  weakening the existing rule that a task whose *fix* touches submodule
+  content is refused. Not already expressible: the strip_paths-over-submodule
+  refusal (`HARVESTING.md`, "The image") exists precisely because a strip
+  cannot safely remove a submodule path without leaving `.gitmodules` naming
+  a directory that was never created, and the same reasoning is why no
+  existing lever routes around this one either. Filed here for the same
+  reason as the duplicate-`fullName` item above: it bounds which `base_sha`s
+  are harvestable, not a gap safe to close once collection is underway.
+
 - [ ] **The test half is applied at setup, and that is a methodology choice.**
   A real bug-fix PR carries the test that proves the fix, so at `base_sha` the
   oracle does not exist and §3.3's "runs tests, sees failures, self-corrects"
@@ -1043,19 +1075,6 @@ size. Two exceptions are marked CAPTURE and should ride along with Gate 1.
   depends on which model gets entitled — a non-gpt-5 neutral judge (deepseek,
   qwen, mistral, grok) hits no such guard and needs no change at all.
 
-- [ ] **A cross-file duplicate `fullName` is refused even though
-  `<file>::<fullName>` is unambiguous.** The quarantine works off `fullName`
-  alone because vitest's/jest's `-t` matches name and not file, and neither
-  framework offers a flag that scopes a name pattern to one file — but the
-  *node id* a manifest actually declares already carries the file
-  (`tests/doc/stringify.ts::maps ...`), so passing the file as a positional
-  filter beside `-t` would let the runner disambiguate what the id already
-  disambiguates, and the exclusion could lift. Measured 2026-09-02 on
-  `eemeli/yaml`: four collisions under `describe('circular references', ...)`,
-  shared verbatim between `tests/doc/stringify.ts` and `tests/doc/createNode.ts`,
-  forced `tests.paths` down from `tests/` to one file — a real yield cost on a
-  real task, not a hypothetical one.
-
 - [ ] **`load_task_set` validates every manifest in the task-set root before
   `--tasks` filters, so one broken sibling manifest blocks every other task's
   gate and grade.** Measured 2026-09-02, twice independently: a sibling's
@@ -1085,21 +1104,6 @@ size. Two exceptions are marked CAPTURE and should ride along with Gate 1.
   via the driver," not as dead code — exercising it needs either mutating
   between `prepare_bases` and `resolve_tasks` inside one process (not
   triggerable from outside) or calling `preflight()` directly.
-
-- [ ] **The sqlglot ssh-submodule refusal blocks a suite that never reads the
-  submodule, and there is no manifest lever to say so.** `tobymao/sqlglot`
-  added `.gitmodules` naming an ssh url on 2026-02-27 (`3a930dad6`, #7167);
-  every `base_sha` at or after it is refused before preflight ever runs, even
-  for a task whose suite never touches the submodule's content at all. A
-  manifest key to declare a submodule as unneeded — leave the gitlink in the
-  index, never populate it, never refuse on its url scheme — would reopen
-  post-2026-02-27 sqlglot (and any repository shaped like it) without
-  weakening the existing rule that a task whose *fix* touches submodule
-  content is refused. Not already expressible: the strip_paths-over-submodule
-  refusal (`HARVESTING.md`, "The image") exists precisely because a strip
-  cannot safely remove a submodule path without leaving `.gitmodules` naming
-  a directory that was never created, and the same reasoning is why no
-  existing lever routes around this one either.
 
 - [ ] **Files an `image.build` step writes INTO `/repo` are discarded by the
   runtime bind mount, and which side should own the fix is still an open
