@@ -86,10 +86,19 @@ class _PyTask:
     fake.
     """
 
-    def __init__(self, task_id, python):
+    def __init__(self, task_id, python, framework="pytest", node="22"):
         self.task_id = task_id
         self.task_set_commit = ""
-        self.image = type("I", (), {"python": python})()
+        self.image = type("I", (), {"python": python, "node": node})()
+        # `task_runtime` reads `tests.framework` and NEVER `image.node`
+        # directly: a pytest task carries an unread node default, and a fake
+        # that omits the key would make the base-selection path pass on a
+        # shape the loader cannot produce.
+        self.tests = type("T", (), {"framework": framework})()
+
+
+def _fake_task(framework="pytest", task_id="t", python="3.12", node="22"):
+    return _PyTask(task_id, python, framework=framework, node=node)
 
 
 def test_the_version_set_comes_from_the_task_set_not_from_the_allowlist(
@@ -109,8 +118,8 @@ def test_the_version_set_comes_from_the_task_set_not_from_the_allowlist(
     # `prepare_bases` a list instead of the mapping and the test fails on the
     # fake rather than on the code.
     def _fake_build(root, versions):
-        asked["versions"] = list(versions)
-        return {v: "sha256:" + v for v in versions}
+        asked["versions"] = sorted(versions)
+        return {pair: "sha256:" + pair[1] for pair in versions}
 
     monkeypatch.setattr(rm, "build_base_images", _fake_build)
     monkeypatch.setattr(rm, "base_claude_version", lambda image: "2.1.220")
@@ -119,8 +128,9 @@ def test_the_version_set_comes_from_the_task_set_not_from_the_allowlist(
         [_PyTask("a", "3.12"), _PyTask("b", "3.11"), _PyTask("c", "3.12")]
     )
 
-    assert sorted(asked["versions"]) == ["3.11", "3.12"]
-    assert bases == {"3.11": "sha256:3.11", "3.12": "sha256:3.12"}
+    assert sorted(asked["versions"]) == [("python", "3.11"), ("python", "3.12")]
+    assert bases == {("python", "3.11"): "sha256:3.11",
+                     ("python", "3.12"): "sha256:3.12"}
     assert expected == "2.1.220"
 
 
@@ -139,7 +149,8 @@ def test_two_bases_that_disagree_on_the_agent_stop_the_invocation(monkeypatch):
     )
 
     with pytest.raises(rm.ImageError) as excinfo:
-        rm.assert_one_agent({"3.12": "sha256:3.12", "3.11": "sha256:3.11"})
+        rm.assert_one_agent({("python", "3.12"): "sha256:3.12",
+                             ("python", "3.11"): "sha256:3.11"})
 
     assert "2.1.220" in str(excinfo.value)
     assert "2.1.999" in str(excinfo.value)
@@ -157,7 +168,8 @@ def test_a_base_that_answers_nothing_is_a_refusal_not_an_agreement(monkeypatch):
     monkeypatch.setattr(rm, "base_claude_version", lambda image: "")
 
     with pytest.raises(rm.ImageError) as excinfo:
-        rm.assert_one_agent({"3.12": "sha256:a", "3.11": "sha256:b"})
+        rm.assert_one_agent({("python", "3.12"): "sha256:a",
+                             ("python", "3.11"): "sha256:b"})
 
     assert "3.11" in str(excinfo.value) and "3.12" in str(excinfo.value)
 
@@ -174,7 +186,8 @@ def test_one_base_that_answers_nothing_is_also_a_refusal(monkeypatch):
     )
 
     with pytest.raises(rm.ImageError):
-        rm.assert_one_agent({"3.12": "sha256:a", "3.11": "sha256:b"})
+        rm.assert_one_agent({("python", "3.12"): "sha256:a",
+                             ("python", "3.11"): "sha256:b"})
 
 
 def test_bases_that_agree_yield_the_single_version(monkeypatch):
@@ -182,8 +195,8 @@ def test_bases_that_agree_yield_the_single_version(monkeypatch):
 
     monkeypatch.setattr(rm, "base_claude_version", lambda image: "2.1.220")
 
-    assert rm.assert_one_agent({"3.12": "sha256:a", "3.11": "sha256:b"}) == \
-        "2.1.220"
+    assert rm.assert_one_agent({("python", "3.12"): "sha256:a",
+                                ("python", "3.11"): "sha256:b"}) == "2.1.220"
 
 
 def test_main_stops_before_any_task_image_when_the_bases_disagree(
@@ -247,8 +260,71 @@ def test_each_task_is_built_against_the_base_its_manifest_names(
 
     rm.resolve_tasks(
         [_PyTask("a", "3.11"), _PyTask("b", "3.12")],
-        {"3.11": "sha256:B11", "3.12": "sha256:B12"},
+        {("python", "3.11"): "sha256:B11", ("python", "3.12"): "sha256:B12"},
         "2.1.220", tmp_path, force=True,
     )
 
     assert seen == {"a": "sha256:B11", "b": "sha256:B12"}
+
+
+def test_the_base_set_is_the_runtimes_the_task_set_actually_needs(monkeypatch):
+    from bakeoff.tasks import task_runtime
+
+    tasks = [_fake_task(framework="pytest"), _fake_task(framework="vitest")]
+
+    assert {task_runtime(t) for t in tasks} == {("python", "3.12"), ("node", "22")}
+
+
+def test_disagreeing_claude_versions_across_bases_refuse_the_whole_invocation(
+    monkeypatch
+):
+    """Broadening 5's cross-base check, unchanged in CONTRACT and widened only
+    in key type -- it takes `{key: image_id}`, probes each with
+    `base_claude_version`, and raises `ImageError`. Two Dockerfiles carrying two
+    `ARG CLAUDE_CODE_VERSION` lines is where it earns the most: nothing in a
+    record compares `Versions.claude_code` across tasks.
+
+    An EMPTY probe is a refusal, not agreement: preflight's guard is `elif
+    expected_claude_version and ...`, falsy on "", so "every base failed to
+    answer" would silently disable the agent-version check for every task."""
+    from bakeoff.images import ImageError
+    import scripts.run_matrix as rm
+
+    monkeypatch.setattr(
+        rm, "base_claude_version",
+        lambda image: "2.1.219" if "node" in image else "2.1.220")
+    with pytest.raises(ImageError):
+        rm.assert_one_agent({("python", "3.12"): "sha256:py",
+                             ("node", "22"): "sha256:node"})
+
+    monkeypatch.setattr(rm, "base_claude_version", lambda image: "")
+    with pytest.raises(ImageError):
+        rm.assert_one_agent({("python", "3.12"): "sha256:py",
+                             ("node", "22"): "sha256:node"})
+
+
+def test_a_node_task_is_built_against_the_node_base(monkeypatch, tmp_path):
+    """The mapping is indexed by `task_runtime(task)`, not by
+    `task.image.python` -- which every task carries, node ones included, so
+    indexing by it would hand a vitest task the python base. That image builds
+    and that container starts; the runner is simply not there, and it reaches
+    the model as exit 127 on every arm."""
+    import scripts.run_matrix as rm
+
+    seen = {}
+
+    def _fake_build(task, base, build_root, cache):
+        seen[task.task_id] = base
+        return "sha256:img-" + task.task_id
+
+    monkeypatch.setattr(rm, "build_task_image", _fake_build)
+    monkeypatch.setattr(rm, "image_entrypoint", lambda image: ["/inherited"])
+
+    rm.resolve_tasks(
+        [_fake_task(framework="pytest", task_id="py"),
+         _fake_task(framework="vitest", task_id="js")],
+        {("python", "3.12"): "sha256:BPY", ("node", "22"): "sha256:BNODE"},
+        "2.1.220", tmp_path, force=True,
+    )
+
+    assert seen == {"py": "sha256:BPY", "js": "sha256:BNODE"}

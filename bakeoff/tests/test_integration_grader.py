@@ -74,7 +74,7 @@ from bakeoff.schema import (
     TerminationReason,
     Versions,
 )
-from bakeoff.tasks import load_task, materialize
+from bakeoff.tasks import load_task, materialize, task_runtime
 
 # Both, module-wide. See the module docstring: `task_image` is what keeps the
 # section 6.6 logger gate offline, and a per-test decorator is a thing the next
@@ -147,8 +147,8 @@ def click_image(click_task, grader_cache) -> str:
     """
     # Keyed by version exactly as the drivers do it: the base a task gets is
     # the one its manifest names, never a default that happens to match.
-    base = build_base_images(REPO_ROOT, [click_task.image.python])[
-        click_task.image.python
+    base = build_base_images(REPO_ROOT, [task_runtime(click_task)])[
+        task_runtime(click_task)
     ]
     image = build_task_image(click_task, base, grader_cache / "build",
                              grader_cache)
@@ -626,7 +626,7 @@ def test_a_task_images_env_reaches_both_the_gates_exec_and_the_agents(
         task_id=click_task.task_id + "-envprobe",
         image=dataclasses.replace(click_task.image, env=declared),
     )
-    base = build_base_images(REPO_ROOT, [task.image.python])[task.image.python]
+    base = build_base_images(REPO_ROOT, [task_runtime(task)])[task_runtime(task)]
     image = build_task_image(task, base, grader_cache / "build",
                              grader_cache)
 

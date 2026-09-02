@@ -69,7 +69,12 @@ from bakeoff.proxy import (  # noqa: E402
     proxy_environment,
 )
 from bakeoff.session import effective_config  # noqa: E402
-from bakeoff.tasks import TaskError, load_task_set, materialize  # noqa: E402
+from bakeoff.tasks import (  # noqa: E402
+    TaskError,
+    load_task_set,
+    materialize,
+    task_runtime,
+)
 
 # Under $HOME, never /var/folders: the Docker VM on macOS mounts $HOME only,
 # and a repo bind-mounted from elsewhere appears inside the container as a
@@ -91,6 +96,27 @@ DEFAULT_TASK_SET = REPO / "taskset"
 CELL_OVERHEAD_S = 120
 
 
+def _base_label(key: tuple[str, str]) -> str:
+    """One base, named the way an operator would say it: `python 3.12`.
+
+    A tuple's repr in a refusal message (`('node', '22')`) is readable but
+    reads as a data structure rather than as the thing that failed, and these
+    messages are the whole product of a gate that refuses an invocation.
+    """
+    return " ".join(key)
+
+
+def _short_base_label(key) -> str:
+    """The build banner's form: `py3.12`, `node22`.
+
+    Kept distinct from `_base_label` so the python line reads exactly as it did
+    before node existed -- `base py3.12  sha256:...` is what every stored
+    preflight log and every runbook shows.
+    """
+    runtime, version = key
+    return f"py{version}" if runtime == "python" else f"{runtime}{version}"
+
+
 def base_claude_version(image: str) -> str:
     probe = subprocess.run(
         ["docker", "run", "--rm", "--entrypoint", "sh", image, "-c", "claude --version"],
@@ -99,7 +125,7 @@ def base_claude_version(image: str) -> str:
     return probe.stdout.strip().split()[0] if probe.returncode == 0 else ""
 
 
-def assert_one_agent(bases: dict[str, str]) -> str:
+def assert_one_agent(bases: dict[tuple[str, str], str]) -> str:
     """Every base ships the same Claude Code, or nothing runs.
 
     What this replaces. `preflight`'s `expected_claude_version` refusal says
@@ -124,19 +150,27 @@ def assert_one_agent(bases: dict[str, str]) -> str:
     agent-version check is off for every task in the matrix. A gate that
     disables another gate by returning its own failure is worse than no gate.
 
-    In practice they always agree: one `ARG CLAUDE_CODE_VERSION` in one file.
-    That is exactly why an unchecked divergence would be assumed away.
+    It used to be true that they always agree, because there was one
+    `ARG CLAUDE_CODE_VERSION` in one file. Broadening 7 added a SECOND base
+    Dockerfile with its own copy of that line, which is where this check earns
+    the most -- and `tests/test_images.py` asserts the two pins are equal as a
+    cheap offline first line, because this one needs a daemon and two builds.
+
+    Nothing here DECIDES on the key -- it is carried into the message and
+    nowhere else. Broadening 5 keyed `bases` by python version; this takes
+    `(runtime, version)`, and the widening is a type annotation plus how a key
+    is spelled in a refusal.
     """
-    seen = {version: base_claude_version(image)
-            for version, image in sorted(bases.items())}
+    seen = {key: base_claude_version(image)
+            for key, image in sorted(bases.items())}
     rendered = ", ".join(
-        f"python {v} -> {c or '<no answer>'}" for v, c in seen.items()
+        f"{_base_label(k)} -> {c or '<no answer>'}" for k, c in seen.items()
     )
-    blank = sorted(v for v, c in seen.items() if not c)
+    blank = sorted(_base_label(k) for k, c in seen.items() if not c)
     if blank:
         raise ImageError(
             f"`claude --version` answered nothing in the base image(s) for "
-            f"python {', '.join(blank)}: {rendered}. An empty version is not "
+            f"{', '.join(blank)}: {rendered}. An empty version is not "
             "agreement -- it is falsy, so preflight's expected_claude_version "
             "check would be silently disabled for every task in this matrix. "
             "Rebuild the bases."
@@ -147,31 +181,39 @@ def assert_one_agent(bases: dict[str, str]) -> str:
             f"the base images do not all ship the same Claude Code: {rendered}. "
             "Section 5.4 holds the agent identical across everything being "
             "compared, and no per-task check can see this -- each task is "
-            "gated against its own base. Rebuild them all from one "
-            "docker/eval-agent.Dockerfile."
+            "gated against its own base. Rebuild them all, and check that "
+            "docker/eval-agent.Dockerfile and docker/eval-agent-node.Dockerfile "
+            "still carry the same ARG CLAUDE_CODE_VERSION."
         )
     return distinct.pop()
 
 
-def prepare_bases(tasks) -> tuple[dict[str, str], str]:
+def prepare_bases(tasks) -> tuple[dict[tuple[str, str], str], str]:
     """The base images this task set needs, built and checked.
 
     Called by `main` BEFORE `resolve_tasks` and before the proxy image is
     built, because both of the refusals below are free and offline while
     everything after them costs an image build or a token.
 
-    The version set comes from the TASKS, never from `tasks._PYTHON_VERSIONS`:
-    building every allowed interpreter on every invocation is three image
-    builds for a task set that uses one, in the half of the run documented as
-    free.
+    The set comes from the TASKS, never from `tasks._PYTHON_VERSIONS` /
+    `_NODE_VERSIONS`: building every allowed runtime on every invocation is
+    several image builds for a task set that uses one, in the half of the run
+    documented as free.
+
+    `task_runtime`, never `task.image.python` -- EVERY task carries a python
+    version, node ones included (it is a dataclass default nobody read), so
+    indexing on that key hands a vitest task the python base. That image builds
+    and that container starts; the runner is simply absent, and it reaches the
+    model as exit 127 on every arm.
     """
-    versions = sorted({task.image.python for task in tasks})
-    print(f"\nbuilding {len(versions)} base image(s): "
-          f"python {', '.join(versions)} ...", flush=True)
-    bases = build_base_images(REPO, versions)
+    keys = sorted({task_runtime(task) for task in tasks})
+    print(f"\nbuilding {len(keys)} base image(s): "
+          f"{', '.join(_base_label(k) for k in keys)} ...", flush=True)
+    bases = build_base_images(REPO, keys)
     expected = assert_one_agent(bases)
-    for version in versions:
-        print(f"base py{version}  {bases[version][:19]}...  claude {expected}")
+    for key in keys:
+        print(f"base {_short_base_label(key)}  {bases[key][:19]}...  "
+              f"claude {expected}")
     return bases, expected
 
 
@@ -182,10 +224,10 @@ def resolve_tasks(tasks, bases, expected_version, cache, force):
     the image id and the start sha -- everything a run needs that is not in
     the manifest.
 
-    `bases` maps a Python version to a base image id, and the base is chosen
-    PER TASK from `task.image.python`. Handing every task the first entry
-    still builds and still runs -- under an interpreter the task was not cut
-    for, with only preflight's read-back saying so.
+    `bases` maps a `(runtime, version)` pair to a base image id, and the base
+    is chosen PER TASK by `task_runtime`. Handing every task the first entry
+    still builds and still runs -- under an interpreter, or a runtime, the task
+    was not cut for, with only preflight's read-back saying so.
 
     The preflight cache is keyed by `preflight.preflight_cache_key` --
     (manifest digest, image id, start sha, PREFLIGHT_VERSION).
@@ -206,7 +248,7 @@ def resolve_tasks(tasks, bases, expected_version, cache, force):
     failures: list[str] = []
     for task in tasks:
         print(f"\n=== {task.task_id} ===", flush=True)
-        image = build_task_image(task, bases[task.image.python],
+        image = build_task_image(task, bases[task_runtime(task)],
                                  cache / "build", cache)
         entrypoint = image_entrypoint(image)
         if entrypoint:

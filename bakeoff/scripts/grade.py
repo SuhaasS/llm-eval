@@ -118,7 +118,12 @@ from bakeoff.preflight import (  # noqa: E402
     preflight_cache_key,
 )
 from bakeoff.runner import harness_commit  # noqa: E402
-from bakeoff.tasks import TaskError, load_task_set, materialize  # noqa: E402
+from bakeoff.tasks import (  # noqa: E402
+    TaskError,
+    load_task_set,
+    materialize,
+    task_runtime,
+)
 
 # Under $HOME for the reason `run_matrix` documents: the Docker VM on macOS
 # mounts $HOME only, and a directory bind-mounted from elsewhere appears inside
@@ -320,13 +325,17 @@ def resolve_task(task, cache: Path, base_image: str,
 
 
 def task_resolver(cache: Path, force_preflight: bool = False) -> Callable:
-    """`resolve_env` for the real thing: one base image per Python version.
+    """`resolve_env` for the real thing: one base image per `(runtime, version)`.
 
     A closure rather than a parameter, so `grade_event_log`'s seam is the
     one-argument `(task) -> TaskSetup` every test can fake, and so the base
     image is not built at all by a batch whose records are all gated. The
-    cache is keyed by `task.image.python`: one build per distinct version, and
+    cache is keyed by `task_runtime(task)`: one build per distinct pair, and
     still lazy, so that property survives the broadening.
+
+    `task_runtime`, never `task.image.python` -- every task carries a python
+    version, a vitest one included, so that key would silently grade a node
+    task inside the python base, where the runner does not exist.
 
     This driver deliberately does NOT call `run_matrix.assert_one_agent`. It
     is offline and per record, it reads the preflight cache `run_matrix`
@@ -336,13 +345,13 @@ def task_resolver(cache: Path, force_preflight: bool = False) -> Callable:
     `base_image` parameter is unchanged: it takes one image, and the caller
     decides which.
     """
-    built: dict[str, str] = {}
+    built: dict[tuple[str, str], str] = {}
 
     def resolve(task) -> TaskSetup:
-        version = task.image.python
-        if version not in built:
-            built.update(build_base_images(REPO, [version]))
-        return resolve_task(task, cache, built[version], force_preflight)
+        key = task_runtime(task)
+        if key not in built:
+            built.update(build_base_images(REPO, [key]))
+        return resolve_task(task, cache, built[key], force_preflight)
 
     return resolve
 

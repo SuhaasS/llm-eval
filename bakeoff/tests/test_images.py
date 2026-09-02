@@ -15,6 +15,7 @@ reads four capability failures.
 from __future__ import annotations
 
 import io
+import re
 import subprocess
 import tarfile
 from pathlib import Path
@@ -250,6 +251,8 @@ def test_build_task_image_strips_the_context_it_unpacks(tmp_path, monkeypatch):
         apt = ()
         pip = ()
         build = ()
+        python = "3.12"
+        node = "22"
         env = {}
 
     class _Task:
@@ -258,6 +261,9 @@ def test_build_task_image_strips_the_context_it_unpacks(tmp_path, monkeypatch):
         repo_url = "file:///nowhere"
         base_sha = "0" * 40
         image = _Image()
+        # `task_runtime` reads this; build_task_image asks it which base
+        # it is rendering for (D15).
+        tests = type("T", (), {"framework": "pytest"})()
         strip_paths = ("CLAUDE.md", ".claude")
         test_files = ()
         solution_files = ()
@@ -325,6 +331,8 @@ def _sub_task_stub(fixture, strip_paths=()):
         apt = ()
         pip = ()
         build = ()
+        python = "3.12"
+        node = "22"
         env = {}
 
     class _Task:
@@ -333,6 +341,9 @@ def _sub_task_stub(fixture, strip_paths=()):
         repo_url = str(fixture["sup"])
         base_sha = fixture["base"]
         image = _Image()
+        # `task_runtime` reads this; build_task_image asks it which base
+        # it is rendering for (D15).
+        tests = type("T", (), {"framework": "pytest"})()
         strip_paths = ()
         test_files = ()
         solution_files = ()
@@ -434,6 +445,8 @@ def test_a_task_with_no_submodules_takes_no_extra_archive(tmp_path, monkeypatch)
         apt = ()
         pip = ()
         build = ()
+        python = "3.12"
+        node = "22"
         env = {}
 
     class _Task:
@@ -444,6 +457,9 @@ def test_a_task_with_no_submodules_takes_no_extra_archive(tmp_path, monkeypatch)
             ["git", "rev-parse", "HEAD~1"], cwd=fixture["sup"], check=True,
             capture_output=True, text=True).stdout.strip()
         image = _Image()
+        # `task_runtime` reads this; build_task_image asks it which base
+        # it is rendering for (D15).
+        tests = type("T", (), {"framework": "pytest"})()
         strip_paths = ()
         test_files = ()
         solution_files = ()
@@ -542,6 +558,8 @@ def test_build_task_image_passes_the_manifests_env_through(tmp_path,
         apt = ()
         pip = ()
         build = ()
+        python = "3.12"
+        node = "22"
         env = {"CI": "1"}
 
     class _Task:
@@ -550,6 +568,9 @@ def test_build_task_image_passes_the_manifests_env_through(tmp_path,
         repo_url = "file:///nowhere"
         base_sha = "0" * 40
         image = _Image()
+        # `task_runtime` reads this; build_task_image asks it which base
+        # it is rendering for (D15).
+        tests = type("T", (), {"framework": "pytest"})()
         strip_paths = ()
         test_files = ()
         solution_files = ()
@@ -568,8 +589,8 @@ def test_each_version_gets_its_own_tag():
     """One tag for two interpreters means the second build silently replaces
     the first, and every task afterwards resolves the same tag to the wrong
     base -- which builds, runs, and is green."""
-    assert images.base_tag("3.11") == "bakeoff-eval-agent:base-3.11"
-    assert images.base_tag("3.12") != images.base_tag("3.11")
+    assert images.base_tag("python", "3.11") == "bakeoff-eval-agent:base-python-3.11"
+    assert images.base_tag("python", "3.12") != images.base_tag("python", "3.11")
 
 
 def test_build_base_image_passes_the_version_as_a_build_arg(monkeypatch):
@@ -577,13 +598,13 @@ def test_build_base_image_passes_the_version_as_a_build_arg(monkeypatch):
     monkeypatch.setattr(images, "_run", lambda args, cwd=None: calls.append(args) or "")
     monkeypatch.setattr(images, "image_id", lambda tag: "sha256:" + tag)
 
-    images.build_base_image(Path("/repo_root"), "3.11")
+    images.build_base_image(Path("/repo_root"), "python", "3.11")
 
     argv = calls[0]
     assert "--build-arg" in argv
     assert argv[argv.index("--build-arg") + 1] == "BASE_PYTHON_VERSION=3.11"
     assert "-t" in argv and argv[argv.index("-t") + 1] == \
-        "bakeoff-eval-agent:base-3.11"
+        "bakeoff-eval-agent:base-python-3.11"
 
 
 def test_the_arg_is_not_named_PYTHON_VERSION(monkeypatch):
@@ -597,7 +618,7 @@ def test_the_arg_is_not_named_PYTHON_VERSION(monkeypatch):
     monkeypatch.setattr(images, "_run", lambda args, cwd=None: calls.append(args) or "")
     monkeypatch.setattr(images, "image_id", lambda tag: "sha256:" + tag)
 
-    images.build_base_image(Path("/repo_root"), "3.13")
+    images.build_base_image(Path("/repo_root"), "python", "3.13")
 
     assert "PYTHON_VERSION=3.13" not in calls[0]
 
@@ -609,13 +630,19 @@ def test_one_build_per_distinct_version_not_per_request(monkeypatch):
     built = []
     monkeypatch.setattr(
         images, "build_base_image",
-        lambda root, version: built.append(version) or ("sha256:" + version),
+        lambda root, runtime, version: built.append((runtime, version))
+        or ("sha256:" + version),
     )
 
-    bases = images.build_base_images(Path("/r"), ["3.12", "3.11", "3.12", "3.12"])
+    bases = images.build_base_images(
+        Path("/r"),
+        [("python", "3.12"), ("python", "3.11"), ("python", "3.12"),
+         ("python", "3.12")],
+    )
 
-    assert sorted(built) == ["3.11", "3.12"]
-    assert bases == {"3.11": "sha256:3.11", "3.12": "sha256:3.12"}
+    assert sorted(built) == [("python", "3.11"), ("python", "3.12")]
+    assert bases == {("python", "3.11"): "sha256:3.11",
+                     ("python", "3.12"): "sha256:3.12"}
 
 
 def test_every_copy_of_the_default_version_says_the_same_thing():
@@ -643,7 +670,7 @@ def test_every_copy_of_the_default_version_says_the_same_thing():
 def test_every_allowlisted_version_is_a_tag_this_module_can_name():
     from bakeoff.tasks import _PYTHON_VERSIONS
 
-    tags = {images.base_tag(v) for v in _PYTHON_VERSIONS}
+    tags = {images.base_tag("python", v) for v in _PYTHON_VERSIONS}
 
     assert len(tags) == len(_PYTHON_VERSIONS)
 
@@ -660,7 +687,7 @@ def test_a_non_default_base_really_builds_and_carries_the_pins():
     than against a rendered string. Measured 2026-09-01: 3.11 gives Python
     3.11.16, pytest 9.1.1, claude 2.1.220, uid 1000."""
     repo_root = Path(__file__).resolve().parent.parent
-    image = images.build_base_image(repo_root, "3.11")
+    image = images.build_base_image(repo_root, "python", "3.11")
 
     probe = subprocess.run(
         ["docker", "run", "--rm", "--entrypoint", "sh", image, "-c",
@@ -672,3 +699,288 @@ def test_a_non_default_base_really_builds_and_carries_the_pins():
     assert "pytest 9.1.1" in probe.stdout
     assert "2.1.220" in probe.stdout
     assert probe.stdout.rstrip().endswith("1000")
+
+
+# --- per-runtime base images --------------------------------------------------
+
+
+def test_base_tag_names_the_runtime_and_the_version():
+    """The tag string moves (`base-3.12` -> `base-python-3.12`) and nothing
+    else does: the python Dockerfile is unchanged, so the image ID is
+    unchanged, and every cache in this repo keys on the ID -- preflight's, the
+    oracle's fingerprint, Versions.container_image_digest. No warm verdict is
+    invalidated by the rename."""
+    from bakeoff.images import base_tag
+
+    assert base_tag("python", "3.12") == "bakeoff-eval-agent:base-python-3.12"
+    assert base_tag("node", "22") == "bakeoff-eval-agent:base-node-22"
+
+
+def test_build_base_images_builds_each_pair_exactly_once(monkeypatch):
+    calls = []
+    from bakeoff import images
+
+    monkeypatch.setattr(images, "_run", lambda args, cwd=None: calls.append(args))
+    monkeypatch.setattr(images, "image_id", lambda tag: f"sha256:{tag}")
+
+    built = images.build_base_images(
+        Path("/repo"),
+        {("python", "3.12"), ("node", "22"), ("python", "3.12")},
+    )
+
+    assert set(built) == {("python", "3.12"), ("node", "22")}
+    assert len(calls) == 2
+
+
+def test_each_runtime_gets_its_own_dockerfile_and_build_arg(monkeypatch):
+    """Two files, not one with a switched FROM. node:22-bookworm-slim already
+    occupies uid 1000 with a `node` user, so `useradd --uid 1000 eval` exits 4
+    there and succeeds on python:3.12-slim-bookworm (measured 2026-09-01) --
+    and a shell conditional around a useradd is the shape that half-succeeds
+    and leaves the image running as root, which Claude Code refuses."""
+    from bakeoff import images
+
+    seen = []
+    monkeypatch.setattr(images, "_run", lambda args, cwd=None: seen.append(args))
+    monkeypatch.setattr(images, "image_id", lambda tag: "sha256:x")
+
+    images.build_base_image(Path("/repo"), "node", "22")
+
+    argv = " ".join(seen[0])
+    assert "eval-agent-node.Dockerfile" in argv
+    assert "BASE_NODE_VERSION=22" in argv
+    assert "BASE_PYTHON_VERSION" not in argv
+
+
+def test_both_base_dockerfiles_pin_the_same_claude_code_version():
+    """Versions.claude_code is read from the transcript, per run, and nothing
+    compares it ACROSS tasks. Two Dockerfiles carrying two ARG lines is a real
+    way for two arms of one comparison to run different agents, invisibly."""
+    root = Path(__file__).resolve().parent.parent / "docker"
+    pattern = re.compile(r"^ARG CLAUDE_CODE_VERSION=(\S+)", re.M)
+
+    pins = {
+        pattern.search(p.read_text()).group(1)
+        for p in (root / "eval-agent.Dockerfile",
+                  root / "eval-agent-node.Dockerfile")
+    }
+
+    assert len(pins) == 1
+
+
+def test_both_base_dockerfiles_run_as_a_non_root_eval_user_and_clear_entrypoint():
+    root = Path(__file__).resolve().parent.parent / "docker"
+    for name in ("eval-agent.Dockerfile", "eval-agent-node.Dockerfile"):
+        text = (root / name).read_text()
+        assert "USER eval" in text
+        assert "ENTRYPOINT []" in text
+        assert "--uid 1000 eval" in text
+
+
+def test_the_node_dockerfile_deletes_the_images_own_uid_1000_user_first():
+    """Measured 2026-09-01: node:22-bookworm-slim ships `node:x:1000:1000`, and
+    `useradd --create-home --uid 1000 eval` fails there with exit 4. Without
+    the userdel the build dies; with it removed later, it dies again."""
+    text = (Path(__file__).resolve().parent.parent / "docker"
+            / "eval-agent-node.Dockerfile").read_text()
+
+    assert text.index("userdel") < text.index("--uid 1000 eval")
+
+
+def test_the_node_dockerfile_installs_the_runners_outside_repo():
+    """Baking node_modules at /repo is REPLACED by the bind mount -- measured,
+    `node_modules GONE` -- which is the failure `pip install -e .` avoids and
+    node has no site-packages to avoid it with. /node_modules resolves because
+    node's resolver walks up from the importing file."""
+    text = (Path(__file__).resolve().parent.parent / "docker"
+            / "eval-agent-node.Dockerfile").read_text()
+
+    # M15: `npm install --prefix /` fails on a bare tree with `Tracker
+    # "idealTree" already exists`, so /package.json is written first and the
+    # install runs with `cd /` and no --prefix.
+    assert "> /package.json" in text
+    assert "--save-dev" not in text   # the runners must stay under dependencies
+    assert "/repo/node_modules" not in text
+    assert "NODE_PATH" not in text  # measured unnecessary; see the plan's D4
+
+
+def test_a_node_task_image_re_asserts_the_bases_runner_pins_after_build():
+    """A task's own dependency install can remove the runners: `npm ci`'s
+    documented contract is to delete node_modules before installing, and at the
+    `/` prefix that is where they live. HARVESTING recommends `npm install`
+    instead -- but a convention this codebase cannot enforce is one a task will
+    eventually violate, and the failure reaches the model as exit 127 on every
+    arm of that task."""
+    text = render_dockerfile("base", apt=[], pip=[],
+                             build=["npm install --prefix / lodash"],
+                             runtime="node")
+
+    assert text.index("npm install --prefix / lodash") < text.index(
+        "BAKEOFF_VITEST_VERSION")
+    assert "npm ci" in text  # the remedy is named in the failure message
+
+
+def test_a_python_task_image_renders_byte_identically_to_today():
+    assert render_dockerfile("base", apt=["less"], pip=["pytest==8.3.5"],
+                             build=[]) == render_dockerfile(
+        "base", apt=["less"], pip=["pytest==8.3.5"], build=[],
+        runtime="python")
+
+
+def _runtime_task_stub(framework):
+    class _Image:
+        apt = ()
+        pip = ()
+        build = ()
+        env = {}
+        # BOTH, on every task. That is the shape the loader produces -- a
+        # vitest manifest still carries the python default nobody read -- and
+        # it is why `task_runtime` is the only correct index into `bases`.
+        python = "3.12"
+        node = "22"
+
+    class _Tests:
+        pass
+
+    _Tests.framework = framework
+
+    class _Task:
+        task_id = "rt"
+        task_version = 1
+        repo_url = "file:///nowhere"
+        base_sha = "0" * 40
+        image = _Image()
+        tests = _Tests()
+        strip_paths = ()
+        test_files = ()
+        solution_files = ()
+        extra_files = ()
+
+    return _Task()
+
+
+def _generated_dockerfile(framework, tmp_path, monkeypatch):
+    archive = _archive_bytes(tmp_path / "source")
+    real_run = subprocess.run
+    monkeypatch.setattr("bakeoff.tasks.ensure_mirror",
+                        lambda url, sha, cache: tmp_path / "mirror")
+    monkeypatch.setattr("bakeoff.images.subprocess.run",
+                        _fake_run_with_archive(archive, real_run))
+    monkeypatch.setattr("bakeoff.images._run", lambda *a, **k: "sha256:fake")
+
+    build_task_image(_runtime_task_stub(framework), "sha256:base",
+                     tmp_path / "build", tmp_path / "cache")
+    return (tmp_path / "build" / "image-rt" / "Dockerfile").read_text()
+
+
+def test_the_re_assertion_reaches_a_generated_node_task_image(tmp_path, monkeypatch):
+    """`render_dockerfile` growing the parameter is half of D15; the other half
+    is `build_task_image` deriving the runtime from the TASK and passing it.
+    Nothing in the rendered string can say whether the caller ever asks for
+    `runtime="node"`, and a default that is never overridden is a check that
+    never runs."""
+    (tmp_path / "source").mkdir()
+    (tmp_path / "source" / "index.js").write_text("module.exports = 1;\n")
+
+    text = _generated_dockerfile("vitest", tmp_path, monkeypatch)
+
+    assert "BAKEOFF_VITEST_VERSION" in text
+    assert "BAKEOFF_JEST_VERSION" in text
+
+
+def test_a_generated_pytest_task_image_carries_no_node_assertion(
+    tmp_path, monkeypatch
+):
+    """The other side of the guard: a python task image is what it was, so no
+    stored `container_image_digest` and no warm preflight verdict moves."""
+    (tmp_path / "source").mkdir()
+    (tmp_path / "source" / "calc.py").write_text("x = 1\n")
+
+    text = _generated_dockerfile("pytest", tmp_path, monkeypatch)
+
+    assert "BAKEOFF_VITEST_VERSION" not in text
+
+
+@pytest.mark.integration
+# `task_image` as well, even though no TASK image is built here: the section
+# 6.6 gate selects `integration and not task_image` and is documented as
+# needing no network, and a real base build pulls from Docker Hub, runs apt
+# and reaches the npm registry.
+@pytest.mark.task_image
+def test_the_node_base_really_builds_and_carries_the_pins():
+    """Measured 2026-09-02. The bare `vitest --version` rather than the
+    absolute path is the assertion for `ENV PATH=/node_modules/.bin:$PATH`:
+    `npm install` puts the shims at /node_modules/.bin and changes no
+    environment (M12), so without that ENV a bare `vitest` is exit 127 -- and
+    section 3.3 measures a loop run with commands THE AGENT INVENTS, where
+    `npx vitest` working and `vitest` not is an inconsistency the agent
+    discovers by burning turns."""
+    repo_root = Path(__file__).resolve().parent.parent
+    image = images.build_base_image(repo_root, "node", "22")
+
+    probe = subprocess.run(
+        ["docker", "run", "--rm", "--entrypoint", "sh", image, "-c",
+         "node --version && vitest --version "
+         "&& node -p 'require(\"/node_modules/vitest/package.json\").version' "
+         "&& node -p 'require(\"/node_modules/jest/package.json\").version' "
+         "&& jest --version && claude --version && id -u "
+         # A loop, not `command -v a b c`: dash's builtin reports only the
+         # FIRST name and exits 0, so the multi-argument spelling silently
+         # asserts nothing about the four that follow.
+         "&& for c in git rg timeout vitest jest; do command -v $c; done "
+         "&& echo \"$BAKEOFF_VITEST_VERSION $BAKEOFF_JEST_VERSION\""],
+        capture_output=True, text=True, check=True,
+    )
+    out = probe.stdout
+
+    assert out.startswith("v22.")
+    assert "vitest/3.2.7" in out                    # on PATH, not by full path
+    assert "\n3.2.7\n" in out                       # vitest, from its package.json
+    assert "\n30.5.0\n" in out                      # jest, from its package.json
+    # Measured 2026-09-02 and asserted so it stays visible: jest 30.5.0's CLI
+    # answers 30.4.2, because @jest/core's published bundle inlines a stale
+    # version string. Pinning against `jest --version` would fail this build
+    # forever, or force BAKEOFF_JEST_VERSION to a number no package.json in the
+    # image agrees with -- which is why the Dockerfile reads the manifest.
+    assert "\n30.4.2\n" in out
+    assert "2.1.220" in out
+    assert "\n1000\n" in out                        # uid, not root
+    assert "/usr/bin/git" in out
+    # The assertion for `ENV PATH=/node_modules/.bin:$PATH`. `npm install` puts
+    # the shims at /node_modules/.bin and changes no environment (M12), so
+    # without that ENV these two resolve to nothing and a bare `vitest` is exit
+    # 127 -- while `npx vitest` and `npm test` work, an inconsistency section
+    # 3.3's loop makes the agent discover by burning turns.
+    assert "/node_modules/.bin/vitest" in out
+    assert "/node_modules/.bin/jest" in out
+    assert "3.2.7 30.5.0" in out                    # the exported pins, for D15
+
+
+def test_neither_runner_is_pinned_against_its_cli_version():
+    """Measured 2026-09-02: `npm install jest@30.5.0` resolves jest, jest-cli
+    and @jest/core all to 30.5.0, and `jest --version` still answers 30.4.2 --
+    @jest/core's published bundle carries an inlined
+    `module.exports = {"version":"30.4.2"}`. So the CLI's answer is the version
+    of nothing that is installed, and comparing against it would fail every
+    node image build, on every arm, over an upstream packaging bug the model
+    never saw.
+
+    VITEST TOO, and its `--version` does answer 3.2.7. Two probes answering one
+    question in two shapes is how one of them quietly stops being checked: a
+    reader who sees vitest matched on `--version` has no reason to believe the
+    jest half is doing something else on purpose.
+
+    Asserted in BOTH places, because they are two independent copies of the
+    check -- the base's own and the generated task image's (D15)."""
+    text = (Path(__file__).resolve().parent.parent / "docker"
+            / "eval-agent-node.Dockerfile").read_text()
+    from bakeoff.images import _NODE_RUNNER_REASSERTION
+
+    for where in (text, _NODE_RUNNER_REASSERTION):
+        for runner in ("jest", "vitest"):
+            assert f'require("/node_modules/{runner}/package.json").version' \
+                in where
+            # The `--version` calls that remain discard their output: they
+            # prove the shim EXECUTES and are never compared to a pin. A
+            # capture (`$(... --version)`) is what this refuses.
+            assert f"$(/node_modules/.bin/{runner} --version" not in where

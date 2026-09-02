@@ -5,9 +5,10 @@ Two layers, and the split is what keeps arms comparable:
   the BASE image (docker/eval-agent.Dockerfile) carries everything that must
   be identical for every task and every arm -- the pinned Claude Code, git,
   ripgrep, the non-root user, the mount points, the cleared entrypoint. It is
-  built once per PYTHON VERSION, selected by a manifest's `image.python`, so
-  one Dockerfile covers every allowed interpreter; every arm of a given task
-  still runs the same one, which is what section 5.4 holds identical.
+  built once per (RUNTIME, VERSION) -- `("python", "3.12")`, `("node", "22")`
+  -- selected by `tasks.task_runtime`, so one Dockerfile per runtime covers
+  every allowed version of it; every arm of a given task still runs the same
+  one, which is what section 5.4 holds identical.
 
   the TASK image adds that task's dependencies, and nothing else.
 
@@ -53,20 +54,42 @@ PROXY_TAG = "bakeoff-litellm-proxy:matrix"
 _DEFAULT_PYTHON = "3.12"
 
 
-def base_tag(python_version: str) -> str:
+#: One Dockerfile and one build arg per runtime. A dict rather than an
+#: if/else so adding a runtime is one entry and the two facts about it cannot
+#: drift apart.
+#:
+#: Two FILES rather than one with a switched `FROM`, on differences that are
+#: not parameters: node:22-bookworm-slim already occupies uid 1000 with a
+#: `node` user, so the python file's `useradd` fails there with exit 4
+#: (measured 2026-09-01), and a shell conditional around a useradd is the
+#: shape that half-succeeds and leaves an image running as root -- which
+#: Claude Code refuses, emitting zero events on every arm. See the plan's D3.
+_BASES = {
+    "python": ("eval-agent.Dockerfile", "BASE_PYTHON_VERSION"),
+    "node": ("eval-agent-node.Dockerfile", "BASE_NODE_VERSION"),
+}
+
+
+def base_tag(runtime: str, version: str) -> str:
     """The local tag for one base image.
 
-    Per VERSION, because one tag for two interpreters means the second build
-    silently replaces the first and every task afterwards resolves that tag to
-    the wrong base. That failure builds, runs and goes green: the suite is
-    executed by an interpreter the task was not cut for, and only preflight's
-    `python --version` read-back says so.
+    Per (RUNTIME, VERSION), because one tag for two bases means the second
+    build silently replaces the first and every task afterwards resolves that
+    tag to the wrong one. That failure builds, runs and goes green: the suite
+    is executed by an interpreter -- or a runtime -- the task was not cut for,
+    and only preflight's read-back says so.
 
-    Named for the version rather than for Python. When broadening 7 adds a
-    node base, this function and `build_base_images` are the only two places
-    that learn about a second axis.
+    `bakeoff-eval-agent:base-3.12` became `base-python-3.12` when node joined.
+    The tag STRING is the only thing that moved: the python Dockerfile is
+    unchanged, so its image ID is unchanged, and every cache in this repo keys
+    on the ID rather than the tag -- `preflight_cache_key`, `oracle_fingerprint`
+    and `Versions.container_image_digest` alike. So no warm verdict is
+    invalidated by this rename, and the old tag is left orphaned on any machine
+    that has one, pointing at the same image.
     """
-    return f"bakeoff-eval-agent:base-{python_version}"
+    if runtime not in _BASES:
+        raise ImageError(f"no base image is defined for runtime {runtime!r}")
+    return f"bakeoff-eval-agent:base-{runtime}-{version}"
 
 
 class ImageError(RuntimeError):
@@ -101,25 +124,32 @@ def image_entrypoint(tag: str) -> list[str]:
     return list(value or [])
 
 
-def build_base_image(repo_root: Path, python_version: str = _DEFAULT_PYTHON) -> str:
-    """Build docker/eval-agent.Dockerfile at one Python and return its image ID.
+def build_base_image(repo_root: Path, runtime: str, version: str,
+                     tag: str | None = None) -> str:
+    """Build one runtime's base Dockerfile at one version and return its ID.
 
-    The version reaches the build as `--build-arg BASE_PYTHON_VERSION`, which
-    is what the Dockerfile's pre-FROM ARG consumes. See the comment there for
-    why that name and not `PYTHON_VERSION`.
+    The version reaches the build as `--build-arg BASE_<RUNTIME>_VERSION`,
+    which is what that Dockerfile's pre-FROM ARG consumes. See the comment
+    there for why that name and not the bare `PYTHON_VERSION`/`NODE_VERSION`:
+    both official base images set one as an ENV, and ENV beats a redeclared
+    ARG after FROM, so the expansion would silently read the patch level.
 
-    No allowlist check here. `tasks._python_version` is the one gate, at load
-    time with no daemon; a second copy of the set is how a value one gate
-    accepted reaches a builder governed by another. This module cannot import
-    `tasks` at module scope in any case -- `build_task_image` already imports
-    `ensure_mirror` locally to avoid the cycle.
+    No allowlist check here. `tasks._python_version` and `tasks._node_version`
+    are the gates, at load time with no daemon; a second copy of either set is
+    how a value one gate accepted reaches a builder governed by another. This
+    module cannot import `tasks` at module scope in any case --
+    `build_task_image` already imports `ensure_mirror` locally to avoid the
+    cycle.
     """
-    tag = base_tag(python_version)
+    # `base_tag` FIRST: it carries the named refusal for an unknown runtime,
+    # and indexing `_BASES` before it would answer with a bare KeyError.
+    tag = tag or base_tag(runtime, version)
+    dockerfile, build_arg = _BASES[runtime]
     _run(
         [
             "docker", "build", "-q",
-            "--build-arg", f"BASE_PYTHON_VERSION={python_version}",
-            "-f", str(Path(repo_root) / "docker" / "eval-agent.Dockerfile"),
+            "--build-arg", f"{build_arg}={version}",
+            "-f", str(Path(repo_root) / "docker" / dockerfile),
             "-t", tag, str(repo_root),
         ]
     )
@@ -127,8 +157,14 @@ def build_base_image(repo_root: Path, python_version: str = _DEFAULT_PYTHON) -> 
 
 
 def build_base_images(repo_root: Path,
-                      versions: Iterable[str]) -> dict[str, str]:
-    """Every base a task set needs, built once each, keyed by version.
+                      runtimes: Iterable[tuple[str, str]],
+                      ) -> dict[tuple[str, str], str]:
+    """Every base a task set needs, built once per distinct pair.
+
+    Keyed by `(runtime, version)` because that is what identifies a base now.
+    Broadening 5 keyed it by version alone and said in as many words that when
+    node arrived the key would become whatever tuple identifies a base, and
+    that this function and `base_tag` would be the only places that changed.
 
     Callers pass one entry per TASK; this deduplicates. Building per task pays
     a full image build for every duplicate, and on a 60-task set that turns
@@ -136,11 +172,11 @@ def build_base_images(repo_root: Path,
     for.
 
     Sorted, so a build log reads the same way twice and a failure names the
-    same version first.
+    same base first.
     """
     return {
-        version: build_base_image(repo_root, version)
-        for version in sorted(set(versions))
+        pair: build_base_image(repo_root, *pair)
+        for pair in sorted(set(runtimes))
     }
 
 
@@ -155,9 +191,51 @@ def build_proxy_image(repo_root: Path, tag: str = PROXY_TAG) -> str:
     return tag
 
 
+#: The plan's D15, emitted after the last `image.build` RUN and only on a node
+#: base. A task's own dependency install can REMOVE the pinned runners: `npm
+#: ci`'s documented contract is to delete the installed tree before installing,
+#: and at the `/` prefix that is exactly where the base put them. Whether it
+#: fires depends on which package.json/package-lock.json pair npm resolves for
+#: the given prefix and cwd -- which an `image.build` line decides by accident,
+#: so `HARVESTING.md` can recommend `npm install --prefix / --omit=dev` but
+#: cannot enforce it, and a convention that is right only under an unstated cwd
+#: is one a task will eventually violate.
+#:
+#: A BUILD-time check rather than a preflight one on purpose. Preflight would
+#: catch it too -- the f2p run would exit 127 -- but it would report it as a
+#: broken ENVIRONMENT on a task whose image was already built and served from
+#: the task-image cache, and the operator's remedy is a rebuild either way.
+#: Failing the build names the cause at the step that caused it.
+#:
+#: The expected versions come from the BASE IMAGE's own ENV, never from a
+#: second constant here: two copies of a pin is how one moves. Docker expands
+#: an inherited ENV in a derived build, so `${BAKEOFF_VITEST_VERSION}` below is
+#: the value the base actually installed and asserted -- verified against a
+#: daemon 2026-09-02 rather than assumed: a derived build whose `image.build`
+#: deleted /node_modules/jest failed HERE, naming the pin, and one running
+#: `npm install --prefix / --omit=dev` built clean.
+#:
+#: Both runners are read from their INSTALLED package.json rather than from
+#: `--version`, matching the base. For jest that is forced: measured
+#: 2026-09-02, jest 30.5.0's CLI answers 30.4.2 from a stale string inlined
+#: into @jest/core's published bundle, so a `--version` comparison would fail
+#: every node task image build -- on every arm, over an upstream packaging bug
+#: the model never saw.
+_NODE_RUNNER_REASSERTION = r'''RUN v="$(node -p 'require("/node_modules/vitest/package.json").version' 2>/dev/null)"; \
+    j="$(node -p 'require("/node_modules/jest/package.json").version' 2>/dev/null)"; \
+    case "$v" in "${BAKEOFF_VITEST_VERSION}") ;; \
+      *) echo "image.build changed the pinned test runner: expected vitest ${BAKEOFF_VITEST_VERSION}, got '${v}'. \
+Use 'npm install --prefix / --omit=dev', never 'npm ci' -- npm ci deletes node_modules at the prefix before installing, and the cwd where it does not delete them is the one where it installs none of yours instead. The base saves the runners under 'dependencies', so --omit=dev never prunes them." >&2; exit 1 ;; \
+    esac; \
+    case "$j" in "${BAKEOFF_JEST_VERSION}"*) ;; \
+      *) echo "image.build changed the pinned test runner: expected jest ${BAKEOFF_JEST_VERSION}, got '${j}'. This reads jest's installed package.json, never 'jest --version' -- measured 2026-09-02, jest 30.5.0's CLI answers 30.4.2 from a stale string inlined into @jest/core's bundle." >&2; exit 1 ;; \
+    esac'''
+
+
 def render_dockerfile(base_image: str, apt: list[str], pip: list[str],
                       build: list[str],
-                      env: dict[str, str] | None = None) -> str:
+                      env: dict[str, str] | None = None,
+                      runtime: str = "python") -> str:
     """The generated task Dockerfile, as text.
 
     Separate from the build so it is testable without a daemon: the
@@ -165,6 +243,11 @@ def render_dockerfile(base_image: str, apt: list[str], pip: list[str],
     ENTRYPOINT, never leaves /repo root-owned -- are properties of this
     string, and a test that has to build an image to check them is a test
     nobody runs.
+
+    `runtime` selects the D15 re-assertion and nothing else: on `"node"` the
+    generated file re-checks the base's pinned test runners after the last
+    `image.build` step. `"python"` renders exactly the text this function
+    rendered before the parameter existed.
 
     `env` is emitted AFTER every RUN, which is what keeps it out of the build.
     Placement does not change the final image config, but it decides what the
@@ -203,6 +286,13 @@ def render_dockerfile(base_image: str, apt: list[str], pip: list[str],
     lines.append("COPY repo /repo")
     for command in build:
         lines.append(f"RUN cd /repo && {command}")
+    # AFTER the last image.build step, because that is what it is checking, and
+    # ONLY for a node base -- so a python task image renders byte-identically
+    # to what it rendered before this parameter existed, and no stored
+    # `container_image_digest` or warm preflight verdict moves. That is also
+    # why `runtime` defaults rather than being required.
+    if runtime == "node":
+        lines.append(_NODE_RUNNER_REASSERTION)
     lines.extend(
         [
             # The bind mount overrides this on macOS (virtiofs ignores
@@ -363,7 +453,7 @@ def build_task_image(
     that included the test patch would bake the oracle into a layer where no
     later step could tell it apart from a dependency.
     """
-    from bakeoff.tasks import ensure_mirror
+    from bakeoff.tasks import ensure_mirror, task_runtime
 
     build_root = Path(build_root)
     context = build_root / f"image-{task.task_id}"
@@ -421,6 +511,12 @@ def build_task_image(
             list(task.image.pip),
             list(task.image.build),
             env=dict(task.image.env),
+            # Derived from the TASK, never from `base_image` -- which is an
+            # image id and says nothing about what is inside it. Half of D15 is
+            # `render_dockerfile` growing the parameter; the other half is this
+            # line, and a default that is never overridden is a check that
+            # never runs.
+            runtime=task_runtime(task)[0],
         )
     )
     tag = f"bakeoff-task-{task.task_id}:v{task.task_version}"

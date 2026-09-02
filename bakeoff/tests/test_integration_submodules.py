@@ -52,7 +52,7 @@ import pytest
 from bakeoff import tasks
 from bakeoff.images import build_base_images, build_task_image, image_entrypoint
 from bakeoff.preflight import preflight
-from bakeoff.tasks import load_task, materialize
+from bakeoff.tasks import load_task, materialize, task_runtime
 
 pytestmark = [pytest.mark.integration, pytest.mark.task_image]
 
@@ -216,7 +216,7 @@ def test_the_image_and_the_run_tree_carry_the_same_submodule_blob(
     # the one its MANIFEST names, never a default that happens to match.
     # Broadening 5 made the base per version, and a hard-coded "3.12" here
     # would go on passing while testing a base the task never asked for.
-    base = build_base_images(REPO_ROOT, [task.image.python])[task.image.python]
+    base = build_base_images(REPO_ROOT, [task_runtime(task)])[task_runtime(task)]
     image = build_task_image(task, base, workspace / "build", cache)
     assert image.startswith("sha256:"), (
         f"{image!r} is not a content pin; RunContainer refuses a tag"
