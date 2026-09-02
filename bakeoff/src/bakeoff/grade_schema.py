@@ -172,9 +172,12 @@ class NotGradedReason(str, Enum):
     * the run never produced a gradable submission (`EXCLUDED`, `NO_TURNS`,
       `CRASHED`, `NO_FINAL_DIFF`, the two unappliable-diff cases, and
       `SUBMODULE_GITLINK_UNGRADABLE` -- where a submission exists and is
-      appliable, but what it carries is a submodule gitlink pointing at a
-      commit that lives only in the run tree that produced it, so the agent
-      may well have fixed the bug and the harness cannot see the content);
+      appliable, but what it carries is a GITLINK pointing at a commit that
+      lives only in the run tree that produced it, so the agent may well have
+      fixed the bug and the harness cannot see the content. Either a declared
+      submodule the agent committed inside, or a repository the agent created
+      itself with `git init`/`git clone` in a tracked subdirectory, which
+      produces the same chunk on a task with no submodules at all);
     * the grading environment broke (`ENVIRONMENT_ERROR`,
       `SCOPE_COLLECTED_NOTHING`, `PREFLIGHT_FAILED`, `ORACLE_FAILED`,
       `TASK_SETUP_FAILED`);

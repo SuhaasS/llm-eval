@@ -393,6 +393,16 @@ def build_task_image(
             f"{extract.stderr.decode('utf-8', 'replace')}"
         )
 
+    # ORDER IS LOAD-BEARING, and only in this direction. A `strip_paths` entry
+    # that is an ANCESTOR of a submodule path -- `vendor`, with the submodule
+    # at `vendor/libdep` -- removes the directory the extract writes into. Run
+    # the other way round the strip would delete a tree that is not there yet,
+    # be a silent no-op (a path matching nothing is deliberately not an error,
+    # see `_strip_build_context`), and the submodule content would then land
+    # in the context the operator asked to have it removed from -- on the
+    # import path when `image.build` runs `pip install -e .`, which is the
+    # exact disagreement between image and run tree that key exists to close.
+    # Extract first, strip second: the strip is the last word either way.
     _extract_submodules(task, repo_dir, cache_root)
     _strip_build_context(repo_dir, list(task.strip_paths))
 

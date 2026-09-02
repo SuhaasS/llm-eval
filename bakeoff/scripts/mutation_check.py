@@ -1738,6 +1738,47 @@ MUTATIONS = [
         "tests/test_preflight.py -k a_declared_env_that_did_not_reach",
         "not integration",
     ),
+    (
+        # The whole point of D3. Reverting to the FULL mirror leaves every
+        # unit test green -- the tree materializes, the suite collects, the
+        # gate passes -- while `git -C <path> log --all` in the run tree hands
+        # the agent submodule content newer than the gitlink, differentially,
+        # since only an arm that looks collects it.
+        "tasks: populate a submodule from the unpruned mirror",
+        "src/bakeoff/tasks.py",
+        "        sub.path: ensure_pruned_mirror(sub.url, sub.sha, cache_root)",
+        "        sub.path: ensure_mirror(sub.url, sub.sha, cache_root)",
+        "tests/test_tasks.py -k cannot_reach_the_future",
+        "not integration",
+    ),
+    (
+        # Without this the ladder applies a gitlink diff GREEN (measured:
+        # exit 0), grades a tree the agent's work is absent from, and stamps
+        # `resolved: False` -- an accusation -- on work the harness could not
+        # capture. It fires on ANY task, not only one with a declared
+        # submodule: `git init` in a tracked subdirectory produces the same
+        # chunk against a repository that has never had one.
+        "grader: grade a submission that only moves a gitlink",
+        "src/bakeoff/grader.py",
+        "    if gitlinks:",
+        "    if False:",
+        "tests/test_grader.py -k gitlink_submission_is_not_graded",
+        "not integration",
+    ),
+    (
+        # The residual ambiguity once the match is boundary-anchored:
+        # `vendor/lib` and `vendor/lib dep` both match ONE status line,
+        # because the separator the boundary rule looks for is itself part of
+        # the longer path. The shorter one renames the submodule in the
+        # evidence -- and every path in that evidence is a real index path, so
+        # nothing downstream can tell it is the wrong one.
+        "preflight: take the shortest matching gitlink path",
+        "src/bakeoff/preflight.py",
+        '            "path": max(match, key=len),',
+        '            "path": min(match, key=len),',
+        "tests/test_preflight.py -k longest_match",
+        "not integration",
+    ),
 ]
 
 

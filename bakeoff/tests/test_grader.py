@@ -110,22 +110,6 @@ BASE_SHA = "b" * 40
 # --------------------------------------------------------------------------
 
 
-@pytest.fixture(autouse=True)
-def _no_submodules(monkeypatch):
-    """Every task here is a `SimpleNamespace`, and `grade_run` now asks
-    `tasks.task_submodules` for the gitlinks before it grades anything.
-
-    That call reaches `ensure_mirror`, which wants a `repo_url` these fixtures
-    have no business carrying and a clone this file has never needed -- so the
-    default answer is `()`, which is also the true answer for every task in
-    today's corpus. Autouse rather than per test because the reach is
-    `grade_run`'s, not any one test's, and a test that forgot the patch would
-    fail on a missing attribute rather than on what it is about.
-    `_with_submodule` overrides it where the gitlink refusal is the subject.
-    """
-    monkeypatch.setattr(grader, "task_submodules", lambda task, cache_root: ())
-
-
 def is_f2p(argv):
     """The f2p invocation: pytest, with node ids selected and nothing
     deselected."""
@@ -468,6 +452,8 @@ def test_an_ungraded_record_does_not_claim_an_empty_quarantine(tmp_path):
 # 1b. the gitlink refusal, which runs beside the gates and before the ladder
 # --------------------------------------------------------------------------
 
+#: Shape 1: a DECLARED submodule whose gitlink the agent moved by committing
+#: inside it. Measured 2026-09-01 (git 2.50.1) on a synthetic superproject.
 _GITLINK_SUBMISSION = (
     "diff --git a/vendor/libdep b/vendor/libdep\n"
     "index 942c381..c464218 160000\n"
@@ -478,19 +464,32 @@ _GITLINK_SUBMISSION = (
     "+Subproject commit c46421867cd1d0ac5a2038e156236a73a4cdeaac\n"
 )
 
+#: Shape 2: an AGENT-CREATED nested repository, on a task with NO submodules
+#: at all. Produced verbatim 2026-09-01 with git 2.50.1, by:
+#:
+#:     git init -b main .            # a plain repo, one tracked file src/calc.py
+#:     git add -A && git commit      # <base>
+#:     mkdir src/vendored && cd src/vendored
+#:     git init -b main . && touch helper.py && git add -A && git commit
+#:     cd - && git add -A            # "warning: adding embedded git repository"
+#:     git diff --cached <base>      # <- the text below
+#:
+#: and then, on a FRESH clone of the same base, `git apply --index` of it
+#: exits 0, writes `160000 4f5328fc... src/vendored` into the index, and
+#: leaves an EMPTY DIRECTORY at `src/vendored` in the working tree. The
+#: agent's `helper.py` is nowhere.
+_NESTED_REPO_SUBMISSION = (
+    "diff --git a/src/vendored b/src/vendored\n"
+    "new file mode 160000\n"
+    "index 0000000..4f5328f\n"
+    "--- /dev/null\n"
+    "+++ b/src/vendored\n"
+    "@@ -0,0 +1 @@\n"
+    "+Subproject commit 4f5328fcf96da17d142cfc082764652008343211\n"
+)
 
-def _with_submodule(monkeypatch, *paths):
-    monkeypatch.setattr(
-        grader, "task_submodules",
-        lambda task, cache_root: tuple(
-            SimpleNamespace(name=p, path=p, url="https://x/y.git", sha="0" * 40)
-            for p in paths
-        ),
-    )
 
-
-def test_a_gitlink_submission_is_not_graded_rather_than_failed(monkeypatch,
-                                                               tmp_path):
+def test_a_gitlink_submission_is_not_graded_rather_than_failed(tmp_path):
     """Measured 2026-09-01, git 2.50.1: `git apply --index` of this diff on a
     freshly materialized tree exits 0 with only `warning: unable to rmdir`,
     moves the INDEX gitlink to a commit that exists nowhere but the original
@@ -500,12 +499,16 @@ def test_a_gitlink_submission_is_not_graded_rather_than_failed(monkeypatch,
     limitation of the harness's own diff capture, since `git add -A` stages
     NOTHING for an uncommitted edit inside a submodule.
 
+    NOTHING IS MONKEYPATCHED. The refusal reads the submission's own chunks,
+    so this reaches it through `grade_run` on the ordinary `_task()` fixture,
+    which declares no submodules -- which is the point: an earlier draft asked
+    the task for its declared submodule set, and that set is empty for every
+    task in today's corpus.
+
     No container is started and no tree is materialized: the refusal sits
     beside `not_graded_gate`, before either, which is why this test needs
     neither Docker nor a mirror.
     """
-    _with_submodule(monkeypatch, "vendor/libdep")
-
     graded = grade_run(_record(diff=_GITLINK_SUBMISSION), _task(),
                        "sha256:x", None, tmp_path / "cache",
                        tmp_path / "artifacts")
@@ -517,42 +520,68 @@ def test_a_gitlink_submission_is_not_graded_rather_than_failed(monkeypatch,
     assert "vendor/libdep" in graded.not_graded_detail
 
 
-def test_a_task_with_no_submodules_reaches_the_ladder(monkeypatch, tmp_path):
-    """Backwards compatibility. `pallets/click` has no gitlink, and the check
-    must return `()` for it without changing where the record goes next.
+def test_an_agent_created_nested_repo_is_not_graded_either(tmp_path):
+    """The shape the DECLARED-submodule authority was blind to.
+
+    `git init` or `git clone` inside a tracked subdirectory makes `git add -A`
+    emit exactly one `new file mode 160000` chunk, on a repository that has
+    never had a submodule. `_task()` declares none, `pallets/click` has none,
+    and under the first draft of this refusal that submission applied green
+    and graded a tree with an EMPTY DIRECTORY where the agent's work was --
+    `resolved: False` on any task in the corpus.
     """
-    _with_submodule(monkeypatch)  # no paths
+    graded = grade_run(_record(diff=_NESTED_REPO_SUBMISSION), _task(),
+                       "sha256:x", None, tmp_path / "cache",
+                       tmp_path / "artifacts")
 
-    touched = grader._submodule_gitlinks_touched(
-        _task(), _GITLINK_SUBMISSION, tmp_path / "cache")
+    assert graded.resolved is None
+    assert graded.not_graded_reason == \
+        NotGradedReason.SUBMODULE_GITLINK_UNGRADABLE.value
+    assert graded.grade_failure is None
+    assert "src/vendored" in graded.not_graded_detail
 
-    assert touched == ()
+
+def test_both_gitlink_shapes_are_read_out_of_the_chunk(tmp_path):
+    """The two mode spellings git uses, and the paths from `_chunk_path`."""
+    assert grader._gitlinks_touched(_GITLINK_SUBMISSION) == ("vendor/libdep",)
+    assert grader._gitlinks_touched(_NESTED_REPO_SUBMISSION) == ("src/vendored",)
 
 
-def test_an_ordinary_submission_touches_no_gitlink(monkeypatch, tmp_path):
-    """EQUALITY against the submodule path, not `_under`. A path INSIDE a
-    submodule cannot appear in a submission at all (measured: `git add -A`
-    stages nothing for it), so only the gitlink entry itself can ever match.
+def test_an_ordinary_submission_touches_no_gitlink():
+    """Backwards compatibility, and the reason the mode line is the authority
+    rather than the `Subproject commit` line the hunk body carries: a body
+    line is file content with one marker character in front of it, so a
+    submission that EDITS a file containing that text would match. This file
+    carries such lines, in the fixtures above.
     """
-    _with_submodule(monkeypatch, "vendor/libdep")
-
-    touched = grader._submodule_gitlinks_touched(
-        _task(), TEXT_DIFF, tmp_path / "cache")
-
-    assert touched == ()
+    assert grader._gitlinks_touched(TEXT_DIFF) == ()
 
 
-def test_an_unparseable_submission_is_left_to_the_existing_refusal(monkeypatch,
-                                                                   tmp_path):
+def test_a_text_chunk_whose_content_mentions_a_subproject_commit_is_graded():
+    """Constructed from the constant above: an ordinary Python file gaining
+    the exact bytes of a gitlink hunk body. Under a body-text authority this
+    is a false refusal -- `resolved: None` on a submission that fixes the bug.
+    """
+    forged = (
+        "diff --git a/src/calc.py b/src/calc.py\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/src/calc.py\n"
+        "+++ b/src/calc.py\n"
+        "@@ -1,0 +1,2 @@\n"
+        "+FIXTURE = \"\"\"\n"
+        "+Subproject commit 4f5328fcf96da17d142cfc082764652008343211\n"
+    )
+
+    assert grader._gitlinks_touched(forged) == ()
+
+
+def test_an_unparseable_submission_is_left_to_the_existing_refusal():
     """A parse failure is `_apply_submission`'s to name, not this check's.
     Two authorities for one shape is the mistake `not_graded_gate`'s docstring
     already records, and this one runs FIRST -- so a raise here would take
     `LOSSY_DIFF_UNAPPLIABLE` off every lossy row.
     """
-    _with_submodule(monkeypatch, "vendor/libdep")
-
-    assert grader._submodule_gitlinks_touched(
-        _task(), "not a diff at all\n", tmp_path / "cache") == ()
+    assert grader._gitlinks_touched("not a diff at all\n") == ()
 
 
 # --------------------------------------------------------------------------

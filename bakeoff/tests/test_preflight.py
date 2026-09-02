@@ -28,6 +28,7 @@ from bakeoff.preflight import (
     EXIT_NOTHING_COLLECTED,
     EXIT_TESTS_FAILED,
     EXIT_USAGE_ERROR,
+    _gitlink_paths,
     _parse_python_version,
     _parse_submodule_status,
     collection_error_modules,
@@ -2022,11 +2023,17 @@ def test_the_submodule_status_parse_reads_the_leading_character():
     assert parsed == [
         {"path": "vendor/libdep",
          "sha": "942c381d88cecca36be86b2e902f554ad145ec44",
-         "initialised": True},
+         "initialised": True, "marker": " "},
         {"path": "vendor/other",
-         "sha": "0" * 40, "initialised": False},
-        {"path": "vendor/third", "sha": "1" * 40, "initialised": False},
+         "sha": "0" * 40, "initialised": False, "marker": "-"},
+        {"path": "vendor/third", "sha": "1" * 40, "initialised": False,
+         "marker": "+"},
     ]
+
+    # `initialised` collapses `-` and `+`; the raw marker is what separates
+    # "the directory is empty" from "the directory holds the WRONG revision".
+    # Both are NO-GO and the remedy differs, so the record keeps the marker.
+    assert [entry["marker"] for entry in parsed] == [" ", "-", "+"]
 
 
 def test_a_status_line_whose_path_contains_a_paren_is_parsed_from_the_index():
@@ -2041,7 +2048,7 @@ def test_a_status_line_whose_path_contains_a_paren_is_parsed_from_the_index():
     assert unmatched == []
     assert parsed == [{"path": "ven (dor)/lib",
                        "sha": "942c381d88cecca36be86b2e902f554ad145ec44",
-                       "initialised": True}]
+                       "initialised": True, "marker": " "}]
 
 
 def test_a_status_line_the_index_has_no_gitlink_for_is_a_problem():
@@ -2055,6 +2062,75 @@ def test_a_status_line_the_index_has_no_gitlink_for_is_a_problem():
 
     assert parsed == []
     assert unmatched == [out.rstrip("\n")]
+
+
+def test_a_sibling_prefix_path_does_not_claim_another_submodules_line():
+    """The bare-`startswith` defect, and it is NOT the nested-prefix one below.
+
+    Here `vendor/libdep` is not in the index at all -- the only gitlink is
+    `vendor/lib`. A bare `startswith` matches, so the line is filed under
+    `vendor/lib`: a path that IS in the authoritative set, which is precisely
+    what makes the mistake undetectable downstream. `stale` then names a
+    submodule the line was never about, and the NO-GO points the operator at
+    the wrong directory.
+
+    The boundary match sends it to `unmatched` instead, where it becomes the
+    "the two readers disagree about this tree" problem -- the true description
+    of an index and a status listing that name different paths.
+    """
+    out = " 942c381d88cecca36be86b2e902f554ad145ec44 vendor/libdep (heads/main)\n"
+
+    parsed, unmatched = _parse_submodule_status(out, ("vendor/lib",))
+
+    assert parsed == []
+    assert unmatched == [out.rstrip("\n")]
+
+
+def test_a_sibling_prefix_with_no_separator_at_all_does_not_match():
+    """The same defect with neither `/` nor space: ` <sha> vendorx` against the
+    gitlink `vendor`. `startswith` says yes; there is no boundary to speak of.
+    """
+    out = " " + "9" * 40 + " vendorx\n"
+
+    parsed, unmatched = _parse_submodule_status(out, ("vendor",))
+
+    assert parsed == []
+    assert unmatched == [out.rstrip("\n")]
+
+
+def test_a_gitlink_record_with_no_tab_yields_no_path_and_never_raises():
+    """`git ls-files -s -z` records are `<mode> <sha> <stage>\\t<path>`. A
+    record beginning `160000 ` with no TAB made the old `split("\\t", 1)[1]`
+    raise IndexError -- out of a gate `run_matrix` does not wrap, so a
+    traceback instead of the NO-GO the driver knows how to handle.
+
+    It contributes no path, which is not a silent drop: any status line for it
+    then matches nothing and is reported as the two readers disagreeing.
+    """
+    class _TablessIndex:
+        def exec(self, cmd, **kw):
+            assert cmd[:3] == ["git", "ls-files", "-s"]
+            return _Exec(stdout="160000 " + "a" * 40 + " 0\0")
+
+    assert _gitlink_paths(_TablessIndex()) == ()
+
+
+def test_a_space_containing_sibling_path_takes_the_longest_match():
+    """What is left for `max(key=len)` once the match is boundary-anchored.
+
+    A tree carrying both `vendor/lib` and `vendor/lib dep` is the one shape
+    where two index paths genuinely match ONE status line: the separator the
+    boundary rule looks for is itself part of the longer path. The shorter one
+    would rename the submodule in the evidence, so the longest match is the
+    only one that can be right.
+    """
+    out = " " + "9" * 40 + " vendor/lib dep (heads/main)\n"
+
+    parsed, unmatched = _parse_submodule_status(
+        out, ("vendor/lib", "vendor/lib dep"))
+
+    assert unmatched == []
+    assert [entry["path"] for entry in parsed] == ["vendor/lib dep"]
 
 
 def test_a_nested_gitlink_prefix_does_not_claim_the_longer_path():
@@ -2088,7 +2164,7 @@ def test_an_initialised_submodule_at_its_gitlink_is_a_GO(monkeypatch, tmp_path):
     assert result.evidence["submodules"] == [
         {"path": "vendor/libdep",
          "sha": "942c381d88cecca36be86b2e902f554ad145ec44",
-         "initialised": True}
+         "initialised": True, "marker": " "}
     ]
     assert result.evidence["submodules_orphaned"] == []
 
@@ -2112,7 +2188,8 @@ def test_an_uninitialised_submodule_is_a_preflight_problem(monkeypatch,
     assert not result.ok
     assert any("vendor/libdep" in p for p in result.problems)
     assert result.evidence["submodules"] == [
-        {"path": "vendor/libdep", "sha": "0" * 40, "initialised": False}
+        {"path": "vendor/libdep", "sha": "0" * 40, "initialised": False,
+         "marker": "-"}
     ]
 
 
@@ -2133,7 +2210,8 @@ def test_a_submodule_at_the_wrong_commit_is_a_preflight_problem(monkeypatch,
     assert not result.ok
     assert any("not initialised at their gitlink" in p for p in result.problems)
     assert result.evidence["submodules"] == [
-        {"path": "vendor/libdep", "sha": "1" * 40, "initialised": False}
+        {"path": "vendor/libdep", "sha": "1" * 40, "initialised": False,
+         "marker": "+"}
     ]
 
 
@@ -2270,7 +2348,7 @@ def test_an_unreadable_gitmodules_is_not_reported_as_no_orphans(monkeypatch,
     assert result.evidence["submodules"] == [
         {"path": "vendor/libdep",
          "sha": "942c381d88cecca36be86b2e902f554ad145ec44",
-         "initialised": True}
+         "initialised": True, "marker": " "}
     ]
     assert any(".gitmodules" in p for p in result.problems)
 

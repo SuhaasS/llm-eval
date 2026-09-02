@@ -1451,8 +1451,8 @@ def _refuse_submodule_conflicts(task: TaskManifest, subs: tuple[Submodule, ...],
 
     `mirrors` maps a submodule path to its pruned mirror, and is `{}` wherever
     no mirror exists yet -- `derive_submodules` runs with no cache root, and
-    `images.build_task_image` and `grader.grade_run` reach it through
-    `task_submodules`, which has none either. So the one refusal that needs a
+    `images.build_task_image` reaches it through `task_submodules`, which has
+    none either. So the one refusal that needs a
     clone (nested submodules) is skipped there and runs again from
     `_init_submodules`, which calls this function a SECOND time with the real
     mapping once the mirrors exist -- where a clone was going to happen anyway.
@@ -1527,13 +1527,20 @@ def _refuse_submodule_conflicts(task: TaskManifest, subs: tuple[Submodule, ...],
 def task_submodules(task: TaskManifest, cache_root: Path) -> tuple[Submodule, ...]:
     """`ensure_mirror` then `derive_submodules`. THE entry point.
 
-    Two callers, neither of which holds a mirror at the point it needs the
-    answer: `images.build_task_image` (wired in Task 3) and
-    `grader.grade_run` (Task 5). `materialize` deliberately does NOT come
+    One caller, which does not hold a mirror at the point it needs the answer:
+    `images.build_task_image`. `materialize` deliberately does NOT come
     through here -- it already holds the PRUNED superproject mirror, which
     carries `base_sha`'s history and answers both reads, so it calls
     `derive_submodules` against that and takes no second trip through
     `ensure_mirror`.
+
+    `grader.grade_run` was the second caller and is NOT one any more. Its
+    gitlink refusal reads the submission's own chunks instead, because the
+    DECLARED set is empty for every task in today's corpus while an agent can
+    create a gitlink with `git init` in any tracked subdirectory of any of
+    them -- so the declared set was the wrong authority, and asking for it
+    cost the grader a mirror clone per record for a question the diff already
+    answers.
 
     Deriving per caller costs two git reads against a warm cache; threading
     one value through three signatures would make each caller depend on a

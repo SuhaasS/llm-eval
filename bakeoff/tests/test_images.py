@@ -372,6 +372,34 @@ def test_the_build_context_still_carries_no_git_directory(tmp_path, monkeypatch)
     assert [p for p in repo.rglob(".git")] == []
 
 
+def test_an_ancestor_strip_path_wins_over_the_submodule_extract(tmp_path,
+                                                                monkeypatch):
+    """ORDER, and it is only visible on an ancestor entry.
+
+    `strip_paths: ["vendor"]` with the submodule at `vendor/libdep` is a
+    manifest asking for the whole directory gone. Extract-then-strip honours
+    it. Strip-then-extract would delete a directory that does not exist yet --
+    a deliberate NO-OP, since a `strip_paths` entry matching nothing is not an
+    error -- and the submodule content would then be written back into the
+    context the operator asked to have it removed from, on the import path
+    when `image.build` runs `pip install -e .`.
+
+    The plain entry (`vendor/libdep` itself) is order-INSENSITIVE in outcome,
+    which is why it cannot pin this: one order removes the extracted tree, the
+    other never writes it. The ancestor is the case that separates them.
+    """
+    fixture = _submodule_fixture(tmp_path)
+    monkeypatch.setattr("bakeoff.images._run", lambda *a, **k: "sha256:fake")
+    monkeypatch.setattr(tasks, "_SUBMODULE_URL_PREFIX", "")
+
+    build_task_image(_sub_task_stub(fixture, strip_paths=("vendor",)),
+                     "sha256:base", tmp_path / "build", tmp_path / "cache")
+
+    repo = tmp_path / "build" / "image-t" / "repo"
+    assert not (repo / "vendor").exists()
+    assert (repo / ".gitmodules").exists()   # the strip touches nothing else
+
+
 def test_a_task_with_no_submodules_takes_no_extra_archive(tmp_path, monkeypatch):
     """Backwards compatibility. `pallets/click` at its base_sha has no gitlink,
     and a zero-submodule task must not gain a git call against the mirror.

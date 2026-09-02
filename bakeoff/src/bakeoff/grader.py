@@ -105,7 +105,6 @@ from bakeoff.tasks import (
     _under,
     diff_chunks,
     materialize,
-    task_submodules,
 )
 
 #: What this ladder asserts, as a version. It gates resume -- a run already
@@ -149,22 +148,29 @@ from bakeoff.tasks import (
 #: Schedulable rather than urgent, precisely because no verdict changes until
 #: a manifest raises the key.
 #:
-#: 4 -> 5: `_submodule_gitlinks_touched`. A submission that moves a submodule
-#: gitlink is NOT GRADED instead of being run through the ladder. Under 4 such
-#: a submission applied with exit 0, moved only the index, left the
-#: submodule's working tree at the original commit, and the ladder graded the
-#: ORIGINAL content -- so the verdict was `resolved: False`, an accusation,
-#: over content the harness could not capture. That is a change to what the
-#: ladder MEANS on an input it already accepted, so the version moves whether
-#: or not any stored run hits it.
+#: 4 -> 5: `_gitlinks_touched`. A submission that changes a GITLINK is NOT
+#: GRADED instead of being run through the ladder. Under 4 such a submission
+#: applied with exit 0, moved only the index, and left no content behind it --
+#: so the ladder graded a tree the agent's work is absent from and the verdict
+#: was `resolved: False`, an accusation, over content the harness could not
+#: capture. That is a change to what the ladder MEANS on an input it already
+#: accepted, so the version moves whether or not any stored run hits it.
+#:
+#: The version does NOT move again for the authority change that landed with
+#: it: an earlier draft of this refusal intersected the submission's paths
+#: with the task's DECLARED submodules and was therefore inert on every task
+#: in today's corpus, which is the same set of stored rows the diff-derived
+#: authority also leaves untouched -- no run in any stored event log carries a
+#: `160000` chunk. Nothing was ever graded under the narrow draft, so there is
+#: no line for a reader to tell apart.
 #:
 #: Operator note: as with 3 -> 4, this re-grades EVERY stored run into a fresh
 #: `v5` artifacts directory beside the existing one, at the cost of a full
-#: grading pass per event log. Schedulable rather than urgent: today's corpus
-#: has no submodule task, so `task_submodules` returns `()` for every stored
-#: row and no verdict changes. It has to land with the code that makes the
-#: divergence possible, not with the first task that exercises it, because the
-#: resume gate in `scripts/grade.py` keys on (run_id, GRADER_VERSION) alone.
+#: grading pass per event log. Schedulable rather than urgent: no stored
+#: submission touches a gitlink, so no verdict changes. It has to land with
+#: the code that makes the divergence possible, not with the first run that
+#: exercises it, because the resume gate in `scripts/grade.py` keys on
+#: (run_id, GRADER_VERSION) alone.
 GRADER_VERSION: str = "5"
 
 #: Wall clock for the HOST-side gitleaks scan, and for nothing else.
@@ -577,49 +583,117 @@ def _parse_submission(diff: str) -> list[tuple[str, str, str]]:
         return parsed
 
 
-def _submodule_gitlinks_touched(task, diff: str,
-                                cache_root: Path) -> tuple[str, ...]:
-    """The submodule paths this submission changes, if any.
+#: A chunk's header carries a `160000` mode exactly when the chunk is a
+#: gitlink, in each of the three shapes git emits for one: `new file mode`
+#: (an agent-created nested repository, measured below), `deleted file mode`,
+#: and the `index <a>..<b> <mode>` line of an ordinary modification, which
+#: spells the mode out whenever it did NOT change. `old mode`/`new mode` cover
+#: the fourth, a mode change into or out of a gitlink.
+#:
+#: HEADER, never the hunk body, and that is the whole reason this is a mode
+#: match rather than the `Subproject commit` line the body carries. Those two
+#: are equivalent on any diff git produced -- but a hunk body line is FILE
+#: CONTENT with a one-character marker in front of it, so any submission that
+#: edits a file whose text happens to contain `Subproject commit <sha>` would
+#: match. That is not hypothetical: `tests/test_grader.py` in this repository
+#: carries such lines verbatim, inside the fixtures for this very refusal. A
+#: header mode line cannot be forged by content, because content never reaches
+#: column zero of a header.
+_GITLINK_MODE = re.compile(
+    r"^(?:old mode|new mode|new file mode|deleted file mode) 160000$"
+    r"|^index [0-9a-f]+\.\.[0-9a-f]+ 160000$"
+)
 
-    Measured 2026-09-01 (git 2.50.1). Two facts, and together they make such a
-    submission ungradable rather than wrong:
+
+def _chunk_is_gitlink(chunk: str) -> bool:
+    """Whether one file chunk changes a gitlink, read out of the chunk itself.
+
+    Only the lines BEFORE the first hunk header are considered; see
+    `_GITLINK_MODE` for why the body is not an authority.
+
+    Residual, recorded rather than papered over: a PURE RENAME of a gitlink
+    with no mode change emits `similarity index`/`rename from`/`rename to`
+    and neither a mode line nor a hunk body, so neither this authority nor the
+    `Subproject commit` one sees it. It is out of reach of an agent working in
+    a run tree -- renaming a submodule means editing `.gitmodules` too, which
+    IS a text chunk the submission carries -- and it is named here so nobody
+    re-derives the gap as a bug.
+    """
+    for line in chunk.split("\n"):
+        if line.startswith("@@"):
+            break
+        if _GITLINK_MODE.match(line.rstrip("\r")):
+            return True
+    return False
+
+
+def _gitlinks_touched(diff: str) -> tuple[str, ...]:
+    """The gitlink paths this submission changes, if any.
+
+    Measured 2026-09-01 (git 2.50.1). Three facts, and together they make such
+    a submission ungradable rather than wrong:
 
       `git add -A` stages NOTHING for an uncommitted edit inside a submodule,
       so `container.snapshot_diff` -- `git add -A` then `git diff --cached
       base_sha` -- returns ZERO BYTES for it. Not even the `-dirty` gitlink
       line survives staging.
 
-      An agent that COMMITS inside the submodule does move the gitlink, and
+      An agent that COMMITS inside a submodule does move the gitlink, and
       `git apply --index` of the resulting diff on a freshly materialized tree
       exits 0 (`warning: unable to rmdir` only), moves the index entry to a
       commit that exists nowhere outside the original run tree's
       `.git/modules`, and leaves the submodule's working tree UNCHANGED.
 
-    So the ladder would apply cleanly and then grade the original content, and
-    the verdict would be `resolved: False` -- an accusation -- for work the
-    harness could not capture. `NotGradedReason`, never `GradeFailure`: a
-    GradeFailure puts the row in the denominator as a model failure, which is
-    precisely the claim this refusal exists to avoid making.
+      An agent that runs `git init` or `git clone` inside ANY tracked
+      subdirectory produces the same shape on a task with NO submodules at
+      all. Measured, `src/vendored` under a plain repository:
 
-    EQUALITY against the submodule path, not `_under`. A path INSIDE a
-    submodule cannot appear in a submission at all (first fact above), so
-    anything under one is either impossible or a hand-edited diff, and the
-    exact-match rule keeps the refusal narrow.
+          git add -A                    -> "warning: adding embedded git
+                                            repository: src/vendored"
+          git diff --cached <base>      -> "new file mode 160000" +
+                                           "+Subproject commit 4f5328fc..."
+          git apply --index <that>      -> exit 0; index carries
+                                           `160000 4f5328fc... src/vendored`;
+                                           the working tree gets an EMPTY
+                                           DIRECTORY there.
+
+    So the ladder would apply cleanly and then grade a tree the agent's work
+    is absent from, and the verdict would be `resolved: False` -- an
+    accusation -- for content the harness could not capture.
+    `NotGradedReason`, never `GradeFailure`: a GradeFailure puts the row in
+    the denominator as a model failure, which is precisely the claim this
+    refusal exists to avoid making.
+
+    THE AUTHORITY IS THE SUBMISSION, NOT THE TASK. The first version of this
+    check intersected the submission's paths with `task_submodules(...)` --
+    the `.gitmodules`-declared set at `base_sha` -- and that set is empty for
+    every task in today's corpus, `pallets/click` included. It therefore saw
+    the first two facts and was blind to the third, which is the one that can
+    fire on ANY task. A task-derived allowlist also costs a mirror clone at
+    grade time for a question the diff already answers, so dropping it removes
+    the `ensure_mirror` hop from `grade_run` as well.
+
+    Paths still come from `_chunk_path`, never from a regex over the
+    `diff --git` header -- `tasks.py`'s module docstring records the five
+    drafts of that parser and the five different silent-wrong-path bugs they
+    shipped. Only the gitlink DECISION is read out of the chunk text.
 
     A submission that cannot be parsed returns `()` and is left alone.
     `_apply_submission` already names that shape with its own detail, and a
     second authority for one refusal is the mistake `not_graded_gate`'s
     docstring records.
     """
-    paths = {sub.path for sub in task_submodules(task, Path(cache_root))}
-    if not paths:
-        return ()
     try:
         parsed = _parse_submission(diff)
     except TaskError:
         return ()
-    touched = {p for _chunk, source, dest in parsed for p in (source, dest)}
-    return tuple(sorted(touched & paths))
+    touched = {
+        path
+        for chunk, source, dest in parsed
+        if _chunk_is_gitlink(chunk)
+        for path in (source, dest)
+    }
+    return tuple(sorted(touched))
 
 
 def _added_lines(chunk: str) -> str:
@@ -1727,11 +1801,11 @@ def grade_run(record: RunRecord, task, image: str, oracle: Oracle | None,
 
     The gitlink refusal sits beside it and for the same reason, but it is a
     SEPARATE function rather than a branch of `not_graded_gate`: that gate is
-    also called by `run_ladder` and asks only whether a submission exists,
-    while this one reads the submission's contents and needs the task and the
-    cache root, neither of which the gate takes. It runs before the artifacts
-    wipe and before `materialize`, so a refused row costs no tree and no
-    container.
+    also called by `run_ladder` and asks only whether a submission EXISTS,
+    while this one reads the submission's contents. It runs before the
+    artifacts wipe and before `materialize`, so a refused row costs no tree
+    and no container -- and, since the authority is the diff rather than the
+    task, no mirror clone either.
 
     The tree is removed on the way out, including on the failure paths: it
     holds the submission applied on top of the start state, which is a trap
@@ -1763,16 +1837,14 @@ def grade_run(record: RunRecord, task, image: str, oracle: Oracle | None,
         return build_grade_record(record, task, image, oracle,
                                   _gated_result(gate))
 
-    gitlinks = _submodule_gitlinks_touched(
-        task, record.artifacts.final_diff or "", Path(cache_root)
-    )
+    gitlinks = _gitlinks_touched(record.artifacts.final_diff or "")
     if gitlinks:
         return build_grade_record(record, task, image, oracle, _gated_result((
             NotGradedReason.SUBMODULE_GITLINK_UNGRADABLE,
             f"the submission changes the gitlink(s) {', '.join(gitlinks)}; the "
             "referenced commit exists only in the run tree that produced it, "
-            "and applying the diff moves the index without moving the "
-            "submodule's content",
+            "and applying the diff moves the index without moving any content "
+            "into the graded tree",
         )))
 
     artifacts_dir = Path(artifacts_root) / record.run_id / f"v{GRADER_VERSION}"

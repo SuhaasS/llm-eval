@@ -379,6 +379,26 @@ def _parse_submodule_status(
     resolved by falling back to `tail.strip()`: that fallback would put a
     DISPLAY-derived path back into the evidence, which is the exact thing
     taking paths from `ls-files` exists to prevent.
+
+    THE MATCH IS BOUNDARY-ANCHORED, not a bare `startswith`, and that is a
+    correction. Measured: the line ` <sha> vendor/libdep (heads/main)` against
+    an index whose only gitlink is `vendor/lib` satisfies a bare `startswith`,
+    so the entry is filed under `vendor/lib` -- a path that IS in the
+    authoritative set, so nothing downstream can tell it is the wrong one, and
+    `stale` then names a submodule the line was never about. ` <sha> vendorx`
+    against `vendor` is the same defect with no separator at all. The suffix
+    git appends is always space-delimited (`" (heads/main)"`, measured), so
+    equality-or-`path + " "` admits every real line and neither sibling.
+    `max(key=len)` stays as belt-and-braces for a tree carrying both
+    `vendor/lib` and `vendor/lib dep`, where two entries can still match one
+    line; it is no longer the thing keeping a sibling out.
+
+    Each entry carries the RAW MARKER beside `initialised`, because that
+    boolean collapses two states an operator has to tell apart: `-` is an
+    empty or uninitialised directory (the suite imports nothing) and `+` is an
+    initialised submodule at the WRONG commit (the suite imports content that
+    is not `base_sha`'s, and passes or fails for reasons that are not the
+    model's). Both are NO-GO and the remedy differs, so the record says which.
     """
     parsed, unmatched = [], []
     for line in out.splitlines():
@@ -386,17 +406,16 @@ def _parse_submodule_status(
             continue
         marker, rest = line[0], line[1:]
         sha, _, tail = rest.partition(" ")
-        match = [path for path in paths if tail.startswith(path)]
+        match = [path for path in paths
+                 if tail == path or tail.startswith(path + " ")]
         if not match:
             unmatched.append(line)
             continue
         parsed.append({
-            # The LONGEST match, because `startswith` is satisfied by every
-            # prefix: a tree carrying both `vendor/lib` and `vendor/libdep`
-            # would otherwise record the second line under the first name.
             "path": max(match, key=len),
             "sha": sha,
             "initialised": marker == " ",
+            "marker": marker,
         })
     return parsed, unmatched
 
@@ -418,6 +437,16 @@ def _gitlink_paths(container) -> tuple[str, ...] | None:
     to a repository with no submodules. `None` here means "not read"; the
     caller turns that into a problem plus `None` evidence, the same shape the
     `git submodule status` branch uses.
+
+    `partition`, never `split("\t", 1)[1]`. A record beginning `160000 ` with
+    no TAB in it makes the indexed form raise `IndexError` -- an exception
+    this function has no contract for, escaping a gate whose caller does not
+    wrap it, which is the traceback-instead-of-NO-GO failure the paragraph
+    above exists to prevent. A record that yields no path contributes none,
+    and that is not a silent drop: the matching `git submodule status` line
+    then finds nothing to match, lands in `unmatched`, and is reported as the
+    two readers disagreeing -- which is what a record neither reader can name
+    IS.
     """
     result = container.exec(["git", "ls-files", "-s", "-z"])
     if result.exit_code != 0:
@@ -425,7 +454,9 @@ def _gitlink_paths(container) -> tuple[str, ...] | None:
     paths = []
     for record in result.stdout.split("\0"):
         if record.startswith("160000 "):
-            paths.append(record.split("\t", 1)[1])
+            _meta, _tab, path = record.partition("\t")
+            if path:
+                paths.append(path)
     return tuple(paths)
 
 
