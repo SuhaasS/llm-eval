@@ -2895,3 +2895,89 @@ plus one test assertion in `test_preflight.py` changed; the mutation anchor
 line was left byte-identical.
 
 Unit suite: 1290 passed, 51 deselected.
+
+## Broadening 6 — git submodules — 2026-09-02
+
+A repository whose suite needs a git submodule can now be cut as a task.
+Nothing is declared in the manifest: a submodule's path, url and pinned
+commit are all inside the tree at `base_sha`, so `derive_submodules` reads
+them out with git's own parsers (`git ls-tree` for the gitlink, `.gitmodules`
+for the url), cross-checks the two, and refuses a task where they disagree.
+Content comes from a per-`(submodule url, gitlink sha)` pruned bare mirror
+built by the existing `ensure_pruned_mirror`, unchanged — a new caller, not a
+new mechanism. `materialize` initialises each submodule from that local
+mirror with no network; `build_task_image` extracts a second `git archive`
+into the submodule's path so the build context stays `.git`-free and
+oracle-free; preflight reads `git submodule status` back out of the
+container; the grader refuses a submission that moves a gitlink, because it
+applies green and grades the wrong content.
+
+**The measurements that drove each decision.**
+
+- **M3 — the future-commit leak.** `git submodule update --init` against a
+  submodule's real url fetches its *whole* history, future commits included —
+  the same leak `ensure_pruned_mirror` exists to close for the superproject,
+  reproduced one level down. It is why content comes from a pruned mirror
+  rather than a live clone, and why that mirror is keyed on
+  `(submodule url, gitlink sha)` rather than reused from anywhere else.
+- **M4 — the transient `-c` leaves the submodule uninitialised.**
+  `git -c submodule.<name>.url=<mirror> submodule update --init` populates
+  the content with no network, but `git submodule status` afterwards still
+  reads `-<sha>` — uninitialised — because the transient form never writes
+  `submodule.<name>.url` into `.git/config` and `submodule init` skips
+  registration. The url has to be persisted with `git config` first, which is
+  why `_init_submodules` writes it, updates, then rewrites it back to the
+  `.gitmodules` value once the host cache path is no longer needed.
+- **M5 — the file-transport refusal.** git has refused a submodule clone over
+  `file://` by default since CVE-2022-39253, and the pruned mirror is a local
+  path — so `protocol.file.allow=always` is a *production* requirement, not a
+  test-fixture one, and both failure modes (transport refused, url
+  unreachable) exit loudly rather than leaving anything silent.
+- **M8 — the zero-byte submission diff.** `git add -A` does not recurse into
+  a submodule, so an uncommitted edit inside one is invisible to every
+  checkpoint and to the final diff — not even the `-dirty` gitlink line
+  survives staging. This is the whole argument for refusing a task whose fix
+  touches submodule content, and for the residual D10 records rather than
+  closes (below).
+- **M11 — the green apply.** An agent that *commits* inside a submodule moves
+  the gitlink, and that diff applies cleanly to a fresh tree: the index moves,
+  the working tree does not, and the ladder then grades the original content.
+  The verdict that falls out is `resolved: False` — an accusation for work the
+  harness could not see — which is why the grader gained a refusal
+  (`NotGradedReason.SUBMODULE_GITLINK_UNGRADABLE`) read out of the submission
+  itself rather than out of the task's declared submodule set, so it also
+  catches an agent-created nested repo on a task with no submodules at all.
+- **M13 — the container probe.** The `safe.directory /repo` line
+  `RunContainer.__enter__` already sets is sufficient for a submodule tree at
+  uid 1000 against a repo owned by uid 0, on both git 2.39.5 (production) and
+  2.54.0 — so `container.py` did not change.
+
+**What was deliberately not built.** No manifest key — the submodule set is a
+pure function of `base_sha`, which the manifest already pins, and a declared
+copy could drift from the tree. No `RunRecord` field — `Versions.task_set_commit`
+plus `container_image_digest` already let a reader re-derive the same tuple
+offline. No `SCHEMA_VERSION` or `ORACLE_VERSION` bump — no run-record field
+changed meaning, and the oracle already reaches submodules through
+`materialize`. No `container.py` change — M13 measured the existing
+`safe.directory` line is enough. No relative-url resolution — `../x.git`
+resolves against the superproject's own remote, which the run tree does not
+carry, and the resolution rules need their own measurement before they are
+written (`TASKS.md`). No `--recursive` — nested submodules are refused rather
+than supported, because the untested path leaves the inner directory empty,
+which reads as clean.
+
+**Versions.** `PREFLIGHT_VERSION` 7 → 8 (a cached PASS under the old gate was
+written by a check that never looked at a submodule). `GRADER_VERSION` 4 → 5
+(a run graded under the old version was graded by a ladder that would have
+said `False` here). `GRADE_SCHEMA_VERSION` 1.1.0 → 1.2.0, a minor bump for the
+additive `SUBMODULE_GITLINK_UNGRADABLE` member. `click-3360`'s `start_sha`
+stays `33575cc0b75608fa5cbcb1d3ae3347b81eac437f` — it has no gitlink, and a
+zero-submodule task takes a path that runs no extra git command against the
+run tree.
+
+`python-poetry/tomlkit` moves out of `HARVESTING.md`'s Excluded table on a
+measured `.gitmodules` (one submodule, https, non-nested) rather than on the
+assumption that being unblocked on submodules makes it usable — its other
+screening criteria are still unmeasured.
+
+Unit suite: 1338 passed, 52 deselected.

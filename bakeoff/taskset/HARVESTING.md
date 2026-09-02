@@ -382,9 +382,37 @@ rather than by reasoning:
   version verdict — the key exists for the candidates the screen has not reached
   yet, and a re-screen at a second version is what would populate this
   paragraph.
-- **No git submodules.** The build context is `git archive base_sha`, which
-  drops them. `tomlkit` cannot collect its suite for this reason: it needs
-  `tests/toml-test`, and the directory arrives empty.
+- **Submodules are supported, with three limits.**
+  - The path, url and pinned commit are derived from `base_sha` — nothing goes
+    in the manifest. Two git readers must agree (`git ls-tree` for the
+    gitlink, `.gitmodules` for the url), and a task where they do not is
+    refused at load.
+  - The url must be `https://`. Relative (`../x.git`), `ssh://`, `git@…` and
+    `file://` are refused; a repository whose `.gitmodules` uses a relative
+    url is currently out, and that is a deferral rather than a judgement
+    (`TASKS.md`).
+  - Nested submodules are refused.
+  - **A task whose fix touches submodule content is out.** Measured
+    2026-09-01: `git add -A` stages nothing for an uncommitted edit inside a
+    submodule, so a submission diff is zero bytes for it; an agent that
+    commits inside the submodule produces a gitlink diff that applies green
+    and grades the original content. The loader refuses a reference diff
+    touching a submodule path, and the grader refuses such a submission as
+    not-graded.
+  - **A suite that writes inside the submodule is out.** An untracked file
+    there makes the superproject's `git status --porcelain` report
+    ` M <path>`, which is preflight's clean-tree NO-GO, and `gitignore_extra`
+    cannot fix it — that key writes the superproject's `.gitignore`, and the
+    rule would have to live inside the submodule's own tree.
+  - **A suite, a conftest or an `image.build` step that runs
+    `git submodule update` itself is out.** The submodule is already
+    populated before the container starts, the container has no route off
+    the host, and the `.gitmodules` url the run tree carries is the truthful
+    upstream https one — so the command fails, and it fails inside a suite
+    whose exit code the gate reads as the task's own.
+  - **An orphaned `.gitmodules` stanza is fine.** A `path` naming no gitlink
+    is inert (never listed, never fetched, no directory created); preflight
+    records it as `submodules_orphaned` and nothing refuses it.
 - **No VCS-derived version**, unless `build:` supplies a pretend-version. Same
   cause: `git archive` leaves no `.git`, and `setuptools_scm` refuses with
   *"unable to detect version"*. Measured across 12 candidates, only
@@ -429,6 +457,11 @@ package installed at image-build time and one the agent rebuilds in the run tree
 therefore disagree on version string. Nothing asserts this: preflight already
 runs the suite inside the image, so a mismatch that breaks anything surfaces
 there.
+
+A submodule's history is pruned the same way, to its gitlink: the run tree's
+`.git/modules/<path>` is hardlink-cloned from a mirror built and verified
+exactly like the superproject's, so `git -C <path> log --all` in the run tree
+reaches nothing after the pin.
 
 ---
 
@@ -498,6 +531,14 @@ each candidate still needs the Layer 2 read.
 | Textualize/rich | `pip: ["attrs"]` | 1 collection error without it | 40 |
 | python-humanize/humanize | 6 import errors, undiagnosed | — | 21 |
 | python-attrs/attrs, python-attrs/cattrs | `image.env: {CI: "1", HYPOTHESIS_STORAGE_DIRECTORY: "/tmp/bakeoff-hypothesis"}` for the property-based suite | **not measured** — the editable install collides with a site-packages `attr`, and that is now the only known blocker | — |
+| python-poetry/tomlkit | nothing — the submodule is derived, not declared (broadening 6) | **not measured** beyond the submodule shape itself | — |
+
+**tomlkit is unblocked on its submodule, not screened.**
+`python-poetry/tomlkit` — one submodule, `tests/toml-test` at
+`https://github.com/BurntSushi/toml-test.git`, non-nested. Measured 2026-09-01
+at `HEAD` via a blobless shallow clone; re-check at the chosen `base_sha`,
+which the derivation does anyway. Its other screening criteria are
+unmeasured — being unblocked on submodules is not the same as being usable.
 
 **attrs/cattrs are half-reopened, not reopened.** They were excluded for two
 reasons and this broadening lifts one. The other — `pip install -e .`
@@ -532,7 +573,6 @@ preflight to catch the omission.
 
 | repo | why |
 |---|---|
-| python-poetry/tomlkit | suite needs the `tests/toml-test` submodule; `git archive` drops it |
 | un33k/python-slugify | no harvestable PRs |
 
 ### Internal repositories

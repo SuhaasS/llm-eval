@@ -1196,6 +1196,20 @@ These need a call, not code. Most are cheap to make and expensive to make late.
   comparable at equal text. Caps derive from the Phase 3 calibration pilot;
   decide the policy there.
 
+- [ ] **Relative `.gitmodules` urls.** git resolves `../toml-test.git` against
+  the superproject's own remote. The derivation could resolve it against
+  `task.repo_url` instead, which is well-defined and offline — but the
+  resolution rules (`./`, `../` chains, a trailing `.git`, a `repo_url` with
+  or without a trailing slash) need measuring before they are written, and the
+  refusal is correct in the meantime. The likeliest thing to block a real
+  repository. A deferral, not a defect (broadening 6).
+
+- [ ] **Nested submodules.** `submodule update --init --recursive` plus one
+  pruned mirror per `(inner url, inner gitlink)`, and preflight's
+  `git submodule status --recursive`. Refused today because the untested path
+  leaves the inner directory empty, which reads as clean. A deferral, not a
+  defect (broadening 6).
+
 - [ ] **Record the Sonnet transport asymmetry as a §6.4 confound.** Sonnet 5
   signs SigV4 against bedrock-runtime while all three candidates go through the
   mantle passthrough. Different code path, different request shape: on runtime,
