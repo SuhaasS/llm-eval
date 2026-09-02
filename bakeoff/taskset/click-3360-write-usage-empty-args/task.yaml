@@ -134,6 +134,19 @@ tests:
 # humans who wrote the PR had the stripped file.
 
 image:
+  # python: "3.12"
+  #
+  # Omitted, which means the default -- and the default is what this repository
+  # needs. Declare it only when the suite requires another interpreter, and
+  # QUOTE it: YAML reads an unquoted 3.10 as the float 3.1, so the version that
+  # reaches the build would not be the one written here. Accepted values are
+  # "3.11", "3.12" and "3.13" -- the three the base image has been built at
+  # (verified 2026-09-01; pytest 9.1.1 and Claude Code 2.1.220 install on all
+  # three). Every ARM of a task runs the same base, so this is a property of
+  # the task and not a section 5.4 divergence; preflight reads `python --version`
+  # back out of the container and refuses a mismatch, because the base tag is
+  # local and mutable and a stale one leaves every other gate green.
+  #
   # `less` is a TEST dependency of this repository and the base image ships no
   # pager. tests/test_utils.py parametrizes `test_echo_via_pager` over
   # ["cat", "less", ...]; with no `less` on PATH the pager path closes the

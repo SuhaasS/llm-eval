@@ -217,6 +217,14 @@ docker run --rm -it -v "$PWD":/w -w /w python:3.12-slim-bookworm bash -c '
   git clean -xfd && time python -m pytest -q -p no:cacheprovider ; git status --porcelain'
 ```
 
+`python:3.12-slim-bookworm` here matches the base image's default. If a
+repository's suite fails on it for a version reason — a `SyntaxError` on
+newer syntax, a removed stdlib module, a C extension with no wheel — re-run
+the screen against `python:3.11-slim-bookworm` or `python:3.13-slim-bookworm`
+and, if it passes there, declare `image.python: "3.11"` (quoted) in the
+manifest. Only those three are accepted; see `taskset/HARVESTING.md` for how
+the set grows.
+
 What you are looking for, and what each answer disqualifies:
 
 | observation | verdict |
@@ -405,6 +413,7 @@ tests:
   allow_extra_paths: ["CHANGES.rst"]  # files in NEITHER half
 
 image:
+  # python: "3.12"                    # QUOTED. 3.11 | 3.12 (default) | 3.13
   apt: []                             # OS packages the suite needs
   pip: ["pytest==8.3.5"]              # PINNED versions only
   build: ["pip install -e ."]         # EDITABLE — see below
@@ -430,8 +439,15 @@ provenance:
   original_model: null
 ```
 
-Three keys that bite:
+Four keys that bite:
 
+- **`image.python` is quoted, and from a closed set.** YAML reads an unquoted
+  `3.10` as the float `3.1`, so the version that reaches the build is not the
+  one you wrote — the loader refuses a non-string rather than coercing. The set
+  is `{"3.11", "3.12", "3.13"}` because those are the three the base image has
+  been built at; anything else is a floating tag or a registry error mid-build.
+  Every arm of a task runs the same base, so this is a per-task choice and not
+  a §5.4 divergence.
 - **`image.build` must install editable.** A plain `pip install .` resolves
   imports to site-packages, so nothing the agent writes to `/repo` takes
   effect — every arm fails identically and it reads as four weak models.
@@ -539,6 +555,7 @@ capability.
 | `strip_paths` removes X, which the reference diff's test/solution half also changes | add X to `tests.allow_extra_paths`, or narrow the strip |
 | the start state still carries X, which `strip_paths` says it removed | the preflight tree is stale, or a build step re-created it, or X is a symlink whose target was stripped and the link was not. Re-run with `--force-preflight` |
 | image declares an `ENTRYPOINT` | the container's `sleep infinity` becomes an argument to it and the container exits immediately. Use a base without one |
+| preflight says the container runs a different Python than the manifest declares | a stale or mismatched base image. Rebuild: `run_matrix.py --preflight-only` builds the set the task set needs and re-tags each one |
 | the solution half does not apply | the reference was cut against the wrong base |
 | `tests.runner` does not contain `pytest` | the red/green distinction is built on pytest's exit codes and nothing else currently supplies it |
 

@@ -562,7 +562,11 @@ def preflight(
     evidence["hypothesis_imported_by_suite"] = None
     evidence["python_declared"] = declared_python = _declared_python(task)
     #: `None`, not `""`. A gate that never started a container has not
-    #: observed an empty version -- it has not observed anything.
+    #: observed an empty version -- it has not observed anything. Below,
+    #: a container that DID start but whose `python --version` exited
+    #: non-zero writes `""` instead: that is an observed empty answer, a
+    #: different absence than never having looked, and the two must not
+    #: render identically.
     evidence["python_observed"] = None
 
     if not any("pytest" in part for part in tests.runner):
@@ -630,6 +634,10 @@ def preflight(
         # wrote it to stderr; 3.4+ does not), so `.stdout` is the right field.
         python = container.exec(["python", "--version"])
         if python.exit_code != 0:
+            # An observed empty answer, not an unobserved one: the container
+            # started and the probe ran, it just did not exit 0. `None` above
+            # is reserved for the path that never started a container at all.
+            evidence["python_observed"] = ""
             problems.append(
                 "`python --version` failed inside the image: the base this "
                 f"task declares (image.python: {declared_python!r}) either was "

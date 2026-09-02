@@ -2863,3 +2863,35 @@ nobody asked for.
 Unit suite: 1256 passed, 50 deselected (docs-only task; the count reflects
 Tasks 1-5's plumbing and test pins, not this task, which touched no `.py`
 file).
+
+## Broadening 5 — a per-task Python version — 2026-09-01
+
+- **The `ARG` name is measured, not stylistic.** The `python:` images set their
+  own `ENV PYTHON_VERSION` (3.11.16 / 3.12.13 / 3.13.15) and `ENV` beats `ARG`,
+  so `${PYTHON_VERSION}` after the `FROM` reads the patch level even when
+  redeclared. Latent today; a plausible wrong value the moment anything
+  expands it.
+- **The default is byte-identical.** The parameterised file with no
+  `--build-arg` builds to `sha256:dfd2cc06…`, the same id as the
+  unparameterised one, so no stored `container_image_digest` and no cached
+  verdict moved.
+- **`assert_one_agent` is the check the broadening created.** Several bases
+  make preflight's `expected_claude_version` refusal tautological; the
+  driver-level comparison is the only place a split agent is visible.
+- **No record field.** `execute_run` makes no `claude --version` exec —
+  `Versions.claude_code` comes from the transcript — so there was no free
+  run-time read to make an observation out of. Digest + manifest is the join,
+  as it is for `image.env`, and `SCHEMA_VERSION` did not move.
+- **What was not done:** no repository was re-screened at 3.11 or 3.13, so no
+  currently-excluded repo has been shown to be reopened by this key (see
+  `TASKS.md` follow-up below).
+
+Also fixed on review of Tasks 3-4: `preflight.py`'s `python_observed` no longer
+collapses two different absences into the same `None`. A container that starts
+but whose `python --version` exits non-zero now records `""` — an observed
+empty answer — while `None` stays reserved for the path that never starts a
+container at all (`tests.runner` without `pytest`). One line in `preflight.py`
+plus one test assertion in `test_preflight.py` changed; the mutation anchor
+line was left byte-identical.
+
+Unit suite: 1290 passed, 51 deselected.

@@ -1878,6 +1878,9 @@ def test_a_patch_level_difference_is_not_a_mismatch(monkeypatch, tmp_path):
 
 
 def test_an_image_with_no_python_at_all_is_a_named_problem(monkeypatch, tmp_path):
+    """The container started and the probe ran -- it exited 127. That is an
+    OBSERVED empty answer, not the unobserved absence the pre-container path
+    leaves behind, so it is recorded as "" rather than reusing that None."""
     task = _FakeTask(image=_FakeImage(python="3.12"))
     container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
                                    present=("tests/",), python=None)
@@ -1886,7 +1889,7 @@ def test_an_image_with_no_python_at_all_is_a_named_problem(monkeypatch, tmp_path
 
     assert not result.ok
     assert any("python --version" in p for p in result.problems)
-    assert result.evidence["python_observed"] is None
+    assert result.evidence["python_observed"] == ""
 
 
 def test_the_evidence_keys_exist_on_the_path_that_never_starts_a_container(

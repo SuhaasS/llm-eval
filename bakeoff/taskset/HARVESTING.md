@@ -40,6 +40,7 @@ Runs before anything builds.
 | every `strip_paths` entry matches a file TRACKED at `base_sha` (checked in `materialize`) | a typo strips nothing and leaves the file the task was cut to remove; the preflight context-file check knows four names, so a mistyped vendored tree passes every gate. It also means a strip cannot name a file the PR *creates* |
 | `task_id` is unique in the set | `run_id` is `sha256(task|model|sample|attempt)`, so two tasks sharing an id collide in the event log — discovered at the far end of a matrix, after the tokens are spent |
 | `image.env` keys are in the allowlist (`CI`, `HYPOTHESIS_STORAGE_DIRECTORY`) and are not a key the harness itself sets; values carry none of `\n` `\r` `"` `\\` `$`; `HYPOTHESIS_STORAGE_DIRECTORY` is an absolute path outside `/repo` | an allowlist because a denylist would have to anticipate `CLAUDE_CODE_USE_BEDROCK`, which bypasses the proxy and leaves the wire log empty with the run still looking normal; a harness-owned key applying to preflight and the grader but overridden on the agent's own process — two environments for one task; a value that does not survive a generated `ENV KEY="value"` Dockerfile line; hypothesis writing into the tree the §5.6 submission diff is taken against |
+| `image.python`, when declared, is a quoted string in `{"3.11", "3.12", "3.13"}` | an unquoted `3.10` is the float `3.1` and an unquoted `3.11` is `3.11` — the version that reaches the build is the parser's, not the manifest's. An unlisted value is either a floating tag (two collections months apart on different interpreters, with nothing in the record saying which) or one that fails at the `FROM` with a registry error mid-build |
 
 ### Preflight — `src/bakeoff/preflight.py`
 
@@ -49,6 +50,10 @@ Runs inside the pinned image, before the proxy starts.
   pytest's exit codes and nothing else can currently supply it.
 - The image is non-root, `claude --version` matches the base pin, `git` and
   `rg` are present.
+- **`python --version` inside the image parses to the declared
+  `image.python`.** The base tag is local and mutable; a stale or mismatched
+  base runs the suite under an interpreter the task was not cut for, and
+  every other gate stays green.
 - The container's HEAD is `start_sha`.
 - **No `CLAUDE.md`, `AGENTS.md`, `.claude` or `.cursorrules` in the start
   state.** §5.2 pins the session config precisely because agent files
@@ -356,6 +361,25 @@ is *already in* the tree, and the difference is where this section lives.
 Three ways a task image fails at build time, silently, all found by screening
 rather than by reasoning:
 
+- **The interpreter is a choice, and a closed one.** `image.python` selects the
+  base — `"3.11"`, `"3.12"` (the default) or `"3.13"`. Every arm of a task runs
+  the same base, so this is not a §5.4 divergence: what that section holds
+  identical is the environment two *arms* are compared in, and a task is
+  compared against itself. Adding a fourth version is three steps and the first
+  is a measurement: build `docker/eval-agent.Dockerfile` with
+  `--build-arg BASE_PYTHON_VERSION=<v>` and confirm both in-image pin
+  assertions fire (`pytest 9.1.1 pinned`, `claude 2.1.220 pinned`), then add the
+  string to `tasks._PYTHON_VERSIONS`, then add it here. Verified 2026-09-01:
+  3.11 → `Python 3.11.16`, 3.12 → `3.12.13`, 3.13 → `3.13.15`, with pytest
+  9.1.1 and Claude Code 2.1.220 installing on all three.
+
+  **No screened repository is excluded on this ground today.** The screen at
+  `docs/BUILDING-A-TASK-SET.md` §2 was run entirely in `python:3.12-slim-bookworm`
+  (recorded above), so a repository needing 3.11 or 3.13 semantics would have
+  shown up as a suite failure with an unrelated-looking cause rather than as a
+  version verdict — the key exists for the candidates the screen has not reached
+  yet, and a re-screen at a second version is what would populate this
+  paragraph.
 - **No git submodules.** The build context is `git archive base_sha`, which
   drops them. `tomlkit` cannot collect its suite for this reason: it needs
   `tests/toml-test`, and the directory arrives empty.

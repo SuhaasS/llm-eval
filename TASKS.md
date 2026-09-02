@@ -1124,6 +1124,19 @@ judge runs after one — which is why they sit here rather than above.
   needs a
   `PREFLIGHT_VERSION` bump because it changes what a cached verdict contains.
 
+- [ ] **Re-screen the `HARVESTING.md` corpus at 3.11 and 3.13.** Broadening 5
+  gave a manifest `image.python: "3.11" | "3.12" | "3.13"`, closed and
+  enforced at load time, but the whole screen at `docs/BUILDING-A-TASK-SET.md`
+  §2 was run in `python:3.12-slim-bookworm` only — so a candidate excluded for
+  a suite failure with an unrelated-looking cause (a `SyntaxError` on newer
+  syntax, a removed stdlib module, a C extension with no wheel) has never been
+  tried against the interpreter that would actually fix it. No repository has
+  been shown to be reopened by this key today. Re-run the screening command
+  against `python:3.11-slim-bookworm` and `python:3.13-slim-bookworm` for the
+  candidates `HARVESTING.md` already excluded, and report which pass — the key
+  is built and gated, but claiming a yield improvement without this
+  measurement would be the "report the gap, never estimate it" rule broken.
+
 ---
 
 ## P3 — Decisions to settle before numbers are published
