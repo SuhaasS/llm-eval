@@ -707,6 +707,12 @@ def test_a_grading_timeout_is_a_model_verdict():
 
 
 def test_f2p_environment_exit_is_never_stamped_on_the_model():
+    """The fixture reports no bare-module ERROR line (stdout is empty, stderr
+    is prose), so the confinement predicate finds nothing and refuses for
+    every code here -- including 2 and 4, which broadening 2 otherwise
+    accepts. This pins the FALLBACK path, not "exit 4 is never a model
+    verdict"; the accepted-shape branch is pinned separately, by the confined
+    fixtures below."""
     for code in (2, 3, 4, 5):
         env = FakeEnv(rules=[(is_f2p, (code, "", "collection error"))])
         result = _ladder(env=env)
@@ -731,28 +737,42 @@ def test_f2p_failures_are_recorded_by_node_id():
     assert result.f2p_failed_node_ids == ("tests/test_calc.py::test_add",)
 
 
-def test_an_unfixed_collection_error_is_a_named_failure_not_an_ungradable_run():
+@pytest.mark.parametrize("code,f2p_entry", [
+    # 4: a selected node id whose module will not import -- the shape f2p's
+    # own run makes when f2p declares a node id (row A, test_preflight.py's
+    # test_an_f2p_module_that_will_not_import_is_accepted_when_p2p_is_green).
+    (4, "tests/test_calc.py::test_add"),
+    # 2: a bare-module f2p entry collects the module path rather than a node
+    # id and gets the collection-interrupted exit a directory/module-path run
+    # gives (row B, same test). `f2p_modules` splits on "::" regardless, so
+    # containment holds identically either way -- EXIT_COLLECTION_FAILURES
+    # is (4, 2) and check 5 must treat both members alike.
+    (2, "tests/test_calc.py"),
+])
+def test_an_unfixed_collection_error_is_a_named_failure_not_an_ungradable_run(
+    code, f2p_entry
+):
     """Otherwise a do-nothing arm outranks a half-working one.
 
     On a task whose f2p module does not import at the start state, an arm that
-    changed nothing leaves it not importing: pytest exits 4 and check 5 used to
-    call that ENVIRONMENT_ERROR -- `resolved: None`, not graded. An arm that
-    half-fixed the import gets exit 1 and `resolved: False`. So in any view
-    that counts False, the arm that did NOTHING looks better than the one that
-    tried. A null standing in for a negative is the defect this ladder is built
-    around, and here it was pointing the wrong way.
+    changed nothing leaves it not importing: pytest exits 4 (or 2) and check 5
+    used to call that ENVIRONMENT_ERROR -- `resolved: None`, not graded. An
+    arm that half-fixed the import gets exit 1 and `resolved: False`. So in
+    any view that counts False, the arm that did NOTHING looks better than the
+    one that tried. A null standing in for a negative is the defect this
+    ladder is built around, and here it was pointing the wrong way.
 
     Containment, not equality: a submission that fixed one of two f2p modules
     errors on a subset and is still a model failure. Anything OUTSIDE the
     declared modules stays an environment error -- see the next test."""
     env = FakeEnv(rules=[
-        (is_f2p, (4,
+        (is_f2p, (code,
                   "ERROR: found no collectors for /repo/tests/test_calc.py::test_add\n"
                   "ERROR tests/test_calc.py\n1 error in 0.01s\n",
                   "")),
     ])
 
-    result = _ladder(env=env)
+    result = _ladder(task=_task(f2p=(f2p_entry,)), env=env)
 
     assert result.resolved is False
     assert result.grade_failure == GradeFailure.F2P_FAILED.value

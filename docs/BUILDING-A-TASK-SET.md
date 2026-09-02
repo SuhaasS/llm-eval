@@ -271,8 +271,9 @@ half, so the test module raises `ImportError` during collection and pytest
 exits **4** (a selected node id whose module will not import; a directory run
 gives 2). Since `PREFLIGHT_VERSION` 4 that is an **accepted** task shape, under
 a narrow condition you can check by eye before cutting anything: the reported
-`ERROR` lines must name **exactly** the modules holding your declared f2p ids —
-so an f2p set that spans a module the PR adds *and* a module that already
+`ERROR` lines must name **exactly** the modules holding your declared f2p ids,
+and f2p must go green after the reference fix — so an f2p set that spans a
+module the PR adds *and* a module that already
 imports cannot work, because a collection error stops the run before the second
 module's tests are ever attempted. Measured on `trucking-doc-extraction` #3.
 
@@ -360,9 +361,12 @@ the PR also changes a test in a module that already imports, that test's id
 cannot be in `f2p` for this task — a collection error hides it, so preflight
 would be accepting an id nobody checked, and it refuses instead.
 
-Copy those ids exactly. Preflight asserts every declared id appears in pytest's
-FAILED/ERROR lines at the start state, so a typo is caught — but a *missing* id
-is not, and an f2p set narrower than the real one under-specifies the task.
+Copy those ids exactly. On an exit-1 task preflight asserts every declared id
+appears in pytest's FAILED/ERROR lines, so a typo is caught; on a
+collection-error task the equivalent check is the module-level equality above
+(a typo there surfaces as `ERROR: not found:`, which reports nothing and is
+refused). In neither case is a *missing* id caught, and an f2p set narrower
+than the real one under-specifies the task.
 
 `p2p` is normally left empty, meaning "everything else the runner collects".
 If you do declare it, **list leaf node ids only** (`path::test_name`, never a
@@ -494,7 +498,8 @@ capability.
 | nothing under `tests.paths` | `tests.paths` does not match where this repo keeps its tests |
 | nothing left for the fix | every file landed in the test half or `allow_extra_paths` |
 | a rename crosses the test/solution boundary | the file would be both the agent's oracle and part of its submission. Pick a different PR |
-| f2p exits 5 at the start state, or 2/4 with `ERROR: not found:` | a declared node id does not exist — a typo, or the id changed shape (parametrization) |
+| f2p exits 4 with `ERROR: not found:` | a declared node id does not exist — a typo, or the id changed shape (parametrization) |
+| f2p exits 5 at the start state | nothing was collected — a `collect_ignore`, a `testpaths` mismatch, or an f2p selection that matched no tests |
 | f2p exits 2/4 and the reported `ERROR` modules are not exactly the declared f2p modules | a module errored that no f2p id names (broken environment: fix `image.pip`/`image.apt`), or a declared f2p module did not error (its ids are unobservable behind another module's collection error — narrow `f2p` to the modules that actually error, or pick a different PR) |
 | f2p could not be collected AND p2p is not green | the confinement parse cannot tell a missing symbol from a missing interpreter; p2p is the evidence that separates them, so fix the environment first |
 | f2p exits 0 at the start state | the test half did not actually land, or the bug is already fixed at `base_sha` |
@@ -665,7 +670,7 @@ raise.
 | a fix is applied, the source is correct on disk, pytest is still red | stale `.pyc`. CPython invalidates on (mtime in whole seconds, size) and both halves are ordinary — an operator swap preserves byte count, and an agent edits and re-runs inside one second. The image sets `PYTHONDONTWRITEBYTECODE=1`; do not remove it |
 | a task passes preflight, then the dry run reports a huge `diff=` for an agent that edited nothing | a committed venv, build output or vendored tree tracked at `base_sha`. §5.6 stages everything, so it lands in every submission and diff size measures that tree. Preflight's tree-clean check only covers what the *suite* writes — screen with `git ls-tree -r --name-only <base_sha> \| wc -l` before cutting |
 | a candidate PR's f2p exits **4** at the start state with `ERROR <module>` and no `::` | the test half imports a symbol the fix introduces. **Repairable — this is an accepted shape** if every reported `ERROR` names a declared f2p module, p2p is green there, and f2p goes green after the fix (§3.1, §3.4) |
-| a collection-error candidate is refused with "the rest of the suite is not green — no tests were collected" | ignoring the erroring module left the sweep empty: this repo's test tree holds no regression baseline outside that module. Not repairable by configuration; pick a PR in a repo with a wider suite |
+| a collection-error candidate is refused with "the rest of the suite is not green at the start state -- no tests were collected" | ignoring the erroring module left the sweep empty: this repo's test tree holds no regression baseline outside that module. Not repairable by configuration; pick a PR in a repo with a wider suite |
 | a collection-error candidate is refused and the printed argv shows an `--ignore` that did not take | the ignore paths come from pytest's **rootdir**-relative `ERROR` lines and `--ignore` resolves against the **working directory**. They coincide when rootdir is `/repo`; a `pyproject.toml` in a subdirectory or a `--rootdir` in `tests.runner` breaks it |
 | `smoke_bedrock.py` reports `MISSING BAKEOFF_MANTLE_TOKEN` / `SKIP` on four arms | the gate reads the env var and does not mint a token; `run_matrix.py` derives one itself. Re-run with `--derive-mantle-token` before concluding anything about credentials (§1.6) |
 | the driver says creds are good for 12 h and they die in under one | static keys in `.env` expose no `_expiry_time`, so the window falls back to the mantle token's nominal TTL. The abort streaks are the real backstop; size the invocation yourself or use `AWS_PROFILE` (§1.6) |

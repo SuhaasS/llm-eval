@@ -889,7 +889,11 @@ def _check_f2p(state: _State, task, env) -> None:
     # subset and is still a model failure. A module outside the set is
     # indistinguishable from an image that lost a dependency, and an empty
     # reported set is a manifest typo (`ERROR: not found:` carries a colon) --
-    # both fall through to the environment path, unchanged.
+    # both fall through to the environment path, unchanged. Preflight's
+    # green-after conjunct is what licenses this branch: a confined error set
+    # at grade time is a submission that broke an import preflight already
+    # proved importable after the reference fix, not a stranger dependency
+    # loss the task never claimed.
     if code in EXIT_COLLECTION_FAILURES:
         modules = collection_error_modules(result.stdout + result.stderr)
         if modules is not None and modules <= f2p_modules(tuple(task.tests.f2p)):

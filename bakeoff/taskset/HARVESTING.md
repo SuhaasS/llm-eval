@@ -132,7 +132,8 @@ that passes Layer 1 and measures the wrong thing.
   **4** (a selected node id whose module will not import) rather than **1**.
   Preflight refused that outright until broadening 2 and now accepts it, under
   a narrow, measured condition: every reported `ERROR` line names a declared
-  f2p module, nothing else is reported, and p2p is green at the start state.
+  f2p module, nothing else is reported, p2p is green at the start state, and
+  f2p goes green after the reference fix.
   Measured on `trucking-doc-extraction` #3, whose `test_redact_db_url.py`
   imports a redaction helper the fix introduces — `1 error during collection`,
   nothing else red.
