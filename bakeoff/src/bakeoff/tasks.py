@@ -239,6 +239,35 @@ class TaskBudget:
 
 
 @dataclass(frozen=True)
+class Submodule:
+    """One gitlink at `base_sha`, DERIVED rather than declared (see the
+    module docstring's third load-bearing item, and spec section 3.7).
+
+    Every field is inside the tree `base_sha` already pins: `path` and `sha`
+    are a `160000` entry in `git ls-tree`, `name` and `url` are the section
+    header and value in the `.gitmodules` blob. A manifest key restating them
+    would be configuration reported as observation, and it could drift from
+    the tree while every other check passed.
+
+    `name` is not `path`: the `[submodule "NAME"]` header is what
+    `submodule.<name>.url` keys on, and git does not require the two to match.
+    """
+
+    name: str
+    path: str
+    url: str
+    sha: str
+
+
+#: The only submodule url shape the eval can fetch. A relative url ("../x.git")
+#: resolves against the superproject's remote, which `materialize` deletes and
+#: the container cannot reach; ssh needs keys the eval does not carry; file://
+#: points at the task author's laptop. Refused at derivation so the failure
+#: names the manifest, not `git submodule update`'s clone error.
+_SUBMODULE_URL_PREFIX = "https://"
+
+
+@dataclass(frozen=True)
 class TaskManifest:
     task_id: str
     task_version: int
@@ -1303,6 +1332,162 @@ def ensure_mirror(repo_url: str, base_sha: str, cache_root: Path) -> Path:
                 "nothing and record the result as an ordinary run."
             )
         return mirror
+
+
+def derive_submodules(task: TaskManifest, mirror: Path) -> tuple[Submodule, ...]:
+    """The submodules of `task.base_sha`, from git's own parsers, cross-checked.
+
+    TWO independent readers, and their agreement is the guarantee. `ls-tree`
+    gives the paths that have a gitlink; `.gitmodules` gives the paths that
+    have a url. A path in one set and not the other is a QUIET failure in both
+    directions -- a url with no gitlink makes the init fail with git's message
+    instead of one naming the task, and a gitlink with no url leaves the
+    directory empty, which is byte-identical to a suite that cannot import and
+    is scored as capability on every arm (measured 2026-09-01, git 2.50.1:
+    `git status --porcelain` is EMPTY in a run tree whose submodule directory
+    has zero entries).
+
+    Both reads are NUL-delimited, for the reason `_chunk_path`'s docstring
+    gives: paths come from git, never from a regex over a header line.
+
+    The url rule is enforced through the module constant
+    `_SUBMODULE_URL_PREFIX` rather than a parameter, so the test fixtures --
+    local repositories, so the whole materialization path runs offline -- relax
+    it by monkeypatching one name, and no shipping signature carries a flag
+    that only tests ever set.
+    """
+    entries = _git("ls-tree", "-r", "-z", task.base_sha, cwd=mirror).stdout
+    gitlinks: dict[str, str] = {}
+    for record in entries.split("\0"):
+        if not record:
+            continue
+        meta, _, path = record.partition("\t")
+        mode, _, rest = meta.partition(" ")
+        if mode != "160000":
+            continue
+        gitlinks[path] = rest.split(" ")[-1]
+
+    declared: dict[str, dict[str, str]] = {}
+    if gitlinks or _has_gitmodules(mirror, task.base_sha):
+        listing = _git("config", "--blob", f"{task.base_sha}:.gitmodules",
+                       "--list", "-z", cwd=mirror, check=False)
+        if listing.returncode != 0 and gitlinks:
+            raise TaskError(
+                f"{task.task_id}: {task.base_sha} carries gitlinks "
+                f"({', '.join(sorted(gitlinks))}) but no readable .gitmodules, "
+                "so no url exists to fetch them from and the directories would "
+                "arrive empty."
+            )
+        for record in listing.stdout.split("\0"):
+            key, _, value = record.partition("\n")
+            if not key.startswith("submodule."):
+                continue
+            name, _, field = key[len("submodule."):].rpartition(".")
+            if field in ("path", "url"):
+                declared.setdefault(name, {})[field] = value
+
+    by_path = {v["path"]: (name, v) for name, v in declared.items()
+               if "path" in v}
+    # ONE-DIRECTIONAL, and the direction is the decision. A gitlink with no
+    # url has nothing to fetch from and leaves a directory `git status
+    # --porcelain` reports as CLEAN -- quiet, and fatal. The reverse is inert:
+    # measured 2026-09-01, a `.gitmodules` entry naming a path with no gitlink
+    # is not listed by `git submodule status`, is not fetched by `update
+    # --init` (exit 0) and creates no directory, because git drives everything
+    # off the index. Refusing it would refuse a real, working shape -- a
+    # submodule `git rm --cached`'d with its stanza left behind. Preflight
+    # records those names as `submodules_orphaned` instead.
+    unfetchable = sorted(set(gitlinks) - set(by_path))
+    if unfetchable:
+        raise TaskError(
+            f"{task.task_id}: the tree at {task.base_sha} carries gitlinks "
+            f"with no .gitmodules url: {', '.join(unfetchable)}. There is "
+            "nothing to fetch them from, so each directory would arrive empty "
+            "-- and an empty submodule directory leaves `git status "
+            "--porcelain` clean, so nothing downstream would say so."
+        )
+
+    subs = tuple(
+        Submodule(name=by_path[path][0], path=path,
+                  url=by_path[path][1].get("url", ""), sha=sha)
+        for path, sha in sorted(gitlinks.items())
+    )
+    _refuse_submodule_conflicts(task, subs, mirrors={})
+    return subs
+
+
+def _has_gitmodules(mirror: Path, sha: str) -> bool:
+    return _git("cat-file", "-e", f"{sha}:.gitmodules", cwd=mirror,
+                check=False).returncode == 0
+
+
+def _refuse_submodule_conflicts(task: TaskManifest, subs: tuple[Submodule, ...],
+                                mirrors: dict[str, Path]) -> None:
+    """The four refusals that are not about the two readers agreeing.
+
+    `mirrors` maps a submodule path to its pruned mirror, and is `{}` wherever
+    no mirror exists yet -- `derive_submodules` runs with no cache root, so the
+    one refusal that needs a clone (nested submodules, added in Task 2) is
+    skipped there and runs again from `_init_submodules`, where a clone was
+    going to happen anyway.
+
+    Four refusals here, not five: the gitlink-with-no-url check is
+    `derive_submodules`' own, because it is a property of the pair of readers
+    rather than of one entry.
+
+    Each is a shape that would otherwise fail LATE and describe the wrong
+    thing: a bad url as `git submodule update`'s clone error, a nested
+    submodule as an empty directory one level further down, a strip as a
+    `git rm` against a path the manifest never meant, and a reference diff
+    touching submodule content as a preflight green-after that passes on a fix
+    no submission diff can contain (measured 2026-09-01: plain `git apply`
+    edits inside a submodule at exit 0, and `git add -A` then stages NOTHING
+    for it -- the checkpoint diff is zero bytes).
+    """
+    for sub in subs:
+        if not sub.url.startswith(_SUBMODULE_URL_PREFIX):
+            raise TaskError(
+                f"{task.task_id}: submodule {sub.path} declares url "
+                f"{sub.url!r}, which is not {_SUBMODULE_URL_PREFIX}. A relative "
+                "url resolves against a remote the run tree does not have, and "
+                "ssh/file urls cannot be fetched by this eval."
+            )
+        # `_under` is `PurePosixPath.is_relative_to`, so it already matches
+        # the path itself; an `or p == sub.path` conjunct would be dead.
+        stripped = [p for p in task.strip_paths if _under(p, (sub.path,))]
+        if stripped:
+            raise TaskError(
+                f"{task.task_id}: strip_paths names {', '.join(stripped)}, "
+                f"which is at or under the submodule {sub.path}. The strip runs "
+                "against a start state where the submodule is not initialised, "
+                "so it would remove the gitlink and leave .gitmodules naming a "
+                "path that no longer exists."
+            )
+        touched = [p for p in (*task.test_files, *task.solution_files,
+                               *task.extra_files)
+                   if _under(p, (sub.path,))]
+        if touched:
+            raise TaskError(
+                f"{task.task_id}: the reference diff touches "
+                f"{', '.join(sorted(touched))}, which is at or under the "
+                f"submodule {sub.path}. A submission diff cannot carry an edit "
+                "inside a submodule -- `git add -A` stages nothing for it -- so "
+                "a task whose fix lives there is ungradable by construction."
+            )
+
+
+def task_submodules(task: TaskManifest, cache_root: Path) -> tuple[Submodule, ...]:
+    """`ensure_mirror` then `derive_submodules`. THE entry point.
+
+    Three callers -- `materialize`, `images.build_task_image` and
+    `grader.grade_run` -- and each of them already needs the mirror. Deriving
+    three times costs two git reads against a warm cache; threading one value
+    through three signatures would make each caller depend on a neighbour
+    having run the refusals in `derive_submodules`, which is the failure this
+    module's every other check is shaped to avoid.
+    """
+    mirror = ensure_mirror(task.repo_url, task.base_sha, cache_root)
+    return derive_submodules(task, mirror)
 
 
 # Bumping this invalidates every cached pruned mirror. Bump it whenever the

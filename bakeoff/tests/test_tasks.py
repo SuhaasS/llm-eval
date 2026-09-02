@@ -108,6 +108,82 @@ def upstream(tmp_path):
     return {"path": repo, "base": base, "head": head, "reference": reference}
 
 
+SUB_LIB = "VALUE = 1\n"
+SUB_LIB_FUTURE = "VALUE = 999\n"
+
+
+@pytest.fixture
+def upstream_submodule(tmp_path):
+    """A superproject with one submodule, whose upstream has moved PAST the pin.
+
+    The future commit is the point. `git submodule update --init` against the
+    real url clones the submodule's whole history (measured 2026-09-01, git
+    2.50.1), so a fixture whose submodule has nothing after the gitlink cannot
+    tell a pruned mirror from an unpruned one -- which is the guarantee Task 2
+    exists to pin.
+
+    `-c protocol.file.allow=always` on every submodule-touching command: git
+    refuses the file transport for submodules by default since the CVE-2022-39253
+    hardening, and a local path is a file transport. Production needs the same
+    flag for the same reason (the pruned mirror is a local path), so this is not
+    a fixture-only concession.
+    """
+    lib = tmp_path / "libdep"
+    (lib / "libdep").mkdir(parents=True)
+    (lib / "libdep" / "__init__.py").write_text(SUB_LIB)
+    _sh("git", "init", "-q", cwd=lib)
+    _sh("git", "config", "user.email", "t@t.test", cwd=lib)
+    _sh("git", "config", "user.name", "t", cwd=lib)
+    _sh("git", "add", "-A", cwd=lib)
+    _sh("git", "commit", "-q", "-m", "libdep v1", cwd=lib)
+    pinned = _sh("git", "rev-parse", "HEAD", cwd=lib)
+    (lib / "libdep" / "__init__.py").write_text(SUB_LIB_FUTURE)
+    _sh("git", "commit", "-q", "-am", "libdep FUTURE", cwd=lib)
+    future = _sh("git", "rev-parse", "HEAD", cwd=lib)
+
+    repo = tmp_path / "super"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "calc.py").write_text(BUGGY)
+    (repo / "tests" / "test_calc.py").write_text(OLD_TEST)
+    _sh("git", "init", "-q", cwd=repo)
+    _sh("git", "config", "user.email", "t@t.test", cwd=repo)
+    _sh("git", "config", "user.name", "t", cwd=repo)
+    _sh("git", "add", "-A", cwd=repo)
+    _sh("git", "commit", "-q", "-m", "base", cwd=repo)
+    _sh("git", "-c", "protocol.file.allow=always", "submodule", "add", "-q",
+        str(lib), "vendor/libdep", cwd=repo)
+    _sh("git", "-c", "protocol.file.allow=always", "-C", "vendor/libdep",
+        "checkout", "-q", pinned, cwd=repo)
+    _sh("git", "add", "-A", cwd=repo)
+    _sh("git", "commit", "-q", "-m", "pin the submodule", cwd=repo)
+    base = _sh("git", "rev-parse", "HEAD", cwd=repo)
+
+    (repo / "calc.py").write_text(FIXED)
+    (repo / "tests" / "test_calc.py").write_text(NEW_TEST)
+    _sh("git", "add", "-A", cwd=repo)
+    _sh("git", "commit", "-q", "-m", "fix", cwd=repo)
+    head = _sh("git", "rev-parse", "HEAD", cwd=repo)
+    reference = subprocess.run(
+        ["git", "diff", base, head], cwd=repo, check=True,
+        capture_output=True, text=True,
+    ).stdout
+    return {"path": repo, "base": base, "head": head, "reference": reference,
+            "lib": lib, "pinned": pinned, "future": future,
+            "sub_path": "vendor/libdep"}
+
+
+@pytest.fixture
+def local_urls(monkeypatch):
+    """Accept the fixtures' local-path submodule urls.
+
+    Empties `_SUBMODULE_URL_PREFIX` so `startswith` is vacuously true. The
+    fixtures are local repositories on purpose -- the same reason `upstream`
+    is -- so that the whole materialization path runs offline; a test that
+    needed the network would be a test that stops running.
+    """
+    monkeypatch.setattr(tasks, "_SUBMODULE_URL_PREFIX", "")
+
+
 def _manifest(**overrides) -> str:
     data = {
         "task_id": "t-001",
@@ -2301,3 +2377,131 @@ def test_declaring_a_python_version_moves_the_digest_but_not_the_start_state(
     assert pinned.manifest_digest != plain.manifest_digest
     assert materialize(pinned, tmp_path / "tb" / "repo", tmp_path / "cb") == \
         materialize(plain, tmp_path / "ta" / "repo", tmp_path / "ca")
+
+
+# --- submodules --------------------------------------------------------------
+
+
+def _sub_task(tmp_path, up, **overrides):
+    return load_task(_write_task(tmp_path / "set", up, **overrides))
+
+
+def test_a_repository_with_no_submodules_derives_an_empty_tuple(tmp_path, upstream):
+    task = _sub_task(tmp_path, upstream)
+    mirror = tasks.ensure_mirror(str(upstream["path"]), upstream["base"],
+                                 tmp_path / "cache")
+
+    assert tasks.derive_submodules(task, mirror) == ()
+
+
+def test_the_gitlink_and_the_gitmodules_blob_are_both_read(tmp_path,
+                                                           upstream_submodule,
+                                                           local_urls):
+    """Path and sha come from `ls-tree`, url from `.gitmodules`, name from the
+    section header -- all four from git's own parsers over NUL-delimited output.
+    """
+    up = upstream_submodule
+    task = _sub_task(tmp_path, up)
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
+
+    (sub,) = tasks.derive_submodules(task, mirror)
+
+    assert sub.path == "vendor/libdep"
+    assert sub.name == "vendor/libdep"
+    assert sub.sha == up["pinned"]
+    assert sub.url == str(up["lib"])
+
+
+def test_a_gitlink_with_no_gitmodules_url_is_refused(tmp_path,
+                                                     upstream_submodule,
+                                                     local_urls):
+    """The quiet shape: no url, so the directory would simply stay empty and
+    the suite would fail to collect on every arm -- with `git status
+    --porcelain` reporting the tree as clean throughout.
+    """
+    up = upstream_submodule
+    _sh("git", "rm", "-q", "--cached", ".gitmodules", cwd=up["path"])
+    _sh("git", "-c", "user.email=t@t.test", "-c", "user.name=t",
+        "commit", "-q", "-m", "drop .gitmodules", cwd=up["path"])
+    base = _sh("git", "rev-parse", "HEAD", cwd=up["path"])
+    task = _sub_task(tmp_path, {**up, "base": base})
+    mirror = tasks.ensure_mirror(str(up["path"]), base, tmp_path / "cache")
+
+    with pytest.raises(TaskError, match="vendor/libdep"):
+        tasks.derive_submodules(task, mirror)
+
+
+def test_a_gitmodules_entry_with_no_gitlink_is_NOT_refused(tmp_path,
+                                                           upstream_submodule,
+                                                           local_urls):
+    """The other direction is inert, and refusing it would refuse a working
+    task. Measured 2026-09-01, git 2.50.1: git drives everything off the
+    index, so an orphaned stanza is not listed by `git submodule status`, is
+    not fetched by `update --init` (exit 0), creates no directory and leaves
+    the tree clean. The shape is real -- a submodule `git rm --cached`'d with
+    its .gitmodules stanza left behind. Preflight records the name as
+    `submodules_orphaned` instead.
+    """
+    up = upstream_submodule
+    gitmodules = up["path"] / ".gitmodules"
+    gitmodules.write_text(
+        gitmodules.read_text()
+        + '\n[submodule "vendor/gone"]\n\tpath = vendor/gone\n'
+        '\turl = https://example.invalid/gone.git\n'
+    )
+    _sh("git", "add", ".gitmodules", cwd=up["path"])
+    _sh("git", "-c", "user.email=t@t.test", "-c", "user.name=t",
+        "commit", "-q", "-m", "orphan stanza", cwd=up["path"])
+    base = _sh("git", "rev-parse", "HEAD", cwd=up["path"])
+    task = _sub_task(tmp_path, {**up, "base": base})
+    mirror = tasks.ensure_mirror(str(up["path"]), base, tmp_path / "cache")
+
+    assert [s.path for s in tasks.derive_submodules(task, mirror)] \
+        == ["vendor/libdep"]
+
+
+def test_a_non_https_submodule_url_is_refused(tmp_path, upstream_submodule):
+    """The fixture's own url is a local path, which is exactly the shape that
+    must be refused in production -- so this test needs no extra setup, while
+    every OTHER test in this section relaxes the constant (see `local_urls`).
+    """
+    up = upstream_submodule
+    task = _sub_task(tmp_path, up)
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
+
+    with pytest.raises(TaskError, match="https://"):
+        tasks.derive_submodules(task, mirror)
+
+
+def test_a_strip_path_covering_a_submodule_is_refused(tmp_path,
+                                                      upstream_submodule,
+                                                      local_urls):
+    up = upstream_submodule
+    task = _sub_task(tmp_path, up, extra_yaml='strip_paths: ["vendor/libdep"]')
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
+
+    with pytest.raises(TaskError, match="strip_paths"):
+        tasks.derive_submodules(task, mirror)
+
+
+def test_a_reference_diff_touching_a_submodule_path_is_refused(
+        tmp_path, upstream_submodule, local_urls):
+    """Measured 2026-09-01: `git apply` WITHOUT `--index` applies such a patch
+    exit 0 and edits submodule content, which is how preflight's green-after
+    check would pass on a fix no submission diff can ever contain.
+    """
+    up = upstream_submodule
+    reference = up["reference"] + (
+        "diff --git a/vendor/libdep/libdep/__init__.py"
+        " b/vendor/libdep/libdep/__init__.py\n"
+        "--- a/vendor/libdep/libdep/__init__.py\n"
+        "+++ b/vendor/libdep/libdep/__init__.py\n"
+        "@@ -1 +1 @@\n"
+        "-VALUE = 1\n"
+        "+VALUE = 2\n"
+    )
+    task = _sub_task(tmp_path, {**up, "reference": reference})
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
+
+    with pytest.raises(TaskError, match="reference diff"):
+        tasks.derive_submodules(task, mirror)
