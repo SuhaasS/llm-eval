@@ -353,6 +353,52 @@ def test_a_misspelled_grading_key_is_refused_rather_than_dropped(
     assert "typecheck" in str(excinfo.value), "the message must name the allowed set"
 
 
+def test_strip_paths_loads_and_is_exposed(tmp_path, upstream):
+    """A manifest key nothing can read is configuration nobody can report.
+    `materialize`, `build_task_image` and preflight all need this list."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream,
+        extra_yaml='strip_paths: ["CLAUDE.md", ".claude"]',
+    )
+
+    task = load_task(task_dir)
+
+    assert task.strip_paths == ("CLAUDE.md", ".claude")
+
+
+def test_a_manifest_with_no_strip_paths_still_loads(tmp_path, upstream):
+    """Every manifest written before this key existed keeps loading, and the
+    absent case is one value rather than a None every caller re-decides."""
+    assert load_task(_write_task(tmp_path / "set", upstream)).strip_paths == ()
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["", " CLAUDE.md", "/etc/passwd", "../outside", ".", "./", ".git",
+     ".git/hooks", "*.log", "docs/*", ":(glob)**/x"],
+)
+def test_a_strip_path_that_would_remove_the_wrong_thing_is_refused(
+    tmp_path, upstream, bad
+):
+    """This key's effect is a DELETE, so the validation is stricter than
+    `_validate_prefixes` alone.
+
+    `.` and `./` pass every check that function makes -- measured,
+    `PurePosixPath(".").parts` is `()` and `is_relative_to(".")` is True for
+    every path -- and name the whole tree, so the start state would be emptied
+    and `start_sha` would still be a pure function of the manifest. `.git`
+    would take the repository the submission diff is computed against. Glob
+    and pathspec magic would make what gets removed a property of the tree
+    rather than of the manifest, and the existence check in `materialize`
+    would then pass on one accidental match."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream, extra_yaml=f"strip_paths: [{bad!r}]",
+    )
+
+    with pytest.raises(TaskError, match="strip_paths"):
+        load_task(task_dir)
+
+
 # --- provenance --------------------------------------------------------------
 
 

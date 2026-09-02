@@ -199,6 +199,13 @@ class TaskManifest:
     root: Path
     declared_start_sha: str = ""
     gitignore_extra: tuple[str, ...] = ()
+    #: Paths removed from the start state in the same setup commit that
+    #: applies the test half. What lifts a repository's agent-file or
+    #: vendored-tree date floor without hand-rewriting `base_sha`: the
+    #: modification is in the manifest, so it is in `manifest_digest` and in
+    #: `start_sha`, rather than in a rewritten history a reader diffing
+    #: against upstream would not find there.
+    strip_paths: tuple[str, ...] = ()
     provenance: dict[str, Any] = field(default_factory=dict)
     #: Git commit of the task-set repository, `-dirty` when the task set has
     #: uncommitted changes. This is what makes a stored record re-derivable
@@ -396,6 +403,57 @@ def _validate_prefixes(prefixes: tuple[str, ...], where: str) -> None:
             raise TaskError(f"{where}: {prefix!r} is empty or padded")
         if prefix.startswith("/") or ".." in PurePosixPath(prefix).parts:
             raise TaskError(f"{where}: {prefix!r} must be relative and free of '..'")
+
+
+#: Pathspec magic `git rm` would honour and this key does not accept. See
+#: `_validate_strip_paths`.
+_PATHSPEC_MAGIC = ("*", "?", "[", "]")
+
+
+def _validate_strip_paths(paths: tuple[str, ...], where: str) -> None:
+    """Refuse a strip entry that would remove something nobody asked for.
+
+    `_validate_prefixes` covers empty, padded, absolute and `..`-bearing
+    entries. The three refusals here are specific to a key whose effect is a
+    DELETE rather than a classification.
+
+    `.` and `./` pass every one of those checks and name the whole tree:
+    measured, `PurePosixPath(".").parts` is `()` and
+    `PurePosixPath("a/b").is_relative_to(PurePosixPath("."))` is True. The
+    start state would be emptied and `start_sha` would still be a pure
+    function of the manifest -- perfectly reproducible and completely wrong.
+
+    `.git` is the same shape one level worse: the delete runs in the run tree,
+    so it would destroy the repository the section 5.6 submission diff is
+    taken against.
+
+    Pathspec magic is refused because `git rm` takes PATHSPECS, not paths.
+    `strip_paths: ["*.log"]` would glob, and `_strip_paths_from_tree`'s
+    existence check would then pass on one accidental match while the author
+    meant something else -- a manifest key whose meaning is a property of the
+    tree it is applied to, inside the one field that has to be a pure function
+    of the manifest.
+    """
+    _validate_prefixes(paths, where)
+    for path in paths:
+        parts = PurePosixPath(path).parts
+        if not parts:
+            raise TaskError(
+                f"{where}: {path!r} names the whole tree; strip_paths removes "
+                "what it names, so this would empty the start state"
+            )
+        if parts[0] == ".git":
+            raise TaskError(
+                f"{where}: {path!r} is inside the repository's own .git; the "
+                "strip runs in the run tree and would destroy the repository "
+                "the submission diff is taken against"
+            )
+        if path.startswith(":") or any(ch in path for ch in _PATHSPEC_MAGIC):
+            raise TaskError(
+                f"{where}: {path!r} carries pathspec magic; this key names "
+                "paths, and a pattern would make what is removed a property "
+                "of the tree rather than of the manifest"
+            )
 
 
 def split_reference_diff(
@@ -655,6 +713,13 @@ def load_task(task_dir: Path, set_commit: str = "") -> TaskManifest:
     extra_paths = _strs(
         tests_raw.get("allow_extra_paths"), f"{where}:tests.allow_extra_paths"
     )
+    # Validated before the split so a malformed entry is reported without
+    # first paying for git's per-chunk parse of the whole reference.
+    # `manifest_digest` needs no term for this key: it hashes the raw manifest
+    # bytes, so declaring or editing a strip already invalidates the task's
+    # preflight cache entry.
+    strip_paths = _strs(data.get("strip_paths"), f"{where}:strip_paths")
+    _validate_strip_paths(strip_paths, f"{where}:strip_paths")
     test_diff, solution_diff, test_files, solution_files, extra_files = (
         split_reference_diff(reference, test_paths, extra_paths=extra_paths)
     )
@@ -712,6 +777,7 @@ def load_task(task_dir: Path, set_commit: str = "") -> TaskManifest:
         root=task_dir,
         declared_start_sha=str(declared_start),
         gitignore_extra=_strs(data.get("gitignore_extra"), f"{where}:gitignore_extra"),
+        strip_paths=strip_paths,
         provenance=dict(data.get("provenance") or {}),
         task_set_commit=set_commit,
         manifest_digest=hashlib.sha256(raw_manifest + raw_reference).hexdigest()[:16],
