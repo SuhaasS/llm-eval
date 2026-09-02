@@ -24,7 +24,7 @@ Three things are load-bearing and are argued where they happen:
   capability figure, arriving through the dataset instead of the image.
 
   That commit is deterministic. Fixed author, committer, date and message, so
-  its SHA is a pure function of (base_sha, test half, gitignore_extra) and
+  its SHA is a pure function of (base_sha, strip_paths, test half, gitignore_extra) and
   section 5.1's byte-identical world stays checkable rather than asserted.
   `start_sha` in the manifest is optional and, when present, verified: a
   re-cut patch or an edited manifest that moves the start state is exactly
@@ -1489,6 +1489,52 @@ def ensure_pruned_mirror(repo_url: str, base_sha: str, cache_root: Path) -> Path
         return _build_pruned_mirror(source, dest, base_sha)
 
 
+def _strip_paths_from_tree(
+    repo: Path, strip_paths: tuple[str, ...], task_id: str
+) -> bool:
+    """Remove the declared paths from index AND worktree. True if anything went.
+
+    `git rm -r`, not `git rm -r --cached`: the point of the key is that the
+    agent does not read a stripped CLAUDE.md and `pip install -e .` does not
+    resolve against a stripped vendored tree, and both need the file gone from
+    disk rather than only from the index. The deletions are staged, so the
+    caller's existing setup commit carries them and `start_sha` moves.
+
+    A path that matches nothing is a TaskError, and `--ignore-unmatch` is
+    deliberately absent. A typo (`.cluade/`) strips nothing and leaves the
+    file in the start state -- and nothing downstream says so, because
+    preflight's `_CONTEXT_FILES` check knows four names, so a mistyped
+    vendored tree or a fifth agent-file spelling passes every gate and the
+    confound is permanent in an append-only log. That is the failure this key
+    exists to prevent, so it cannot also be the failure the key introduces.
+
+    The existence check reads `git ls-files`'s OUTPUT, not its exit code:
+    measured 2026-09-01, `git ls-files -z -- nope` exits 0 with an empty
+    stdout, which is the silent zero `container._checked_exec` exists to
+    refuse. It asks about TRACKED content, because only tracked content is in
+    the tree `start_sha` names -- which is also why a strip cannot name a file
+    the reference diff CREATES, even one `allow_extra_paths` legitimately
+    lists. (`git rm` also refuses an unmatched pathspec, exit 128; this check
+    is kept because it names the manifest key and reports every missing entry
+    at once instead of the first.)
+    """
+    if not strip_paths:
+        return False
+    missing = [
+        path for path in strip_paths
+        if not _git("ls-files", "-z", "--", path, cwd=repo).stdout
+    ]
+    if missing:
+        raise TaskError(
+            f"{task_id}: strip_paths names {', '.join(missing)}, which no "
+            "tracked file is at or under in the start state. A typo strips "
+            "nothing and silently leaves behind the file the task was cut to "
+            "remove."
+        )
+    _git("rm", "-r", "-q", "--", *strip_paths, cwd=repo)
+    return True
+
+
 def materialize(task: TaskManifest, dest: Path, cache_root: Path) -> str:
     """Build the run's start state on disk and return its commit SHA.
 
@@ -1507,6 +1553,12 @@ def materialize(task: TaskManifest, dest: Path, cache_root: Path) -> str:
     agent and a host path leaked into the run. The reflog is expired for the
     same reason: the clone records `clone: from <host cache path>` in
     `.git/logs/HEAD`, which now carries the cache layout and `base_sha`.
+
+    `strip_paths` is applied first and lands in the same setup commit, so the
+    commit's SHA stays a pure function of (base_sha, strip, test half,
+    gitignore_extra) and `start_sha` remains pinnable. A strip that did not
+    move `start_sha` would be a change to what every arm was asked to do that
+    no stored record could distinguish.
     """
     dest = Path(dest)
     if dest.exists():
@@ -1550,7 +1602,13 @@ def materialize(task: TaskManifest, dest: Path, cache_root: Path) -> str:
             "resolve. The pruned mirror it was cloned from needs --dissociate."
         )
 
-    staged = False
+    # FIRST, before the test half and before `gitignore_extra`. The loader
+    # refuses a strip that covers either half of the reference, so nothing the
+    # test patch writes can land under a stripped prefix; `.gitignore` is the
+    # only path a later step can legitimately re-create there, and running the
+    # strip first is what makes that deterministic rather than an order the
+    # reader has to infer.
+    staged = _strip_paths_from_tree(dest, task.strip_paths, task.task_id)
     if task.test_diff.strip():
         patch = dest / ".bakeoff-test.patch"
         patch.write_text(task.test_diff)

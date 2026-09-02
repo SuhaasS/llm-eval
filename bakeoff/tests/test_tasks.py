@@ -64,7 +64,10 @@ def upstream(tmp_path):
     Local rather than remote on purpose: `materialize` clones with
     `--mirror`, which works against a path, so the whole materialization path
     is exercised offline. A test that needed the network would be a test that
-    stops running.
+    stops running. It also carries `CLAUDE.md`, `.claude/settings.json`,
+    `vendor/dep.py` and `CHANGES.md` alongside `calc.py` and its test, because
+    `strip_paths` exists for exactly those shapes -- an agent file, a
+    vendored tree, and a changelog the fix commit does not touch.
     """
     repo = tmp_path / "upstream"
     (repo / "tests").mkdir(parents=True)
@@ -462,7 +465,7 @@ def test_a_stripped_path_in_the_test_half_is_refused(tmp_path, upstream):
         tmp_path / "set", upstream, extra_yaml='strip_paths: ["tests"]',
     )
 
-    with pytest.raises(TaskError, match=r"strip_paths.*test_calc\.py.*test"):
+    with pytest.raises(TaskError, match=r"test_calc\.py.*test half"):
         load_task(task_dir)
 
 
@@ -643,6 +646,145 @@ def test_the_host_path_does_not_travel_into_the_run(tmp_path, upstream):
         if path.is_file() and str(cache) in path.read_text()
     ]
     assert leaked == []
+
+
+def test_strip_paths_removes_the_path_in_the_setup_commit(tmp_path, upstream):
+    """One commit onto base, not two.
+
+    `start_sha` is pinned in the manifest and verified on every
+    materialization; its job is that one manifest names one tree. A second
+    commit would still be deterministic but would make `start_sha` describe a
+    two-step history for some tasks and a one-step history for others."""
+    task = load_task(_write_task(
+        tmp_path / "set", upstream,
+        extra_yaml='strip_paths: ["CLAUDE.md", ".claude", "vendor"]',
+    ))
+    repo = tmp_path / "run" / "repo"
+
+    start = materialize(task, repo, tmp_path / "cache")
+
+    assert not (repo / "CLAUDE.md").exists()
+    assert not (repo / ".claude").exists()
+    assert not (repo / "vendor").exists()
+    tracked = _sh("git", "ls-tree", "-r", "--name-only", start, cwd=repo)
+    assert "CLAUDE.md" not in tracked
+    assert "vendor/dep.py" not in tracked
+    assert "calc.py" in tracked, "the strip must remove only what it names"
+    assert not _sh("git", "status", "--porcelain", cwd=repo), \
+        "committed, not left dirty"
+    assert _sh("git", "rev-list", "--count", f"{upstream['base']}..{start}",
+               cwd=repo) == "1"
+
+
+def test_declaring_strip_paths_moves_the_start_state(tmp_path, upstream):
+    """The modification is in the manifest, so it has to be in the sha every
+    record names. A strip invisible to `start_sha` would be a change to what
+    every arm was asked to do that no stored record could distinguish."""
+    plain = load_task(_write_task(tmp_path / "a", upstream))
+    stripped = load_task(_write_task(
+        tmp_path / "b", upstream, extra_yaml='strip_paths: ["CLAUDE.md"]',
+    ))
+
+    assert materialize(plain, tmp_path / "ra" / "repo", tmp_path / "cache") \
+        != materialize(stripped, tmp_path / "rb" / "repo", tmp_path / "cache")
+
+
+def test_an_empty_strip_paths_does_not_move_the_start_state(tmp_path, upstream):
+    """Backwards compatibility, stated as a property. Every manifest written
+    before this key existed -- the click task among them, whose `start_sha` is
+    pinned in its task.yaml -- must materialize to exactly what it did
+    before, so an absent key and an empty list have to be the same state and
+    neither may run a git call."""
+    absent = load_task(_write_task(tmp_path / "a", upstream))
+    empty = load_task(_write_task(
+        tmp_path / "b", upstream, extra_yaml="strip_paths: []",
+    ))
+
+    assert materialize(absent, tmp_path / "ra" / "repo", tmp_path / "cache") \
+        == materialize(empty, tmp_path / "rb" / "repo", tmp_path / "cache")
+
+
+def test_a_declared_strip_path_that_is_not_in_the_tree_is_refused(
+    tmp_path, upstream
+):
+    """The failure this key must not introduce. A typo strips nothing, the
+    file stays in the start state, and nothing downstream says so: preflight's
+    context-file check knows four names, so a mistyped vendored tree or a
+    fifth agent-file spelling passes every gate and the confound is permanent
+    in an append-only log. `--ignore-unmatch` is deliberately absent."""
+    task = load_task(_write_task(
+        tmp_path / "set", upstream, extra_yaml='strip_paths: [".cluade"]',
+    ))
+
+    with pytest.raises(TaskError, match=r"strip_paths.*\.cluade"):
+        materialize(task, tmp_path / "run" / "repo", tmp_path / "cache")
+
+
+def test_an_untracked_path_is_not_something_a_strip_can_remove(
+    tmp_path, upstream
+):
+    """The existence check asks git about TRACKED content, because only
+    tracked content is in the tree `start_sha` names. It also reads
+    `ls-files`'s OUTPUT rather than its exit code: measured,
+    `git ls-files -z -- nope` exits 0 with empty stdout, which is the silent
+    zero `container._checked_exec` exists to refuse.
+
+    The same rule is why `strip_paths` cannot name a file the PR CREATES,
+    even when `allow_extra_paths` also names it."""
+    (upstream["path"] / "scratch.txt").write_text("untracked\n")
+    task = load_task(_write_task(
+        tmp_path / "set", upstream, extra_yaml='strip_paths: ["scratch.txt"]',
+    ))
+
+    with pytest.raises(TaskError, match=r"strip_paths.*scratch\.txt"):
+        materialize(task, tmp_path / "run" / "repo", tmp_path / "cache")
+
+
+def test_a_stripped_extra_path_is_gone_from_the_start_state(tmp_path, upstream):
+    """The other half of Task 2's `..._loads`: the exclusion and the strip are
+    enforced in two different places, and only a materialization shows they
+    agree -- `allow_extra_paths` keeps the file out of both halves, the strip
+    removes it, and nothing tries to apply a patch onto a path that is gone.
+
+    It also demonstrates the constraint task authors have to know about: the
+    strip needs the path to be TRACKED at base_sha, so this combination works
+    for a changelog the PR edits and not for one it creates."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream,
+        extra_yaml=(
+            '  allow_extra_paths: ["CHANGES.md"]\n'
+            'strip_paths: ["CHANGES.md"]'
+        ),
+    )
+    (task_dir / "reference.diff").write_text(
+        upstream["reference"] + CHANGELOG_CHUNK
+    )
+    task = load_task(task_dir)
+    repo = tmp_path / "run" / "repo"
+
+    materialize(task, repo, tmp_path / "cache")
+
+    assert not (repo / "CHANGES.md").exists()
+
+
+def test_the_strip_runs_before_the_gitignore_is_written(tmp_path, upstream):
+    """Order: strip, then the test half, then `gitignore_extra`, then one
+    commit. A stripped path the TEST half re-creates cannot occur -- the
+    loader refuses that overlap -- so `.gitignore` is the only path a later
+    step can legitimately re-create under a strip prefix, and strip-first is
+    what makes that deterministic. Reversed, the strip would delete the file
+    the manifest just asked for."""
+    task = load_task(_write_task(
+        tmp_path / "set", upstream,
+        extra_yaml='strip_paths: [".gitignore"]\ngitignore_extra: ["*.log"]',
+    ))
+    repo = tmp_path / "run" / "repo"
+
+    materialize(task, repo, tmp_path / "cache")
+
+    text = (repo / ".gitignore").read_text()
+    assert "*.log" in text
+    assert "__pycache__/" not in text, "upstream's .gitignore was stripped"
 
 
 # --- the run tree does not contain the answer --------------------------------
