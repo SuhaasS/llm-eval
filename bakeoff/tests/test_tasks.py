@@ -20,6 +20,7 @@ import pytest
 
 from bakeoff import tasks
 from bakeoff.tasks import (
+    TaskBudget,
     TaskError,
     TaskGrading,
     diff_chunks,
@@ -155,6 +156,111 @@ def _write_task(root: Path, upstream, name="t-001", **overrides) -> Path:
     (task_dir / "task.yaml").write_text(_manifest(**fields))
     (task_dir / "reference.diff").write_text(upstream["reference"])
     return task_dir
+
+
+def _budget_task(tmp_path, upstream, body: str) -> Path:
+    """A manifest whose `budget:` block is the literal YAML in `body`.
+
+    `extra_yaml` is appended verbatim, which is what lets these tests state
+    the malformed shapes a keyword-per-key helper could not express -- the
+    same reason the `grading:` tests use it.
+    """
+    return _write_task(tmp_path / "set", upstream,
+                       extra_yaml="budget:\n" + body)
+
+
+def test_the_suite_timeout_defaults_to_the_constant_it_replaces(
+    tmp_path, upstream
+):
+    """600 was `preflight(timeout_s=600)`, `ensure_oracle(timeout_s=600)` and
+    `grader.GRADE_TIMEOUT_S`, three copies of one number. A manifest that does
+    not mention the key must gate and grade exactly as it did before, so the
+    default is that number and not a rounder one."""
+    task = load_task(_write_task(tmp_path / "set", upstream))
+    assert task.budget.suite_timeout_s == 600
+
+
+def test_a_declared_suite_timeout_is_read(tmp_path, upstream):
+    task = load_task(_budget_task(tmp_path, upstream, (
+        "  max_turns: 40\n"
+        "  wall_clock_timeout_s: 3600\n"
+        "  suite_timeout_s: 1800\n"
+    )))
+    assert task.budget.suite_timeout_s == 1800
+
+
+@pytest.mark.parametrize("yaml_value", ['"600"', "600.0", "null", "0", "-1"])
+def test_a_suite_timeout_that_is_not_a_positive_int_is_a_load_error(
+    tmp_path, upstream, yaml_value
+):
+    """`int("600")` and `int(600.0)` both SUCCEED, so the bare `int(...)` the
+    other two budget keys use accepts a quoted or floated value silently and
+    the manifest stops being a faithful record. An explicit `null` is refused
+    rather than defaulted: the author WROTE the key, so reading it as "never
+    written" is the wrong repair -- which is why `_positive_int` takes an
+    `_ABSENT` sentinel and not a `None` default.
+
+    Parametrized over YAML SOURCE. `'"600"'` reaches the file with its quotes;
+    written as a Python `"600"` it would render unquoted, parse as the int
+    600, and this case would silently stop testing anything."""
+    with pytest.raises(TaskError, match="budget.suite_timeout_s"):
+        load_task(_budget_task(
+            tmp_path, upstream, f"  suite_timeout_s: {yaml_value}\n"))
+
+
+def test_a_boolean_suite_timeout_is_refused_rather_than_read_as_one_second(
+    tmp_path, upstream
+):
+    """Its own test, because the failure mode differs from every value above:
+    those are visibly wrong, and this one is ACCEPTED. `bool` IS an `int` in
+    Python, so `int(True)` is 1 and `suite_timeout_s: true` kills every gated
+    and graded command after one second -- a NO-GO at the gate and, past it,
+    `timed_out` stamped on every arm -- for a YAML typo. `isinstance(value,
+    bool)` must be tested BEFORE `isinstance(value, int)`; folded into it the
+    bool branch is dead code a mutation cannot catch."""
+    with pytest.raises(TaskError, match="budget.suite_timeout_s"):
+        load_task(_budget_task(tmp_path, upstream, "  suite_timeout_s: true\n"))
+
+
+def test_a_suite_timeout_over_the_agents_wall_clock_is_refused_with_the_sum(
+    tmp_path, upstream
+):
+    """The agent re-runs this suite INSIDE `wall_clock_timeout_s` and there is
+    no per-command bound in its container, so a suite the author says may need
+    longer than the agent's whole run is a task no arm can verify even once --
+    the run is SIGTERMed mid-suite and the diff is unchecked. Spec section 3.3
+    measures a loop that ends in "runs tests, sees failures, self-corrects";
+    this is that loop truncated, and it is settled by arithmetic over two
+    manifest numbers, so it is a LOAD error rather than a preflight one.
+
+    The message must carry both numbers: an author told only "too large" has
+    to guess which of the two to move."""
+    with pytest.raises(TaskError) as exc:
+        load_task(_budget_task(tmp_path, upstream, (
+            "  wall_clock_timeout_s: 900\n"
+            "  suite_timeout_s: 1800\n"
+        )))
+    message = str(exc.value)
+    assert "1800" in message and "900" in message
+    assert "wall_clock_timeout_s" in message
+
+
+def test_a_suite_timeout_equal_to_the_wall_clock_loads(tmp_path, upstream):
+    """Strictly `>`, not `>=`. Equality leaves the agent exactly one suite run
+    and no editing time, which is degenerate -- but "degenerate" is a judgement
+    about how much slack an agent needs, and this rule asserts only what
+    arithmetic settles. Pinned so a later tightening is a deliberate change
+    rather than an unnoticed one."""
+    task = load_task(_budget_task(tmp_path, upstream, (
+        "  wall_clock_timeout_s: 900\n"
+        "  suite_timeout_s: 900\n"
+    )))
+    assert task.budget.suite_timeout_s == 900
+
+
+def test_the_default_budget_pair_is_self_consistent():
+    """The defaults must not be a pair the loader would refuse: 600 <= 900."""
+    assert TaskBudget().suite_timeout_s <= TaskBudget().wall_clock_timeout_s
 
 
 # --- the split ---------------------------------------------------------------

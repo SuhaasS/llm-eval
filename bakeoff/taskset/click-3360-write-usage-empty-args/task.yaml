@@ -232,6 +232,23 @@ budget:
   # pilot's slowest-converging model, not from the incumbent.
   max_turns: 40
   wall_clock_timeout_s: 900
+  # suite_timeout_s: NOT USED by this task -- click's suite runs in 1.4 s, so
+  # the 600 s default is 400x the headroom it needs. Shown because this
+  # manifest is the documentation for the key.
+  #
+  # It is the coreutils `timeout` bound on every command preflight, the
+  # oracle and the offline grader run inside the container: each suite
+  # invocation AND each declared grading.* argv. It does NOT bound the agent,
+  # whose own suite runs happen inside wall_clock_timeout_s.
+  #
+  #   suite_timeout_s: 1800
+  #
+  # A positive integer, and it may not exceed wall_clock_timeout_s -- the
+  # agent re-runs this suite inside that budget, so a longer one describes a
+  # task no arm could verify even once. Raising it multiplies the gate's wall
+  # cost: preflight runs the suite five times (four when tests.p2p is
+  # declared) plus once per declared grading.* argv, all before the proxy
+  # starts and inside the same one-hour SSO session the matrix needs.
 
 provenance:
   repo: pallets/click

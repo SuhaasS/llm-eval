@@ -190,6 +190,24 @@ class TaskBudget:
     # exactly what that section forbids.
     max_turns: int = 40
     wall_clock_timeout_s: int = 900
+    #: The coreutils `timeout` bound on every command preflight, the oracle
+    #: and the offline grader run INSIDE the container -- each suite
+    #: invocation and each declared `grading.*` argv alike. "Suite" is the
+    #: short name; the breadth is the point, because the gate and the grader
+    #: run the SAME commands and a second key for the grading argvs would be
+    #: a second number that can diverge between them.
+    #:
+    #: It does NOT bound the agent: the agent's own suite runs happen inside
+    #: `wall_clock_timeout_s` with no per-command bound (`claude_runner`
+    #: wraps the whole `claude -p`). That independence is why the two keys
+    #: are separate, and the `>` refusal in `load_task` is the one place
+    #: they are compared.
+    #:
+    #: 600 is the constant this replaced, in three copies: `preflight(
+    #: timeout_s=600)`, `ensure_oracle(timeout_s=600)` and
+    #: `grader.GRADE_TIMEOUT_S`. A manifest that does not declare the key
+    #: therefore gates and grades byte-identically to before.
+    suite_timeout_s: int = 600
 
 
 @dataclass(frozen=True)
@@ -729,6 +747,12 @@ def _refuse_stripped_halves(
 # --- loading -----------------------------------------------------------------
 
 
+#: "the key is not in the manifest", which is not the same as `null`. A `None`
+#: default would collapse the two, and `key: null` is a key the author WROTE
+#: -- reading it as "never written" is the wrong repair.
+_ABSENT = object()
+
+
 def _require(data: dict, key: str, kind: type, where: str) -> Any:
     if key not in data:
         raise TaskError(f"{where}: missing required key {key!r}")
@@ -746,6 +770,36 @@ def _strs(value: Any, where: str) -> tuple[str, ...]:
     if not isinstance(value, list) or any(not isinstance(v, str) for v in value):
         raise TaskError(f"{where}: expected a list of strings, got {value!r}")
     return tuple(value)
+
+
+def _positive_int(value: Any, where: str, default: int) -> int:
+    """A budget number, or a `TaskError` that names the key.
+
+    Three things a bare `int(...)` gets wrong, and the third is the reason
+    this exists at all:
+
+    * `int("forty")` raises a bare `ValueError` out of `load_task`, with no
+      manifest path in the traceback -- which is how `max_turns` and
+      `wall_clock_timeout_s` behave today.
+    * `int("600")` and `int(600.0)` SUCCEED, so a quoted or floated value is
+      accepted silently and the manifest stops being a faithful record.
+    * `bool` IS an `int` in Python: `int(True)` is 1. `suite_timeout_s: true`
+      would kill every gated and graded command after one second, which reads
+      as a task whose tests hang -- a NO-GO at the gate and `timed_out`
+      stamped on every arm past it -- for a YAML typo. So the bool test comes
+      FIRST; folded into the int test it is dead code a mutation cannot catch.
+
+    `_ABSENT` rather than `None` for "not declared", so an explicit `key: null`
+    falls through to the refusal. Applied to `suite_timeout_s` only:
+    `max_turns` and `wall_clock_timeout_s` keep their bare `int(...)` because
+    tightening them could refuse a manifest that loads today, which belongs in
+    its own change (`TASKS.md`).
+    """
+    if value is _ABSENT:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise TaskError(f"{where}: must be a positive integer, got {value!r}")
+    return value
 
 
 def task_set_commit(root: Path) -> str:
@@ -918,6 +972,41 @@ def load_task(task_dir: Path, set_commit: str = "") -> TaskManifest:
         )
     _refuse_stripped_halves(test_files, solution_files, strip_paths, where)
 
+    budget = TaskBudget(
+        max_turns=int(budget_raw.get("max_turns", TaskBudget.max_turns)),
+        wall_clock_timeout_s=int(
+            budget_raw.get("wall_clock_timeout_s", TaskBudget.wall_clock_timeout_s)
+        ),
+        suite_timeout_s=_positive_int(
+            budget_raw.get("suite_timeout_s", _ABSENT),
+            f"{where}:budget.suite_timeout_s",
+            TaskBudget.suite_timeout_s,
+        ),
+    )
+    # The agent re-runs this suite INSIDE its wall clock and nothing bounds it
+    # per command there, so a suite the author says may need longer than the
+    # agent's whole run is a task no arm can verify even once: section 3.3
+    # measures a loop that ends in "runs tests, sees failures, self-corrects",
+    # and this is that loop truncated by a SIGTERM mid-suite, with a diff
+    # nobody checked. Settled by arithmetic over two manifest numbers, so it
+    # is refused HERE rather than in preflight -- an image build is a high
+    # price for a contradiction visible in the YAML. Strictly `>`: equality is
+    # degenerate but is a judgement about slack, not something arithmetic
+    # settles.
+    if budget.suite_timeout_s > budget.wall_clock_timeout_s:
+        raise TaskError(
+            f"{where}: budget.suite_timeout_s ({budget.suite_timeout_s}) "
+            "exceeds budget.wall_clock_timeout_s "
+            f"({budget.wall_clock_timeout_s}) by "
+            f"{budget.suite_timeout_s - budget.wall_clock_timeout_s}s. The "
+            "agent re-runs this suite inside its wall clock, so it could not "
+            "verify its own work even once -- the run would be terminated "
+            "mid-suite with an unchecked diff, and that is indistinguishable "
+            "from a model that simply ran out of time. Raise "
+            "wall_clock_timeout_s, or lower suite_timeout_s to what the suite "
+            "actually needs."
+        )
+
     return TaskManifest(
         task_id=task_id,
         task_version=task_version,
@@ -943,12 +1032,7 @@ def load_task(task_dir: Path, set_commit: str = "") -> TaskManifest:
             ),
             lint=_strs(grading_raw.get("lint"), f"{where}:grading.lint"),
         ),
-        budget=TaskBudget(
-            max_turns=int(budget_raw.get("max_turns", TaskBudget.max_turns)),
-            wall_clock_timeout_s=int(
-                budget_raw.get("wall_clock_timeout_s", TaskBudget.wall_clock_timeout_s)
-            ),
-        ),
+        budget=budget,
         reference_diff=reference,
         test_diff=test_diff,
         solution_diff=solution_diff,
