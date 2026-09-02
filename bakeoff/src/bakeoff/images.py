@@ -4,7 +4,10 @@ Two layers, and the split is what keeps arms comparable:
 
   the BASE image (docker/eval-agent.Dockerfile) carries everything that must
   be identical for every task and every arm -- the pinned Claude Code, git,
-  ripgrep, the non-root user, the mount points, the cleared entrypoint.
+  ripgrep, the non-root user, the mount points, the cleared entrypoint. It is
+  built once per PYTHON VERSION, selected by a manifest's `image.python`, so
+  one Dockerfile covers every allowed interpreter; every arm of a given task
+  still runs the same one, which is what section 5.4 holds identical.
 
   the TASK image adds that task's dependencies, and nothing else.
 
@@ -35,10 +38,35 @@ check exists rather than being assumed.
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Iterable
 from pathlib import Path
 
-BASE_TAG = "bakeoff-eval-agent:base"
 PROXY_TAG = "bakeoff-litellm-proxy:matrix"
+
+#: Restated rather than imported: `build_task_image` already imports `tasks`
+#: locally rather than at module scope, and a module-scope import here would
+#: undo that. Pinned equal to `tasks._DEFAULT_PYTHON` AND to the Dockerfile's
+#: `ARG BASE_PYTHON_VERSION` default by
+#: tests/test_images.py::test_every_copy_of_the_default_version_says_the_same_thing
+#: -- three copies that can drift is a manifest declaring nothing loading as a
+#: task whose base nobody built.
+_DEFAULT_PYTHON = "3.12"
+
+
+def base_tag(python_version: str) -> str:
+    """The local tag for one base image.
+
+    Per VERSION, because one tag for two interpreters means the second build
+    silently replaces the first and every task afterwards resolves that tag to
+    the wrong base. That failure builds, runs and goes green: the suite is
+    executed by an interpreter the task was not cut for, and only preflight's
+    `python --version` read-back says so.
+
+    Named for the version rather than for Python. When broadening 7 adds a
+    node base, this function and `build_base_images` are the only two places
+    that learn about a second axis.
+    """
+    return f"bakeoff-eval-agent:base-{python_version}"
 
 
 class ImageError(RuntimeError):
@@ -73,16 +101,47 @@ def image_entrypoint(tag: str) -> list[str]:
     return list(value or [])
 
 
-def build_base_image(repo_root: Path, tag: str = BASE_TAG) -> str:
-    """Build docker/eval-agent.Dockerfile and return its image ID."""
+def build_base_image(repo_root: Path, python_version: str = _DEFAULT_PYTHON) -> str:
+    """Build docker/eval-agent.Dockerfile at one Python and return its image ID.
+
+    The version reaches the build as `--build-arg BASE_PYTHON_VERSION`, which
+    is what the Dockerfile's pre-FROM ARG consumes. See the comment there for
+    why that name and not `PYTHON_VERSION`.
+
+    No allowlist check here. `tasks._python_version` is the one gate, at load
+    time with no daemon; a second copy of the set is how a value one gate
+    accepted reaches a builder governed by another. This module cannot import
+    `tasks` at module scope in any case -- `build_task_image` already imports
+    `ensure_mirror` locally to avoid the cycle.
+    """
+    tag = base_tag(python_version)
     _run(
         [
             "docker", "build", "-q",
+            "--build-arg", f"BASE_PYTHON_VERSION={python_version}",
             "-f", str(Path(repo_root) / "docker" / "eval-agent.Dockerfile"),
             "-t", tag, str(repo_root),
         ]
     )
     return image_id(tag)
+
+
+def build_base_images(repo_root: Path,
+                      versions: Iterable[str]) -> dict[str, str]:
+    """Every base a task set needs, built once each, keyed by version.
+
+    Callers pass one entry per TASK; this deduplicates. Building per task pays
+    a full image build for every duplicate, and on a 60-task set that turns
+    the free offline half of `--preflight-only` into something nobody waits
+    for.
+
+    Sorted, so a build log reads the same way twice and a failure names the
+    same version first.
+    """
+    return {
+        version: build_base_image(repo_root, version)
+        for version in sorted(set(versions))
+    }
 
 
 def build_proxy_image(repo_root: Path, tag: str = PROXY_TAG) -> str:

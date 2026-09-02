@@ -17,6 +17,7 @@ from __future__ import annotations
 import io
 import subprocess
 import tarfile
+from pathlib import Path
 
 import pytest
 
@@ -355,3 +356,110 @@ def test_build_task_image_passes_the_manifests_env_through(tmp_path,
                      tmp_path / "cache")
 
     assert rendered["env"] == {"CI": "1"}
+
+
+# --- the parameterised base image ---------------------------------------------
+
+
+def test_each_version_gets_its_own_tag():
+    """One tag for two interpreters means the second build silently replaces
+    the first, and every task afterwards resolves the same tag to the wrong
+    base -- which builds, runs, and is green."""
+    assert images.base_tag("3.11") == "bakeoff-eval-agent:base-3.11"
+    assert images.base_tag("3.12") != images.base_tag("3.11")
+
+
+def test_build_base_image_passes_the_version_as_a_build_arg(monkeypatch):
+    calls = []
+    monkeypatch.setattr(images, "_run", lambda args, cwd=None: calls.append(args) or "")
+    monkeypatch.setattr(images, "image_id", lambda tag: "sha256:" + tag)
+
+    images.build_base_image(Path("/repo_root"), "3.11")
+
+    argv = calls[0]
+    assert "--build-arg" in argv
+    assert argv[argv.index("--build-arg") + 1] == "BASE_PYTHON_VERSION=3.11"
+    assert "-t" in argv and argv[argv.index("-t") + 1] == \
+        "bakeoff-eval-agent:base-3.11"
+
+
+def test_the_arg_is_not_named_PYTHON_VERSION(monkeypatch):
+    """Measured 2026-09-01: the official python: images set their own
+    ENV PYTHON_VERSION (3.11.16, 3.12.13, 3.13.15) and ENV beats ARG, so after
+    FROM the expansion reads the base image's patch level -- even after the ARG
+    is redeclared. The current file never expands it after FROM, so today the
+    collision is latent; a later edit that did would read a plausible wrong
+    value. The name is the whole defence."""
+    calls = []
+    monkeypatch.setattr(images, "_run", lambda args, cwd=None: calls.append(args) or "")
+    monkeypatch.setattr(images, "image_id", lambda tag: "sha256:" + tag)
+
+    images.build_base_image(Path("/repo_root"), "3.13")
+
+    assert "PYTHON_VERSION=3.13" not in calls[0]
+
+
+def test_one_build_per_distinct_version_not_per_request(monkeypatch):
+    """The drivers call this with one entry per TASK. Building per task pays
+    an image build for every duplicate, and on a 60-task set that is the
+    difference between a preflight pass and one nobody waits for."""
+    built = []
+    monkeypatch.setattr(
+        images, "build_base_image",
+        lambda root, version: built.append(version) or ("sha256:" + version),
+    )
+
+    bases = images.build_base_images(Path("/r"), ["3.12", "3.11", "3.12", "3.12"])
+
+    assert sorted(built) == ["3.11", "3.12"]
+    assert bases == {"3.11": "sha256:3.11", "3.12": "sha256:3.12"}
+
+
+def test_every_copy_of_the_default_version_says_the_same_thing():
+    """THREE copies of "3.12" exist by the end of this broadening -- the
+    Dockerfile's ARG default, `tasks._DEFAULT_PYTHON` (which is
+    `TaskImage.python`'s default), and `images._DEFAULT_PYTHON` (restated
+    because this module cannot import `tasks` at module scope). Two that can
+    drift means a manifest declaring no `python:` loads as a task whose base
+    nobody built -- the build succeeds, the suite runs, and the interpreter is
+    not the one the default named.
+
+    `preflight` is deliberately NOT a fourth copy: it imports
+    `_DEFAULT_PYTHON` from `tasks` (Task 4)."""
+    from bakeoff.tasks import _DEFAULT_PYTHON as manifest_default
+
+    dockerfile = (
+        Path(__file__).resolve().parent.parent / "docker" / "eval-agent.Dockerfile"
+    ).read_text()
+
+    assert images._DEFAULT_PYTHON == manifest_default
+    assert f"ARG BASE_PYTHON_VERSION={manifest_default}\n" in dockerfile
+    assert "FROM python:${BASE_PYTHON_VERSION}-slim-bookworm\n" in dockerfile
+
+
+def test_every_allowlisted_version_is_a_tag_this_module_can_name():
+    from bakeoff.tasks import _PYTHON_VERSIONS
+
+    tags = {images.base_tag(v) for v in _PYTHON_VERSIONS}
+
+    assert len(tags) == len(_PYTHON_VERSIONS)
+
+
+@pytest.mark.integration
+def test_a_non_default_base_really_builds_and_carries_the_pins():
+    """The claim this broadening rests on, checked against a daemon rather
+    than against a rendered string. Measured 2026-09-01: 3.11 gives Python
+    3.11.16, pytest 9.1.1, claude 2.1.220, uid 1000."""
+    repo_root = Path(__file__).resolve().parent.parent
+    image = images.build_base_image(repo_root, "3.11")
+
+    probe = subprocess.run(
+        ["docker", "run", "--rm", "--entrypoint", "sh", image, "-c",
+         "python --version && pytest --version && claude --version && id -u"],
+        capture_output=True, text=True, check=True,
+    )
+
+    assert probe.stdout.startswith("Python 3.11.")
+    assert "pytest 9.1.1" in probe.stdout
+    assert "2.1.220" in probe.stdout
+    assert probe.stdout.rstrip().endswith("1000")

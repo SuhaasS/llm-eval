@@ -27,7 +27,33 @@
 # LiteLLM proxy, so anything it needs at run time must be here already --
 # `apt-get install` during a run cannot reach a mirror, by design.
 
-FROM python:3.12-slim-bookworm
+# The interpreter, per task. `image.python` in a manifest selects which of
+# these bases the drivers build and hand to `build_task_image`; every ARM of
+# a task runs the same one, so this is not a section 5.4 divergence -- what
+# that section holds identical is the environment two arms are compared in.
+#
+# NOT named PYTHON_VERSION, and the name is load-bearing. Measured 2026-09-01
+# (Docker 29.5.2, legacy builder): the official python: images set their own
+# `ENV PYTHON_VERSION` -- 3.11.16, 3.12.13, 3.13.15 -- and ENV beats ARG, so
+# after this FROM the expansion resolves to the base image's PATCH level and
+# not to the build arg, whether or not the ARG is redeclared:
+#
+#   after-FROM without redeclare: [3.11.16]
+#   after-FROM WITH redeclare:    [3.11.16]
+#
+# Nothing below expands it, so today that is latent. A later edit that wants
+# to -- a version-conditional pip line, an ENV, broadening 7's node install --
+# would read a plausible wrong value with no error. Under this name the
+# redeclaration behaves: `[3.11] vs image ENV [3.11.16]`.
+#
+# The default matches `bakeoff.tasks._DEFAULT_PYTHON` and is pinned equal by
+# tests/test_images.py. Measured: with no --build-arg this file builds to the
+# byte-identical image id it built before the ARG existed
+# (sha256:dfd2cc069bad6346465ec1ecfe0a704faac3cb0e86ddbcfbc424b60f9380915a),
+# so no stored record's container_image_digest and no cached preflight verdict
+# moves.
+ARG BASE_PYTHON_VERSION=3.12
+FROM python:${BASE_PYTHON_VERSION}-slim-bookworm
 
 # ripgrep is a Claude Code runtime dependency; git is what snapshot_diff
 # and the base_sha checkout need. `timeout` (coreutils) enforces the
