@@ -149,13 +149,17 @@ class _Deriver:
         self.quarantined = quarantined
         self.calls = 0
 
-    def __call__(self, task, image, cache_root, timeout_s):
+    def __call__(self, task, image, cache_root):
         self.calls += 1
         return self.quarantined
 
 
 def _task(task_id="click-3360", digest="abc"):
-    return SimpleNamespace(task_id=task_id, manifest_digest=digest)
+    return SimpleNamespace(
+        task_id=task_id,
+        manifest_digest=digest,
+        budget=SimpleNamespace(suite_timeout_s=600, wall_clock_timeout_s=900),
+    )
 
 
 def test_a_cold_cache_derives_once_and_stores_the_verdict(tmp_path, monkeypatch):
@@ -323,9 +327,12 @@ def _stub_derive_environment(monkeypatch, tmp_path, existing, results):
         "bakeoff.oracle.RunContainer",
         lambda image, repo_path, base_sha: _FakeContainer(existing),
     )
-    monkeypatch.setattr(
-        "bakeoff.oracle._Runner", lambda container, argv, timeout_s: runner
-    )
+
+    def _make_runner(container, argv, timeout_s):
+        runner.timeout_s = timeout_s
+        return runner
+
+    monkeypatch.setattr("bakeoff.oracle._Runner", _make_runner)
 
     def _fake_materialize(task, dest, cache_root):
         Path(dest).mkdir(parents=True)
@@ -345,6 +352,7 @@ def _derive_task(paths, p2p=()):
             paths=paths,
             runner=("python", "-m", "pytest", "-q"),
         ),
+        budget=SimpleNamespace(suite_timeout_s=600, wall_clock_timeout_s=900),
     )
 
 
@@ -356,7 +364,7 @@ def test_the_quarantine_is_derived_only_over_prefixes_that_exist(
     )
     task = _derive_task(paths=("tests/", "docs/"))
 
-    assert _derive(task, "sha256:img", tmp_path, 600) == ()
+    assert _derive(task, "sha256:img", tmp_path) == ()
     # "docs/" does not exist at the reference state. Passed raw it is a
     # positional argument pytest cannot collect -- exit 4, which `_classify`
     # refuses, so a task preflight passed on purpose becomes ungradable.
@@ -371,7 +379,7 @@ def test_an_explicit_p2p_list_derives_with_no_scope(tmp_path, monkeypatch):
     )
     task = _derive_task(paths=("tests/",), p2p=("tests/test_x.py::test_b",))
 
-    assert _derive(task, "sha256:img", tmp_path, 600) == ()
+    assert _derive(task, "sha256:img", tmp_path) == ()
     assert [c["scope"] for c in runner.calls] == [(), ()]
 
 
@@ -383,7 +391,7 @@ def test_the_derivation_tree_does_not_outlive_the_derivation(
     _stub_derive_environment(
         monkeypatch, tmp_path, existing={"tests/"}, results=[(0, ""), (0, "")]
     )
-    _derive(_derive_task(paths=("tests/",)), "sha256:img", tmp_path, 600)
+    _derive(_derive_task(paths=("tests/",)), "sha256:img", tmp_path)
     assert not (tmp_path / "oracle-tree" / "click-3360").exists()
 
 
@@ -394,8 +402,36 @@ def test_the_tree_is_removed_even_when_the_derivation_refuses(
         monkeypatch, tmp_path, existing={"tests/"}, results=[(2, "")]
     )
     with pytest.raises(OracleError):
-        _derive(_derive_task(paths=("tests/",)), "sha256:img", tmp_path, 600)
+        _derive(_derive_task(paths=("tests/",)), "sha256:img", tmp_path)
     assert not (tmp_path / "oracle-tree" / "click-3360").exists()
+
+
+def test_the_derivation_bounds_its_two_reference_runs_by_the_manifest(
+    tmp_path, monkeypatch
+):
+    """The quarantine is derived from two full suite runs at the reference
+    state. Under a bound the manifest does not ask for, a slow-but-healthy
+    suite raises OracleError ("the p2p run exited 124") and the task becomes
+    ungradable -- for a number the task author already declared."""
+    runner = _stub_derive_environment(
+        monkeypatch, tmp_path, existing={"tests/"}, results=[(0, ""), (0, "")]
+    )
+    task = _derive_task(paths=("tests/",))
+    task.budget.suite_timeout_s = 4321  # SimpleNamespace, assigns directly
+
+    _derive(task, "sha256:" + "a" * 64, tmp_path)
+
+    assert runner.timeout_s == 4321
+
+
+def test_neither_oracle_entry_point_takes_a_timeout_parameter():
+    """Same reasoning as `preflight`: the parameter is deleted rather than
+    defaulted, so `grade.py`'s `ensure_oracle(task, image, Path(cache))` call
+    cannot be left on a bound the manifest does not ask for."""
+    import inspect
+
+    assert "timeout_s" not in inspect.signature(ensure_oracle).parameters
+    assert "timeout_s" not in inspect.signature(_derive).parameters
 
 
 def test_the_quarantine_still_refuses_a_run_that_could_not_collect():

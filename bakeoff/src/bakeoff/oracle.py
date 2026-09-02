@@ -80,7 +80,14 @@ from bakeoff.tasks import materialize
 #: digest nor the image digest moves when THIS file changes, so without it a
 #: warm cache serves a quarantine derived by the old rules and a change to
 #: those rules is inert on exactly the tasks about to be graded.
-ORACLE_VERSION: str = "1"
+#:
+#: 1 -> 2: the derivation's two reference runs are bounded by
+#: `budget.suite_timeout_s` rather than by a function default. The manifest
+#: digest does not cover it -- a manifest that already carries the key loads
+#: under the older loader, which ignores unknown `budget` sub-keys -- so
+#: without this every cached quarantine would be one derived at 600 against a
+#: manifest asking for something else.
+ORACLE_VERSION: str = "2"
 
 #: preflight's pytest exit meanings plus the codes the `timeout` wrapper and
 #: the shell contribute. Non-{0,1} is refused whatever the code, but the
@@ -220,7 +227,7 @@ def derive_quarantine(runner, tests, scope: tuple[str, ...] = ()) -> tuple[str, 
     return quarantine
 
 
-def _derive(task, image: str, cache_root: Path, timeout_s: int) -> tuple[str, ...]:
+def _derive(task, image: str, cache_root: Path) -> tuple[str, ...]:
     """The Docker-touching half: a fresh tree at the reference state, twice run.
 
     Separated from `derive_quarantine` so the derivation's semantics are
@@ -268,7 +275,16 @@ def _derive(task, image: str, cache_root: Path, timeout_s: int) -> tuple[str, ..
                     + (applied.stderr or applied.stdout).strip()[:1000]
                 )
 
-            runner = _Runner(container, task.tests.runner, timeout_s)
+            # Off the manifest, and the parameter is gone rather than
+            # defaulted: `grade.py` calls `ensure_oracle(task, image,
+            # Path(cache))` with no bound, so a default here would derive the
+            # quarantine under a number the task does not ask for while
+            # preflight gated it under one that it does. A slow-but-healthy
+            # reference run then exits 124, `_classify` raises, and the task
+            # becomes ungradable -- silently, since the cache stores only the
+            # verdict.
+            runner = _Runner(container, task.tests.runner,
+                             task.budget.suite_timeout_s)
             # Filtered through preflight's own existence check rather than
             # passed raw, because that is the filter the grader's check 6
             # applies. A declared prefix absent at the post-fix state is an
@@ -290,8 +306,7 @@ def _derive(task, image: str, cache_root: Path, timeout_s: int) -> tuple[str, ..
         shutil.rmtree(tree, ignore_errors=True)
 
 
-def ensure_oracle(task, image: str, cache_root: Path,
-                  timeout_s: int = 600) -> Oracle:
+def ensure_oracle(task, image: str, cache_root: Path) -> Oracle:
     """The task's quarantine, derived once per (manifest, image, version).
 
     Deriving is two full suite runs inside a container; across 80 tasks that
@@ -330,7 +345,7 @@ def ensure_oracle(task, image: str, cache_root: Path,
 
     oracle = Oracle(
         fingerprint=fingerprint,
-        quarantined=tuple(_derive(task, image, cache_root, timeout_s)),
+        quarantined=tuple(_derive(task, image, cache_root)),
         # Explicit on this path too, so the two constructions are the same
         # statement. Leaning on the default here and naming it there makes the
         # cache-miss version look like it could differ from the cache-hit one.
