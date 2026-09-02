@@ -2217,6 +2217,13 @@ def test_image_python_defaults_to_the_base_images_version(tmp_path, upstream):
     assert load_task(task_dir).image.python == "3.12"
 
 
+def test_the_default_is_itself_an_allowlisted_version():
+    """`_python_version` returns the default BEFORE the allowlist check, so a
+    default outside the set is the one value that reaches a build ungated --
+    every manifest that declares nothing, which is all of them today."""
+    assert tasks._DEFAULT_PYTHON in tasks._PYTHON_VERSIONS
+
+
 def test_an_allowlisted_version_is_carried_verbatim(tmp_path, upstream):
     task_dir = _write_task(
         tmp_path / "set", upstream, extra_yaml='image:\n  python: "3.11"\n'

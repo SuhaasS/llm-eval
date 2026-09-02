@@ -63,7 +63,7 @@ import pytest
 from bakeoff import oracle as oracle_module
 from bakeoff.grade_schema import GradeFailure, NotGradedReason
 from bakeoff.grader import GRADER_VERSION, grade_run
-from bakeoff.images import build_base_image, build_task_image, image_entrypoint
+from bakeoff.images import build_base_images, build_task_image, image_entrypoint
 from bakeoff.oracle import ensure_oracle
 from bakeoff.preflight import EXIT_TESTS_FAILED
 from bakeoff.schema import (
@@ -145,7 +145,11 @@ def click_image(click_task, grader_cache) -> str:
     an inherited ENTRYPOINT makes `RunContainer`'s `sleep infinity` an argument
     to it and the container exits immediately.
     """
-    base = build_base_image(REPO_ROOT)
+    # Keyed by version exactly as the drivers do it: the base a task gets is
+    # the one its manifest names, never a default that happens to match.
+    base = build_base_images(REPO_ROOT, [click_task.image.python])[
+        click_task.image.python
+    ]
     image = build_task_image(click_task, base, grader_cache / "build",
                              grader_cache)
     assert image.startswith("sha256:"), (
@@ -622,7 +626,8 @@ def test_a_task_images_env_reaches_both_the_gates_exec_and_the_agents(
         task_id=click_task.task_id + "-envprobe",
         image=dataclasses.replace(click_task.image, env=declared),
     )
-    image = build_task_image(task, build_base_image(REPO_ROOT), grader_cache / "build",
+    base = build_base_images(REPO_ROOT, [task.image.python])[task.image.python]
+    image = build_task_image(task, base, grader_cache / "build",
                              grader_cache)
 
     agent_env = container_env(ClaudeCodeConfig(

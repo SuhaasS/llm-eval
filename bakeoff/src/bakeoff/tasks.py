@@ -165,6 +165,13 @@ _GRADING_KEYS = tuple(f.name for f in dataclass_fields(TaskGrading))
 #: `tests/test_images.py::test_the_dockerfile_default_matches_the_manifest_default`
 #: -- two defaults that can drift means a manifest declaring nothing loads as a
 #: task whose base was never built.
+#:
+#: It must also be a member of `_PYTHON_VERSIONS` below, and that is the one
+#: relationship neither constant's own checks cover: `_python_version` returns
+#: this value BEFORE the allowlist check, so a default outside the set is the
+#: single value that reaches a build ungated -- and it reaches it from every
+#: manifest that declares nothing, which is all of them today. Pinned by
+#: `tests/test_tasks.py::test_the_default_is_itself_an_allowlisted_version`.
 _DEFAULT_PYTHON = "3.12"
 
 
@@ -529,6 +536,11 @@ _IMAGE_ENV_ALLOWED = frozenset({"CI", "HYPOTHESIS_STORAGE_DIRECTORY"})
 #: `python:3.14-slim-bookworm` exists and is deliberately absent -- nobody has
 #: built the eval image on it, and an unmeasured entry is this constant
 #: claiming something it does not know.
+#:
+#: `_DEFAULT_PYTHON` above must stay a member of this set. Removing a version
+#: that happens to be the default leaves every manifest that declares nothing
+#: pointing at a base nobody builds, and no refusal fires -- the default is
+#: returned before this set is consulted.
 _PYTHON_VERSIONS = frozenset({"3.11", "3.12", "3.13"})
 
 

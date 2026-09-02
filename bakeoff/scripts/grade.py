@@ -103,7 +103,7 @@ from bakeoff.grader import (  # noqa: E402
     not_graded_gate,
 )
 from bakeoff.images import (  # noqa: E402
-    build_base_image,
+    build_base_images,
     build_task_image,
     image_entrypoint,
 )
@@ -320,18 +320,29 @@ def resolve_task(task, cache: Path, base_image: str,
 
 
 def task_resolver(cache: Path, force_preflight: bool = False) -> Callable:
-    """`resolve_env` for the real thing: the base image, built once.
+    """`resolve_env` for the real thing: one base image per Python version.
 
     A closure rather than a parameter, so `grade_event_log`'s seam is the
     one-argument `(task) -> TaskSetup` every test can fake, and so the base
-    image is not built at all by a batch whose records are all gated.
+    image is not built at all by a batch whose records are all gated. The
+    cache is keyed by `task.image.python`: one build per distinct version, and
+    still lazy, so that property survives the broadening.
+
+    This driver deliberately does NOT call `run_matrix.assert_one_agent`. It
+    is offline and per record, it reads the preflight cache `run_matrix`
+    already wrote, and the invocation that spent the money is where a
+    cross-task claim about the agent has to hold -- refusing here would refuse
+    to grade a collection that is already paid for. `resolve_task`'s own
+    `base_image` parameter is unchanged: it takes one image, and the caller
+    decides which.
     """
     built: dict[str, str] = {}
 
     def resolve(task) -> TaskSetup:
-        if "base" not in built:
-            built["base"] = build_base_image(REPO)
-        return resolve_task(task, cache, built["base"], force_preflight)
+        version = task.image.python
+        if version not in built:
+            built.update(build_base_images(REPO, [version]))
+        return resolve_task(task, cache, built[version], force_preflight)
 
     return resolve
 

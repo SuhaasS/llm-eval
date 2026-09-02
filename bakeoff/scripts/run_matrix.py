@@ -41,7 +41,8 @@ sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO))
 
 from bakeoff.images import (  # noqa: E402
-    build_base_image,
+    ImageError,
+    build_base_images,
     build_proxy_image,
     build_task_image,
     image_entrypoint,
@@ -98,12 +99,93 @@ def base_claude_version(image: str) -> str:
     return probe.stdout.strip().split()[0] if probe.returncode == 0 else ""
 
 
-def resolve_tasks(tasks, base_image, expected_version, cache, force):
+def assert_one_agent(bases: dict[str, str]) -> str:
+    """Every base ships the same Claude Code, or nothing runs.
+
+    What this replaces. `preflight`'s `expected_claude_version` refusal says
+    "two tasks would run different agents and the comparison across them is
+    not one". Handing each task its OWN base's version keeps the useful half
+    of that -- it still catches a task image whose `image.pip`/`image.build`
+    clobbered `claude` -- and loses exactly one thing: cross-BASE agreement.
+    Nothing downstream restores it. `Versions.claude_code` is read from the
+    transcript, per run, and no reader compares it across tasks, so two bases
+    on two agents would pass every gate and be invisible in the log.
+
+    Probing ONE base and passing that string to everyone would also restore
+    it, and is rejected: it makes one base arbitrarily canonical, and it
+    surfaces a build-level defect as a per-task preflight failure late in the
+    run rather than before the first task image is built.
+
+    EMPTY IS A REFUSAL, and it is checked before agreement.
+    `base_claude_version` returns "" when its `docker run` exits non-zero, so
+    "every base failed to answer" collapses to the single value "" -- which
+    reads as agreement, and is falsy, so preflight's
+    `elif expected_claude_version and ...` guard never fires and the
+    agent-version check is off for every task in the matrix. A gate that
+    disables another gate by returning its own failure is worse than no gate.
+
+    In practice they always agree: one `ARG CLAUDE_CODE_VERSION` in one file.
+    That is exactly why an unchecked divergence would be assumed away.
+    """
+    seen = {version: base_claude_version(image)
+            for version, image in sorted(bases.items())}
+    rendered = ", ".join(
+        f"python {v} -> {c or '<no answer>'}" for v, c in seen.items()
+    )
+    blank = sorted(v for v, c in seen.items() if not c)
+    if blank:
+        raise ImageError(
+            f"`claude --version` answered nothing in the base image(s) for "
+            f"python {', '.join(blank)}: {rendered}. An empty version is not "
+            "agreement -- it is falsy, so preflight's expected_claude_version "
+            "check would be silently disabled for every task in this matrix. "
+            "Rebuild the bases."
+        )
+    distinct = set(seen.values())
+    if len(distinct) > 1:
+        raise ImageError(
+            f"the base images do not all ship the same Claude Code: {rendered}. "
+            "Section 5.4 holds the agent identical across everything being "
+            "compared, and no per-task check can see this -- each task is "
+            "gated against its own base. Rebuild them all from one "
+            "docker/eval-agent.Dockerfile."
+        )
+    return distinct.pop()
+
+
+def prepare_bases(tasks) -> tuple[dict[str, str], str]:
+    """The base images this task set needs, built and checked.
+
+    Called by `main` BEFORE `resolve_tasks` and before the proxy image is
+    built, because both of the refusals below are free and offline while
+    everything after them costs an image build or a token.
+
+    The version set comes from the TASKS, never from `tasks._PYTHON_VERSIONS`:
+    building every allowed interpreter on every invocation is three image
+    builds for a task set that uses one, in the half of the run documented as
+    free.
+    """
+    versions = sorted({task.image.python for task in tasks})
+    print(f"\nbuilding {len(versions)} base image(s): "
+          f"python {', '.join(versions)} ...", flush=True)
+    bases = build_base_images(REPO, versions)
+    expected = assert_one_agent(bases)
+    for version in versions:
+        print(f"base py{version}  {bases[version][:19]}...  claude {expected}")
+    return bases, expected
+
+
+def resolve_tasks(tasks, bases, expected_version, cache, force):
     """Build each task's image, materialize its start state, and preflight.
 
     Returns (resolved, failures). `resolved` maps task_id to a dict carrying
     the image id and the start sha -- everything a run needs that is not in
     the manifest.
+
+    `bases` maps a Python version to a base image id, and the base is chosen
+    PER TASK from `task.image.python`. Handing every task the first entry
+    still builds and still runs -- under an interpreter the task was not cut
+    for, with only preflight's read-back saying so.
 
     The preflight cache is keyed by `preflight.preflight_cache_key` --
     (manifest digest, image id, start sha, PREFLIGHT_VERSION).
@@ -124,7 +206,8 @@ def resolve_tasks(tasks, base_image, expected_version, cache, force):
     failures: list[str] = []
     for task in tasks:
         print(f"\n=== {task.task_id} ===", flush=True)
-        image = build_task_image(task, base_image, cache / "build", cache)
+        image = build_task_image(task, bases[task.image.python],
+                                 cache / "build", cache)
         entrypoint = image_entrypoint(image)
         if entrypoint:
             failures.append(
@@ -317,13 +400,16 @@ def main() -> int:
     print(f"repeats   {args.repeats}   seed {args.seed}")
     print(f"event log {args.event_log}")
 
-    print("\nbuilding base image ...", flush=True)
-    base_image = build_base_image(REPO)
-    expected_version = base_claude_version(base_image)
-    print(f"base      {base_image[:19]}...  claude {expected_version}")
+    try:
+        bases, expected_version = prepare_bases(tasks)
+    except ImageError as exc:
+        # Same shape as the preflight NO-GO below: nothing was run, nothing
+        # was spent, and the operator gets the reason rather than a traceback.
+        print(f"\nBASE IMAGE NO-GO -- nothing was run and nothing was spent\n  {exc}")
+        return 1
 
     resolved, failures = resolve_tasks(
-        tasks, base_image, expected_version, CACHE, args.force_preflight
+        tasks, bases, expected_version, CACHE, args.force_preflight
     )
     if failures:
         print("\nPREFLIGHT NO-GO -- nothing was run and nothing was spent")
