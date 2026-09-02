@@ -218,6 +218,7 @@ def _task(
             f2p=f2p,
             p2p=p2p,
             allow_extra_paths=(),
+            framework="pytest",
         ),
         grading=SimpleNamespace(build=build, typecheck=typecheck, lint=lint),
         budget=SimpleNamespace(

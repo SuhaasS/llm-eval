@@ -309,6 +309,15 @@ class PytestAdapter:
         # and backwards compatibility is a constraint of this broadening.
         return None
 
+    def validate_id_set(self, node_ids, where):
+        # Also deliberately empty, and for a second reason on top of the one
+        # above: pytest selects by the WHOLE node id, path included, so
+        # `a.py::test_x` and `b.py::test_x` are unambiguous to `--deselect`
+        # and to a positional alike. The node adapters' duplicate-`fullName`
+        # refusal here would refuse a manifest that loads today, over a hazard
+        # pytest does not have.
+        return None
+
     def hypothesis_interpreter(self, runner):
         return _runner_python(tuple(runner))
 

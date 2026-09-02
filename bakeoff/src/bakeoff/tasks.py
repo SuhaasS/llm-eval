@@ -49,6 +49,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from uuid import uuid4
 
+from bakeoff.runners import for_framework
+
 MANIFEST_NAME = "task.yaml"
 REFERENCE_NAME = "reference.diff"
 
@@ -123,6 +125,15 @@ class TaskTests:
     #: the fix" needs a source-tree oracle the harness does not have; an
     #: unlisted file still lands in the solution half.
     allow_extra_paths: tuple[str, ...] = ()
+    #: Which runner adapter reads this suite. `pytest` -- the default -- keeps
+    #: every existing manifest loading unchanged. See `_FRAMEWORKS` for why
+    #: the set is closed, and `bakeoff/src/bakeoff/runners/` for what an
+    #: adapter is and which pytest-specific judgement each method replaces.
+    #:
+    #: Last in the field order rather than beside `runner`, which is where it
+    #: reads best, because a frozen dataclass needs every field after the
+    #: first defaulted one to carry a default and `f2p` does not.
+    framework: str = "pytest"
 
 
 @dataclass(frozen=True)
@@ -174,6 +185,15 @@ _GRADING_KEYS = tuple(f.name for f in dataclass_fields(TaskGrading))
 #: `tests/test_tasks.py::test_the_default_is_itself_an_allowlisted_version`.
 _DEFAULT_PYTHON = "3.12"
 
+#: `TaskImage.node`'s default, and the node base Dockerfile's own
+#: `ARG BASE_NODE_VERSION` default. Same pair, and the same failure, as
+#: `_DEFAULT_PYTHON` one line up: two defaults that can drift means a manifest
+#: declaring nothing loads as a task whose base was never built. It must also
+#: be a member of `_NODE_VERSIONS`, for the reason stated there -- `_node_version`
+#: returns this value BEFORE the allowlist check, so the default is the one
+#: value that can reach a build ungated.
+_DEFAULT_NODE = "22"
+
 
 @dataclass(frozen=True)
 class TaskImage:
@@ -205,6 +225,17 @@ class TaskImage:
     #: a mismatch, because the tag is mutable and local and a stale one leaves
     #: every unit test green while the suite runs under the wrong interpreter.
     python: str = _DEFAULT_PYTHON
+    #: The node base image's major, for a `vitest` or `jest` task. Mirrors
+    #: `python` above key for key -- validated against a closed set, quoted or
+    #: refused, read back out of the finished container by preflight.
+    #:
+    #: DECLARING IT ON A PYTEST TASK IS A LOAD ERROR, and so is declaring
+    #: `python` on a node task. The runtime is derived from
+    #: `tests.framework` (see `task_runtime`); two keys that each imply one is
+    #: two sources for one fact, and the failure of a disagreement between
+    #: them is a task gated in one interpreter and run in another -- silently,
+    #: because both halves build and both halves run.
+    node: str = _DEFAULT_NODE
 
 
 #: The keys `image:` accepts, derived from the dataclass for the same reason
@@ -548,6 +579,48 @@ _REPO_MOUNT = "/repo"
 #:          the only lever that keeps all of it out.
 _IMAGE_ENV_ALLOWED = frozenset({"CI", "HYPOTHESIS_STORAGE_DIRECTORY"})
 
+#: The test frameworks this harness can classify. Closed, and it must equal
+#: `bakeoff.runners.FRAMEWORKS` -- pinned from both files, because a reader of
+#: either constant has to be told it is half of a pair. `for_framework` raises
+#: KeyError rather than defaulting, and this allowlist is the only thing that
+#: keeps that raise unreachable; a default in either place classifies a jest
+#: run with pytest's exit codes, which means exit 1 for a BROKEN CONFIG read as
+#: a test failure and stamped on the model, permanently, in an append-only
+#: store.
+#:
+#: Measured 2026-09-01 in node:22-bookworm-slim, vitest 3.2.7 and jest 30.5.0:
+#: both exit 1 for a failing test, an unresolvable import, a syntax error, a
+#: nonexistent file argument AND a broken config, and BOTH exit 0 when a `-t`
+#: pattern matches nothing. That is why each entry needs an adapter that reads
+#: a JSON report rather than a row in a table of exit codes.
+_FRAMEWORKS = frozenset({"pytest", "vitest", "jest"})
+
+#: The frameworks that need the node base image. Derived from the framework
+#: rather than declared, so there is one source for the runtime.
+_NODE_FRAMEWORKS = frozenset({"vitest", "jest"})
+
+
+def _framework(value: Any, where: str) -> str:
+    """`tests.framework`, validated. `"pytest"` when absent.
+
+    Absent means pytest and not "unknown", because every manifest that exists
+    predates the key -- backwards compatibility is a constraint of this
+    broadening, not a hope.
+    """
+    if value is None:
+        return "pytest"
+    if not isinstance(value, str) or value not in _FRAMEWORKS:
+        raise TaskError(
+            f"{where}: {value!r} is not a test framework this harness can "
+            f"classify. Allowed: {sorted(_FRAMEWORKS)}. The gate tells 'the "
+            "bug is present' from 'the environment is broken' by reading what "
+            "the runner reported, and each framework reports it differently -- "
+            "pytest through its exit code, vitest and jest through a JSON "
+            "report, because both of those exit 1 for a test failure and for a "
+            "broken config alike"
+        )
+    return value
+
 #: Python versions the base Dockerfile is KNOWN to build, because someone
 #: built it. A closed set rather than a free string, for two reasons that are
 #: each silent without it:
@@ -616,6 +689,75 @@ def _python_version(value: Any, where: str) -> str:
             "to taskset/HARVESTING.md"
         )
     return value
+
+
+#: Node majors the node base Dockerfile is KNOWN to build, because someone
+#: built it. The same closed-set argument `_PYTHON_VERSIONS` makes, both halves
+#: of it: `node:22-bookworm-slim` is republished, so an unpinned entry means
+#: two collections months apart run different runtimes under one manifest with
+#: nothing in the record saying so; and an unbuildable string fails at the FROM
+#: with a registry error, over the network, mid-build.
+#:
+#: Verified 2026-09-01: node v22.23.2, npm 10.9.8, vitest 3.2.7, jest 30.5.0,
+#: Claude Code 2.1.220, uid 1000 (after `userdel -r node` -- the base image
+#: ships a `node` user at that uid and `useradd --uid 1000` exits 4 without
+#: it).
+#:
+#: TO ADD A VERSION, all three steps: build docker/eval-agent-node.Dockerfile
+#: with `--build-arg BASE_NODE_VERSION=<v>` and confirm the claude and runner
+#: pin assertions fire; add the string here with the date; add the row to
+#: taskset/HARVESTING.md. `20` and `24` exist as tags and are deliberately
+#: absent -- an unmeasured entry is this constant claiming what it does not
+#: know.
+#:
+#: `_DEFAULT_NODE` must stay a member of this set, for the reason stated
+#: beside it: `_node_version` returns the default BEFORE this check.
+_NODE_VERSIONS = frozenset({"22"})
+
+
+def _node_version(value: Any, where: str) -> str:
+    """`image.node`, validated. The default when absent.
+
+    A `str` is REQUIRED, never coerced, for `_python_version`'s reason and not
+    for a weaker one. `str(22)` happens to be right today; the refusal is here
+    because the next version to be added is `22.1`, and YAML reads a bare
+    `22.10` as the float `22.1` -- a value that is a property of the parser
+    rather than of the manifest.
+    """
+    if value is None:
+        return _DEFAULT_NODE
+    if not isinstance(value, str):
+        raise TaskError(
+            f"{where}: {value!r} is {type(value).__name__}, not a string -- "
+            'quote it (`node: "22"`). YAML reads an unquoted 22.10 as the '
+            "float 22.1, so the version that reaches the build is not the one "
+            "the manifest names"
+        )
+    if value not in _NODE_VERSIONS:
+        raise TaskError(
+            f"{where}: {value!r} is not a Node version this base image is "
+            f"known to build. Allowed: {sorted(_NODE_VERSIONS)}. To add one, "
+            "build docker/eval-agent-node.Dockerfile with `--build-arg "
+            "BASE_NODE_VERSION=<v>`, confirm the claude and runner pin "
+            "assertions fire, then add it to _NODE_VERSIONS and to "
+            "taskset/HARVESTING.md"
+        )
+    return value
+
+
+def task_runtime(task: TaskManifest) -> tuple[str, str]:
+    """Which base image this task needs: `("python", "3.12")` or `("node", "22")`.
+
+    Derived from `tests.framework`, never declared. Two manifest keys that can
+    each imply a runtime is two sources for one fact, and a disagreement
+    between them is a task gated in one interpreter and run in another -- the
+    silent shape, because both halves build and both halves run. `load_task`
+    therefore refuses a manifest that declares the key belonging to the other
+    runtime, which is what leaves this function total.
+    """
+    if task.tests.framework in _NODE_FRAMEWORKS:
+        return ("node", task.image.node)
+    return ("python", task.image.python)
 
 
 #: Characters that do not survive a generated `ENV KEY="value"` line. `$` is
@@ -1042,6 +1184,27 @@ def load_task(task_dir: Path, set_commit: str = "") -> TaskManifest:
         raise TaskError(
             f"{where}: {sorted(overlap)} are declared as both f2p and p2p"
         )
+    framework = _framework(tests_raw.get("framework"), f"{where}:tests.framework")
+    adapter = for_framework(framework)
+    # Cross-checked rather than derived from each other, in either direction:
+    # each key catches the other's typo. A runner read by the wrong adapter is
+    # classified by the wrong rules -- and on the node side there is no exit
+    # code that would say so, because vitest and jest exit 1 for a failing
+    # test and for a broken config alike.
+    if not any(adapter.runner_marker in part for part in runner):
+        raise TaskError(
+            f"{where}: tests.framework is {framework!r} but no element of "
+            f"tests.runner contains {adapter.runner_marker!r} "
+            f"({list(runner)!r}). Each key catches the other's typo, which is "
+            "why neither is derived from the other -- and a runner read by the "
+            "wrong adapter is classified by the wrong rules."
+        )
+    # Per-framework, and EMPTY for pytest: pytest selects by the whole node id,
+    # path included, so a shape rule added here now could refuse a manifest
+    # that loads today.
+    for node_id in (*f2p, *p2p):
+        adapter.validate_node_id(node_id, test_paths, where)
+    adapter.validate_id_set((*f2p, *p2p), where)
 
     image_raw = data.get("image") or {}
     if not isinstance(image_raw, dict):
@@ -1057,6 +1220,30 @@ def load_task(task_dir: Path, set_commit: str = "") -> TaskManifest:
         raise TaskError(
             f"{where}: unknown image key(s) {unknown}; allowed: "
             f"{list(_IMAGE_KEYS)}"
+        )
+    # The runtime is DERIVED from `tests.framework` -- see `task_runtime`. The
+    # key belonging to the other runtime is refused rather than ignored,
+    # because ignoring it is the silent half: a manifest declaring
+    # `python: "3.11"` beside `framework: vitest` would build a node base and
+    # say nothing, and the author would have no way to learn that the version
+    # they pinned was never consulted.
+    declared_node = image_raw.get("node")
+    declared_python = image_raw.get("python")
+    is_node = framework in _NODE_FRAMEWORKS
+    if is_node and declared_python is not None:
+        raise TaskError(
+            f"{where}: image.python is declared but tests.framework is "
+            f"{framework!r}, which runs on the node base image. The runtime "
+            "comes from the framework; declaring both is two sources for one "
+            "fact, and a disagreement gates the task in one interpreter and "
+            "runs it in another."
+        )
+    if not is_node and declared_node is not None:
+        raise TaskError(
+            f"{where}: image.node is declared but tests.framework is "
+            f"{framework!r}, which runs on the python base image. The runtime "
+            "comes from the framework; declaring both is two sources for one "
+            "fact."
         )
     budget_raw = data.get("budget") or {}
     if not isinstance(budget_raw, dict):
@@ -1166,14 +1353,15 @@ def load_task(task_dir: Path, set_commit: str = "") -> TaskManifest:
         prompt=prompt,
         tests=TaskTests(
             paths=test_paths, runner=runner, f2p=f2p, p2p=p2p,
-            allow_extra_paths=extra_paths,
+            allow_extra_paths=extra_paths, framework=framework,
         ),
         image=TaskImage(
             apt=_strs(image_raw.get("apt"), f"{where}:image.apt"),
             pip=_strs(image_raw.get("pip"), f"{where}:image.pip"),
             build=_strs(image_raw.get("build"), f"{where}:image.build"),
             env=_env_map(image_raw.get("env"), f"{where}:image.env"),
-            python=_python_version(image_raw.get("python"), f"{where}:image.python"),
+            python=_python_version(declared_python, f"{where}:image.python"),
+            node=_node_version(declared_node, f"{where}:image.node"),
         ),
         grading=TaskGrading(
             build=_strs(grading_raw.get("build"), f"{where}:grading.build"),

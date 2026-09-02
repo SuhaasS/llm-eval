@@ -178,6 +178,16 @@ class RunnerAdapter(Protocol):
                          where: str) -> None:
         """Raise `TaskError` if this id cannot be selected by this framework."""
 
+    def validate_id_set(self, node_ids: tuple[str, ...], where: str) -> None:
+        """Raise `TaskError` if the declared ids are unselectable TOGETHER.
+
+        Separate from `validate_node_id` because the defect is a property of
+        the SET: no id in it is wrong on its own. It is empty for pytest,
+        whose selection carries the path, and it is where the node adapters
+        refuse two ids sharing a `fullName` across files -- `-t` matches by
+        name alone and no flag pairs a name pattern with a file.
+        """
+
     def hypothesis_interpreter(self, runner: tuple[str, ...]) -> str | None:
         """The interpreter to probe for hypothesis, or `None` for no probe.
 

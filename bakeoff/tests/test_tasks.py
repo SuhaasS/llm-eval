@@ -10,6 +10,7 @@ of a matrix, after the tokens are spent.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -195,6 +196,13 @@ def _manifest(**overrides) -> str:
         "runner": '["python", "-m", "pytest", "-q"]',
         "f2p": '["tests/test_calc.py::test_new"]',
         "start_sha": "",
+        # Raw YAML appended INSIDE the `tests:` block, after `f2p`. Separate
+        # from `extra_yaml` because a `tests.` key has to be indented under a
+        # mapping this helper already opened; and because a key repeated after
+        # the default -- `runner:`, `f2p:` -- overrides it, PyYAML taking the
+        # last occurrence, which is what lets a test restate one key without a
+        # keyword for every key.
+        "tests_extra": "",
         # A raw YAML block appended verbatim, so a test can write a `grading:`
         # section -- including the malformed shapes a keyword-per-key helper
         # could not express.
@@ -218,6 +226,8 @@ def _manifest(**overrides) -> str:
         f"  runner: {data['runner']}",
         f"  f2p: {data['f2p']}",
     ]
+    if data["tests_extra"]:
+        lines.append(data["tests_extra"].rstrip("\n"))
     if data["extra_yaml"]:
         lines.append(data["extra_yaml"])
     lines.append("")
@@ -232,6 +242,35 @@ def _write_task(root: Path, upstream, name="t-001", **overrides) -> Path:
     (task_dir / "task.yaml").write_text(_manifest(**fields))
     (task_dir / "reference.diff").write_text(upstream["reference"])
     return task_dir
+
+
+def _write_node_task(root: Path, upstream, *, paths=("tests/",), f2p=None,
+                     p2p=None, extra_yaml="") -> Path:
+    """A `tests.framework: vitest` manifest over the same fixture repository.
+
+    The repository underneath is still the Python one -- nothing in these
+    tests runs a suite, and the reference diff only has to split under
+    `paths`. What is under test is the LOADER, which is where a node manifest
+    is refused or accepted.
+
+    `extra_yaml` here is the BODY of the `image:` block, not a top-level
+    block, because every image key these tests state (`node:`, `python:`)
+    lives under one mapping and writing `image:\\n` in each caller would be
+    four copies of the same line.
+    """
+    tests_extra = ["  framework: vitest"]
+    if p2p is not None:
+        tests_extra.append(f"  p2p: {json.dumps(list(p2p))}")
+    return _write_task(
+        root, upstream,
+        paths=json.dumps(list(paths)),
+        runner=json.dumps(["/node_modules/.bin/vitest", "run", "--no-cache"]),
+        f2p=json.dumps(list(
+            f2p if f2p is not None else ["tests/a.test.js::does a thing"]
+        )),
+        tests_extra="\n".join(tests_extra),
+        extra_yaml=("image:\n" + extra_yaml.rstrip("\n")) if extra_yaml else "",
+    )
 
 
 def _budget_task(tmp_path, upstream, body: str) -> Path:
@@ -2321,6 +2360,14 @@ def test_the_default_is_itself_an_allowlisted_version():
     assert tasks._DEFAULT_PYTHON in tasks._PYTHON_VERSIONS
 
 
+def test_the_node_default_is_itself_an_allowlisted_version():
+    """The same relationship one key over, and the same hole: `_node_version`
+    returns `_DEFAULT_NODE` before consulting the set, so a default outside it
+    reaches a build ungated -- from every node manifest that declares
+    nothing."""
+    assert tasks._DEFAULT_NODE in tasks._NODE_VERSIONS
+
+
 def test_an_allowlisted_version_is_carried_verbatim(tmp_path, upstream):
     task_dir = _write_task(
         tmp_path / "set", upstream, extra_yaml='image:\n  python: "3.11"\n'
@@ -2833,3 +2880,246 @@ def test_a_submodule_left_at_the_wrong_commit_is_refused(
     with pytest.raises(TaskError, match="not at its gitlink") as excinfo:
         _materialize_sub(tmp_path, up)
     assert up["pinned"] in str(excinfo.value)
+
+
+# --- tests.framework ----------------------------------------------------------
+
+
+def test_framework_defaults_to_pytest_so_every_existing_manifest_loads(
+    tmp_path, upstream
+):
+    task_dir = _write_task(tmp_path / "set", upstream)  # no framework: key
+
+    assert load_task(task_dir).tests.framework == "pytest"
+
+
+def test_the_allowlist_and_the_adapter_registry_cannot_disagree():
+    """`for_framework` raises KeyError on an unknown name rather than
+    defaulting, and this allowlist is the only thing that keeps that
+    unreachable. A default in either place would classify a jest run with
+    pytest's exit codes -- exit 1 for a config error, graded as the model's
+    failure."""
+    from bakeoff.runners import FRAMEWORKS
+    from bakeoff.tasks import _FRAMEWORKS
+
+    assert set(_FRAMEWORKS) == set(FRAMEWORKS)
+
+
+def test_an_unknown_framework_is_refused_with_the_allowlist_in_the_message(
+    tmp_path, upstream
+):
+    task_dir = _write_task(
+        tmp_path / "set", upstream, tests_extra="  framework: mocha\n"
+    )
+
+    with pytest.raises(TaskError) as excinfo:
+        load_task(task_dir)
+
+    assert "mocha" in str(excinfo.value)
+    assert "pytest" in str(excinfo.value)
+
+
+def test_a_node_framework_needs_a_node_shaped_runner(tmp_path, upstream):
+    """Not preflight's check -- this one costs no daemon. The two are not
+    redundant: this refuses a manifest, preflight refuses an IMAGE whose
+    runner is on PATH but wrong."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream,
+        tests_extra='  framework: vitest\n  runner: ["python", "-m", "pytest"]\n',
+    )
+
+    with pytest.raises(TaskError) as excinfo:
+        load_task(task_dir)
+
+    assert "vitest" in str(excinfo.value)
+
+
+# --- node id shapes -----------------------------------------------------------
+
+
+def test_a_node_f2p_id_must_carry_a_file_and_a_full_test_name(
+    tmp_path, upstream
+):
+    """`<file>::<fullName>`. The right half is what the reporter emits --
+    ancestorTitles joined by single spaces plus the title -- and what `-t`
+    matches, so no translation layer can be wrong about it."""
+    task_dir = _write_node_task(
+        tmp_path / "set", upstream, f2p=["tests/a.test.js"]
+    )
+
+    with pytest.raises(TaskError) as excinfo:
+        load_task(task_dir)
+
+    assert "::" in str(excinfo.value)
+
+
+def test_a_node_f2p_id_with_an_empty_half_is_refused(tmp_path, upstream):
+    for bad in ("::a name", "tests/a.test.js::"):
+        task_dir = _write_node_task(tmp_path / bad.replace("/", "_"), upstream,
+                                    f2p=[bad])
+        with pytest.raises(TaskError):
+            load_task(task_dir)
+
+
+def test_a_node_f2p_id_outside_tests_paths_is_refused(tmp_path, upstream):
+    """The scoped p2p run selects by path prefix, so an id whose file is
+    outside the declared scope can never be deselected from it -- and a
+    deselection that matches nothing is SILENT on node: measured, `-t` matching
+    nothing exits 0 with every test reported skipped."""
+    task_dir = _write_node_task(
+        tmp_path / "set", upstream, paths=["tests/"],
+        f2p=["other/a.test.js::does a thing"],
+    )
+
+    with pytest.raises(TaskError) as excinfo:
+        load_task(task_dir)
+
+    assert "tests/" in str(excinfo.value)
+
+
+def test_two_declared_ids_sharing_a_full_name_across_files_are_refused(
+    tmp_path, upstream
+):
+    """`-t` matches `fullName` and knows nothing about which file a test came
+    from, and there is no flag that pairs them -- the file positionals and the
+    name pattern are ANDed across the whole run. So a quarantine of
+    `a.test.js::works` also deselects `b.test.js::works`, silently, with
+    `p2p_deselected` agreeing because two tests really were skipped.
+
+    This is the half the author created and it costs no daemon. The half that
+    matters more -- a collision between a declared id and a test the manifest
+    never mentions -- is preflight's, against the real report."""
+    task_dir = _write_node_task(
+        tmp_path / "set", upstream,
+        f2p=["tests/a.test.js::works"], p2p=["tests/b.test.js::works"],
+    )
+
+    with pytest.raises(TaskError) as excinfo:
+        load_task(task_dir)
+
+    assert "works" in str(excinfo.value)
+    assert "tests/a.test.js" in str(excinfo.value)
+
+
+def test_the_same_full_name_in_the_same_file_is_not_refused(tmp_path, upstream):
+    """Two entries with the same left AND right half are a duplicate, which
+    `tests.f2p contains duplicates` already refuses. The new rule is about
+    DIFFERENT files, and a rule that also fired on the same file would be a
+    second, worse message for a case that already has one."""
+    task_dir = _write_node_task(
+        tmp_path / "set", upstream,
+        f2p=["tests/a.test.js::works"], p2p=["tests/a.test.js::other"],
+    )
+
+    assert load_task(task_dir).tests.framework == "vitest"
+
+
+def test_a_pytest_manifest_may_share_node_names_across_modules(
+    tmp_path, upstream
+):
+    """pytest selects by the WHOLE node id, path included, so `a.py::test_x`
+    and `b.py::test_x` are unambiguous there. Applying the node rule to pytest
+    would refuse a manifest that loads today, over a hazard pytest does not
+    have."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream,
+        tests_extra='  f2p: ["tests/a.py::test_x"]\n  p2p: ["tests/b.py::test_x"]\n',
+    )
+
+    assert load_task(task_dir).tests.framework == "pytest"
+
+
+def test_a_wellformed_node_manifest_loads(tmp_path, upstream):
+    task = load_task(_write_node_task(tmp_path / "set", upstream))
+
+    assert task.tests.framework == "vitest"
+    assert task.image.node == "22"
+
+
+def test_a_pytest_id_shape_is_not_newly_constrained(tmp_path, upstream):
+    """Backwards compatibility as a rule, not as a hope: adding a shape rule to
+    the pytest branch could refuse a manifest that loads today, and there is
+    exactly one."""
+    task = load_task(_write_task(tmp_path / "set", upstream))
+
+    assert task.tests.framework == "pytest"
+
+
+# --- the runtime is derived, never declared twice -----------------------------
+
+
+def test_image_node_on_a_pytest_task_is_a_load_error(tmp_path, upstream):
+    """Two keys that can each imply a runtime is two sources for one fact, and
+    the failure of a disagreement between them is a task gated in one
+    interpreter and run in another."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream, extra_yaml='image:\n  node: "22"\n'
+    )
+
+    with pytest.raises(TaskError) as excinfo:
+        load_task(task_dir)
+
+    assert "framework" in str(excinfo.value)
+
+
+def test_image_python_on_a_node_task_is_a_load_error(tmp_path, upstream):
+    task_dir = _write_node_task(
+        tmp_path / "set", upstream, extra_yaml='  python: "3.12"\n'
+    )
+
+    with pytest.raises(TaskError):
+        load_task(task_dir)
+
+
+def test_task_runtime_names_the_base_a_task_needs(tmp_path, upstream):
+    from bakeoff.tasks import task_runtime
+
+    assert task_runtime(load_task(_write_task(tmp_path / "p", upstream))) == (
+        "python", "3.12")
+    assert task_runtime(load_task(_write_node_task(tmp_path / "n", upstream))) == (
+        "node", "22")
+
+
+def test_a_node_version_nobody_built_is_refused(tmp_path, upstream):
+    task_dir = _write_node_task(tmp_path / "set", upstream,
+                                extra_yaml='  node: "18"\n')
+
+    with pytest.raises(TaskError) as excinfo:
+        load_task(task_dir)
+
+    assert "22" in str(excinfo.value)
+
+
+def test_an_unquoted_node_version_is_refused_rather_than_coerced(
+    tmp_path, upstream
+):
+    """YAML parses a bare 22 as an int. `str(22)` happens to be right; the
+    refusal is here because the NEXT version is `22.1` and a bare 22.10 parses
+    as the float 22.1, which is the silent-wrong-value shape one key over.
+
+    `"quote it"`, not `"quote"`: every TaskError opens with the manifest PATH,
+    which under pytest's tmp_path is derived from this test's own name -- and
+    this test's name contains "unquoted". Measured before `image.node` existed
+    at all, the bare substring passed against `unknown image key(s) ['node']`,
+    so the assertion would have gone on passing whatever the loader said."""
+    task_dir = _write_node_task(tmp_path / "set", upstream,
+                                extra_yaml="  node: 22\n")
+
+    with pytest.raises(TaskError) as excinfo:
+        load_task(task_dir)
+
+    assert "quote it" in str(excinfo.value)
+
+
+def test_the_click_task_still_loads_and_its_start_sha_has_not_moved(tmp_path):
+    """None of these keys takes part in the setup commit, so `start_sha`
+    cannot move. Asserted anyway, because "cannot move" is the claim rather
+    than the evidence."""
+    task = load_task(
+        Path(__file__).resolve().parent.parent
+        / "taskset" / "click-3360-write-usage-empty-args"
+    )
+
+    assert task.tests.framework == "pytest"
+    assert task.declared_start_sha == (
+        "33575cc0b75608fa5cbcb1d3ae3347b81eac437f")

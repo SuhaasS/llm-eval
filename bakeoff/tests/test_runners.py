@@ -25,10 +25,20 @@ from bakeoff.runners import (
     for_framework,
 )
 
-# TODO (broadening 7 Task 4): pin `tasks._FRAMEWORKS == FRAMEWORKS` here once
-# the manifest key and its closed allowlist exist. Until then the registry has
-# nothing to disagree with, and `for_framework` raises KeyError rather than
-# defaulting precisely so that disagreement can never be silent.
+def test_the_manifest_allowlist_and_this_registry_cannot_disagree():
+    """`tasks._FRAMEWORKS` is what a manifest's `tests.framework` is validated
+    against, and this registry is what the validated value is then looked up
+    in. `for_framework` raises KeyError rather than defaulting, so that
+    allowlist is the only thing keeping the raise unreachable -- an entry in
+    one and not the other is a KeyError out of the middle of preflight, after
+    the container is up, with no manifest path in the message.
+
+    Pinned from both files. `test_tasks.py` asserts the same equality, because
+    a reader of either file has to be told that the constant in front of them
+    is half of a pair."""
+    from bakeoff.tasks import _FRAMEWORKS
+
+    assert set(_FRAMEWORKS) == set(FRAMEWORKS)
 
 
 def test_the_three_frameworks_resolve_and_nothing_else_does():

@@ -1024,9 +1024,10 @@ def _check_f2p(state: _State, task, env) -> None:
     # jest run with pytest's exit codes -- where 1 is what a config error, an
     # import error and a failing assertion all return alike -- and stamp
     # F2P_FAILED on an environment defect, permanently, in an append-only
-    # store. `getattr` with a default because the manifest key is broadening 7
-    # Task 4's and a task object predating it must not crash the ladder.
-    adapter = for_framework(getattr(task.tests, "framework", "pytest"))
+    # store. Read straight off the field: it exists on every TaskManifest since
+    # broadening 7 Task 4, and a `getattr` default outliving its field is a
+    # silent fallback to pytest on a jest task.
+    adapter = for_framework(task.tests.framework)
     runner = _Runner(env, task.tests.runner, task.budget.suite_timeout_s,
                      adapter)
     result = runner.select(tuple(task.tests.f2p))
@@ -1147,7 +1148,7 @@ def _check_p2p(state: _State, task, env, oracle: Oracle | None) -> None:
 
     # Explicit adapter, for the reason `_check_f2p` states: a call site left on
     # the pytest default reads a jest config error as P2P_REGRESSION.
-    adapter = for_framework(getattr(task.tests, "framework", "pytest"))
+    adapter = for_framework(task.tests.framework)
     runner = _Runner(env, task.tests.runner, task.budget.suite_timeout_s,
                      adapter)
     result = runner.pass_to_pass(

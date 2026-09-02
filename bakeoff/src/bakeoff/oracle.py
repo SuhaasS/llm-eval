@@ -315,8 +315,7 @@ def _derive(task, image: str, cache_root: Path) -> tuple[str, ...]:
             # must not crash the derivation.
             runner = _Runner(container, task.tests.runner,
                              task.budget.suite_timeout_s,
-                             for_framework(
-                                 getattr(task.tests, "framework", "pytest")))
+                             for_framework(task.tests.framework))
             # Filtered through preflight's own existence check rather than
             # passed raw, because that is the filter the grader's check 6
             # applies. A declared prefix absent at the post-fix state is an

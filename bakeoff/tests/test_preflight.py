@@ -268,6 +268,7 @@ def test_a_non_pytest_runner_is_refused_rather_than_guessed_at(tmp_path):
         class tests:  # noqa: N801 - mirrors the manifest shape
             runner = ("make", "test")
             f2p = ("x",)
+            framework = "pytest"
 
         class budget:  # noqa: N801 - mirrors the manifest shape
             suite_timeout_s = 600

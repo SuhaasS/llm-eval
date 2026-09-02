@@ -387,6 +387,7 @@ def _derive_task(paths, p2p=()):
             p2p=p2p,
             paths=paths,
             runner=("python", "-m", "pytest", "-q"),
+            framework="pytest",
         ),
         budget=SimpleNamespace(suite_timeout_s=600, wall_clock_timeout_s=900),
     )

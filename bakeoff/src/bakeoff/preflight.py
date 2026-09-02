@@ -660,7 +660,7 @@ def preflight(
     # wrote it and every other key here is now framework-dependent --
     # `f2p_before_exit` most of all, since 1 means "a test failed" under
     # pytest and means nothing at all under vitest.
-    adapter = for_framework(getattr(tests, "framework", "pytest"))
+    adapter = for_framework(tests.framework)
     evidence["framework"] = adapter.name
     # NOT a parameter with a default. Both drivers call this with `task` and
     # neither passes a bound, so reading it here makes "a consumer left on the
