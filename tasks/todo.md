@@ -2655,8 +2655,8 @@ bare-module f2p entry, was unpinned.
 
 Layer 2 categorically excluded a property-based suite: "a hypothesis-driven
 suite can pass a wrong fix on a lucky draw and fail a right one on an unlucky
-seed." Four commits (`c41d20a`, `e34aeb7`, `009ac45`, `5f4caab`) replace that
-exclusion with a manifest `image.env` key — an allowlist of exactly `CI` and
+seed." Five commits (`c41d20a`, `e34aeb7`, `009ac45`, `5f4caab`, `579579e`)
+replace that exclusion with a manifest `image.env` key — an allowlist of exactly `CI` and
 `HYPOTHESIS_STORAGE_DIRECTORY` — baked into the task Dockerfile as `ENV` lines
 after every build step, so Hypothesis's determinism reaches every process in
 the container: the gate's runner, the oracle's, the grader's, the agent's own
@@ -2753,3 +2753,20 @@ new preflight assertions). `SCHEMA_VERSION` and `GRADER_VERSION` unmoved —
 nothing new reaches a record and no ladder check changes what it means.
 `click-3360`'s `start_sha` unmoved: the new key is under `image:`, which is
 not an input to `materialize`. Unit suite: 1225 passed, 50 deselected.
+
+Final-review fix wave (this section's own commit): a loader-table row for
+`image.env` and two preflight bullets for the hypothesis-without-CI NO-GO and
+the rg-could-not-answer refusal, both of which were code refusals listed only
+under Layer 2; the `PREFLIGHT_VERSION` 5 comment corrected from "two
+environment assertions" to the three that shipped; the ambiguous "hypothesis-
+import probe" wording (confusable with the `import hypothesis` probe) renamed
+to "hypothesis-import scan (rg over tests.paths)", with the never-ran test's
+substring assertion updated to match; a missing `"--"` before the scanned
+paths in the rg argv, so a `tests.paths` entry starting with `-` cannot parse
+as a flag; two new params on the non-empty-string `_env_map` refusal (`CI: 1`
+as a YAML int, `CI: ""` as an empty string), which had no coverage; and the
+click `task.yaml` refused-chars comment, which named a newline, a quote, a
+backslash and `$` but not `\r`. Verified: full unit suite; the integration leg
+including `task_image` (the env-merge test at
+`tests/test_integration_grader.py` had never run); a fresh `--preflight-only`
+GO on `click-3360-write-usage-empty-args`; and `mutation_check.py` run solo.

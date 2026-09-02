@@ -39,6 +39,7 @@ Runs before anything builds.
 | no test-half or solution-half file lies under a `strip_paths` prefix | the patch would be applied onto a path that no longer exists — and dropping the chunk instead would make `solution_diff` something other than the merged PR, or shrink the oracle, with every gate still green |
 | every `strip_paths` entry matches a file TRACKED at `base_sha` (checked in `materialize`) | a typo strips nothing and leaves the file the task was cut to remove; the preflight context-file check knows four names, so a mistyped vendored tree passes every gate. It also means a strip cannot name a file the PR *creates* |
 | `task_id` is unique in the set | `run_id` is `sha256(task|model|sample|attempt)`, so two tasks sharing an id collide in the event log — discovered at the far end of a matrix, after the tokens are spent |
+| `image.env` keys are in the allowlist (`CI`, `HYPOTHESIS_STORAGE_DIRECTORY`) and are not a key the harness itself sets; values carry none of `\n` `\r` `"` `\\` `$`; `HYPOTHESIS_STORAGE_DIRECTORY` is an absolute path outside `/repo` | an allowlist because a denylist would have to anticipate `CLAUDE_CODE_USE_BEDROCK`, which bypasses the proxy and leaves the wire log empty with the run still looking normal; a harness-owned key applying to preflight and the grader but overridden on the agent's own process — two environments for one task; a value that does not survive a generated `ENV KEY="value"` Dockerfile line; hypothesis writing into the tree the §5.6 submission diff is taken against |
 
 ### Preflight — `src/bakeoff/preflight.py`
 
@@ -64,6 +65,21 @@ Runs inside the pinned image, before the proxy starts.
   configuration and the container's environment is the observation, and this
   is the only place the two meet — a value that did not take is silent, and
   what it silently loses is determinism.
+- **A declared test path that imports `hypothesis` is a NO-GO unless the
+  manifest declares `image.env: {CI: ...}`.** Availability alone does not
+  trigger it — hypothesis is a common transitive dependency — so this is two
+  probes: `python -c "import hypothesis"` records `hypothesis_importable`, and
+  `rg` over `tests.paths` records whether the declared tests actually import
+  it. Only the second firing with no declared `CI` is refused; the remedy
+  (`image.env: {CI: "1", HYPOTHESIS_STORAGE_DIRECTORY:
+  "/tmp/bakeoff-hypothesis"}`) makes the suite reproducible, not correct — see
+  the property-based-suite bullet under Layer 2.
+- **An `rg` exit code that is neither 0 (match) nor 1 (no match) is a NO-GO
+  naming the argv and the exit code, never a silent "not imported".** rg is
+  asserted present earlier in this list, so an unreadable path or a bad
+  pattern is an environment problem preflight can see and must not read as a
+  quiet `False` — that would disarm the one check that catches an undeclared
+  property-based suite.
 - f2p is **red** at the start state, in one of two ways, and never `0` (already
   solved). Either it exits **1** with every declared f2p id in pytest's
   FAILED/ERROR lines, or it exits **4** (or **2**) because the modules holding

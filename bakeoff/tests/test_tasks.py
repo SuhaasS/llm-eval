@@ -2045,6 +2045,26 @@ def test_a_value_that_would_not_survive_a_dockerfile_line_is_refused(
         load_task(task_dir)
 
 
+@pytest.mark.parametrize("extra_yaml", [
+    "image:\n  env:\n    CI: 1\n",      # a YAML int, not a string
+    'image:\n  env:\n    CI: ""\n',     # a string, but empty
+])
+def test_a_non_string_or_empty_env_value_is_refused(
+    tmp_path, upstream, extra_yaml
+):
+    """The fourth `_env_map` refusal has no coverage elsewhere: a YAML scalar
+    that is not a string (`CI: 1` parses as an int) and a value that is a
+    string but empty (`CI: ""`) both fail `isinstance(raw_value, str) and
+    raw_value` and must be refused before the char-level checks above ever
+    run."""
+    task_dir = _write_task(tmp_path / "set", upstream, extra_yaml=extra_yaml)
+
+    with pytest.raises(TaskError) as exc:
+        load_task(task_dir)
+
+    assert "non-empty string" in str(exc.value)
+
+
 @pytest.mark.parametrize("value", ["relative/path", "/repo", "/repo/.hyp"])
 def test_a_storage_directory_inside_the_repo_is_refused(
     tmp_path, upstream, value

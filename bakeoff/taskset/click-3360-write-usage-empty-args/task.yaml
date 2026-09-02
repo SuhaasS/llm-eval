@@ -191,9 +191,9 @@ image:
   # time, so without it the `constants/` cache lands in the tree the section
   # 5.6 submission diff is taken against.
   #
-  # Values may not carry a newline, a quote, a backslash or a `$`: the last
-  # one is EXPANDED by the builder, which would make the value a property of
-  # the build rather than of the manifest.
+  # Values may not carry a newline, a carriage return, a quote, a backslash
+  # or a `$`: the last one is EXPANDED by the builder, which would make the
+  # value a property of the build rather than of the manifest.
   #
   # Declaring env does NOT move start_sha -- it is under `image:`, which is
   # not an input to the start state. It does move the image id, and therefore

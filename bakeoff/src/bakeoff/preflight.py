@@ -88,13 +88,14 @@ _FAILED_LINE = re.compile(r"^(?:FAILED|ERROR)\s+(\S+)", re.MULTILINE)
 #: cached under 3 was written by a gate that refused that task shape outright,
 #: and one cached under 4 was written by a gate whose p2p-before run carries
 #: `--ignore` on exactly those tasks.
-#: 5 adds two environment assertions: the `image.env` read-back, and the
-#: refusal of a task whose declared test paths IMPORT hypothesis while the
-#: manifest declares no CI (availability alone is not the trigger -- the
-#: package is a common transitive dependency). A verdict cached under 4 was
-#: written by a gate that looked at neither, so a task whose determinism lever
-#: silently failed to apply -- or was never declared -- would keep serving a
-#: PASS.
+#: 5 adds three refusals: the `image.env` read-back mismatch, the refusal of
+#: a task whose declared test paths IMPORT hypothesis while the manifest
+#: declares no CI (availability alone is not the trigger -- the package is a
+#: common transitive dependency), and the refusal of an rg probe that could
+#: not answer (an exit code that is neither 0 nor 1). A verdict cached under 4
+#: was written by a gate that looked at none of them, so a task whose
+#: determinism lever silently failed to apply -- or was never declared, or
+#: whose scan environment was broken -- would keep serving a PASS.
 PREFLIGHT_VERSION: str = "5"
 
 
@@ -670,8 +671,12 @@ def preflight(
         scanned = _present(container, tests.paths)
         used: bool | None = None
         if scanned:
+            # `--` before the paths: a `tests.paths` entry starting with `-`
+            # (e.g. a directory named `-tests/`) would otherwise parse as an
+            # rg flag rather than a path, turning a scan target into a
+            # silent argv change.
             probe_argv = ["rg", "-q", r"^\s*(from|import)\s+hypothesis\b",
-                          *scanned]
+                          "--", *scanned]
             probe = container.exec(probe_argv)
             # Three-valued on purpose. 0 is a match, 1 is no match, and
             # anything else (an unreadable path, a bad pattern, no rg) is
@@ -692,7 +697,8 @@ def preflight(
                 used = False
             else:
                 problems.append(
-                    "the hypothesis-import probe could not answer: `"
+                    "the hypothesis-import scan (rg over tests.paths) could "
+                    "not answer: `"
                     + " ".join(probe_argv) + f"` exited {probe.exit_code}, "
                     "not 0 (match) or 1 (no match). rg exits 2 on an "
                     "unreadable path or a bad pattern and it is asserted "

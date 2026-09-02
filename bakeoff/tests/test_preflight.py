@@ -1567,7 +1567,7 @@ def test_no_declared_test_path_exists_so_the_probe_never_ran(monkeypatch,
 
     assert result.evidence["hypothesis_imported_by_suite"] is None
     assert not any(cmd[:1] == ["rg"] for cmd in container.commands)
-    assert not any("rg" in problem or "hypothesis-import probe" in problem
+    assert not any("rg" in problem or "hypothesis-import scan" in problem
                    for problem in result.problems)
 
 
