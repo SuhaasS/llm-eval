@@ -365,17 +365,19 @@ rather than by reasoning:
   base — `"3.11"`, `"3.12"` (the default) or `"3.13"`. Every arm of a task runs
   the same base, so this is not a §5.4 divergence: what that section holds
   identical is the environment two *arms* are compared in, and a task is
-  compared against itself. Adding a fourth version is three steps and the first
+  compared against itself. Adding a fourth version is four steps and the first
   is a measurement: build `docker/eval-agent.Dockerfile` with
   `--build-arg BASE_PYTHON_VERSION=<v>` and confirm both in-image pin
   assertions fire (`pytest 9.1.1 pinned`, `claude 2.1.220 pinned`), then add the
-  string to `tasks._PYTHON_VERSIONS`, then add it here. Verified 2026-09-01:
+  string to `tasks._PYTHON_VERSIONS`, then add it here, and update
+  `docs/BUILDING-A-TASK-SET.md`'s screening note and keys-that-bite bullet.
+  Verified 2026-09-01:
   3.11 → `Python 3.11.16`, 3.12 → `3.12.13`, 3.13 → `3.13.15`, with pytest
   9.1.1 and Claude Code 2.1.220 installing on all three.
 
   **No screened repository is excluded on this ground today.** The screen at
   `docs/BUILDING-A-TASK-SET.md` §2 was run entirely in `python:3.12-slim-bookworm`
-  (recorded above), so a repository needing 3.11 or 3.13 semantics would have
+  (recorded under **Screened repositories** below), so a repository needing 3.11 or 3.13 semantics would have
   shown up as a suite failure with an unrelated-looking cause rather than as a
   version verdict — the key exists for the candidates the screen has not reached
   yet, and a re-screen at a second version is what would populate this

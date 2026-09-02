@@ -1818,7 +1818,7 @@ def test_a_declaration_that_prefixes_another_version_is_still_refused(
     result = _run_preflight(monkeypatch, tmp_path, task, container)
 
     assert not result.ok
-    assert any("3.1" in p and "3.13" in p for p in result.problems)
+    assert any("'3.1'" in p and "3.13.15" in p for p in result.problems)
 
 
 def test_a_prefix_match_would_accept_the_wrong_interpreter():
