@@ -396,3 +396,25 @@ def test_the_tree_is_removed_even_when_the_derivation_refuses(
     with pytest.raises(OracleError):
         _derive(_derive_task(paths=("tests/",)), "sha256:img", tmp_path, 600)
     assert not (tmp_path / "oracle-tree" / "click-3360").exists()
+
+
+def test_the_quarantine_still_refuses_a_run_that_could_not_collect():
+    """The oracle is deliberately UNCHANGED by broadening 2.
+
+    Both of its runs are at the POST-FIX state, where preflight has already
+    proved f2p exits 0 -- so no collection error can reach it. If one does, the
+    polarity is the worst in the codebase: a broken run reports no failed node
+    ids, so a classifier that softened here would read a suite that never
+    collected as a clean run and derive an empty quarantine from two of them.
+    """
+    from types import SimpleNamespace
+
+    from bakeoff.oracle import OracleError, _classify
+
+    with pytest.raises(OracleError) as excinfo:
+        _classify(SimpleNamespace(
+            exit_code=4, stdout="ERROR tests/a.py\n1 error in 0.01s\n",
+            stderr="",
+        ))
+
+    assert "exited 4" in str(excinfo.value)

@@ -731,6 +731,101 @@ def test_f2p_failures_are_recorded_by_node_id():
     assert result.f2p_failed_node_ids == ("tests/test_calc.py::test_add",)
 
 
+def test_an_unfixed_collection_error_is_a_named_failure_not_an_ungradable_run():
+    """Otherwise a do-nothing arm outranks a half-working one.
+
+    On a task whose f2p module does not import at the start state, an arm that
+    changed nothing leaves it not importing: pytest exits 4 and check 5 used to
+    call that ENVIRONMENT_ERROR -- `resolved: None`, not graded. An arm that
+    half-fixed the import gets exit 1 and `resolved: False`. So in any view
+    that counts False, the arm that did NOTHING looks better than the one that
+    tried. A null standing in for a negative is the defect this ladder is built
+    around, and here it was pointing the wrong way.
+
+    Containment, not equality: a submission that fixed one of two f2p modules
+    errors on a subset and is still a model failure. Anything OUTSIDE the
+    declared modules stays an environment error -- see the next test."""
+    env = FakeEnv(rules=[
+        (is_f2p, (4,
+                  "ERROR: found no collectors for /repo/tests/test_calc.py::test_add\n"
+                  "ERROR tests/test_calc.py\n1 error in 0.01s\n",
+                  "")),
+    ])
+
+    result = _ladder(env=env)
+
+    assert result.resolved is False
+    assert result.grade_failure == GradeFailure.F2P_FAILED.value
+    assert result.not_graded_reason is None
+    assert result.environment_error is None
+    # Observation, verbatim: pytest reported a MODULE, and a module is a node
+    # id -- the collector node. The absent `::` is what says so.
+    assert result.f2p_failed_node_ids == ("tests/test_calc.py",)
+
+
+def test_a_collection_error_outside_the_f2p_modules_stays_an_environment_error():
+    """A `False` is an accusation. A module erroring that no f2p id names is
+    indistinguishable from an image that lost a dependency, and stamping
+    f2p_failed on it would blame the model for the grader's environment. This
+    is also exactly what today's exit-2 route already does, so the branch above
+    is not allowed to widen it."""
+    env = FakeEnv(rules=[
+        (is_f2p, (4, "ERROR tests/test_unrelated.py\n1 error in 0.01s\n", "")),
+    ])
+
+    result = _ladder(env=env)
+
+    assert result.resolved is None
+    assert result.not_graded_reason == NotGradedReason.ENVIRONMENT_ERROR.value
+    assert result.environment_error_check == "f2p"
+    assert result.grade_failure is None
+
+
+def test_a_typoed_f2p_id_at_grade_time_is_still_an_environment_error():
+    """Same exit code, and the manifest is the thing that is wrong. `ERROR: not
+    found:` carries a colon, so nothing is reported, the predicate refuses, and
+    the grade does not accuse the model for the task author's typo."""
+    env = FakeEnv(rules=[
+        (is_f2p, (4, "ERROR: not found: /repo/tests/test_calc.py::test_add\n"
+                     "(no match in any of [<Module test_calc.py>])\n", "")),
+    ])
+
+    result = _ladder(env=env)
+
+    assert result.resolved is None
+    assert result.environment_error_check == "f2p"
+
+
+def test_check_6_still_reads_a_collection_error_as_an_environment_error():
+    """Check 6 is deliberately UNCHANGED. It is only reached when check 5
+    passed, which means every f2p module imported -- so a bare-module ERROR
+    there names something outside the task, and that is the environment. The
+    p2p argv is untouched too: no `--ignore`, no
+    `--continue-on-collection-errors`, so the graded command is still the one
+    preflight validated."""
+    env = FakeEnv(rules=[
+        (is_p2p, (2, "ERROR tests/test_other.py\n"
+                     "!!! Interrupted: 1 error during collection !!!\n", "")),
+    ])
+
+    result = _ladder(env=env)
+
+    assert result.resolved is None
+    assert result.environment_error_check == "p2p"
+    p2p_argv = next(argv for argv in env.argvs if is_p2p(argv))
+    assert not any(arg.startswith("--ignore") for arg in p2p_argv)
+    assert "--continue-on-collection-errors" not in p2p_argv
+
+
+def test_the_grader_version_moved_with_what_check_5_means():
+    """It gates resume -- a run already graded under the current grader is
+    skipped -- so a stored grade the gate skipped for agreeing with "the
+    current grader" would otherwise be one this grader disagrees with."""
+    from bakeoff.grader import GRADER_VERSION
+
+    assert GRADER_VERSION == "3"
+
+
 def test_p2p_rides_the_quarantine_and_the_scope():
     env = FakeEnv()
     oracle = _oracle(("tests/test_flaky.py::test_a",

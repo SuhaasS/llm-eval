@@ -86,11 +86,14 @@ from bakeoff.grade_schema import (
 from bakeoff.oracle import Oracle
 from bakeoff.preflight import (
     EXIT_ALL_PASSED,
+    EXIT_COLLECTION_FAILURES,
     EXIT_NOTHING_COLLECTED,
     EXIT_TESTS_FAILED,
     PREFLIGHT_VERSION,
     _existing_prefixes,
     _Runner,
+    collection_error_modules,
+    f2p_modules,
     failed_node_ids,
 )
 from bakeoff.runner import harness_commit
@@ -115,7 +118,15 @@ from bakeoff.tasks import (
 #: the version moves whether or not anything was graded under 1: a stored
 #: grade the resume gate skipped for agreeing with "the current grader" would
 #: otherwise be one this grader disagrees with.
-GRADER_VERSION: str = "2"
+#:
+#: 2 -> 3: check 5 reads a CONFINED collection error as `f2p_failed` rather
+#: than as an environment error (broadening 2). On a task whose f2p module does
+#: not import at the start state, an arm that changed nothing left it not
+#: importing and graded as NOT GRADED, while an arm that half-fixed it graded
+#: `False` -- so the do-nothing arm was invisible in every view that counts
+#: `False`. That is a change to what a check MEANS, so the version moves
+#: whether or not anything was graded under 2.
+GRADER_VERSION: str = "3"
 
 #: Wall clock for one graded command, applied by coreutils `timeout` INSIDE
 #: the container. `RunContainer.exec` blocks with no timeout of its own and
@@ -863,9 +874,37 @@ def _check_f2p(state: _State, task, env) -> None:
     if code == _TIMEOUT_EXIT:
         state.fail("f2p", GradeFailure.F2P_FAILED, result, timed_out=True,
                    detail=f"hit the {GRADE_TIMEOUT_S}s grading timeout")
-    # 2/3/4/5 and everything else: the suite did not run. That is the Phase 0c
-    # failure -- a broken environment is also a non-zero exit -- and reading it
-    # as a model failure is what a bare `!= 0` does.
+
+    # A collection error CONFINED to this task's own f2p modules. Preflight
+    # (version 4 or later) accepts a task whose f2p module does not import at
+    # the start state, and an arm that changed nothing leaves it not importing:
+    # exit 4, which the fallback below calls an environment error. That made
+    # the do-nothing arm NOT GRADED while an arm that half-fixed the import
+    # graded `False` -- so in any view counting `False` the arm that did
+    # nothing looked better than the one that tried.
+    #
+    # CONTAINMENT here, where preflight uses equality. Preflight must account
+    # for every declared id; this must never accuse for anything outside the
+    # task, and a submission that fixed one of two f2p modules errors on a
+    # subset and is still a model failure. A module outside the set is
+    # indistinguishable from an image that lost a dependency, and an empty
+    # reported set is a manifest typo (`ERROR: not found:` carries a colon) --
+    # both fall through to the environment path, unchanged.
+    if code in EXIT_COLLECTION_FAILURES:
+        modules = collection_error_modules(result.stdout + result.stderr)
+        if modules is not None and modules <= f2p_modules(tuple(task.tests.f2p)):
+            # Observation, verbatim: pytest reported MODULES, and a module is a
+            # node id -- the collector node. A reader tells them from test ids
+            # by the absent `::`, which is the same discriminator the parser
+            # uses.
+            state.f2p_failed_node_ids = tuple(sorted(modules))
+            state.fail("f2p", GradeFailure.F2P_FAILED, result,
+                       detail="did not import: "
+                              + ", ".join(state.f2p_failed_node_ids))
+
+    # Everything else: the suite did not run. That is the Phase 0c failure --
+    # a broken environment is also a non-zero exit -- and reading it as a model
+    # failure is what a bare `!= 0` does.
     state.environment(
         "f2p",
         f"the f2p run exited {code}, so the tests did not run: {_head(result)}",
