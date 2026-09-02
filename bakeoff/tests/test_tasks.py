@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 
+from bakeoff import tasks
 from bakeoff.tasks import (
     TaskError,
     TaskGrading,
@@ -1905,3 +1906,161 @@ def test_leading_blank_lines_are_refused_rather_than_dropped():
 
     with pytest.raises(TaskError, match="byte for byte"):
         diff_chunks(diff)
+
+
+# --- image.env ---------------------------------------------------------------
+
+_ENV_BLOCK = 'image:\n  env:\n    CI: "1"\n'
+
+
+def test_image_env_defaults_to_empty_and_an_old_manifest_still_loads(
+    tmp_path, upstream
+):
+    """Every manifest written before this key existed must load unchanged, and
+    the absent case has to be ONE value rather than a None every caller
+    re-decides -- the reason `grading` is defaulted the same way."""
+    task_dir = _write_task(tmp_path / "set", upstream)  # no image: block
+
+    assert load_task(task_dir).image.env == {}
+
+
+def test_image_env_is_carried_verbatim(tmp_path, upstream):
+    task_dir = _write_task(
+        tmp_path / "set", upstream,
+        extra_yaml=(
+            "image:\n"
+            '  env:\n'
+            '    CI: "1"\n'
+            '    HYPOTHESIS_STORAGE_DIRECTORY: "/tmp/bakeoff-hypothesis"\n'
+        ),
+    )
+
+    assert load_task(task_dir).image.env == {
+        "CI": "1",
+        "HYPOTHESIS_STORAGE_DIRECTORY": "/tmp/bakeoff-hypothesis",
+    }
+
+
+def test_a_key_outside_the_allowlist_is_refused(tmp_path, upstream):
+    """An unrestricted image.env re-opens the hole the env ALLOWLIST exists to
+    close from the other side: CLAUDE_CODE_USE_BEDROCK is kept out of the host
+    environment by PASSTHROUGH_ENV and is not set by container_env, so an image
+    ENV carrying it would reach the agent, make the CLI ignore
+    ANTHROPIC_BASE_URL, bypass the proxy, and leave the mandatory wire log
+    empty with the run still looking normal."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream,
+        extra_yaml='image:\n  env:\n    CLAUDE_CODE_USE_BEDROCK: "1"\n',
+    )
+
+    with pytest.raises(TaskError) as exc:
+        load_task(task_dir)
+
+    assert "CLAUDE_CODE_USE_BEDROCK" in str(exc.value)
+    assert "HYPOTHESIS_STORAGE_DIRECTORY" in str(exc.value)  # names the set
+
+
+def test_an_image_env_that_is_not_a_mapping_is_refused(tmp_path, upstream):
+    """`image: {env: []}` is what an author who started a list and never wrote
+    the keys leaves behind. `or {}` cannot tell it from absent, so it would
+    load as a task declaring no environment -- and a hypothesis suite whose
+    determinism lever silently never applied is a suite that sometimes
+    passes."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream, extra_yaml="image:\n  env: []\n"
+    )
+
+    with pytest.raises(TaskError, match="expected a mapping"):
+        load_task(task_dir)
+
+
+def test_the_allowlist_and_the_harness_pinned_keys_are_disjoint():
+    """Checked as a property of the two sets, not of one manifest.
+
+    An allowlist entry naming a key `_eval_env` also sets would be silently
+    overridden on the AGENT's exec while still applying to preflight's and the
+    grader's -- two environments for one task, with nothing in the record
+    saying which. This is what makes adding a careless allowlist entry a red
+    suite rather than a bad eval."""
+    from bakeoff.claude_runner import pinned_env_keys
+
+    assert not (tasks._IMAGE_ENV_ALLOWED & pinned_env_keys())
+
+
+def test_a_pinned_key_is_refused_even_if_someone_allowlists_it(
+    tmp_path, upstream, monkeypatch
+):
+    """Belt and braces, and the braces are the half that survives a future
+    edit: the allowlist is what an author reads, and this refusal is what
+    catches an entry added to it without reading decision 6."""
+    monkeypatch.setattr(
+        tasks, "_IMAGE_ENV_ALLOWED",
+        tasks._IMAGE_ENV_ALLOWED | {"CLAUDE_CONFIG_DIR"},
+    )
+    task_dir = _write_task(
+        tmp_path / "set", upstream,
+        extra_yaml='image:\n  env:\n    CLAUDE_CONFIG_DIR: "/elsewhere"\n',
+    )
+
+    with pytest.raises(TaskError) as exc:
+        load_task(task_dir)
+
+    assert "the harness sets" in str(exc.value)
+
+
+@pytest.mark.parametrize("literal", [
+    '"/tmp/a\\nb"',        # a newline would end the ENV line early
+    "'/tmp/a\"b'",         # the value is emitted double-quoted
+    "'/tmp/a\\\\b'",       # a backslash continues a Dockerfile line
+    '"$HOME/hyp"',         # Docker EXPANDS this against the build environment
+])
+def test_a_value_that_would_not_survive_a_dockerfile_line_is_refused(
+    tmp_path, upstream, literal
+):
+    """The `$` case is the one that is not about syntax. Docker expands $VAR
+    in an ENV value against the BUILD environment, so the recorded value would
+    be a property of the builder rather than of the manifest -- the same
+    argument that refuses pathspec magic in strip_paths.
+
+    Written as YAML literals rather than Python strings because the loader
+    reads YAML: `"a\\nb"` in double quotes is a real newline to the parser,
+    which is the shape that has to be refused."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream,
+        extra_yaml=(
+            f"image:\n  env:\n    HYPOTHESIS_STORAGE_DIRECTORY: {literal}\n"
+        ),
+    )
+
+    with pytest.raises(TaskError):
+        load_task(task_dir)
+
+
+@pytest.mark.parametrize("value", ["relative/path", "/repo", "/repo/.hyp"])
+def test_a_storage_directory_inside_the_repo_is_refused(
+    tmp_path, upstream, value
+):
+    """The key exists to keep hypothesis's writes out of the tree the §5.6
+    submission diff is taken against. Pointed back into /repo it undoes
+    exactly that, and what lands in the tree becomes a property of a string an
+    author typed."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream,
+        extra_yaml=(
+            f'image:\n  env:\n    HYPOTHESIS_STORAGE_DIRECTORY: "{value}"\n'
+        ),
+    )
+
+    with pytest.raises(TaskError) as exc:
+        load_task(task_dir)
+
+    assert "/repo" in str(exc.value)
+
+
+def test_the_repo_mount_constant_matches_the_container_it_describes():
+    """tasks.py spells /repo itself rather than importing REPO_MOUNT, because
+    container.py imports `docker` at module level and the loader deliberately
+    does not depend on a daemon. The drift belongs here."""
+    from bakeoff.container import REPO_MOUNT
+
+    assert tasks._REPO_MOUNT == REPO_MOUNT

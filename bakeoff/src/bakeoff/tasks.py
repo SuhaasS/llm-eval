@@ -166,6 +166,20 @@ class TaskImage:
     apt: tuple[str, ...] = ()
     pip: tuple[str, ...] = ()
     build: tuple[str, ...] = ()
+    #: Environment baked into the task image as Dockerfile ENV lines, so it
+    #: reaches EVERY process in the container -- preflight's runner, the
+    #: oracle's, the grader's, the agent's `claude` -- and the commands the
+    #: agent invents. That last one is the whole reason it is here and not in
+    #: `tests.runner`: the agent is never told the runner argv (it gets
+    #: `task.prompt` and nothing else), so a flag in the runner would leave
+    #: the gate measuring one suite and section 3.3's self-correction loop
+    #: running another. Same shape, and the same argument, as the base image's
+    #: PYTHONDONTWRITEBYTECODE.
+    #:
+    #: Keys are restricted to `_IMAGE_ENV_ALLOWED`. See its comment: an
+    #: unrestricted map re-opens the CLAUDE_CODE_USE_BEDROCK hole that
+    #: `claude_runner`'s env allowlist exists to close.
+    env: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -409,6 +423,131 @@ def _validate_prefixes(prefixes: tuple[str, ...], where: str) -> None:
 #: Pathspec magic `git rm` would honour and this key does not accept. See
 #: `_validate_strip_paths`.
 _PATHSPEC_MAGIC = ("*", "?", "[", "]")
+
+#: Where `RunContainer` binds the run tree. Spelled here rather than imported
+#: from `container.REPO_MOUNT`, because container.py imports `docker` at
+#: module level and this loader deliberately runs without a daemon.
+#: `test_the_repo_mount_constant_matches_the_container_it_describes` is where
+#: the drift is caught.
+_REPO_MOUNT = "/repo"
+
+#: The only keys `image.env` may set. An ALLOWLIST, not a denylist, for
+#: exactly the reason `claude_runner`'s module docstring gives: a denylist has
+#: to anticipate every contaminant, and the one that matters most --
+#: CLAUDE_CODE_USE_BEDROCK / _USE_VERTEX -- makes the CLI ignore
+#: ANTHROPIC_BASE_URL, bypass the proxy, and leave the mandatory wire log
+#: empty with the run still looking normal. Those two are kept out of the HOST
+#: environment by PASSTHROUGH_ENV and are not set by `container_env`, so an
+#: image ENV is precisely the route that is otherwise open.
+#:
+#: Every entry is argued once, here:
+#:
+#:   CI  -- Hypothesis registers a built-in `ci` profile at import time
+#:          (derandomize=True, database=None, deadline=None) and auto-loads it
+#:          whenever any of twelve CI variables is present; `"CI": None` in
+#:          its `_CI_VARS` means presence alone, any value. Measured
+#:          2026-09-01 against hypothesis 6.167.1: a property-based suite that
+#:          gives `0 0 0 0 1 1 1 1 0 0` over ten fresh runs gives `1 1 1 1 1 1`
+#:          under CI=1. It is also INERT where it does not apply -- in an
+#:          image without hypothesis, `CI=1 pytest` is exit 0 and writes
+#:          nothing, where any `--hypothesis-*` flag is exit 4 before
+#:          collection.
+#:
+#:   HYPOTHESIS_STORAGE_DIRECTORY -- Hypothesis's storage root is
+#:          `Path.cwd() / ".hypothesis"` fixed at import time
+#:          (configuration.py:20), so with workdir=/repo it lands in the tree
+#:          the section 5.6 submission diff is taken against. CI=1 stops the
+#:          `examples/` database but not the `constants/` cache, and an agent
+#:          running pytest from a subdirectory gets a second copy in a
+#:          directory whose self-written .gitignore guard never fired. This is
+#:          the only lever that keeps all of it out.
+_IMAGE_ENV_ALLOWED = frozenset({"CI", "HYPOTHESIS_STORAGE_DIRECTORY"})
+
+#: Characters that do not survive a generated `ENV KEY="value"` line. `$` is
+#: the one that is not about syntax: Docker EXPANDS it against the build
+#: environment, which would make the value a property of the builder rather
+#: than of the manifest -- the argument that refuses pathspec magic in
+#: strip_paths, one key over.
+_ENV_VALUE_REFUSED = ('\n', '\r', '"', '\\', '$')
+
+_ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _env_map(value: Any, where: str) -> dict[str, str]:
+    """`image.env`, validated. Empty when absent.
+
+    Four refusals, each naming a failure that is silent without it:
+
+    * a key outside `_IMAGE_ENV_ALLOWED` -- see that constant;
+    * a key the harness itself sets -- Docker's exec env wins over the image's
+      (measured), so the value would apply to preflight and the grader and NOT
+      to the agent, which is two environments for one task;
+    * a value carrying `_ENV_VALUE_REFUSED`;
+    * HYPOTHESIS_STORAGE_DIRECTORY inside /repo, which undoes the only thing
+      that key is for.
+    """
+    from bakeoff.claude_runner import pinned_env_keys
+
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise TaskError(f"{where}: expected a mapping, got {value!r}")
+
+    pinned = pinned_env_keys()
+    env: dict[str, str] = {}
+    for raw_key, raw_value in value.items():
+        key = str(raw_key)
+        if not _ENV_KEY.match(key):
+            raise TaskError(
+                f"{where}: {key!r} is not a usable environment variable name"
+            )
+        if key in pinned:
+            raise TaskError(
+                f"{where}: {key!r} is a key the harness sets itself. Docker "
+                "merges an exec's environment into the image's with the "
+                "exec's keys winning, so this would apply to preflight and "
+                "the grader and be overridden on the agent's own process -- "
+                "two environments for one task, with nothing recording which"
+            )
+        if key not in _IMAGE_ENV_ALLOWED:
+            raise TaskError(
+                f"{where}: {key!r} is not an allowed image.env key. The "
+                "allowed set is "
+                f"{sorted(_IMAGE_ENV_ALLOWED)}; it is an allowlist because a "
+                "denylist would have to anticipate CLAUDE_CODE_USE_BEDROCK, "
+                "which bypasses the proxy and leaves the wire log empty with "
+                "the run still looking normal"
+            )
+        if not isinstance(raw_value, str) or not raw_value:
+            raise TaskError(
+                f"{where}: {key!r} must be a non-empty string, got "
+                f"{raw_value!r}"
+            )
+        bad = [ch for ch in _ENV_VALUE_REFUSED if ch in raw_value]
+        if bad:
+            raise TaskError(
+                f"{where}: {key!r} carries {bad!r}, which would not survive "
+                'a generated `ENV KEY="value"` line ("$" is expanded by the '
+                "builder, so the value would be a property of the build "
+                "rather than of the manifest)"
+            )
+        if key == "HYPOTHESIS_STORAGE_DIRECTORY":
+            path = PurePosixPath(raw_value)
+            # `is_relative_to` covers the equal case too -- measured,
+            # `PurePosixPath("/repo").is_relative_to("/repo")` is True -- so
+            # `/repo` itself and anything under it are one check, and the
+            # `is_absolute` clause is what catches a relative entry before
+            # `is_relative_to` is asked a question about a path with no root.
+            if not path.is_absolute() or path.is_relative_to(_REPO_MOUNT):
+                raise TaskError(
+                    f"{where}: {raw_value!r} must be an absolute path outside "
+                    f"{_REPO_MOUNT}. This key exists to keep hypothesis's "
+                    "writes out of the tree the section 5.6 submission diff "
+                    "is taken against; pointed back inside it, it undoes "
+                    "exactly that"
+                )
+        env[key] = raw_value
+    return env
 
 
 def _validate_strip_paths(paths: tuple[str, ...], where: str) -> None:
@@ -795,6 +934,7 @@ def load_task(task_dir: Path, set_commit: str = "") -> TaskManifest:
             apt=_strs(image_raw.get("apt"), f"{where}:image.apt"),
             pip=_strs(image_raw.get("pip"), f"{where}:image.pip"),
             build=_strs(image_raw.get("build"), f"{where}:image.build"),
+            env=_env_map(image_raw.get("env"), f"{where}:image.env"),
         ),
         grading=TaskGrading(
             build=_strs(grading_raw.get("build"), f"{where}:grading.build"),

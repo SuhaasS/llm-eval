@@ -193,6 +193,50 @@ def container_env(config: ClaudeCodeConfig) -> dict[str, str]:
     return _eval_env(config)
 
 
+#: The base image's own ENV, and the one member of `pinned_env_keys` that
+#: nothing in this process can derive -- it is set in
+#: docker/eval-agent.Dockerfile, not by `_eval_env`. Listed here so the
+#: refusal in tasks.py has one source for the whole set.
+#:
+#: CPython invalidates a .pyc on (source mtime in whole seconds, source size)
+#: and both halves are ordinary here, so a task image that turned this off
+#: would feed section 3.3's self-correction loop the code the agent already
+#: replaced. Measured 2026-08-13 in the eval image, and it made
+#: verify_logger.py fail on 2 of 3 consecutive runs.
+_BASE_IMAGE_ENV = frozenset({"PYTHONDONTWRITEBYTECODE"})
+
+
+def pinned_env_keys() -> frozenset[str]:
+    """Every environment key the harness itself decides. `tasks.py` refuses these.
+
+    Docker MERGES an exec's environment into the image's, with the exec's keys
+    winning (measured 2026-09-01, Docker 29.5.2). So a task image declaring a
+    key this function names would be overridden on the AGENT's process --
+    which alone gets `container_env` -- while still applying to preflight's
+    and the grader's execs, which pass no env. That is two environments for
+    one task, and nothing in the record would say which one produced a result.
+
+    DERIVED from `_eval_env` and `PASSTHROUGH_ENV` rather than hand-listed,
+    for `_GRADING_KEYS`' reason: a copy goes stale the first time a key is
+    added, and the failure of a stale list is the silent one.
+
+    The sentinel matters. `_eval_env` emits ANTHROPIC_CUSTOM_HEADERS only when
+    `custom_headers` is truthy and the dataclass default is "", so a default
+    config would leave the set missing exactly the key that carries the run id
+    -- the one whose loss makes every call unattributed.
+    """
+    sentinel = ClaudeCodeConfig(
+        model="", base_url="", auth_token="", settings_path="",
+        config_dir="", max_turns=0, wall_clock_timeout_s=0,
+        custom_headers="X-Bakeoff-Run-Id: sentinel",
+    )
+    return (
+        frozenset(_eval_env(sentinel))
+        | frozenset(PASSTHROUGH_ENV)
+        | _BASE_IMAGE_ENV
+    )
+
+
 def config_digest(config: ClaudeCodeConfig) -> str:
     """Digest of everything that must be identical across arms.
 

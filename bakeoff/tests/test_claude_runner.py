@@ -174,6 +174,41 @@ def test_container_env_does_not_forward_host_paths():
     assert env["CLAUDE_CONFIG_DIR"] == "/run/artifacts/r-001/claude-config"
 
 
+def test_pinned_env_keys_covers_the_key_that_is_only_set_when_non_empty():
+    """The sentinel in `pinned_env_keys` is the whole reason it is a function.
+
+    `_eval_env` emits ANTHROPIC_CUSTOM_HEADERS only when `custom_headers` is
+    truthy, and the dataclass default is "". Built from a default config, the
+    set would be missing exactly the key that carries the run id -- so a task
+    image could set it, the agent's exec would override it, and preflight and
+    the grader would read one value while the agent's calls carried another.
+    """
+    from bakeoff.claude_runner import pinned_env_keys
+
+    keys = pinned_env_keys()
+
+    assert "ANTHROPIC_CUSTOM_HEADERS" in keys
+    assert "ANTHROPIC_BASE_URL" in keys
+    assert "CLAUDE_CONFIG_DIR" in keys
+
+
+def test_pinned_env_keys_includes_the_host_allowlist_and_the_base_image_pin():
+    """PATH and HOME come from PASSTHROUGH_ENV; PYTHONDONTWRITEBYTECODE comes
+    from the base image and is the one member nothing in this process can
+    derive.
+
+    A task image overriding PATH would stop `claude` resolving; overriding
+    PYTHONDONTWRITEBYTECODE re-arms the stale-pyc defect that already made
+    verify_logger.py fail on 2 of 3 consecutive runs and shipped a `.pyc` as
+    the first hunk of a live submission diff.
+    """
+    from bakeoff.claude_runner import pinned_env_keys
+
+    keys = pinned_env_keys()
+
+    assert {"PATH", "HOME", "PYTHONDONTWRITEBYTECODE"} <= keys
+
+
 def test_config_digest_covers_environment_not_just_command():
     """The digest is stored as proof the arms ran identically, but every
     behavior knob except --max-turns lives in the environment. A digest over
