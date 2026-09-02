@@ -1478,6 +1478,7 @@ def test_the_env_evidence_says_which_absence_it_is_on_the_early_return(
     assert result.evidence["image_env_observed"] is None
     assert result.evidence["image_env_mismatch"] is None
     assert result.evidence["hypothesis_importable"] is None
+    assert result.evidence["hypothesis_imported_by_suite"] is None
 
 
 def test_the_preflight_version_moved_with_the_new_assertion():
@@ -1529,8 +1530,8 @@ class _FakeImage:
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cd bakeoff && .venv/bin/python -m pytest tests/test_preflight.py -q -k "env or preflight_version or hypothesis"`
-Expected: FAIL — `KeyError: 'image_env_declared'`, `TypeError: __init__() got an unexpected keyword argument 'hypothesis_importable'`, `ImportError: cannot import name '_runner_python'`, and `assert '4' == '5'`. Twelve new test functions, 17 collected items (`test_the_import_probe_uses_the_runners_own_interpreter` is parametrized six ways); confirm the filter selects all 17 with `--collect-only -q | tail -1` before trusting the run.
+Run: `cd bakeoff && .venv/bin/python -m pytest tests/test_preflight.py -q -k "env or preflight_version or hypothesis or rg_probe or runners_own_interpreter or declared_test_path or unset_variable"`
+Expected: FAIL — `KeyError: 'image_env_declared'`, `TypeError: __init__() got an unexpected keyword argument 'hypothesis_importable'`, `ImportError: cannot import name '_runner_python'`, and `assert '4' == '5'`. Thirteen new test functions, 18 collected items (`test_the_import_probe_uses_the_runners_own_interpreter` is parametrized six ways); confirm the filter selects all 18 NEW items with `--collect-only -q` before trusting the run — if the count is lower, the filter is missing a name, and the fix is the filter, never the number.
 
 - [ ] **Step 3: Implement the probe**
 
