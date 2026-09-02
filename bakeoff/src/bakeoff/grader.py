@@ -238,7 +238,8 @@ from bakeoff.tasks import (
 #: carries as `sqlglot-6927-dremio-trycast`.
 #: 8 -> 9 is not a change to what any check asserts. It retires grades that
 #: may carry an `APPLY_FAILED` produced by a stale bind mount rather than by
-#: the submission (round 2 item 3, 2026-09-03): `grade-tree/<run_id>` was one
+#: the submission, in the window BEFORE `_assert_repo_mounted` landed (round 2
+#: item 3, 2026-09-03): `grade-tree/<run_id>` was one
 #: path per run and was reused across passes, the Docker VM served the second
 #: container the empty directory it had cached, `git apply` failed against
 #: that, and `scripts/grade.py`'s resume key is (run_id, GRADER_VERSION)

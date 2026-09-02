@@ -1990,7 +1990,8 @@ MUTATIONS = [
         # `import shutil` from this module -- a NameError would make the test
         # red for a reason that is not the guarantee. Reuse alone is the
         # guarantee: under this mutation both runs share one config directory,
-        # so the test sees 1 entry where it asserts 2.
+        # so the test sees an empty shared directory where it asserts two
+        # leaves.
         "config dir: reuse one host path per artifacts root across runs",
         "src/bakeoff/runner.py",
         '    host_config_dir = fresh_tree(artifacts_root / "claude-config")',

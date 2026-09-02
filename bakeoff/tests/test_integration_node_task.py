@@ -26,10 +26,9 @@ defended: a path the VM *does* share, deleted and rebuilt on the host between
 containers, is served from a stale cache and appears empty roughly every other
 time (measured -- see `node_tree`). Hence `container.fresh_tree` per run tree,
 never a shared one, and `_mounted`'s post-condition beside it: under both node
-frameworks an
-empty `/repo` exits **1** with `No test files found`, which is the same exit a
-failing test gives, so an empty mount does not make this file flaky -- it makes
-it pass while measuring nothing.
+frameworks an empty `/repo` exits **1** with `No test files found`, which is
+the same exit a failing test gives, so an empty mount does not make this file
+flaky -- it makes it pass while measuring nothing.
 """
 
 from __future__ import annotations

@@ -700,10 +700,10 @@ def main() -> int:
                 "diff_b": len(record.artifacts.final_diff or ""),
                 "problems": problems,
             }
-            # Present only when the tree survives, never a null -- the same
-            # discipline `artifacts.wire_log_gz` keeps one layer down. Under
+            # Never a path that is not this run's -- and absent, not null,
+            # because a row without `--keep` has no path to name. Under
             # `--keep` the run tree outlives the cell and a reader wants the
-            # path; without it there is no path to name.
+            # path.
             if kept:
                 row["kept_repo"] = kept
             rows.append(row)
