@@ -173,7 +173,15 @@ def _strip_build_context(repo_dir: Path, strip_paths: list[str]) -> None:
 
     A path that matches nothing is NOT an error. `tasks._strip_paths_from_tree`
     raises on exactly that, and `run_matrix` builds the image before
-    materializing, so raising here too means one typo is reported twice.
+    materializing, so raising here too means one typo is reported twice. That
+    includes a path through a DANGLING intermediate symlink (`docs` pointing
+    nowhere, `strip_paths: ["docs/x"]`): `target.is_symlink()` and
+    `target.exists()` both read as absent for it (`lstat` fails on a
+    component that resolves to nothing, and pathlib turns that `OSError` into
+    `False` rather than raising), so it is a no-op, checked BEFORE the escape
+    guard below. Only a path that resolves to something -- inside `repo_dir`
+    or out -- reaches that guard; "nothing is there" and "something is there,
+    outside repo_dir" are different claims and get different outcomes.
 
     `is_symlink()` before `is_dir()`: `is_dir()` follows the link and
     `shutil.rmtree` then raises "Cannot call rmtree on a symbolic link".
@@ -185,10 +193,11 @@ def _strip_build_context(repo_dir: Path, strip_paths: list[str]) -> None:
     `tasks._validate_strip_paths` rejects an absolute entry, one carrying
     `..`, and one carrying pathspec magic. That does not cover an
     INTERMEDIATE symlink -- `git archive` preserves symlinks, so an upstream
-    `docs -> /elsewhere` plus a strip path of `docs/x` resolves outside
-    `repo_dir` and would unlink there, since only the final path component is
-    ever checked with `is_symlink()`. Refused here too, before anything is
-    touched: the resolved parent of `target` must stay under `repo_dir`, or
+    `docs -> /elsewhere` plus a strip path of `docs/x`, with a real file at
+    `elsewhere/x`, resolves outside `repo_dir` and would unlink there, since
+    only the final path component is ever checked with `is_symlink()`.
+    Refused here too, once the no-op check above says something is actually
+    there: the resolved parent of `target` must stay under `repo_dir`, or
     this raises rather than deleting outside it. (`tasks.materialize` would
     also refuse the same manifest afterward -- `git ls-files` sees nothing
     tracked through the escaped path -- but only after this step already
@@ -208,6 +217,8 @@ def _strip_build_context(repo_dir: Path, strip_paths: list[str]) -> None:
     repo_root = Path(repo_dir).resolve()
     for path in strip_paths:
         target = Path(repo_dir) / path
+        if not target.is_symlink() and not target.exists():
+            continue
         parent = target.parent.resolve()
         if repo_root != parent and repo_root not in parent.parents:
             raise ImageError(f"strip path {path!r} escapes repo_dir via a symlink")

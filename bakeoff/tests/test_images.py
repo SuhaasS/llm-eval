@@ -147,6 +147,22 @@ def test_a_strip_through_an_intermediate_symlink_does_not_escape_repo_dir(tmp_pa
     assert (repo / "docs").is_symlink(), "context is untouched by the refusal"
 
 
+def test_a_strip_through_a_dangling_intermediate_symlink_is_not_an_error(tmp_path):
+    """`docs` points nowhere, so `docs/x` matches nothing -- the same claim
+    `test_a_path_missing_from_the_build_context_is_not_an_error` makes for a
+    plain missing path. This must stay a no-op rather than reaching the
+    escape guard: `target.parent.resolve()` follows the stored symlink text
+    literally even though nothing is there, which would otherwise land
+    outside `repo_dir` and raise on a path that removes nothing."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "docs").symlink_to(tmp_path / "nowhere-at-all")
+
+    _strip_build_context(repo, ["docs/x"])
+
+    assert (repo / "docs").is_symlink(), "the dangling link itself was not named and stays"
+
+
 def test_a_path_missing_from_the_build_context_is_not_an_error(tmp_path):
     """`materialize` raises on exactly this, and `run_matrix` builds the image
     BEFORE materializing -- raising in both places means one typo is reported
