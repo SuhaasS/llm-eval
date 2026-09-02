@@ -151,6 +151,50 @@ def render_dockerfile(base_image: str, apt: list[str], pip: list[str],
     return "\n".join(lines)
 
 
+def _strip_build_context(repo_dir: Path, strip_paths: list[str]) -> None:
+    """Remove the manifest's `strip_paths` from the unpacked build context.
+
+    The context is `git archive base_sha`, not the start state, so a stripped
+    path is still here. For an agent file that is harmless -- the bind mount
+    replaces /repo at run time and the image is never what the agent reads --
+    but for the other half of what the key is for it is not: a committed venv
+    or vendored tree left in the scaffold is on the import path when
+    `image.build` runs `pip install -e .`, so the environment the image pins
+    is resolved against a directory the run tree does not have, and nothing
+    downstream compares the two. Same class as a non-editable install: the
+    image and the run disagree silently, and preflight's green-after check
+    only catches it when the disagreement happens to break the suite.
+
+    The named paths' CONTENT goes; an emptied parent directory can remain
+    (stripping `vendor/dep.py` leaves `vendor/`, while git tracks no
+    directories so the run tree has none). That residue is deliberate: an
+    empty directory carries no module and no dependency, and pruning parents
+    would start guessing at which of them the archive was supposed to have.
+
+    A path that matches nothing is NOT an error. `tasks._strip_paths_from_tree`
+    raises on exactly that, and `run_matrix` builds the image before
+    materializing, so raising here too means one typo is reported twice.
+
+    `is_symlink()` before `is_dir()`: `is_dir()` follows the link and
+    `shutil.rmtree` then raises "Cannot call rmtree on a symbolic link".
+    Measured upstream -- sqlglot's CLAUDE.md is a symlink to AGENTS.md, which
+    is why taskset/HARVESTING.md records that repository's date floor as
+    covering both names.
+
+    Escaping `repo_dir` is impossible by construction rather than by a check
+    here: `tasks._validate_strip_paths` refuses an absolute entry, one
+    carrying `..`, and one carrying pathspec magic.
+    """
+    import shutil
+
+    for path in strip_paths:
+        target = Path(repo_dir) / path
+        if target.is_symlink() or target.is_file():
+            target.unlink()
+        elif target.is_dir():
+            shutil.rmtree(target)
+
+
 def build_task_image(
     task, base_image: str, build_root: Path, cache_root: Path
 ) -> str:
@@ -190,6 +234,8 @@ def build_task_image(
             f"unpacking {task.base_sha} failed: "
             f"{extract.stderr.decode('utf-8', 'replace')}"
         )
+
+    _strip_build_context(repo_dir, list(task.strip_paths))
 
     (context / "Dockerfile").write_text(
         render_dockerfile(
