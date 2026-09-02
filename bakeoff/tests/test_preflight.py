@@ -1043,6 +1043,44 @@ def test_a_typoed_f2p_id_still_stops_the_matrix(monkeypatch, tmp_path):
     assert any("did not run at the start state" in p for p in result.problems)
 
 
+def test_a_collection_error_after_the_reference_fix_is_still_a_refusal(
+    monkeypatch, tmp_path
+):
+    """The third conjunct, and the only one that can see this defect.
+
+    Green-after is NOT relaxed, and the symmetry that suggests relaxing it is
+    the trap. Red-before accepts a confined collection error because the
+    missing symbol IS the bug; after the reference fix that symbol exists, so
+    the module imports and the tests exit 0. A reference that leaves it
+    unimportable has fixed nothing, and a solved run and an idle run would
+    leave identical evidence -- the failure `preflight`'s module docstring
+    opens with.
+
+    It is also the ENVIRONMENT DISCRIMINATOR, which is the part that is easy to
+    miss. A dependency imported only by the f2p module is confined under
+    conjunct (i) -- the f2p selection imports only those modules -- and leaves
+    p2p green under conjunct (ii), because p2p never imports it. Neither of the
+    first two conjuncts can refuse it. This scripted shape is that defect
+    exactly: the error set is perfectly confined and p2p is green, so nothing
+    but this block keeps the refusal."""
+    task = _FakeTask()
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=task.tests, present=("tests/",),
+        f2p_before=_Exec(exit_code=4, stdout=_COLLECTION_ERROR_OUT),
+        f2p_after=_Exec(exit_code=4, stdout=_COLLECTION_ERROR_OUT),
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert not result.ok
+    assert any("do NOT pass after the reference" in p for p in result.problems)
+    assert result.evidence["f2p_after_exit"] == 4
+    # The environment discriminator: both of the earlier conjuncts held, so
+    # nothing but green-after is what refuses this task.
+    assert result.evidence["f2p_red_kind"] == "collection_error"
+    assert result.evidence["p2p_before_exit"] == EXIT_ALL_PASSED
+
+
 def test_the_preflight_version_moved_with_what_the_gate_asserts():
     """It is in `preflight_cache_key`, and none of the other three components
     moves when this file changes: a manifest digest describes the task, an
