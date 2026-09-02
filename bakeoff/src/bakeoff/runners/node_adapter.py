@@ -342,12 +342,22 @@ class _NodeFlavour:
         # is safe on a greedy option because it starts with `-`, which ends
         # the array.
         if selected:
+            pairs = list(self._group_by_file(selected))
+            # A file in `ignored` gets no group at all -- that flag's one
+            # caller is preflight's p2p run at the START state, whose whole
+            # point is that the f2p module must not be collected. But only
+            # while some other group will run: if EVERY selected file is
+            # ignored (the f2p module's own failure to load takes every
+            # explicitly-declared p2p id in it down too), dropping them all
+            # would return an empty SEQUENCE, which `_Runner.run` refuses --
+            # turning what used to be a per-task NO-GO into a `ValueError`
+            # that `run_matrix.py` has no `except` around, killing every
+            # remaining task's gate. Emit the groups anyway and let the run
+            # be loud (KIND_NOTHING_RAN) instead of the driver going quiet.
+            keep_any = any(path not in ignored for path, _ in pairs)
             groups = []
-            for path, titles in self._group_by_file(selected):
-                # A file in `ignored` gets no group at all -- that flag's one
-                # caller is preflight's p2p run at the START state, whose whole
-                # point is that the f2p module must not be collected.
-                if path in ignored:
+            for path, titles in pairs:
+                if path in ignored and keep_any:
                     continue
                 pattern = ""
                 drop = self._titles_in(deselected, path)
@@ -367,9 +377,13 @@ class _NodeFlavour:
         # report of ZERO tests, so a check that emitted it would report the
         # regression suite as not green on a task that is fine. Those prefixes
         # are dropped, and group 0 with them when nothing is left for it to
-        # run -- but only while some other group will run, because an empty
-        # SEQUENCE is what `_Runner.run` refuses, and a loud empty invocation
-        # is the better failure of the two.
+        # run under the narrowed scope -- but only while some other group
+        # will run, because an empty SEQUENCE is what `_Runner.run` refuses.
+        # When the whole declared scope collapses this way, group 0 does not
+        # stay empty: `_scope_positionals`' `or [guard + ".*"]` fallback
+        # sweeps the whole repository minus the excluded files -- the same
+        # argv the scope=() callers already get -- so this is kept-and-
+        # widened, not the loud-and-empty invocation it might read as.
         remaining = [prefix for prefix in scope if prefix not in excluded]
         # Group 0: everything under scope EXCEPT the files holding a
         # deselection, and no `-t` at all. Then one group per such file,

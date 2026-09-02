@@ -1861,7 +1861,7 @@ MUTATIONS = [
         "not integration",
     ),
     (
-        # The whole reason `p2p_args` owns the argv rather than composing it.
+        # The whole reason `p2p_argvs` owns the argv rather than composing it.
         # Measured 2026-09-02: vitest REJECTS a second `-t` (exit 1, and no
         # report file, so it classifies as an environment problem) and jest
         # comma-joins the two into a pattern matching neither, running nothing

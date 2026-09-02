@@ -396,10 +396,10 @@ rules, not instead of them.
               s.add(a.fullName); } }
         for (const a of f) for (const b of f)
           if (a!==b && b.includes(a)) console.log("CONTAINED PATH:", a, "<", b);'
-- **A jest task’s own `testPathIgnorePatterns` is honoured.** Under
-  `GRADER_VERSION` 10 the harness emits that flag nowhere, so the repository’s
+- **A jest task's own `testPathIgnorePatterns` is honoured.** Under
+  `GRADER_VERSION` 10 the harness emits that flag nowhere, so the repository's
   configuration decides what jest collects. This is a change from 9, where the
-  one run that used it **replaced** the repository’s list with jest’s built-in
+  one run that used it **replaced** the repository's list with jest's built-in
   default — measured on `eemeli/yaml`, whose config declares `tests/_utils` and
   `tests/json-test-suite/` and no `/node_modules/` at all, and whose
   `tests/_utils` helpers match its own `testMatch`.

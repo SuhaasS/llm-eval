@@ -106,19 +106,19 @@ Neither produces a fixture; both are pinned by tests in `test_runners.py`.
    → `Error: Expected a single value for option "-t, --testNamePattern <pattern>",
    received ["a", "b"]`, exit 1, **no report file**. `jest -t adds -t subs`
    comma-joins them (`Ran all test suites … with tests matching "adds,subs"`),
-   matches neither test, and exits **0**. Hence one `p2p_args` owning the whole
+   matches neither test, and exits **0**. Hence one `p2p_argvs` owning the whole
    argv, and hence the test that counts the `-t` flags.
 2. **jest's `--testPathIgnorePatterns` is a greedy yargs array, so the
    positionals must come FIRST.** Measured: `jest tests/ --testPathIgnorePatterns=…`
    drops the named file and runs the rest, while
    `jest --testPathIgnorePatterns=fail.test.js tests/` swallows `tests/` into the
    ignore array and runs **nothing**, at exit 1 with an empty `testResults`.
-   `p2p_args` emits the scope before the flags for exactly this reason; the
+   `p2p_argvs` emits the scope before the flags for exactly this reason; the
    trailing `-t` is safe because it starts with `-`, which ends the array.
 3. **vitest's ignore flag is `--exclude=<path>`, the equals form, not a
    space-separated pair.** Measured 2026-09-02 alongside jest's
    `--testPathIgnorePatterns=<path>`: both frameworks are called with `=`,
-   and `p2p_args` emits it that way for both. Pinned in `test_runners.py`
+   and `p2p_argvs` emits it that way for both. Pinned in `test_runners.py`
    (`test_node_ignore_flags_are_per_framework_and_jest_keeps_its_default`) as
    the exact argv `["tests/", "--exclude=tests/x.js"]`, not a two-element
    `["--exclude", "tests/x.js"]`.

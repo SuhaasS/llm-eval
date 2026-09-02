@@ -959,6 +959,18 @@ class _ScriptedContainer:
         #: scripting emits one command per check and never reads them.
         self._f2p_open = False
         self._open = None
+        #: The scoped check's own expected argv groups, memoized on first use
+        #: (needs `tests.framework`'s adapter, not available yet at
+        #: construction). Recognised by MATCHING against this list -- the
+        #: same rule the f2p check already uses `select_argvs` for -- rather
+        #: than by the `-t`-absent-means-opening heuristic the deselect-branch
+        #: p2p checks still use: a `tests.paths` entry may be a FILE that is
+        #: also the sole deselected one, which drops the scoped check's group
+        #: 0 (`node_adapter.p2p_argvs`'s own comment) and leaves every one of
+        #: its commands carrying a `-t` -- the shape the heuristic reads as
+        #: "not opening". Matching against the adapter's own groups survives
+        #: that, the way asking it for `select_argvs` already does for f2p.
+        self._scoped_groups = None
         #: Override the default red-before / green-after / p2p-before answers.
         #: Defaults stay the healthy exit-1 task so a test states only the one
         #: thing it is about.
@@ -1132,10 +1144,12 @@ class _ScriptedContainer:
         1 + K of them, so a fixture keyed on an invocation ORDINAL breaks
         silently: group 1 of the p2p-BEFORE check would increment `p2p_runs`
         to 2 and be served the p2p_after report, and every assertion above
-        would still be green over the wrong evidence. Every group of a check
-        is therefore served the SAME report -- the adapter's `merge_reports`
-        is what turns them back into one -- and the counters move once per
-        check.
+        would still be green over the wrong evidence. Every check's FIRST
+        command is served the scripted report; every continuation gets an
+        EMPTY one instead, because the adapter's `merge_reports` concatenates
+        `testResults` -- re-serving would file the same file twice in
+        `files_run` and double every count derived from it (see the `#:`
+        comment below). The counters move once per check either way.
 
         A separate branch rather than a widened one: the pytest scripting
         above is what `test_grading_p2p_with_no_extras_is_the_argv_preflight_
@@ -1147,14 +1161,31 @@ class _ScriptedContainer:
         the declared ids looks like and matching ANY of its groups, rather
         than by re-deriving the argv here: a second copy of that rule is a
         second thing that can be wrong about which run a report belongs to.
-        The other two are told apart by a CHECK BOUNDARY rather than by a
-        count -- a group carrying no `-t` opens a new check, and a group
-        carrying a `-t` and a single file positional continues the open one.
+        The scoped check is recognised the same way, against `p2p_argvs`'
+        own deselect-branch groups for the full declared scope -- NOT by a
+        `-t`-absent-means-opening heuristic, which mis-keys the one shape
+        `node_adapter.p2p_argvs` documents: a `tests.paths` entry that is
+        also the sole deselected file drops the scoped check's group 0, so
+        its only command carries a `-t` and would otherwise be read as a
+        continuation of whatever check happened to be open last (or, on a
+        framework whose bare file filter happens to equal that same `paths`
+        entry, as an unopened "scoped" check served an empty report instead
+        of its scripted one). The p2p checks are the one place the `-t`
+        heuristic still applies -- they always call `p2p_argvs` with
+        `scope=()`, which never omits group 0, so the heuristic's premise
+        holds there.
         """
         from bakeoff.runners import for_framework
 
         adapter = for_framework(self.tests.framework)
         select = adapter.select_argvs(tuple(self.tests.f2p))
+        if self._scoped_groups is None:
+            self._scoped_groups = adapter.p2p_argvs(
+                selected=(), scope=tuple(self.tests.paths),
+                deselected=tuple(self.tests.f2p), ignored=())
+        scoped_index = next(
+            (i for i, group in enumerate(self._scoped_groups)
+             if group and rest[:len(group)] == group), None)
         if any(group and rest[:len(group)] == group for group in select):
             # Every group of one selection belongs to the same check; the
             # check opens on the FIRST of them.
@@ -1165,21 +1196,24 @@ class _ScriptedContainer:
             key = "f2p_before" if self.f2p_runs == 1 else "f2p_after"
         else:
             self._f2p_open = False
-            # Group 0 of a deselect-branch check carries no `-t`; groups 1..K
-            # each carry one plus a single file positional and continue it.
-            opening = "-t" not in rest
-            if any(arg in self.tests.paths for arg in rest):
+            if scoped_index is not None:
+                opening = scoped_index == 0
                 if opening:
                     self.scoped_runs += 1
                     self._open = "scoped"
                 key = "scoped"
-            elif not opening and self._open is not None:
-                key = self._open
             else:
-                self.p2p_runs += 1
-                self.p2p_argvs.append(list(rest))
-                key = "p2p_before" if self.p2p_runs == 1 else "p2p_after"
-                self._open = key
+                # Group 0 of a deselect-branch check carries no `-t`; groups
+                # 1..K each carry one plus a single file positional and
+                # continue it.
+                opening = "-t" not in rest
+                if not opening and self._open is not None:
+                    key = self._open
+                else:
+                    self.p2p_runs += 1
+                    self.p2p_argvs.append(list(rest))
+                    key = "p2p_before" if self.p2p_runs == 1 else "p2p_after"
+                    self._open = key
         #: The scripted report describes what the check's FIRST command ran.
         #: A continuation group is served an EMPTY report rather than a copy:
         #: the merge CONCATENATES `testResults`, so re-serving would file the
@@ -3658,6 +3692,36 @@ def test_running_a_flat_argv_raises_rather_than_splatting_it():
 
     with pytest.raises(TypeError):
         runner.run(["--config", "/tmp/nope.mjs"])
+
+
+def test_pass_to_pass_does_not_raise_when_every_explicit_p2p_id_is_ignored():
+    """The production call path deviation 2 left unguarded (`node_adapter.
+    NodeAdapter.p2p_argvs`'s explicit-`selected` branch). `preflight`'s
+    p2p-BEFORE run passes `ignore` naming the f2p module(s) that failed to
+    load at the start state, and on an explicit-`tests.p2p` task every
+    declared id can live in that one module -- so before the adapter's own
+    guard, EVERY group was dropped unconditionally, `p2p_argvs` returned `[]`,
+    and `_Runner.run` raised `ValueError` on the empty sequence. `run_matrix.
+    py` has no `except` around `preflight(...)`, so that one task's shape used
+    to take every remaining task's gate down with it. `pass_to_pass` must
+    return a result here -- a NO-GO problem for THIS task, not a crash for
+    every task after it -- whatever that result later classifies as."""
+    from bakeoff.preflight import _Runner
+    from bakeoff.runners import KIND_PASSED, for_framework
+
+    tests = _FakeTests(paths=("tests/",), f2p=("tests/a.test.js::does a thing",),
+                       p2p=("tests/f.test.js::red",),
+                       runner=("/node_modules/.bin/vitest", "run", "--no-cache"),
+                       framework="vitest")
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=tests, present=tests.paths,
+        reports={"p2p_before": _node_report([]), "p2p_after": _node_report([])})
+    runner = _Runner(container, tests.runner, 600, adapter=for_framework("vitest"))
+
+    result = runner.pass_to_pass(tests, ignore=("tests/f.test.js",))
+
+    assert result is not None
+    assert runner.classify(result).kind != KIND_PASSED
 
 
 def test_the_merged_exit_code_prefers_a_timeout_over_an_ordinary_failure():

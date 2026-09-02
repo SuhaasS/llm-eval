@@ -174,7 +174,7 @@ def test_pytest_merge_reports_is_None_and_that_is_a_claim():
     assert adapter.merge_reports([{"testResults": []}]) is None
 
 
-def test_pytest_p2p_args_matches_the_live_runner_on_both_branches():
+def test_pytest_p2p_argvs_matches_the_live_runner_on_both_branches():
     """The live argv against the PRE-REFACTOR LITERALS, spelled out here.
 
     An earlier draft compared `_Runner.pass_to_pass`'s argv against
@@ -246,7 +246,7 @@ def test_pytest_select_argvs_are_the_bare_node_ids():
         ("a::b", "c::d")) == [["a::b", "c::d"]]
 
 
-def test_pytest_select_args_match_the_live_runner():
+def test_pytest_select_argvs_match_the_live_runner():
     """The live `_Runner.select` argv against the PRE-REFACTOR LITERAL.
 
     Comparing it against `adapter.select_args(node_ids)` was `f(x) == f(x)`
@@ -988,6 +988,40 @@ def test_a_quarantined_id_naming_an_uncollected_file_emits_no_pattern_for_it():
     assert not any("z.test.js" in arg for arg in groups[0])
 
 
+def test_the_explicit_branch_still_drops_an_ignored_file_when_another_will_run():
+    """The guard added below for the all-ignored case must not resurrect the
+    ordinary drop: with a second, non-ignored file selected, the ignored
+    file's group is skipped exactly as it was before."""
+    groups = for_framework("vitest").p2p_argvs(
+        selected=("tests/f.test.js::red", "tests/g.test.js::blue"), scope=(),
+        deselected=(), ignored=("tests/f.test.js",))
+
+    assert len(groups) == 1
+    assert not any("f.test.js" in arg for arg in groups[0])
+    assert any("g.test.js" in arg for arg in groups[0])
+
+
+def test_the_explicit_branch_does_not_drop_every_group_when_every_selected_file_is_ignored():
+    """Mirrors the deselect branch's own guard
+    (`test_group_zero_survives_when_it_is_the_only_group_there_could_be` in
+    `test_preflight.py`). `ignored` is preflight's p2p-BEFORE flag, naming
+    files whose f2p module failed to import at the start state -- and on an
+    explicit `tests.p2p` task every declared id can live in that one module,
+    so dropping every one of them the way the partial case above drops a
+    single file would return `groups == []` here. An empty SEQUENCE is what
+    `_Runner.run` refuses, and `run_matrix.py` has no `except` around
+    `preflight(...)` -- so an unconditional drop turns a per-task NO-GO into a
+    `ValueError` that kills every remaining task's gate. The group is emitted,
+    and the run is left loud (KIND_NOTHING_RAN), instead."""
+    for framework in ("vitest", "jest"):
+        groups = for_framework(framework).p2p_argvs(
+            selected=("tests/f.test.js::red",), scope=(),
+            deselected=(), ignored=("tests/f.test.js",))
+
+        assert len(groups) == 1, framework
+        assert "-t" in groups[0], framework
+
+
 def test_no_node_argv_group_ever_carries_two_dash_t():
     """The ONE-`-t` rule is per ARGV and was never about one invocation.
     Measured 2026-09-02:
@@ -1146,15 +1180,20 @@ def test_a_scope_prefix_that_is_itself_the_deselected_file_gets_no_group_zero():
 def test_group_zero_survives_when_it_is_the_only_group_there_could_be():
     """The skip above is conditional on something ELSE running. With no
     deselected file there is no other group, and an empty SEQUENCE is what
-    `_Runner.run` refuses -- so a loud empty invocation (exit 1, a report of
-    zero tests, KIND_NOTHING_RAN, a NO-GO naming the scope) is emitted
-    instead of a crash out of the middle of the gate."""
+    `_Runner.run` refuses -- so group 0 is kept instead of a crash out of the
+    middle of the gate. It does not stay empty, though: with the whole
+    declared scope excluded, `_scope_positionals` falls back to sweeping the
+    whole repository minus the excluded file -- the same argv the `scope=()`
+    callers already get -- so what is emitted is a WIDENED regression check,
+    not a loud empty one."""
     groups = for_framework("jest").p2p_argvs(
         selected=(), scope=("tests/a.test.js",), deselected=(),
         ignored=("tests/a.test.js",))
 
     assert len(groups) == 1
     assert "-t" not in groups[0]
+    assert groups[0] == [
+        "^(?!tests/a\\.test\\.js$)(?!/repo/tests/a\\.test\\.js$).*"]
 
 
 def test_node_merge_reports_concatenate_test_results_and_sum_pending():

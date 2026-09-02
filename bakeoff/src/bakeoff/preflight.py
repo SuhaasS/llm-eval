@@ -2195,7 +2195,8 @@ def preflight(
             "into a file it does not name, and a quarantine would silently "
             "remove a test from the regression check. jest anchors at the mount "
             "and cannot hit this. Rename or move one of the files in the task "
-            "repo, or narrow tests.paths; see taskset/HARVESTING.md."
+            "repo, or declare an explicit tests.p2p that does not reach either "
+            "file; see taskset/HARVESTING.md."
         )
 
     return PreflightResult(
