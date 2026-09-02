@@ -61,7 +61,13 @@ Runs inside the pinned image, before the proxy starts.
 - **`python --version` inside the image parses to the declared
   `image.python`.** The base tag is local and mutable; a stale or mismatched
   base runs the suite under an interpreter the task was not cut for, and
-  every other gate stays green.
+  every other gate stays green. **On python tasks only.** On a node task the
+  probe never runs and both `python_declared` and `python_observed` are
+  `null` — the node base ships no `python` at all, and a node manifest is
+  forbidden from declaring `image.python`, so a gate that probed anyway got a
+  non-zero exit and refused every node task in the set. `null` is "the gate
+  did not look", which is a different absence from the `""` a probe that ran
+  and answered nothing files.
 - The container's HEAD is `start_sha`.
 - **No `CLAUDE.md`, `AGENTS.md`, `.claude` or `.cursorrules` in the start
   state.** §5.2 pins the session config precisely because agent files
@@ -290,7 +296,14 @@ rules, not instead of them.
   `/node_modules/.bin` on `PATH`; a task's own dependencies go through
   `image.build` at the same prefix:
 
-      build: ["sh", "-lc", "npm install --prefix / --omit=dev <deps>"]
+      build: ["npm install --prefix / --omit=dev <deps>"]
+
+  Each element of `image.build` is one **shell command string**, rendered as
+  its own `RUN cd /repo && <element>` — not an argv. An `["sh", "-lc", "…"]`
+  spelling renders three RUN lines, the second of which is `RUN cd /repo &&
+  -lc` and exits 127, so the build fails before your dependencies are
+  installed. The `cd /repo && ` prefix is already there; a shell is already
+  there.
 
   **Never `npm ci` at that prefix.** Its documented contract is to delete
   `node_modules` before installing, and that is where the runners live;

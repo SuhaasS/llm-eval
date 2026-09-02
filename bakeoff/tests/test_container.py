@@ -246,6 +246,141 @@ def test_no_network_at_all_is_not_reported_as_isolated(alpine_container):
     assert "no recording proxy" in evidence
 
 
+# --- the bind mount actually landed ------------------------------------------
+
+
+class _FakeExec:
+    """One `exec_run` answer, in the shape the docker SDK returns under
+    `demux=True`: `(exit_code, (stdout, stderr))` with both halves bytes."""
+
+    def __init__(self, exit_code: int = 0, stdout: bytes = b""):
+        self.exit_code = exit_code
+        self.output = (stdout, b"")
+
+
+class _FakeContainer:
+    """A started container that answers a scripted `/repo` listing.
+
+    `removed` is the assertion this class exists for: `__exit__` is NOT
+    invoked when `__enter__` raises, so a post-condition that refuses without
+    removing leaves a live container carrying `bakeoff.eval_agent` -- the
+    label `HostSampler` counts peers by -- and every concurrent run would file
+    `contention_flag: true` against a container nobody is using.
+    """
+
+    def __init__(self, listing: bytes):
+        self.id = "fake"
+        self.listing = listing
+        self.removed = False
+        self.killed = False
+
+    def exec_run(self, cmd, **_kw):
+        if cmd[:1] == ["find"] or cmd[:1] == ["ls"]:
+            return _FakeExec(0, self.listing)
+        return _FakeExec(0, b"")
+
+    def kill(self):
+        self.killed = True
+
+    def remove(self, force=False):
+        self.removed = True
+
+
+class _FakeClient:
+    def __init__(self, container):
+        self.containers = self
+        self._container = container
+
+    def run(self, *_a, **_kw):
+        return self._container
+
+
+def _fake_docker(monkeypatch, container):
+    import bakeoff.container as container_module
+
+    monkeypatch.setattr(
+        container_module.docker, "from_env", lambda: _FakeClient(container)
+    )
+
+
+def test_a_bind_mount_that_did_not_land_is_refused_and_the_container_removed(
+    monkeypatch, tmp_path
+):
+    """The production half of the trap `test_integration_node_task._mounted`
+    found. A host path the Docker VM does share, rmtree'd and re-materialized
+    between containers, is served from a stale mount cache and appears EMPTY
+    inside the container -- measured, four cycles of the same path gave
+    `[files], [], [files], []`.
+
+    Nothing downstream can tell that apart from a legitimate answer. An empty
+    `/repo` exits **1** with `No test files found` under both node frameworks,
+    which is the same exit a failing test gives; on the offline grader it
+    becomes `APPLY_FAILED` and stamps `resolved: False` -- an accusation
+    against a submission the model actually produced -- over an environment
+    difference the model never saw. So the check is here, at the one place
+    every call site goes through, rather than in each of the four that reuse a
+    host path.
+
+    The removal is half the guarantee. `__exit__` is not invoked when
+    `__enter__` raises, and the container carries `bakeoff.eval_agent` -- the
+    label `HostSampler` counts peers by -- so a refusal that left it running
+    would flip `contention_flag` on every concurrent run for as long as it
+    survived.
+    """
+    (tmp_path / "repo").mkdir()
+    (tmp_path / "repo" / "a.txt").write_text("x")
+    fake = _FakeContainer(listing=b"")
+    _fake_docker(monkeypatch, fake)
+
+    with pytest.raises(ContainerError, match="bind mount"):
+        with RunContainer(
+            image="sha256:" + "0" * 64,
+            repo_path=str(tmp_path / "repo"),
+            base_sha="",
+        ):
+            pass
+
+    assert fake.removed, (
+        "a refused container was left running under the label the sampler "
+        "counts peers by"
+    )
+
+
+def test_a_bind_mount_that_landed_is_not_refused(monkeypatch, tmp_path):
+    """The other half: a container that answers with anything at all is the
+    ordinary case, and this check must never cost a run that would work."""
+    (tmp_path / "repo").mkdir()
+    (tmp_path / "repo" / "a.txt").write_text("x")
+    fake = _FakeContainer(listing=b"/repo/a.txt\n")
+    _fake_docker(monkeypatch, fake)
+
+    with RunContainer(
+        image="sha256:" + "0" * 64,
+        repo_path=str(tmp_path / "repo"),
+        base_sha="",
+    ) as container:
+        assert container._container is fake
+    assert fake.removed, "the ordinary exit still removes the container"
+
+
+def test_an_empty_host_directory_is_not_a_mount_failure(monkeypatch, tmp_path):
+    """The post-condition is conditioned on the HOST side being non-empty,
+    because an empty answer is only evidence of a stale mount when there was
+    something to see. `oracle.py` and the grader both start a container over a
+    directory they are about to populate, and refusing those would turn a
+    defensive check into an outage."""
+    (tmp_path / "repo").mkdir()
+    fake = _FakeContainer(listing=b"")
+    _fake_docker(monkeypatch, fake)
+
+    with RunContainer(
+        image="sha256:" + "0" * 64,
+        repo_path=str(tmp_path / "repo"),
+        base_sha="",
+    ):
+        pass
+
+
 class _AddSequence:
     """A `git add -A` that fails the way the real race does, N times."""
 

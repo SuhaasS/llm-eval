@@ -532,7 +532,7 @@ tests:
 
 image:
   node: "22"                            # QUOTED. {"22"} today
-  build: ["sh", "-lc", "npm install --prefix / --omit=dev lodash@4.17.21"]
+  build: ["npm install --prefix / --omit=dev lodash@4.17.21"]
 ```
 
 `framework` and `runner` are cross-checked, not derived from each other, so

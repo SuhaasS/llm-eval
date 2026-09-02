@@ -2119,10 +2119,21 @@ def test_the_preflight_version_moved_with_the_new_assertion():
     is the first commit of that broadening to change what the gate ASSERTS --
     the ones before it are a refactor whose argv is byte-identical on both
     branches -- so it is the first that must invalidate a cache, and it
-    carries `evidence["framework"]` with it."""
+    carries `evidence["framework"]` with it.
+
+    10 -> 11 is that broadening's own final review, and it moves for the same
+    reason 9 -> 10 did while changing no verdict at all. Three evidence keys
+    changed what an ABSENCE means: `duplicate_full_names` and
+    `scope_files_outside` went from `[]` to `None` for a scoped run that wrote
+    no report, and `f2p_before_not_run` joined them -- it was `[]` on the
+    runner-gate early return, which starts no container, and on a node f2p run
+    that produced no report, so it claimed a measurement it never made. A blob
+    cached before and one written after would otherwise share a version string
+    with `[]` meaning two different things in them, which is the one thing
+    this number exists to let a reader rule out."""
     from bakeoff.preflight import PREFLIGHT_VERSION
 
-    assert PREFLIGHT_VERSION == "10"
+    assert PREFLIGHT_VERSION == "11"
 
 
 # --- every submodule is initialised at its gitlink ---------------------------
@@ -3030,13 +3041,52 @@ def test_every_new_evidence_key_is_present_on_an_explicit_p2p_task():
 
 def test_the_new_evidence_keys_survive_the_early_return():
     """The runner-gate refusal returns before any container starts. The two
-    keys knowable without one are still written; the rest stay `None`."""
+    keys knowable without one are still written; the rest stay `None`.
+
+    `f2p_before_not_run` is one of the rest, and it used to be `[]` here. No
+    container started, no f2p selection ran, and nothing read a report -- so
+    `[]`, which everywhere else in this file means "measured, every declared
+    id ran", was a claim about a measurement this path never made. It is the
+    same correction `duplicate_full_names` and `scope_files_outside` already
+    carry, and it is what moved `PREFLIGHT_VERSION` to 11."""
     result = _preflight_over(_node_container(runner=("python", "-m", "pytest")))
 
     assert not result.ok
     assert result.evidence["scope_files_run"] is None
     assert result.evidence["runner_cache_flags"] == ["--no-cache"]
-    assert result.evidence["f2p_before_not_run"] == []
+    assert result.evidence["f2p_before_not_run"] is None
+
+
+def test_an_f2p_run_that_wrote_no_report_did_not_measure_what_ran():
+    """The second shape, and the one a cached verdict actually gets wrong.
+
+    Measured 2026-09-01 on both node frameworks: a broken config exits 1 and
+    writes NO report at all. `verify_selected` never runs (`classify` guards on
+    `last_report is not None`), so `Outcome.not_run` stays empty and
+    `sorted(...)` gave `[]` -- byte-identical to "every declared id reached a
+    verdict" -- for a run that produced no evidence whatever. The verdict is
+    still NO-GO, because a report-less run is an ENVIRONMENT outcome and the
+    red-before assertion refuses it; but the evidence outlives the verdict, and
+    it was saying the gate had checked and cleared.
+
+    `report_path() is None` is NOT this absence, which is why the guard is not
+    a bare `last_report is not None`: pytest writes no report BY DESIGN and
+    answers a selection matching nothing with exit 4 and an `ERROR: not found:`
+    line, so `[]` there is a claim the framework backs. A missing report is an
+    absence only on a framework that writes one."""
+    container, task = _node_container()
+    container.reports["f2p_before"] = None
+
+    with tempfile.TemporaryDirectory() as repo:
+        with mock.patch("bakeoff.preflight.RunContainer",
+                        lambda **kwargs: container):
+            result = preflight(task, image="sha256:x", repo_path=Path(repo),
+                               start_sha="s" * 40)
+
+    assert not result.ok
+    assert result.evidence["f2p_before_not_run"] is None
+    # Not a claim that every id ran, and not a claim that none did.
+    assert not any("did not RUN" in p for p in result.problems)
 
 
 def test_a_scoped_run_that_left_the_declared_paths_is_a_problem():
@@ -3051,6 +3101,32 @@ def test_a_scoped_run_that_left_the_declared_paths_is_a_problem():
 
     assert not result.ok
     assert result.evidence["scope_files_outside"] == ["jtests/b.test.cjs"]
+
+
+def test_a_node_scoped_run_that_collected_nothing_gets_the_named_code():
+    """The last raw exit-code branch in this file, and it could only ever fire
+    for pytest.
+
+    `SCOPE_COLLECTS_NOTHING` is what `grade.py` turns into
+    `NotGradedReason.SCOPE_COLLECTED_NOTHING` -- a mis-scoped task and a task
+    that fails its red-before assertion are different author errors with
+    different remedies, and the generic reason sends the author looking for a
+    bug in a task whose only defect is a `tests.paths` that selects nothing.
+    The branch read pytest's exit **5** for it, and neither node framework has
+    one: measured, vitest and jest answer a scope that matched no file with 1,
+    and a `-t` that matched nothing inside a file that DID load with 0. So a
+    mis-scoped node task got the generic reason and its author got sent to the
+    wrong place.
+
+    `KIND_NOTHING_RAN` is the same fact stated in terms no framework owns, and
+    it is pytest-identical: `pytest_adapter.classify` returns exactly this kind
+    for exit 5."""
+    from bakeoff.preflight import SCOPE_COLLECTS_NOTHING
+
+    result = _preflight_over(_node_container(scope_names=[]))
+
+    assert not result.ok
+    assert SCOPE_COLLECTS_NOTHING in result.problem_codes
 
 
 def test_the_scope_check_matches_by_path_component_not_by_prefix_string():

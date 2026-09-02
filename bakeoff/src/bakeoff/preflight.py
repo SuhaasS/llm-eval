@@ -39,6 +39,7 @@ from bakeoff.container import RunContainer
 from bakeoff.runners import (
     KIND_FAILED,
     KIND_LOAD_ERROR,
+    KIND_NOTHING_RAN,
     KIND_PASSED,
     Outcome,
     for_framework,
@@ -137,7 +138,18 @@ _PYTEST_ADAPTER = for_framework("pytest")
 #: refactor whose argv is byte-identical on both branches -- so a warm verdict
 #: served across them describes a gate that would return the same verdict,
 #: which is the property this version exists to protect.
-PREFLIGHT_VERSION: str = "10"
+#: 11 is the same rule applied to that broadening's own review. Three evidence
+#: keys changed what an absence MEANS without changing any verdict:
+#: `duplicate_full_names` and `scope_files_outside` went from `[]` ("measured,
+#: nothing found") to `None` ("no scoped run was made, or it wrote no report"),
+#: and `f2p_before_not_run` joined them -- it was `[]` on the runner-gate early
+#: return, which starts no container at all, and on a node f2p run that wrote
+#: no report, so it claimed a measurement it never made. A cached blob and a
+#: fresh one would otherwise carry the identical version string with `[]`
+#: meaning two different things in them, which is exactly what a reader uses
+#: this number to rule out. The gate's GO/NO-GO is unchanged across 10 -> 11;
+#: what moved is what a stored verdict's evidence can be read to say.
+PREFLIGHT_VERSION: str = "11"
 
 
 def preflight_cache_key(task, image: str, start_sha: str) -> str:
@@ -782,13 +794,23 @@ def preflight(
     # across a set of cached verdicts. `None` is "not measured on this path";
     # `[]` is "measured, nothing found".
     #
-    # `runner_cache_flags` and `f2p_before_not_run` start as `[]` rather than
-    # `None` because both are measured on EVERY path that reaches them -- the
-    # cache flags before the container, the not-run set on every f2p run -- so
-    # a `None` there would be a third state nothing can produce.
+    # `runner_cache_flags` starts as `[]` rather than `None` because it is
+    # measured on every path that reaches it: it is a function of the adapter
+    # and of `tests.runner`, so it is knowable with no container at all.
+    #
+    # `f2p_before_not_run` is NOT, and it used to claim otherwise. Two paths
+    # reach the end of this function without measuring it: the runner-gate
+    # early return below, which starts no container and runs no selection, and
+    # a node f2p run that wrote NO REPORT AT ALL -- measured 2026-09-01, what a
+    # broken config gives on both frameworks -- where `classify` guards on
+    # `last_report is not None`, `verify_selected` never runs, and
+    # `Outcome.not_run` stays empty. On both, `[]` said "measured, every
+    # declared id reached a verdict" for a gate that measured nothing. Same
+    # rule as `duplicate_full_names` and `scope_files_outside`, and the reason
+    # `PREFLIGHT_VERSION` moved to 11.
     evidence["runner_cache_flags"] = []
     evidence["runner_cache_flags_missing"] = []
-    evidence["f2p_before_not_run"] = []
+    evidence["f2p_before_not_run"] = None
     evidence["duplicate_full_names"] = None
     evidence["scope_files_run"] = None
     evidence["scope_files_outside"] = None
@@ -1350,7 +1372,19 @@ def preflight(
         # error, where a file that did not load holds no assertions, nothing
         # "ran" by construction, and the branch below already names it.
         not_run = sorted(red_outcome.not_run)
-        evidence["f2p_before_not_run"] = not_run
+        # `None` when this run produced no report on a framework that writes
+        # one: `verify_selected` never ran, so `not_run` is empty because
+        # nothing was checked rather than because nothing was missing. The
+        # same guard `duplicate_full_names` carries, for the same reason, and
+        # NOT a bare `last_report is not None` -- pytest writes no report by
+        # design and answers a selection matching nothing with exit 4 and an
+        # `ERROR: not found:` line, so `[]` there is a claim its framework
+        # backs. A missing report is an absence only where one is written.
+        evidence["f2p_before_not_run"] = (
+            not_run
+            if adapter.report_path() is None or runner.last_report is not None
+            else None
+        )
         if not_run and red_outcome.kind != KIND_LOAD_ERROR:
             problems.append(
                 "these declared f2p tests did not RUN at the start state: "
@@ -1725,7 +1759,18 @@ def preflight(
                         )
 
                     if scoped_outcome.kind != KIND_PASSED:
-                        if scoped.exit_code == EXIT_NOTHING_COLLECTED:
+                        # The OUTCOME, not the exit code -- the last raw one
+                        # in this file. Exit 5 is pytest's and only pytest's:
+                        # measured 2026-09-01, vitest and jest answer a scope
+                        # matching no file with 1 and a `-t` matching nothing
+                        # inside a file that loaded with 0, so a mis-scoped
+                        # node task fell through to the generic
+                        # `PREFLIGHT_FAILED` reason and sent its author
+                        # looking for a bug in the task instead of at
+                        # `tests.paths`. `KIND_NOTHING_RAN` is pytest-identical
+                        # -- `pytest_adapter.classify` returns exactly it for
+                        # exit 5 -- so the pytest branch is unchanged.
+                        if scoped_outcome.kind == KIND_NOTHING_RAN:
                             problem_codes.append(SCOPE_COLLECTS_NOTHING)
                         problems.append(
                             "the p2p run the GRADER will make is not green "

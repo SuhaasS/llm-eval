@@ -33,13 +33,18 @@ committing.
 ## Why the bug is an operator swap
 
 `a - b` -> `a + b` preserves the file's byte count, and the integration test
-re-runs the suite inside the same second. That pair is precisely the input that
-made CPython serve stale bytecode in this repository's own eval image on
-2026-08-13 -- `.pyc` invalidation keys on (source mtime in whole seconds,
-source size), and an operator swap moves neither -- feeding spec section 3.3's
-"runs tests, sees failures, self-corrects" loop the OLD behaviour after a
-correct fix, so the agent corrects away from the right answer and is scored on
-it. `PYTHONDONTWRITEBYTECODE=1` closed that on the python base. The node base
+re-runs the suite immediately, with no cache-clearing step between. That byte
+count is half of the input that made CPython serve stale bytecode in this
+repository's own eval image on 2026-08-13 -- `.pyc` invalidation keys on
+(source mtime in whole seconds, source size), and an operator swap moves
+neither -- feeding spec section 3.3's "runs tests, sees failures,
+self-corrects" loop the OLD behaviour after a correct fix, so the agent
+corrects away from the right answer and is scored on it. The whole-second half
+is not something the test controls and it does not claim to: a re-run that
+crossed a second boundary would still pass. The byte count is the half a
+fixture can pin.
+
+`PYTHONDONTWRITEBYTECODE=1` closed that on the python base. The node base
 declares no analogue, because measured 2026-09-01 there is nothing to close:
 vite's `.vite` directory is a DEPENDENCY optimiser cache rather than a
 source-transform one, and jest's cache is content-hash keyed. This fixture is

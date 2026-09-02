@@ -140,6 +140,15 @@ def verify_selected(report: dict | None, requested: tuple[str, ...],
     A missing report answers "all of them", not "none of them": `report=None`
     is the config-error signal, and "nothing was requested that did not run" is
     the one reading a run which produced no evidence cannot support.
+
+    That branch is for DIRECT callers -- this function is public and its rule
+    has to hold for whatever asks it. `preflight._Runner.classify`, the only
+    caller in the harness, cannot reach it: it guards on `last_report is not
+    None` before asking, because a report-less run is already an ENVIRONMENT
+    outcome there and replacing `not_run` on top of that would state the same
+    absence twice, once as a kind and once as a list of ids. Preflight's own
+    `f2p_before_not_run` says which absence it is instead -- `None` for a run
+    that wrote no report, `[]` for one that did and named every id.
     """
     if report is None:
         return frozenset(requested)
@@ -366,10 +375,16 @@ class _NodeFlavour:
     def executed_names(self, report):
         """Every assertion that reached a verdict, as `(relpath, fullName)`.
 
-        Defined AFTER `classify` on purpose: `scripts/mutation_check.py`
-        anchors that classifier's `if report is None:` by its exact text and
-        replaces the FIRST occurrence, so a second one earlier in the file
-        would silently move the mutation to a different guard.
+        `scripts/mutation_check.py` anchors `classify`'s own `if report is
+        None:` by its exact text and replaces the FIRST occurrence, and what
+        keeps that anchor on the right guard is INDENTATION, not position: the
+        anchor carries eight leading spaces, so every method body here matches
+        it and `verify_selected`'s module-level four-space guard -- which sits
+        EARLIER in this file than `classify` does -- cannot. Position only
+        orders the method-body ones among themselves. So a new four-space
+        `if report is None:` anywhere is harmless; an eight-space one added
+        above `classify` would silently move the mutation to a different
+        guard, and `mutation_check` would report CAUGHT for the wrong reason.
 
         `passed` OR `failed`, the same rule `verify_selected` reads through
         this method: a test that was skipped and a test that was never

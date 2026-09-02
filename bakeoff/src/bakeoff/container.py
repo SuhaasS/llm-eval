@@ -137,11 +137,87 @@ class RunContainer:
             labels={"bakeoff.eval_agent": "1"},
             **network_kwargs,
         )
+        self._assert_repo_mounted()
         if self.install_git:
             self.exec(["sh", "-c", "command -v git || apk add --no-cache git"])
         if self.base_sha:
             self.exec(["git", "config", "--global", "--add", "safe.directory", REPO_MOUNT])
         return self
+
+    def _assert_repo_mounted(self) -> None:
+        """Refuse a container whose bind mount did not land.
+
+        The trap is the Docker VM's mount cache, and it is NOT the macOS
+        `/var/folders` one (which the harness's `--basetemp` rule covers). A
+        host path the VM DOES share, removed and re-materialized underneath it
+        between containers, is served from a stale cache and comes up EMPTY:
+        measured 2026-09-02, four cycles of rmtree -> materialize -> new
+        container on one path gave `[files], [], [files], []`. Four production
+        call sites reuse a path that way -- `grader.py`'s `grade-tree/<run_id>`
+        on a re-grade, `oracle.py`'s `oracle-tree/<task_id>`, `grade.py`'s
+        `grade-preflight-tree/<task_id>`, and `run_matrix.py` -- so the check
+        belongs at the one place all four go through.
+
+        It is here because an empty `/repo` RESOLVES rather than failing. Both
+        node frameworks answer it with `No test files found` at exit **1**, the
+        same exit a failing test gives, so a gate passes while measuring
+        nothing; on the offline grader the same emptiness is `APPLY_FAILED`,
+        which stamps `resolved: False` -- an accusation that the model's patch
+        did not work -- over an environment difference the model never saw.
+        That is `_checked_exec`'s rule one layer up: an empty answer that is
+        byte-identical to a legitimate one is the failure this class refuses to
+        pass along quietly.
+
+        CONDITIONED ON THE HOST SIDE, because an empty answer is evidence only
+        when there was something to see: `oracle.py` and the grader both start
+        a container over a directory they are about to populate, and refusing
+        those would turn a defensive check into an outage.
+
+        THE REMOVAL IS HALF THE GUARANTEE. `__exit__` is not invoked when
+        `__enter__` raises, and this container carries `bakeoff.eval_agent` --
+        the label `HostSampler` counts peers by, and the one that makes a
+        leaked container findable -- so a refusal that left it running would
+        file `contention_flag: true` against every concurrent run for as long
+        as it survived.
+
+        The raise reaches `execute_run` inside its `try` (the `with
+        RunContainer` sits there), so a run refused here still produces a
+        CRASHED record naming this in `crash_error`, and never no record.
+
+        `-print -quit` rather than a bare listing: the question is whether
+        ANYTHING is there, and stopping at the first entry keeps the cost flat
+        on a large tree.
+        """
+        try:
+            host_empty = not any(os.scandir(self.repo_path))
+        except OSError:
+            # An unreadable host path is not this check's finding to make --
+            # whatever comes next will fail on it loudly and with the right
+            # message. Refusing here would rename that failure.
+            return
+        if host_empty:
+            return
+        seen = self.exec(
+            ["find", REPO_MOUNT, "-mindepth", "1", "-maxdepth", "1",
+             "-print", "-quit"]
+        )
+        if seen.stdout.strip():
+            return
+        try:
+            self._container.remove(force=True)
+        except Exception:  # noqa: BLE001 - the raise below is the real signal
+            pass
+        finally:
+            self._container = None
+        raise ContainerError(
+            f"{REPO_MOUNT} is empty inside the container but {self.repo_path} "
+            "is not: the bind mount did not land (the Docker VM serves a "
+            "reused host path from a stale cache -- measured, every other "
+            "container on one path). Nothing downstream can see this: an "
+            "empty /repo is byte-identical to a red suite on both node "
+            "frameworks (`No test files found`, exit 1) and to APPLY_FAILED "
+            "on the grader. Use a fresh path per container."
+        )
 
     def __exit__(self, *_exc: object) -> None:
         if self._container is not None:

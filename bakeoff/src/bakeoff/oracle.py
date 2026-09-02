@@ -318,10 +318,6 @@ def _derive(task, image: str, cache_root: Path) -> tuple[str, ...]:
             # site left on the default would read a broken jest run as "these
             # tests failed" and quarantine them -- shrinking the regression
             # check on every submission of that task, forever.
-            #
-            # `getattr` with a default, like `preflight._gate`'s: the manifest
-            # key is broadening 7 Task 4's, and a `task` object predating it
-            # must not crash the derivation.
             runner = _Runner(container, task.tests.runner,
                              task.budget.suite_timeout_s,
                              for_framework(task.tests.framework))

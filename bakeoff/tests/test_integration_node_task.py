@@ -288,6 +288,11 @@ def test_the_node_fixture_gates_green(node_tree, node_image):
     assert result.evidence["framework"] == "vitest"
     assert result.evidence["f2p_red_kind"] == "failed"
     assert result.evidence["f2p_before_not_run"] == []
+    # `[]`, not `None`, and the pair is the assertion. Both keys are `None`
+    # when the run that would fill them wrote no report -- what a broken
+    # config gives on both node frameworks -- so a real green gate is the one
+    # place the `[]` side of that distinction can be measured end to end.
+    assert result.evidence["duplicate_full_names"] == []
     assert result.evidence["scope_files_outside"] == []
     assert result.evidence["runner_cache_flags_missing"] == []
     assert result.evidence["dirty_after_tests"] == ""
@@ -330,11 +335,18 @@ def test_a_fix_at_the_same_byte_count_in_the_same_second_is_seen(
     """There is no `.pyc` analogue here, and this is where that stops being a
     probe result.
 
-    `src/calc.js`'s bug is an operator swap, so the fix preserves byte count,
-    and the second run starts inside the same second -- the exact input that
-    made pytest serve stale bytecode in this repo's own eval image on
-    2026-08-13, feeding section 3.3's self-correction loop the OLD behaviour
-    after a correct fix.
+    `src/calc.js`'s bug is an operator swap, so the fix preserves the file's
+    byte count, and nothing between the two runs clears a cache. That is the
+    half this test controls, and it is the half CPython's invalidation key --
+    (source mtime in whole seconds, source size) -- makes cheap to defeat: it
+    is what served stale bytecode in this repo's own eval image on 2026-08-13,
+    feeding section 3.3's self-correction loop the OLD behaviour after a
+    correct fix. The seconds half is NOT controlled here and is not claimed:
+    a run that crossed a second boundary would pass this test too. The
+    measurement that settles the node side is the negative one recorded in
+    `fixtures/node_task/README.md` -- vite's `.vite` is a dependency-optimiser
+    cache, not a source-transform one, and jest's is content-hash keyed -- and
+    this test is what would notice if either stopped being true.
     """
     task, repo, start_sha = node_tree
     runner = ["timeout", "600", *task.tests.runner, "tests/calc.test.js",
@@ -467,7 +479,7 @@ def node_oracle(task_dir, node_image):
     return ensure_oracle(load_task(task_dir), node_image, CACHE_ROOT)
 
 
-def test_the_grader_resolves_the_reference_fix(node_tree, node_image,
+def test_the_grader_resolves_the_reference_fix(task_dir, node_image,
                                                node_oracle, tmp_path_factory):
     """Checks 5 and 6 over a real node submission. The reference diff IS the
     oracle, so if it does not grade `resolved: True` no submission can.
@@ -478,7 +490,10 @@ def test_the_grader_resolves_the_reference_fix(node_tree, node_image,
     """
     from bakeoff.grader import grade_run
 
-    task, _, _ = node_tree
+    # `task_dir`, not `node_tree`: the grader materializes its own tree from
+    # the manifest, so taking the fixture that builds one costs a `materialize`
+    # per test and pins nothing.
+    task = load_task(task_dir)
     record = _record_with_diff(task, task.solution_diff)
 
     grade = grade_run(record, task, node_image, node_oracle, CACHE_ROOT,
@@ -490,14 +505,14 @@ def test_the_grader_resolves_the_reference_fix(node_tree, node_image,
 
 
 def test_an_empty_submission_is_EMPTY_PATCH_and_never_reaches_the_suite(
-    node_tree, node_image, node_oracle, tmp_path_factory
+    task_dir, node_image, node_oracle, tmp_path_factory
 ):
     """`EMPTY_PATCH` is a GradeFailure rather than a NotGradedReason: the run
     produced turns, cost tokens and changed no file, which is a fact about the
     model and belongs in the denominator."""
     from bakeoff.grader import grade_run
 
-    task, _, _ = node_tree
+    task = load_task(task_dir)
     record = _record_with_diff(task, "")
 
     grade = grade_run(record, task, node_image, node_oracle, CACHE_ROOT,

@@ -825,31 +825,20 @@ one ends a multi-day run outright.
   `oracle-tree/<task_id>`, `grade.py`'s `grade-preflight-tree/<task_id>`, and
   `run_matrix.py`. The integration test that found this worked around it
   locally with a uuid per run tree plus a post-container `ls` post-condition
-  (`tests/test_integration_node_task.py`'s `_mounted`); neither landed in the
-  production paths above. The reviewed ruling was a defensive post-condition
-  in `RunContainer.__enter__` (`bakeoff/src/bakeoff/container.py`) — when the
-  host `repo_path` is non-empty, exec an `ls`/`find` inside the container
-  after start and raise `ContainerError` naming the bind mount if it comes
-  back empty — pinned by a unit test against the fake docker client already
-  used in `test_container.py`. That catches the symptom per container start;
-  it does not remove the cause, which is the four call sites above reusing
-  one path across containers instead of a uuid per tree. Neither the
-  post-condition nor the uuid change has landed as of `cc151c0`.
+  (`tests/test_integration_node_task.py`'s `_mounted`). **The post-condition
+  has since landed in production** (broadening 7, Task 10's final review):
+  `RunContainer._assert_repo_mounted` runs at the end of `__enter__` and, when
+  the host `repo_path` is non-empty, execs `find /repo -mindepth 1 -maxdepth 1
+  -print -quit` and raises `ContainerError` naming the bind mount if it comes
+  back empty — force-removing the container first, since `__exit__` is not
+  invoked when `__enter__` raises and a survivor carries `bakeoff.eval_agent`
+  and would flip `contention_flag` on every peer. Pinned by three unit tests
+  against a fake docker client in `test_container.py`.
 
-- [ ] **A cached preflight verdict cannot tell which of two evidence shapes
-  produced it, because the version that should have moved did not.**
-  Broadening 7, Task 9 changed what `duplicate_full_names` and
-  `scope_files_outside` mean for a scoped run that wrote **no** report at all
-  — `[]` ("measured, nothing found") became `None` ("nothing was measured") —
-  which is exactly the class of change `PREFLIGHT_VERSION` exists to
-  invalidate a stale cache over. The review that found it ruled
-  `PREFLIGHT_VERSION` should move `"10"` → `"11"`; the shipped code still
-  pins `"10"` (a `test_preflight.py` assertion pins the literal, and
-  `preflight.py`'s own constant agrees), so a verdict cached before the fix
-  and one computed after it carry the identical version string. Neither is
-  wrong on its own — `[]` versus `None` is still the correct pair going
-  forward — but a reader cannot use the version alone to know which meaning a
-  stored `"10"` evidence blob is using.
+  **What remains is the cause, not the symptom**: the four call sites above
+  still reuse one host path across containers instead of a uuid per tree, so
+  the post-condition converts a silent wrong measurement into a loud refusal
+  and no further. Give each of them a unique run-tree path.
 
 ---
 
