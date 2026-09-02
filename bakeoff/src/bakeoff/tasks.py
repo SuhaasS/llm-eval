@@ -586,12 +586,13 @@ _REPO_MOUNT = "/repo"
 #:          assert against `TZ=America/New_York` (`test/zones/local.test.js`)
 #:          and this allowlist had no way to grant it. `_env_map` holds TZ to
 #:          an extra value shape the other two keys do not need
-#:          (`_TZ_VALUE = re.compile(r"\A[A-Za-z0-9_+\-/]+\Z")`): a `TZ` value
-#:          is consumed by libc, not by this harness, and a leading `:` makes
-#:          glibc read the rest as a FILE PATH rather than a zone name -- the
-#:          character-blacklist check above this constant does not catch a
-#:          bare `:/etc/localtime`, so TZ needs a positive allowlist of its
-#:          own on top of it.
+#:          (`_TZ_VALUE = re.compile(r"\A(?!/)[A-Za-z0-9_+\-/]+\Z")`): a `TZ`
+#:          value is consumed by libc, not by this harness, and a leading `:`
+#:          OR `/` makes glibc read the rest as a FILE PATH rather than a
+#:          zone name -- the character-blacklist check above this constant
+#:          does not catch a bare `/etc/localtime` (no colon at all, and `/`
+#:          is a legal zone-name character), so TZ needs a positive allowlist
+#:          of its own on top of it.
 _IMAGE_ENV_ALLOWED = frozenset({"CI", "HYPOTHESIS_STORAGE_DIRECTORY", "TZ"})
 
 #: The test frameworks this harness can classify. Closed, and it must equal
@@ -788,12 +789,17 @@ _ENV_KEY = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
 #: The extra shape a TZ value must have, on top of `_ENV_VALUE_REFUSED`. An
 #: IANA zone name (`America/New_York`) or `UTC`/`Etc/GMT+N` -- letters,
 #: digits, `_`, `+`, `-`, `/`. glibc's `tzset` reads a `TZ` value starting
-#: with `:` as a FILE PATH rather than a zone name, and the character
-#: blacklist above does not refuse a bare `:` -- so `:/etc/localtime` (or
-#: worse, a path into the image an agent's edits could reach) would pass that
-#: check and be handed to libc verbatim. This regex is a positive allowlist
-#: instead, precisely because the value is consumed outside this harness.
-_TZ_VALUE = re.compile(r"\A[A-Za-z0-9_+\-/]+\Z")
+#: with `:` OR `/` as a FILE PATH rather than a zone name: a leading `:` is
+#: already refused by the character class (`:` was never in it), but a
+#: leading `/` was not, and `/` IS in the class for `America/New_York` and
+#: `Etc/GMT+5`. Measured 2026-09-02 in the eval image (glibc 2.36):
+#: `TZ=/usr/share/zoneinfo/Asia/Tokyo` resolves identically to
+#: `TZ=:/usr/share/zoneinfo/Asia/Tokyo`, and `TZ=/etc/localtime` resolves
+#: too -- so a bare leading `/`, with no colon anywhere, hands libc a path
+#: into the image just as effectively, including a path an agent's own edits
+#: could reach (`/repo/tzfile`, say). The negative lookahead below refuses
+#: only a LEADING `/`; the character elsewhere in the value is unaffected.
+_TZ_VALUE = re.compile(r"\A(?!/)[A-Za-z0-9_+\-/]+\Z")
 
 
 def _env_map(value: Any, where: str) -> dict[str, str]:
@@ -874,8 +880,8 @@ def _env_map(value: Any, where: str) -> dict[str, str]:
             raise TaskError(
                 f"{where}: {key!r} value {raw_value!r} is not an IANA zone "
                 "name or UTC/Etc/GMT+N. A TZ value is consumed by libc, not "
-                "by this harness -- a leading `:` makes glibc read the rest "
-                "as a file path rather than a zone name, which the "
+                "by this harness -- a leading `:` OR `/` makes glibc read "
+                "the rest as a file path rather than a zone name, which the "
                 "character blacklist above does not catch on its own"
             )
         env[key] = raw_value

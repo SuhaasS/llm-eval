@@ -2271,6 +2271,27 @@ def test_a_bare_collection_error_is_not_a_problem(monkeypatch, tmp_path):
     assert result.evidence["bare_runner_exit"] == EXIT_COLLECTION_INTERRUPTED
 
 
+def test_a_bare_exit_code_outside_the_accepted_set_is_a_problem(
+    monkeypatch, tmp_path
+):
+    """127 is "command not found" -- the interpreter this probe resolved is
+    not on PATH, which is exactly "the agent cannot run the command it will
+    naturally type". Falling through the 0/1/2/4/5/124 ladder in silence
+    would record `bare_runner_exit: 127` as evidence with no problem beside
+    it, reading as a clean gate."""
+    task = _FakeTask()
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=task.tests, present=("tests/",),
+        bare_runner=_Exec(exit_code=127, stderr="exec: python: not found\n"),
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert not result.ok
+    assert any("127" in p for p in result.problems), result.problems
+    assert result.evidence["bare_runner_exit"] == 127
+
+
 def test_a_node_task_never_runs_a_bare_pytest_at_all(monkeypatch, tmp_path):
     """vitest and jest have no addopts analogue -- both exit 1 for a broken
     config, a failing test and an unresolvable import alike (measured), so a
@@ -2308,8 +2329,7 @@ def test_the_bare_argv_carries_none_of_tests_runners_extra_arguments(
     argv = result.evidence["bare_runner_argv"]
     assert "--override-ini=addopts=" not in argv
     assert "tests/" not in argv
-    assert argv == ["timeout", "600", "python", "-m", "pytest",
-                    "--co", "-q", "-p", "no:cacheprovider"]
+    assert argv == ["timeout", "600", "python", "-m", "pytest", "--co", "-q"]
 
 
 def test_the_bare_probe_runs_before_the_reference_is_applied(
@@ -2960,6 +2980,13 @@ def test_preflight_refuses_a_runner_that_does_not_match_the_framework(tmp_path):
     assert "unittest" in result.problems[0]
     # No container was started, so the container-only evidence keys stay None.
     assert result.evidence["image_env_observed"] is None
+    assert result.evidence["bare_runner_exit"] is None
+    # The OTHER path that skips the bare-runner probe: `bare_runner_skipped`
+    # must carry a reason here too, not just on the node early-return path
+    # covered by `test_a_node_task_never_runs_a_bare_pytest_at_all` -- an
+    # unset key would render identically to "the probe ran and skipped
+    # silently", which is exactly the absence this key exists to distinguish.
+    assert result.evidence["bare_runner_skipped"]
 
 
 def test_preflight_evidence_names_the_framework_it_judged_under():

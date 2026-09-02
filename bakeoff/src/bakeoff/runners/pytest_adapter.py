@@ -83,7 +83,14 @@ _EXIT_MEANING = {
 #: `ERROR: not found:`, which the alternation must keep excluding) --
 #: `[^)\n]*` / `[^\]\n]*` bound the label to one line so a stray unmatched
 #: bracket in a subtest's own `-` message can never swallow the node id past
-#: it. There is no `SUBERROR`: the same measurement raised a bare `ValueError`
+#: it. The accepted cost is the opposite direction: a label whose OWN value
+#: contains a balanced `)` or `]` (`SUBFAILED(msg='a)b') tests/x.py::T::t -
+#: ...`) stops the class one character early, so neither alternative matches
+#: and the line's node id is DROPPED rather than mis-captured -- degrading to
+#: the pre-fix (v7) behaviour for that one line. Judged rarer than the id
+#: being swallowed, and unaddressed.
+#:
+#: There is no `SUBERROR`: the same measurement raised a bare `ValueError`
 #: (not an assertion) inside a `subTest` block and pytest still labelled the
 #: line `SUBFAILED`, so no second alternative was added for a shape that does
 #: not occur. A node all of whose subtests pass prints no FAILURES entry and
@@ -140,9 +147,18 @@ def _runner_python(runner: tuple[str, ...]) -> str:
 
     Falls back to "python" when `runner[0]` is not an interpreter at all --
     `["pytest", "-q", ...]` is a legal runner, and the console script gives no
-    interpreter path to reuse. The fallback is a guess and is allowed to be:
-    this probe decides whether to ASK for `CI`, and preflight's runner check
-    has already established that `pytest` is in the argv.
+    interpreter path to reuse.
+
+    Two callers, two different costs for the same guess. The availability
+    probe's fallback is allowed to be a guess: it decides whether to ASK for
+    `CI`, and preflight's runner check has already established that `pytest`
+    is in the argv, so a wrong guess there costs one skipped question. The
+    bare-runner probe (`preflight.py`, broadening 7) is the SECOND caller,
+    and its fallback consequence is a NO-GO, not a question -- on a
+    `["pytest", "-q", ...]` runner the fallback's `python -m pytest` can
+    resolve a different interpreter than the gated argv would have run under,
+    and a usage error from THAT mismatch is filed against the repository's
+    own configuration exactly as a real one would be.
     """
     if runner and _PYTHON_BASENAME.match(PurePosixPath(runner[0]).name):
         return runner[0]

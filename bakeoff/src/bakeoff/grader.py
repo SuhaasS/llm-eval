@@ -954,6 +954,14 @@ def _check_test_restore(state: _State, task, env, start_sha: str,
             )
 
     for prefix in paths:
+        if prefix in submodules:
+            # `prefix` is nothing but a gitlink -- the exclusion above already
+            # left it untouched and `excludes` empties this pathspec, so a
+            # `git checkout` here can only fail with the same message the
+            # "absent at the start state" branch below uses for a genuinely
+            # missing prefix. Skip it rather than file a note that misnames
+            # the cause: this path was not absent, it was excluded.
+            continue
         restored = env.exec(
             ["git", "checkout", start_sha, "--", prefix, *excludes]
         )

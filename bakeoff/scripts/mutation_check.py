@@ -1605,6 +1605,21 @@ MUTATIONS = [
         "not integration",
     ),
     (
+        # Fix 1's own exclusion had no anchor: both the `find` and the
+        # `replace` above carry `*excludes` verbatim, so neither mutation
+        # exercises it. Deleting `*excludes` from the `git rm` restores the
+        # exact tomlkit-514 defect this exclusion was written to close -- a
+        # submodule under a declared test prefix gets blindly `rm -r`'d.
+        "grader: rm a submodule the exclusion was supposed to spare",
+        "src/bakeoff/grader.py",
+        '            ["git", "rm", "-r", "-f", "--quiet", "--ignore-unmatch", "--",\n'
+        "             *paths, *excludes]",
+        '            ["git", "rm", "-r", "-f", "--quiet", "--ignore-unmatch", "--",\n'
+        "             *paths]",
+        "tests/test_grader.py -k excluded_from_rm_and_checkout",
+        "not integration",
+    ),
+    (
         # The other half of the same guarantee, and the non-obvious one:
         # without `--index` an agent-ADDED file stays untracked, and
         # `git rm` cannot remove an untracked path (measured). The restore

@@ -2363,6 +2363,31 @@ def test_a_leading_colon_tz_value_is_refused(tmp_path, upstream, value):
     assert "IANA zone" in str(exc.value)
 
 
+@pytest.mark.parametrize(
+    "value", ["/etc/localtime", "/usr/share/zoneinfo/Asia/Tokyo", "/repo/tzfile"]
+)
+def test_a_leading_slash_tz_value_is_refused(tmp_path, upstream, value):
+    """The colon guard alone does not close this: glibc's `tzset` reads a
+    leading `/` exactly like a leading `:` -- a FILE PATH rather than a zone
+    name -- and `/` is a character `_TZ_VALUE`'s class already allows for
+    `America/New_York` and `Etc/GMT+5`. Measured 2026-09-02 in the eval image
+    (glibc 2.36): `TZ=/usr/share/zoneinfo/Asia/Tokyo` resolves identically to
+    `TZ=:/usr/share/zoneinfo/Asia/Tokyo`, and `TZ=/etc/localtime` resolves
+    too, with no colon anywhere. Without a leading-`/` refusal a manifest
+    could point TZ at a file inside the tree the agent itself edits
+    (`/repo/tzfile`), making the zone a property of the run rather than of
+    the manifest."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream,
+        extra_yaml=f'image:\n  env:\n    TZ: "{value}"\n',
+    )
+
+    with pytest.raises(TaskError) as exc:
+        load_task(task_dir)
+
+    assert "IANA zone" in str(exc.value)
+
+
 def test_the_repo_mount_constant_matches_the_container_it_describes():
     """tasks.py spells /repo itself rather than importing REPO_MOUNT, because
     container.py imports `docker` at module level and the loader deliberately

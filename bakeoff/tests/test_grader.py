@@ -809,6 +809,28 @@ def test_a_submodule_under_the_test_prefix_is_excluded_from_rm_and_checkout():
     assert "left submodule tests/toml-test in place" in restore.detail
 
 
+def test_a_prefix_that_is_nothing_but_a_gitlink_skips_its_own_checkout():
+    """A declared prefix that IS the submodule (not a parent of it) has
+    nothing for `git checkout` to restore -- the exclusion above already
+    empties that pathspec, so the previous code issued a `git checkout` that
+    could only fail with the same message the "absent at the start state"
+    branch uses for a genuinely missing prefix, misattributing an excluded
+    gitlink as absent. The fix skips the per-prefix checkout for exactly this
+    case rather than filing a note that misnames the cause.
+    """
+    gitlink_sha = "c" * 40
+    ls_tree_stdout = f"160000 commit {gitlink_sha}\ttests/toml-test\x00"
+    env = FakeEnv(rules=[(["git", "ls-tree"], (0, ls_tree_stdout, ""))])
+    result = _ladder(env=env, task=_task(paths=("tests/toml-test",)))
+
+    assert not any(a[:2] == ["git", "checkout"] for a in env.argvs)
+
+    restore = _check(result, "test_restore")
+    assert restore.status == "pass"
+    assert "left submodule tests/toml-test in place" in restore.detail
+    assert "did not match any file" not in restore.detail
+
+
 def test_no_gitlink_leaves_the_rm_and_checkout_argv_byte_for_byte_unchanged():
     """The fix must be invisible to every task in today's corpus: with no
     `160000` entry under the declared prefixes, `excludes` is empty and the

@@ -883,8 +883,16 @@ def preflight(
     #: `bare_runner_argv` is `None` for the same two paths, and stays `None`
     #: on the node one even once a container starts: the argv a reader would
     #: see there is the one this probe never ran.
+    #:
+    #: `bare_runner_skipped` was left out of this seed once: it was written
+    #: only in the node `else` branch below, so the runner-gate early return
+    #: recorded `bare_runner_exit: None` with no key at all saying why --
+    #: the same "two absences that render identically" shape one layer down.
+    #: Seeded `None` here for the same two paths, and the runner-gate return
+    #: below sets a reason string of its own.
     evidence["bare_runner_exit"] = None
     evidence["bare_runner_argv"] = None
+    evidence["bare_runner_skipped"] = None
 
     # BEFORE the runner gate, so a manifest refused for a bad runner still
     # records what its declared framework wanted. Needs no container: both
@@ -933,6 +941,10 @@ def preflight(
             "the node frameworks means exit 1 for a config error graded as a "
             "test failure -- and without that distinction the gate is "
             "worthless"
+        )
+        evidence["bare_runner_skipped"] = (
+            "tests.runner does not match tests.framework: no container "
+            "started, so the bare-runner probe never ran"
         )
         return PreflightResult(
             task_id=task.task_id, task_version=task.task_version,
@@ -1076,9 +1088,28 @@ def preflight(
         # `--co` (collect-only): this asks "does the repo's config parse",
         # not "do the tests pass" -- a real run would double the suite cost
         # for a question the f2p/p2p runs below already answer. NO
-        # `--override-ini`, no paths: omitting every argument `tests.runner`
-        # adds is the whole point, so the repo's own ini/addopts apply
-        # exactly as they would for an agent that never read task.yaml.
+        # `--override-ini`, no paths, and deliberately NO `-p
+        # no:cacheprovider`: omitting every argument `tests.runner` adds is
+        # the whole point, and that flag is one of them. An earlier draft
+        # carried it to keep the probe's own collection from writing
+        # `.pytest_cache/` into the tree -- but `--co` writes no cache
+        # directory at all, with or without the flag (measured 2026-09-02,
+        # base-python-3.12: neither run leaves a `.pytest_cache/`, since
+        # collection-only never gets to the point cacheprovider persists
+        # anything), so the flag was buying nothing. What it WAS doing:
+        # disabling cacheprovider removes the command-line options that
+        # plugin registers, so a repo whose own `addopts` names one of them
+        # (`--lf`, `--ff`, `--nf`, `--cache-clear`, `--cache-show`, `--sw`)
+        # becomes a usage error under the probe's argv alone. Measured
+        # 2026-09-02, same image, a repo with `addopts = "--lf"`: the
+        # agent's own command (`python -m pytest tests/`) exits 0, while
+        # `--co -q -p no:cacheprovider` exits 4 with `unrecognized
+        # arguments: --lf` -- a false NO-GO that names the repository's
+        # config as a usage error and prescribes a missing plugin that was
+        # never missing. So the flag is dropped: omitting every argument
+        # `tests.runner` adds is what makes this probe bare, and the flag
+        # was the one argument still hiding a class of manifest this probe
+        # exists to catch honestly.
         #
         # Only for pytest. The node frameworks have no addopts analogue --
         # vitest and jest answer a broken config, a failing test and an
@@ -1091,7 +1122,7 @@ def preflight(
             interpreter = _runner_python(tests.runner)
             bare_argv = [
                 "timeout", str(timeout_s), interpreter, "-m", "pytest",
-                "--co", "-q", "-p", "no:cacheprovider",
+                "--co", "-q",
             ]
             evidence["bare_runner_argv"] = bare_argv
             bare = container.exec(bare_argv)
@@ -1129,10 +1160,27 @@ def preflight(
                     f"{timeout_s}s: this task's own configuration cannot "
                     "be trusted to even collect in this image"
                 )
-            # 0, 1, 2, 5 are not a problem: 2 is a collection error the task
+            elif bare.exit_code not in (
+                EXIT_ALL_PASSED, EXIT_TESTS_FAILED, EXIT_COLLECTION_INTERRUPTED,
+                EXIT_NOTHING_COLLECTED,
+            ):
+                # Everything else used to fall through here in silence: 3
+                # (pytest internal error) and 127 (the interpreter this
+                # probe resolved is not on PATH) both land in `_EXIT_MEANING`
+                # already, and 127 in particular is "the agent cannot run the
+                # command it will naturally type" -- the exact failure this
+                # probe exists to catch, not a code to let through unnamed.
+                problems.append(
+                    "the bare pytest collection "
+                    f"(`{' '.join(bare_argv)}`) exited "
+                    f"{bare.exit_code} ({adapter.explain(bare.exit_code)})"
+                )
+            # 0, 2, 5 are not a problem: 2 is a collection error the task
             # may legitimately carry at the start state (broadening 2), 5 is
             # "no tests collected", which the f2p checks judge on their own,
-            # and 1 cannot happen with --co.
+            # and 1 cannot happen with --co (kept in the accepted set anyway,
+            # since `--co` never selecting tests is a property of the argv
+            # this probe controls, not one worth re-deriving here).
         else:
             evidence["bare_runner_skipped"] = (
                 f"{adapter.name} has no addopts analogue: a broken config, "
