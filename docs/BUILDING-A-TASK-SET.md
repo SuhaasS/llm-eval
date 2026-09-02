@@ -272,7 +272,8 @@ exits **4** (a selected node id whose module will not import; a directory run
 gives 2). Since `PREFLIGHT_VERSION` 4 that is an **accepted** task shape, under
 a narrow condition you can check by eye before cutting anything: the reported
 `ERROR` lines must name **exactly** the modules holding your declared f2p ids,
-and f2p must go green after the reference fix — so an f2p set that spans a
+the rest of the suite must be green at the start state with those modules
+ignored, and f2p must go green after the reference fix — so an f2p set that spans a
 module the PR adds *and* a module that already
 imports cannot work, because a collection error stops the run before the second
 module's tests are ever attempted. Measured on `trucking-doc-extraction` #3.
