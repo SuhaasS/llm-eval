@@ -64,7 +64,9 @@ _FAILED_LINE = re.compile(r"^(?:FAILED|ERROR)\s+(\S+)", re.MULTILINE)
 #: newly added assertion is inert on exactly the tasks about to be run. Bump
 #: it with any change to what preflight asserts. 1 is the implicit version of
 #: every verdict cached before the scoped-p2p and grading assertions landed.
-PREFLIGHT_VERSION: str = "2"
+#: 3 adds the `strip_paths` assertion: a verdict cached under 2 was written
+#: by a gate that never looked at that key at all.
+PREFLIGHT_VERSION: str = "3"
 
 
 def preflight_cache_key(task, image: str, start_sha: str) -> str:
@@ -150,6 +152,31 @@ def _explain(code: int) -> str:
     return _EXIT_MEANING.get(code, f"exit code {code}")
 
 
+def _present(container, names, *, dangling_counts: bool = False) -> list[str]:
+    """Which of `names` exist in the container's tree, in declared order.
+
+    `test -e` FOLLOWS symlinks, which is right for a context file -- sqlglot's
+    CLAUDE.md is a symlink to AGENTS.md, and a DANGLING link named `.claude`
+    gives the agent no context at all.
+
+    `dangling_counts` adds a `-L` probe, and the strip assertion needs it for
+    the opposite reason: its claim is "this path is gone from the tree", and a
+    link whose target was stripped is a path the agent's `ls` still shows.
+    Measured 2026-09-01: for a symlink to a missing target, `[ -e x ]` exits 1
+    and `[ -L x ]` exits 0.
+
+    One helper for every caller -- the context files, the scope filter (used
+    by preflight and by the grader's check 6 alike) and the strip -- because a
+    second copy of this probe is where the symlink semantics drift.
+    """
+    probes = ["-e", "-L"] if dangling_counts else ["-e"]
+    return [
+        name for name in names
+        if any(container.exec(["test", probe, name]).exit_code == 0
+               for probe in probes)
+    ]
+
+
 def _existing_prefixes(container, prefixes: tuple[str, ...]) -> tuple[str, ...]:
     """The declared prefixes that exist in the tree, in declared order.
 
@@ -160,10 +187,7 @@ def _existing_prefixes(container, prefixes: tuple[str, ...]) -> tuple[str, ...]:
     accepts on purpose. Filtered here and unfiltered there, or the reverse,
     and the gated argv is not the graded argv.
     """
-    return tuple(
-        prefix for prefix in prefixes
-        if container.exec(["test", "-e", prefix]).exit_code == 0
-    )
+    return tuple(_present(container, prefixes))
 
 
 def _declared_grading(task) -> list[tuple[str, tuple[str, ...]]]:
@@ -338,16 +362,47 @@ def preflight(
                 f"the container is at {head} but the start state is {start_sha}"
             )
 
-        present = [
-            name
-            for name in _CONTEXT_FILES
-            if container.exec(["test", "-e", name]).exit_code == 0
-        ]
+        present = _present(container, _CONTEXT_FILES)
         if present:
             problems.append(
                 f"the start state carries {', '.join(present)}: section 5.2 "
                 "pins the session config, and a task-local agent file gives "
                 "this task a context the others do not have"
+            )
+
+        # The strip, checked against the TREE rather than against the manifest
+        # or the code that performed it. `materialize` raises when a declared
+        # path matches nothing, so this cannot fire on a typo -- what it
+        # catches is the artifact disagreeing with the manifest for any other
+        # reason (a build step re-creating the path, a stale preflight tree, a
+        # future change to the strip that stops working). A strip that did not
+        # happen is invisible: the file is in every arm's context and in every
+        # submission diff, and no later stage re-derives it.
+        #
+        # `dangling_counts=True`: stripping a symlink's target and not the link
+        # leaves a path `test -e` calls absent and `ls` still shows.
+        #
+        # `getattr`, like `_declared_grading`'s: this function takes an
+        # untyped `task` and a manifest object predating the key must not
+        # crash the gate.
+        # Both keys are written unconditionally: "this task strips nothing"
+        # and "the gate did not look" render identically as a missing key, and
+        # absence is recorded rather than implied.
+        stripped = tuple(getattr(task, "strip_paths", ()))
+        still_there = (
+            _present(container, stripped, dangling_counts=True)
+            if stripped else []
+        )
+        evidence["stripped_paths"] = list(stripped)
+        evidence["stripped_paths_present"] = still_there
+        if still_there:
+            problems.append(
+                f"the start state still carries {', '.join(still_there)}, "
+                "which the manifest's strip_paths says it removed. Section "
+                "5.2 pins the session config and section 5.6 stages "
+                "everything, so an un-stripped path is both a context this "
+                "task has and the others do not, and a file in every "
+                "submission diff."
             )
 
         runner = _Runner(container, tests.runner, timeout_s)

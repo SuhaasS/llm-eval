@@ -969,7 +969,7 @@ def _check_p2p(state: _State, task, env, oracle: Oracle | None) -> None:
         # NOT the environment path. `test -e` passes an existing-but-EMPTY
         # directory (measured), pytest then exits 5, and that is a fact about
         # the task's configuration rather than about the grader's environment.
-        # With `PREFLIGHT_VERSION` 2 in place both routes to
+        # With `PREFLIGHT_VERSION` 2 or later in place both routes to
         # SCOPE_COLLECTED_NOTHING should be unreachable -- preflight's scoped
         # assertion proves collection first -- and they are kept as defence in
         # depth.

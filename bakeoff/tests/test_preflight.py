@@ -119,7 +119,9 @@ def test_a_non_pytest_runner_is_refused_rather_than_guessed_at(tmp_path):
 # --- the real thing ----------------------------------------------------------
 
 
-def _smoke_task(tmp_path, calc_body: str, reference: str) -> Path:
+def _smoke_task(tmp_path, calc_body: str, reference: str, *,
+                extra_files: dict[str, str] | None = None,
+                extra_yaml: str = "") -> Path:
     """A task built from the smoke fixture, so preflight can be run for real
     without the network or a 20k-line repository."""
     upstream = tmp_path / "upstream"
@@ -137,6 +139,10 @@ def _smoke_task(tmp_path, calc_body: str, reference: str) -> Path:
     (upstream / "tests" / "test_calc.py").write_text(
         "from calc import add\n\n\ndef test_zero():\n    assert add(0, 0) == 0\n"
     )
+    for name, body in (extra_files or {}).items():
+        target = upstream / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body)
     for args in (["init", "-q"], ["config", "user.email", "t@t.test"],
                  ["config", "user.name", "t"], ["add", "-A"],
                  ["commit", "-q", "-m", "base"]):
@@ -161,6 +167,7 @@ def _smoke_task(tmp_path, calc_body: str, reference: str) -> Path:
         '  paths: ["tests/"]\n'
         '  runner: ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider"]\n'
         '  f2p: ["tests/test_calc.py::test_add"]\n'
+        + (f"{extra_yaml}\n" if extra_yaml else "")
     )
     return task_dir
 
@@ -522,12 +529,13 @@ class _ScriptedContainer:
     an f2p selection.
     """
 
-    def __init__(self, *, start_sha, tests, present=(), scoped_exit=0,
-                 grading_exits=None):
+    def __init__(self, *, start_sha, tests, present=(), dangling=(),
+                 scoped_exit=0, grading_exits=None):
         self.commands = []
         self.start_sha = start_sha
         self.tests = tests
         self.present = set(present)
+        self.dangling = set(dangling)
         self.scoped_exit = scoped_exit
         self.grading_exits = dict(grading_exits or {})
         self.f2p_runs = 0
@@ -549,6 +557,11 @@ class _ScriptedContainer:
             return _Exec()
         if cmd[:2] == ["test", "-e"]:
             return _Exec(exit_code=0 if cmd[2] in self.present else 1)
+        if cmd[:2] == ["test", "-L"]:
+            # A dangling symlink: `-e` says absent, `-L` says there is still a
+            # path here. Measured 2026-09-01: `[ -e dangling ]` exits 1 and
+            # `[ -L dangling ]` exits 0.
+            return _Exec(exit_code=0 if cmd[2] in self.dangling else 1)
         if cmd[:2] == ["git", "rev-parse"]:
             return _Exec(stdout=self.start_sha + "\n")
         if cmd[:2] == ["git", "status"]:
@@ -594,6 +607,7 @@ class _FakeTask:
     task_version: int = 1
     manifest_digest: str = "d"
     solution_diff: str = "diff --git a/x b/x\n"
+    strip_paths: tuple = ()
 
 
 def _run_preflight(monkeypatch, tmp_path, task, container):
@@ -728,3 +742,109 @@ def test_a_healthy_task_declares_the_gate_that_produced_its_verdict(
     assert result.preflight_version == PREFLIGHT_VERSION
     assert result.to_dict()["preflight_version"] == PREFLIGHT_VERSION
     assert result.to_dict()["problem_codes"] == []
+
+
+def test_a_strip_that_did_not_happen_is_a_problem(monkeypatch, tmp_path):
+    """The load-bearing direction, and the reason this is a check on the TREE
+    rather than on the manifest: a strip that silently did not happen leaves
+    the file in every arm's context and in every submission diff, and no later
+    stage re-derives it.
+
+    In the DEFAULT suite. `addopts = "-m 'not integration'"`, so a guarantee
+    pinned only by the integration tests below is not pinned by the run an
+    implementer or CI actually makes."""
+    task = _FakeTask(strip_paths=("vendor",))
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=("tests/", "vendor"))
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert not result.ok
+    assert any("strip_paths" in problem for problem in result.problems)
+    assert result.evidence["stripped_paths"] == ["vendor"]
+    assert result.evidence["stripped_paths_present"] == ["vendor"]
+
+
+def test_a_dangling_symlink_a_strip_left_behind_is_still_present(
+    monkeypatch, tmp_path
+):
+    """`test -e` alone would call this absent. Measured 2026-09-01: for a
+    symlink whose target is gone, `[ -e x ]` exits 1 and `[ -L x ]` exits 0 --
+    so stripping a link's TARGET and not the link (the sqlglot shape, where
+    CLAUDE.md is a symlink to AGENTS.md) would leave a path the agent's `ls`
+    still shows while the gate reported it removed."""
+    task = _FakeTask(strip_paths=("CLAUDE.md",))
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=("tests/",),
+                                   dangling=("CLAUDE.md",))
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert result.evidence["stripped_paths_present"] == ["CLAUDE.md"]
+    assert any("strip_paths" in problem for problem in result.problems)
+
+
+def test_a_completed_strip_is_recorded_and_is_not_a_problem(
+    monkeypatch, tmp_path
+):
+    """Absence is recorded, never implied: the gate says it looked, and says
+    what it found, rather than leaving a reader to infer both from silence."""
+    task = _FakeTask(strip_paths=("vendor",))
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=("tests/",))
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert result.ok, result.problems
+    assert result.evidence["stripped_paths"] == ["vendor"]
+    assert result.evidence["stripped_paths_present"] == []
+
+
+@pytest.mark.integration
+def test_a_task_that_strips_a_vendored_tree_preflights(tmp_path, agent_image):
+    """The pass direction against the real thing: `materialize` removed the
+    paths, the container agrees, and the evidence says so."""
+    task = load_task(_smoke_task(
+        tmp_path, "def add(a, b):\n    return a - b\n", _reference(fix_source=True),
+        extra_files={"CLAUDE.md": "# notes\n", "vendor/dep.py": "V = 1\n"},
+        extra_yaml='strip_paths: ["CLAUDE.md", "vendor"]',
+    ))
+    repo = tmp_path / "run" / "repo"
+    start = materialize(task, repo, tmp_path / "cache")
+
+    result = preflight(task, image=agent_image, repo_path=repo, start_sha=start)
+
+    assert result.ok, result.problems
+    assert result.evidence["stripped_paths"] == ["CLAUDE.md", "vendor"]
+    assert result.evidence["stripped_paths_present"] == []
+
+
+@pytest.mark.integration
+def test_a_strip_that_did_not_happen_is_refused_by_the_real_gate(
+    tmp_path, agent_image
+):
+    """`vendor/`, not `CLAUDE.md`, so the strip check is the only thing that
+    could name it -- the context-file check would otherwise answer for the
+    same path and this assertion would pass with the strip check deleted.
+
+    TWO problems are expected, not one: the re-created file is untracked, so
+    the post-suite `git status --porcelain` check fires as well. That is why
+    the assertion names the strip problem specifically rather than counting
+    them."""
+    task = load_task(_smoke_task(
+        tmp_path, "def add(a, b):\n    return a - b\n", _reference(fix_source=True),
+        extra_files={"vendor/dep.py": "V = 1\n"},
+        extra_yaml='strip_paths: ["vendor"]',
+    ))
+    repo = tmp_path / "run" / "repo"
+    start = materialize(task, repo, tmp_path / "cache")
+    # Put it back, untracked -- the shape a build step or an image layer
+    # leaves behind, and the one the manifest claims is gone.
+    (repo / "vendor").mkdir()
+    (repo / "vendor" / "dep.py").write_text("V = 1\n")
+
+    result = preflight(task, image=agent_image, repo_path=repo, start_sha=start)
+
+    assert not result.ok
+    assert any("strip_paths" in problem for problem in result.problems)
+    assert result.evidence["stripped_paths_present"] == ["vendor"]
