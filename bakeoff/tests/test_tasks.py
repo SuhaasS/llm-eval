@@ -2202,3 +2202,95 @@ def test_the_repo_mount_constant_matches_the_container_it_describes():
     from bakeoff.container import REPO_MOUNT
 
     assert tasks._REPO_MOUNT == REPO_MOUNT
+
+
+# --- image.python -------------------------------------------------------------
+
+
+def test_image_python_defaults_to_the_base_images_version(tmp_path, upstream):
+    """Every manifest written before this key existed must load unchanged, and
+    the default has to be the version the base Dockerfile's own ARG default
+    builds -- two defaults that can drift is one manifest loading as a task
+    whose image nobody built."""
+    task_dir = _write_task(tmp_path / "set", upstream)  # no image: block
+
+    assert load_task(task_dir).image.python == "3.12"
+
+
+def test_an_allowlisted_version_is_carried_verbatim(tmp_path, upstream):
+    task_dir = _write_task(
+        tmp_path / "set", upstream, extra_yaml='image:\n  python: "3.11"\n'
+    )
+
+    assert load_task(task_dir).image.python == "3.11"
+
+
+def test_a_version_nobody_built_is_refused_at_load_time(tmp_path, upstream):
+    """Measured 2026-09-01: `--build-arg BASE_PYTHON_VERSION=3.99` fails with
+    `failed to resolve reference "docker.io/library/python:3.99-slim-bookworm"
+    ... not found` -- a registry round-trip, mid-build, on a machine that may
+    be offline. The allowlist turns that into a message naming the manifest."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream, extra_yaml='image:\n  python: "3.99"\n'
+    )
+
+    with pytest.raises(TaskError) as excinfo:
+        load_task(task_dir)
+
+    assert "3.99" in str(excinfo.value)
+    assert "3.12" in str(excinfo.value)  # the allowlist is in the message
+
+
+def test_a_floating_major_version_is_refused(tmp_path, upstream):
+    """`python:3-slim-bookworm` resolves and is republished, so two collections
+    months apart run different interpreters under one manifest and no record
+    says so. Same defect `image.pip`'s "pinned, not floored" rule prevents."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream, extra_yaml='image:\n  python: "3"\n'
+    )
+
+    with pytest.raises(TaskError):
+        load_task(task_dir)
+
+
+def test_an_unquoted_version_is_refused_rather_than_coerced(tmp_path, upstream):
+    """YAML parses bare `3.11` as a float and bare `3.10` as `3.1`. Coercing
+    with str() would turn the second into a version nobody named; the refusal
+    names the quotes."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream, extra_yaml="image:\n  python: 3.11\n"
+    )
+
+    with pytest.raises(TaskError) as excinfo:
+        load_task(task_dir)
+
+    assert "quote" in str(excinfo.value).lower()
+
+
+def test_the_worked_example_task_still_loads_on_the_default(tmp_path):
+    """Backwards compatibility, stated over the real manifest rather than a
+    fixture: click declares no `python:` and must keep the base it has."""
+    task = load_task(
+        Path(__file__).resolve().parent.parent
+        / "taskset" / "click-3360-write-usage-empty-args"
+    )
+
+    assert task.image.python == "3.12"
+
+
+def test_declaring_a_python_version_moves_the_digest_but_not_the_start_state(
+    tmp_path, upstream
+):
+    """`manifest_digest` hashes the manifest BYTES, so the key participates
+    with no term of its own and every preflight and oracle cache keyed on it
+    invalidates. `start_sha` must NOT move: the key takes no part in the setup
+    commit, and a task whose start state moved is a different task."""
+    plain = load_task(_write_task(tmp_path / "a", upstream))
+    pinned = load_task(
+        _write_task(tmp_path / "b", upstream,
+                    extra_yaml='image:\n  python: "3.11"\n')
+    )
+
+    assert pinned.manifest_digest != plain.manifest_digest
+    assert materialize(pinned, tmp_path / "tb" / "repo", tmp_path / "cb") == \
+        materialize(plain, tmp_path / "ta" / "repo", tmp_path / "ca")

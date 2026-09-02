@@ -160,6 +160,13 @@ class TaskGrading:
 #: on a manifest that is correct.
 _GRADING_KEYS = tuple(f.name for f in dataclass_fields(TaskGrading))
 
+#: The base Dockerfile's own `ARG BASE_PYTHON_VERSION` default, restated here
+#: as `TaskImage.python`'s default. Pinned equal by
+#: `tests/test_images.py::test_the_dockerfile_default_matches_the_manifest_default`
+#: -- two defaults that can drift means a manifest declaring nothing loads as a
+#: task whose base was never built.
+_DEFAULT_PYTHON = "3.12"
+
 
 @dataclass(frozen=True)
 class TaskImage:
@@ -180,6 +187,17 @@ class TaskImage:
     #: unrestricted map re-opens the CLAUDE_CODE_USE_BEDROCK hole that
     #: `claude_runner`'s env allowlist exists to close.
     env: dict[str, str] = field(default_factory=dict)
+    #: The base image's Python. Every ARM of a task runs the same base, so
+    #: this is a per-task property and not a section 5.4 divergence -- what
+    #: that section holds identical is the environment two ARMS are compared
+    #: in, and a task is compared against itself.
+    #:
+    #: Validated against `_PYTHON_VERSIONS` at load time. It selects which
+    #: base image the drivers build and hand to `build_task_image`; preflight
+    #: reads `python --version` back out of the finished container and refuses
+    #: a mismatch, because the tag is mutable and local and a stale one leaves
+    #: every unit test green while the suite runs under the wrong interpreter.
+    python: str = _DEFAULT_PYTHON
 
 
 @dataclass(frozen=True)
@@ -483,6 +501,71 @@ _REPO_MOUNT = "/repo"
 #:          directory whose self-written .gitignore guard never fired. This is
 #:          the only lever that keeps all of it out.
 _IMAGE_ENV_ALLOWED = frozenset({"CI", "HYPOTHESIS_STORAGE_DIRECTORY"})
+
+#: Python versions the base Dockerfile is KNOWN to build, because someone
+#: built it. A closed set rather than a free string, for two reasons that are
+#: each silent without it:
+#:
+#:   A floating tag is a moving base. `python:3-slim-bookworm` and
+#:   `python:3.13-slim-bookworm` are both republished, so two collections
+#:   months apart run different interpreters under one manifest and nothing in
+#:   the record says which -- the defect `image.pip`'s "pinned, not floored"
+#:   rule exists to prevent, one key over.
+#:
+#:   An unbuildable string fails LATE. Measured 2026-09-01, Docker 29.5.2:
+#:   `--build-arg BASE_PYTHON_VERSION=3.99` gets `failed to resolve reference
+#:   "docker.io/library/python:3.99-slim-bookworm": ... not found` at the FROM,
+#:   after a build has started and over the network. Here it is a TaskError
+#:   with the manifest path in it, before any daemon is touched.
+#:
+#: Each entry was measured by building `docker/eval-agent.Dockerfile` at that
+#: version and confirming BOTH in-Dockerfile pin assertions fired -- `pytest
+#: 9.1.1 pinned` and `claude 2.1.220 pinned`. Verified 2026-09-01 for all
+#: three; 3.11 gave Python 3.11.16, 3.12 gave 3.12.13, 3.13 gave 3.13.15.
+#:
+#: TO ADD A VERSION, all three steps: build the real base at it and confirm
+#: both assertions fire; add the string here with the date; add the row to
+#: taskset/HARVESTING.md's table and the note in docs/BUILDING-A-TASK-SET.md.
+#: `python:3.14-slim-bookworm` exists and is deliberately absent -- nobody has
+#: built the eval image on it, and an unmeasured entry is this constant
+#: claiming something it does not know.
+_PYTHON_VERSIONS = frozenset({"3.11", "3.12", "3.13"})
+
+
+def _python_version(value: Any, where: str) -> str:
+    """`image.python`, validated. The default when absent.
+
+    A `str` is REQUIRED, never coerced. YAML parses an unquoted `3.11` as the
+    float 3.11 and an unquoted `3.10` as `3.1` -- so `str(value)` would turn a
+    manifest asking for 3.10 into one asking for a version that is not in the
+    allowlist at all, or (had 3.1 been listed) into a silently different
+    interpreter. Same class as `_ENV_VALUE_REFUSED`'s `$`: a value that is a
+    property of the parser rather than of the manifest.
+    """
+    if value is None:
+        return _DEFAULT_PYTHON
+    if not isinstance(value, str):
+        raise TaskError(
+            f"{where}: {value!r} is {type(value).__name__}, not a string -- "
+            "quote it (`python: \"3.11\"`). YAML reads an unquoted 3.11 as a "
+            "float and an unquoted 3.10 as 3.1, so the version that reaches "
+            "the build is not the one the manifest names"
+        )
+    if value not in _PYTHON_VERSIONS:
+        raise TaskError(
+            f"{where}: {value!r} is not a Python version this base image is "
+            f"known to build. Allowed: {sorted(_PYTHON_VERSIONS)}. A version "
+            "outside the set is either a floating tag -- two collections "
+            "months apart running different interpreters under one manifest, "
+            "with nothing in the record saying so -- or one that fails at the "
+            "FROM with a registry error mid-build. To add one, build "
+            "docker/eval-agent.Dockerfile with "
+            "`--build-arg BASE_PYTHON_VERSION=<v>`, confirm the pytest and "
+            "claude pin assertions fire, then add it to _PYTHON_VERSIONS and "
+            "to taskset/HARVESTING.md"
+        )
+    return value
+
 
 #: Characters that do not survive a generated `ENV KEY="value"` line. `$` is
 #: the one that is not about syntax: Docker EXPANDS it against the build
@@ -1027,6 +1110,7 @@ def load_task(task_dir: Path, set_commit: str = "") -> TaskManifest:
             pip=_strs(image_raw.get("pip"), f"{where}:image.pip"),
             build=_strs(image_raw.get("build"), f"{where}:image.build"),
             env=_env_map(image_raw.get("env"), f"{where}:image.env"),
+            python=_python_version(image_raw.get("python"), f"{where}:image.python"),
         ),
         grading=TaskGrading(
             build=_strs(grading_raw.get("build"), f"{where}:grading.build"),
