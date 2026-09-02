@@ -382,7 +382,7 @@ rather than by reasoning:
   version verdict — the key exists for the candidates the screen has not reached
   yet, and a re-screen at a second version is what would populate this
   paragraph.
-- **Submodules are supported, with three limits.**
+- **Submodules are supported, with six limits.**
   - The path, url and pinned commit are derived from `base_sha` — nothing goes
     in the manifest. Two git readers are involved (`git ls-tree` for the
     gitlink, `.gitmodules` for the url) and the two directions of disagreement

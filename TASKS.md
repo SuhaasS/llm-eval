@@ -1226,6 +1226,17 @@ These need a call, not code. Most are cheap to make and expensive to make late.
   state at checkpoint time — a change to what a run RECORDS, not to how one is
   graded — so it needs its own plan. Measured 2026-09-01 (broadening 6, M8).
 
+- [ ] **A pure gitlink rename is invisible to the grader's gitlink refusal.**
+  `grader._chunk_is_gitlink` reads the chunk header for a `160000` mode line
+  (`new file mode`, `deleted file mode`, `old mode`/`new mode`, `index …
+  160000`); a rename chunk with 100% similarity carries none of those, so a
+  submission that only moves a submodule directory applies `--index` green and
+  is graded against the old content. Not measured on a real submission —
+  recorded here so the gap is in the backlog and not only in the docstring.
+  Closing it means reading the `similarity index`/`rename from` header and
+  checking the destination's mode in the index. Measured 2026-09-02
+  (broadening 6 fix wave).
+
 - [ ] **The submodule's `remote remove` is `check=False` and the `reflog
   expire` beside it is `check=True`; nothing measured the asymmetry.** Both
   calls in `tasks._init_submodules` are leak guards over the same object — a
