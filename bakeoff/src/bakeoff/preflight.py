@@ -70,7 +70,7 @@ _EXIT_MEANING = {
     4: "usage error -- a selected node id does not exist, OR the module it "
        "names could not be imported",
     5: "no tests were collected",
-    124: "the command hit the preflight timeout",
+    124: "the command hit the suite timeout (budget.suite_timeout_s)",
 }
 
 _FAILED_LINE = re.compile(r"^(?:FAILED|ERROR)\s+(\S+)", re.MULTILINE)
@@ -96,7 +96,13 @@ _FAILED_LINE = re.compile(r"^(?:FAILED|ERROR)\s+(\S+)", re.MULTILINE)
 #: was written by a gate that looked at none of them, so a task whose
 #: determinism lever silently failed to apply -- or was never declared, or
 #: whose scan environment was broken -- would keep serving a PASS.
-PREFLIGHT_VERSION: str = "5"
+#: 6 makes the gate's bound a manifest value (`budget.suite_timeout_s`)
+#: instead of a function default. `manifest_digest` alone does not cover this:
+#: a manifest that ALREADY carries the key loads fine under the older loader,
+#: which ignores unknown `budget` sub-keys, so its digest does not move when
+#: this code lands and every warm cache would serve a verdict gated at 600
+#: against a manifest that asks for something else.
+PREFLIGHT_VERSION: str = "6"
 
 
 def preflight_cache_key(task, image: str, start_sha: str) -> str:
@@ -392,6 +398,26 @@ class _Runner:
         self.last_argv = ["timeout", str(self.timeout_s), *self.runner, *extra]
         return self.container.exec(self.last_argv)
 
+    @property
+    def last_timeout_s(self) -> int | None:
+        """The bound the last invocation actually CARRIED, off its own argv.
+
+        Preflight's evidence and the grader's `GradeRecord.suite_timeout_s`
+        both come through here rather than off the manifest, for the reason
+        `last_argv` exists at all: a second read of the configuration is a
+        second thing that can be right about what was ASKED for while the argv
+        carried something else, sitting inside the record that exists to say
+        what happened.
+
+        `None` when no invocation has been made, or when the argv carries no
+        `timeout` prefix -- "nobody bounded this", which is a different claim
+        from any number, and one a `0` or a fallback to `self.timeout_s` would
+        make unrepresentable.
+        """
+        if len(self.last_argv) >= 2 and self.last_argv[0] == "timeout":
+            return int(self.last_argv[1])
+        return None
+
     def select(self, node_ids: tuple[str, ...]):
         return self.run(list(node_ids))
 
@@ -453,7 +479,6 @@ def preflight(
     repo_path: Path,
     start_sha: str,
     expected_claude_version: str = "",
-    timeout_s: int = 600,
 ) -> PreflightResult:
     """Every reason this task is not a task. Empty `problems` means GO.
 
@@ -466,6 +491,13 @@ def preflight(
     problem_codes: list[str] = []
     evidence: dict = {}
     tests = task.tests
+    # NOT a parameter with a default. Both drivers call this with `task` and
+    # neither passes a bound, so reading it here makes "a consumer left on the
+    # constant" unrepresentable rather than merely tested for -- and that
+    # divergence is the silent one: a suite that fits the gate's bound and is
+    # killed under the grader's stamps `timed_out`, which is `resolved:
+    # False`, on every arm, permanently, over a number the model never saw.
+    timeout_s = task.budget.suite_timeout_s
 
     # Written BEFORE the guard below, because `image.env` is a property of the
     # manifest and is knowable with no daemon. The other three keys stay None
@@ -764,6 +796,11 @@ def preflight(
         # rather than raised, so nothing else about this function has to move.
 
         red = runner.select(tests.f2p)
+        # Off the ARGV, not off the manifest -- see `_Runner.last_timeout_s`.
+        # Written after the first invocation rather than at construction, so
+        # the key is absent on the path where no command ever ran and a reader
+        # of a cached verdict can tell that from a run that was bounded.
+        evidence["suite_timeout_s"] = runner.last_timeout_s
         evidence["f2p_before_exit"] = red.exit_code
 
         collected = (

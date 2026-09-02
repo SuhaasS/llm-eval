@@ -266,6 +266,9 @@ def test_a_non_pytest_runner_is_refused_rather_than_guessed_at(tmp_path):
             runner = ("make", "test")
             f2p = ("x",)
 
+        class budget:  # noqa: N801 - mirrors the manifest shape
+            suite_timeout_s = 600
+
     result = preflight(_Task(), image="sha256:x", repo_path=tmp_path,
                        start_sha="s" * 40)
 
@@ -903,10 +906,18 @@ class _FakeImage:
 
 
 @dataclass(frozen=True)
+class _FakeBudget:
+    suite_timeout_s: int = 600
+    wall_clock_timeout_s: int = 900
+    max_turns: int = 40
+
+
+@dataclass(frozen=True)
 class _FakeTask:
     tests: _FakeTests = field(default_factory=_FakeTests)
     image: _FakeImage = field(default_factory=_FakeImage)
     grading: TaskGrading = field(default_factory=TaskGrading)
+    budget: _FakeBudget = field(default_factory=_FakeBudget)
     task_id: str = "t"
     task_version: int = 1
     manifest_digest: str = "d"
@@ -1251,6 +1262,92 @@ def test_a_healthy_task_declares_the_gate_that_produced_its_verdict(
     assert result.preflight_version == PREFLIGHT_VERSION
     assert result.to_dict()["preflight_version"] == PREFLIGHT_VERSION
     assert result.to_dict()["problem_codes"] == []
+
+
+def test_the_gate_bounds_every_command_by_the_manifests_number(
+    monkeypatch, tmp_path
+):
+    """Not `timeout_s=`. A defaulted parameter beside a manifest key is two
+    sources for one number, and a driver left on the default is the silent
+    divergence this whole broadening exists to close -- a suite that fits the
+    gate's bound and is killed under the grader's stamps `timed_out`, which is
+    `resolved: False`, an accusation against the model, over a number it never
+    saw.
+
+    EVERY command, not just the suite: the declared grading.* argvs go through
+    the same prefix, because the grader runs those too and a second key for
+    them would be a second thing that can diverge."""
+    task = _FakeTask(
+        budget=_FakeBudget(suite_timeout_s=1234, wall_clock_timeout_s=3600),
+        grading=TaskGrading(lint=("ruff", "check", ".")),
+    )
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=task.tests, present=("tests/",))
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert result.ok, result.problems
+    bounded = [cmd for cmd in container.commands if cmd[0] == "timeout"]
+    # five suite runs on the deselect branch + one declared grading argv
+    assert len(bounded) == 6, bounded
+    assert {cmd[1] for cmd in bounded} == {"1234"}
+
+
+def test_the_evidence_records_the_bound_off_the_argv_not_off_the_manifest(
+    monkeypatch, tmp_path
+):
+    """`last_argv` exists so a problem can name what was actually run rather
+    than a reconstruction of it, and the same reasoning covers this: reading
+    the manifest a second time is a second thing that can be right about what
+    was ASKED for while the argv carried something else. Configuration is
+    never reported as observation."""
+    task = _FakeTask(budget=_FakeBudget(suite_timeout_s=1234,
+                                        wall_clock_timeout_s=3600))
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=task.tests, present=("tests/",))
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert result.evidence["suite_timeout_s"] == 1234
+
+
+def test_no_bound_is_recorded_when_no_command_ever_ran(monkeypatch, tmp_path):
+    """The non-pytest `tests.runner` refusal returns before the container is
+    even entered. An absent key is honest there -- no command ran under any
+    bound -- and a manifest value written anyway would be a claim about a run
+    that did not happen."""
+    task = _FakeTask(tests=_FakeTests(runner=("go", "test", "./...")))
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=task.tests, present=("tests/",))
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert not result.ok
+    assert "suite_timeout_s" not in result.evidence
+
+
+def test_last_timeout_s_is_none_before_any_invocation():
+    """`None` is "nobody bounded this", which is a different claim from any
+    number -- the same distinction `wire_unattributed` and `cache_state.warm`
+    make. A `0` or a fallback to the constructor argument would make "the
+    argv carried no timeout prefix" unrepresentable."""
+    from bakeoff.preflight import _Runner
+
+    runner = _Runner(_Recorder(), ("python", "-m", "pytest", "-q"), 1234)
+    assert runner.last_timeout_s is None
+    runner.run([])
+    assert runner.last_timeout_s == 1234
+
+
+def test_preflight_takes_no_timeout_parameter():
+    """The parameter is DELETED, not defaulted. With it gone, "a consumer left
+    on the constant" is unrepresentable rather than merely tested for -- which
+    is why neither driver needed a line changed."""
+    import inspect
+
+    from bakeoff.preflight import preflight
+
+    assert "timeout_s" not in inspect.signature(preflight).parameters
 
 
 def test_a_strip_that_did_not_happen_is_a_problem(monkeypatch, tmp_path):
@@ -1623,7 +1720,7 @@ def test_the_preflight_version_moved_with_the_new_assertion():
     serves a verdict written by a gate that never looked at image.env."""
     from bakeoff.preflight import PREFLIGHT_VERSION
 
-    assert PREFLIGHT_VERSION == "5"
+    assert PREFLIGHT_VERSION == "6"
 
 
 @pytest.mark.integration
