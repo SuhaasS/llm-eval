@@ -5,8 +5,8 @@ from pathlib import Path
 import pytest
 
 from bakeoff.grade_schema import (
-    CHECK_ORDER, CheckResult, GradeFailure, GradeRecord, NotGradedReason,
-    append_grade, load_grades, schema_at_least,
+    CHECK_ORDER, GRADE_SCHEMA_VERSION, CheckResult, GradeFailure, GradeRecord,
+    NotGradedReason, append_grade, load_grades, schema_at_least,
 )
 
 
@@ -21,6 +21,18 @@ def _record(run_id: str = "r1", **kw) -> GradeRecord:
     )
     base.update(kw)
     return GradeRecord(**base)
+
+
+def test_the_grade_schema_version_moved_with_what_the_record_means():
+    """A reader that cannot tell grade schema versions apart reads an absent
+    field as a positive negative claim -- the same reason `SCHEMA_VERSION`
+    moves for additive bumps.
+
+    Pinned to a literal so a bump is a DELIBERATE edit rather than a side
+    effect: 1.0.0 -> 1.1.0 adds `GradeRecord.suite_timeout_s`, because with
+    the bound now per task, `timed_out: True` alone cannot say what the
+    check actually blew."""
+    assert GRADE_SCHEMA_VERSION == "1.1.0"
 
 
 def test_round_trip_preserves_every_field_and_type():

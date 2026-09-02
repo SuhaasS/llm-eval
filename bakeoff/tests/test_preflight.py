@@ -767,6 +767,62 @@ def test_scope_prefixes_lead_the_extra_segment():
     assert "tests/" not in explicit.commands[0]
 
 
+def test_the_gate_and_the_grader_bound_one_manifest_by_one_number(
+    monkeypatch, tmp_path
+):
+    """The invariant this broadening is FOR, asserted across the seam rather
+    than on either side of it.
+
+    Preflight and the ladder run the same commands -- the f2p selection, the
+    scoped p2p run, each declared `grading.*` argv -- and each wraps them in
+    its own `timeout` prefix. Written as two independent reads of the manifest
+    (which is what Tasks 2 and 4 are), reverting either one to a constant
+    leaves both files' own tests green: preflight would gate at 600 and pass a
+    slow task, the ladder would kill the same suite at the manifest's 1234, or
+    the reverse. What comes out is `timed_out` -- a GradeFailure, so `resolved:
+    False` -- on every arm of that task, permanently, in an append-only store,
+    over a number the model never saw.
+
+    Asserted on the ARGVs both sides actually emitted, never on "both read the
+    same attribute": a mock that watches the attribute is green through a
+    consumer that reads it and then discards it.
+
+    The grader's checks are called directly rather than through `run_ladder`,
+    because the ladder's early rungs need a patch, a tree and a `git apply`
+    that have nothing to do with this property.
+    """
+    from bakeoff import grader
+
+    task = _FakeTask(
+        budget=_FakeBudget(suite_timeout_s=1234, wall_clock_timeout_s=3600),
+        grading=TaskGrading(lint=("ruff", "check", ".")),
+    )
+
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=task.tests, present=("tests/",))
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+    assert result.ok, result.problems
+    gated = {cmd[1] for cmd in container.commands if cmd[0] == "timeout"}
+    assert gated == {"1234"}, container.commands
+
+    graded_commands: list[list[str]] = []
+
+    class _Env:
+        def exec(self, argv):
+            graded_commands.append(list(argv))
+            return _Exec(exit_code=0)
+
+    state = grader._State()
+    env = _Env()
+    grader._check_command(state, "lint", task, env)
+    grader._check_f2p(state, task, env)
+    grader._check_p2p(state, task, env, None)
+
+    graded = {cmd[1] for cmd in graded_commands if cmd[0] == "timeout"}
+    assert graded == gated
+    assert state.suite_timeout_s == 1234
+
+
 # --- the two new gate assertions ---------------------------------------------
 
 

@@ -204,9 +204,12 @@ class TaskBudget:
     #: they are compared.
     #:
     #: 600 is the constant this replaced, in three copies: `preflight(
-    #: timeout_s=600)`, `ensure_oracle(timeout_s=600)` and
-    #: `grader.GRADE_TIMEOUT_S`. A manifest that does not declare the key
-    #: therefore gates and grades byte-identically to before.
+    #: timeout_s=600)`, `ensure_oracle(timeout_s=600)` and the grader's own
+    #: per-check bound (`_check_command`/`_check_f2p`/`_check_p2p`, formerly
+    #: `GRADE_TIMEOUT_S`). A manifest that does not declare the key therefore
+    #: gates and grades byte-identically to before. `grader.SCAN_TIMEOUT_S`
+    #: is not one of the three: it bounds only the host-side gitleaks scan,
+    #: which has no `task` in scope and never ran in a container.
     suite_timeout_s: int = 600
 
 

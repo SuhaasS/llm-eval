@@ -173,9 +173,12 @@ def test_the_suite_timeout_defaults_to_the_constant_it_replaces(
     tmp_path, upstream
 ):
     """600 was `preflight(timeout_s=600)`, `ensure_oracle(timeout_s=600)` and
-    `grader.GRADE_TIMEOUT_S`, three copies of one number. A manifest that does
-    not mention the key must gate and grade exactly as it did before, so the
-    default is that number and not a rounder one."""
+    the grader's own per-check bound (formerly `GRADE_TIMEOUT_S`, now read off
+    this field directly), three copies of one number. `grader.SCAN_TIMEOUT_S`
+    is a fourth, separate constant -- it bounds only the host-side gitleaks
+    scan, not a copy of this default. A manifest that does not mention the
+    key must gate and grade exactly as it did before, so the default is that
+    number and not a rounder one."""
     task = load_task(_write_task(tmp_path / "set", upstream))
     assert task.budget.suite_timeout_s == 600
 

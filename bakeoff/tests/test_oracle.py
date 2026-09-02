@@ -39,6 +39,23 @@ class FakeRunner:
 TESTS = SimpleNamespace(f2p=("tests/test_x.py::test_a",), p2p=())
 
 
+def test_the_oracle_version_moved_with_what_derivation_means():
+    """It is in the fingerprint for the reason `PREFLIGHT_VERSION` is in
+    preflight's key: neither the manifest digest nor the image digest moves
+    when this file's rules change, so without the bump a warm cache serves a
+    quarantine derived by the old rules on exactly the tasks about to be
+    graded.
+
+    Pinned to a literal so a bump is a DELIBERATE edit rather than a side
+    effect: 1 -> 2 is the derivation's two reference runs reading their
+    `timeout` bound off `task.budget.suite_timeout_s` instead of a function
+    default, where a manifest that already declares the key loads fine under
+    the older loader (which ignores unknown `budget` sub-keys) and would
+    otherwise go on being derived at 600 against a bound it does not ask
+    for."""
+    assert ORACLE_VERSION == "2"
+
+
 def test_both_runs_green_yields_empty_quarantine():
     assert derive_quarantine(FakeRunner([(0, ""), (0, "")]), TESTS) == ()
 
