@@ -64,7 +64,12 @@ from typing import Any
 # negative claim -- the same reason `SCHEMA_VERSION` moves for additive bumps.
 # 1.1.0 adds `suite_timeout_s`: with the bound per task, `timed_out` alone
 # does not say what was blown.
-GRADE_SCHEMA_VERSION = "1.1.0"
+# 1.2.0 adds `NotGradedReason.SUBMODULE_GITLINK_UNGRADABLE`. Additive in
+# fields and not in meaning: `not_graded_reason` can now carry a value no
+# earlier writer could produce, and a reader that cannot tell the versions
+# apart has no way to know whether its absence on a line is a measurement or
+# a vocabulary it did not have.
+GRADE_SCHEMA_VERSION = "1.2.0"
 
 # The oldest `RunRecord` schema whose fields mean what `from_dict` and the
 # ladder were written to assume. Below it the run is not graded and
@@ -165,7 +170,11 @@ class NotGradedReason(str, Enum):
     out of the denominator rather than counted as a failure:
 
     * the run never produced a gradable submission (`EXCLUDED`, `NO_TURNS`,
-      `CRASHED`, `NO_FINAL_DIFF`, and the two unappliable-diff cases);
+      `CRASHED`, `NO_FINAL_DIFF`, the two unappliable-diff cases, and
+      `SUBMODULE_GITLINK_UNGRADABLE` -- where a submission exists and is
+      appliable, but what it carries is a submodule gitlink pointing at a
+      commit that lives only in the run tree that produced it, so the agent
+      may well have fixed the bug and the harness cannot see the content);
     * the grading environment broke (`ENVIRONMENT_ERROR`,
       `SCOPE_COLLECTED_NOTHING`, `PREFLIGHT_FAILED`, `ORACLE_FAILED`,
       `TASK_SETUP_FAILED`);
@@ -182,6 +191,7 @@ class NotGradedReason(str, Enum):
     NO_FINAL_DIFF = "no_final_diff"
     BINARY_HUNK_UNAPPLIABLE = "binary_hunk_unappliable"
     LOSSY_DIFF_UNAPPLIABLE = "lossy_diff_unappliable"
+    SUBMODULE_GITLINK_UNGRADABLE = "submodule_gitlink_ungradable"
     ENVIRONMENT_ERROR = "environment_error"
     SCOPE_COLLECTED_NOTHING = "scope_collected_nothing"
     PREFLIGHT_FAILED = "preflight_failed"

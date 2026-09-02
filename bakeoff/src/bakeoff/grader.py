@@ -15,8 +15,9 @@ because collapsing any pair makes one of them unreadable:
 
 * `resolved is None` + `not_graded_reason` -- no verdict exists. The run never
   produced a gradable submission (`EXCLUDED`, `NO_TURNS`, `CRASHED`,
-  `NO_FINAL_DIFF`, `BINARY_HUNK_UNAPPLIABLE`, `LOSSY_DIFF_UNAPPLIABLE`) or the
-  grading environment broke (`ENVIRONMENT_ERROR`, `SCOPE_COLLECTED_NOTHING`).
+  `NO_FINAL_DIFF`, `BINARY_HUNK_UNAPPLIABLE`, `LOSSY_DIFF_UNAPPLIABLE`,
+  `SUBMODULE_GITLINK_UNGRADABLE`) or the grading environment broke
+  (`ENVIRONMENT_ERROR`, `SCOPE_COLLECTED_NOTHING`).
   Only the first group says anything about the model, and it does not say the
   model failed.
 * `resolved is False` + `grade_failure` -- the grader looked and the submission
@@ -104,6 +105,7 @@ from bakeoff.tasks import (
     _under,
     diff_chunks,
     materialize,
+    task_submodules,
 )
 
 #: What this ladder asserts, as a version. It gates resume -- a run already
@@ -146,7 +148,24 @@ from bakeoff.tasks import (
 #: old one is the finding -- and it costs a full grading pass per event log.
 #: Schedulable rather than urgent, precisely because no verdict changes until
 #: a manifest raises the key.
-GRADER_VERSION: str = "4"
+#:
+#: 4 -> 5: `_submodule_gitlinks_touched`. A submission that moves a submodule
+#: gitlink is NOT GRADED instead of being run through the ladder. Under 4 such
+#: a submission applied with exit 0, moved only the index, left the
+#: submodule's working tree at the original commit, and the ladder graded the
+#: ORIGINAL content -- so the verdict was `resolved: False`, an accusation,
+#: over content the harness could not capture. That is a change to what the
+#: ladder MEANS on an input it already accepted, so the version moves whether
+#: or not any stored run hits it.
+#:
+#: Operator note: as with 3 -> 4, this re-grades EVERY stored run into a fresh
+#: `v5` artifacts directory beside the existing one, at the cost of a full
+#: grading pass per event log. Schedulable rather than urgent: today's corpus
+#: has no submodule task, so `task_submodules` returns `()` for every stored
+#: row and no verdict changes. It has to land with the code that makes the
+#: divergence possible, not with the first task that exercises it, because the
+#: resume gate in `scripts/grade.py` keys on (run_id, GRADER_VERSION) alone.
+GRADER_VERSION: str = "5"
 
 #: Wall clock for the HOST-side gitleaks scan, and for nothing else.
 #: `_ContainerEnv.scan_secrets` shells out to `docker run` rather than through
@@ -556,6 +575,51 @@ def _parse_submission(diff: str) -> list[tuple[str, str, str]]:
             source, dest = _chunk_path(chunk, root)
             parsed.append((chunk, source, dest))
         return parsed
+
+
+def _submodule_gitlinks_touched(task, diff: str,
+                                cache_root: Path) -> tuple[str, ...]:
+    """The submodule paths this submission changes, if any.
+
+    Measured 2026-09-01 (git 2.50.1). Two facts, and together they make such a
+    submission ungradable rather than wrong:
+
+      `git add -A` stages NOTHING for an uncommitted edit inside a submodule,
+      so `container.snapshot_diff` -- `git add -A` then `git diff --cached
+      base_sha` -- returns ZERO BYTES for it. Not even the `-dirty` gitlink
+      line survives staging.
+
+      An agent that COMMITS inside the submodule does move the gitlink, and
+      `git apply --index` of the resulting diff on a freshly materialized tree
+      exits 0 (`warning: unable to rmdir` only), moves the index entry to a
+      commit that exists nowhere outside the original run tree's
+      `.git/modules`, and leaves the submodule's working tree UNCHANGED.
+
+    So the ladder would apply cleanly and then grade the original content, and
+    the verdict would be `resolved: False` -- an accusation -- for work the
+    harness could not capture. `NotGradedReason`, never `GradeFailure`: a
+    GradeFailure puts the row in the denominator as a model failure, which is
+    precisely the claim this refusal exists to avoid making.
+
+    EQUALITY against the submodule path, not `_under`. A path INSIDE a
+    submodule cannot appear in a submission at all (first fact above), so
+    anything under one is either impossible or a hand-edited diff, and the
+    exact-match rule keeps the refusal narrow.
+
+    A submission that cannot be parsed returns `()` and is left alone.
+    `_apply_submission` already names that shape with its own detail, and a
+    second authority for one refusal is the mistake `not_graded_gate`'s
+    docstring records.
+    """
+    paths = {sub.path for sub in task_submodules(task, Path(cache_root))}
+    if not paths:
+        return ()
+    try:
+        parsed = _parse_submission(diff)
+    except TaskError:
+        return ()
+    touched = {p for _chunk, source, dest in parsed for p in (source, dest)}
+    return tuple(sorted(touched & paths))
 
 
 def _added_lines(chunk: str) -> str:
@@ -1661,6 +1725,14 @@ def grade_run(record: RunRecord, task, image: str, oracle: Oracle | None,
     accepted precisely so a caller does not have to derive a quarantine for a
     run that will not be graded.
 
+    The gitlink refusal sits beside it and for the same reason, but it is a
+    SEPARATE function rather than a branch of `not_graded_gate`: that gate is
+    also called by `run_ladder` and asks only whether a submission exists,
+    while this one reads the submission's contents and needs the task and the
+    cache root, neither of which the gate takes. It runs before the artifacts
+    wipe and before `materialize`, so a refused row costs no tree and no
+    container.
+
     The tree is removed on the way out, including on the failure paths: it
     holds the submission applied on top of the start state, which is a trap
     for anyone who inspects the cache by hand.
@@ -1690,6 +1762,18 @@ def grade_run(record: RunRecord, task, image: str, oracle: Oracle | None,
     if gate is not None:
         return build_grade_record(record, task, image, oracle,
                                   _gated_result(gate))
+
+    gitlinks = _submodule_gitlinks_touched(
+        task, record.artifacts.final_diff or "", Path(cache_root)
+    )
+    if gitlinks:
+        return build_grade_record(record, task, image, oracle, _gated_result((
+            NotGradedReason.SUBMODULE_GITLINK_UNGRADABLE,
+            f"the submission changes the gitlink(s) {', '.join(gitlinks)}; the "
+            "referenced commit exists only in the run tree that produced it, "
+            "and applying the diff moves the index without moving the "
+            "submodule's content",
+        )))
 
     artifacts_dir = Path(artifacts_root) / record.run_id / f"v{GRADER_VERSION}"
     shutil.rmtree(artifacts_dir, ignore_errors=True)

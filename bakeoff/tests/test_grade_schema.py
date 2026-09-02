@@ -31,8 +31,23 @@ def test_the_grade_schema_version_moved_with_what_the_record_means():
     Pinned to a literal so a bump is a DELIBERATE edit rather than a side
     effect: 1.0.0 -> 1.1.0 adds `GradeRecord.suite_timeout_s`, because with
     the bound now per task, `timed_out: True` alone cannot say what the
-    check actually blew."""
-    assert GRADE_SCHEMA_VERSION == "1.1.0"
+    check actually blew; 1.1.0 -> 1.2.0 adds
+    `NotGradedReason.SUBMODULE_GITLINK_UNGRADABLE`, which is a value a reader
+    of the `not_graded_reason` field can now meet and could not before."""
+    assert GRADE_SCHEMA_VERSION == "1.2.0"
+
+
+def test_the_gitlink_refusal_is_a_not_graded_reason_and_not_a_failure():
+    """It belongs to the FIRST group -- the run never produced a gradable
+    submission -- and the enum it is NOT in is the point: a `GradeFailure`
+    would put the row in the denominator as a model failure, which is the one
+    claim this refusal exists to avoid making.
+    """
+    assert (NotGradedReason.SUBMODULE_GITLINK_UNGRADABLE.value
+            == "submodule_gitlink_ungradable")
+    assert "submodule_gitlink_ungradable" not in {
+        m.value for m in GradeFailure
+    }
 
 
 def test_round_trip_preserves_every_field_and_type():
@@ -79,6 +94,24 @@ def test_a_1_0_0_line_loads_with_no_bound_rather_than_a_fabricated_one(
     records, malformed = load_grades(p)
     assert malformed == 0
     assert records[0].suite_timeout_s is None
+
+
+def test_a_1_1_0_line_loads_unchanged_under_1_2_0(tmp_path: Path):
+    """1.2.0 adds an enum MEMBER and no field, so a 1.1.0 line is
+    field-identical and must load with nothing defaulted and nothing lost.
+    The version still moves: a reader that meets
+    `submodule_gitlink_ungradable` on a line claiming 1.1.0 would be reading
+    a value that writer could not have produced.
+    """
+    data = _record().to_dict()
+    data["grade_schema_version"] = "1.1.0"
+    p = tmp_path / "grades.jsonl"
+    p.write_text(json.dumps(data) + "\n", encoding="utf-8")
+
+    records, malformed = load_grades(p)
+    assert malformed == 0
+    assert records[0].grade_schema_version == "1.1.0"
+    assert records[0].suite_timeout_s == data["suite_timeout_s"]
 
 
 def test_append_then_load_returns_both_records(tmp_path: Path):

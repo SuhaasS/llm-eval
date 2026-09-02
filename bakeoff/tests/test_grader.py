@@ -21,6 +21,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import bakeoff.grader as grader
 from bakeoff.grade_schema import CHECK_ORDER, GradeFailure, NotGradedReason
 from bakeoff.grader import (
     GRADER_VERSION,
@@ -107,6 +108,22 @@ BASE_SHA = "b" * 40
 # --------------------------------------------------------------------------
 # fakes
 # --------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _no_submodules(monkeypatch):
+    """Every task here is a `SimpleNamespace`, and `grade_run` now asks
+    `tasks.task_submodules` for the gitlinks before it grades anything.
+
+    That call reaches `ensure_mirror`, which wants a `repo_url` these fixtures
+    have no business carrying and a clone this file has never needed -- so the
+    default answer is `()`, which is also the true answer for every task in
+    today's corpus. Autouse rather than per test because the reach is
+    `grade_run`'s, not any one test's, and a test that forgot the patch would
+    fail on a missing attribute rather than on what it is about.
+    `_with_submodule` overrides it where the gitlink refusal is the subject.
+    """
+    monkeypatch.setattr(grader, "task_submodules", lambda task, cache_root: ())
 
 
 def is_f2p(argv):
@@ -445,6 +462,97 @@ def test_an_ungraded_record_does_not_claim_an_empty_quarantine(tmp_path):
     assert grade.f2p_declared is None
     assert grade.p2p_quarantine_requested is None
     assert all(c.status == "skipped" for c in grade.checks)
+
+
+# --------------------------------------------------------------------------
+# 1b. the gitlink refusal, which runs beside the gates and before the ladder
+# --------------------------------------------------------------------------
+
+_GITLINK_SUBMISSION = (
+    "diff --git a/vendor/libdep b/vendor/libdep\n"
+    "index 942c381..c464218 160000\n"
+    "--- a/vendor/libdep\n"
+    "+++ b/vendor/libdep\n"
+    "@@ -1 +1 @@\n"
+    "-Subproject commit 942c381d88cecca36be86b2e902f554ad145ec44\n"
+    "+Subproject commit c46421867cd1d0ac5a2038e156236a73a4cdeaac\n"
+)
+
+
+def _with_submodule(monkeypatch, *paths):
+    monkeypatch.setattr(
+        grader, "task_submodules",
+        lambda task, cache_root: tuple(
+            SimpleNamespace(name=p, path=p, url="https://x/y.git", sha="0" * 40)
+            for p in paths
+        ),
+    )
+
+
+def test_a_gitlink_submission_is_not_graded_rather_than_failed(monkeypatch,
+                                                               tmp_path):
+    """Measured 2026-09-01, git 2.50.1: `git apply --index` of this diff on a
+    freshly materialized tree exits 0 with only `warning: unable to rmdir`,
+    moves the INDEX gitlink to a commit that exists nowhere but the original
+    run tree's .git/modules, and leaves the submodule's working tree at the
+    original commit. The ladder would then run the suite against content the
+    agent never wrote and return `resolved: False` -- an accusation over a
+    limitation of the harness's own diff capture, since `git add -A` stages
+    NOTHING for an uncommitted edit inside a submodule.
+
+    No container is started and no tree is materialized: the refusal sits
+    beside `not_graded_gate`, before either, which is why this test needs
+    neither Docker nor a mirror.
+    """
+    _with_submodule(monkeypatch, "vendor/libdep")
+
+    graded = grade_run(_record(diff=_GITLINK_SUBMISSION), _task(),
+                       "sha256:x", None, tmp_path / "cache",
+                       tmp_path / "artifacts")
+
+    assert graded.resolved is None
+    assert graded.not_graded_reason == \
+        NotGradedReason.SUBMODULE_GITLINK_UNGRADABLE.value
+    assert graded.grade_failure is None
+    assert "vendor/libdep" in graded.not_graded_detail
+
+
+def test_a_task_with_no_submodules_reaches_the_ladder(monkeypatch, tmp_path):
+    """Backwards compatibility. `pallets/click` has no gitlink, and the check
+    must return `()` for it without changing where the record goes next.
+    """
+    _with_submodule(monkeypatch)  # no paths
+
+    touched = grader._submodule_gitlinks_touched(
+        _task(), _GITLINK_SUBMISSION, tmp_path / "cache")
+
+    assert touched == ()
+
+
+def test_an_ordinary_submission_touches_no_gitlink(monkeypatch, tmp_path):
+    """EQUALITY against the submodule path, not `_under`. A path INSIDE a
+    submodule cannot appear in a submission at all (measured: `git add -A`
+    stages nothing for it), so only the gitlink entry itself can ever match.
+    """
+    _with_submodule(monkeypatch, "vendor/libdep")
+
+    touched = grader._submodule_gitlinks_touched(
+        _task(), TEXT_DIFF, tmp_path / "cache")
+
+    assert touched == ()
+
+
+def test_an_unparseable_submission_is_left_to_the_existing_refusal(monkeypatch,
+                                                                   tmp_path):
+    """A parse failure is `_apply_submission`'s to name, not this check's.
+    Two authorities for one shape is the mistake `not_graded_gate`'s docstring
+    already records, and this one runs FIRST -- so a raise here would take
+    `LOSSY_DIFF_UNAPPLIABLE` off every lossy row.
+    """
+    _with_submodule(monkeypatch, "vendor/libdep")
+
+    assert grader._submodule_gitlinks_touched(
+        _task(), "not a diff at all\n", tmp_path / "cache") == ()
 
 
 # --------------------------------------------------------------------------
@@ -935,10 +1043,12 @@ def test_the_grader_version_moved_with_what_check_5_means():
     effect: 2 -> 3 was check 5 reading a confined collection error as
     `f2p_failed`; 3 -> 4 is checks 3-7 reading their `timeout` bound off
     `task.budget.suite_timeout_s`, where a longer bound turns a `timed_out`
-    fail into a pass on the same stored input."""
+    fail into a pass on the same stored input; 4 -> 5 is the gitlink refusal,
+    which takes a submission the ladder used to grade `False` out of the
+    denominator entirely."""
     from bakeoff.grader import GRADER_VERSION
 
-    assert GRADER_VERSION == "4"
+    assert GRADER_VERSION == "5"
 
 
 def test_p2p_rides_the_quarantine_and_the_scope():
