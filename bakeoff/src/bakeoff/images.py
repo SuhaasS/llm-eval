@@ -309,12 +309,56 @@ def _strip_build_context(repo_dir: Path, strip_paths: list[str]) -> None:
             shutil.rmtree(target)
 
 
+def _extract_submodules(task, repo_dir: Path, cache_root: Path) -> None:
+    """A second `git archive` per submodule, into the empty directory the first
+    one left.
+
+    Measured 2026-09-01 (git 2.50.1): `git archive <base_sha>` emits
+    `.gitmodules` and an EMPTY directory entry for each submodule path. So the
+    image built from a one-archive context has a directory the run tree will
+    have content in -- `pip install -e .` resolves against the wrong tree, and
+    nothing downstream compares the two. Same class as a non-editable install:
+    the image and the run disagree silently.
+
+    From the PRUNED mirror, not the full one, so the image layer and the run
+    tree are built from the same object set. Nothing here writes a `.git`, and
+    the tree is `base_sha`'s, so the test half -- the oracle -- is still absent;
+    that is why this is two archives rather than a copy of a materialized run
+    tree, which would carry both.
+    """
+    from bakeoff.tasks import ensure_pruned_mirror, task_submodules
+
+    for sub in task_submodules(task, cache_root):
+        mirror = ensure_pruned_mirror(sub.url, sub.sha, cache_root)
+        target = Path(repo_dir) / sub.path
+        target.mkdir(parents=True, exist_ok=True)
+        archive = subprocess.run(
+            ["git", "archive", "--format=tar", sub.sha],
+            cwd=mirror, capture_output=True,
+        )
+        if archive.returncode != 0:
+            raise ImageError(
+                f"git archive {sub.sha} for submodule {sub.path} failed: "
+                f"{archive.stderr.decode('utf-8', 'replace')}"
+            )
+        extract = subprocess.run(
+            ["tar", "-x", "-C", str(target)], input=archive.stdout,
+            capture_output=True,
+        )
+        if extract.returncode != 0:
+            raise ImageError(
+                f"unpacking submodule {sub.path} at {sub.sha} failed: "
+                f"{extract.stderr.decode('utf-8', 'replace')}"
+            )
+
+
 def build_task_image(
     task, base_image: str, build_root: Path, cache_root: Path
 ) -> str:
     """Build one task's image and return its image ID.
 
-    The build context is `git archive base_sha`, not the materialized run
+    The build context is `git archive base_sha`, plus one `git archive` per
+    submodule gitlink (`_extract_submodules`), never the materialized run
     tree: the image must be a function of the manifest alone, and a context
     that included the test patch would bake the oracle into a layer where no
     later step could tell it apart from a dependency.
@@ -349,6 +393,7 @@ def build_task_image(
             f"{extract.stderr.decode('utf-8', 'replace')}"
         )
 
+    _extract_submodules(task, repo_dir, cache_root)
     _strip_build_context(repo_dir, list(task.strip_paths))
 
     (context / "Dockerfile").write_text(

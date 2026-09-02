@@ -22,6 +22,7 @@ from pathlib import Path
 import pytest
 
 import bakeoff.images as images
+import bakeoff.tasks as tasks
 from bakeoff.images import (
     ImageError,
     _strip_build_context,
@@ -191,6 +192,28 @@ def _archive_bytes(source) -> bytes:
     return buffer.getvalue()
 
 
+def _fake_run_with_archive(archive: bytes, real_run):
+    """`git archive` returns `archive`; `git ls-tree`/`git cat-file` report no
+    gitlinks and no `.gitmodules`, so `_extract_submodules`'s derivation sees
+    zero submodules against the fake `tmp_path / "mirror"` these call sites
+    point `ensure_mirror` at, rather than needing that path to be a real repo.
+    Everything else falls through to `real_run`, which is what keeps the
+    docker calls (faked separately via `images._run`) and any other caller
+    honest -- same shared-module patch this file already uses.
+    """
+    def fake_run(args, **kwargs):
+        argv = list(args)
+        if argv[:2] == ["git", "archive"]:
+            return subprocess.CompletedProcess(args, 0, stdout=archive, stderr=b"")
+        if argv[:2] == ["git", "ls-tree"]:
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        if argv[:2] == ["git", "cat-file"]:
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="")
+        return real_run(args, **kwargs)
+
+    return fake_run
+
+
 def test_build_task_image_strips_the_context_it_unpacks(tmp_path, monkeypatch):
     """The CALL SITE, not the helper.
 
@@ -214,11 +237,7 @@ def test_build_task_image_strips_the_context_it_unpacks(tmp_path, monkeypatch):
     (source / "calc.py").write_text("x = 1\n")
     archive = _archive_bytes(source)
     real_run = subprocess.run
-
-    def fake_run(args, **kwargs):
-        if list(args)[:2] == ["git", "archive"]:
-            return subprocess.CompletedProcess(args, 0, stdout=archive, stderr=b"")
-        return real_run(args, **kwargs)
+    fake_run = _fake_run_with_archive(archive, real_run)
 
     # `build_task_image` imports ensure_mirror from bakeoff.tasks INSIDE the
     # function, so the patch has to land on the source module.
@@ -240,6 +259,9 @@ def test_build_task_image_strips_the_context_it_unpacks(tmp_path, monkeypatch):
         base_sha = "0" * 40
         image = _Image()
         strip_paths = ("CLAUDE.md", ".claude")
+        test_files = ()
+        solution_files = ()
+        extra_files = ()
 
     build_task_image(_Task(), "sha256:base", tmp_path / "build",
                      tmp_path / "cache")
@@ -248,6 +270,147 @@ def test_build_task_image_strips_the_context_it_unpacks(tmp_path, monkeypatch):
     assert (unpacked / "calc.py").exists(), "the archive was unpacked at all"
     assert not (unpacked / "CLAUDE.md").exists()
     assert not (unpacked / ".claude").exists()
+
+
+def _submodule_fixture(tmp_path):
+    """A superproject mirror plus a submodule mirror, both real bare repos.
+
+    Real rather than faked because the thing under test is that TWO archives
+    are taken and the second lands inside the first's empty directory --
+    measured 2026-09-01 (git 2.50.1): `git archive` emits `.gitmodules` and a
+    zero-entry directory for the gitlink, so a stubbed single archive could
+    not express the bug.
+    """
+    def sh(*args, cwd):
+        subprocess.run(args, cwd=cwd, check=True, capture_output=True)
+
+    lib = tmp_path / "lib"
+    (lib / "libdep").mkdir(parents=True)
+    (lib / "libdep" / "__init__.py").write_text("VALUE = 1\n")
+    sh("git", "init", "-q", cwd=lib)
+    sh("git", "config", "user.email", "t@t.test", cwd=lib)
+    sh("git", "config", "user.name", "t", cwd=lib)
+    sh("git", "add", "-A", cwd=lib)
+    sh("git", "commit", "-q", "-m", "lib", cwd=lib)
+    pinned = subprocess.run(["git", "rev-parse", "HEAD"], cwd=lib,
+                            check=True, capture_output=True,
+                            text=True).stdout.strip()
+
+    sup = tmp_path / "sup"
+    sup.mkdir()
+    (sup / "calc.py").write_text("x = 1\n")
+    sh("git", "init", "-q", cwd=sup)
+    sh("git", "config", "user.email", "t@t.test", cwd=sup)
+    sh("git", "config", "user.name", "t", cwd=sup)
+    sh("git", "add", "-A", cwd=sup)
+    sh("git", "commit", "-q", "-m", "base", cwd=sup)
+    sh("git", "-c", "protocol.file.allow=always", "submodule", "add", "-q",
+       str(lib), "vendor/libdep", cwd=sup)
+    sh("git", "add", "-A", cwd=sup)
+    sh("git", "commit", "-q", "-m", "sub", cwd=sup)
+    base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=sup, check=True,
+                          capture_output=True, text=True).stdout.strip()
+    return {"sup": sup, "lib": lib, "base": base, "pinned": pinned}
+
+
+def _sub_task_stub(fixture, strip_paths=()):
+    class _Image:
+        apt = ()
+        pip = ()
+        build = ()
+        env = {}
+
+    class _Task:
+        task_id = "t"
+        task_version = 1
+        repo_url = str(fixture["sup"])
+        base_sha = fixture["base"]
+        image = _Image()
+        strip_paths = ()
+        test_files = ()
+        solution_files = ()
+        extra_files = ()
+
+    _Task.strip_paths = tuple(strip_paths)
+    return _Task()
+
+
+def test_the_build_context_carries_submodule_content(tmp_path, monkeypatch):
+    """The context is two archives, not one. Measured 2026-09-01: `git archive`
+    emits a submodule as an EMPTY DIRECTORY entry (`.gitmodules` is in the
+    archive, the content is not), so a one-archive context ships an image whose
+    `pip install -e .` resolves against a directory the run tree will have
+    content in -- the same silent image/run disagreement a non-editable
+    install produces, and nothing downstream compares the two.
+    """
+    fixture = _submodule_fixture(tmp_path)
+    monkeypatch.setattr("bakeoff.images._run", lambda *a, **k: "sha256:fake")
+    monkeypatch.setattr(tasks, "_SUBMODULE_URL_PREFIX", "")
+
+    build_task_image(_sub_task_stub(fixture), "sha256:base",
+                     tmp_path / "build", tmp_path / "cache")
+
+    repo = tmp_path / "build" / "image-t" / "repo"
+    assert (repo / "vendor" / "libdep" / "libdep" / "__init__.py").read_text() \
+        == "VALUE = 1\n"
+    assert (repo / ".gitmodules").exists()
+
+
+def test_the_build_context_still_carries_no_git_directory(tmp_path, monkeypatch):
+    """`git archive` twice, never a copied run tree: a run tree is base_sha
+    PLUS the committed test half, so copying one bakes the oracle into a layer
+    no later step can tell from a dependency.
+    """
+    fixture = _submodule_fixture(tmp_path)
+    monkeypatch.setattr("bakeoff.images._run", lambda *a, **k: "sha256:fake")
+    monkeypatch.setattr(tasks, "_SUBMODULE_URL_PREFIX", "")
+
+    build_task_image(_sub_task_stub(fixture), "sha256:base",
+                     tmp_path / "build", tmp_path / "cache")
+
+    repo = tmp_path / "build" / "image-t" / "repo"
+    assert [p for p in repo.rglob(".git")] == []
+
+
+def test_a_task_with_no_submodules_takes_no_extra_archive(tmp_path, monkeypatch):
+    """Backwards compatibility. `pallets/click` at its base_sha has no gitlink,
+    and a zero-submodule task must not gain a git call against the mirror.
+    """
+    fixture = _submodule_fixture(tmp_path)
+    monkeypatch.setattr("bakeoff.images._run", lambda *a, **k: "sha256:fake")
+    real_run = subprocess.run
+    archives = []
+
+    def counting_run(args, **kwargs):
+        if list(args)[:2] == ["git", "archive"]:
+            archives.append(list(args))
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr("bakeoff.images.subprocess.run", counting_run)
+
+    class _Image:
+        apt = ()
+        pip = ()
+        build = ()
+        env = {}
+
+    class _Task:
+        task_id = "t"
+        task_version = 1
+        repo_url = str(fixture["sup"])
+        base_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD~1"], cwd=fixture["sup"], check=True,
+            capture_output=True, text=True).stdout.strip()
+        image = _Image()
+        strip_paths = ()
+        test_files = ()
+        solution_files = ()
+        extra_files = ()
+
+    build_task_image(_Task(), "sha256:base", tmp_path / "build",
+                     tmp_path / "cache")
+
+    assert len(archives) == 1
 
 
 def test_env_lines_come_after_every_build_step():
@@ -316,12 +479,7 @@ def test_build_task_image_passes_the_manifests_env_through(tmp_path,
     (source / "calc.py").write_text("x = 1\n")
     archive = _archive_bytes(source)
     real_run = subprocess.run
-
-    def fake_run(args, **kwargs):
-        if list(args)[:2] == ["git", "archive"]:
-            return subprocess.CompletedProcess(args, 0, stdout=archive,
-                                               stderr=b"")
-        return real_run(args, **kwargs)
+    fake_run = _fake_run_with_archive(archive, real_run)
 
     rendered = {}
     real_render = images.render_dockerfile
@@ -351,6 +509,9 @@ def test_build_task_image_passes_the_manifests_env_through(tmp_path,
         base_sha = "0" * 40
         image = _Image()
         strip_paths = ()
+        test_files = ()
+        solution_files = ()
+        extra_files = ()
 
     build_task_image(_Task(), "sha256:base", tmp_path / "build",
                      tmp_path / "cache")
