@@ -23,7 +23,11 @@ import pytest
 
 from bakeoff.preflight import (
     EXIT_ALL_PASSED,
+    EXIT_COLLECTION_INTERRUPTED,
     EXIT_TESTS_FAILED,
+    EXIT_USAGE_ERROR,
+    collection_error_modules,
+    f2p_modules,
     failed_node_ids,
     preflight,
 )
@@ -77,6 +81,151 @@ def test_a_node_id_that_does_not_exist_is_a_usage_error(tmp_path):
     )
 
     assert result.returncode not in (EXIT_ALL_PASSED, EXIT_TESTS_FAILED)
+
+
+def test_selecting_a_node_id_whose_module_will_not_import_is_exit_4_not_2(tmp_path):
+    """The measurement this whole broadening turns on, taken against the real
+    runner rather than asserted.
+
+    `_Runner.select` passes node ids POSITIONALLY, and pytest answers a node
+    id whose module raises on import with a USAGE ERROR (4), not with the
+    collection-interrupted code (2). 2 is what a module-path or directory run
+    gives -- which is how the `trucking-doc-extraction` #3 measurement was
+    taken, and why an acceptance written for 2 alone would be dead code on
+    every task preflight actually runs.
+
+    Measured 2026-09-01 against pytest 9.1.1 (the venv and the base image pin)
+    and pytest 8.3.5 (what `click-3360`'s image.pip pins); both agree.
+    """
+    repo = tmp_path / "repo"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "mypkg.py").write_text("def other():\n    return 1\n")
+    (repo / "tests" / "test_new.py").write_text(
+        "from mypkg import added_symbol\n\n\n"
+        "def test_added():\n    assert added_symbol() == 1\n"
+    )
+    argv = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"]
+
+    selected = subprocess.run(
+        [*argv, "tests/test_new.py::test_added"],
+        cwd=repo, capture_output=True, text=True,
+    )
+    whole_module = subprocess.run(
+        [*argv, "tests/test_new.py"], cwd=repo, capture_output=True, text=True
+    )
+
+    assert selected.returncode == EXIT_USAGE_ERROR
+    assert whole_module.returncode == EXIT_COLLECTION_INTERRUPTED
+    # And both name the MODULE, with no `::`, in the summary.
+    assert collection_error_modules(selected.stdout + selected.stderr) == {
+        "tests/test_new.py"
+    }
+
+
+def test_nothing_runs_at_all_when_collection_fails(tmp_path):
+    """So "every declared f2p id appears in FAILED/ERROR" is UNSATISFIABLE on
+    this shape and has to become a claim about modules.
+
+    A selection spanning a module that will not import and a module that
+    imports and fails reports ONLY the collection error -- the failing test
+    never runs. A gate that kept the id-level rule would refuse every task of
+    this shape while believing it was checking something."""
+    repo = tmp_path / "repo"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "tests" / "test_broken.py").write_text("import nonexistent_module\n")
+    (repo / "tests" / "test_red.py").write_text(
+        "def test_red():\n    assert 1 == 2\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         "tests/test_broken.py::test_x", "tests/test_red.py::test_red"],
+        cwd=repo, capture_output=True, text=True,
+    )
+
+    assert result.returncode == EXIT_USAGE_ERROR
+    # Measured (row J): the output names only the erroring module, so a
+    # direct absence check is exact. A `.split(header)[-1]` form would return
+    # the WHOLE output when the header is absent (row K), and assert nothing.
+    assert "test_red.py" not in result.stdout + result.stderr
+
+
+def test_every_erroring_module_is_reported_not_only_the_first(tmp_path):
+    """The equality in preflight's acceptance rests on this and nothing else.
+
+    If pytest stopped at the first import failure a two-module f2p set would
+    report one module, the equality could never hold, and every such task would
+    be refused for a reason that is a property of the reporter rather than of
+    the task -- a gate that looks strict and is arbitrary."""
+    repo = tmp_path / "repo"
+    (repo / "tests").mkdir(parents=True)
+    for name in ("test_one.py", "test_two.py"):
+        (repo / "tests" / name).write_text("import nonexistent_module\n")
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         "tests/test_one.py::test_a", "tests/test_two.py::test_b"],
+        cwd=repo, capture_output=True, text=True,
+    )
+
+    assert result.returncode == EXIT_USAGE_ERROR
+    assert collection_error_modules(result.stdout + result.stderr) == {
+        "tests/test_one.py", "tests/test_two.py"
+    }
+
+
+def test_collection_error_modules_separates_a_dead_module_from_a_dead_test():
+    """The discriminator is the absent `::`, and it is the whole parser.
+
+    pytest writes `ERROR <module>` for a module that would not import and
+    `FAILED <mod>::<test>` / `ERROR <mod>::<test>` for a test that failed or
+    whose fixture blew up. Reading a fixture error as "the module did not
+    import" would let a task through whose declared tests never ran for a
+    reason the gate is supposed to refuse."""
+    collection = (
+        "ERROR: found no collectors for /repo/tests/new.py::test_added\n"
+        "ERROR tests/new.py\n"
+        "1 error in 0.01s\n"
+    )
+    fixture_error = (
+        "ERROR tests/new.py::test_added - ValueError: closed file\n"
+        "1 error in 0.01s\n"
+    )
+    mixed = "ERROR tests/new.py\nFAILED tests/other.py::test_x\n"
+
+    assert collection_error_modules(collection) == {"tests/new.py"}
+    assert collection_error_modules(fixture_error) is None
+    assert collection_error_modules(mixed) is None
+
+
+def test_a_typoed_node_id_is_not_a_collection_error():
+    """The two exit-4 shapes have to stay apart: a manifest naming a test that
+    was renamed upstream must keep stopping the matrix, not be accepted as
+    "the module could not be collected".
+
+    Measured: both `ERROR: not found:` and `ERROR: file or directory not
+    found:` carry a COLON after ERROR, so `_FAILED_LINE` never matches them and
+    the reported set is empty."""
+    not_found = (
+        "ERROR: not found: /repo/tests/a.py::test_gone\n"
+        "(no match in any of [<Module a.py>])\n\n\nno tests ran in 0.00s\n"
+    )
+    no_file = (
+        "ERROR: file or directory not found: tests/nope.py::test_x\n\n"
+        "no tests ran in 0.00s\n"
+    )
+
+    assert collection_error_modules(not_found) is None
+    assert collection_error_modules(no_file) is None
+
+
+def test_f2p_modules_is_the_part_before_the_first_colons():
+    """Parametrized ids carry `::` inside brackets on the RIGHT of the split,
+    so splitting once from the left is the only correct reading."""
+    assert f2p_modules(
+        ("tests/a.py::test_one[x::y]", "tests/a.py::Klass::test_two",
+         "tests/b.py::test_three")
+    ) == {"tests/a.py", "tests/b.py"}
 
 
 def test_failed_node_ids_reads_both_failures_and_errors():

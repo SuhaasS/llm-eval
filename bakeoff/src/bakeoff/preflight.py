@@ -41,16 +41,34 @@ from bakeoff.container import RunContainer
 # Phase 0c failure. See https://docs.pytest.org/en/stable/reference/exit-codes
 EXIT_ALL_PASSED = 0
 EXIT_TESTS_FAILED = 1
+#: Collection was interrupted. Reached by a run that collects a DIRECTORY or a
+#: MODULE PATH -- not by the f2p selection, which is positional node ids. See
+#: EXIT_USAGE_ERROR.
+EXIT_COLLECTION_INTERRUPTED = 2
+#: Two causes, and telling them apart is the whole of broadening 2. Measured
+#: 2026-09-01 against pytest 9.1.1 and 8.3.5: selecting `mod.py::test` when
+#: `mod.py` raises on import exits 4 with an `ERROR mod.py` summary line, and
+#: selecting a node id that does not exist in a module that imports fine ALSO
+#: exits 4 -- with `ERROR: not found:` (colon), which `_FAILED_LINE` does not
+#: match, so the reported set is empty. The first is a task shape to accept;
+#: the second is a manifest typo that must keep stopping the matrix.
+EXIT_USAGE_ERROR = 4
 #: The scoped run's failure mode, and the whole of its detection. No "collected
 #: 0 items" summary matching: the pinned runners carry `-q`, which suppresses
 #: that line (measured), so a guard on the string could not fire under the
 #: configuration actually used -- the dead-guard shape a mutation cannot catch.
+#: `-q` does NOT suppress "Interrupted: N error during collection" (also
+#: measured); nothing parses that line and nothing should.
 EXIT_NOTHING_COLLECTED = 5
+#: The two codes a collection error can arrive as. 4 first, because that is the
+#: one preflight's own f2p run produces.
+EXIT_COLLECTION_FAILURES = (EXIT_USAGE_ERROR, EXIT_COLLECTION_INTERRUPTED)
 _EXIT_MEANING = {
     2: "collection was interrupted (an import error in a test module, most "
        "often a dependency the image does not ship)",
     3: "pytest hit an internal error",
-    4: "usage error -- a selected node id does not exist",
+    4: "usage error -- a selected node id does not exist, OR the module it "
+       "names could not be imported",
     5: "no tests were collected",
     124: "the command hit the preflight timeout",
 }
@@ -219,6 +237,56 @@ def failed_node_ids(output: str) -> set[str]:
     about it.
     """
     return {match.group(1) for match in _FAILED_LINE.finditer(output)}
+
+
+def collection_error_modules(output: str) -> frozenset[str] | None:
+    """The test modules pytest could not COLLECT -- or `None` for anything else.
+
+    Section 3.3's loop ends in "runs tests, sees failures, self-corrects", and
+    a PR that ADDS a symbol hands the agent an `ImportError` instead of an
+    assertion. That is a real task shape, and it is one preflight refused
+    outright until broadening 2, because both of its exit codes (4 for a
+    selection, 2 for a directory sweep) are also what a broken image gives.
+
+    The discriminator is `::`, and it is the whole parser. Measured 2026-09-01
+    against pytest 9.1.1 and 8.3.5, under the pinned `-q -p no:cacheprovider`:
+
+    * a module that raised on import          -> `ERROR tests/new.py`
+    * a test that failed                      -> `FAILED tests/new.py::test_x`
+    * a test whose fixture raised             -> `ERROR tests/new.py::test_x`
+    * a node id that does not exist           -> `ERROR: not found: ...`
+    * a path that does not exist              -> `ERROR: file or directory ...`
+
+    The last two carry a COLON after `ERROR`, so `_FAILED_LINE` never matches
+    them and they arrive here as an empty set -- which is refused, because a
+    manifest naming a renamed test must keep stopping the matrix rather than
+    being read as "the module could not be collected".
+
+    `None` rather than an empty frozenset for the refusal: "no collection
+    errors" and "collection errors mixed with test results" are different
+    facts, and a caller comparing an empty set against the declared modules
+    would silently accept the second on a task that declares no f2p ids.
+
+    The comparison against `f2p_modules` is deliberately NOT made here. The two
+    callers need different ones -- preflight equality, the grader containment
+    (see the offline-grader spec, check 5) -- and folding both behind a flag
+    would make each call site unreadable about which claim it is making.
+    """
+    reported = failed_node_ids(output)
+    if not reported or any("::" in item for item in reported):
+        return None
+    return frozenset(reported)
+
+
+def f2p_modules(f2p: tuple[str, ...]) -> frozenset[str]:
+    """The module half of each declared f2p node id.
+
+    Split once, from the LEFT: a parametrized id can carry `::` inside its
+    brackets (`tests/a.py::test_one[x::y]`) and a class-scoped id carries two,
+    so `rsplit` or an unbounded `split` would name something that is not a
+    module and the equality in `preflight` would never hold.
+    """
+    return frozenset(node_id.split("::", 1)[0] for node_id in f2p)
 
 
 class _Runner:
