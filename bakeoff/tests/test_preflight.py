@@ -23,6 +23,7 @@ import pytest
 
 from bakeoff.preflight import (
     EXIT_ALL_PASSED,
+    EXIT_COLLECTION_FAILURES,
     EXIT_COLLECTION_INTERRUPTED,
     EXIT_TESTS_FAILED,
     EXIT_USAGE_ERROR,
@@ -37,6 +38,12 @@ FIXTURE = Path(__file__).resolve().parent.parent / "fixtures" / "smoke_task"
 
 
 # --- the distinction the gate is built on ------------------------------------
+
+
+def test_exit_usage_error_is_checked_before_exit_collection_interrupted():
+    """The tuple's order is a documented decision nothing else reads yet: 4
+    first, because that is the one preflight's own f2p run produces."""
+    assert EXIT_COLLECTION_FAILURES == (EXIT_USAGE_ERROR, EXIT_COLLECTION_INTERRUPTED)
 
 
 def test_a_broken_environment_and_a_present_bug_are_different_exit_codes(tmp_path):
@@ -578,17 +585,27 @@ def test_a_declared_p2p_set_is_actually_used():
 
 def test_grading_p2p_with_no_extras_is_the_argv_preflight_validated():
     """The whole reason the grader goes through this method rather than
-    hand-building the branch: with both keyword arguments left at their
-    defaults the argv is byte-identical to the one the gate validated. The
-    moment the graded command and the gated command drift apart, the oracle
-    stops describing the thing being graded.
+    hand-building the branch: with every keyword argument left at its default
+    the argv is byte-identical to the one the gate validated. The moment the
+    graded command and the gated command drift apart, the oracle stops
+    describing the thing being graded.
 
     Written against the LITERAL argv rather than against a second call of the
     same method: `pass_to_pass(t) == pass_to_pass(t, extra_deselect=(),
-    scope=())` is symmetric and holds no matter what the body emits, so it
-    would stay green through an inserted flag or a reordered segment -- the
-    two changes the property exists to catch. Both branches are spelled out
+    scope=(), ignore=())` is symmetric and holds no matter what the body emits,
+    so it would stay green through an inserted flag or a reordered segment --
+    the two changes the property exists to catch. Both branches are spelled out
     because the explicit-p2p branch has its own `*extra` splice.
+
+    `ignore` is the third keyword and the one broadening 2 added. It is used by
+    ONE caller (preflight's p2p run at the START state, which the grader never
+    makes) and defaults inert everywhere else, which is what keeps this literal
+    true for the run the grader does make. It is spliced into `extra`, so it
+    reaches BOTH branches -- and on the explicit-`tests.p2p` branch it is a
+    NO-OP, because that branch selects node ids and pytest imports only the
+    modules those ids name. Spliced there anyway rather than guarded: one
+    splice is one thing to keep right, and a guard would be a second place the
+    two branches could diverge, for a saving of nothing.
     """
     from bakeoff.preflight import _Runner
 
@@ -612,9 +629,33 @@ def test_grading_p2p_with_no_extras_is_the_argv_preflight_validated():
     # comparison cannot pass by symmetry.
     supplied = _Recorder()
     _Runner(supplied, _Tests().runner, 60).pass_to_pass(
-        _Tests(), extra_deselect=(), scope=()
+        _Tests(), extra_deselect=(), scope=(), ignore=()
     )
     assert supplied.commands == deselect_branch.commands
+
+
+def test_ignore_lands_as_one_flag_per_path_after_the_deselects():
+    """Position is pinned, not just presence.
+
+    `--ignore=<path>` is one argument, not a flag and a value: measured
+    2026-09-01, pytest 9.1.1 and 8.3.5 both accept `--ignore=tests/x.py` and
+    both silently accept a path that does not exist (so a stale entry degrades
+    to no effect rather than to the exit-4 usage error the gate would refuse).
+    A test that only asserted "the string appears somewhere" would stay green
+    through a splice that put it before the runner, where it is not a pytest
+    argument at all."""
+    from bakeoff.preflight import _Runner
+
+    recorder = _Recorder()
+    _Runner(recorder, _Tests().runner, 60).pass_to_pass(
+        _Tests(), ignore=("tests/new.py", "tests/other.py")
+    )
+
+    assert recorder.commands == [
+        ["timeout", "60", "python", "-m", "pytest", "-q",
+         "--deselect", "tests/a.py::test_one",
+         "--ignore=tests/new.py", "--ignore=tests/other.py"]
+    ]
 
 
 def test_the_quarantine_rides_as_deselect_flags():

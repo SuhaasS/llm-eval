@@ -256,11 +256,16 @@ def collection_error_modules(output: str) -> frozenset[str] | None:
     * a test whose fixture raised             -> `ERROR tests/new.py::test_x`
     * a node id that does not exist           -> `ERROR: not found: ...`
     * a path that does not exist              -> `ERROR: file or directory ...`
+    * a broken `tests/conftest.py`            -> no `short test summary info`
+      section at all -- exit 4 with the reported set EMPTY, so the run is
+      UNCONFINED (measured 2026-09-01, pytest 9.1.1 and 8.3.5)
 
-    The last two carry a COLON after `ERROR`, so `_FAILED_LINE` never matches
-    them and they arrive here as an empty set -- which is refused, because a
-    manifest naming a renamed test must keep stopping the matrix rather than
-    being read as "the module could not be collected".
+    The last three carry no `ERROR <path>` line matching `_FAILED_LINE` --
+    the first two are prefixed with a colon `_FAILED_LINE` does not match, the
+    third prints no summary section for the parser to find at all -- so they
+    arrive here as an empty set, which is refused: a manifest naming a renamed
+    test, or a task whose conftest cannot even import, must keep stopping the
+    matrix rather than being read as "the module could not be collected".
 
     `None` rather than an empty frozenset for the refusal: "no collection
     errors" and "collection errors mixed with test results" are different
@@ -317,7 +322,8 @@ class _Runner:
         return self.run(list(node_ids))
 
     def pass_to_pass(self, tests, extra_deselect: tuple[str, ...] = (),
-                     scope: tuple[str, ...] = ()):
+                     scope: tuple[str, ...] = (),
+                     ignore: tuple[str, ...] = ()):
         """The p2p set: whatever the manifest declared, or everything else.
 
         Both branches are real. An explicit list is what a task needs when
@@ -335,9 +341,29 @@ class _Runner:
         both empty, the argv is byte-identical to what preflight validated --
         a test pins that, because the moment the graded command and the gated
         command drift apart, the oracle stops describing the thing being graded.
+
+        `ignore` appends `--ignore=<path>` and has exactly ONE caller:
+        preflight's p2p run at the START state, on a task whose f2p module does
+        not import there. That run sweeps the rootdir, so the erroring module
+        aborts collection before `--deselect` is ever applied -- measured
+        2026-09-01, pytest 9.1.1 and 8.3.5, exit 2 -- and the p2p baseline the
+        acceptance depends on cannot be observed at all without it. The
+        flag is spliced into both branches below, so on a task with an
+        explicit `tests.p2p` it is emitted and inert -- positional ids never
+        collect the f2p module -- which is why one splice point, not two, is
+        the honest shape.
+
+        It is safe here and only here because preflight's p2p-BEFORE run is not
+        an argv the grader ever makes: the graded p2p runs at the
+        post-submission state, and the preflight run that must match it
+        byte-for-byte is p2p-AFTER, which gets no `ignore`. What the ignore
+        hides -- a non-f2p test inside the ignored module -- is measured by
+        that same p2p-after run, which collects the module once the reference
+        lands and must exit 0.
         """
         extra = [arg for node_id in extra_deselect
                  for arg in ("--deselect", node_id)]
+        extra += [f"--ignore={path}" for path in ignore]
         if tests.p2p:
             return self.run([*tests.p2p, *extra])
         args: list[str] = [*scope]
