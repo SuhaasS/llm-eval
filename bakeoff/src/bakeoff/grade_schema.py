@@ -366,13 +366,18 @@ class GradeRecord:
     #: grade predates the field, never "pytest" -- a default naming a real
     #: framework would be this field claiming a fact nobody measured.
     #:
-    #: It is an OBSERVATION rather than configuration echoed back: it names the
-    #: adapter that produced `f2p_failed_node_ids`, `p2p_failed_node_ids` and
-    #: `p2p_deselected`, whose id SHAPES and whose UNITS differ per framework.
-    #: pytest's `p2p_deselected` counts deselections pytest was asked to make;
-    #: the node adapters' counts every test that did not run, `it.skip`
-    #: included. Summed across a mixed task set without this field, the total
-    #: is not a count of anything.
+    #: It is VALIDATED CONFIGURATION, not a measurement: `run_ladder` sets it
+    #: to `for_framework(task.tests.framework).name`, an identity round-trip
+    #: through a registry keyed by that same manifest string (`grader.py`'s
+    #: own `_State.framework` docstring says so). It is still worth recording
+    #: rather than left for a reader to re-derive from the manifest, because
+    #: the closed allowlist behind `for_framework` is the single source of
+    #: truth for which adapter's semantics -- id shapes, `p2p_deselected`
+    #: units -- apply to `f2p_failed_node_ids`, `p2p_failed_node_ids` and
+    #: `p2p_deselected` on this line. An OBSERVATION would instead be the
+    #: adapter that actually classified each check's `Outcome`; no code path
+    #: diverges from the declared framework today, so the two coincide, but
+    #: this field records the latter's SOURCE (config), not the former.
     framework: str = ""
 
     # Config (what was asked) beside observation (what pytest reported). See

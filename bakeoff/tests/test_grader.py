@@ -1156,6 +1156,22 @@ def test_framework_survives_a_refusal_at_check_one():
     assert result.framework == "pytest"
 
 
+def test_a_pre_container_gate_refusal_records_no_framework():
+    """`NO_TURNS` fires before `run_ladder` ever reads `task.tests.framework`
+    -- the ladder never got past the gate to learn which adapter it would
+    have used. `LadderResult.framework` stays `None`, and
+    `build_grade_record`'s `framework=ladder.framework or ""` is what turns
+    that `None` into the same `""` a pre-field grade reads as."""
+    result = _ladder(_record(turns_used=0))
+    assert result.not_graded_reason == NotGradedReason.NO_TURNS.value
+    assert result.framework is None
+
+    grade = build_grade_record(
+        _record(turns_used=0), _task(), "sha256:image", None, result
+    )
+    assert grade.framework == ""
+
+
 def test_p2p_rides_the_quarantine_and_the_scope():
     env = FakeEnv()
     oracle = _oracle(("tests/test_flaky.py::test_a",
