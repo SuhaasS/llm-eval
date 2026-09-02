@@ -1910,8 +1910,6 @@ def test_leading_blank_lines_are_refused_rather_than_dropped():
 
 # --- image.env ---------------------------------------------------------------
 
-_ENV_BLOCK = 'image:\n  env:\n    CI: "1"\n'
-
 
 def test_image_env_defaults_to_empty_and_an_old_manifest_still_loads(
     tmp_path, upstream
@@ -1981,10 +1979,21 @@ def test_the_allowlist_and_the_harness_pinned_keys_are_disjoint():
     overridden on the AGENT's exec while still applying to preflight's and the
     grader's -- two environments for one task, with nothing in the record
     saying which. This is what makes adding a careless allowlist entry a red
-    suite rather than a bad eval."""
+    suite rather than a bad eval.
+
+    It does NOT cover the proxy-bypass hole, and the second assertion is what
+    says so. `CLAUDE_CODE_USE_BEDROCK` / `_USE_VERTEX` are pinned by ABSENCE
+    -- `PASSTHROUGH_ENV` keeps them out and `_eval_env` never sets them -- so
+    `pinned_env_keys()` cannot see them and this disjointness holds vacuously
+    for exactly the two keys that matter most. They are named literally
+    instead, because an image `ENV CLAUDE_CODE_USE_BEDROCK=1` would make the
+    CLI ignore `ANTHROPIC_BASE_URL`, bypass the proxy, and leave the mandatory
+    wire log empty with the run still looking normal."""
     from bakeoff.claude_runner import pinned_env_keys
 
     assert not (tasks._IMAGE_ENV_ALLOWED & pinned_env_keys())
+    assert not (tasks._IMAGE_ENV_ALLOWED
+                & {"CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"})
 
 
 def test_a_pinned_key_is_refused_even_if_someone_allowlists_it(

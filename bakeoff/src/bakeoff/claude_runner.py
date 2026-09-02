@@ -149,7 +149,17 @@ def build_command(config: ClaudeCodeConfig) -> list[str]:
 
 
 def _eval_env(config: ClaudeCodeConfig) -> dict[str, str]:
-    """The variables the harness sets deliberately."""
+    """The variables the harness sets deliberately.
+
+    A key added here CONDITIONALLY -- emitted only when some config field is
+    set, the way `ANTHROPIC_CUSTOM_HEADERS` is -- must also be forced by
+    `pinned_env_keys()`'s sentinel config below. That function derives its set
+    by calling this one, so a key absent under the sentinel is a key
+    `tasks._env_map` will happily let a task image set, and the agent's exec
+    then silently overrides it: preflight and the grader see one environment
+    and the agent sees another. The disjointness test cannot catch it, because
+    the key is missing from the set the test compares against.
+    """
     extra = (
         {"ANTHROPIC_CUSTOM_HEADERS": config.custom_headers}
         if config.custom_headers

@@ -787,12 +787,21 @@ class _ScriptedContainer:
 
     def __init__(self, *, start_sha, tests, present=(), dangling=(),
                  scoped_exit=0, grading_exits=None,
-                 f2p_before=None, f2p_after=None, p2p_before=None):
+                 f2p_before=None, f2p_after=None, p2p_before=None,
+                 env=None, hypothesis_importable=False,
+                 hypothesis_in_suite=False, rg_exit=None):
         self.commands = []
         self.start_sha = start_sha
         self.tests = tests
         self.present = set(present)
         self.dangling = set(dangling)
+        self.env = dict(env or {})
+        self.hypothesis_importable = hypothesis_importable
+        self.hypothesis_in_suite = hypothesis_in_suite
+        #: An explicit override for `rg`'s exit code, because the boolean
+        #: above cannot express the third answer -- "the probe could not
+        #: answer" -- which is the one a quiet False would swallow.
+        self.rg_exit = rg_exit
         self.scoped_exit = scoped_exit
         self.grading_exits = dict(grading_exits or {})
         self.f2p_runs = 0
@@ -827,6 +836,26 @@ class _ScriptedContainer:
             # path here. Measured 2026-09-01: `[ -e dangling ]` exits 1 and
             # `[ -L dangling ]` exits 0.
             return _Exec(exit_code=0 if cmd[2] in self.dangling else 1)
+        if cmd[:1] == ["printenv"]:
+            # Measured 2026-09-01: `printenv KEY` exits 0 with the value (even
+            # when that value is empty) and exits 1 with empty stdout when the
+            # key is unset. The exit code is the whole discriminator, which is
+            # why the gate does not use `echo $KEY`.
+            if cmd[1] in self.env:
+                return _Exec(stdout=self.env[cmd[1]] + "\n")
+            return _Exec(exit_code=1)
+        if len(cmd) >= 3 and cmd[1] == "-c" and "import hypothesis" in cmd[2]:
+            # Matched on the SHAPE, not on `cmd[0] == "python"`: the probe
+            # takes its interpreter from `tests.runner`, so a test that
+            # scripts a venv runner must still be answered here.
+            return _Exec(exit_code=0 if self.hypothesis_importable else 1)
+        if cmd[:1] == ["rg"]:
+            # rg's three exit codes are the point (0 match, 1 no match,
+            # anything else could-not-answer), so `rg_exit` overrides the
+            # boolean when a test is about the third one.
+            if self.rg_exit is not None:
+                return _Exec(exit_code=self.rg_exit)
+            return _Exec(exit_code=0 if self.hypothesis_in_suite else 1)
         if cmd[:2] == ["git", "rev-parse"]:
             return _Exec(stdout=self.start_sha + "\n")
         if cmd[:2] == ["git", "status"]:
@@ -869,8 +898,14 @@ class _FakeTests:
 
 
 @dataclass(frozen=True)
+class _FakeImage:
+    env: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class _FakeTask:
     tests: _FakeTests = field(default_factory=_FakeTests)
+    image: _FakeImage = field(default_factory=_FakeImage)
     grading: TaskGrading = field(default_factory=TaskGrading)
     task_id: str = "t"
     task_version: int = 1
@@ -1093,16 +1128,6 @@ def test_a_collection_error_after_the_reference_fix_is_still_a_refusal(
     assert result.evidence["p2p_before_exit"] == EXIT_ALL_PASSED
 
 
-def test_the_preflight_version_moved_with_what_the_gate_asserts():
-    """It is in `preflight_cache_key`, and none of the other three components
-    moves when this file changes: a manifest digest describes the task, an
-    image id the environment, a start sha the tree. Without the bump every warm
-    cache serves a verdict written by a gate that refused this task shape."""
-    from bakeoff.preflight import PREFLIGHT_VERSION
-
-    assert PREFLIGHT_VERSION == "4"
-
-
 def test_a_scope_that_collects_nothing_is_a_named_problem_code(monkeypatch, tmp_path):
     """Exit 5 is the whole detection. The pinned runner carries `-q`, which
     suppresses the "collected 0 items" summary line (measured), so a guard
@@ -1282,6 +1307,262 @@ def test_a_completed_strip_is_recorded_and_is_not_a_problem(
     assert result.ok, result.problems
     assert result.evidence["stripped_paths"] == ["vendor"]
     assert result.evidence["stripped_paths_present"] == []
+
+
+# --- the environment, read back out of the container --------------------------
+
+
+def test_a_declared_env_that_did_not_reach_the_image_is_a_problem(
+    monkeypatch, tmp_path
+):
+    """image.env is CONFIGURATION; the container's environment is the
+    OBSERVATION, and this is the only place the two are compared.
+
+    An un-applied image.env is invisible in the worst way: the suite goes back
+    to being nondeterministic, the gate passes on a lucky draw, and every arm
+    is scored against an oracle that answers differently per run. Three ways
+    it happens without anyone editing render_dockerfile -- a stale tag (a task
+    edited without a task_version bump moves manifest_digest and need not move
+    the image id), a base image whose own ENV later collides, and a future
+    edit that emits the lines in the wrong place.
+    """
+    task = _FakeTask(image=_FakeImage(env={"CI": "1"}))
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=("tests/",),
+                                   env={})  # nothing set in the container
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert not result.ok
+    assert any("CI" in problem and "image.env" in problem
+               for problem in result.problems)
+    assert result.evidence["image_env_mismatch"] == ["CI"]
+
+
+def test_a_declared_env_that_matches_is_not_a_problem(monkeypatch, tmp_path):
+    task = _FakeTask(image=_FakeImage(env={"CI": "1"}))
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=("tests/",), env={"CI": "1"})
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert result.ok, result.problems
+    assert result.evidence["image_env_observed"] == {"CI": "1"}
+    assert result.evidence["image_env_mismatch"] == []
+
+
+def test_both_env_keys_are_written_even_when_nothing_is_declared(
+    monkeypatch, tmp_path
+):
+    """"This task declares no environment" and "the gate did not look" render
+    identically as a missing key, and a cached verdict outlives the code that
+    wrote it. Same rule as stripped_paths / stripped_paths_present."""
+    task = _FakeTask()  # no image.env
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=("tests/",))
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert result.ok, result.problems
+    assert result.evidence["image_env_declared"] == {}
+    assert result.evidence["image_env_observed"] == {}
+    assert result.evidence["image_env_mismatch"] == []
+
+
+def test_an_unset_variable_is_recorded_as_null_and_an_empty_one_as_empty(
+    monkeypatch, tmp_path
+):
+    """Two different absences that render identically are the same defect one
+    layer down. `printenv` is what separates them and `echo $KEY` is not:
+    measured 2026-09-01, `printenv NOT_SET` exits 1 with empty stdout while
+    `printenv SET_EMPTY` exits 0 with empty stdout."""
+    task = _FakeTask(image=_FakeImage(env={"CI": "1"}))
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=("tests/",), env={"CI": ""})
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert not result.ok
+    assert result.problems == tuple(
+        p for p in result.problems if "image.env" in p
+    )  # the mismatch is the ONLY reason this is a NO-GO
+    assert result.evidence["image_env_observed"] == {"CI": ""}
+
+    absent = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                present=("tests/",), env={})
+    result = _run_preflight(monkeypatch, tmp_path, task, absent)
+
+    assert result.evidence["image_env_observed"] == {"CI": None}
+
+
+def test_the_env_is_read_before_the_suite_runs(monkeypatch, tmp_path):
+    """Order, not presence. A broken environment produces five downstream
+    suite failures, and reporting them instead of the cause sends the task
+    author round the loop for the wrong reason."""
+    task = _FakeTask(image=_FakeImage(env={"CI": "1"}))
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   env={"CI": "1"})
+
+    _run_preflight(monkeypatch, tmp_path, task, container)
+
+    printenv = next(i for i, cmd in enumerate(container.commands)
+                    if cmd[:1] == ["printenv"])
+    first_suite = next(i for i, cmd in enumerate(container.commands)
+                       if cmd[:1] == ["timeout"])
+
+    assert printenv < first_suite
+
+
+def test_a_suite_that_imports_hypothesis_with_no_CI_is_refused(monkeypatch,
+                                                               tmp_path):
+    """The check that runs in the OTHER direction, and the only one that can
+    catch the manifest nobody wrote.
+
+    The read-back compares declared against observed, so a property-based task
+    whose author never declared CI passes every other assertion in this file:
+    declared == {} == observed, mismatch empty, GO. The ladder then runs on a
+    lucky draw -- measured, `0 0 0 0 1 1 1 1 0 0` over ten fresh runs -- and
+    nothing in the record distinguishes that task from one that never needed a
+    lever."""
+    task = _FakeTask()  # no image.env
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=("tests/",),
+                                   hypothesis_importable=True,
+                                   hypothesis_in_suite=True)
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert not result.ok
+    assert result.evidence["hypothesis_importable"] is True
+    assert result.evidence["hypothesis_imported_by_suite"] is True
+    assert any("hypothesis" in problem and "CI" in problem
+               for problem in result.problems)
+
+
+def test_a_suite_that_imports_hypothesis_WITH_CI_is_fine(monkeypatch, tmp_path):
+    """The negative, so the check above cannot pass by refusing everything."""
+    task = _FakeTask(image=_FakeImage(env={"CI": "1"}))
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=("tests/",), env={"CI": "1"},
+                                   hypothesis_importable=True,
+                                   hypothesis_in_suite=True)
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert result.ok, result.problems
+
+
+def test_hypothesis_merely_INSTALLED_is_recorded_and_not_refused(monkeypatch,
+                                                                 tmp_path):
+    """INSTALLED is not USED, and the distinction is the whole of the trigger.
+
+    hypothesis arrives transitively all the time -- a dev-extra, a
+    `pip install -e .[test]` in image.build, a dependency of a dependency --
+    and a NO-GO on availability alone would refuse a task whose suite never
+    imports it, naming a remedy ("drop it from image.pip") the author cannot
+    apply because nothing they wrote put it there. Recorded, so a reader can
+    still see it; not a problem."""
+    task = _FakeTask()  # no image.env
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=("tests/",),
+                                   hypothesis_importable=True,
+                                   hypothesis_in_suite=False)
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert result.ok, result.problems
+    assert result.evidence["hypothesis_importable"] is True
+    assert result.evidence["hypothesis_imported_by_suite"] is False
+
+
+def test_an_rg_probe_that_could_not_answer_is_None_and_not_False(monkeypatch,
+                                                                 tmp_path):
+    """A quiet False here silently disarms the only check that catches an
+    undeclared property-based suite.
+
+    rg exits 0 for a match and 1 for none; anything else -- an unreadable
+    path, a bad pattern, no rg -- is a probe that did not answer. Two absences
+    that render identically as `false` are the same defect one layer down."""
+    task = _FakeTask()
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=("tests/",), rg_exit=2)
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert result.evidence["hypothesis_imported_by_suite"] is None
+    assert not any("hypothesis" in problem for problem in result.problems)
+
+
+def test_no_declared_test_path_exists_so_the_probe_never_ran(monkeypatch,
+                                                             tmp_path):
+    """`_present` filters the prefixes, for `_existing_prefixes`' reason: a
+    declared path absent at the start state is an input this gate tolerates,
+    and handing rg a path that does not exist makes it exit 2. With nothing to
+    scan the answer is None -- not False."""
+    task = _FakeTask()
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=(),  # tests/ is not there
+                                   hypothesis_importable=True)
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert result.evidence["hypothesis_imported_by_suite"] is None
+    assert not any(cmd[:1] == ["rg"] for cmd in container.commands)
+
+
+@pytest.mark.parametrize("runner,expected", [
+    (("python", "-m", "pytest", "-q"), "python"),
+    (("python3", "-m", "pytest"), "python3"),
+    (("/opt/venv/bin/python3.12", "-m", "pytest"), "/opt/venv/bin/python3.12"),
+    # Not an interpreter: a console script gives no interpreter path to reuse,
+    # so the probe falls back rather than running `pytest -c "import ..."`.
+    (("pytest", "-q"), "python"),
+    (("pythonish-wrapper", "-m", "pytest"), "python"),
+    ((), "python"),
+])
+def test_the_import_probe_uses_the_runners_own_interpreter(runner, expected):
+    """A runner of ["/opt/venv/bin/python", "-m", "pytest"] resolves imports
+    against that venv's site-packages, so probing whichever `python` is first
+    on PATH answers a question about a different environment -- and answers it
+    confidently."""
+    from bakeoff.preflight import _runner_python
+
+    assert _runner_python(runner) == expected
+
+
+def test_the_env_evidence_says_which_absence_it_is_on_the_early_return(
+    monkeypatch, tmp_path
+):
+    """`preflight` returns before RunContainer when tests.runner names no
+    pytest, so there is no container to read anything back from.
+
+    `observed: {}` and `mismatch: []` there would be a CLAIM -- that the gate
+    looked and found agreement -- for a gate that never started a container.
+    None says which kind of absence it is, the same way cache_state.warm and
+    wire_unattributed do. `declared` IS written, because it is a property of
+    the manifest and is knowable without a daemon."""
+    task = _FakeTask(tests=_FakeTests(runner=("make", "test")),
+                     image=_FakeImage(env={"CI": "1"}))
+
+    result = preflight(task, image="sha256:x", repo_path=tmp_path,
+                       start_sha="s" * 40)
+
+    assert not result.ok  # the non-pytest runner, which is the existing check
+    assert result.evidence["image_env_declared"] == {"CI": "1"}
+    assert result.evidence["image_env_observed"] is None
+    assert result.evidence["image_env_mismatch"] is None
+    assert result.evidence["hypothesis_importable"] is None
+    assert result.evidence["hypothesis_imported_by_suite"] is None
+
+
+def test_the_preflight_version_moved_with_the_new_assertion():
+    """It is in the cache key, and it is the only component that moves when
+    THIS file changes -- a manifest digest describes the task, an image id the
+    environment, a start sha the tree. Without the bump every warm cache
+    serves a verdict written by a gate that never looked at image.env."""
+    from bakeoff.preflight import PREFLIGHT_VERSION
+
+    assert PREFLIGHT_VERSION == "5"
 
 
 @pytest.mark.integration

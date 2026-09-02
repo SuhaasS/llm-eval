@@ -1710,6 +1710,21 @@ MUTATIONS = [
         "tests/test_grade_schema.py -k append_then_load",
         "not integration",
     ),
+    (
+        # An image.env that did not reach the image is silent: the suite goes
+        # back to being nondeterministic (measured, 0 0 0 0 1 1 1 1 0 0 over
+        # ten fresh runs of unchanged code), the gate passes on a lucky draw,
+        # and every arm is scored against an oracle that answers differently
+        # per run. Reverting the refusal restores exactly that -- the evidence
+        # is still recorded, so the verdict flips from NO-GO to PASS with no
+        # other visible change.
+        "preflight: record the image.env mismatch and stop refusing it",
+        "src/bakeoff/preflight.py",
+        "        if mismatch:\n            problems.append(",
+        "        if False:\n            problems.append(",
+        "tests/test_preflight.py -k a_declared_env_that_did_not_reach",
+        "not integration",
+    ),
 ]
 
 

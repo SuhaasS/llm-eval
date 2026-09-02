@@ -31,7 +31,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from bakeoff.container import RunContainer
 
@@ -88,7 +88,14 @@ _FAILED_LINE = re.compile(r"^(?:FAILED|ERROR)\s+(\S+)", re.MULTILINE)
 #: cached under 3 was written by a gate that refused that task shape outright,
 #: and one cached under 4 was written by a gate whose p2p-before run carries
 #: `--ignore` on exactly those tasks.
-PREFLIGHT_VERSION: str = "4"
+#: 5 adds two environment assertions: the `image.env` read-back, and the
+#: refusal of a task whose declared test paths IMPORT hypothesis while the
+#: manifest declares no CI (availability alone is not the trigger -- the
+#: package is a common transitive dependency). A verdict cached under 4 was
+#: written by a gate that looked at neither, so a task whose determinism lever
+#: silently failed to apply -- or was never declared -- would keep serving a
+#: PASS.
+PREFLIGHT_VERSION: str = "5"
 
 
 def preflight_cache_key(task, image: str, start_sha: str) -> str:
@@ -197,6 +204,68 @@ def _present(container, names, *, dangling_counts: bool = False) -> list[str]:
         if any(container.exec(["test", probe, name]).exit_code == 0
                for probe in probes)
     ]
+
+
+def _observed_env(container, keys: tuple[str, ...]) -> dict[str, str | None]:
+    """What the container's environment actually holds, per declared key.
+
+    `printenv`, never `sh -c 'echo $KEY'`, because the exit code is the whole
+    discriminator: measured 2026-09-01, `printenv KEY` exits 0 with the value
+    even when that value is the empty string, and exits 1 with empty stdout
+    when the key is unset. `echo` cannot tell those apart, and two different
+    absences that render identically are the same defect one layer down.
+    `None` here means "not set"; `""` means "set to nothing".
+
+    Only the DECLARED keys are read. A dump of the whole environment would put
+    values nobody asked about into `preflight.json`, which outlives the run
+    and is read by hand.
+    """
+    observed: dict[str, str | None] = {}
+    for key in keys:
+        result = container.exec(["printenv", key])
+        observed[key] = (
+            result.stdout.rstrip("\n") if result.exit_code == 0 else None
+        )
+    return observed
+
+
+def _declared_env(task) -> dict[str, str]:
+    """The manifest's `image.env`, or {}.
+
+    `getattr` twice, like `_declared_grading`'s and the strip's: this module's
+    entry point takes an untyped `task`, and a manifest object predating the
+    key must not crash the gate.
+    """
+    return dict(getattr(getattr(task, "image", None), "env", {}) or {})
+
+
+#: Basenames that mean "this argv element is a Python interpreter".
+#: `python`, `python3`, and `pythonX.Y` -- the three shapes a `tests.runner`
+#: actually carries. Matched on the BASENAME so an absolute
+#: `/usr/local/bin/python3.12` counts, and anchored so `pythonish-wrapper`
+#: does not.
+_PYTHON_BASENAME = re.compile(r"^python(?:\d+(?:\.\d+)?)?$")
+
+
+def _runner_python(runner: tuple[str, ...]) -> str:
+    """The interpreter this task's suite runs under, or "python".
+
+    The availability probe has to ask the interpreter the RUNNER uses, not
+    whichever `python` is first on PATH: a task whose runner is
+    `["/opt/venv/bin/python", "-m", "pytest", ...]` resolves imports against
+    that venv's site-packages, and probing the system interpreter would answer
+    a question about a different environment. `click-3360`'s runner is
+    `["python", "-m", "pytest", ...]`, so the common case is unchanged.
+
+    Falls back to "python" when `runner[0]` is not an interpreter at all --
+    `["pytest", "-q", ...]` is a legal runner, and the console script gives no
+    interpreter path to reuse. The fallback is a guess and is allowed to be:
+    this probe decides whether to ASK for `CI`, and preflight's runner check
+    has already established that `pytest` is in the argv.
+    """
+    if runner and _PYTHON_BASENAME.match(PurePosixPath(runner[0]).name):
+        return runner[0]
+    return "python"
 
 
 def _existing_prefixes(container, prefixes: tuple[str, ...]) -> tuple[str, ...]:
@@ -397,6 +466,17 @@ def preflight(
     evidence: dict = {}
     tests = task.tests
 
+    # Written BEFORE the guard below, because `image.env` is a property of the
+    # manifest and is knowable with no daemon. The other three keys stay None
+    # on this path: `observed: {}` and `mismatch: []` would be a CLAIM that
+    # the gate looked and agreed, from a gate that never started a container.
+    # Two absences that render identically are the same defect one layer down.
+    evidence["image_env_declared"] = declared = _declared_env(task)
+    evidence["image_env_observed"] = None
+    evidence["image_env_mismatch"] = None
+    evidence["hypothesis_importable"] = None
+    evidence["hypothesis_imported_by_suite"] = None
+
     if not any("pytest" in part for part in tests.runner):
         # The red/green distinction is built on pytest's exit codes. Another
         # runner may be addable later, but silently accepting one now would
@@ -502,6 +582,121 @@ def preflight(
                 "everything, so an un-stripped path is both a context this "
                 "task has and the others do not, and a file in every "
                 "submission diff."
+            )
+
+        # The environment, checked against the CONTAINER rather than against
+        # the manifest. `image.env` is configuration; what the container holds
+        # is the observation, and this is the only place the two meet.
+        #
+        # An un-applied image.env is invisible in the worst way. Its whole job
+        # is determinism -- measured 2026-09-01 against hypothesis 6.167.1, a
+        # property-based suite gives `0 0 0 0 1 1 1 1 0 0` over ten fresh runs
+        # of unchanged code and `1 1 1 1 1 1` under CI=1 -- so a value that
+        # did not take means the gate passed on a lucky draw and every arm is
+        # scored against an oracle that answers differently per run.
+        #
+        # Not redundant with "we generated the Dockerfile ourselves": a stale
+        # tag (a task edited without a task_version bump moves manifest_digest
+        # and need not move the image id), a base image whose own ENV later
+        # collides, and a future edit that emits the lines in the wrong place
+        # all leave the rendering tests green.
+        #
+        # `getattr`, like `_declared_grading`'s and the strip's: this function
+        # takes an untyped `task`, and a manifest object predating the key
+        # must not crash the gate.
+        #
+        # BEFORE `_Runner` is built, so a bad environment is reported as
+        # itself rather than as five downstream suite failures.
+        #
+        # `image_env_declared` was written before the guard above, on every
+        # path including the one that never reaches a container. What this
+        # block writes is the pair only a container can answer -- `observed`
+        # and `mismatch` -- overwriting the `None`s set there. Both are
+        # written whether or not anything was declared: "this task declares no
+        # environment" and "the gate did not look" render identically as a
+        # missing key, and a cached verdict outlives the code that wrote it.
+        observed = _observed_env(container, tuple(sorted(declared)))
+        mismatch = sorted(
+            key for key, value in declared.items() if observed.get(key) != value
+        )
+        evidence["image_env_observed"] = observed
+        evidence["image_env_mismatch"] = mismatch
+        if mismatch:
+            problems.append(
+                "the container's environment does not match the manifest's "
+                "image.env for "
+                + ", ".join(
+                    f"{key} (declared {declared[key]!r}, container "
+                    f"{observed.get(key)!r})" for key in mismatch
+                )
+                + ". That key is baked as a Dockerfile ENV so it reaches "
+                "every process in the container, including the ones the agent "
+                "invents; a value that did not take is silent -- the suite "
+                "goes back to being nondeterministic and the gate passes on a "
+                "lucky draw. Rebuild the task image (a task edited without a "
+                "task_version bump moves manifest_digest and need not move "
+                "the image id)."
+            )
+
+        # The other direction, and the only check that catches the manifest
+        # nobody wrote. Everything above compares DECLARED against OBSERVED,
+        # so a property-based task whose author never declared CI passes all
+        # of it -- declared is {}, observed is {}, mismatch is empty, GO --
+        # and the ladder then runs on a lucky draw. Measured 2026-09-01
+        # against hypothesis 6.167.1, that draw is `0 0 0 0 1 1 1 1 0 0` over
+        # ten fresh runs of unchanged code on an unchanged tree.
+        #
+        # TWO probes, and the second is what keeps the refusal honest.
+        # INSTALLED is not USED: hypothesis is a common transitive dependency
+        # (a dev-extra, a `pip install -e .[test]` in image.build, a
+        # dependency of a dependency), and a NO-GO on availability alone would
+        # refuse a task whose suite never imports it -- with a remedy the
+        # author cannot apply, since nothing they wrote put it there.
+        #
+        # The interpreter comes off `tests.runner` rather than being
+        # hardcoded: a runner of ["/opt/venv/bin/python", "-m", "pytest"]
+        # resolves imports against that venv, so probing whichever `python` is
+        # first on PATH would answer a question about a different environment.
+        importable = container.exec(
+            [_runner_python(tests.runner), "-c", "import hypothesis"]
+        ).exit_code == 0
+        evidence["hypothesis_importable"] = importable
+
+        # `rg` is asserted present above, so this adds no dependency. Filtered
+        # through `_present` for the reason `_existing_prefixes` gives: a
+        # declared prefix absent at the start state is an input this gate
+        # tolerates, and handing rg a path that does not exist makes it exit 2
+        # -- which must read as "could not answer", not as "no match".
+        scanned = _present(container, tests.paths)
+        used: bool | None = None
+        if scanned:
+            probe = container.exec(
+                ["rg", "-q", r"^\s*(from|import)\s+hypothesis\b", *scanned]
+            )
+            # Three-valued on purpose. 0 is a match, 1 is no match, and
+            # anything else (an unreadable path, a bad pattern, no rg) is
+            # UNKNOWN -- a quiet False there would silently disarm the only
+            # check that catches an undeclared property-based suite.
+            used = (True if probe.exit_code == 0
+                    else False if probe.exit_code == 1 else None)
+        evidence["hypothesis_imported_by_suite"] = used
+
+        if used and "CI" not in declared:
+            problems.append(
+                "the declared test paths import hypothesis and the manifest "
+                "declares no image.env CI. A property-based suite without it "
+                "is a coin flip -- measured, ten fresh runs of one property "
+                "test over unchanged code gave `0 0 0 0 1 1 1 1 0 0`, and six "
+                "under CI=1 gave `1 1 1 1 1 1` -- so the gate would be "
+                "certifying a task whose red-before/green-after verdict is a "
+                "draw. Add `image.env: {CI: \"1\", "
+                "HYPOTHESIS_STORAGE_DIRECTORY: \"/tmp/bakeoff-hypothesis\"}` "
+                "and read HARVESTING.md's Layer 2 bullet before doing so -- "
+                "determinism makes this oracle reproducible, not correct. "
+                "(This fires on an IMPORT in tests.paths, not on the package "
+                "being installed: hypothesis arriving transitively through "
+                "image.build in a suite that never uses it is fine and is "
+                "recorded as hypothesis_importable without a problem.)"
             )
 
         runner = _Runner(container, tests.runner, timeout_s)

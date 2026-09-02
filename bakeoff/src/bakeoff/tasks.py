@@ -470,7 +470,7 @@ _IMAGE_ENV_ALLOWED = frozenset({"CI", "HYPOTHESIS_STORAGE_DIRECTORY"})
 #: strip_paths, one key over.
 _ENV_VALUE_REFUSED = ('\n', '\r', '"', '\\', '$')
 
-_ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_ENV_KEY = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
 
 
 def _env_map(value: Any, where: str) -> dict[str, str]:
