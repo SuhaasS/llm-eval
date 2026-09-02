@@ -156,6 +156,55 @@ image:
   # site-packages, so nothing the agent writes to /repo takes effect and every
   # arm fails identically -- preflight's green-after check is what catches it.
   build: ["pip install -e ."]
+  # env: NOT USED by this task -- click's suite is example-based, so nothing
+  # here needs pinning. Shown because this manifest is the documentation for
+  # the key.
+  #
+  # Baked into the task image as Dockerfile ENV lines, AFTER every build step
+  # (so a value declared for the test runner cannot change how the image was
+  # assembled) and therefore in the finished image's config. Docker merges an
+  # image's environment into every exec with the exec's own keys winning, so
+  # these reach preflight's runner, the oracle's, the grader's, the agent's
+  # `claude` and every command the agent invents -- which is the point.
+  # `tests.runner` could not do that: the agent is never told the runner argv,
+  # it gets `prompt` and nothing else.
+  #
+  #   env:
+  #     CI: "1"
+  #     HYPOTHESIS_STORAGE_DIRECTORY: "/tmp/bakeoff-hypothesis"
+  #
+  # An ALLOWLIST of keys, not a free map: CI and HYPOTHESIS_STORAGE_DIRECTORY
+  # and nothing else. An unrestricted map would reopen the hole the harness's
+  # env allowlist exists to close -- CLAUDE_CODE_USE_BEDROCK here would make
+  # the CLI ignore ANTHROPIC_BASE_URL, bypass the proxy, and leave the
+  # mandatory wire log empty with the run still looking normal.
+  #
+  # CI=1 is what makes a hypothesis suite deterministic: hypothesis registers
+  # a built-in `ci` profile (derandomize=True, database=None, deadline=None)
+  # and auto-loads it on the presence of that variable. Measured 2026-09-01
+  # against hypothesis 6.167.1: ten fresh runs of one property test gave
+  # `0 0 0 0 1 1 1 1 0 0`, and six under CI=1 gave `1 1 1 1 1 1`. There is no
+  # HYPOTHESIS_PROFILE environment variable to use instead.
+  #
+  # HYPOTHESIS_STORAGE_DIRECTORY must be absolute and outside /repo -- refused
+  # at load otherwise. Hypothesis's storage root is fixed to the cwd at import
+  # time, so without it the `constants/` cache lands in the tree the section
+  # 5.6 submission diff is taken against.
+  #
+  # Values may not carry a newline, a quote, a backslash or a `$`: the last
+  # one is EXPANDED by the builder, which would make the value a property of
+  # the build rather than of the manifest.
+  #
+  # Declaring env does NOT move start_sha -- it is under `image:`, which is
+  # not an input to the start state. It does move the image id, and therefore
+  # `Versions.container_image_digest` on every record, which is where a reader
+  # finds it: the record deliberately carries no copy of this map, because a
+  # manifest field published under a record's provenance would be
+  # configuration reported as observation.
+  #
+  # Section 6.4 confound, to be recorded here by any task that uses it: `CI`
+  # is a general-purpose signal and the repository's own code may branch on
+  # it, so the arms are scored on that repo's CI-mode suite.
 
 # grading: WAIVED -- all three keys, deliberately, and recorded here because
 # HARVESTING.md requires a task to declare a `grading:` block or to say why

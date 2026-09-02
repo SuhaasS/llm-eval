@@ -58,6 +58,12 @@ Runs inside the pinned image, before the proxy starts.
   did not happen puts the file in every arm's context and in every submission
   diff, and no later stage re-derives it. The probe is `-e` **or** `-L`, so a
   symlink whose target was stripped still counts as present.
+- **Every `image.env` key holds its declared value inside the container.** Read
+  back with `printenv`, whose exit code separates "set to the empty string"
+  from "not set at all" (measured; `echo $KEY` cannot). `image.env` is
+  configuration and the container's environment is the observation, and this
+  is the only place the two meet — a value that did not take is silent, and
+  what it silently loses is determinism.
 - f2p is **red** at the start state, in one of two ways, and never `0` (already
   solved). Either it exits **1** with every declared f2p id in pytest's
   FAILED/ERROR lines, or it exits **4** (or **2**) because the modules holding
@@ -111,9 +117,64 @@ that passes Layer 1 and measures the wrong thing.
   was rejected for exactly this: its tests pin an arbitrary storage name, so a
   different-but-correct fix would be scored as a failure. Prefer tests that
   compare rendered output, return values, or raised messages.
-- **No property-based oracle.** A hypothesis-driven suite can pass a wrong fix
-  on a lucky draw and fail a right one on an unlucky seed. `attrs` and `cattrs`
-  are out for this reason.
+- **A property-based suite is allowed, and only with `image.env: {CI: "1"}`.**
+  Measured 2026-09-01 against hypothesis 6.167.1, a property test over a rare
+  input gives `0 0 0 0 1 1 1 1 0 0` across ten fresh runs of unchanged code on
+  an unchanged tree, and `1 1 1 1 1 1` under `CI=1`. Hypothesis registers a
+  built-in `ci` profile at import time — `derandomize=True`, `database=None`,
+  `deadline=None` — and auto-loads it when any of twelve CI variables is
+  present; `"CI"` counts on presence alone, any value. There is **no
+  `HYPOTHESIS_PROFILE` environment variable** (the string in `pytest --help`
+  is argparse's metavar for `--hypothesis-profile`), and a profile the repo
+  would have to register is unreachable anyway: the start state is `base_sha`
+  plus the test half, so the harness cannot rely on a repo-side `conftest.py`.
+
+  Declare `HYPOTHESIS_STORAGE_DIRECTORY` too, pointing outside `/repo`.
+  Hypothesis's storage root is `Path.cwd() / ".hypothesis"` fixed at import
+  time, so with `workdir=/repo` it lands in the tree the §5.6 submission diff
+  is taken against. `CI=1` stops the `examples/` database but not the
+  `constants/` cache, and an agent that runs pytest from a subdirectory gets a
+  second copy there. `gitignore_extra` is **not** the fix and is not needed:
+  hypothesis writes `.hypothesis/.gitignore` containing `*`, so the tree is
+  already clean to `git status --porcelain` and to `git add -A` — a
+  `gitignore_extra` entry would move `start_sha` and change nothing.
+
+  **What determinism does and does not buy.** It does not make the oracle
+  safe; it makes it *reproducible*. A wrong fix can still pass on a pinned
+  draw, and it will then pass on every repeat — so §5.7's N=3 repeats catch
+  nothing here, because all three runs draw the same examples.
+
+  Worse, and this is the rule that decides which suites are admissible:
+  **Hypothesis mines integer and string literals out of the modules the suite
+  imports and feeds them into the example pool, so the examples a submission
+  is judged by are a function of the source code under test.** Measured
+  2026-09-01, one property (`@given(st.integers(0, 1_000_000_000))`,
+  `assert n != 137`) against an imported `magic.py`, `CI=1` throughout, six
+  fresh runs per row:
+
+  | imported `magic.py` | verdict |
+  |---|---|
+  | `MAGIC = 137` | `1 1 1 1 1 1` — the one-in-a-billion bug is found, every time |
+  | `MAGIC = 1370` | `0 0 0 0 0 0` — missed, every time |
+  | `MAGIC = 137` again | `1 1 1 1 1 1` — found again; the flip is reversible |
+  | `MAGIC = 999` | `0 0 0 0 0 0` |
+
+  The same literal in a file the suite does **not** import changes nothing
+  (`0 0 0`), so it is import reachability and not the tree's bytes. The agent
+  is being asked to edit exactly those modules, so the oracle's strictness is
+  coupled to the shape of the fix: a submission that happens to write the
+  right constant is judged by a strictly stronger example set than one that
+  does not, and the grade records both as "the suite passed". Preflight's
+  red-before/green-after verdict is taken on the **reference** fix's tree and
+  does not transfer.
+
+  So: prefer a suite whose examples are **exhaustive and explicit** —
+  `@example` decorators, or `st.sampled_from` over a small closed set — where
+  the mined pool cannot change what is checked. A suite whose only oracle is a
+  draw over a large space is admissible only if you have read the property and
+  are satisfied that *any* correct fix passes it and *no* wrong one does,
+  which is the same judgment call as the "tests assert behaviour, not internal
+  names" bullet above and is harder here, not easier.
 - **The suite is deterministic.** Preflight runs p2p twice; a flake makes the
   gate a coin flip and the eval unreproducible.
 - **An explicit `tests.p2p` lists LEAF node ids only** — `path::test_name`,
@@ -368,6 +429,15 @@ each candidate still needs the Layer 2 read.
 | pygments/pygments | `pip: ["wcag_contrast_ratio"]` | 1 collection error without it | 64 |
 | Textualize/rich | `pip: ["attrs"]` | 1 collection error without it | 40 |
 | python-humanize/humanize | 6 import errors, undiagnosed | — | 21 |
+| python-attrs/attrs, python-attrs/cattrs | `image.env: {CI: "1", HYPOTHESIS_STORAGE_DIRECTORY: "/tmp/bakeoff-hypothesis"}` for the property-based suite | **not measured** — the editable install collides with a site-packages `attr`, and that is now the only known blocker | — |
+
+**attrs/cattrs are half-reopened, not reopened.** They were excluded for two
+reasons and this broadening lifts one. The other — `pip install -e .`
+resolving `attr` against site-packages instead of the run tree — is the
+non-editable-install failure mode in a new dress: imports resolve past `/repo`
+so nothing the agent writes takes effect, every arm fails identically, and
+preflight's green-after check is what catches it. Nobody has run that gate on
+these repositories. Do not cut a task from either without doing so first.
 
 **sqlglot carries a date constraint.** `CLAUDE.md` was added 2026-02-02
 (`a65c8701a306`, PR #6899); `AGENTS.md` followed on 2026-03-19
@@ -395,7 +465,6 @@ preflight to catch the omission.
 | repo | why |
 |---|---|
 | python-poetry/tomlkit | suite needs the `tests/toml-test` submodule; `git archive` drops it |
-| python-attrs/attrs, python-attrs/cattrs | hypothesis property-based suites; the editable install also collides with a site-packages `attr` |
 | un33k/python-slugify | no harvestable PRs |
 
 ### Internal repositories

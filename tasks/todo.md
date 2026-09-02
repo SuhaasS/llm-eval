@@ -2650,3 +2650,106 @@ as "pytest reported nothing" when the branch never looked. The message now
 says which. And `test_an_f2p_module_that_will_not_import_is_accepted_when_p2p_is_green`
 is parametrized over exit codes `[4, 2]` — the exit-2 arm, reachable via a
 bare-module f2p entry, was unpinned.
+
+## Broadening 3 — hypothesis suites — 2026-09-01
+
+Layer 2 categorically excluded a property-based suite: "a hypothesis-driven
+suite can pass a wrong fix on a lucky draw and fail a right one on an unlucky
+seed." Four commits (`c41d20a`, `e34aeb7`, `009ac45`, `5f4caab`) replace that
+exclusion with a manifest `image.env` key — an allowlist of exactly `CI` and
+`HYPOTHESIS_STORAGE_DIRECTORY` — baked into the task Dockerfile as `ENV` lines
+after every build step, so Hypothesis's determinism reaches every process in
+the container: the gate's runner, the oracle's, the grader's, the agent's own
+`claude`, and the commands the agent invents. `pinned_env_keys()` proves the
+allowlist disjoint from the keys the harness itself sets, so nothing an image
+declares can be silently shadowed on one exec and not another.
+
+Measurements that decided it:
+
+- **§1a's ten-run row.** One property test over a rare input, no seed,
+  default profile: `0 0 0 0 1 1 1 1 0 0` across ten fresh runs of unchanged
+  code on an unchanged tree. Under `CI=1`: `1 1 1 1 1 1`.
+- **The `ci` profile is three settings, not one, registered at import.**
+  `derandomize=True`, `database=None`, `deadline=None`, auto-loaded on any of
+  twelve CI variables being present — `"CI"` counts on presence alone, any
+  value. `derandomize=True` *implies* `database=None` (passing a non-`None`
+  database alongside it raises `InvalidArgument`), so seed and database are
+  one lever, not two.
+- **`HYPOTHESIS_PROFILE` is not an environment variable.** Grepping hypothesis
+  6.167.1's site-packages for it returns no matches; the string in
+  `pytest --help` is argparse's metavar for `--hypothesis-profile`, and that
+  flag with an unregistered profile name is `INTERNALERROR`, exit 3, zero
+  tests run.
+- **`.hypothesis/.gitignore` self-ignores.** Hypothesis writes it containing
+  `*` the first time it creates the directory, so `git status --porcelain` is
+  already clean and `git add -A` does not sweep it into a submission diff.
+- **`--hypothesis-seed` is exit 4 without the plugin**, identically via the
+  CLI and via `PYTEST_ADDOPTS`, in an image without hypothesis — where `CI=1`
+  is inert there (exit 0, nothing written). That asymmetry is why `CI` is the
+  key and a seed flag is not: a seed flag would break every other task's
+  image the moment hypothesis was absent.
+- **The Docker merge was measured, not taken from the docstring.** Against an
+  image declaring three `ENV` keys, three exec shapes agree on one rule:
+  merge, with the exec's own keys winning. No `env=` argument sees all three
+  image keys; an `env={...}` argument sees all three plus its own; an
+  overriding `env=` sees the override and the other two unchanged. That is
+  what makes `container_env` naming none of `_IMAGE_ENV_ALLOWED` load-bearing,
+  pinned by `pinned_env_keys()`'s disjointness assertion offline and by
+  `5f4caab`'s integration test against a real image and both exec shapes.
+- **§1g's constant-mining table, the finding that reshaped Layer 2.** Same
+  property, same `CI=1`, varying only a literal in an imported `magic.py`:
+  `MAGIC = 137` finds a one-in-a-billion bug `1 1 1 1 1 1`, `MAGIC = 1370`
+  misses it `0 0 0 0 0 0`, `MAGIC = 137` again finds it, `MAGIC = 999` misses
+  it — reversible, six of six each way. The same literal in a file the suite
+  does not import changes nothing. Determinism makes the oracle reproducible;
+  it does not make it correct, and the example pool a submission is judged by
+  is a function of the source under test — coupled to exactly the modules the
+  agent is asked to edit.
+- **The `claude` 2.1.220 grep, settled by a live probe rather than left as a
+  reading of a 272 MB bundle.** Every `CI` hit in the bundled CLI is colour
+  selection or an environment-name function; seven of eight `isCI` matches are
+  false positives from bundled zod's `isCIDR`. The offline smoke gate then ran
+  the real CLI over the real transport twice — once against the unmodified
+  base image, once against a throwaway image carrying `ENV CI=1` appended at
+  the end of `docker/eval-agent.Dockerfile`, reverted immediately after. Both
+  runs agreed on all three arms: `turns_streamed=3`, `stdout_malformed_lines=0`,
+  `turns_used=3`, verdict `go`. `TASKS.md` keeps only what this cannot answer —
+  whether a *live* run differs.
+
+Four things the plan's own first draft got wrong, corrected before code was
+written:
+
+1. It assumed a `HYPOTHESIS_PROFILE` environment variable existed; §1b found
+   none.
+2. It assumed `gitignore_extra` was needed for `.hypothesis/`; the tree is in
+   fact already clean without it (decision 10), and the entry would have
+   moved `start_sha` for no observable change.
+3. It assumed a seed and a database were separate levers to pull; measured,
+   `derandomize=True` implies `database=None`, so they are one.
+4. **Its mechanism for tree-dependence was wrong.** The first draft blamed
+   "the agent edits the tree" — adding an unrelated file at the repo root
+   holding the falsifying literal changed nothing (`0 0 0`, §1g). The real
+   mechanism is Hypothesis mining constants out of the modules the suite
+   **imports**, which is narrower than the first draft's claim, worse (it is
+   coupled to exactly the files the agent is asked to change), and reversible
+   in both directions on the same literal.
+
+Deliberately not built (decision 12): no `tests.env` or per-exec env plumbing
+(decision 3's rejected mechanism, because the agent is never told
+`tests.runner`); no new `RunRecord`/`GradeRecord` field and no
+`SCHEMA_VERSION`/`GRADER_VERSION` bump (decision 8 —
+`Versions.container_image_digest` already pins the `ENV` layer as an
+observation of the built image); no hypothesis in the base image (a task that
+needs it declares `image.pip`, like any other dependency); no unknown-key
+rejection for the `image:` block generally; no new task cut from
+`attrs`/`cattrs` — their other blocker, an editable install colliding with a
+site-packages `attr`, is unmeasured, and `HARVESTING.md` records that rather
+than implying the repositories are now usable; no `--hypothesis-seed`,
+`--hypothesis-profile`, `HYPOTHESIS_DATABASE_FILE` or
+`PYTEST_DISABLE_PLUGIN_AUTOLOAD` anywhere (decisions 1e, 2, 11).
+
+`PREFLIGHT_VERSION` 4 → 5 (the env read-back and the two hypothesis probes are
+new preflight assertions). `SCHEMA_VERSION` and `GRADER_VERSION` unmoved —
+nothing new reaches a record and no ladder check changes what it means.
+`click-3360`'s `start_sha` unmoved: the new key is under `image:`, which is
+not an input to `materialize`. Unit suite: 1225 passed, 50 deselected.

@@ -457,6 +457,30 @@ that strips nothing is refused, and a file the PR *creates* cannot be
 stripped), and a path the reference diff also touches has to be in
 `tests.allow_extra_paths` as well, or the load is refused.
 
+`image.env` is a **map under `image:`**, and its keys are an allowlist: `CI`
+and `HYPOTHESIS_STORAGE_DIRECTORY`, nothing else. It is baked into the task
+image as `ENV` lines, so it reaches every process in the container — the
+gate's runner, the grader's, the agent's `claude`, and the commands the agent
+invents. Use it when the suite is property-based:
+
+```yaml
+image:
+  pip: ["hypothesis==6.167.1"]        # or whatever the repo's lockfile pins
+  build: ["pip install -e ."]
+  env:
+    CI: "1"
+    HYPOTHESIS_STORAGE_DIRECTORY: "/tmp/bakeoff-hypothesis"
+```
+
+`CI=1` loads Hypothesis's built-in `ci` profile — `derandomize=True`,
+`database=None`, `deadline=None` — which is the difference between a suite
+that answers `0 0 0 0 1 1 1 1 0 0` over ten runs and one that answers
+`1 1 1 1 1 1`. It does **not** move `start_sha` (it is not an input to the
+start state) but it does move the image id, so preflight re-runs. Read
+`HARVESTING.md`'s Layer 2 bullet before cutting a property-based task at all:
+determinism makes the oracle reproducible, not correct, and the draw is a
+function of the tree the agent is editing.
+
 ### 3.6 Run the gate
 
 ```bash
@@ -679,6 +703,8 @@ raise.
 | a run reads *"No deployments available"* at status `None` | expired credentials. litellm does not classify an expired AWS token as an auth error; it surfaces as 500, cools the deployment down, and the cooldown then hides the cause |
 | every arm's submission fails to apply during grading | index staleness across the host/container boundary. Fixed in `grader._refresh_index`; if you see it again, that is a regression, not a model result |
 | one arm's cells are all `turns=0` and permanent | the per-arm abort streak should have caught it. Records are written under mode `"x"` and `run_id` is deterministic, so those rows cannot be rewritten — start a new event log |
+| a property-based task's preflight passes, then a later run of the same task NO-GOes with no manifest change | `image.env` never applied. Preflight reads it back with `printenv` since `PREFLIGHT_VERSION` 5, so the refusal names the key — rebuild the task image. A task edited without a `task_version` bump moves `manifest_digest` and need not move the image id |
+| a hypothesis task grades `resolved` for one arm and not another on submissions that look equivalent | expected, and not a bug in the harness. Hypothesis mines literals out of the modules the suite **imports** and feeds them into the example pool, so two correct-looking fixes are judged by different examples — measured, changing one integer literal in an imported module flipped six consecutive verdicts in each direction. The same literal in a non-imported file changes nothing. Prefer suites with exhaustive `@example`s (§4) |
 
 ---
 

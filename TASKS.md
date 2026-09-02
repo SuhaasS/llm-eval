@@ -1091,6 +1091,36 @@ judge runs after one — which is why they sit here rather than above.
   where the record is read, or filter on the record's field and let the grade
   line's be the cross-check.
 
+- **Confirm on a LIVE cell that `CI=1` in a task image does not change Claude
+  Code's behaviour.** Broadening 3 bakes that variable into a property-based
+  task's image and it reaches the agent's own process, which is the point.
+  Measured offline: `claude` 2.1.220 reads `CI` in exactly two places — the
+  bundled `supports-color` colour-depth block (`"CI" in env` ×1, `CI_ENVS` ×3)
+  and an environment-name function (`process.env.CIRCLECI` …); the eight
+  `isCI` hits are seven zod `isCIDR` plus one `isCI:Yt(!1)` field. Both should
+  be inert without a TTY, and `scripts/smoke_test.py --mode offline` against an
+  image carrying `ENV CI=1` passes (broadening 3's Final verification). What
+  that leaves open is a live cell: turn counts, tool-call counts and
+  `terminal_finish_reason` against the same cell without the variable. Do it
+  before the first property-based task is collected, not after — a behaviour
+  difference on one task's image is a §6.4 confound only that task's arms
+  carry, and `RunRecord.config_digest` will not move, because it covers
+  `_eval_env` and `PASSTHROUGH_ENV` and not the image's ENV. That is correct
+  (the image is pinned by `container_image_digest`) and it does mean the
+  difference is invisible in a digest comparison.
+
+- **Two evidence families disagree about what an unreachable check writes.**
+  Broadening 3's `image_env_*` / `hypothesis_*` keys are written on *every*
+  path — `declared` with a value, the rest as explicit `null` — on the
+  pre-container early return at `preflight.py:469-497`. `stripped_paths` and
+  `stripped_paths_present`, added by broadening 1, are simply **absent** there.
+  Both encode "the gate did not look"; only one of them says so, and a reader
+  of a cached `preflight.json` cannot tell an absent `stripped_paths` from a
+  verdict written by a gate too old to have the key. Make them consistent by
+  moving the strip's two keys before the guard as `null`s — the new family is
+  the shape to copy, not the other way round. Cheap, and it needs a
+  `PREFLIGHT_VERSION` bump because it changes what a cached verdict contains.
+
 ---
 
 ## P3 — Decisions to settle before numbers are published
