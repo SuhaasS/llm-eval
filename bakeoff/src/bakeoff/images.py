@@ -221,13 +221,27 @@ def build_proxy_image(repo_root: Path, tag: str = PROXY_TAG) -> str:
 #: into @jest/core's published bundle, so a `--version` comparison would fail
 #: every node task image build -- on every arm, over an upstream packaging bug
 #: the model never saw.
-_NODE_RUNNER_REASSERTION = r'''RUN v="$(node -p 'require("/node_modules/vitest/package.json").version' 2>/dev/null)"; \
+#:
+#: THE EMPTY PIN IS REFUSED FIRST, and without that line this whole check
+#: passed VACUOUSLY on exactly the base it exists to defend. `${BAKEOFF_*}`
+#: expands to the empty string when the base declares no such ENV -- a python
+#: base, a hand-built one, a node base edited to drop the pair -- and
+#: `case "" in "") ;;` MATCHES, so the vitest half went green against nothing.
+#: jest's half was worse: `"${BAKEOFF_JEST_VERSION}"*` degrades to the bare
+#: glob `*`, which matches every string including the empty one `node -p`
+#: leaves behind when /node_modules/jest is gone. So the shape that could only
+#: be caught here -- an `image.build` that deleted the runners, on a base whose
+#: pins are missing -- built clean. Both halves are fixed together: the `-n`
+#: guard, and an EXACT jest match (the trailing `*` bought nothing; the base
+#: asserts the same package.json string exactly).
+_NODE_RUNNER_REASSERTION = r'''RUN [ -n "$BAKEOFF_VITEST_VERSION" ] && [ -n "$BAKEOFF_JEST_VERSION" ] || { echo "the base declares no runner pins -- not a node base" >&2; exit 1; }; \
+    v="$(node -p 'require("/node_modules/vitest/package.json").version' 2>/dev/null)"; \
     j="$(node -p 'require("/node_modules/jest/package.json").version' 2>/dev/null)"; \
     case "$v" in "${BAKEOFF_VITEST_VERSION}") ;; \
       *) echo "image.build changed the pinned test runner: expected vitest ${BAKEOFF_VITEST_VERSION}, got '${v}'. \
 Use 'npm install --prefix / --omit=dev', never 'npm ci' -- npm ci deletes node_modules at the prefix before installing, and the cwd where it does not delete them is the one where it installs none of yours instead. The base saves the runners under 'dependencies', so --omit=dev never prunes them." >&2; exit 1 ;; \
     esac; \
-    case "$j" in "${BAKEOFF_JEST_VERSION}"*) ;; \
+    case "$j" in "${BAKEOFF_JEST_VERSION}") ;; \
       *) echo "image.build changed the pinned test runner: expected jest ${BAKEOFF_JEST_VERSION}, got '${j}'. This reads jest's installed package.json, never 'jest --version' -- measured 2026-09-02, jest 30.5.0's CLI answers 30.4.2 from a stale string inlined into @jest/core's bundle." >&2; exit 1 ;; \
     esac'''
 

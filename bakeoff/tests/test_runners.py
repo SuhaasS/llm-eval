@@ -1007,9 +1007,13 @@ def test_executed_names_reports_only_the_tests_that_reached_a_verdict(framework)
 @pytest.mark.parametrize("framework", ("vitest", "jest"))
 def test_executed_names_of_a_report_that_does_not_exist_is_empty(framework):
     """A run that wrote no report ran nothing this can name. It is NOT the
-    caller's cue that nothing collided: preflight only reaches the duplicate
-    rule off a scoped run it classified, and `report=None` classifies as an
-    environment problem before that."""
+    caller's cue that nothing collided, and the ORDER does not rescue the
+    caller either -- which is what this docstring used to claim. preflight
+    runs the duplicate rule IMMEDIATELY after the scoped invocation and
+    reaches the KIND_PASSED comparison forty lines later, so an empty answer
+    here reached the evidence as `[]` -- "measured, nothing found" -- for a
+    run that measured nothing at all. preflight guards its own write on
+    `last_report` for that reason; this method stays total."""
     assert list(for_framework(framework).executed_names(None)) == []
 
 

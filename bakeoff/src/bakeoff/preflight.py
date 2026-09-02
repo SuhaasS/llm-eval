@@ -44,7 +44,7 @@ from bakeoff.runners import (
     for_framework,
 )
 from bakeoff.runners.node_adapter import verify_selected
-from bakeoff.tasks import _DEFAULT_PYTHON, _under
+from bakeoff.tasks import _DEFAULT_PYTHON, _under, task_runtime
 
 # Re-exported, not re-defined. These moved to `bakeoff.runners.pytest_adapter`
 # when the exit-code judgement became per-framework (broadening 7), and they
@@ -723,6 +723,15 @@ def preflight(
     # pytest and means nothing at all under vitest.
     adapter = for_framework(tests.framework)
     evidence["framework"] = adapter.name
+    #: `"python"` or `"node"`, DERIVED from `tests.framework` and never
+    #: declared -- the same single source `run_matrix` builds the base from.
+    #: Read here because the interpreter read-back below is a claim about the
+    #: python base and a node task makes none: measured, the node base ships
+    #: no `python` at all, so `python --version` exits non-zero, the read-back
+    #: files `python_observed: ""` and a NO-GO, and every node task in the set
+    #: is refused for the absence of a thing it never declared (D12 -- a node
+    #: manifest may not carry `image.python`; `load_task` refuses it).
+    runtime = task_runtime(task)[0]
     # NOT a parameter with a default. Both drivers call this with `task` and
     # neither passes a bound, so reading it here makes "a consumer left on the
     # constant" unrepresentable rather than merely tested for -- and that
@@ -741,13 +750,22 @@ def preflight(
     evidence["image_env_mismatch"] = None
     evidence["hypothesis_importable"] = None
     evidence["hypothesis_imported_by_suite"] = None
-    evidence["python_declared"] = declared_python = _declared_python(task)
+    #: `None` on a node task, and that is the null rule rather than a
+    #: convenience: `_declared_python` falls back to `_DEFAULT_PYTHON` when the
+    #: key is absent, so a node manifest -- which `load_task` FORBIDS from
+    #: declaring `image.python` at all -- would otherwise publish "3.12" as a
+    #: thing this task declared. `None` here says the gate did not look,
+    #: which is what actually happened.
+    evidence["python_declared"] = declared_python = (
+        _declared_python(task) if runtime == "python" else None
+    )
     #: `None`, not `""`. A gate that never started a container has not
     #: observed an empty version -- it has not observed anything. Below,
     #: a container that DID start but whose `python --version` exited
     #: non-zero writes `""` instead: that is an observed empty answer, a
     #: different absence than never having looked, and the two must not
-    #: render identically.
+    #: render identically. A node task leaves it `None` for the third
+    #: reason: the probe was never run.
     evidence["python_observed"] = None
     #: `None`, not `[]`: nothing was measured. `[]` is the observation "this
     #: tree has no submodules", which is what the check below writes for the
@@ -876,8 +894,29 @@ def preflight(
         #
         # Measured 2026-09-01: `python --version` writes to STDOUT (Python 2
         # wrote it to stderr; 3.4+ does not), so `.stdout` is the right field.
-        python = container.exec(["python", "--version"])
-        if python.exit_code != 0:
+        #
+        # NOT RUN AT ALL ON A NODE TASK, and the gate is written AROUND the
+        # three branches rather than as an `if` wrapping them, so the
+        # mutation-check anchor on the equality below keeps its exact text and
+        # its exact indentation. `node:22-bookworm-slim` ships no `python`
+        # (measured 2026-09-02: `exec: "python": executable file not found`),
+        # so this probe exits non-zero, files `python_observed: ""` -- an
+        # OBSERVATION -- and refuses every node task in the set for the
+        # absence of an interpreter its manifest is forbidden from declaring
+        # (D12). `None` is the correct answer there: the gate did not look.
+        python = (container.exec(["python", "--version"])
+                  if runtime == "python" else None)
+        if python is None:
+            # A node task. `python_declared` and `python_observed` both stay
+            # `None`, which is a third absence beside the two below -- "the
+            # gate never started a container" and "the probe ran and answered
+            # nothing" -- and it must not render as either. There is no
+            # node analogue to add here: the runtime read-back a node task
+            # needs is the runner pin, and that is asserted at BUILD time by
+            # `images._NODE_RUNNER_REASSERTION`, where the remedy (rebuild) is
+            # named at the step that caused it.
+            pass
+        elif python.exit_code != 0:
             # An observed empty answer, not an unobserved one: the container
             # started and the probe ran, it just did not exit 0. `None` above
             # is reserved for the path that never started a container at all.
@@ -1598,7 +1637,31 @@ def preflight(
                     # and the key stays `None` -- "no scoped run was made",
                     # which is a different fact from "no duplicates were
                     # found", and the two must not render identically.
-                    evidence["duplicate_full_names"] = duplicates
+                    #
+                    # A THIRD ABSENCE, and the one this key had wrong: a scoped
+                    # run that wrote NO REPORT AT ALL. `executed_names(None)`
+                    # yields nothing, so `duplicates` came out `[]` --
+                    # byte-identical to "the report was read and holds no
+                    # collision" -- for a run that measured nothing whatever.
+                    # Measured, that is exactly what a broken config gives on
+                    # both node frameworks: exit 1 and no file. The verdict is
+                    # still NO-GO (the scoped run is not KIND_PASSED, forty
+                    # lines down), but the evidence outlives the verdict, and
+                    # it was saying the duplicate check ran and cleared.
+                    #
+                    # `report_path() is None` is NOT that absence, which is why
+                    # the guard is not a bare `last_report is not None`. pytest
+                    # writes no report BY DESIGN and its `executed_names` is
+                    # empty as a CLAIM -- a pytest node id carries its file, so
+                    # `--deselect a.py::test_x` cannot reach `b.py::test_x` and
+                    # the hazard does not exist there. A missing report is an
+                    # absence only on a framework that writes one.
+                    evidence["duplicate_full_names"] = (
+                        duplicates
+                        if adapter.report_path() is None
+                        or runner.last_report is not None
+                        else None
+                    )
                     if duplicates:
                         problems.append(
                             "two or more tests under tests.paths share a full "
@@ -1628,8 +1691,21 @@ def preflight(
                     # is the mistake the runner's own filter already makes
                     # (`tests_helpers/x` starts with `tests` and is not under
                     # `tests/`).
+                    #
+                    # `None` WHEN `files_run` IS, and that is the same
+                    # correction one key up rather than a separate one: `[]`
+                    # here read as "measured, nothing left the scope" for two
+                    # runs that measured nothing -- a pytest run, whose adapter
+                    # reports no file list at all (and whose `scope_files_run`
+                    # already said `None` two lines above, so the pair
+                    # contradicted each other), and a node run that wrote no
+                    # report, where the whole point of the check is that a
+                    # positional argument is a substring filter and nobody can
+                    # say what it matched. The `if outside:` below is unchanged
+                    # by this: `None` is falsy exactly as `[]` was, so no
+                    # verdict moves -- only the evidence stops claiming.
                     outside = (
-                        [] if files_run is None
+                        None if files_run is None
                         else [p for p in files_run if not _under(p, scope)])
                     evidence["scope_files_outside"] = outside
                     if outside:

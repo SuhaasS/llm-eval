@@ -984,3 +984,87 @@ def test_neither_runner_is_pinned_against_its_cli_version():
             # prove the shim EXECUTES and are never compared to a pin. A
             # capture (`$(... --version)`) is what this refuses.
             assert f"$(/node_modules/.bin/{runner} --version" not in where
+
+
+def test_the_re_assertion_refuses_a_base_that_declares_no_runner_pins():
+    """Without this guard the whole D15 check passed VACUOUSLY, and it passed
+    on exactly the input it exists to catch.
+
+    `${BAKEOFF_VITEST_VERSION}` expands to the empty string on any base that
+    declares no such ENV, and `case "" in "")` MATCHES -- so the vitest half
+    went green against nothing at all. The guard is executed here rather than
+    asserted as a substring, because what is being pinned is a shell
+    semantics claim and a text match would survive a rewrite that broke it.
+    """
+    guard = _NODE_GUARD()
+
+    empty = subprocess.run(
+        ["sh", "-c", guard], capture_output=True, text=True,
+        env={"BAKEOFF_VITEST_VERSION": "", "BAKEOFF_JEST_VERSION": ""},
+    )
+    half = subprocess.run(
+        ["sh", "-c", guard], capture_output=True, text=True,
+        env={"BAKEOFF_VITEST_VERSION": "3.2.7", "BAKEOFF_JEST_VERSION": ""},
+    )
+    both = subprocess.run(
+        ["sh", "-c", guard], capture_output=True, text=True,
+        env={"BAKEOFF_VITEST_VERSION": "3.2.7", "BAKEOFF_JEST_VERSION": "30.5.0"},
+    )
+
+    assert empty.returncode == 1
+    assert "not a node base" in empty.stderr
+    # ONE pin missing is still not a node base. `&&` between the two tests is
+    # what makes that true; `||` between them would accept a half-declared base
+    # and leave the other half of the check matching the empty string.
+    assert half.returncode == 1
+    assert both.returncode == 0
+
+
+def test_an_empty_pin_would_otherwise_match_both_halves_of_the_check():
+    """The measurement the guard above is built on, taken against `sh` rather
+    than reasoned about: an empty `case` pattern matches the empty string, and
+    jest's old trailing `*` degraded to a bare glob that matches ANYTHING --
+    including the empty string `node -p` leaves behind when the runner it is
+    asked about has been deleted."""
+    probe = subprocess.run(
+        ["sh", "-c",
+         'case "" in "") echo VITEST_HALF_MATCHED ;; esac; '
+         'case "30.4.2" in ""*) echo JEST_HALF_MATCHED ;; esac'],
+        capture_output=True, text=True,
+    )
+
+    assert probe.stdout.split() == ["VITEST_HALF_MATCHED", "JEST_HALF_MATCHED"]
+    # So the trailing `*` is gone: the base asserts the installed
+    # package.json string exactly and this re-assertion compares the same one.
+    assert '"${BAKEOFF_JEST_VERSION}"*)' not in images._NODE_RUNNER_REASSERTION
+    assert '"${BAKEOFF_JEST_VERSION}")' in images._NODE_RUNNER_REASSERTION
+
+
+def _NODE_GUARD() -> str:
+    """The first statement of the re-assertion, as a runnable `sh` command.
+
+    Sliced off the real constant rather than restated, because a second copy
+    of the guard is a guard that can stop being the one the build runs.
+    """
+    first = images._NODE_RUNNER_REASSERTION.split("; \\\n", 1)[0]
+    assert first.startswith("RUN "), first
+    return first[len("RUN "):]
+
+
+def test_every_copy_of_the_default_node_version_says_the_same_thing():
+    """The node analogue of the python test above, and the same failure: two
+    copies of "22" that can drift means a manifest declaring no `image.node`
+    loads as a task whose base nobody built. The build succeeds, the suite
+    runs, and the runtime is not the one the default named.
+
+    TWO copies here rather than three -- `images.py` has no `_DEFAULT_NODE`,
+    because `base_tag` is reached through `task_runtime`, which reads the
+    manifest's own default."""
+    dockerfile = (
+        Path(__file__).resolve().parent.parent / "docker"
+        / "eval-agent-node.Dockerfile"
+    ).read_text()
+
+    assert f"ARG BASE_NODE_VERSION={tasks._DEFAULT_NODE}\n" in dockerfile
+    assert "FROM node:${BASE_NODE_VERSION}-bookworm-slim\n" in dockerfile
+    assert tasks._DEFAULT_NODE in tasks._NODE_VERSIONS

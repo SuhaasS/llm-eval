@@ -273,6 +273,17 @@ def test_a_non_pytest_runner_is_refused_rather_than_guessed_at(tmp_path):
             f2p = ("x",)
             framework = "pytest"
 
+        # Required since preflight reads `task_runtime` -- the ONE source for
+        # which base a task needs -- to decide whether the interpreter
+        # read-back applies at all (D12). `image` is NOT one of the keys this
+        # module reads defensively with `getattr`: those are keys that arrived
+        # after some manifest was already written, and `image` has been on
+        # `TaskManifest` since the first one, with a default factory, so no
+        # real task object can be missing it.
+        class image:  # noqa: N801 - mirrors the manifest shape
+            python = "3.12"
+            node = "22"
+
         class budget:  # noqa: N801 - mirrors the manifest shape
             suite_timeout_s = 600
 
@@ -1133,6 +1144,13 @@ class _FakeTests:
 class _FakeImage:
     env: dict = field(default_factory=dict)
     python: str = "3.12"
+    #: Both keys carry their default, exactly as `TaskImage` does. A real
+    #: manifest may declare only the one belonging to its framework --
+    #: `load_task` refuses the other -- but `task_runtime`, which preflight now
+    #: reads, indexes whichever one the framework selects, so a stub missing
+    #: the node half would raise `AttributeError` out of the gate on every
+    #: vitest and jest test in this file.
+    node: str = "22"
 
 
 @dataclass(frozen=True)
@@ -3074,16 +3092,24 @@ def test_a_pytest_runner_without_no_cacheprovider_is_NOT_newly_refused():
 
 def test_a_pytest_task_records_the_node_keys_as_measured_absences():
     """`[]` where the gate looked and found nothing, `None` where the
-    framework cannot answer. `scope_files_run` is `None` because the pytest
-    adapter reports no file list at all -- not because no scoped run was made
-    -- and `duplicate_full_names` is `[]` because the scoped run DID happen
-    and pytest's ids carry their file, so the hazard does not exist."""
+    framework cannot answer.
+
+    `duplicate_full_names` is `[]` because the scoped run DID happen and
+    pytest's ids carry their file, so the hazard does not exist -- that is a
+    CLAIM, and it is why the guard on this key is not a bare `last_report is
+    not None`: pytest writes no report by design.
+
+    `scope_files_run` and `scope_files_outside` are BOTH `None`, and the pair
+    used to disagree: the first said "the pytest adapter reports no file list
+    at all" while the second said `[]`, "measured, nothing left the scope",
+    derived from that same absent list. Nothing measured what a positional
+    argument matched, so neither key may claim it did."""
     result = _preflight_over(_pytest_container())
 
     assert result.ok, result.problems
     assert result.evidence["duplicate_full_names"] == []
     assert result.evidence["scope_files_run"] is None
-    assert result.evidence["scope_files_outside"] == []
+    assert result.evidence["scope_files_outside"] is None
 
 
 def test_the_report_is_deleted_before_every_node_run_and_read_back_after():
@@ -3101,3 +3127,51 @@ def test_the_report_is_deleted_before_every_node_run_and_read_back_after():
     for command in container.commands:
         if command[:1] == ["timeout"]:
             assert "--reporter=json" in command, command
+
+
+def test_a_node_task_is_not_gated_on_an_interpreter_it_never_declared():
+    """D12. `image.python` is REFUSED on a node manifest (`load_task`), and
+    `node:22-bookworm-slim` ships no `python` at all -- so the read-back probed
+    for an interpreter the task is forbidden from naming, got a non-zero exit,
+    and refused every node task in the set with a message about a key the
+    author could not have written.
+
+    `container.python = None` is that image verbatim: the probe exits 127. The
+    assertion that matters is the third one -- the command is never ISSUED --
+    because a gate that ran the probe and ignored the answer would satisfy the
+    first two and still pay for it the day the message changed.
+
+    Both evidence keys stay `None`: the gate did not look. Not `""`, which is
+    the OTHER absence one branch over -- a probe that ran and answered
+    nothing -- and not `"3.12"`, which is what `_declared_python`'s fallback
+    would have published as a thing this manifest declared."""
+    container, task = _node_container()
+    container.python = None
+
+    result = _preflight_over((container, task))
+
+    assert result.ok, result.problems
+    assert ["python", "--version"] not in container.commands
+    assert result.evidence["python_declared"] is None
+    assert result.evidence["python_observed"] is None
+
+
+def test_a_scoped_run_that_wrote_no_report_measured_neither_node_rule():
+    """The config-error shape, which is the one both keys were wrong about.
+
+    Measured on both frameworks: a broken config exits 1 and writes NO file.
+    `executed_names(None)` then yields nothing and `Outcome.files_run` is
+    absent, so the duplicate rule recorded `[]` and the scope rule recorded
+    `[]` -- "measured, nothing found", from a run that measured nothing. The
+    verdict was always NO-GO (the scoped run is not KIND_PASSED), but a
+    preflight verdict is cached and outlives the code that wrote it, and these
+    keys are read by a human comparing task shapes."""
+    container, task = _node_container()
+    container.reports["scoped"] = None
+
+    result = _preflight_over((container, task))
+
+    assert not result.ok
+    assert result.evidence["duplicate_full_names"] is None
+    assert result.evidence["scope_files_run"] is None
+    assert result.evidence["scope_files_outside"] is None
