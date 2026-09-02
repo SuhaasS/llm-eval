@@ -3167,3 +3167,173 @@ from `[]` to `None` for a scoped run that wrote no report at all, without the
 here — see `TASKS.md`.
 
 Unit suite: 1506 passed, 61 deselected.
+
+---
+
+## Round 2 item 3 — a unique host path per bind-mounted tree — 2026-09-03
+
+Plan: [docs/superpowers/plans/2026-09-03-round2-3-unique-run-trees.md](../docs/superpowers/plans/2026-09-03-round2-3-unique-run-trees.md).
+
+Broadening 7 landed the post-condition; this closes the **cause**. Every host
+path the harness bind-mounts is now allocated by one helper,
+`container.fresh_tree(parent)`, which returns `<parent>/<uuid4().hex>` — a
+directory no container has ever mounted. The stable key (`run_id`, `task_id`,
+the cell label, the artifacts root) stays in the path as the *parent*, so a
+tree is still findable by grep; only the leaf is unique.
+
+**The measurement, restated because everything here rests on it.** Four cycles
+of `rmtree` → `materialize` → new container on one host path, `ls /repo`
+inside each container (2026-09-02):
+
+```
+cycle 0  ls /repo -> ['README.md', 'package.json', 'src', 'tests']
+cycle 1  ls /repo -> []
+cycle 2  ls /repo -> ['README.md', 'package.json', 'src', 'tests']
+cycle 3  ls /repo -> []
+```
+
+This is not the `/var/folders` trap (a path the Docker VM does not share at
+all, which the `--basetemp` convention covers). It is a path the VM *does*
+share, whose inode the host replaced underneath the VM's cache. An empty mount
+**resolves** rather than failing: an empty `/repo` is `No test files found` at
+exit 1 under vitest and jest — the exit a genuinely red suite gives — and
+`git apply` fails against it, which the grader reads as `APPLY_FAILED` →
+`resolved: False`.
+
+**Six sites, not the four `TASKS.md` named.** Review 1 found the sixth.
+
+| # | site | path | caught by `_assert_repo_mounted`? |
+|---|---|---|---|
+| 1 | `grader.grade_run` | `<cache>/grade-tree/<run_id>` | yes |
+| 2 | `oracle._derive` | `<cache>/oracle-tree/<task_id>` | yes |
+| 3 | `grade.resolve_task` | `<cache>/grade-preflight-tree/<task_id>` | yes |
+| 4 | `run_matrix.resolve_tasks` | `<cache>/preflight-tree/<task_id>` | yes |
+| 5 | `run_matrix.run_cell` | `<artifacts>/<stamp>/<cell>/repo` | yes |
+| 6 | `runner.execute_run` | `<artifacts_root>/claude-config` | **no** |
+
+Site 6 is the one with no backstop at all, and it is the worst of the six on
+every axis: the `rmtree` → `mkdir` → mount sequence was already written,
+`_assert_repo_mounted` checks `REPO_MOUNT` and only `REPO_MOUNT`, and the
+failure is not loud. The agent writes its transcript into the cached inode,
+the host directory stays empty, transcript discovery globs it and finds
+nothing, and the run parses to zero turns, zero tokens and zero cost — with
+the tokens already spent. That is a *lost cell*, not a wrong one, and it is
+why the site-6 mutation anchor is not optional: with no guard behind it, the
+anchor is the only thing keeping that allocation from being reverted.
+`runner.py`'s emptiness read-back is **not** a mount post-condition and is now
+worded as what it is — it reads the *host* side, which after `fresh_tree` is
+empty by construction, so it answers for the allocator and never for the mount.
+
+**`_assert_repo_mounted` stays, unchanged in behaviour.** The cause it caught
+is one of several: `/var/folders`, a future call site that builds a path by
+hand, a daemon fault. It is the post-condition; `fresh_tree` is the cause.
+
+**Version bumps.** `GRADER_VERSION` 8 → 9 and `PREFLIGHT_VERSION` 13 → 14.
+Neither changes what any check asserts; both retire verdicts that may have
+been produced through a container this code can no longer interrogate.
+`grade.py`'s resume key is `(run_id, GRADER_VERSION)` alone, so without the
+bump a suspect `APPLY_FAILED` line is never revisited — and an operator cannot
+tell a stale-mount one from a real one by reading either line. The preflight
+key runs through `preflight_cache_key`, so `preflight.json` (run_matrix) and
+`preflight-grade.json` (grade.py) invalidate together: one offline re-gate per
+task per driver, no credentials and no spend. `ORACLE_VERSION` did **not**
+move — a derivation over an empty tree cannot cache a wrong verdict, because
+the reference fix fails to apply and `_derive` raises before any verdict
+exists. `SCHEMA_VERSION` and `GRADE_SCHEMA_VERSION` did not move: no record or
+grade field was added.
+
+**No field was added, and the one path now written down is written only when
+it is true.** `run_cell` returns the kept tree under `--keep`, `main` puts it
+in the `matrix-<stamp>.json` row under a **`kept_repo`** key present only then,
+and the cell also prints `  kept <path>`. Present-or-absent is the
+`artifacts.wire_log_gz` discipline; a null would have been two absences
+rendering identically. The key is `kept_repo` rather than `repo` because this
+same commit deletes a dead `"repo"` key from `resolved` a few hundred lines up
+in the same file (M5: nothing ever read it), and a live `"repo"` key here
+would make the diff read as a move.
+
+**The sweep's real bound, stated honestly rather than overclaimed.**
+`_sweep_stale_trees` runs at the **leaf** level with a 24 h age guard, so it
+only ever collects a husk under a key that is allocated under again — true of
+`preflight-tree/<task_id>` and `grade-preflight-tree/<task_id>` on every
+invocation, and not true of `grade-tree/<run_id>`, `oracle-tree/<task_id>`, a
+per-cell `tree/` or a per-run `claude-config/`. The empty key directories are
+never collected at all (~960 inodes for an 80 × 4 × 3 matrix). Sweeping the
+key level was **refused**, not deferred: `fresh_tree` opens with
+`parent.mkdir(parents=True, exist_ok=True)`, which does not refresh an
+existing directory's mtime, so an age-guarded key sweep would `rmtree` a key a
+concurrent allocator has just passed through and is about to put a leaf under,
+whose `mkdir` then raises `FileNotFoundError` — the same race that rejected
+`parent.rmdir()`. Carried as a P3 line. One free consequence: the legacy
+`preflight-tree/<task_id>/repo` trees the old shape left on disk are ordinary
+leaves to the sweep and are collected once they age past a day.
+
+**uuid4, not a stamp plus a counter.** The reuse that bites is *across
+processes* — `run_matrix` invoked twice on one task, `grade.py` twice on one
+cache — and a counter restarts at `0` in a new process, so `…-0` is precisely
+the path the previous process already mounted. And not `tempfile.mkdtemp`,
+which hard-codes 0o700: the container runs as uid 1000 while the host
+directory is owned by the operator, so on a Linux host that mode makes the
+mount unreadable to the agent. `test_an_allocated_tree_is_not_mkdtemps_owner_only_mode`
+pins it relative to the process umask, which is honest at every umask.
+
+**Docs checked and not moved.** `docs/BUILDING-A-TASK-SET.md`: two greps run
+per the plan — the cache-layout one (`preflight-tree|grade-tree|oracle-tree|
+.cache/bakeoff`) finds no tree paths, and the constants one finds four
+**historical attributions** (`PREFLIGHT_VERSION` at 239, 282, 786;
+`GRADER_VERSION` at 729) which all stay true after both bumps. Recorded here
+so a later reader does not re-check. `HANDOFF.md` does not move: no sweep
+reaches the pruned-mirror cache — every `fresh_tree` parent is a `grade-tree`,
+`oracle-tree`, `grade-preflight-tree`, `preflight-tree`, per-cell `tree/` or
+per-run `claude-config/`, and no mirror path is a parent of any of them.
+
+**Tests.** 13 new named tests, 15 collected (two parametrized ×2): six on
+`fresh_tree` itself in `test_container.py` (two allocations differ; a fresh
+leaf is empty beside a populated sibling; a removed name is never reissued
+across 50 more allocations; a day-old sibling is swept and a fresh one is
+not; a sweep that raises does not cost the allocation, ×2 over `scandir` and
+`rmtree`; the umask assertion), and one per production site elsewhere. Four
+existing tests changed without changing the count: the two `test_oracle.py`
+tree-removal assertions became `iterdir()` checks (the key directory survives
+as an empty husk by design; what must not survive is the leaf holding the
+reference fix), and the two version pins moved with their constants'
+changelog docstrings.
+
+**Verification.**
+
+- Unit: `1554 passed, 62 deselected` (1539 baseline + 15).
+- `scripts/verify_logger.py`: **GATE PASSED**.
+- `scripts/mutation_check.py`, run solo: **164/164** (160 baseline + four new
+  anchors, one per site whose revert is a distinct guarantee — the allocator
+  itself, `preflight-tree`, `grade-tree`, and site 6's config dir). All four
+  CAUGHT.
+- Integration, node: `tests/test_integration_node_task.py`, 8 passed, with
+  `node_tree` now going through `fresh_tree` instead of its own private uuid.
+  `_mounted` stays: it asserts the expected *content* is there, which is
+  strictly stronger than `_assert_repo_mounted`'s "anything at all".
+- Integration, grader: `tests/test_integration_grader.py`, 7 passed.
+- **The acceptance test — the loop that measured the defect.** Four
+  consecutive `run_matrix.py --preflight-only --force-preflight` invocations
+  on the vitest task `ufo-214-without-trailing-slash-query`: **PASS, PASS,
+  PASS, PASS**, exit 0 each time. Before this change the even-numbered
+  invocations refused with `_assert_repo_mounted`'s `ContainerError`, and
+  before that guard existed they passed while measuring nothing.
+- **The grader half.** Two `grade.py --re-grade` passes over
+  `eventlog-ufo-214-without-trailing-slash-query` against one cache root: both
+  wrote `resolved: False` for the empty submission and `resolved: True` for
+  the reference, with identical check names and per-check verdicts. No
+  `APPLY_FAILED` appearing only in the second. The first pass rewrote both
+  already-graded runs because `GRADER_VERSION` moved — by design.
+
+**Left open.** The husk residue above (P3). Site 6 still has no mount
+post-condition, which is accepted and stated rather than hidden: a freshly
+allocated config directory is *supposed* to be empty on the host, so there is
+nothing for a mount-time check to compare, and the only downstream signal
+would be `trajectory_parse_error` on a zero-turn run after the tokens are
+spent. The pre-container region of `execute_run` is still uncontained — an
+`OSError` from `fresh_tree`'s two `mkdir`s escapes exactly as the bare `mkdir`
+there does today; one concrete failure mode (a silent `rmtree` failure into
+`FileExistsError`) was removed and none was added. Containing it needs a
+`finalize_error`-style channel for that phase, which is its own change.
+
+Unit suite: 1554 passed, 62 deselected.

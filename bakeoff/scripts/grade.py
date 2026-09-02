@@ -76,6 +76,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO))
 
+from bakeoff.container import fresh_tree  # noqa: E402
 from bakeoff.eventlog import EventLog  # noqa: E402
 from bakeoff.grade_schema import (  # noqa: E402
     CHECK_ORDER,
@@ -291,8 +292,14 @@ def resolve_task(task, cache: Path, base_image: str,
             "and the container would exit immediately"
         )
 
-    work = Path(cache) / "grade-preflight-tree" / task.task_id
-    shutil.rmtree(work, ignore_errors=True)
+    # A path no container has mounted. One stable path per task, removed and
+    # re-materialized at the top of the NEXT invocation, is the stale bind
+    # mount: the Docker VM serves the directory it cached for that source, so
+    # every second `grade.py` invocation gated this task against an EMPTY
+    # `/repo` (measured 2026-09-02, `[files], [], [files], []` over four
+    # cycles) -- which on a vitest task is `No test files found` at exit 1,
+    # the exit a genuinely red suite gives.
+    work = fresh_tree(Path(cache) / "grade-preflight-tree" / task.task_id)
     try:
         start_sha = materialize(task, work / "repo", Path(cache))
 

@@ -2206,10 +2206,19 @@ def test_the_preflight_version_moved_with_the_new_assertion():
     arguments -- is itself a usage error in this image: `bidict-389-putall-
     rollback-clean`'s gated runner bypasses that with
     `--override-ini=addopts=` and passes, while the bare command an agent
-    naturally types exits 4 from turn one, bug fixed and unfixed alike."""
+    naturally types exits 4 from turn one, bug fixed and unfixed alike.
+
+    13 -> 14 is not a new assertion. It retires cached PASS verdicts observed
+    through a container this code can no longer interrogate:
+    `preflight-tree/<task_id>` was one path per task, reused across
+    invocations, and the Docker VM served the second container an empty
+    `/repo` -- which on a vitest task is `No test files found` at exit 1, the
+    shape a PASS cannot be told apart from (round 2 item 3, 2026-09-03). Both
+    caches key through `preflight_cache_key`, so `preflight.json` and
+    `preflight-grade.json` invalidate together."""
     from bakeoff.preflight import PREFLIGHT_VERSION
 
-    assert PREFLIGHT_VERSION == "13"
+    assert PREFLIGHT_VERSION == "14"
 
 
 # --- fix 2: the bare-runner probe ---------------------------------------------

@@ -40,6 +40,11 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO))
 
+# Module scope on purpose. `bakeoff.container` imports `docker` and NOT
+# litellm, so it does not undo the reason `bakeoff.runner`,
+# `bakeoff.claude_runner` and `bakeoff.proxy_callback` are deferred into
+# `run_cell`: `--preflight-only` has to stay off litellm.
+from bakeoff.container import fresh_tree  # noqa: E402
 from bakeoff.images import (  # noqa: E402
     ImageError,
     build_base_images,
@@ -235,6 +240,15 @@ def resolve_tasks(tasks, bases, expected_version, cache, force):
     into half an hour, and a gate that is expensive to run is a gate that
     gets skipped -- the same argument verify_logger.py makes for staying
     free.
+
+    The preflight tree is allocated by `container.fresh_tree` and removed when
+    the resolution ends. The shape it replaces -- one stable path per task,
+    `rmtree`'d at the TOP of the next invocation -- is the stale bind mount
+    measured 2026-09-02: the Docker VM serves the directory it cached for a
+    mount source, so the second container on that path saw an EMPTY `/repo`
+    (`[files], [], [files], []` over four cycles). On a vitest task that is
+    `No test files found` at exit 1, the exit a genuinely red suite gives, so
+    every second `--preflight-only` invocation gated on nothing at all.
     """
     cache_path = cache / "preflight.json"
     cached = {}
@@ -259,39 +273,46 @@ def resolve_tasks(tasks, bases, expected_version, cache, force):
             )
             continue
 
-        work = cache / "preflight-tree" / task.task_id
-        shutil.rmtree(work, ignore_errors=True)
-        start_sha = materialize(task, work / "repo", cache)
-        print(f"image     {image[:19]}...")
-        print(f"start_sha {start_sha}  (base {task.base_sha[:12]} + test half)")
-        if not task.declared_start_sha:
-            print(f"          pin it: repo.start_sha: {start_sha}")
+        work = fresh_tree(cache / "preflight-tree" / task.task_id)
+        try:
+            start_sha = materialize(task, work / "repo", cache)
+            print(f"image     {image[:19]}...")
+            print(f"start_sha {start_sha}  (base {task.base_sha[:12]} + test half)")
+            if not task.declared_start_sha:
+                print(f"          pin it: repo.start_sha: {start_sha}")
 
-        key = preflight_cache_key(task, image, start_sha)
-        if cached.get(task.task_id, {}).get("key") == key:
-            print("preflight cached PASS (--force-preflight to re-run)")
-            resolved[task.task_id] = {"image": image, "start_sha": start_sha,
-                                      "repo": work / "repo"}
-            continue
+            key = preflight_cache_key(task, image, start_sha)
+            if cached.get(task.task_id, {}).get("key") == key:
+                print("preflight cached PASS (--force-preflight to re-run)")
+                resolved[task.task_id] = {"image": image,
+                                          "start_sha": start_sha}
+                continue
 
-        result = preflight(
-            task, image=image, repo_path=work / "repo", start_sha=start_sha,
-            expected_claude_version=expected_version,
-        )
-        write_json(cache / "preflight" / f"{task.task_id}.json", result.to_dict())
-        if not result.ok:
-            print("preflight NO-GO")
-            for problem in result.problems:
-                print(f"  - {problem}")
-            failures.append(f"{task.task_id}: {len(result.problems)} problem(s)")
-            continue
-        print(
-            "preflight PASS  f2p red at start, green after the reference; "
-            "p2p green both ways; tree clean"
-        )
-        cached[task.task_id] = {"key": key}
-        resolved[task.task_id] = {"image": image, "start_sha": start_sha,
-                                  "repo": work / "repo"}
+            result = preflight(
+                task, image=image, repo_path=work / "repo", start_sha=start_sha,
+                expected_claude_version=expected_version,
+            )
+            write_json(cache / "preflight" / f"{task.task_id}.json",
+                       result.to_dict())
+            if not result.ok:
+                print("preflight NO-GO")
+                for problem in result.problems:
+                    print(f"  - {problem}")
+                failures.append(
+                    f"{task.task_id}: {len(result.problems)} problem(s)")
+                continue
+            print(
+                "preflight PASS  f2p red at start, green after the reference; "
+                "p2p green both ways; tree clean"
+            )
+            cached[task.task_id] = {"key": key}
+            resolved[task.task_id] = {"image": image, "start_sha": start_sha}
+        finally:
+            # The tree does not outlive the resolution, and both `continue`
+            # paths above pass through here. Removing it is safe only because
+            # `fresh_tree` will never reissue the name -- which is the whole
+            # difference from the shape this replaces.
+            shutil.rmtree(work, ignore_errors=True)
 
     write_json(cache_path, cached)
     return resolved, failures
@@ -323,14 +344,17 @@ def run_cell(cell, task, resolved, args, event_log, wire_dir, network, artifacts
     from bakeoff.runner import execute_run
 
     run_root = artifacts / f"{cell.task_id}-{cell.model}-{cell.sample_index}"
-    repo = run_root / "repo"
-    # No rmtree. The artifacts root is per-invocation, so this path is new
-    # every time and there is nothing to clear -- and a delete keyed on a path
-    # with no attempt_number in it becomes the artifacts-collision bug the
-    # moment run-level retry lands (TASKS.md P1): two attempts of one cell
-    # would share a stamp AND a directory, and the second would delete the
-    # first's artifacts and its record.unwritten.json while both records live
-    # in the log.
+    repo = fresh_tree(run_root / "tree") / "repo"
+    # No rmtree. The artifacts root is per-invocation AND the tree leaf is per
+    # materialization, so this path is new every time and there is nothing to
+    # clear -- and a delete keyed on a path with no attempt_number in it
+    # becomes the artifacts-collision bug the moment run-level retry lands
+    # (TASKS.md P1): two attempts of one cell would share a stamp AND a
+    # directory, and the second would delete the first's artifacts and its
+    # record.unwritten.json while both records live in the log. The leaf is
+    # also what keeps a retry off a path a container has already mounted: the
+    # Docker VM serves a replaced host inode from its cache, EMPTY (measured
+    # 2026-09-02, `[files], [], [files], []` over four cycles).
     # A fresh tree per run. Sharing one would let a later sample start from
     # an earlier sample's dirty state and report a diff its own agent never
     # made (spec section 5.1: fresh container per sample, no state bleed).
@@ -380,9 +404,16 @@ def run_cell(cell, task, resolved, args, event_log, wire_dir, network, artifacts
     write_json(run_root / "artifacts" / "effective_config.json", config_dump)
 
     unattributed = unattributed_count(wire_dir) - before
-    if not args.keep:
-        shutil.rmtree(repo, ignore_errors=True)
-    return record, config_dump, unattributed
+    kept = None
+    if args.keep:
+        kept = str(repo)
+        print(f"  kept {repo}")
+    else:
+        # The whole leaf, not just `repo`: the leaf is the allocation, and
+        # leaving it behind is the husk `fresh_tree` cannot collect under a
+        # key nothing allocates under again.
+        shutil.rmtree(repo.parent, ignore_errors=True)
+    return record, config_dump, unattributed, kept
 
 
 def main() -> int:
@@ -620,7 +651,7 @@ def main() -> int:
             print(f"\n[{index}/{len(resume.todo)}] {cell.label}", flush=True)
             try:
                 cell_started = time.monotonic()
-                record, config_dump, unattributed = run_cell(
+                record, config_dump, unattributed, kept = run_cell(
                     cell, task, resolved[cell.task_id], args,
                     event_log, wire_dir, proxy.internal_name, artifacts,
                     # Both are this invocation's stamp today, which is exactly
@@ -654,23 +685,28 @@ def main() -> int:
             if problems:
                 infra[cell.label] = problems
             abort = tracker.record(cell.model, bad=bool(problems))
-            rows.append(
-                {
-                    "cell": cell.label,
-                    "outcome": record.outcome.value,
-                    "turns": record.turns_used,
-                    "tools": record.tool_calls.total,
-                    "wire": record.wire_entries_seen,
-                    "cost": record.cost_usd,
-                    "wall_s": record.time.wall_clock_total_ms / 1000,
-                    # The whole cell, not just the agent. The two differ by
-                    # exactly CELL_OVERHEAD_S's true value, which is the
-                    # measurement that constant is standing in for.
-                    "cell_wall_s": round(cell_wall_s, 1),
-                    "diff_b": len(record.artifacts.final_diff or ""),
-                    "problems": problems,
-                }
-            )
+            row = {
+                "cell": cell.label,
+                "outcome": record.outcome.value,
+                "turns": record.turns_used,
+                "tools": record.tool_calls.total,
+                "wire": record.wire_entries_seen,
+                "cost": record.cost_usd,
+                "wall_s": record.time.wall_clock_total_ms / 1000,
+                # The whole cell, not just the agent. The two differ by
+                # exactly CELL_OVERHEAD_S's true value, which is the
+                # measurement that constant is standing in for.
+                "cell_wall_s": round(cell_wall_s, 1),
+                "diff_b": len(record.artifacts.final_diff or ""),
+                "problems": problems,
+            }
+            # Present only when the tree survives, never a null -- the same
+            # discipline `artifacts.wire_log_gz` keeps one layer down. Under
+            # `--keep` the run tree outlives the cell and a reader wants the
+            # path; without it there is no path to name.
+            if kept:
+                row["kept_repo"] = kept
+            rows.append(row)
             cost = "unpriced" if record.cost_usd is None else f"{record.cost_usd:.5f}"
             print(
                 f"  {record.outcome.value:18} turns={record.turns_used:<3} "

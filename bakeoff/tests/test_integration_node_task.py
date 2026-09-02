@@ -24,8 +24,9 @@ pass. The probe this file was written from hit exactly that on its first run.
 THE EMPTY MOUNT HAS A SECOND SHAPE and this file hit that one too, so both are
 defended: a path the VM *does* share, deleted and rebuilt on the host between
 containers, is served from a stale cache and appears empty roughly every other
-time (measured -- see `node_tree`). Hence a uuid per run tree, never a shared
-one, and `_mounted`'s post-condition beside it: under both node frameworks an
+time (measured -- see `node_tree`). Hence `container.fresh_tree` per run tree,
+never a shared one, and `_mounted`'s post-condition beside it: under both node
+frameworks an
 empty `/repo` exits **1** with `No test files found`, which is the same exit a
 failing test gives, so an empty mount does not make this file flaky -- it makes
 it pass while measuring nothing.
@@ -36,12 +37,11 @@ from __future__ import annotations
 import contextlib
 import shutil
 import subprocess
-import uuid
 from pathlib import Path
 
 import pytest
 
-from bakeoff.container import RunContainer
+from bakeoff.container import RunContainer, fresh_tree
 from bakeoff.grade_schema import GradeFailure
 from bakeoff.images import build_base_image, build_task_image, image_entrypoint
 from bakeoff.oracle import ensure_oracle
@@ -219,10 +219,14 @@ def node_tree(task_dir):
     ambiguity `bakeoff.runners` exists because of. So a shared path does not
     make this file flaky; it makes it PASS while measuring nothing.
 
-    A uuid per test removes the cause. `_mounted` below is the post-condition
-    that would catch it coming back.
+    This measurement is the evidence the production fix rests on. A uuid per
+    tree removes the cause, and since round 2 item 3 (2026-09-03) that
+    allocator is `container.fresh_tree`, used by every host path the harness
+    bind-mounts -- so this fixture is one of its callers rather than a
+    parallel implementation of it. `_mounted` below is the post-condition that
+    would catch the cause coming back.
     """
-    tree = CACHE_ROOT / "tree" / uuid.uuid4().hex
+    tree = fresh_tree(CACHE_ROOT / "tree")
     task = load_task(task_dir)
     start_sha = materialize(task, tree / "repo", CACHE_ROOT)
     yield task, tree / "repo", start_sha
@@ -241,6 +245,11 @@ def _mounted(image: str, repo: Path, start_sha: str):
     did is worthless without this one first. It is a plain `ls`, on purpose:
     the file the tests read is the thing to look for, and a check that went
     through git would answer for the mount and for git at once.
+
+    Not redundant with `RunContainer._assert_repo_mounted`, which landed
+    later: that guard refuses a mount holding nothing at all, and this one
+    asserts the expected CONTENT is there -- a strictly stronger claim, and
+    the one every assertion in this file depends on.
     """
     with RunContainer(image=image, repo_path=str(repo),
                       base_sha=start_sha) as container:

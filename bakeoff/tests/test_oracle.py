@@ -437,7 +437,10 @@ def test_the_derivation_tree_does_not_outlive_the_derivation(
         monkeypatch, tmp_path, existing={"tests/"}, results=[(0, ""), (0, "")]
     )
     _derive(_derive_task(paths=("tests/",)), "sha256:img", tmp_path)
-    assert not (tmp_path / "oracle-tree" / "click-3360").exists()
+    # The KEY directory survives as an empty husk by design (one inode per
+    # task, never per derivation); what must not survive is a tree holding the
+    # reference fix, which is the leaf.
+    assert not list((tmp_path / "oracle-tree" / "click-3360").iterdir())
 
 
 def test_the_tree_is_removed_even_when_the_derivation_refuses(
@@ -448,7 +451,10 @@ def test_the_tree_is_removed_even_when_the_derivation_refuses(
     )
     with pytest.raises(OracleError):
         _derive(_derive_task(paths=("tests/",)), "sha256:img", tmp_path)
-    assert not (tmp_path / "oracle-tree" / "click-3360").exists()
+    # The KEY directory survives as an empty husk by design (one inode per
+    # task, never per derivation); what must not survive is a tree holding the
+    # reference fix, which is the leaf.
+    assert not list((tmp_path / "oracle-tree" / "click-3360").iterdir())
 
 
 def test_the_derivation_bounds_its_two_reference_runs_by_the_manifest(
@@ -548,3 +554,28 @@ def test_the_derivation_hands_the_runner_the_tasks_adapter(
     _derive(_derive_task(paths=("tests/",)), "sha256:img", tmp_path)
 
     assert runner.adapter is for_framework("pytest")
+
+
+def test_two_derivations_for_one_task_mount_different_host_paths(
+    tmp_path, monkeypatch
+):
+    """`oracle-tree/<task_id>` is one path per task, and a re-derivation
+    mounts it again -- the second container then sees the VM's cached, empty
+    copy and the reference fix "does not apply", which makes a sound task
+    ungradable."""
+    mounted: list[str] = []
+
+    def _recording(image, repo_path, base_sha):
+        mounted.append(str(repo_path))
+        return _FakeContainer({"tests/"})
+
+    for _ in range(2):
+        _stub_derive_environment(
+            monkeypatch, tmp_path, existing={"tests/"},
+            results=[(0, ""), (0, "")],
+        )
+        monkeypatch.setattr("bakeoff.oracle.RunContainer", _recording)
+        _derive(_derive_task(paths=("tests/",)), "sha256:img", tmp_path)
+
+    assert mounted[0] != mounted[1]
+    assert all("click-3360" in p for p in mounted)

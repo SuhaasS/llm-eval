@@ -1939,6 +1939,66 @@ MUTATIONS = [
         "tests/test_runners.py -k a_subfailed_line",
         "not integration",
     ),
+    (
+        # Round 2 item 3: the Docker VM serves a reused bind-mount source from
+        # a stale cache -- measured 2026-09-02, `[files], [], [files], []` over
+        # four cycles on one path. A fixed leaf name puts that back, and an
+        # empty mount does not fail: it is `No test files found` at exit 1 on
+        # both node frameworks and APPLY_FAILED on the grader. NOTE: under this
+        # mutation the SECOND fresh_tree call raises FileExistsError at
+        # `tree.mkdir()` before the assertion is reached -- `exist_ok=False` is
+        # deliberate, so the test is red with a traceback rather than an
+        # assertion diff.
+        "mount: hand back one shared host path per key, restoring the stale mount",
+        "src/bakeoff/container.py",
+        "    tree = parent / uuid.uuid4().hex",
+        '    tree = parent / "tree"',
+        "tests/test_container.py -k different_paths",
+        "not integration",
+    ),
+    (
+        # The site the probe measured: `--preflight-only` twice on one task
+        # gated the second invocation against an empty tree, and on a vitest
+        # task that PASSES while measuring nothing.
+        "preflight: reuse one host tree per task across invocations",
+        "scripts/run_matrix.py",
+        '        work = fresh_tree(cache / "preflight-tree" / task.task_id)',
+        '        work = cache / "preflight-tree" / task.task_id\n'
+        "        shutil.rmtree(work, ignore_errors=True)",
+        "tests/test_run_matrix.py -k different_host_paths",
+        "not integration",
+    ),
+    (
+        # The site GRADER_VERSION's bump rests on: `grade-tree/<run_id>` reused
+        # across passes, served empty, `git apply` failing, and APPLY_FAILED
+        # stamping `resolved: False` on a submission that was fine.
+        "grade: reuse one host tree per run_id across grading passes",
+        "src/bakeoff/grader.py",
+        '    tree = fresh_tree(Path(cache_root) / "grade-tree" / record.run_id)',
+        '    tree = Path(cache_root) / "grade-tree" / record.run_id\n'
+        "    shutil.rmtree(tree, ignore_errors=True)",
+        "tests/test_grader.py -k different_host_paths",
+        "not integration",
+    ),
+    (
+        # Site 6, the one with no mount post-condition: `_assert_repo_mounted`
+        # reads REPO_MOUNT only, and the host-side read-back in runner.py
+        # answers for the allocator, not for the mount. A stale
+        # CLAUDE_CONFIG_DIR is a run recorded with zero turns, zero tokens and
+        # zero cost after the tokens are spent. NOTE: `new` restores the reused
+        # path WITHOUT the `shutil.rmtree` line, because Task 4 deletes
+        # `import shutil` from this module -- a NameError would make the test
+        # red for a reason that is not the guarantee. Reuse alone is the
+        # guarantee: under this mutation both runs share one config directory,
+        # so the test sees 1 entry where it asserts 2.
+        "config dir: reuse one host path per artifacts root across runs",
+        "src/bakeoff/runner.py",
+        '    host_config_dir = fresh_tree(artifacts_root / "claude-config")',
+        '    host_config_dir = artifacts_root / "claude-config"\n'
+        "    host_config_dir.mkdir(parents=True, exist_ok=True)",
+        "tests/test_fault_injection.py -k different_config_dirs",
+        "not integration",
+    ),
 ]
 
 

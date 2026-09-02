@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import shutil
 import subprocess
 import traceback
 from dataclasses import dataclass, field, replace
@@ -54,7 +53,7 @@ from bakeoff.claude_runner import (
     config_digest,
 )
 from bakeoff.classify import RunSignals, classify_exclusion, classify_failure
-from bakeoff.container import HostSampler, RunContainer
+from bakeoff.container import HostSampler, RunContainer, fresh_tree
 from bakeoff.costs import PRICING_BASIS
 from bakeoff.eventlog import EventLog
 from bakeoff.proxy_callback import (
@@ -1042,15 +1041,22 @@ def execute_run(
     # prior-run lookup is.
     unattributed_before = _unattributed(proxy_wire_dir)
 
-    # Fresh and empty per run: transcript discovery globs this directory and
-    # trusts that whatever it finds belongs to this run.
-    host_config_dir = artifacts_root / "claude-config"
-    shutil.rmtree(host_config_dir, ignore_errors=True)
-    # `exist_ok`, because the line above cannot fail loudly: `ignore_errors`
-    # guarantees a removal that did not work is silent, and the bare `mkdir`
-    # then raised `FileExistsError` on exactly that case -- outside every `try`
-    # in this function, so the run died with no record at all.
-    host_config_dir.mkdir(parents=True, exist_ok=True)
+    # Fresh per run AND a path no container has mounted. This directory is
+    # bind-mounted (`extra_mounts` below), and the rmtree + mkdir it replaces
+    # was the stale-mount defect at a site nothing catches: the Docker VM
+    # serves a replaced host inode from its cache -- measured 2026-09-02,
+    # empty every other container -- and `_assert_repo_mounted` checks
+    # `REPO_MOUNT` and only `REPO_MOUNT`. The agent then writes its transcript
+    # into the cached inode, this directory stays empty, transcript discovery
+    # globs it and finds nothing, and the run parses to zero turns, zero
+    # tokens and zero cost with the tokens already spent.
+    #
+    # It also retires the `exist_ok=True` this line used to need: `rmtree` with
+    # `ignore_errors` could not fail loudly, so a removal that did not work
+    # left the bare `mkdir` raising FileExistsError -- outside every `try` in
+    # this function, so the run died with no record at all. Nothing is removed
+    # now, and a uuid leaf cannot collide.
+    host_config_dir = fresh_tree(artifacts_root / "claude-config")
     # Not ignored, because transcript discovery globs this directory and trusts
     # that whatever it finds belongs to this run. Leftovers mean that trust is
     # misplaced, and a wrong transcript is worse than a missing one.
@@ -1059,7 +1065,7 @@ def execute_run(
         leftover = list(host_config_dir.iterdir())
         if leftover:
             stale_config = (
-                f"config dir not empty after rmtree: {len(leftover)} entry(ies); "
+                f"config dir not empty at allocation: {len(leftover)} entry(ies); "
                 "transcript discovery may find another run's file"
             )
     except OSError as exc:  # noqa: BLE001 - naming it is the point, not raising

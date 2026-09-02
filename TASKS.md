@@ -840,38 +840,6 @@ one ends a multi-day run outright.
   that the `bedrock/` Sonnet arm still reports `client_request` because no openai
   param mapping runs on its path.
 
-- [ ] **A reused host run-tree path is served stale by the Docker VM's mount
-  cache, and it reads as a passing measurement rather than as a failure.**
-  Found while gating a real node task (broadening 7, Task 9). A path the
-  Docker VM does share — `rmtree`'d and re-materialized on the host between
-  containers — is served from a stale cache and comes up **empty** roughly
-  every other time: measured directly, four cycles of `ls /repo` inside a
-  freshly started container gave `[files], [], [files], []`. A vitest task
-  answers an empty tree with `No test files found` at exit 1, the same exit a
-  genuinely failing suite gives, so a shared run-tree path does not make a
-  node gate flaky — it makes it **pass while measuring nothing**. On the
-  offline grader the same emptiness becomes `APPLY_FAILED` → `resolved:
-  False`, an accusation against a submission the model actually produced. The
-  production call sites that reuse a host path this way: `grader.py`'s
-  `grade-tree/<run_id>` (a re-grade reuses it), `oracle.py`'s
-  `oracle-tree/<task_id>`, `grade.py`'s `grade-preflight-tree/<task_id>`, and
-  `run_matrix.py`. The integration test that found this worked around it
-  locally with a uuid per run tree plus a post-container `ls` post-condition
-  (`tests/test_integration_node_task.py`'s `_mounted`). **The post-condition
-  has since landed in production** (broadening 7, Task 10's final review):
-  `RunContainer._assert_repo_mounted` runs at the end of `__enter__` and, when
-  the host `repo_path` is non-empty, execs `find /repo -mindepth 1 -maxdepth 1
-  -print -quit` and raises `ContainerError` naming the bind mount if it comes
-  back empty — force-removing the container first, since `__exit__` is not
-  invoked when `__enter__` raises and a survivor carries `bakeoff.eval_agent`
-  and would flip `contention_flag` on every peer. Pinned by three unit tests
-  against a fake docker client in `test_container.py`.
-
-  **What remains is the cause, not the symptom**: the four call sites above
-  still reuse one host path across containers instead of a uuid per tree, so
-  the post-condition converts a silent wrong measurement into a loud refusal
-  and no further. Give each of them a unique run-tree path.
-
 ---
 
 ## P2 — Derivation gaps (Gate 3; safe to close after collection)
@@ -1517,6 +1485,24 @@ These need a call, not code. Most are cheap to make and expensive to make late.
   (`RunRecord.host` does), so nothing on the line can say the grader's host was
   busier than the gate's. One measurement — preflight's per-run elapsed suite
   time in the evidence — answers both.
+
+- [ ] **`fresh_tree`'s husks are collected under two of six keys, and the empty
+  key directories are never collected.** `container._sweep_stale_trees` runs at
+  the leaf level, so it only ever reaches a husk under a key that is allocated
+  under again: `preflight-tree/<task_id>` and `grade-preflight-tree/<task_id>`
+  are revisited on every invocation and are bounded at one day of crashes; a
+  husk under `grade-tree/<run_id>`, `oracle-tree/<task_id>`, a per-cell
+  `tree/` or a per-run `claude-config/` survives until the operator's `rm
+  -rf`. Bounded by work-done-and-crashed rather than by invocations, which is
+  the acceptable shape, but it is not zero. The key directories themselves are
+  never removed at all — ~960 empty inodes for an 80 × 4 × 3 matrix. Sweeping
+  the key level is **refused**, not deferred: `fresh_tree` opens with
+  `parent.mkdir(parents=True, exist_ok=True)`, which does not refresh an
+  existing directory's mtime, so an age-guarded key sweep would `rmtree` a key
+  a concurrent allocator has just passed through and is about to put a leaf
+  under, whose `mkdir` then raises `FileNotFoundError`. Any fix here needs a
+  different mechanism — a retry around the leaf `mkdir`, or a lock — not a
+  wider sweep. (Round 2 item 3, 2026-09-03.)
 
 ---
 

@@ -76,7 +76,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from bakeoff.container import ContainerError, RunContainer
+from bakeoff.container import ContainerError, RunContainer, fresh_tree
 from bakeoff.grade_schema import (
     CHECK_ORDER,
     CheckResult,
@@ -236,7 +236,15 @@ from bakeoff.tasks import (
 #: re-grade into a fresh `v8` artifacts directory; a verdict changes only for
 #: a task whose f2p or p2p ids fail through `subTest`, which today's corpus
 #: carries as `sqlglot-6927-dremio-trycast`.
-GRADER_VERSION: str = "8"
+#: 8 -> 9 is not a change to what any check asserts. It retires grades that
+#: may carry an `APPLY_FAILED` produced by a stale bind mount rather than by
+#: the submission (round 2 item 3, 2026-09-03): `grade-tree/<run_id>` was one
+#: path per run and was reused across passes, the Docker VM served the second
+#: container the empty directory it had cached, `git apply` failed against
+#: that, and `scripts/grade.py`'s resume key is (run_id, GRADER_VERSION)
+#: ALONE -- so without the bump those lines are never revisited and the
+#: accusation stands permanently in an append-only file.
+GRADER_VERSION: str = "9"
 
 #: Wall clock for the HOST-side gitleaks scan, and for nothing else.
 #: `_ContainerEnv.scan_secrets` shells out to `docker run` rather than through
@@ -1951,7 +1959,10 @@ def grade_run(record: RunRecord, task, image: str, oracle: Oracle | None,
 
     The tree is removed on the way out, including on the failure paths: it
     holds the submission applied on top of the start state, which is a trap
-    for anyone who inspects the cache by hand.
+    for anyone who inspects the cache by hand. That removal is safe only
+    because `fresh_tree` allocated the leaf and will never reissue the name:
+    removing a path a later pass then mounts again is precisely the stale
+    bind mount this call site used to carry.
 
     THE ARTIFACTS DIRECTORY IS PER GRADER VERSION AND IS EMPTIED FIRST, and
     both halves close the same defect the record's `wire_log_gz` was fixed for:
@@ -1991,8 +2002,14 @@ def grade_run(record: RunRecord, task, image: str, oracle: Oracle | None,
 
     artifacts_dir = Path(artifacts_root) / record.run_id / f"v{GRADER_VERSION}"
     shutil.rmtree(artifacts_dir, ignore_errors=True)
-    tree = Path(cache_root) / "grade-tree" / record.run_id
-    shutil.rmtree(tree, ignore_errors=True)
+    # A path no container has mounted, never `run_id` alone: `run_id` is
+    # unique within a collection and not across one, so a second pass mounts a
+    # path an earlier one already did -- and the Docker VM then serves the
+    # stale, EMPTY directory it cached (measured 2026-09-02, `[files], [],
+    # [files], []` over four cycles on one path). `git apply` fails against
+    # that, which is APPLY_FAILED -> `resolved: False`: an accusation that the
+    # model's patch did not work, over an environment difference it never saw.
+    tree = fresh_tree(Path(cache_root) / "grade-tree" / record.run_id)
     start_sha = materialize(task, tree / "repo", Path(cache_root))
     try:
         with RunContainer(image=image, repo_path=str(tree / "repo"),

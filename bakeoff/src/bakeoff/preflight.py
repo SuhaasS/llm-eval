@@ -174,7 +174,20 @@ _PYTEST_ADAPTER = for_framework("pytest")
 #: failure mode this file's module docstring names. A cached v12 PASS on a
 #: pytest task must be re-run under 13 to be believed; a v12 NO-GO is
 #: unaffected (nothing this version adds can turn a NO-GO into a GO).
-PREFLIGHT_VERSION: str = "13"
+#: 13 -> 14 is not a new assertion. It retires cached PASS verdicts observed
+#: through a container this code can no longer interrogate:
+#: `preflight-tree/<task_id>` was one path per task, reused across
+#: invocations, and the Docker VM served the second container the empty
+#: directory it had cached for that mount source (measured 2026-09-02,
+#: `[files], [], [files], []` over four cycles) -- which on a vitest task is
+#: `No test files found` at exit 1, the shape a PASS cannot be told apart
+#: from. The tree is not in the cache key and could not be: the verdict
+#: outlives the artifact it describes, so the version is the only lever that
+#: retires a suspect one. Both caches key through `preflight_cache_key`, so
+#: `preflight.json` (run_matrix) and `preflight-grade.json` (grade.py)
+#: invalidate together -- one offline re-gate per task per driver, no
+#: credentials and no spend.
+PREFLIGHT_VERSION: str = "14"
 
 
 def preflight_cache_key(task, image: str, start_sha: str) -> str:

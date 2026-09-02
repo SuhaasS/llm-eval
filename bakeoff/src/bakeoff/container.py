@@ -22,10 +22,13 @@ git is present.
 from __future__ import annotations
 
 import os
+import shutil
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from math import ceil
+from pathlib import Path
 from typing import Any, Callable
 
 import docker
@@ -33,6 +36,13 @@ import docker
 from bakeoff.schema import HostMetrics
 
 REPO_MOUNT = "/repo"
+
+# How old a leaf under a `fresh_tree` parent has to be before the sweep may
+# take it. A graded record's tree lives minutes and an eval cell's is capped
+# by `wall_clock_timeout_s`, so a day is ~1000x the longest legitimate hold --
+# and the margin is what keeps the sweep from deleting a tree out from under
+# a concurrent `run_matrix` or `grade.py` running against the same cache.
+STALE_TREE_AGE_S = 86_400
 
 # How many times `git add -A` may lose the race against the agent's own
 # atomic writes before the failure is treated as real. Three, with a short
@@ -52,6 +62,91 @@ SNAPSHOT_INDEX = "/tmp/bakeoff-snapshot-index"
 
 class ContainerError(RuntimeError):
     pass
+
+
+def fresh_tree(parent: Path) -> Path:
+    """A host directory under `parent` that NO container has ever mounted.
+
+    The Docker VM caches the directory it serves for a bind-mount source. A
+    host path that is `rmtree`d and re-created underneath that cache is served
+    from it and arrives EMPTY inside the container -- measured 2026-09-02,
+    four cycles on one path gave `[files], [], [files], []`. An empty mount
+    then RESOLVES: an empty `/repo` is `No test files found` at exit 1 under
+    vitest and jest, the same exit a red suite gives, and `git apply` fails,
+    which the grader reads as APPLY_FAILED -> `resolved: False`; an empty
+    CLAUDE_CONFIG_DIR is a run that parses to zero turns, zero tokens and zero
+    cost with the tokens already spent. So the failure is not flakiness, it is
+    a passing measurement of nothing, an accusation against a model, or a lost
+    cell. `RunContainer._assert_repo_mounted` is the post-condition for the
+    `/repo` case; this is the cause, for all of them.
+
+    THE RULE THIS FUNCTION EXISTS TO KEEP: a host path that has been
+    bind-mounted once is never bind-mounted again. Callers may `rmtree` a tree
+    this returned -- that is safe precisely because the allocator will not hand
+    the same name out a second time -- but they may never write into a path
+    they removed.
+
+    The stable key (`run_id`, `task_id`, the cell label, the artifacts root)
+    stays in the path as the PARENT, so an operator can still find a tree by
+    grepping the cache layout; only the leaf is unique. The key-level directory
+    survives cleanup as an empty husk -- see `_sweep_stale_trees` for what that
+    costs and what is and is not collected.
+
+    `uuid4`, not `tempfile.mkdtemp`: mkdtemp hard-codes mode 0o700, and the
+    container runs as uid 1000 while the host directory is owned by the
+    operator, so on a Linux host (no ownership remapping) the mount would be
+    unreadable to the agent. `materialize` creates its trees with the default
+    mode and this stays beside it.
+    """
+    parent = Path(parent)
+    parent.mkdir(parents=True, exist_ok=True)
+    _sweep_stale_trees(parent)
+    tree = parent / uuid.uuid4().hex
+    # `exist_ok=False`, deliberately: a collision here is a bug and has to be
+    # loud. Papering over it by reusing the directory is the defect itself.
+    tree.mkdir()
+    return tree
+
+
+def _sweep_stale_trees(parent: Path, max_age_s: float = STALE_TREE_AGE_S) -> None:
+    """Remove leaves under `parent` that no live process can still be using.
+
+    Husks are the price of `fresh_tree`'s rule: a leaf is removed by the
+    process that allocated it, so a process killed before that leaves one
+    behind, and nothing deletes it later -- deleting it later, BY NAME, is the
+    defect this whole mechanism removes.
+
+    AGE-BASED, never "every sibling". `run_matrix` and `grade.py` run against
+    one cache at the same time on purpose, and deleting a tree out from under
+    a live container is worse than leaking an inode. The leaf's own `st_mtime`
+    is effectively its ALLOCATION time -- everything a run writes goes into a
+    child of it and never touches the leaf's own mtime -- so a 24 h bound is
+    ~1000x the longest legitimate hold (a graded record's tree lives minutes,
+    an eval cell's is capped by `wall_clock_timeout_s`) rather than a bet on
+    what a long run does to its directory.
+
+    LEAF LEVEL ONLY, so this collects a husk only under a key that is
+    allocated under again -- true of `preflight-tree/<task_id>` and
+    `grade-preflight-tree/<task_id>` on every invocation, and not true of a
+    `grade-tree/<run_id>` or a per-cell tree. Sweeping the key level too would
+    collect those, and would `rmtree` a directory a concurrent allocator has
+    just created and is about to put a leaf under, whose `mkdir` then raises
+    `FileNotFoundError`.
+
+    Never raises. A sweep failure must not cost the run it is allocating for
+    -- the rule `HostSampler.start` and `checkpoints.maybe_capture` keep.
+    """
+    cutoff = time.time() - max_age_s
+    try:
+        entries = list(os.scandir(parent))
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            if entry.is_dir() and entry.stat().st_mtime < cutoff:
+                shutil.rmtree(entry.path, ignore_errors=True)
+        except OSError:
+            continue
 
 
 @dataclass(frozen=True)
@@ -152,11 +247,23 @@ class RunContainer:
         host path the VM DOES share, removed and re-materialized underneath it
         between containers, is served from a stale cache and comes up EMPTY:
         measured 2026-09-02, four cycles of rmtree -> materialize -> new
-        container on one path gave `[files], [], [files], []`. Four production
-        call sites reuse a path that way -- `grader.py`'s `grade-tree/<run_id>`
-        on a re-grade, `oracle.py`'s `oracle-tree/<task_id>`, `grade.py`'s
-        `grade-preflight-tree/<task_id>`, and `run_matrix.py` -- so the check
-        belongs at the one place all four go through.
+        container on one path gave `[files], [], [files], []`. Six production
+        call sites reused a path that way until 2026-09-03; each now allocates
+        through `fresh_tree`, so no container mounts a path an earlier one did.
+
+        THE CHECK STAYS, because the cause it caught is one of several. A path
+        the Docker VM does not share at all (`/var/folders`, the `--basetemp`
+        convention) is untouched by that fix; a new call site that builds a
+        path by hand instead of calling `fresh_tree` is not covered by it; and
+        a mount can fail to land for reasons that have nothing to do with the
+        path. This is the post-condition, `fresh_tree` is the cause.
+
+        It covers `REPO_MOUNT` and only `REPO_MOUNT`. The `CLAUDE_CONFIG_DIR`
+        mount is fresh by allocation and has NO mount post-condition of its
+        own: a freshly allocated config directory is supposed to be empty on
+        the host, so there is nothing here for a mount-time check to compare,
+        and `runner.py`'s own read-back answers for the allocator rather than
+        for the mount.
 
         It is here because an empty `/repo` RESOLVES rather than failing. Both
         node frameworks answer it with `No test files found` at exit **1**, the

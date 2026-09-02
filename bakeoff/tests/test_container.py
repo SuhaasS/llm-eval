@@ -1,9 +1,19 @@
+import os
+import shutil
+import stat
 import threading
 import time
 
 import pytest
 
-from bakeoff.container import ContainerError, HostSampler, RunContainer
+import bakeoff.container
+from bakeoff.container import (
+    STALE_TREE_AGE_S,
+    ContainerError,
+    HostSampler,
+    RunContainer,
+    fresh_tree,
+)
 
 integration = pytest.mark.integration
 
@@ -723,3 +733,120 @@ def test_no_container_is_nothing_to_sample_not_a_sampling_failure():
     assert metrics.error == ""
     assert metrics.samples == 0
     assert metrics.contention_flag is None
+
+
+# --- fresh_tree: a host path no container has mounted before ---
+
+
+def test_two_allocations_under_one_parent_are_different_paths(tmp_path):
+    """The Docker VM caches the directory it serves for a bind-mount source,
+    so a second container on one host path is served the cached copy -- EMPTY,
+    measured 2026-09-02 as `[files], [], [files], []` over four cycles. Two
+    allocations under one key must therefore never be one path."""
+    key = tmp_path / "grade-tree" / "run-a"
+    first = fresh_tree(key)
+    second = fresh_tree(key)
+
+    assert first != second
+    assert first.is_dir() and second.is_dir()
+    assert list(first.iterdir()) == []
+    assert list(second.iterdir()) == []
+    # The stable key stays in the path, so an operator can still find a tree
+    # by grepping the cache layout; only the leaf is unique.
+    assert first.parent == second.parent == key
+
+
+def test_an_allocated_tree_is_empty_even_when_a_sibling_holds_content(tmp_path):
+    """`materialize` refuses an existing destination and creates its parent,
+    so allocating the leaf before `materialize(..., leaf / "repo", ...)` is
+    only correct while the leaf itself arrives empty."""
+    key = tmp_path / "preflight-tree" / "click-3360"
+    first = fresh_tree(key)
+    (first / "repo").mkdir()
+    (first / "repo" / "README.md").write_text("x")
+
+    second = fresh_tree(key)
+
+    assert list(second.iterdir()) == []
+    assert (first / "repo" / "README.md").read_text() == "x"
+
+
+def test_a_removed_tree_is_never_handed_out_again(tmp_path):
+    """The rule that makes every caller's `finally: rmtree(tree)` safe: a
+    caller may remove a tree this returned precisely BECAUSE the allocator
+    will not reissue the name. Removing a path that comes back is the defect
+    itself."""
+    key = tmp_path / "grade-tree" / "run-a"
+    removed = fresh_tree(key)
+    shutil.rmtree(removed)
+
+    later = [fresh_tree(key) for _ in range(50)]
+
+    assert removed not in later
+
+
+def test_a_sibling_older_than_a_day_is_swept_and_a_fresh_one_is_not(tmp_path):
+    """The husks a killed process leaves behind are collected by AGE, never by
+    "every sibling": `run_matrix` and `grade.py` run against one cache at the
+    same time on purpose, and deleting a live tree out from under another
+    process is worse than leaking an inode. The recent-sibling half is the
+    load-bearing one."""
+    key = tmp_path / "preflight-tree" / "click-3360"
+    key.mkdir(parents=True)
+    old = key / "an-abandoned-husk"
+    old.mkdir()
+    recent = key / "a-live-tree"
+    recent.mkdir()
+    stale = time.time() - STALE_TREE_AGE_S - 60
+    os.utime(old, (stale, stale))
+
+    allocated = fresh_tree(key)
+
+    assert not old.exists()
+    assert recent.is_dir()
+    assert allocated.is_dir()
+
+
+@pytest.mark.parametrize("failing", ["scandir", "rmtree"])
+def test_a_sweep_that_fails_does_not_cost_the_allocation(
+    tmp_path, monkeypatch, failing
+):
+    """The rule `HostSampler.start` and `checkpoints.maybe_capture` keep: an
+    observation that cannot be made must not cost the work it was observing.
+    A sweep is housekeeping; the allocation is the product."""
+    key = tmp_path / "preflight-tree" / "click-3360"
+    key.mkdir(parents=True)
+    husk = key / "husk"
+    husk.mkdir()
+    stale = time.time() - STALE_TREE_AGE_S - 60
+    os.utime(husk, (stale, stale))
+
+    def _boom(*args, **kwargs):
+        raise OSError("sweep denied")
+
+    if failing == "scandir":
+        monkeypatch.setattr(bakeoff.container.os, "scandir", _boom)
+    else:
+        monkeypatch.setattr(bakeoff.container.shutil, "rmtree", _boom)
+
+    tree = fresh_tree(key)
+
+    assert tree.is_dir()
+    assert list(tree.iterdir()) == []
+
+
+def test_an_allocated_tree_is_not_mkdtemps_owner_only_mode(tmp_path):
+    """`tempfile.mkdtemp` hard-codes 0o700. The container runs as uid 1000 and
+    the host directory is owned by the operator, so on a Linux host (no
+    ownership remapping) that mode makes the bind mount unreadable to the
+    agent -- which is why this allocator is a `mkdir` and not an `mkdtemp`.
+
+    The assertion is relative to the process umask, so it is honest at every
+    umask and red under `mkdtemp` at every umask. Do NOT delete or weaken it:
+    the neighbouring `grader._ContainerEnv.scan_secrets` does use `mkdtemp`
+    (correctly -- gitleaks runs as root in its own container), which makes
+    this the decision a future refactor is most likely to undo."""
+    old = os.umask(0o022)
+    os.umask(old)
+    tree = fresh_tree(tmp_path / "grade-tree" / "run-a")
+    assert stat.S_IMODE(tree.stat().st_mode) == 0o777 & ~old

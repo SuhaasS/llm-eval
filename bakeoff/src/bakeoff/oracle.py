@@ -64,7 +64,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from bakeoff.container import RunContainer
+from bakeoff.container import RunContainer, fresh_tree
 from bakeoff.preflight import (
     _Runner,
     _existing_prefixes,
@@ -279,8 +279,13 @@ def _derive(task, image: str, cache_root: Path) -> tuple[str, ...]:
     paths that leave it behind are exactly the failure paths -- a diff that
     does not apply, a refused exit code, a red-in-both refusal.
     """
-    tree = Path(cache_root) / "oracle-tree" / task.task_id
-    shutil.rmtree(tree, ignore_errors=True)
+    # A path no container has mounted, never `task_id` alone. The Docker VM
+    # caches the directory it serves for a bind-mount source, so a second
+    # derivation on one path is served the cached, EMPTY copy (measured
+    # 2026-09-02, `[files], [], [files], []` over four cycles) -- and against
+    # an empty tree the reference fix does not apply, so `_derive` raises and
+    # a sound task becomes ungradable. Loud, but for the wrong reason.
+    tree = fresh_tree(Path(cache_root) / "oracle-tree" / task.task_id)
     start_sha = materialize(task, tree / "repo", cache_root)
 
     try:

@@ -16,6 +16,7 @@ there -- `resolve_tasks` is still the caller they describe.
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -328,3 +329,147 @@ def test_a_node_task_is_built_against_the_node_base(monkeypatch, tmp_path):
     )
 
     assert seen == {"py": "sha256:BPY", "js": "sha256:BNODE"}
+
+
+# --- round 2 item 3: a unique host path per bind-mounted tree ---------------
+
+
+class _ResolvableTask(_PyTask):
+    """`_PyTask` plus the fields `resolve_tasks` reads once the entrypoint
+    check lets it through -- the existing base-selection tests all stop at
+    that `continue`, so none of them reach the tree at all."""
+
+    def __init__(self, task_id="t", python="3.12"):
+        super().__init__(task_id, python)
+        self.base_sha = "b" * 40
+        self.declared_start_sha = "s" * 40
+        self.manifest_digest = "digest"
+        self.task_version = 1
+
+
+def _stub_resolve_tasks(monkeypatch, rm, on_preflight):
+    monkeypatch.setattr(rm, "build_task_image", lambda *a, **k: "sha256:img")
+    monkeypatch.setattr(rm, "image_entrypoint", lambda image: [])
+    monkeypatch.setattr(rm, "materialize", lambda *a, **k: "s" * 40)
+    monkeypatch.setattr(rm, "write_json", lambda *a, **k: None)
+    monkeypatch.setattr(rm, "preflight", on_preflight)
+
+
+def _preflight_result(task, kw, problems=()):
+    from bakeoff.preflight import PreflightResult
+
+    return PreflightResult(
+        task_id=task.task_id, task_version=task.task_version,
+        start_sha=kw["start_sha"], image=kw["image"],
+        manifest_digest=task.manifest_digest,
+        problems=problems,
+        preflight_version=PREFLIGHT_VERSION,
+    )
+
+
+def test_two_preflights_of_one_task_mount_different_host_paths(
+    tmp_path, monkeypatch
+):
+    """The site the probe measured. `preflight-tree/<task_id>` was one stable
+    path per task, `rmtree`'d at the TOP of the next invocation -- and the
+    Docker VM serves a replaced host inode from its cache, so the second
+    container saw an EMPTY `/repo` (measured 2026-09-02, `[files], [],
+    [files], []` over four cycles). On a vitest task that is `No test files
+    found` at exit 1: the gate PASSES while measuring nothing."""
+    import scripts.run_matrix as rm
+
+    mounted: list[str] = []
+
+    def _recording(task, **kw):
+        mounted.append(str(kw["repo_path"]))
+        return _preflight_result(task, kw)
+
+    _stub_resolve_tasks(monkeypatch, rm, _recording)
+    task = _ResolvableTask()
+    for _ in range(2):
+        rm.resolve_tasks([task], {("python", "3.12"): "sha256:B"},
+                         "2.1.220", tmp_path, force=True)
+
+    assert mounted[0] != mounted[1]
+    assert all(task.task_id in p for p in mounted)
+
+
+@pytest.mark.parametrize("problems", [(), ("f2p green at start",)])
+def test_the_preflight_tree_does_not_outlive_the_resolution(
+    tmp_path, monkeypatch, problems
+):
+    """The tree was left behind on purpose and removed by the NEXT
+    invocation, which is the stale mount written out. It now dies with the
+    resolution -- on the NO-GO path too, which is the one that `continue`s
+    past every line a cleanup could have sat on."""
+    import scripts.run_matrix as rm
+
+    _stub_resolve_tasks(
+        monkeypatch, rm,
+        lambda task, **kw: _preflight_result(task, kw, problems=problems),
+    )
+    task = _ResolvableTask()
+    rm.resolve_tasks([task], {("python", "3.12"): "sha256:B"},
+                     "2.1.220", tmp_path, force=True)
+
+    assert list((tmp_path / "preflight-tree" / task.task_id).iterdir()) == []
+
+
+def test_two_runs_of_one_cell_mount_different_host_paths(tmp_path, monkeypatch):
+    """A run-level retry, or two invocations sharing a one-second stamp, put
+    two containers on one cell's run tree. `materialize` refuses an existing
+    destination, so today that is loud -- but the leaf is what keeps it from
+    becoming the stale mount the moment the retry lands, and it is also what
+    makes `--keep` a path a reader can trust to be this run's."""
+    from types import SimpleNamespace
+
+    import bakeoff.proxy_callback
+    import bakeoff.runner
+    import scripts.run_matrix as rm
+
+    dests: list[str] = []
+
+    def _fake_materialize(task, dest, cache):
+        dests.append(str(dest))
+        return "s" * 40
+
+    def _stub_record():
+        return SimpleNamespace(artifacts=SimpleNamespace(container_stdout=""))
+
+    monkeypatch.setattr(rm, "materialize", _fake_materialize)
+    monkeypatch.setattr(rm, "to_task_spec", lambda *a, **k: object())
+    monkeypatch.setattr(rm, "write_json", lambda *a, **k: None)
+    monkeypatch.setattr(bakeoff.runner, "execute_run",
+                        lambda **kw: _stub_record())
+    monkeypatch.setattr(bakeoff.proxy_callback, "unattributed_count",
+                        lambda d: 0)
+
+    cell = SimpleNamespace(task_id="t", model="sonnet", sample_index=0,
+                           label="t/sonnet/0")
+    task = SimpleNamespace(
+        budget=SimpleNamespace(max_turns=5, wall_clock_timeout_s=60))
+    resolved = {"start_sha": "s" * 40, "image": "sha256:img"}
+    artifacts = tmp_path / "artifacts"
+
+    def _run(keep):
+        return rm.run_cell(
+            cell, task, resolved, SimpleNamespace(keep=keep), None,
+            tmp_path / "wire", None, artifacts, "collection", "stamp",
+        )
+
+    _, _, _, first_kept = _run(False)
+    _, _, _, second_kept = _run(False)
+
+    assert dests[0] != dests[1]
+    assert first_kept is None and second_kept is None
+    # Neither leaf outlives its run: the whole allocation goes, not just
+    # `repo`, and that is safe because the name is never reissued.
+    run_root = artifacts / "t-sonnet-0"
+    assert list((run_root / "tree").iterdir()) == []
+
+    _, _, _, kept = _run(True)
+    assert kept == dests[2]
+    # The leaf survives (the stubbed `materialize` never creates `repo`
+    # itself), and the returned path is what `main` writes into the row.
+    assert Path(kept).parent.is_dir()
+    assert list((run_root / "tree").iterdir()) == [Path(kept).parent]

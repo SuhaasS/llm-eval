@@ -1230,10 +1230,17 @@ def test_the_grader_version_moved_with_what_check_5_means():
     learning `SUBFAILED` (fix 3, 2026-09-02), which changes the stored
     `f2p_failed_node_ids`/`p2p_failed_node_ids` evidence on a `subTest`-only
     failure and, through the oracle's quarantine, can change check 6's
-    verdict on a task whose p2p flake takes that shape."""
+    verdict on a task whose p2p flake takes that shape.
+
+    `8 -> 9` is not a change to what any check asserts. It retires grades that
+    may carry an `APPLY_FAILED` produced by a stale bind mount rather than by
+    the submission (round 2 item 3, 2026-09-03): `grade-tree/<run_id>` was
+    reused across passes, the Docker VM served the cached empty directory, and
+    `scripts/grade.py`'s resume key is `(run_id, GRADER_VERSION)` alone, so
+    without the bump those lines are never revisited."""
     from bakeoff.grader import GRADER_VERSION
 
-    assert GRADER_VERSION == "8"
+    assert GRADER_VERSION == "9"
 
 
 def test_the_grade_says_which_runner_produced_its_numbers():
@@ -2355,3 +2362,46 @@ def test_a_node_f2p_id_that_DID_run_and_failed_is_still_the_models_failure():
     assert state.not_graded_reason is None
     assert state.grade_failure == "f2p_failed"
     assert state.f2p_failed_node_ids == ("tests/a.test.js::does a thing",)
+
+
+def test_two_grades_of_one_run_mount_different_host_paths(monkeypatch, tmp_path):
+    """A re-grade -- or a second event log carrying the same `run_id`, which
+    is 5 of the 7 stored ones -- used to mount `grade-tree/<run_id>` a second
+    time. The Docker VM serves that from its cache, EMPTY (measured
+    2026-09-02), and an empty tree makes `git apply` fail: APPLY_FAILED ->
+    `resolved: False`, against a submission the model really produced."""
+    import bakeoff.grader as grader
+
+    mounted: list[str] = []
+
+    class FakeContainer:
+        def __init__(self, **kw):
+            mounted.append(kw["repo_path"])
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def exec(self, argv, env=None):
+            return SimpleNamespace(exit_code=0, stdout="", stderr="")
+
+    monkeypatch.setattr(grader, "materialize", lambda *a, **kw: START_SHA)
+    monkeypatch.setattr(grader, "RunContainer", FakeContainer)
+    monkeypatch.setattr(grader, "run_ladder",
+                        lambda *a, **kw: _ladder_result())
+
+    record = _record()
+    cache = tmp_path / "cache"
+    for _ in range(2):
+        grade_run(record, _task(), "sha256:image", _oracle(),
+                  cache, tmp_path / "art")
+
+    assert len(mounted) == 2
+    assert mounted[0] != mounted[1]
+    assert all(p.endswith("/repo") for p in mounted)
+    # The stable key stays in the path, so a tree is still findable by run_id.
+    assert all(record.run_id in p for p in mounted)
+    # And the `finally` still fires: no leaf outlives its grade.
+    assert not list((cache / "grade-tree" / record.run_id).iterdir())

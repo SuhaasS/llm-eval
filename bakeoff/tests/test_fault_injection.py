@@ -2215,3 +2215,21 @@ def test_invocation_stamp_is_threaded_through_execute_run(task, tmp_path, monkey
     )
     assert record.collection_id == "coll-1"
     assert record.invocation_stamp == "inv-9"
+
+
+def test_two_runs_under_one_artifacts_root_get_different_config_dirs(
+    task, tmp_path, monkeypatch
+):
+    """The run-level-retry shape at the one mounted path nothing checks.
+    `CLAUDE_CONFIG_DIR` was `artifacts_root/claude-config`, rmtree'd and
+    re-created per run -- and the Docker VM serves a replaced host inode from
+    its cache (measured 2026-09-02, empty every other container). Unlike
+    `/repo` there is no `_assert_repo_mounted` behind it: the agent writes its
+    transcript into the cached inode, this directory stays empty, transcript
+    discovery globs it and finds nothing, and the run is recorded with zero
+    turns, zero tokens and zero cost after the tokens are spent."""
+    log = EventLog(tmp_path / "log")
+    _fake_run(monkeypatch, task, tmp_path, event_log=log, sample_index=0)
+    _fake_run(monkeypatch, task, tmp_path, event_log=log, sample_index=1)
+
+    assert len(list((tmp_path / "artifacts" / "claude-config").iterdir())) == 2
