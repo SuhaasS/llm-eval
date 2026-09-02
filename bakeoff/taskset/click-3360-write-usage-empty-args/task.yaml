@@ -98,6 +98,38 @@ tests:
   # lands in the fix half exactly as before.
   allow_extra_paths: ["CHANGES.rst"]
 
+# strip_paths: NOT USED by this task -- pallets/click carries no agent file
+# and no vendored tree at this base_sha. Shown because this manifest is the
+# documentation for the key.
+#
+# Top-level, beside gitignore_extra, because like gitignore_extra it is a
+# modification the harness makes rather than a statement about upstream --
+# `repo:` holds only what can be checked against GitHub. The listed paths are
+# removed from the index AND the worktree in the same fixed-identity setup
+# commit that applies the test half, so declaring one MOVES start_sha (re-pin
+# it, and bump task_version).
+#
+#   strip_paths: ["CLAUDE.md", "AGENTS.md", ".claude"]
+#
+# Files or directories, matched by path component (".claude" covers
+# ".claude/settings.json" and not ".claudeignore"). Refused at load: an
+# absolute path, "..", a glob, "." and ".git". Refused when the start state is
+# built: a path no TRACKED file is at or under -- a typo strips nothing, and
+# nothing downstream would say so. That also means a file the PR creates
+# cannot be stripped, since it is not there at base_sha to remove.
+#
+# A path the reference diff also touches must be listed in
+# tests.allow_extra_paths as well, which keeps it out of both halves. Strip
+# does not imply exclusion: silently dropping the chunk would make
+# solution_diff something other than the merged PR.
+#
+# Symlinks: list the link AND its target. Stripping only the target leaves a
+# dangling link the agent still sees; preflight's strip probe is `-e` or `-L`,
+# so that is a NO-GO rather than a silent confound.
+#
+# Section 6.4 confound, to be recorded here by any task that uses it: the
+# humans who wrote the PR had the stripped file.
+
 image:
   # `less` is a TEST dependency of this repository and the base image ships no
   # pager. tests/test_utils.py parametrizes `test_echo_via_pager` over

@@ -228,7 +228,8 @@ What you are looking for, and what each answer disqualifies:
 | needs a git submodule | **excluded.** The build context is `git archive base_sha`, which drops submodules; the directory arrives empty |
 | `setuptools_scm` refuses to detect a version | needs a pretend-version in `build:`. `hatch-vcs` does not care |
 | hypothesis / property-based suite | **excluded.** A property suite can pass a wrong fix on a lucky draw and fail a right one on an unlucky seed |
-| `CLAUDE.md`, `AGENTS.md`, `.claude/` or `.cursorrules` present | either pick a `base_sha` predating them, or exclude the repo. A task-local agent file gives that task a context no other task has |
+| `CLAUDE.md`, `AGENTS.md`, `.claude/` or `.cursorrules` present | declare them in `strip_paths` and they are removed in the setup commit — or pick a `base_sha` predating them. List symlinks *and* their targets: if `CLAUDE.md` links to `AGENTS.md`, list both |
+| committed venv or vendored tree at `base_sha` | `strip_paths` can remove it, but judge by size — 2,902 `site-packages` files is a different repository from the one the PR was merged into, and a later `base_sha` is cheaper |
 
 Then filter for supply: merged PRs that close an issue and carry both a test and
 a fix. Repos with hundreds of those are worth the setup cost; repos with three
@@ -415,6 +416,14 @@ Three keys that bite:
 suite drops files into the tree; it is applied in the setup commit and is
 therefore visible in `start_sha`.
 
+`strip_paths` is a **top-level** key too. It lists paths removed from the start
+state — agent files, a small vendored tree — in the same setup commit, so it is
+visible in `start_sha`. Declaring one moves `start_sha`: re-pin it and bump
+`task_version`. Each entry must match a file **tracked at `base_sha`** (a typo
+that strips nothing is refused, and a file the PR *creates* cannot be
+stripped), and a path the reference diff also touches has to be in
+`tests.allow_extra_paths` as well, or the load is refused.
+
 ### 3.6 Run the gate
 
 ```bash
@@ -463,6 +472,9 @@ capability.
 | p2p not green at the start state | a regression check against an already-red suite means nothing. Usually a missing dependency |
 | tree dirty after the suite | add `gitignore_extra` |
 | `CLAUDE.md` / `AGENTS.md` / `.claude` / `.cursorrules` in the start state | pick a `base_sha` predating them, or drop the repo |
+| `strip_paths` names X, which no tracked file is at or under | a typo, or a path the PR creates rather than one that exists at `base_sha`. The check exists because a strip that removes nothing is otherwise invisible |
+| `strip_paths` removes X, which the reference diff's test/solution half also changes | add X to `tests.allow_extra_paths`, or narrow the strip |
+| the start state still carries X, which `strip_paths` says it removed | the preflight tree is stale, or a build step re-created it, or X is a symlink whose target was stripped and the link was not. Re-run with `--force-preflight` |
 | image declares an `ENTRYPOINT` | the container's `sleep infinity` becomes an argument to it and the container exits immediately. Use a base without one |
 | the solution half does not apply | the reference was cut against the wrong base |
 | `tests.runner` does not contain `pytest` | the red/green distinction is built on pytest's exit codes and nothing else currently supplies it |

@@ -35,6 +35,9 @@ Runs before anything builds.
 | `reference.diff` begins with `diff --git`, with nothing before it | a reference that is not exactly a diff is a reference nobody can reproduce |
 | both halves are non-empty after the split | no oracle for the agent to run, or no reference fix to validate against |
 | no rename crosses the test/solution boundary | the file would be simultaneously the agent's oracle and part of its submission, and guessing puts one inside the other |
+| `strip_paths` entries are relative, `..`-free, glob-free, and are neither `.` nor `.git` | the key removes what it names: `.` matches every path (`PurePosixPath(".").parts` is `()`), `.git` would destroy the repository the submission diff is taken against, and a glob would make what is removed a property of the tree rather than of the manifest |
+| no test-half or solution-half file lies under a `strip_paths` prefix | the patch would be applied onto a path that no longer exists — and dropping the chunk instead would make `solution_diff` something other than the merged PR, or shrink the oracle, with every gate still green |
+| every `strip_paths` entry matches a file TRACKED at `base_sha` (checked in `materialize`) | a typo strips nothing and leaves the file the task was cut to remove; the preflight context-file check knows four names, so a mistyped vendored tree passes every gate. It also means a strip cannot name a file the PR *creates* |
 | `task_id` is unique in the set | `run_id` is `sha256(task|model|sample|attempt)`, so two tasks sharing an id collide in the event log — discovered at the far end of a matrix, after the tokens are spent |
 
 ### Preflight — `src/bakeoff/preflight.py`
@@ -50,6 +53,11 @@ Runs inside the pinned image, before the proxy starts.
   state.** §5.2 pins the session config precisely because agent files
   substantially change behaviour; a task-local one gives this task a context
   the others do not have.
+- **Every `strip_paths` entry is absent from the start state.** Checked in the
+  container against the tree, not against the manifest: a strip that silently
+  did not happen puts the file in every arm's context and in every submission
+  diff, and no later stage re-derives it. The probe is `-e` **or** `-L`, so a
+  symlink whose target was stripped still counts as present.
 - f2p exits **1** at the start state — not `0` (already solved), not `2`/`4`/`5`
   (broken environment) — and every declared f2p id appears in pytest's
   FAILED/ERROR lines. Both halves matter: `returncode != 0` accepts a broken
@@ -176,19 +184,44 @@ is *already in* the tree, and the difference is where this section lives.
   both floors *once per repository* (agent files, vendored trees) and screen
   candidates against the later of the two before reading a single diff.
 
-- **Removing an offending path from `base_sha` is legitimate, and it is a
-  modification that has to be recorded.** A one-commit strip with a fixed
-  author, email and date keeps the sha reproducible, and a reference cut
-  against the true `merge_commit^1` still applies as long as the strip touches
-  nothing the PR touches — check with `git apply --check`. Where the PR *does*
-  touch a stripped path, `allow_extra_paths` excludes it from both halves so
-  nothing tries to apply it. Record it under `provenance` (`base_modified`), or
-  a reader diffing `base_sha` against the upstream repository will not find it
-  there.
+- **Removing an offending path is legitimate, and `strip_paths` is how it is
+  recorded.** List the paths in the manifest's top-level `strip_paths` and they
+  are removed — from the index and the worktree — inside the same
+  fixed-identity setup commit that applies the test half and `gitignore_extra`.
+  So the modification is in `manifest_digest` and in `start_sha`, and a reader
+  who cannot find it upstream can find it in the manifest. Nothing has to be
+  hand-rewritten and `base_sha` stays the true `merge_commit^1`, which is what
+  keeps the reference applying.
+
+  A hand-rewritten `base_sha` — a one-commit strip pushed to a fork — is still
+  legitimate for anything `strip_paths` cannot express, and still has to be
+  recorded under `provenance` (`base_modified`). For a `strip_paths` strip the
+  manifest key *is* the record; a duplicate `provenance` note is not required.
+
+  **The path has to be TRACKED at `base_sha`.** A strip that matches no
+  tracked file is refused when the start state is built, on purpose — a typo
+  that strips nothing is the failure this key exists to prevent. One
+  consequence to plan around: `allow_extra_paths` legitimately names a file the
+  PR *creates*, and such a file cannot also be stripped, because it is not
+  there to remove.
+
+  **Where the reference diff touches a stripped path, the load is refused**
+  until that path is also in `tests.allow_extra_paths`, which excludes it from
+  both halves. Strip does not imply exclusion: dropping a chunk because its
+  path is stripped would make `solution_diff` something other than the merged
+  PR, and the case that survives every gate is a reference that is no longer
+  one.
 
   Judge the strip by size. Six agent-file paths is bookkeeping; 2,902 venv
   files is a different repository from the one the PR was merged into, and the
   cheaper answer is a later `base_sha`.
+
+  **The confound, and it has to be recorded per task (§6.4):** the humans who
+  wrote the PR had that file. A repository whose `CLAUDE.md` shaped how its
+  contributors worked is not quite the repository the models are handed once it
+  is stripped, and a stripped vendored tree may be what an import in the fix
+  actually resolved against. Name the stripped paths and this caveat in the
+  manifest's comments, next to the key.
 
 ### The prompt
 
@@ -308,6 +341,14 @@ remains the richest source by an order of magnitude. A SQL transpiler is also
 close to the ideal bug shape: input SQL, exact expected output, tests that
 assert rendered strings rather than internal names.
 
+`strip_paths: ["CLAUDE.md", "AGENTS.md"]` lifts that floor — both are agent
+files and neither is touched by a bug-fix PR — which reopens the 116
+post-cutoff candidates. List **both** names: `CLAUDE.md` is a symlink to
+`AGENTS.md` there, and stripping only the target leaves a dangling link that an
+agent's `ls` still shows. Preflight catches that (its strip probe is `-e` or
+`-L`), so the mistake is a NO-GO rather than a silent confound — but it is
+cheaper to list both than to iterate on the gate.
+
 ### Excluded
 
 | repo | why |
@@ -335,8 +376,8 @@ green-after check is what proves that, per task.
 
 | floor | cause | effect |
 |---|---|---|
-| 2026-03-31 | `.claude/` added (6 files) | every candidate needs a one-commit strip; no test+fix commit predates it |
-| **2026-07-02** | `#4` untracked a committed venv | anything earlier carries 2,902 `site-packages` files |
+| 2026-03-31 | `.claude/` added (6 files) | liftable: `strip_paths: [".claude"]` — six paths is bookkeeping, and the §6.4 confound goes in the manifest |
+| **2026-07-02** | `#4` untracked a committed venv | `strip_paths` can express it, but 2,902 `site-packages` files is a different repository from the one the PR was merged into. Prefer a later `base_sha` |
 
 **Five candidate PRs, two tasks.** The rejections are each a different rule and
 are worth reading as a worked example of Layer 2:
@@ -366,6 +407,10 @@ repository carries no licence, so `provenance.license` is `null` on both.
 2. `base_sha` is `git rev-parse <merge_commit>^1`. Check what is tracked there
    before going further — a committed venv or vendored tree makes every
    submission diff a diff of that tree, and preflight will not tell you.
+
+   An agent file or a small vendored tree there is not disqualifying: list it
+   in `strip_paths` and it is removed in the setup commit. A large one is —
+   see "The start state" above for where that line falls.
 3. Cut the reference with the flags pinned, and store it verbatim:
 
    ```bash

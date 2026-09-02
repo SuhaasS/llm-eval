@@ -24,8 +24,9 @@ Three things are load-bearing and are argued where they happen:
   capability figure, arriving through the dataset instead of the image.
 
   That commit is deterministic. Fixed author, committer, date and message, so
-  its SHA is a pure function of (base_sha, strip_paths, test half, gitignore_extra) and
-  section 5.1's byte-identical world stays checkable rather than asserted.
+  its SHA is a pure function of (base_sha, strip_paths, test half,
+  gitignore_extra) and section 5.1's byte-identical world stays checkable
+  rather than asserted.
   `start_sha` in the manifest is optional and, when present, verified: a
   re-cut patch or an edited manifest that moves the start state is exactly
   what it catches.
@@ -1555,7 +1556,7 @@ def materialize(task: TaskManifest, dest: Path, cache_root: Path) -> str:
     `.git/logs/HEAD`, which now carries the cache layout and `base_sha`.
 
     `strip_paths` is applied first and lands in the same setup commit, so the
-    commit's SHA stays a pure function of (base_sha, strip, test half,
+    commit's SHA stays a pure function of (base_sha, strip_paths, test half,
     gitignore_extra) and `start_sha` remains pinnable. A strip that did not
     move `start_sha` would be a change to what every arm was asked to do that
     no stored record could distinguish.

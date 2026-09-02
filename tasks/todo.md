@@ -2508,3 +2508,69 @@ paths against a faked `_run_codex`, and the supersession rules against
 hand-built judgment lines. Whether a real pass reproduces the two-block split
 F2 fixed, and whether a real codex reply exercises the extractor's rescan, are
 still live-run questions.
+
+## Broadening 1 — `strip_paths` — 2026-09-01
+
+The corpus's binding constraint was not the loader's strictness but a *date*:
+most public repositories added `CLAUDE.md` or `AGENTS.md` at some point, and
+every candidate PR after that commit was out. sqlglot — the richest source by
+an order of magnitude — lost 116 candidates to a file no bug-fix PR touches.
+`strip_paths` removes the named paths in the same fixed-identity setup commit
+that already applies the test half and `gitignore_extra`, so the modification
+lands in `manifest_digest` and in `start_sha` instead of in a hand-rewritten
+history nobody can find upstream.
+
+Five decisions worth keeping:
+
+- **Strip does not imply exclusion from the reference halves.** The tempting
+  shape is for a stripped path to be dropped from `solution_diff`
+  automatically. That makes the reference stop being the merged PR verbatim,
+  and preflight only notices when the missing hunk happens to be one the f2p
+  tests need — so the case that survives every gate is a reference that is no
+  longer a reference. `allow_extra_paths` already means "neither half" and
+  already leaves the file named in `extra_files`, so requiring it keeps the
+  combination visible.
+- **A path matching nothing raises, in `materialize`.** Not at load — the
+  loader never sees the tree. Not in preflight — verdicts there are cached, and
+  the code that would silently do nothing is `materialize`. `--ignore-unmatch`
+  is what a typo needs to become permanent: preflight's `_CONTEXT_FILES` check
+  knows four names, so a mistyped vendored tree would pass every gate into an
+  append-only log. The cost is a constraint task authors have to know: a strip
+  only applies to a path tracked at `base_sha`, so a file the PR *creates*
+  cannot be stripped even when `allow_extra_paths` legitimately names it.
+- **The existence check reads `git ls-files`'s output, not its exit code.**
+  Measured: `git ls-files -z -- nope` exits **0** with an empty stdout. Same
+  silent zero `container._checked_exec` exists to refuse.
+- **The strip probe is `-e` OR `-L`; the context-file probe stays `-e`.**
+  Measured: for a symlink whose target is gone, `[ -e x ]` exits 1 and
+  `[ -L x ]` exits 0. sqlglot's `CLAUDE.md` is a symlink to `AGENTS.md`, so
+  stripping the target alone leaves a path the agent's `ls` shows and an
+  `-e`-only assertion calls removed. The two callers want opposite answers on
+  that input, which is why the predicate takes a flag rather than picking one.
+- **The build context is stripped too.** For agent files it does not matter —
+  the bind mount replaces `/repo`. For a committed venv it does: the tree is on
+  the import path when `image.build` runs `pip install -e .`, so the image
+  pins an environment resolved against a directory the run tree does not have.
+
+Two things the validation had to add beyond `_validate_prefixes`, both because
+this key's effect is a delete rather than a classification: `.` passes every
+existing check and names the whole tree (`PurePosixPath(".").parts` is `()`,
+and `is_relative_to(".")` is True for everything), and `git rm` reads
+pathspecs, so an unrefused `*` would make what is removed a property of the
+tree rather than of the manifest.
+
+Both one-line **call sites** are pinned by default-suite tests rather than by
+mutation anchors, and that was round 1 of the plan review's finding: helper
+tests leave `build_task_image`'s call and `preflight`'s assertion deletable
+with the suite green, and an integration-only pin is deselected by
+`addopts = "-m 'not integration'"` on the run anyone actually makes.
+
+`PREFLIGHT_VERSION` 2 → 3, and the grader's prose reference to version 2 became
+"2 or later". `SCHEMA_VERSION` did not move: nothing new is written into a
+record, and the strip is already visible there as the start sha `to_task_spec`
+carries in `base_sha`.
+
+Confound recorded in HARVESTING.md rather than in code: the humans who wrote
+the PR had the stripped file. A repository whose `CLAUDE.md` shaped how its
+contributors worked is not quite the repository the models are handed once it
+is gone, and that belongs in each manifest's comments as a §6.4 caveat.
