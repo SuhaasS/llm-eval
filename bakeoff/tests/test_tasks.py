@@ -2538,6 +2538,30 @@ def test_a_strip_path_covering_a_submodule_is_refused(tmp_path,
         tasks.derive_submodules(task, mirror)
 
 
+def test_a_strip_path_covering_a_submodule_from_above_is_refused(
+        tmp_path, upstream_submodule, local_urls):
+    """The ANCESTOR direction, which the neighbour above cannot cover.
+
+    `strip_paths: ["vendor"]` with the gitlink at `vendor/libdep` is not AT or
+    UNDER the submodule, it CONTAINS it, so the descendant test stays green
+    with this half of the refusal deleted. Measured 2026-09-01: accepted, the
+    strip's `git rm -r` removes the gitlink, `git submodule update --init`
+    then writes nothing, and the next command in `_init_submodules` runs with
+    `cwd=<dest>/vendor/libdep` -- a bare `FileNotFoundError` out of
+    `subprocess.run`, with no task_id in it, hours into a matrix, wearing the
+    costume of a harness crash rather than a manifest the loader could have
+    refused in milliseconds.
+    """
+    up = upstream_submodule
+    task = _sub_task(tmp_path, up, extra_yaml='strip_paths: ["vendor"]')
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
+
+    with pytest.raises(TaskError, match="above or below") as excinfo:
+        tasks.derive_submodules(task, mirror)
+
+    assert "vendor/libdep" in str(excinfo.value)
+
+
 def test_a_reference_diff_touching_a_submodule_path_is_refused(
         tmp_path, upstream_submodule, local_urls):
     """Measured 2026-09-01: `git apply` WITHOUT `--index` applies such a patch
@@ -2746,11 +2770,19 @@ def test_a_submodule_the_update_left_unpopulated_is_refused(
     empty submodule directory leaves `git status --porcelain` clean and reads
     downstream as a suite that cannot import.
 
-    The sha comparison is what catches it, and the emptiness check never runs.
-    Measured 2026-09-01: `git -C vendor/libdep rev-parse HEAD` inside an EMPTY
-    gitlink directory succeeds and answers with the SUPERPROJECT's HEAD --
-    git walks up to the enclosing repository. So `head.returncode != 0` alone
-    would pass here; comparing against `sub.sha` is the load-bearing half.
+    The EXISTENCE-AND-NON-EMPTY half is what catches it, and that is a
+    correction: this half used to sit last and the sha comparison answered
+    first. It moved above `remote remove`/`reflog expire` because both of
+    those take `dest/sub.path` as their working directory, and
+    `subprocess.run` against a cwd that does not exist raises
+    `FileNotFoundError` -- a bare OSError naming a path, with no task_id, in
+    place of the TaskError this raises.
+
+    The sha comparison did not become redundant, and its own reason is pinned
+    by the neighbour below rather than here. Measured 2026-09-01: `git -C
+    vendor/libdep rev-parse HEAD` inside an EMPTY gitlink directory SUCCEEDS
+    and answers with the SUPERPROJECT's HEAD -- git walks up to the enclosing
+    repository -- so `head.returncode != 0` alone never fires.
     """
     up = upstream_submodule
     real_git = tasks._git
@@ -2761,6 +2793,42 @@ def test_a_submodule_the_update_left_unpopulated_is_refused(
         return real_git(*args, **kwargs)
 
     monkeypatch.setattr(tasks, "_git", a_git_whose_update_does_nothing)
+
+    with pytest.raises(TaskError, match="missing or empty") as excinfo:
+        _materialize_sub(tmp_path, up)
+    assert "vendor/libdep" in str(excinfo.value)
+
+
+def test_a_submodule_left_at_the_wrong_commit_is_refused(
+        tmp_path, upstream_submodule, local_urls, monkeypatch):
+    """What the sha comparison alone can catch, now that the emptiness check
+    runs before it.
+
+    A submodule that is POPULATED but not at its gitlink passes the existence
+    and non-empty guard and passes `rev-parse HEAD` exit 0; only comparing
+    against `sub.sha` says anything is wrong. It is the `+` marker preflight
+    reports one layer down, and it is worse than empty in one respect -- the
+    suite imports SOMETHING, so it collects and then passes or fails for
+    reasons that are not the model's.
+
+    Scripted by moving the submodule's HEAD off the gitlink after the real
+    update has populated it -- an empty commit, so the WORKING TREE is
+    byte-identical to the healthy case and only HEAD differs. That is what
+    makes this the sha comparison's own test: nothing about the directory's
+    contents can distinguish it.
+    """
+    up = upstream_submodule
+    real_git = tasks._git
+
+    def a_git_that_moves_the_submodule_head(*args, **kwargs):
+        result = real_git(*args, **kwargs)
+        if "submodule" in args and "update" in args:
+            real_git("-c", "user.email=t@t.test", "-c", "user.name=t",
+                     "commit", "-q", "--allow-empty", "-m", "drift",
+                     cwd=kwargs["cwd"] / "vendor" / "libdep")
+        return result
+
+    monkeypatch.setattr(tasks, "_git", a_git_that_moves_the_submodule_head)
 
     with pytest.raises(TaskError, match="not at its gitlink") as excinfo:
         _materialize_sub(tmp_path, up)

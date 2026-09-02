@@ -95,7 +95,17 @@ from bakeoff.runners.pytest_adapter import (  # noqa: F401
 #: are populated -- and `git status --porcelain` reports a superproject whose
 #: submodule directory is empty as CLEAN, so no other assertion in this file
 #: can see it either.
-PREFLIGHT_VERSION: str = "8"
+#: 9 changes what 8's submodule assertions ASSERT, which is why an additive-
+#: looking round still moves the key. Three ways a verdict cached under 8 is
+#: not the verdict this gate would give: the status-to-gitlink match became
+#: boundary-anchored, so a tree carrying sibling paths (`vendor/lib` beside
+#: `vendor/libdep`) could file an entry under the wrong path and flip GO/NO-GO
+#: under the old `startswith`; the reverse cross-check now reports an index
+#: gitlink no `git submodule status` line named, which 8 recorded as a
+#: positive empty list; and the orphan read moved to `--get-regexp -z`, so a
+#: submodule whose NAME contains a space is no longer reported as an orphan
+#: under a path that is not a path.
+PREFLIGHT_VERSION: str = "9"
 
 
 def preflight_cache_key(task, image: str, start_sha: str) -> str:
@@ -785,13 +795,53 @@ def preflight(
                     "gitlink for: " + "; ".join(unmatched[:5])
                     + ". The two readers disagree about this tree."
                 )
+            # THE REVERSE CROSS-CHECK, and it is a problem for the same
+            # reason the forward one is. `unmatched` catches a status line no
+            # gitlink explains; this catches a gitlink no status line
+            # explains -- and that direction is the QUIETER of the two,
+            # because an index gitlink that produces no line contributes no
+            # entry, so `submodules` renders as a positive `[]` (or as a
+            # shorter list) with nothing anywhere saying a path was dropped.
+            # `stale` below reads `submodules`, so the one submodule the gate
+            # exists to catch is exactly the one it then cannot see.
+            #
+            # A path can land here two ways -- git listed nothing for it, or
+            # `_parse_submodule_status`'s boundary rule declined a line the
+            # index and the display disagree about -- and both are "the two
+            # readers disagree about this tree", which is what the message
+            # says rather than guessing which.
+            unlisted = sorted(set(gitlinks)
+                              - {entry["path"] for entry in submodules})
+            if unlisted:
+                problems.append(
+                    "the index carries gitlinks `git submodule status` said "
+                    "nothing about: " + ", ".join(unlisted[:5])
+                    + ". The two readers disagree about this tree, and this "
+                    "direction is silent on its own: an unlisted gitlink "
+                    "contributes no entry, so the submodules evidence is a "
+                    "positive list with the path simply missing from it and "
+                    "the initialisation check never sees it."
+                )
             # Inert, therefore recorded rather than refused (measured: git
             # drives submodules off the index, so a stanza with no gitlink is
             # never listed, never fetched and creates no directory). Recorded
             # HERE because in the container it is an observation of the tree
             # the suite will run against.
+            # `-z`, and it is the same rule as `_gitlink_paths`' and
+            # `_chunk_path`'s: take the value from git's own delimiter, never
+            # from a split over a display line. Measured 2026-09-01 (git
+            # 2.50.1): without `-z` the output is `<key> <value>` on one line,
+            # and a submodule NAME may contain a space -- `[submodule "my
+            # sub"]` gives the key `submodule.my sub.path`, so
+            # `split(" ", 1)[1]` returns `sub.path <value>` rather than the
+            # value. That string is then never in `gitlinks`, so a submodule
+            # that is perfectly healthy is reported as an orphan, under a
+            # path that is not a path. `-z` emits `<key>\n<value>\0` per
+            # record (NEWLINE between the two, NUL between records), which is
+            # unambiguous for both -- a key cannot contain a newline and the
+            # trailing NUL leaves one empty final record.
             declared_subs = container.exec(
-                ["git", "config", "-f", ".gitmodules", "--get-regexp",
+                ["git", "config", "-f", ".gitmodules", "--get-regexp", "-z",
                  r"^submodule\..*\.path$"]
             )
             if declared_subs.exit_code in (0, 1):
@@ -800,10 +850,21 @@ def preflight(
                 # gitlinks. Collapsing it with >1 would report a genuine
                 # failure (an unreadable or malformed .gitmodules) as the
                 # measured claim "there are no orphans".
+                #
+                # `partition`, never `split("\n", 1)[1]`: a valueless key
+                # (`path` with no `=`) is a record with no newline in it, and
+                # the indexed form would raise `IndexError` out of a gate
+                # whose caller does not wrap it -- a traceback instead of a
+                # NO-GO, the same failure `_gitlink_paths` documents.
+                declared_paths = set()
+                for record in declared_subs.stdout.split("\0"):
+                    if not record:
+                        continue
+                    _key, sep, value = record.partition("\n")
+                    if sep:
+                        declared_paths.add(value)
                 evidence["submodules_orphaned"] = sorted(
-                    {line.split(" ", 1)[1]
-                     for line in declared_subs.stdout.splitlines() if " " in line}
-                    - set(gitlinks)
+                    declared_paths - set(gitlinks)
                 )
             else:
                 evidence["submodules_orphaned"] = None

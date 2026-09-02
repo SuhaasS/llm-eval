@@ -1500,16 +1500,28 @@ def _refuse_submodule_conflicts(task: TaskManifest, subs: tuple[Submodule, ...],
                 "empty submodule directory leaves `git status --porcelain` "
                 "clean, so nothing downstream would say so."
             )
-        # `_under` is `PurePosixPath.is_relative_to`, so it already matches
-        # the path itself; an `or p == sub.path` conjunct would be dead.
-        stripped = [p for p in task.strip_paths if _under(p, (sub.path,))]
+        # BOTH DIRECTIONS, and the ancestor one is the half that used to fall
+        # through. `_under` is `PurePosixPath.is_relative_to`, so the first
+        # conjunct already matches the path itself and an `or p == sub.path`
+        # would be dead; the second is a strip that covers the submodule from
+        # ABOVE (`strip_paths: ["vendor"]`, gitlink `vendor/libdep`). That
+        # shape was accepted, and it does not fail late in a way that names
+        # the task: `_strip_paths_from_tree`'s `git rm -r` removes the
+        # gitlink, so `_init_submodules`' `git submodule update --init` writes
+        # nothing and the very next command runs with `cwd=dest/vendor/libdep`
+        # -- a directory that does not exist. That is a bare `FileNotFoundError`
+        # out of `subprocess.run`, not a `TaskError` carrying `task_id`, which
+        # is the loader refusing a manifest wearing the costume of a harness
+        # crash.
+        stripped = [p for p in task.strip_paths
+                    if _under(p, (sub.path,)) or _under(sub.path, (p,))]
         if stripped:
             raise TaskError(
                 f"{task.task_id}: strip_paths names {', '.join(stripped)}, "
-                f"which is at or under the submodule {sub.path}. The strip runs "
-                "against a start state where the submodule is not initialised, "
-                "so it would remove the gitlink and leave .gitmodules naming a "
-                "path that no longer exists."
+                f"which covers the submodule {sub.path} from above or below. "
+                "The strip runs against a start state where the submodule is "
+                "not initialised, so it would remove the gitlink and leave "
+                ".gitmodules naming a path that no longer exists."
             )
         touched = [p for p in (*task.test_files, *task.solution_files,
                                *task.extra_files)
@@ -2157,7 +2169,12 @@ def _init_submodules(task: TaskManifest, dest: Path,
     The post-condition is the point of the function. An empty submodule
     directory leaves `git status --porcelain` EMPTY -- byte-identical to a
     healthy tree -- so a silent failure here reads as a suite that cannot
-    import, on every arm, and is scored as capability.
+    import, on every arm, and is scored as capability. Its existence-and-
+    non-empty half runs IMMEDIATELY after the update and before anything
+    takes `dest/sub.path` as a working directory, so a directory that was
+    never written is a `TaskError` naming the task rather than a
+    `FileNotFoundError` out of `subprocess.run`; the HEAD comparison stays
+    below, where it has a repository to ask.
     """
     if not subs:
         return
@@ -2176,6 +2193,29 @@ def _init_submodules(task: TaskManifest, dest: Path,
         _git("-c", "protocol.file.allow=always",
              "submodule", "update", "--init", "--", sub.path, cwd=dest)
         _git("config", key, sub.url, cwd=dest)
+
+        # BEFORE the two commands that run with `cwd=dest/sub.path`, and that
+        # order is the whole point. Everything below this guard -- `remote
+        # remove`, `reflog expire`, the HEAD check -- names the submodule
+        # directory as its working directory, and `subprocess.run` against a
+        # cwd that does not exist raises `FileNotFoundError` from the C
+        # library, not `TaskError`. So any residual way of reaching this loop
+        # with no directory (the loader's strip refusal is the one measured
+        # shape, but it is not the only way an `update --init` can write
+        # nothing) used to surface as a bare OSError naming a path, with no
+        # task_id and nothing saying which of a task set's manifests was at
+        # fault. `iterdir()` raises the same way, so the emptiness half has to
+        # move with the existence half rather than stay below.
+        checked = dest / sub.path
+        if not checked.is_dir() or not any(checked.iterdir()):
+            raise TaskError(
+                f"{task.task_id}: submodule {sub.path} is missing or empty "
+                "after initialisation. An empty submodule directory leaves "
+                "`git status --porcelain` clean, so the suite would simply "
+                "fail to collect and every arm would be scored on an "
+                "environment defect."
+            )
+
         _git("remote", "remove", "origin", cwd=dest / sub.path, check=False)
         # check=True (the default). This is a LEAK GUARD, not tidiness:
         # measured 2026-09-01, the submodule's `logs/HEAD` AND
@@ -2187,7 +2227,6 @@ def _init_submodules(task: TaskManifest, dest: Path,
         # config-only check sees nothing.
         _git("reflog", "expire", "--expire=now", "--all", cwd=dest / sub.path)
 
-        checked = dest / sub.path
         head = _git("rev-parse", "HEAD", cwd=checked, check=False)
         if head.returncode != 0 or head.stdout.strip() != sub.sha:
             raise TaskError(
@@ -2197,11 +2236,6 @@ def _init_submodules(task: TaskManifest, dest: Path,
                 "submodule leaves `git status --porcelain` clean, so the suite "
                 "would simply fail to collect and every arm would be scored on "
                 "an environment defect."
-            )
-        if not any(checked.iterdir()):
-            raise TaskError(
-                f"{task.task_id}: submodule {sub.path} is empty after "
-                "initialisation."
             )
 
 

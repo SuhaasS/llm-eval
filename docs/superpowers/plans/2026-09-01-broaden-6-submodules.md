@@ -361,7 +361,11 @@ NotGradedReason.SUBMODULE_GITLINK_UNGRADABLE = "submodule_gitlink_ungradable"
 
 `resolved` is `None`, `not_graded_reason` names it, and the detail names the paths. It belongs in the first of the enum's three groups — "the run never produced a gradable submission" — because that is exactly what happened: the agent may well have fixed the bug inside the submodule, and the harness cannot see it. A `GradeFailure` would put the row in the denominator as a model failure, which is the accusation this refusal exists to prevent.
 
-Detection reuses what is already imported: `_parse_submission(diff)` gives `(chunk, source, dest)` per file from git's own header parser, and a chunk whose `source` or `dest` equals a declared submodule path is the trigger. Equality, not `_under`: a path *inside* the submodule cannot appear in a submission at all (M8 — it is invisible), so anything under one is either impossible or a hand-edited diff, and the exact-match rule keeps the refusal narrow. A parse failure is left alone; `_apply_submission` already routes that to `LOSSY_DIFF_UNAPPLIABLE`/`APPLY_FAILED` with its own detail, and a second authority for the same shape is the mistake `not_graded_gate`'s docstring already names.
+**Detection reads the submission, not the task — and that is a correction this plan made mid-flight.** The paragraph here originally intersected the submission's paths with the *declared* submodule set (`task_submodules(...)` at `base_sha`). That set is **empty for every task in today's corpus**, `pallets/click` included, so the check would have been dead code against the very shape that can fire anywhere: an agent who runs `git init` or `git clone` in any tracked subdirectory produces the identical `160000` chunk on a repository that has never had a submodule. It also cost an `ensure_mirror` clone at grade time to answer a question the diff already answers; dropping it removes that hop from `grade_run` entirely.
+
+What shipped is `grader._gitlinks_touched(diff)` — one argument, no task, no cache root, no mirror read. `_parse_submission(diff)` gives `(chunk, source, dest)` per file from git's own header parser, and `_chunk_is_gitlink(chunk)` is the trigger: a `160000` **mode line in the chunk HEADER** (`new file mode`, `deleted file mode`, `old`/`new mode`), read only from the lines *before* the first `@@`. Never the `Subproject commit` line in the hunk body — that string is ordinary text in a `.md` or a fixture and would make any file quoting it ungradable. Paths still come from `_chunk_path`, never from a regex over the `diff --git` line, for the reason `tasks.py`'s module docstring records; only the gitlink *decision* is read out of the chunk text. A parse failure returns `()` and is left alone; `_apply_submission` already routes that to `LOSSY_DIFF_UNAPPLIABLE`/`APPLY_FAILED` with its own detail, and a second authority for the same shape is the mistake `not_graded_gate`'s docstring already names.
+
+One residual is recorded in the helper rather than papered over: a **pure rename** of a gitlink with no mode change emits `similarity index`/`rename from`/`rename to` and neither a mode line nor a hunk body, so neither authority sees it. It is out of reach of an agent working in a run tree — renaming a submodule means editing `.gitmodules`, which *is* a text chunk the submission carries — and it has a `TASKS.md` entry so nobody re-derives the gap as a bug.
 
 `GRADER_VERSION` +1 (a run graded under the old version was graded by a ladder that would have said `False` here) and `GRADE_SCHEMA_VERSION` minor +1 (an additive enum member; a reader that cannot tell the versions apart reads the absent value as a positive claim).
 
@@ -390,7 +394,7 @@ The measurement that *is* worth keeping lives where it is an observation: prefli
 | `bakeoff/src/bakeoff/images.py` | `build_task_image` extracts one `git archive` per submodule into its path |
 | `bakeoff/src/bakeoff/preflight.py` | `_submodule_status()`, the initialisation gate, `evidence["submodules"]`, `PREFLIGHT_VERSION` +1 |
 | `bakeoff/src/bakeoff/grade_schema.py` | `NotGradedReason.SUBMODULE_GITLINK_UNGRADABLE`, `GRADE_SCHEMA_VERSION` minor +1 |
-| `bakeoff/src/bakeoff/grader.py` | `_submodule_gitlinks_touched()`, the refusal in `grade_run`, `GRADER_VERSION` +1, `__all__` |
+| `bakeoff/src/bakeoff/grader.py` | `_gitlinks_touched()`, the refusal in `grade_run`, `GRADER_VERSION` +1, `__all__` |
 | `bakeoff/tests/test_tasks.py` | `upstream_submodule` fixture; derivation, refusals, init, `start_sha`-unmoved pins |
 | `bakeoff/tests/test_images.py` | the second archive, and that a zero-submodule task is byte-identical to today |
 | `bakeoff/tests/test_preflight.py` | the status parse and the refusal |
@@ -1815,18 +1819,20 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Read the measurement M11 before starting.** This task exists because such a submission applies **green** and grades the wrong content, which is the worst-shaped defect this pipeline can produce: `resolved: False` is an accusation, and it would land on an agent whose fix the harness simply could not see.
 
+> **Corrected during implementation — read D8 first.** As drafted below, this task derived an allowlist of declared submodule paths (`tasks.task_submodules`) and intersected the submission against it. That set is **empty for every task in today's corpus**, so the check would have been dead code against the shape that can fire anywhere: `git init` in any tracked subdirectory produces the same `160000` chunk on a repository with no submodules at all. What shipped reads the **submission's own chunk headers** and takes no task argument, no cache root and no mirror clone. The step bodies below are kept as the plan was written, with the names and signatures corrected to what shipped; where they still speak of monkeypatching `grader.task_submodules` or of matching by equality against a declared path, D8 is the authority and this section is history.
+
 **Files:**
 - Modify: `bakeoff/src/bakeoff/grade_schema.py` (`NotGradedReason`, its docstring's first group, `GRADE_SCHEMA_VERSION`)
-- Modify: `bakeoff/src/bakeoff/grader.py` (`_submodule_gitlinks_touched`, the refusal in `grade_run`, `GRADER_VERSION`, `__all__`)
+- Modify: `bakeoff/src/bakeoff/grader.py` (`_gitlinks_touched`, the refusal in `grade_run`, `GRADER_VERSION`, `__all__`)
 - Test: `bakeoff/tests/test_grader.py`
 
 **Interfaces:**
-- Produces: `NotGradedReason.SUBMODULE_GITLINK_UNGRADABLE = "submodule_gitlink_ungradable"`; `grader._submodule_gitlinks_touched(task, diff: str, cache_root: Path) -> tuple[str, ...]`.
-- Consumes: Task 1's `tasks.task_submodules`; the existing `grader._parse_submission`, `_gated_result`, `build_grade_record`.
+- Produces: `NotGradedReason.SUBMODULE_GITLINK_UNGRADABLE = "submodule_gitlink_ungradable"`; `grader._chunk_is_gitlink(chunk: str) -> bool` and `grader._gitlinks_touched(diff: str) -> tuple[str, ...]`.
+- Consumes: the existing `grader._parse_submission`, `_chunk_path`, `_gated_result`, `build_grade_record`. **Not** `tasks.task_submodules` — see the correction below.
 
 - [ ] **Step 1: Write the failing tests**
 
-`test_grader.py` has `_task(...)` (a `SimpleNamespace`) and `_record(diff=..., **kw)`. Reuse both. The derivation itself is Task 1's subject, so these tests monkeypatch `grader.task_submodules` — the seam is deliberate: the grader's job here is the *refusal*, and a test that also built a real superproject would be testing Task 1 twice and would make this file need a git fixture it has never needed.
+`test_grader.py` has `_task(...)` (a `SimpleNamespace`) and `_record(diff=..., **kw)`. Reuse both. As drafted, these tests monkeypatched `grader.task_submodules` to supply a declared path; **as shipped there is nothing to monkeypatch** — the submission carries its own evidence, so a literal diff string is the whole fixture and this file still needs no git fixture and no Docker.
 
 ```python
 _GITLINK_SUBMISSION = (
@@ -1884,21 +1890,18 @@ def test_a_task_with_no_submodules_reaches_the_ladder(monkeypatch, tmp_path):
     """
     _with_submodule(monkeypatch)  # no paths
 
-    touched = grader._submodule_gitlinks_touched(
-        _task(), _GITLINK_SUBMISSION, tmp_path / "cache")
+    touched = grader._gitlinks_touched(_GITLINK_SUBMISSION)
 
     assert touched == ()
 
 
 def test_an_ordinary_submission_touches_no_gitlink(monkeypatch, tmp_path):
-    """EQUALITY against the submodule path, not `_under`. A path INSIDE a
-    submodule cannot appear in a submission at all (measured: `git add -A`
-    stages nothing for it), so only the gitlink entry itself can ever match.
+    """A text chunk carries no `160000` mode line, so it cannot trigger the
+    refusal however many files it touches. A path INSIDE a submodule cannot
+    appear in a submission at all (measured: `git add -A` stages nothing for
+    it), so only a gitlink entry itself can ever match.
     """
-    _with_submodule(monkeypatch, "vendor/libdep")
-
-    touched = grader._submodule_gitlinks_touched(
-        _task(), TEXT_DIFF, tmp_path / "cache")
+    touched = grader._gitlinks_touched(TEXT_DIFF)
 
     assert touched == ()
 
@@ -1912,8 +1915,7 @@ def test_an_unparseable_submission_is_left_to_the_existing_refusal(monkeypatch,
     """
     _with_submodule(monkeypatch, "vendor/libdep")
 
-    assert grader._submodule_gitlinks_touched(
-        _task(), "not a diff at all\n", tmp_path / "cache") == ()
+    assert grader._gitlinks_touched("not a diff at all\n") == ()
 ```
 
 `SimpleNamespace` and `grader` are already imported by the module; add `NotGradedReason` to its `from bakeoff.grade_schema import (...)` block if it is not there.
@@ -1924,7 +1926,7 @@ def test_an_unparseable_submission_is_left_to_the_existing_refusal(monkeypatch,
 cd bakeoff && .venv/bin/python -m pytest tests/test_grader.py -q -k gitlink
 ```
 
-Expected: `AttributeError: module 'bakeoff.grader' has no attribute '_submodule_gitlinks_touched'`.
+Expected: `AttributeError: module 'bakeoff.grader' has no attribute '_gitlinks_touched'`.
 
 - [ ] **Step 3: Add the `NotGradedReason` member**
 
@@ -1943,7 +1945,7 @@ Bump `GRADE_SCHEMA_VERSION` by one **minor** (an additive enum member; read the 
 In `bakeoff/src/bakeoff/grader.py`:
 
 ```python
-def _submodule_gitlinks_touched(task, diff: str, cache_root: Path) -> tuple[str, ...]:
+def _gitlinks_touched(diff: str) -> tuple[str, ...]:
     """The submodule paths this submission changes, if any.
 
     Measured 2026-09-01 (git 2.50.1). Two facts, and together they make such a
@@ -1966,33 +1968,36 @@ def _submodule_gitlinks_touched(task, diff: str, cache_root: Path) -> tuple[str,
     GradeFailure puts the row in the denominator as a model failure, which is
     precisely the claim this refusal exists to avoid making.
 
-    EQUALITY against the submodule path, not `_under`. A path INSIDE a
-    submodule cannot appear in a submission at all (first fact above), so
-    anything under one is either impossible or a hand-edited diff, and the
-    exact-match rule keeps the refusal narrow.
+    THE AUTHORITY IS THE SUBMISSION, NOT THE TASK. A declared-path
+    allowlist is empty for every task in today's corpus, so it would be
+    blind to the third fact -- an agent running `git init` in any tracked
+    subdirectory, on a repository that has never had a submodule.
+    `_chunk_is_gitlink` reads a `160000` mode line from the chunk HEADER,
+    never the `Subproject commit` line in the body: that string is ordinary
+    text in a `.md` and would make any file quoting it ungradable.
 
     A submission that cannot be parsed returns `()` and is left alone.
     `_apply_submission` already names that shape with its own detail, and a
     second authority for one refusal is the mistake `not_graded_gate`'s
     docstring records.
     """
-    paths = {sub.path for sub in task_submodules(task, Path(cache_root))}
-    if not paths:
-        return ()
     try:
         parsed = _parse_submission(diff)
     except TaskError:
         return ()
-    touched = {p for _chunk, source, dest in parsed for p in (source, dest)}
-    return tuple(sorted(touched & paths))
+    touched = {
+        path
+        for chunk, source, dest in parsed
+        if _chunk_is_gitlink(chunk)
+        for path in (source, dest)
+    }
+    return tuple(sorted(touched))
 ```
 
-Import `task_submodules` in the existing `from bakeoff.tasks import (...)` block, alphabetically. Then in `grade_run`, immediately after the `not_graded_gate` block and **before** the artifacts wipe and `materialize` — the refusal must cost neither a tree nor a container:
+No new import from `bakeoff.tasks` is needed — that was the drafted design's `task_submodules` hop, and dropping it removes an `ensure_mirror` clone from `grade_run`. Then, immediately after the `not_graded_gate` block and **before** the artifacts wipe and `materialize` — the refusal must cost neither a tree nor a container:
 
 ```python
-    gitlinks = _submodule_gitlinks_touched(
-        task, record.artifacts.final_diff or "", Path(cache_root)
-    )
+    gitlinks = _gitlinks_touched(record.artifacts.final_diff or "")
     if gitlinks:
         return build_grade_record(record, task, image, oracle, _gated_result((
             NotGradedReason.SUBMODULE_GITLINK_UNGRADABLE,
@@ -2003,7 +2008,7 @@ Import `task_submodules` in the existing `from bakeoff.tasks import (...)` block
         )))
 ```
 
-Bump `GRADER_VERSION` by one (read the value on disk) and extend its comment block: a run graded under the old version was graded by a ladder that would have returned `False` here. Add `"_submodule_gitlinks_touched"` to `__all__` only if the module's convention is to export private helpers — check; it is not, so leave `__all__` alone except for any name this task makes public. (It makes none.)
+Bump `GRADER_VERSION` by one (read the value on disk) and extend its comment block: a run graded under the old version was graded by a ladder that would have returned `False` here. Add `"_gitlinks_touched"` to `__all__` only if the module's convention is to export private helpers — check; it is not, so leave `__all__` alone except for any name this task makes public. (It makes none.)
 
 - [ ] **Step 5: Run the tests and watch them pass**
 
@@ -2269,7 +2274,9 @@ cd bakeoff && .venv/bin/python scripts/mutation_check.py
 
 > **A submodule's history is pruned to its gitlink, and the superproject's prune says nothing about it.** The gitlink is one `160000` entry in `base_sha`'s tree, so the submodule's objects are in a *different repository* and `_verify_pruned`'s `rev-list base_sha` sweep never sees them — measured, `git cat-file -e <gitlink sha>` fails in the superproject store. But `git submodule update --init` against the declared url clones the submodule's **whole** history, `remotes/origin/main` included, so the run tree would carry submodule content newer than the pin and `git -C <path> log --all` would hand it to the agent, differentially. `ensure_pruned_mirror` is therefore called a second time per `(submodule url, gitlink sha)` — unchanged, because it is already generic over its two keys — and `materialize` initialises from *that*, with `protocol.file.allow=always` (git has refused the file transport for submodules since CVE-2022-39253, and a local mirror is a file transport). The url is written to `.git/config` **before** the update and rewritten to the `.gitmodules` value after: a transient `-c submodule.<name>.url=` populates the tree but leaves `git submodule status` reading `-<sha>`, i.e. *uninitialised*, which is the character preflight gates on. The rewrite is not enough on its own — measured, the cache path also survives in the submodule's `logs/HEAD` **and** `logs/refs/heads/main` as `clone: from …`, and only `reflog expire --expire=now --all` removes it, so that call is a leak guard rather than tidiness.
 
-> **A submission diff is blind inside a submodule, and the blindness is green rather than loud.** Measured: `git add -A` stages **nothing** for an uncommitted edit inside a submodule, so `snapshot_diff` returns zero bytes for it — not even the `-dirty` gitlink line. An agent that *commits* inside the submodule does move the gitlink, and `git apply --index` of that diff on a fresh tree exits **0** (`warning: unable to rmdir` only), moves the index to a commit that exists nowhere outside the run tree that produced it, and leaves the submodule's working tree unchanged — so the ladder grades the original content and returns `resolved: False`, an accusation for work the harness could not capture. `NotGradedReason.SUBMODULE_GITLINK_UNGRADABLE` takes that row out of the denominator, and `HARVESTING.md` refuses a task whose fix touches submodule content in the first place.
+> **A submission diff is blind inside a submodule, the blindness is green rather than loud, and the refusal reads the SUBMISSION rather than the task.** Measured 2026-09-01: `git add -A` stages **nothing** for an uncommitted edit inside a submodule, so `snapshot_diff` returns zero bytes for it — not even the `-dirty` gitlink line. An agent that *commits* inside one does move the gitlink, and `git apply --index` of that diff on a fresh tree exits **0** (`warning: unable to rmdir` only), moves the index to a commit that exists nowhere outside the run tree that produced it, and leaves the submodule's working tree unchanged — so the ladder grades the original content and returns `resolved: False`, an accusation for work the harness could not capture. `NotGradedReason.SUBMODULE_GITLINK_UNGRADABLE` takes that row out of the denominator.
+>
+> **The authority is the diff, and that is what makes the check reachable at all.** The first version intersected the submission's paths with the task's *declared* submodule set, which is **empty for every task in today's corpus, `pallets/click` included** — so it was dead code against the shape that fires anywhere: an agent running `git init` or `git clone` in any tracked subdirectory of any repository produces the identical chunk (`new file mode 160000` + `+Subproject commit …`, applying to an empty directory). `_gitlinks_touched(diff)` therefore takes one argument, and the trigger is a **`160000` mode line in the chunk HEADER** — the lines before the first `@@` — never the `Subproject commit` line in the hunk body, which is ordinary text in a `.md` or a fixture and would make any file quoting it ungradable. Dropping the declared set also removes an `ensure_mirror` clone from `grade_run`: **no mirror is read at grade time**. Residual, named rather than left to be re-derived: a *pure rename* of a gitlink with no mode change emits neither a mode line nor a hunk body and is seen by neither authority (`TASKS.md`).
 
 > **An empty submodule directory reads as a clean tree.** `git status --porcelain` is byte-identical between a healthy run tree and one whose submodule has zero entries, so a failed initialisation would surface only as a suite that cannot collect — on every arm, scored as capability. `git submodule status`'s leading character is the one signal (` ` initialised at the gitlink, `-` empty or unregistered, `+` the wrong commit), and preflight gates on it — reading its **exit code**, because a failed status returns empty stdout that parses to "there are none". A `.gitmodules` stanza naming no gitlink is the one shape that is genuinely inert (never listed, never fetched, no directory), so it is recorded rather than refused. The converse also bites: an **untracked** file inside the submodule makes the superproject report ` M <path>`, which is preflight's clean-tree NO-GO, and `gitignore_extra` cannot fix it because that key writes the superproject's `.gitignore`.
 

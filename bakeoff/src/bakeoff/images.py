@@ -393,16 +393,24 @@ def build_task_image(
             f"{extract.stderr.decode('utf-8', 'replace')}"
         )
 
-    # ORDER IS LOAD-BEARING, and only in this direction. A `strip_paths` entry
-    # that is an ANCESTOR of a submodule path -- `vendor`, with the submodule
-    # at `vendor/libdep` -- removes the directory the extract writes into. Run
-    # the other way round the strip would delete a tree that is not there yet,
-    # be a silent no-op (a path matching nothing is deliberately not an error,
-    # see `_strip_build_context`), and the submodule content would then land
-    # in the context the operator asked to have it removed from -- on the
-    # import path when `image.build` runs `pip install -e .`, which is the
-    # exact disagreement between image and run tree that key exists to close.
-    # Extract first, strip second: the strip is the last word either way.
+    # ORDER IS DEFENCE IN DEPTH HERE, and it is worth saying that it is no
+    # longer the primary guard. The shape that separates the two orders by
+    # OUTCOME is a `strip_paths` entry that is an ANCESTOR of a submodule path
+    # (`vendor`, with the submodule at `vendor/libdep`): extract-then-strip
+    # honours it, while strip-then-extract deletes a tree that is not there
+    # yet, is a silent no-op (a path matching nothing is deliberately not an
+    # error, see `_strip_build_context`), and writes the submodule content
+    # back into the context the operator asked to have it removed from -- on
+    # the import path when `image.build` runs `pip install -e .`.
+    #
+    # That manifest is now refused at LOAD, in both directions
+    # (`tasks._refuse_submodule_conflicts`), because it does something worse
+    # at materialization time than it does here: the strip removes the
+    # gitlink and `_init_submodules` then chdirs into a directory that no
+    # longer exists. `_extract_submodules` goes through `task_submodules`, so
+    # that refusal fires on the line below, before the strip runs at all.
+    # The order stays because it is the one that is correct without the
+    # refusal, and the refusal lives in another module.
     _extract_submodules(task, repo_dir, cache_root)
     _strip_build_context(repo_dir, list(task.strip_paths))
 

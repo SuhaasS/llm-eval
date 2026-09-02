@@ -2902,7 +2902,13 @@ A repository whose suite needs a git submodule can now be cut as a task.
 Nothing is declared in the manifest: a submodule's path, url and pinned
 commit are all inside the tree at `base_sha`, so `derive_submodules` reads
 them out with git's own parsers (`git ls-tree` for the gitlink, `.gitmodules`
-for the url), cross-checks the two, and refuses a task where they disagree.
+for the url) and cross-checks the two — **asymmetrically**, because the two
+directions of disagreement are not the same fact. A gitlink with no
+`.gitmodules` url is refused at load: nothing could populate that directory,
+and an empty submodule directory leaves `git status --porcelain` clean. The
+reverse, a stanza naming no gitlink, is *inert* — git drives submodules off
+the index, so it is never listed, never fetched and creates no directory —
+and is recorded as `submodules_orphaned` rather than refused.
 Content comes from a per-`(submodule url, gitlink sha)` pruned bare mirror
 built by the existing `ensure_pruned_mirror`, unchanged — a new caller, not a
 new mechanism. `materialize` initialises each submodule from that local
@@ -2937,8 +2943,8 @@ applies green and grades the wrong content.
   a submodule, so an uncommitted edit inside one is invisible to every
   checkpoint and to the final diff — not even the `-dirty` gitlink line
   survives staging. This is the whole argument for refusing a task whose fix
-  touches submodule content, and for the residual D10 records rather than
-  closes (below).
+  touches submodule content, and it leaves one residual this broadening
+  **records rather than closes** — see *The residual* below.
 - **M11 — the green apply.** An agent that *commits* inside a submodule moves
   the gitlink, and that diff applies cleanly to a fresh tree: the index moves,
   the working tree does not, and the ladder then grades the original content.
@@ -2966,14 +2972,40 @@ written (`TASKS.md`). No `--recursive` — nested submodules are refused rather
 than supported, because the untested path leaves the inner directory empty,
 which reads as clean.
 
-**Versions.** `PREFLIGHT_VERSION` 7 → 8 (a cached PASS under the old gate was
-written by a check that never looked at a submodule). `GRADER_VERSION` 4 → 5
+**The residual.** M11's green apply is caught; M8's zero-byte diff is not, and
+cannot be from inside the harness. An agent that edits submodule content and
+never commits it produces a submission diff that is **empty** — `git add -A`
+stages nothing for it — so the grader's ladder stops at `EMPTY_PATCH`, which
+is a `GradeFailure` and stamps `resolved: False`. That verdict is
+indistinguishable from an honest empty run: a model that read the repository,
+concluded nothing needed changing and stopped produces a byte-identical
+submission. No field anywhere says which of the two happened, because the
+harness never saw the edit at all. Refusing a task whose *reference* fix
+touches submodule content keeps this off the tasks where it would be the
+expected path, but it stays reachable on any task with a submodule, since
+what an agent chooses to edit is not something a manifest can constrain. It
+is carried in `TASKS.md` rather than closed here: closing it means capturing
+per-submodule state the checkpoint mechanism does not currently take, and
+that is a change to what a run *records*, not to how one is graded.
+
+**Versions.** `PREFLIGHT_VERSION` 7 → 9 (7 → 8 in the broadening itself: a
+cached PASS under the old gate was written by a check that never looked at a
+submodule; 8 → 9 in the final-review fix wave, which changed what those
+submodule assertions assert — the boundary-anchored status match, the reverse
+gitlink cross-check, and the `--get-regexp -z` orphan read). `GRADER_VERSION` 4 → 5
 (a run graded under the old version was graded by a ladder that would have
 said `False` here). `GRADE_SCHEMA_VERSION` 1.1.0 → 1.2.0, a minor bump for the
 additive `SUBMODULE_GITLINK_UNGRADABLE` member. `click-3360`'s `start_sha`
-stays `33575cc0b75608fa5cbcb1d3ae3347b81eac437f` — it has no gitlink, and a
-zero-submodule task takes a path that runs no extra git command against the
-run tree.
+stays `33575cc0b75608fa5cbcb1d3ae3347b81eac437f` — it has no gitlink, and on
+the **host** a zero-submodule task takes a path that runs no extra git command
+against the run tree (`derive_submodules` returns `()`, so `_init_submodules`
+returns immediately and `build_task_image` takes no second archive). In the
+**container** it is not free and the distinction matters for anyone reading a
+gate's timing: preflight runs its three submodule probes — `git submodule
+status`, `git ls-files -s -z`, `git config -f .gitmodules --get-regexp -z` —
+on every task, submodule or not, because "this tree has none" has to be an
+observation rather than an assumption. That is what makes the empty evidence
+lists a measurement instead of a default.
 
 `python-poetry/tomlkit` moves out of `HARVESTING.md`'s Excluded table on a
 measured `.gitmodules` (one submodule, https, non-nested) rather than on the

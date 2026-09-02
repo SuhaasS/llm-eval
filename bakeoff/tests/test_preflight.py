@@ -979,6 +979,12 @@ class _ScriptedContainer:
                 f"160000 {'a' * 40} 0\t{path}\0" for path in self.gitlinks
             ))
         if cmd[:4] == ["git", "config", "-f", ".gitmodules"]:
+            # The `-z` is asserted, not tolerated. Without it git emits
+            # `<key> <value>` on one line and a submodule NAME containing a
+            # space makes `<key>` unsplittable -- so a scripted container that
+            # answered either argv the same way would let the parser regress
+            # to the space split with every test still green.
+            assert "-z" in cmd, cmd
             declared = (self.gitlinks or ()
                         if self.gitmodules_declared is None
                         else self.gitmodules_declared)
@@ -990,9 +996,12 @@ class _ScriptedContainer:
                 # at all, or one whose stanzas all have gitlinks.
                 exit_code=(self.gitmodules_exit if self.gitmodules_exit
                            is not None else (0 if declared else 1)),
+                # `<key>\n<value>\0` per record, measured against git 2.50.1.
+                # The submodule NAME is the path here (what `git submodule
+                # add` writes), so a path carrying a space produces a key
+                # carrying one -- which is the shape `-z` exists for.
                 stdout="".join(
-                    f"submodule.{path.rsplit('/', 1)[-1]}.path {path}\n"
-                    for path in declared
+                    f"submodule.{path}.path\n{path}\0" for path in declared
                 ),
             )
         if cmd[:2] == ["git", "rev-parse"]:
@@ -1989,10 +1998,18 @@ def test_the_preflight_version_moved_with_the_new_assertion():
     interpreter the container runs; 7 -> 8 is the submodule read-back, and a
     verdict cached under 7 was written by a gate that never asked whether the
     tree's submodules are populated -- which `git status --porcelain` reports
-    as CLEAN when they are not."""
+    as CLEAN when they are not; 8 -> 9 is a round that LOOKS additive and is
+    not, which is the case worth spelling out. It changes what 8's own
+    submodule assertions assert: the status-to-gitlink match became
+    boundary-anchored (a tree with `vendor/lib` beside `vendor/libdep` could
+    file an entry under the wrong path and flip GO/NO-GO under the old
+    `startswith`), an index gitlink that no `git submodule status` line names
+    is now a problem rather than a silently shorter list, and the orphan read
+    moved to `--get-regexp -z` so a submodule name containing a space stops
+    being reported as an orphan under a path that is not a path."""
     from bakeoff.preflight import PREFLIGHT_VERSION
 
-    assert PREFLIGHT_VERSION == "8"
+    assert PREFLIGHT_VERSION == "9"
 
 
 # --- every submodule is initialised at its gitlink ---------------------------
@@ -2297,6 +2314,68 @@ def test_a_status_line_with_no_gitlink_is_reported_as_a_problem(monkeypatch,
     assert not result.ok
     assert any("no gitlink for" in p for p in result.problems)
     assert result.evidence["submodules"] == []
+
+
+def test_a_gitlink_with_no_status_line_is_reported_as_a_problem(monkeypatch,
+                                                                tmp_path):
+    """The REVERSE of the neighbour above, and the quieter of the two.
+
+    An index gitlink that `git submodule status` says nothing about
+    contributes no entry, so `evidence["submodules"]` is a positive `[]` --
+    byte-identical to a task with no submodules at all -- and `stale` reads
+    that list, so the one submodule this whole check exists to catch is
+    exactly the one it cannot see. Without this problem the gate is GO on a
+    tree whose dependency directory may be empty.
+
+    Scripted with an empty status listing rather than a mismatched one, so
+    the `unmatched` problem cannot fire and answer for this assertion.
+    """
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=_FakeTests(), present=("tests/",),
+        gitlinks=("vendor/libdep",), submodule_status="",
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, _FakeTask(), container)
+
+    assert not result.ok
+    assert any("said nothing about" in p and "vendor/libdep" in p
+               for p in result.problems)
+    assert result.evidence["submodules"] == []
+    # Not an orphan: the stanza and the gitlink both exist, it is the status
+    # listing that is missing. The two must not be confused.
+    assert result.evidence["submodules_orphaned"] == []
+
+
+def test_a_submodule_name_with_a_space_is_not_reported_as_an_orphan(
+        monkeypatch, tmp_path):
+    """`--get-regexp -z`, and the name is where the space lands.
+
+    `[submodule "my sub"]` gives the key `submodule.my sub.path`, so without
+    `-z` the line is `submodule.my sub.path vendor/libdep` and
+    `split(" ", 1)[1]` returns `sub.path vendor/libdep` -- a string that is
+    not in `gitlinks`, so a perfectly healthy submodule is reported as an
+    orphan under a path that is not a path. `-z` records `<key>\\n<value>\\0`,
+    which is unambiguous for both halves.
+
+    The `_ScriptedContainer` uses the path as the submodule name (what
+    `git submodule add` writes), so a gitlink path carrying a space is what
+    produces the key that carries one.
+    """
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=_FakeTests(), present=("tests/",),
+        gitlinks=("vendor/my dep",),
+        submodule_status=(
+            " 942c381d88cecca36be86b2e902f554ad145ec44 vendor/my dep"
+            " (heads/main)\n"
+        ),
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, _FakeTask(), container)
+
+    assert result.ok, result.problems
+    assert result.evidence["submodules_orphaned"] == []
+    assert [e["path"] for e in result.evidence["submodules"]] \
+        == ["vendor/my dep"]
 
 
 def test_an_orphaned_gitmodules_stanza_is_recorded_and_not_refused(monkeypatch,

@@ -299,6 +299,13 @@ def _submodule_fixture(tmp_path):
     sup = tmp_path / "sup"
     sup.mkdir()
     (sup / "calc.py").write_text("x = 1\n")
+    # A plain directory that is a SIBLING of the submodule's parent, for the
+    # ancestor-strip test below. It cannot be `vendor/...`: a strip covering
+    # the submodule from above is refused by the loader now
+    # (`_refuse_submodule_conflicts`), so the only ancestor entry the image
+    # path can still be handed is one that does not overlap a gitlink.
+    (sup / "docs" / "api").mkdir(parents=True)
+    (sup / "docs" / "api" / "page.md").write_text("# api\n")
     sh("git", "init", "-q", cwd=sup)
     sh("git", "config", "user.email", "t@t.test", cwd=sup)
     sh("git", "config", "user.name", "t", cwd=sup)
@@ -372,31 +379,38 @@ def test_the_build_context_still_carries_no_git_directory(tmp_path, monkeypatch)
     assert [p for p in repo.rglob(".git")] == []
 
 
-def test_an_ancestor_strip_path_wins_over_the_submodule_extract(tmp_path,
-                                                                monkeypatch):
-    """ORDER, and it is only visible on an ancestor entry.
+def test_an_ancestor_strip_path_coexists_with_the_submodule_extract(
+        tmp_path, monkeypatch):
+    """An ancestor entry over a PLAIN directory, and the two do not interfere.
 
-    `strip_paths: ["vendor"]` with the submodule at `vendor/libdep` is a
-    manifest asking for the whole directory gone. Extract-then-strip honours
-    it. Strip-then-extract would delete a directory that does not exist yet --
-    a deliberate NO-OP, since a `strip_paths` entry matching nothing is not an
-    error -- and the submodule content would then be written back into the
-    context the operator asked to have it removed from, on the import path
-    when `image.build` runs `pip install -e .`.
+    This test used to strip `vendor` with the submodule at `vendor/libdep`,
+    which is the one shape that separates extract-then-strip from
+    strip-then-extract by outcome. That manifest is now refused at load
+    (`tasks._refuse_submodule_conflicts`, both directions) because the same
+    shape does far worse at materialization time than it does here -- the
+    strip removes the gitlink and `_init_submodules` then chdirs into a
+    directory that does not exist. So the ordering claim is pinned by that
+    refusal, not by this file, and what is left to pin here is the ordinary
+    case: an ancestor strip of a sibling directory removes exactly that
+    directory, and the second archive still lands its content inside the
+    empty gitlink directory the first one left.
 
-    The plain entry (`vendor/libdep` itself) is order-INSENSITIVE in outcome,
-    which is why it cannot pin this: one order removes the extracted tree, the
-    other never writes it. The ancestor is the case that separates them.
+    Kept rather than deleted: `build_task_image` still applies the strip and
+    the extract in one order, and a future edit that dropped the second
+    archive, or ran the strip over the whole context after it, would make
+    the submodule assertion below fail.
     """
     fixture = _submodule_fixture(tmp_path)
     monkeypatch.setattr("bakeoff.images._run", lambda *a, **k: "sha256:fake")
     monkeypatch.setattr(tasks, "_SUBMODULE_URL_PREFIX", "")
 
-    build_task_image(_sub_task_stub(fixture, strip_paths=("vendor",)),
+    build_task_image(_sub_task_stub(fixture, strip_paths=("docs",)),
                      "sha256:base", tmp_path / "build", tmp_path / "cache")
 
     repo = tmp_path / "build" / "image-t" / "repo"
-    assert not (repo / "vendor").exists()
+    assert not (repo / "docs").exists()
+    assert (repo / "vendor" / "libdep" / "libdep" / "__init__.py").read_text() \
+        == "VALUE = 1\n"
     assert (repo / ".gitmodules").exists()   # the strip touches nothing else
 
 

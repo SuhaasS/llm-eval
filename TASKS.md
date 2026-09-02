@@ -1210,6 +1210,34 @@ These need a call, not code. Most are cheap to make and expensive to make late.
   leaves the inner directory empty, which reads as clean. A deferral, not a
   defect (broadening 6).
 
+- [ ] **A pure-gitlink submission is refused; a pure-gitlink *edit* is
+  invisible.** The grader catches the agent who COMMITS inside a submodule
+  (`SUBMODULE_GITLINK_UNGRADABLE`, read out of the submission's own chunks).
+  It cannot catch the agent who edits and does not commit: `git add -A` stages
+  nothing for a submodule, so the submission diff is **zero bytes** and the
+  ladder stops at `EMPTY_PATCH` — a `GradeFailure` that stamps
+  `resolved: False`. That is byte-identical to an honest empty run (a model
+  that read the repo, concluded nothing needed changing and stopped), and no
+  field distinguishes them, because the harness never observed the edit.
+  Refusing tasks whose *reference* fix touches submodule content keeps this
+  off the tasks where it would be the expected path, but it stays reachable on
+  any task with a submodule, since what an agent chooses to edit is not
+  something a manifest can constrain. Closing it means capturing per-submodule
+  state at checkpoint time — a change to what a run RECORDS, not to how one is
+  graded — so it needs its own plan. Measured 2026-09-01 (broadening 6, M8).
+
+- [ ] **The submodule's `remote remove` is `check=False` and the `reflog
+  expire` beside it is `check=True`; nothing measured the asymmetry.** Both
+  calls in `tasks._init_submodules` are leak guards over the same object — a
+  host cache path, in `.git/config` and in `logs/HEAD` respectively — so
+  tolerating a non-zero exit on one half means a leak that guard exists to
+  remove can survive in silence. **Leave the code as it is.** The tolerant
+  call is the one whose failure is ordinary ("origin does not exist" on a
+  submodule git chose not to give a remote), and tightening it without first
+  measuring which exit codes git actually produces there would trade a quiet
+  leak for a loud false refusal mid-matrix. What is missing is the
+  measurement, not the fix (broadening 6, final review).
+
 - [ ] **Record the Sonnet transport asymmetry as a §6.4 confound.** Sonnet 5
   signs SigV4 against bedrock-runtime while all three candidates go through the
   mantle passthrough. Different code path, different request shape: on runtime,

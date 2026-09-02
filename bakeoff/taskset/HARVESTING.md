@@ -384,14 +384,25 @@ rather than by reasoning:
   paragraph.
 - **Submodules are supported, with three limits.**
   - The path, url and pinned commit are derived from `base_sha` — nothing goes
-    in the manifest. Two git readers must agree (`git ls-tree` for the
-    gitlink, `.gitmodules` for the url), and a task where they do not is
-    refused at load.
+    in the manifest. Two git readers are involved (`git ls-tree` for the
+    gitlink, `.gitmodules` for the url) and the two directions of disagreement
+    are **not** symmetric: a gitlink with no `.gitmodules` url is refused at
+    load, because that directory would simply stay empty and `git status
+    --porcelain` reports the tree as clean throughout. The reverse — a stanza
+    naming no gitlink — is inert and is recorded rather than refused (last
+    bullet).
   - The url must be `https://`. Relative (`../x.git`), `ssh://`, `git@…` and
     `file://` are refused; a repository whose `.gitmodules` uses a relative
     url is currently out, and that is a deferral rather than a judgement
     (`TASKS.md`).
   - Nested submodules are refused.
+  - **`strip_paths` may not touch a submodule, from above or below.** Both
+    `vendor/libdep` and `vendor` (with the gitlink at `vendor/libdep`) are
+    refused at load. The strip runs against a start state where the submodule
+    is not yet initialised, so it removes the gitlink and leaves `.gitmodules`
+    naming a path that no longer exists — and materialization then chdirs into
+    a directory that was never created. A repository whose vendored tree has
+    to go is not a candidate; strip a sibling directory instead.
   - **A task whose fix touches submodule content is out.** Measured
     2026-09-01: `git add -A` stages nothing for an uncommitted edit inside a
     submodule, so a submission diff is zero bytes for it; an agent that
@@ -404,12 +415,17 @@ rather than by reasoning:
     ` M <path>`, which is preflight's clean-tree NO-GO, and `gitignore_extra`
     cannot fix it — that key writes the superproject's `.gitignore`, and the
     rule would have to live inside the submodule's own tree.
-  - **A suite, a conftest or an `image.build` step that runs
-    `git submodule update` itself is out.** The submodule is already
-    populated before the container starts, the container has no route off
-    the host, and the `.gitmodules` url the run tree carries is the truthful
-    upstream https one — so the command fails, and it fails inside a suite
-    whose exit code the gate reads as the task's own.
+  - **A suite, a conftest or an `image.build` step that runs `git submodule
+    update --remote`, or deinits first, is out.** A *plain* `git submodule
+    update` is fine and this bullet used to claim otherwise: measured
+    2026-09-01, the submodule is registered in `.git/config` and already at
+    its gitlink before the container starts, so the command has nothing to
+    fetch and exits 0 with no network. What is out is any form that needs the
+    remote — `--remote` resolves the branch upstream, and a `deinit` (or a
+    wiped `.git/modules`) makes a subsequent `update` a clone. The container
+    has no route off the host and the `.gitmodules` url the run tree carries
+    is the truthful upstream https one, so those forms fail, and they fail
+    inside a suite whose exit code the gate reads as the task's own.
   - **An orphaned `.gitmodules` stanza is fine.** A `path` naming no gitlink
     is inert (never listed, never fetched, no directory created); preflight
     records it as `submodules_orphaned` and nothing refuses it.
