@@ -71,8 +71,12 @@ def test_the_oracle_version_moved_with_what_derivation_means():
     a quarantine cached under 2 was derived by rules that could not classify a
     node run at all, and whose "the quarantine swallowed the whole p2p list"
     guard depended on pytest's exit 5 -- which vitest and jest answer with 0
-    and a report of every test reported skipped."""
-    assert ORACLE_VERSION == "3"
+    and a report of every test reported skipped. 3 -> 4 is
+    `pytest_adapter._FAILED_LINE` learning `SUBFAILED` (fix 3, 2026-09-02): a
+    p2p node that flakes only through `unittest.subTest` was invisible to
+    `_classify`'s set on both reference runs under 3 and could never land in
+    the quarantine."""
+    assert ORACLE_VERSION == "4"
 
 
 def test_both_runs_green_yields_empty_quarantine():

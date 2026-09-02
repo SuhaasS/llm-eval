@@ -25,6 +25,7 @@ from bakeoff.runners import (
     RunnerAdapter,
     for_framework,
 )
+from bakeoff.runners.pytest_adapter import failed_node_ids
 
 def test_the_manifest_allowlist_and_this_registry_cannot_disagree():
     """`tasks._FRAMEWORKS` is what a manifest's `tests.framework` is validated
@@ -318,6 +319,98 @@ def test_pytest_classify_reports_the_failed_node_ids():
     )
 
     assert outcome.failed_ids == {"tests/a.py::test_one", "tests/b.py::test_two"}
+
+
+def test_failed_node_ids_reads_a_subfailed_line():
+    """Fix 3. pytest 9's core-integrated subtests print `SUBFAILED(label) <id>
+    - <msg>` for a failing `unittest.subTest`, never `FAILED <id>`, for a node
+    whose ONLY failures are subtest failures -- measured 2026-09-02 against
+    the pinned eval image's pytest 9.1.1. A node's failure must map to its own
+    id regardless of how many subtests failed under it, so the node id is the
+    fact and the label is noise."""
+    output = (
+        "SUBFAILED(i=0) tests/x.py::T::test_sub - AssertionError: 0 != 1\n"
+        "1 failed, 2 subtests passed in 0.01s\n"
+    )
+
+    assert failed_node_ids(output) == {"tests/x.py::T::test_sub"}
+
+
+def test_failed_node_ids_collapses_two_subfailed_lines_for_one_id():
+    """Two failing subtests under the same node print two SUBFAILED lines --
+    measured -- and both must resolve to the SAME node id, not two."""
+    output = (
+        "SUBFAILED(i=0) tests/x.py::T::test_sub - AssertionError: 0 != 1\n"
+        "SUBFAILED(i=2) tests/x.py::T::test_sub - AssertionError: 2 != 1\n"
+        "2 failed, 1 subtests passed in 0.01s\n"
+    )
+
+    assert failed_node_ids(output) == {"tests/x.py::T::test_sub"}
+
+
+def test_failed_node_ids_reads_the_positional_subtest_label_shape():
+    """Measured 2026-09-02: a keyword `subTest(i=i)` labels its SUBFAILED line
+    `(i=0)`; a positional `subTest(i)` labels it `[0]` instead -- pytest picks
+    the bracket by the subtest's OWN call shape, not by anything the adapter
+    controls, so both must be accepted."""
+    output = "SUBFAILED[0] tests/x.py::T::test_sub_no_kwargs - AssertionError: 0 != 1\n"
+
+    assert failed_node_ids(output) == {"tests/x.py::T::test_sub_no_kwargs"}
+
+
+def test_failed_node_ids_reads_a_subfailed_beside_a_failed_for_different_ids():
+    """A plain node failure and a subtest-only node failure in the same run
+    are two different facts and both must survive."""
+    output = (
+        "FAILED tests/a.py::test_plain - AssertionError: x\n"
+        "SUBFAILED(i=1) tests/x.py::T::test_sub - AssertionError: 1 != 0\n"
+    )
+
+    assert failed_node_ids(output) == {
+        "tests/a.py::test_plain",
+        "tests/x.py::T::test_sub",
+    }
+
+
+def test_failed_node_ids_does_not_read_a_subfailed_as_an_arbitrary_prefix():
+    """There is no `SUBERROR`: measured 2026-09-02, a bare exception raised
+    inside a `subTest` block (not just a failing assertion) is STILL labelled
+    `SUBFAILED` by pytest 9.1.1, so no second alternative belongs in the
+    regex. And a hypothetical `SUBPASSED` line -- pytest prints none under
+    `-q`, but the regex must not accept one by accident -- must not be read as
+    a failure: only the literal `SUBFAILED` alternative is in `_FAILED_LINE`,
+    so a node whose subtests all pass (no FAILURES entry, no summary line
+    naming it at all) stays absent from the set."""
+    output = "SUBPASSED(i=0) tests/x.py::T::test_ok - ok\n"
+
+    assert failed_node_ids(output) == set()
+
+
+def test_failed_node_ids_still_excludes_the_colon_not_found_case():
+    """The pre-existing `ERROR: not found:` refusal must survive the widened
+    alternation untouched -- a manifest typo still stops the matrix rather
+    than reading as a passed check."""
+    output = "ERROR: not found: /repo/tests/a.py::test_gone\n\nno tests ran in 0.00s\n"
+
+    assert failed_node_ids(output) == set()
+
+
+def test_pytest_classify_is_failed_when_only_subtests_failed():
+    """The end-to-end shape: exit 1 with SUBFAILED-only output must classify
+    as KIND_FAILED and carry the node id in `failed_ids`, exactly as a plain
+    FAILED line would."""
+    outcome = for_framework("pytest").classify(
+        exit_code=1,
+        stdout=(
+            "SUBFAILED(i=0) tests/x.py::T::test_sub - AssertionError: 0 != 1\n"
+            "1 failed, 2 subtests passed in 0.01s\n"
+        ),
+        stderr="",
+        report=None,
+    )
+
+    assert outcome.kind == KIND_FAILED
+    assert outcome.failed_ids == {"tests/x.py::T::test_sub"}
 
 
 def test_pytest_classify_explains_every_kind_it_returns():

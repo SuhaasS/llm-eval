@@ -216,7 +216,27 @@ from bakeoff.tasks import (
 #: directory; a verdict changes only for a task with a submodule under a
 #: declared test prefix, which today's corpus does not carry outside the
 #: fixture this fix adds.
-GRADER_VERSION: str = "7"
+#:
+#: 7 -> 8: `pytest_adapter._FAILED_LINE` learned `SUBFAILED` (fix 3,
+#: 2026-09-02). PASS/FAIL in `_check_f2p`/`_check_p2p` is decided off
+#: `outcome.kind`, which pytest's exit code alone determines, so a `subTest`
+#: -only failure was already graded F2P_FAILED / P2P_REGRESSION correctly
+#: under 7 -- the version does not move to fix a flipped verdict there. It
+#: moves for two things this regex also feeds: `state.f2p_failed_node_ids`
+#: and `p2p_failed_node_ids` are OBSERVATION, stored beside the verdict as
+#: the failing ids, and under 7 they came back silently empty on a
+#: `subTest`-only failure -- a well-formed verdict with a lying evidence
+#: field, the shape CLAUDE.md names "absence recorded, never implied". And
+#: `_check_p2p` deselects `oracle.quarantined`, which `oracle._classify`
+#: derives through this same regex (`ORACLE_VERSION` below) -- so under 7 a
+#: p2p node that flakes only through `subTest` could be missing from the
+#: quarantine, left selected, and fail the regression check on a submission
+#: that never touched it: a real P2P_REGRESSION flip, reached through the
+#: oracle rather than through this file's own parsing. It costs a full
+#: re-grade into a fresh `v8` artifacts directory; a verdict changes only for
+#: a task whose f2p or p2p ids fail through `subTest`, which today's corpus
+#: carries as `sqlglot-6927-dremio-trycast`.
+GRADER_VERSION: str = "8"
 
 #: Wall clock for the HOST-side gitleaks scan, and for nothing else.
 #: `_ContainerEnv.scan_secrets` shells out to `docker run` rather than through

@@ -94,7 +94,20 @@ from bakeoff.tasks import materialize
 #: skipped. No quarantine on today's corpus changes: every stored task is a
 #: pytest one and the pytest adapter maps each exit code onto the kind this
 #: derivation already branched on.
-ORACLE_VERSION: str = "3"
+#:
+#: 3 -> 4: `pytest_adapter._FAILED_LINE` learned `SUBFAILED` (fix 3,
+#: 2026-09-02). `_classify` takes `set(outcome.failed_ids)` straight from that
+#: regex on `KIND_FAILED`, and `derive_quarantine` XORs the two reference
+#: runs' sets -- so a p2p node that flakes only through `unittest.subTest`
+#: under pytest's core-integrated subtests (pytest >= 9) was invisible to
+#: both runs' sets under 3 and could never land in the quarantine, whatever it
+#: did across the two references. A quarantine derived under 3 for a task with
+#: such a node silently omits it, and `_check_p2p` then leaves it selected at
+#: grade time -- P2P_REGRESSION on a submission the flaky node never touched.
+#: No quarantine on today's corpus changes retroactively without a re-run:
+#: the fix widens what the SAME two reference runs can report, so a cached
+#: verdict must be re-derived, not merely re-read, to pick it up.
+ORACLE_VERSION: str = "4"
 
 #: preflight's pytest exit meanings plus the codes the `timeout` wrapper and
 #: the shell contribute. Non-{0,1} is refused whatever the code, but the

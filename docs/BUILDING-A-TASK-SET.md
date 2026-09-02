@@ -347,8 +347,23 @@ fail are your `f2p` list, verbatim node ids:
 ```bash
 git checkout --detach <base_sha>
 git apply <(git diff <base_sha> <merge_commit> -- tests/)
-python -m pytest -q -p no:cacheprovider tests/ 2>&1 | grep -E '^(FAILED|ERROR)'
+python -m pytest -q -p no:cacheprovider tests/ 2>&1 | grep -E '^(FAILED|ERROR|SUBFAILED)'
 ```
+
+**A `SUBFAILED` line still names the id to declare, and the id is the part
+before the label.** pytest's core-integrated subtests (pytest >= 9; the base
+image pins 9.1.1) report a failing `unittest.subTest` as `SUBFAILED(label)
+<node id> - <msg>` or `SUBFAILED[label] <node id> - <msg>` — measured
+2026-09-02 against `sqlglot-6927-dremio-trycast`, whose `validate_all` helper
+wraps every assertion in `subTest` — never as `FAILED <node id>` for a node
+whose only failures are subtest failures. The label (`(i=0)`, `[0]`) is which
+iteration failed, not part of the id; declare the **node id** exactly as it
+appears after the label, the same id `--collect-only` would print for that
+test, and copy it once even if several `SUBFAILED` lines name the same node.
+The gate folds every `SUBFAILED` line for a node back onto that node's id, so
+a `subTest`-only failure gates red exactly like a plain `FAILED` line does —
+but only since preflight learned to parse it (fix 3); an f2p id measured this
+way against an older preflight reads as a false NO-GO.
 
 **If that command prints `ERROR <module>` with no `::` and nothing else, the
 test half does not import at the start state** — the PR adds a symbol its tests

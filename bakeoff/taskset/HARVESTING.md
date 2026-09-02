@@ -113,6 +113,17 @@ Runs inside the pinned image, before the proxy starts.
   that simply does not exist also gives **4** but reports no `ERROR <module>`
   line at all — which is how the gate keeps a manifest typo separate from a
   task shape.
+- **A failing `unittest.subTest` counts as the NODE failing, not as no
+  failure at all.** pytest 9's core-integrated subtests (folded into core in
+  9.0; the base image pins 9.1.1) print `SUBFAILED(label) <node id> - <msg>`
+  for each failing subtest instead of a `FAILED <node id>` line for the node
+  — measured 2026-09-02 (`sqlglot-6927-dremio-trycast`, whose `validate_all`
+  helper wraps every assertion in `subTest`). The parser folds every
+  `SUBFAILED` line for a node back onto that one node id, so a task whose f2p
+  id fails only through `subTest` still gates GO at the before-check and the
+  whole node — every subtest under it — must be green after the reference
+  fix for the after-check to pass; one remaining `SUBFAILED` there is still a
+  failed f2p id, not a partial credit.
 - p2p exits 0 at the start state. A regression check against an already-red
   suite cannot mean anything, and on a collection-error task it is the *only*
   observation of the rest of the suite before the fix. Preflight passes

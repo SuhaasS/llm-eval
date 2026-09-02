@@ -1892,6 +1892,23 @@ MUTATIONS = [
         "tests/test_tasks.py -k sharing_a_full_name",
         "not integration",
     ),
+    (
+        # Fix 3, 2026-09-02: pytest 9's core-integrated subtests report a
+        # `unittest.subTest` failure as `SUBFAILED(label) <id> - <msg>`, never
+        # `FAILED <id>`, for a node whose only failures are subtest failures.
+        # Reverting to the two-alternative regex is the exact PREFLIGHT_VERSION
+        # 11 defect: `failed_node_ids` comes back empty on a run whose own exit
+        # code is 1, and preflight's before-check reads a declared f2p id that
+        # genuinely failed as never having failed -- measured against
+        # `sqlglot-6927-dremio-trycast`, whose `validate_all` helper wraps
+        # every assertion in `subTest`.
+        "runners: stop reading SUBFAILED, restoring the false NO-GO on subTest",
+        "src/bakeoff/runners/pytest_adapter.py",
+        r'    r"^(?:FAILED|ERROR|SUBFAILED(?:\([^)\n]*\)|\[[^\]\n]*\])?)\s+(\S+)",',
+        r'    r"^(?:FAILED|ERROR)\s+(\S+)",',
+        "tests/test_runners.py -k a_subfailed_line",
+        "not integration",
+    ),
 ]
 
 

@@ -1265,6 +1265,40 @@ def test_an_ordinary_red_task_records_the_other_red_kind(monkeypatch, tmp_path):
     assert all("--ignore" not in " ".join(argv) for argv in container.p2p_argvs)
 
 
+def test_a_declared_f2p_id_failing_only_through_subtest_still_gates_go(
+    monkeypatch, tmp_path
+):
+    """Fix 3's regression. sqlglot's `validate_all` wraps each assertion in
+    `unittest.subTest`, and pytest 9's core-integrated subtests report a
+    subtest-only failure as `SUBFAILED(label) <id> - <msg>` rather than
+    `FAILED <id>` -- measured 2026-09-02. Under `PREFLIGHT_VERSION` 11 that
+    line matched neither `FAILED` nor `ERROR`, `failed_node_ids` came back
+    empty on a run whose exit code was 1, and `missing = set(tests.f2p) -
+    set(red_outcome.failed_ids)` read the declared id as never having failed
+    -- a NO-GO on a task the start state genuinely proves red (measured in
+    `w1-sqlglot-6927.md`: `f2p_before_exit: 1, f2p_red_kind: "failed"` beside
+    a refusal reading "declared f2p tests did not fail at the start state").
+    A fake runner that reports exit 1 with ONLY SUBFAILED lines for the
+    declared f2p id must now pass the before-check."""
+    task = _FakeTask()
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=task.tests, present=("tests/",),
+        f2p_before=_Exec(
+            exit_code=EXIT_TESTS_FAILED,
+            stdout=(
+                "SUBFAILED(i=0) tests/a.py::test_one - AssertionError: 0 != 1\n"
+                "SUBFAILED(i=2) tests/a.py::test_one - AssertionError: 2 != 1\n"
+                "2 failed, 1 passed, 2 subtests passed in 0.01s\n"
+            ),
+        ),
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert result.ok, result.problems
+    assert result.evidence["f2p_red_kind"] == "failed"
+
+
 def test_a_collection_error_with_a_red_p2p_is_still_refused(monkeypatch, tmp_path):
     """The second conjunct, and what it does and does not rule out.
 
@@ -2133,7 +2167,7 @@ def test_the_preflight_version_moved_with_the_new_assertion():
     this number exists to let a reader rule out."""
     from bakeoff.preflight import PREFLIGHT_VERSION
 
-    assert PREFLIGHT_VERSION == "11"
+    assert PREFLIGHT_VERSION == "12"
 
 
 # --- every submodule is initialised at its gitlink ---------------------------

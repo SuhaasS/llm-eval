@@ -69,7 +69,30 @@ _EXIT_MEANING = {
     124: "the command hit the suite timeout (budget.suite_timeout_s)",
 }
 
-_FAILED_LINE = re.compile(r"^(?:FAILED|ERROR)\s+(\S+)", re.MULTILINE)
+#: `SUBFAILED` joins the alternation for the same reason `ERROR` is already
+#: in it: pytest 9's core-integrated subtests (subtests were folded into core
+#: in 9.0) print one `SUBFAILED<label> <node id> - <msg>` line per FAILING
+#: subtest instead of a `FAILED <node id>` line for the node, so a node whose
+#: only failures are subtest failures used to vanish from `failed_node_ids`
+#: entirely -- reported set empty, exit code 1, and preflight's own
+#: contradiction message ("declared f2p tests did not fail at the start
+#: state") on a run that plainly failed. Measured 2026-09-02 against the
+#: pinned eval image's pytest 9.1.1: the label is `(i=0)` for a keyword
+#: `subTest(i=i)` and `[0]` for a positional `subTest(i)`, with NO space
+#: between `SUBFAILED` and the label and no colon before the node id (unlike
+#: `ERROR: not found:`, which the alternation must keep excluding) --
+#: `[^)\n]*` / `[^\]\n]*` bound the label to one line so a stray unmatched
+#: bracket in a subtest's own `-` message can never swallow the node id past
+#: it. There is no `SUBERROR`: the same measurement raised a bare `ValueError`
+#: (not an assertion) inside a `subTest` block and pytest still labelled the
+#: line `SUBFAILED`, so no second alternative was added for a shape that does
+#: not occur. A node all of whose subtests pass prints no FAILURES entry and
+#: no summary line at all (measured) -- absent from `failed_node_ids`, as a
+#: passing node must be.
+_FAILED_LINE = re.compile(
+    r"^(?:FAILED|ERROR|SUBFAILED(?:\([^)\n]*\)|\[[^\]\n]*\])?)\s+(\S+)",
+    re.MULTILINE,
+)
 
 #: The `-q` summary line: the FINAL non-empty line of pytest's stdout, ending
 #: in a duration. Measured against the eval image's pytest 9.1.1 on

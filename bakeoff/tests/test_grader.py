@@ -1180,10 +1180,14 @@ def test_the_grader_version_moved_with_what_check_5_means():
     `_check_test_restore` excluding a `160000`-mode gitlink under a declared
     test prefix from the `git rm`/`git checkout` restore, so a submodule
     task's `not_graded_reason: environment_error` at `test_restore` is no
-    longer what a genuine fix reads as."""
+    longer what a genuine fix reads as; 7 -> 8 is `pytest_adapter._FAILED_LINE`
+    learning `SUBFAILED` (fix 3, 2026-09-02), which changes the stored
+    `f2p_failed_node_ids`/`p2p_failed_node_ids` evidence on a `subTest`-only
+    failure and, through the oracle's quarantine, can change check 6's
+    verdict on a task whose p2p flake takes that shape."""
     from bakeoff.grader import GRADER_VERSION
 
-    assert GRADER_VERSION == "7"
+    assert GRADER_VERSION == "8"
 
 
 def test_the_grade_says_which_runner_produced_its_numbers():

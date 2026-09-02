@@ -149,7 +149,19 @@ _PYTEST_ADAPTER = for_framework("pytest")
 #: meaning two different things in them, which is exactly what a reader uses
 #: this number to rule out. The gate's GO/NO-GO is unchanged across 10 -> 11;
 #: what moved is what a stored verdict's evidence can be read to say.
-PREFLIGHT_VERSION: str = "11"
+#:
+#: 11 -> 12: `pytest_adapter._FAILED_LINE` learned `SUBFAILED` (fix 3,
+#: 2026-09-02). A v11 verdict was a false NO-GO on any task whose f2p id fails
+#: only through `unittest.subTest` under pytest's core-integrated subtests
+#: (pytest >= 9): the node's failure printed as `SUBFAILED(label) <id> - ...`
+#: rather than `FAILED <id>`, `failed_ids` came back not containing that id,
+#: and the before-check's "declared f2p tests did not fail at the start
+#: state" fired on a run whose own exit code was 1 -- the Phase 0c
+#: contradiction this gate exists to prevent, reintroduced by the parser
+#: rather than the image. A cached v11 PASS is unaffected (a v11 gate that
+#: passed still passed for the right reason); a cached v11 NO-GO on a subtest
+#: task is stale and must be re-run under 12 to be believed.
+PREFLIGHT_VERSION: str = "12"
 
 
 def preflight_cache_key(task, image: str, start_sha: str) -> str:
