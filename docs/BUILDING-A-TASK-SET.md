@@ -383,6 +383,24 @@ bare module or class). The grader's quarantine refusal compares declared ids
 against quarantined ids and is exact only while every entry names one item; a
 non-leaf entry makes that refusal fail open and the graded run exits 5.
 
+For a vitest task, the recipe is the same idea and a different reporter — run
+it inside the task image, at the start state:
+
+```bash
+# inside the task image, at the start state
+/node_modules/.bin/vitest run --no-cache --reporter=json \
+    --outputFile=/tmp/r.json tests/
+node -e 'const r=require("/tmp/r.json");
+  for (const s of r.testResults) for (const a of (s.assertionResults||[]))
+    if (a.status==="failed") console.log(s.name.replace("/repo/","")+"::"+a.fullName)'
+```
+
+**A `-t` pattern matching nothing exits 0 with every test skipped, so an id
+you typed from the source rather than read from a run is a silent no-op** —
+this is not optional. There is no pytest-style exit 4 to catch the typo; the
+run reports success and the id you invented never gets a verdict from any
+arm.
+
 ### 3.5 Write `task.yaml`
 
 Copy the annotated one at
@@ -499,6 +517,31 @@ start state) but it does move the image id, so preflight re-runs. Read
 `HARVESTING.md`'s Layer 2 bullet before cutting a property-based task at all:
 determinism makes the oracle reproducible, not correct, and the draw is a
 function of the tree the agent is editing.
+
+A vitest task declares `tests.framework`, a node-shaped `runner`, node ids
+carrying the reporter's `fullName` after `::`, and `image.node` instead of
+`image.python`:
+
+```yaml
+tests:
+  paths: ["tests/"]
+  framework: vitest                     # pytest (default) | vitest | jest
+  runner: ["/node_modules/.bin/vitest", "run", "--no-cache"]
+  f2p: ["tests/formatting.test.ts::HelpFormatter writes usage with no args"]
+  p2p: []
+
+image:
+  node: "22"                            # QUOTED. {"22"} today
+  build: ["sh", "-lc", "npm install --prefix / --omit=dev lodash@4.17.21"]
+```
+
+`framework` and `runner` are cross-checked, not derived from each other, so
+either one catches a typo in the other. `image.node` and `image.python` are
+mutually exclusive — the runtime comes from `tests.framework`, and declaring
+the key belonging to the other one is refused at load. See
+`HARVESTING.md`'s JavaScript screening subsection before cutting one of
+these: the `npm install`/`npm ci` and duplicate-`fullName` rules there are
+screening decisions, not manifest keys, and nothing downstream catches them.
 
 ### 3.6 Run the gate
 
@@ -725,6 +768,10 @@ raise.
 | one arm's cells are all `turns=0` and permanent | the per-arm abort streak should have caught it. Records are written under mode `"x"` and `run_id` is deterministic, so those rows cannot be rewritten — start a new event log |
 | a property-based task's preflight passes, then a later run of the same task NO-GOes with no manifest change | `image.env` never applied. Preflight reads it back with `printenv` since `PREFLIGHT_VERSION` 5, so the refusal names the key — rebuild the task image. A task edited without a `task_version` bump moves `manifest_digest` and need not move the image id |
 | a hypothesis task grades `resolved` for one arm and not another on submissions that look equivalent | expected, and not a bug in the harness. Hypothesis mines literals out of the modules the suite **imports** and feeds them into the example pool, so two correct-looking fixes are judged by different examples — measured, changing one integer literal in an imported module flipped six consecutive verdicts in each direction. The same literal in a non-imported file changes nothing. Prefer suites with exhaustive `@example`s (§4) |
+| a node task's f2p run exits 0 and reports every test skipped | a `-t` pattern matching no test. vitest and jest have no pytest-style exit 4 for this — measured, both exit **0** with a summary that reads like success. An f2p id typed from the source rather than read from a run (§3.4) is a silent no-op the gate will not catch |
+| a node task's dependency is missing in every arm, and `image.build` reported success | `node_modules` was installed under `/repo`. It is erased by the bind mount at run time — measured — the same way an editable pytest install avoids and a node one has no equivalent escape from; install at the container root instead (`npm install --prefix / --omit=dev <deps>`, HARVESTING.md) |
+| a node task's runner is exit 127 on every arm after a build that reported success | `npm ci` ran at the `/` prefix and deleted the pinned vitest/jest. Its documented contract is to remove `node_modules` before installing, and whether it fires depends on which `package.json`/`package-lock.json` pair npm resolves for the prefix and cwd — a convention that is right only under an unstated cwd. Use `npm install`, never `npm ci`, in `image.build` |
+| a node quarantine removes a test you never named, and `p2p_deselected` agrees | two tests share a `fullName` across files. `-t` matches the name alone and no flag scopes it to a file, so a quarantine of one silently deselects the other too — and the deselection count is not a check, because both really were skipped. Narrow `tests.paths`, or rename one of the titles in the task repo (HARVESTING.md's JavaScript screening subsection) |
 
 ---
 

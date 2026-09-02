@@ -3013,3 +3013,157 @@ assumption that being unblocked on submodules makes it usable — its other
 screening criteria are still unmeasured.
 
 Unit suite: 1338 passed, 52 deselected.
+
+## Broadening 7 — a second test runner (vitest/jest) — 2026-09-02
+
+A JavaScript or TypeScript repository can now be cut as a task. A manifest
+declares `tests.framework: vitest | jest` (default `pytest`, so no existing
+manifest changes), and every pytest-specific judgement — what an exit code
+means, how a failed id is parsed, how a selection and a deselection are
+spelled, what "nothing was collected" looks like — moved behind a **runner
+adapter** in a new package, `bakeoff/src/bakeoff/runners/`:
+`pytest_adapter.py` is today's logic moved verbatim (argv-byte-identical, and
+the existing argv-identity test was never edited); `node_adapter.py` is one
+classifier shared by both node frameworks, because the report shapes agree
+closely enough that a second, framework-specific branch would be a second
+thing that can be wrong about what happened. `preflight.py`, `oracle.py` and
+`grader.py` kept their structure and now call the adapter instead of
+branching on pytest's numbers. Node needs its own base image
+(`docker/eval-agent-node.Dockerfile`), so `images.base_tag`/`build_base_images`
+grew from a version key to a `(runtime, version)` key, derived from
+`tests.framework` rather than declared a second time — declaring the wrong
+runtime's `image.*` key is refused at load. `GradeRecord.framework` names
+which adapter produced a record's `f2p_failed_node_ids`,
+`p2p_failed_node_ids` and `p2p_deselected`, because the id shapes and the
+units differ per framework and a reader summing across a mixed task set
+needs to know which is which.
+
+**The measurements that drove each decision.** The full table is in the
+plan's Measurements section; these are the three that decided the shape of
+the adapter and would otherwise be re-derived by the next reader.
+
+- **M1 — the exit code carries no information.** Every measured failure shape
+  — a failing test, an unresolvable import, a syntax error, a nonexistent
+  file argument, a broken config file — exits **1** on both vitest 3.2.7 and
+  jest 30.5.0, exactly like a passing selection exits **0**. The row that
+  matters most has no pytest analogue: `-t '<pattern matching nothing>'`
+  exits **0** on both frameworks, reporting every test skipped, under a
+  summary that reads like success (`Tests 3 skipped (3)` /
+  `Tests: 3 skipped, 3 total`). pytest answers the same input with exit 4 and
+  `ERROR: not found:`. So a manifest naming a renamed f2p test, or an oracle
+  quarantine that swallowed the whole p2p list, is silently green on node —
+  which is the whole reason this adapter reads a JSON report instead of a
+  number, and why `Outcome.not_run` and `KIND_NOTHING_RAN` exist at all.
+- **M2 — the JSON report, per framework.** `vitest run --reporter=json
+  --outputFile=<f>` and `jest --json --outputFile=<f>` are a near-superset of
+  each other. Three consequences drove the classifier: `success` is not the
+  classifier (jest reports `success: true` while exiting 1 on "no test files
+  matched"); the load-error discriminator is portable and needs no
+  jest-specific key — a `testResults` entry with `status == "failed"` and an
+  **empty** `assertionResults` is a file that failed to load, on both
+  frameworks, on an import error and a syntax error alike; and it must be
+  checked **before** the failing-assertion branch, because one good file plus
+  one unloadable file reports three *passing* tests and zero failing ones —
+  read in the other order, a task whose f2p file stopped importing grades as
+  solved. And a **broken config file writes no report at all**, on either
+  framework, which is what makes an absent report the config-error signal
+  rather than an edge case to special-case.
+- **M8 — `node_modules` cannot be baked at `/repo`, and `/node_modules`
+  works.** The whole reason `pip install -e .` is correct in this codebase is
+  that site-packages survives the bind mount; node has no site-packages.
+  Measured: a Dockerfile that `npm install`s into `/repo/node_modules` shows
+  it PRESENT without the bind mount and GONE with the run tree mounted over
+  `/repo` — the exact defect the editable pytest install avoids, with no
+  node equivalent escape. Installing at the container root instead works,
+  measured with `NODE_PATH` **unset** and as the non-root **uid 1000**: node's
+  resolver walks up from the importing file (`/repo/tests/x.test.js` →
+  `/repo/node_modules` → `/node_modules`), the repo's own `vitest.config.js`
+  is still discovered, and `/node_modules` is not writable by the eval user.
+  `/node_modules/.bin` is not on `PATH` by default (a bare `vitest` is exit
+  127 while `npx vitest` works), so the node Dockerfile adds
+  `ENV PATH=/node_modules/.bin:$PATH`.
+
+**Task 5's real node-base build, pasted verbatim** (`docker build -f
+docker/eval-agent-node.Dockerfile --build-arg BASE_NODE_VERSION=22 -t
+bakeoff-eval-agent:base-node-22 .`, then a probe container):
+
+```
+vitest 3.2.7 pinned
+jest 30.5.0 pinned
+claude 2.1.220 pinned
+Successfully tagged bakeoff-eval-agent:base-node-22
+```
+
+```
+v22.23.2
+vitest/3.2.7 linux-arm64 node-v22.23.2
+3.2.7             <- vitest, from its package.json
+30.5.0            <- jest, from its package.json
+30.4.2            <- jest --version, the stale bundled string
+2.1.220 (Claude Code)
+1000
+/usr/bin/git
+/usr/bin/rg
+/usr/bin/timeout
+/node_modules/.bin/vitest
+/node_modules/.bin/jest
+3.2.7 30.5.0      <- the exported pins
+```
+
+The `jest --version` line is the reason neither in-Dockerfile pin assertion
+nor the `image.build` re-assertion (D15) reads `jest --version`: jest's CLI
+prints `@jest/core`'s bundled `getVersion()`, which stayed `30.4.2` while
+`npm install jest@30.5.0` resolved `jest`/`jest-cli`/`@jest/core` all to
+`30.5.0` — the CLI's own banner lags the package it ships. Both assertions
+read `node -p 'require(".../package.json").version'` instead, for vitest too
+once found, for the reason two probes answering one question in two shapes
+is how one of them quietly stops being checked.
+
+**What the review process corrected before any code was written.** The plan
+records a direct disagreement between an earlier reviewer's measurement and
+its own re-measurement of the same command, and resolves it by keeping both
+rather than picking a winner: *"The reviewer measured `npm ci --prefix /`
+removing `/node_modules/.bin/vitest`. Reproducing it here with the lockfile
+at `/repo` rather than at `/`, it did **not**."* Both are real — `npm ci`'s
+documented contract is to delete `node_modules` before installing, and
+whether it fires depends on which `package.json`/`package-lock.json` pair npm
+resolves for the given prefix and cwd, which a task author's `image.build`
+line decides by accident. The plan's own conclusion is that the disagreement
+*is* the finding, not a bug in either measurement: "a convention that is
+right only under an unstated cwd is not a convention" is why `HARVESTING.md`
+recommends `npm install` over `npm ci` and why D15's build-time
+re-assertion — not the recommendation — is what actually holds the line.
+That is also why the plan spends a whole adapter method (`p2p_args`) rather
+than composable `select`/`deselect` calls: M4's `-t` measurement found the
+two frameworks disagree in two different ways (vitest rejects a second `-t`
+outright; jest comma-joins it into a pattern matching nothing and exits 0),
+so a design built by composing two independently-correct pieces would have
+reproduced exactly the silent-wrong-argv class of bug this repo has already
+lost five drafts of a diff parser to — caught in review, before Task 1
+started, rather than found later as a fixture failure.
+
+**What was deliberately not built.** No `.pyc`-analogue mitigation in the
+node image — measured directly (overwrite a fix at the same byte count
+inside the same second, re-run): both frameworks went green, because
+`node_modules/.vite` is vite's dependency-optimiser cache, not a
+source-transform cache, and jest's cache is content-hash keyed. No third
+framework (mocha, `node --test`) — YAGNI, and each is a measured exit-code
+table plus a report shape. No property-based determinism check for the node
+frameworks — `TASKS.md` follow-up, and the two places in the code that cite
+it needed the entry adding, which this task did.
+
+**Versions.** `PREFLIGHT_VERSION` 9 → 10, `ORACLE_VERSION` 2 → 3,
+`GRADER_VERSION` 5 → 6, `GRADE_SCHEMA_VERSION` 1.2.0 → 1.3.0 (the additive
+`GradeRecord.framework`). `SCHEMA_VERSION` did not move — no `RunRecord`
+field was added or changed meaning. Task 9's live gate-and-grade run against
+a real vitest fixture task found two hazards no earlier task's fixtures could
+surface: a shared, `rmtree`'d-and-rematerialized run-tree path served stale
+by the Docker VM's mount cache roughly every other cycle (measured
+`[files], [], [files], []`), which reads as a passing measurement rather than
+a failure on both a node preflight and the offline grader; and
+`duplicate_full_names` / `scope_files_outside` evidence keys that changed
+from `[]` to `None` for a scoped run that wrote no report at all, without the
+`PREFLIGHT_VERSION` bump that change should have carried. Neither is closed
+here — see `TASKS.md`.
+
+Unit suite: 1506 passed, 61 deselected.

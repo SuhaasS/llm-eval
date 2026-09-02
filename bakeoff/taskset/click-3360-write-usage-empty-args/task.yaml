@@ -68,6 +68,26 @@ tests:
   # What splits reference.diff into the oracle the agent starts with and the
   # fix it is graded against.
   paths: ["tests/"]
+  # Which runner adapter reads this suite: pytest (the default), vitest or
+  # jest. It decides how "the tests failed" is told from "the environment is
+  # broken" -- pytest answers with its exit code, and the node frameworks
+  # cannot: measured 2026-09-01, vitest 3.2.7 and jest 30.5.0 both exit 1 for a
+  # failing test, an unresolvable import, a syntax error and a broken config
+  # alike, so their adapter reads a JSON report instead.
+  #
+  # framework: pytest
+  #
+  # A vitest task instead declares, and its f2p ids carry the reporter's
+  # fullName after `::` rather than a pytest node path:
+  #
+  #   framework: vitest
+  #   runner: ["/node_modules/.bin/vitest", "run", "--no-cache"]
+  #   f2p: ["tests/formatting.test.ts::HelpFormatter writes usage with no args"]
+  #
+  # and, under `image:`, the node base's major instead of image.python:
+  #
+  #   node: "22"
+  #
   # `-p no:cacheprovider` so the suite writes no .pytest_cache into the tree:
   # section 5.6 stages everything, so anything the test run drops lands in
   # every submission diff.

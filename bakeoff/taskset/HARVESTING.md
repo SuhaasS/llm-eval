@@ -41,13 +41,21 @@ Runs before anything builds.
 | `task_id` is unique in the set | `run_id` is `sha256(task|model|sample|attempt)`, so two tasks sharing an id collide in the event log — discovered at the far end of a matrix, after the tokens are spent |
 | `image.env` keys are in the allowlist (`CI`, `HYPOTHESIS_STORAGE_DIRECTORY`) and are not a key the harness itself sets; values carry none of `\n` `\r` `"` `\\` `$`; `HYPOTHESIS_STORAGE_DIRECTORY` is an absolute path outside `/repo` | an allowlist because a denylist would have to anticipate `CLAUDE_CODE_USE_BEDROCK`, which bypasses the proxy and leaves the wire log empty with the run still looking normal; a harness-owned key applying to preflight and the grader but overridden on the agent's own process — two environments for one task; a value that does not survive a generated `ENV KEY="value"` Dockerfile line; hypothesis writing into the tree the §5.6 submission diff is taken against |
 | `image.python`, when declared, is a quoted string in `{"3.11", "3.12", "3.13"}` | an unquoted `3.10` is the float `3.1` and an unquoted `3.11` is `3.11` — the version that reaches the build is the parser's, not the manifest's. An unlisted value is either a floating tag (two collections months apart on different interpreters, with nothing in the record saying which) or one that fails at the `FROM` with a registry error mid-build |
+| `tests.framework`, when declared, is one of `pytest` (default), `vitest`, `jest` | an unrecognised value would reach `for_framework` and raise a bare `KeyError` out of the middle of preflight, with no manifest path in the message |
+| `tests.runner`'s argv contains the declared framework's marker (`pytest`/`vitest`/`jest`) | the two keys catch each other's typo; a runner read by the wrong adapter is classified by the wrong rules, and on the node side no exit code says so — vitest and jest both exit 1 for a failing test and for a broken config alike |
+| a node `f2p`/`p2p` id is `<file>::<full test name>`, both halves non-empty, the file half has no leading `-` and no `..`/absolute component, and lies under a declared `tests.paths` prefix | `-t` matching no test exits **0** on both frameworks with every test reported skipped (measured), so an id outside the scope could never be deselected from the scoped p2p run, and nothing downstream would say so |
+| `image.python` is absent on a node task, and `image.node` is absent on a pytest task | the runtime is derived from `tests.framework`, never declared twice — a disagreement is a task gated in one interpreter and run in another |
+| `image.node`, when declared, is a quoted string in `_NODE_VERSIONS` (`{"22"}`) | an unquoted `22.10` is the float `22.1`; an unlisted value is a base nobody has built |
 
 ### Preflight — `src/bakeoff/preflight.py`
 
 Runs inside the pinned image, before the proxy starts.
 
-- `tests.runner` contains `pytest`. The red/green distinction is built on
-  pytest's exit codes and nothing else can currently supply it.
+- `tests.runner` contains the declared framework's marker (`pytest`,
+  `vitest` or `jest`). The red/green distinction is built on what the runner
+  reported, and each framework reports it differently — pytest through its
+  exit code, vitest and jest through a JSON report, because both of those
+  exit 1 for a test failure and for a broken config alike.
 - The image is non-root, `claude --version` matches the base pin, `git` and
   `rg` are present.
 - **`python --version` inside the image parses to the declared
@@ -113,6 +121,29 @@ Runs inside the pinned image, before the proxy starts.
   nothing to collect, this repo's test tree has no regression baseline outside
   that module and the task is refused. The refusal prints the argv it ran, so
   both are one glance apart.
+- **Every declared f2p id must have RUN, not merely not-failed (node only).**
+  pytest answers a selection matching nothing with exit 4; vitest and jest
+  answer it with exit **0** and every test reported skipped (measured
+  2026-09-01). After the f2p-before run, when the outcome is not a load error,
+  any id the report shows no terminal verdict for is refused — otherwise a
+  renamed or deleted f2p test reads as a green gate and then as a solved run on
+  every arm. Evidence key `f2p_before_not_run`.
+- **The scoped p2p run must not have left the declared scope (node only).**
+  A positional argument is a substring filter on vitest and a regex on jest,
+  not a path: measured, `vitest run tests/` also matched
+  `/repo/jtests/fail.test.cjs`. After the scoped run, every file it actually
+  touched must be under a declared `tests.paths` prefix (component-wise, never
+  `startswith`) — otherwise the scoped run stops doing the one thing it exists
+  for, which is keeping the agent's scratch files out of the regression check.
+  Evidence keys `scope_files_run` and `scope_files_outside`.
+- **`tests.runner` must carry the framework's cache flags (node only).**
+  `--no-cache` for vitest. Measured: `vitest run` writes
+  `<cwd>/node_modules/.vite` into the bind-mounted tree, and every JavaScript
+  repository's `.gitignore` carries `node_modules/` — which makes the
+  `git status` check below blind to it, unlike pytest's `.pytest_cache/`.
+  jest needs no flag; its default cache directory is already outside the tree
+  and it wrote nothing into the tree in any measured run. Evidence key
+  `runner_cache_flags`.
 - `git status` is clean after the suite runs. §5.6 stages everything, so
   anything the suite drops lands in every submission diff and diff size then
   measures the interpreter rather than the agent. Remedy is `gitignore_extra`
@@ -238,6 +269,83 @@ that passes Layer 1 and measures the wrong thing.
   module and an existing one leaves the existing module's ids unobservable, and
   the gate refuses rather than accept ids nobody checked. Split such a
   candidate, or cut the PR that touches one module.
+
+#### Screening a JavaScript or TypeScript repository
+
+Everything in this section is in addition to Layer 2's language-independent
+rules, not instead of them.
+
+- **The suite must be vitest or jest.** mocha, ava, `node --test` and a custom
+  runner have no adapter, and adding one is a measured exit-code table plus a
+  report shape, not a config entry. Check `package.json`'s `scripts.test`.
+- **The reporter must be available.** `vitest run --reporter=json --outputFile`
+  and `jest --json --outputFile` are built in and need no plugin, but a repo
+  that pins a custom reporter in its config can override the flag. Run both
+  once by hand and confirm a file appears.
+- **The tests must not reach the network.** Nothing in the eval container can
+  (the agent's network is `internal=True`), and a suite that fetches at import
+  time fails as a *load error*, which the gate reads as a broken image.
+- **`node_modules` is not yours to place, and the verb is `npm install`.** The
+  base image installs vitest and jest at `/node_modules` and puts
+  `/node_modules/.bin` on `PATH`; a task's own dependencies go through
+  `image.build` at the same prefix:
+
+      build: ["sh", "-lc", "npm install --prefix / --omit=dev <deps>"]
+
+  **Never `npm ci` at that prefix.** Its documented contract is to delete
+  `node_modules` before installing, and that is where the runners live;
+  whether it fires depends on which `package.json`/`package-lock.json` pair
+  npm resolves for the prefix and cwd, which your `image.build` line decides
+  by accident. And the branch that does *not* delete them is the worse one:
+  measured, `npm ci --prefix /` run from `/repo` resolved the **base's**
+  `/package.json`, kept the runners, and installed **none of your
+  dependencies** — a silent no-op that passes every build-time check and
+  surfaces as a load error at preflight, which the gate reads as a broken
+  image rather than as your manifest. The generated Dockerfile re-asserts the base's pinned runner
+  versions after your build steps, so a build that removes them **fails the
+  build** rather than reaching a model as exit 127 on every arm — but the
+  failure is yours to avoid, not the harness's to repair.
+
+  Anything installed under `/repo` is **erased by the bind mount at run time**
+  — measured — and will look like a missing dependency in every arm.
+- **No two tests under `tests.paths` may share a full name.** `-t` matches
+  `fullName` and knows nothing about which file a test came from, and there is
+  no flag that scopes a name pattern to a file. Two `it('works', …)` in two
+  files means a quarantine of one silently removes the other from the
+  regression check — and `p2p_deselected` agrees, because two tests really were
+  skipped. The loader refuses a collision between two *declared* ids; preflight
+  refuses a collision between any two *executed* ones. A repository whose suite
+  genuinely carries duplicate titles within one scope is **excluded**, unless a
+  narrower `tests.paths` separates them. Check before you cut:
+
+      vitest run --reporter=json --outputFile=/tmp/r.json tests/
+      node -e 'const r=require("/tmp/r.json"),s=new Map();
+        for (const f of r.testResults) for (const a of (f.assertionResults||[]))
+          { if (s.has(a.fullName) && s.get(a.fullName)!==f.name)
+              console.log("DUP:", a.fullName, s.get(a.fullName), f.name);
+            s.set(a.fullName, f.name); }'
+- **`tests.runner` must carry the framework's cache flags.** `--no-cache` for
+  vitest. Preflight refuses a manifest without them, because vitest writes
+  `node_modules/.vite` into the tree and your repo's `.gitignore` hides that
+  from the dirty-tree check.
+- **Node ids are `<file>::<full test name>`.** The name is the reporter's
+  `fullName`: every enclosing `describe` title and the test title, joined by
+  single spaces. Get it from a real run's JSON rather than by reading the
+  source — a `describe.each` or a template literal makes the two differ.
+- **`tests.paths` prefixes must not have a sibling they are a substring of.**
+  A positional argument is a substring filter on vitest and a regex on jest,
+  not a path: `tests/` matches `jtests/` too (measured). Preflight refuses a
+  scoped run that leaves the declared paths, and the remedy is a narrower
+  prefix.
+- **The suite must be deterministic, and nothing checks it here.** Preflight's
+  hypothesis probe is a Python-ecosystem check and answers nothing for
+  `fast-check` or `jest-fuzz`. If the suite is property-based, pin its seed in
+  the repo's own config and say so under `provenance`.
+
+The `npm install` vs `npm ci` rule and the duplicate-full-name exclusion above
+are both screening decisions a harvester makes before writing a manifest, not
+manifest keys — nothing in the loader or preflight can see a repository you
+have not yet cut a task from.
 
 ### Grading
 
@@ -382,6 +490,22 @@ rather than by reasoning:
   version verdict — the key exists for the candidates the screen has not reached
   yet, and a re-screen at a second version is what would populate this
   paragraph.
+- **The runtime is a second choice, derived from `tests.framework` rather
+  than declared.** A pytest task builds the python base above; a vitest or
+  jest task builds the node one, selected by `image.node` — closed, one entry
+  today:
+
+  | version | measured | node | vitest | jest | claude |
+  |---|---|---|---|---|---|
+  | `"22"` (default) | 2026-09-01 | v22.23.2 | 3.2.7 | 30.5.0 | 2.1.220 |
+
+  Adding a second entry is the same three steps as a python version, with one
+  extra: build `docker/eval-agent-node.Dockerfile` with `--build-arg
+  BASE_NODE_VERSION=<v>` and confirm the claude pin **and** both runner pin
+  assertions fire (the base re-asserts its own pins after `image.build`, so a
+  version that cannot install vitest or jest at the pinned string fails the
+  base build itself); add the string to `tasks._NODE_VERSIONS` with the date;
+  add the row here.
 - **Submodules are supported, with six limits.**
   - The path, url and pinned commit are derived from `base_sha` — nothing goes
     in the manifest. Two git readers are involved (`git ls-tree` for the
@@ -518,6 +642,12 @@ candidate's `base_sha` — green here does not guarantee green there, and
 preflight remains the gate. The PR column counts merged pull requests linked to
 an issue and created after 2024-01-01; it is an availability proxy only, since
 each candidate still needs the Layer 2 read.
+
+**No JavaScript or TypeScript repository has been screened yet.** The table
+below is Python-only because that is what the screen in
+`docs/BUILDING-A-TASK-SET.md` §2 has run against. An empty section is not a
+finding — it says the corpus has not been reached, not that nothing in it
+would pass.
 
 ### Clean — pass every mechanical gate
 

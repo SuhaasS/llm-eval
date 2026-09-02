@@ -808,6 +808,49 @@ one ends a multi-day run outright.
   that the `bedrock/` Sonnet arm still reports `client_request` because no openai
   param mapping runs on its path.
 
+- [ ] **A reused host run-tree path is served stale by the Docker VM's mount
+  cache, and it reads as a passing measurement rather than as a failure.**
+  Found while gating a real node task (broadening 7, Task 9). A path the
+  Docker VM does share — `rmtree`'d and re-materialized on the host between
+  containers — is served from a stale cache and comes up **empty** roughly
+  every other time: measured directly, four cycles of `ls /repo` inside a
+  freshly started container gave `[files], [], [files], []`. A vitest task
+  answers an empty tree with `No test files found` at exit 1, the same exit a
+  genuinely failing suite gives, so a shared run-tree path does not make a
+  node gate flaky — it makes it **pass while measuring nothing**. On the
+  offline grader the same emptiness becomes `APPLY_FAILED` → `resolved:
+  False`, an accusation against a submission the model actually produced. The
+  production call sites that reuse a host path this way: `grader.py`'s
+  `grade-tree/<run_id>` (a re-grade reuses it), `oracle.py`'s
+  `oracle-tree/<task_id>`, `grade.py`'s `grade-preflight-tree/<task_id>`, and
+  `run_matrix.py`. The integration test that found this worked around it
+  locally with a uuid per run tree plus a post-container `ls` post-condition
+  (`tests/test_integration_node_task.py`'s `_mounted`); neither landed in the
+  production paths above. The reviewed ruling was a defensive post-condition
+  in `RunContainer.__enter__` (`bakeoff/src/bakeoff/container.py`) — when the
+  host `repo_path` is non-empty, exec an `ls`/`find` inside the container
+  after start and raise `ContainerError` naming the bind mount if it comes
+  back empty — pinned by a unit test against the fake docker client already
+  used in `test_container.py`. That catches the symptom per container start;
+  it does not remove the cause, which is the four call sites above reusing
+  one path across containers instead of a uuid per tree. Neither the
+  post-condition nor the uuid change has landed as of `cc151c0`.
+
+- [ ] **A cached preflight verdict cannot tell which of two evidence shapes
+  produced it, because the version that should have moved did not.**
+  Broadening 7, Task 9 changed what `duplicate_full_names` and
+  `scope_files_outside` mean for a scoped run that wrote **no** report at all
+  — `[]` ("measured, nothing found") became `None` ("nothing was measured") —
+  which is exactly the class of change `PREFLIGHT_VERSION` exists to
+  invalidate a stale cache over. The review that found it ruled
+  `PREFLIGHT_VERSION` should move `"10"` → `"11"`; the shipped code still
+  pins `"10"` (a `test_preflight.py` assertion pins the literal, and
+  `preflight.py`'s own constant agrees), so a verdict cached before the fix
+  and one computed after it carry the identical version string. Neither is
+  wrong on its own — `[]` versus `None` is still the correct pair going
+  forward — but a reader cannot use the version alone to know which meaning a
+  stored `"10"` evidence blob is using.
+
 ---
 
 ## P2 — Derivation gaps (Gate 3; safe to close after collection)
@@ -1137,6 +1180,43 @@ judge runs after one — which is why they sit here rather than above.
   is built and gated, but claiming a yield improvement without this
   measurement would be the "report the gap, never estimate it" rule broken.
 
+- [ ] **No property-based determinism check exists for the node frameworks.**
+  Broadening 3 refuses a pytest task whose declared tests import `hypothesis`
+  with no `image.env: {CI: ...}` declared beside it, closing a gate a lucky
+  draw could otherwise pass through. Nothing equivalent exists for `fast-check`
+  or `jest-fuzz`: `node_adapter.py`'s `hypothesis_interpreter` returns `None`
+  for both node frameworks, and the docstring beside it — and
+  `test_runners.py`'s beside that — both cite this file as where the follow-up
+  is tracked. A node task with a seeded-by-clock property suite gates on
+  whichever draw preflight happens to run, exactly as a pytest one did before
+  broadening 3 closed it there.
+
+- [ ] **Two node ids with the same `fullName` in the SAME file are unguarded,
+  and it is a different gap from the cross-file one broadening 7 closed.**
+  `-t` matches `fullName` alone, so a JS/TS suite that genuinely has two
+  identically-titled tests in one file is indistinguishable to a selection or
+  a deselection targeting either one — but there is no way to *represent* that
+  as two different declared ids in the first place, since a node id is exactly
+  `<file>::<fullName>` with no positional index: both same-file duplicates
+  collapse to the identical string. `node_adapter.validate_id_set` (the
+  loader) and preflight's `duplicate_full_names` check (the real report) both
+  compare `(fullName, path)` pairs and only flag a collision when the `path`
+  differs — a same-file pair, where `path` agrees, passes both by
+  construction. A repo with this shape reads as clean at every gate and
+  silently over-selects or over-deselects whichever test the manifest names.
+
+- [ ] **`_check_p2p` has no `not_run` branch, and the data it would need is
+  structurally absent too.** `grader.py`'s `_check_f2p` reads
+  `outcome.not_run` and routes a non-empty set to `state.environment(...)`
+  rather than `state.fail(...)`, so a node id that stopped matching (M1:
+  `-t` matching nothing exits 0 with every test skipped) is not stamped on
+  the model. `_check_p2p`, forty-odd lines below, has no such branch — and it
+  would not fire if added, as written: `preflight._Runner.classify` only
+  fills `Outcome.not_run` when `self._selected` is set, and `_selected` is
+  written by `_Runner.select` alone; `_check_p2p` calls `pass_to_pass`, which
+  never touches it. So a p2p id that silently stopped matching is invisible
+  on both counts — no check reads it, and no code path populates it.
+
 ---
 
 ## P3 — Decisions to settle before numbers are published
@@ -1380,6 +1460,22 @@ These need a call, not code. Most are cheap to make and expensive to make late.
   plaintext values**, annotated in-file as an expired STS session superseded by
   the SSO profile. Inert and gitignored, but a real secret-key / session-token
   pair sitting on disk with no expiry tracking. Delete the lines.
+
+- [ ] **`images.py` carries two dead pieces from broadening 5's single-runtime
+  signature.** `_DEFAULT_PYTHON` (a module constant, restated from
+  `tasks._DEFAULT_PYTHON` for the import-cycle reason its own comment gives)
+  used to be `build_base_image`'s default argument; broadening 7 made the
+  runtime and version explicit at every call site, so the default is never
+  exercised. It is not fully unread, though — `test_images.py`'s
+  `test_every_copy_of_the_default_version_says_the_same_thing` still asserts
+  `images._DEFAULT_PYTHON == tasks._DEFAULT_PYTHON`, which is the drift pin
+  the constant exists for, so removing it would need that test rewritten
+  first, not just deleted. `build_base_image`'s `tag: str | None = None`
+  parameter is the other half: every caller in `bakeoff/src`, `scripts/` and
+  `tests/` passes only `(repo_root, runtime, version)`, so the parameter's
+  default is exercised on every call and its non-default branch never is.
+  Left in place when found (broadening 7, Task 5) to keep that diff to its
+  subject.
 
 ---
 

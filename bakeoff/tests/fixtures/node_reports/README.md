@@ -115,3 +115,10 @@ Neither produces a fixture; both are pinned by tests in `test_runners.py`.
    ignore array and runs **nothing**, at exit 1 with an empty `testResults`.
    `p2p_args` emits the scope before the flags for exactly this reason; the
    trailing `-t` is safe because it starts with `-`, which ends the array.
+3. **vitest's ignore flag is `--exclude=<path>`, the equals form, not a
+   space-separated pair.** Measured 2026-09-02 alongside jest's
+   `--testPathIgnorePatterns=<path>`: both frameworks are called with `=`,
+   and `p2p_args` emits it that way for both. Pinned in `test_runners.py`
+   (`test_node_ignore_flags_are_per_framework_and_jest_keeps_its_default`) as
+   the exact argv `["tests/", "--exclude=tests/x.js"]`, not a two-element
+   `["--exclude", "tests/x.js"]`.
