@@ -58,12 +58,34 @@ Runs inside the pinned image, before the proxy starts.
   did not happen puts the file in every arm's context and in every submission
   diff, and no later stage re-derives it. The probe is `-e` **or** `-L`, so a
   symlink whose target was stripped still counts as present.
-- f2p exits **1** at the start state — not `0` (already solved), not `2`/`4`/`5`
-  (broken environment) — and every declared f2p id appears in pytest's
-  FAILED/ERROR lines. Both halves matter: `returncode != 0` accepts a broken
-  environment as evidence the bug is present, which is the Phase 0c failure.
+- f2p is **red** at the start state, in one of two ways, and never `0` (already
+  solved). Either it exits **1** with every declared f2p id in pytest's
+  FAILED/ERROR lines, or it exits **4** (or **2**) because the modules holding
+  those ids could not be *collected* — accepted only when the reported `ERROR`
+  lines name **exactly** the declared f2p modules, no more and no fewer, and
+  p2p is green. Both halves matter: `returncode != 0` accepts a broken
+  environment as evidence the bug is present, which is the Phase 0c failure,
+  and the f2p run imports only the f2p modules, so the confinement parse alone
+  cannot tell a missing symbol from a missing interpreter. Measured 2026-09-01
+  against pytest 9.1.1 and 8.3.5: a *selected node id* whose module raises on
+  import gives **4**, a directory or module-path run gives **2**, and a node id
+  that simply does not exist also gives **4** but reports no `ERROR <module>`
+  line at all — which is how the gate keeps a manifest typo separate from a
+  task shape.
 - p2p exits 0 at the start state. A regression check against an already-red
-  suite cannot mean anything.
+  suite cannot mean anything, and on a collection-error task it is the *only*
+  observation of the rest of the suite before the fix. Preflight passes
+  `--ignore=<module>` for the erroring f2p modules on that one run — without it
+  the module aborts collection of the whole sweep and the baseline cannot be
+  read at all. That flag is on **no other run**: the graded p2p command is
+  unchanged. Two things to know when this refusal fires: the ignore paths come
+  from pytest's **rootdir**-relative `ERROR` lines while `--ignore` resolves
+  against the **working directory**, and a non-existent `--ignore` path is
+  accepted in silence (measured) — so a repo whose rootdir is not the working
+  directory gets a flag that no-ops. And if ignoring the erroring module leaves
+  nothing to collect, this repo's test tree has no regression baseline outside
+  that module and the task is refused. The refusal prints the argv it ran, so
+  both are one glance apart.
 - `git status` is clean after the suite runs. §5.6 stages everything, so
   anything the suite drops lands in every submission diff and diff size then
   measures the interpreter rather than the agent. Remedy is `gitignore_extra`
@@ -71,7 +93,9 @@ Runs inside the pinned image, before the proxy starts.
   in `start_sha`.
 - The solution half applies cleanly to the start state.
 - f2p exits 0 after the reference fix, and p2p still exits 0. If the reference
-  cannot pass, no submission can.
+  cannot pass, no submission can — and on a collection-error task this is
+  where the import must have started working. It is **not** relaxed to match
+  red-before.
 
 ---
 
@@ -102,22 +126,35 @@ that passes Layer 1 and measures the wrong thing.
   `scope_collected_nothing` record rather than as silence, which is why the
   shape is a requirement here instead of a check in code — the set is authored
   here, and the predicate cannot be made exact from ids alone.
-- **The test half must IMPORT cleanly at the start state.** A PR that adds a
-  new function and tests for it puts that symbol in the solution half, so the
-  test module raises `ImportError` during collection and pytest exits **2** —
-  the code Layer 1 reads as a broken environment, not as a present bug. The
-  task is then unusable however good it looks: preflight requires exit 1, and
-  relaxing that to `!= 0` is the Phase 0c failure it exists to prevent.
+- **Both import shapes are accepted, and they are different tasks.** A PR that
+  adds a new function and tests for it puts that symbol in the solution half,
+  so the test module raises `ImportError` during collection and pytest exits
+  **4** (a selected node id whose module will not import) rather than **1**.
+  Preflight refused that outright until broadening 2 and now accepts it, under
+  a narrow, measured condition: every reported `ERROR` line names a declared
+  f2p module, nothing else is reported, and p2p is green at the start state.
   Measured on `trucking-doc-extraction` #3, whose `test_redact_db_url.py`
   imports a redaction helper the fix introduces — `1 error during collection`,
   nothing else red.
 
-  The rule this hands you at screening time: **prefer a PR that CHANGES the
-  behaviour of an existing symbol over one that ADDS a symbol.** The first
-  fails at exit 1 with named assertions; the second cannot fail any other way
-  than at collection. Read the test half's import block before anything else —
-  if every name it imports already exists at `merge_commit^1`, the candidate
-  can still work; if any does not, it cannot.
+  **What differs is what the agent reads, and it is not a defect.** On an
+  exit-1 task the loop in §3.3 ends in an assertion message naming an expected
+  value; on a collection-error task it ends in `ImportError: cannot import name
+  'redact_db_url'`. That is exactly what the human who filed the issue saw, so
+  it is the workflow this eval exists to measure rather than a tidied one. Two
+  consequences worth knowing at screening time: a collection-error task gives
+  the agent *no* per-test signal until the import works, so partial credit is
+  coarser; and any cross-task view that reads `f2p_failed_node_ids` will find
+  **module paths** (no `::`) there rather than test ids on such a task.
+
+  **One thing the gate refuses, and it is easy to trip.** The acceptance is an
+  **equality**: every declared f2p module must appear in the ERROR set. A
+  collection error stops the run dead — measured, a selection spanning a broken
+  module and a failing test in a good module reports *only* the collection
+  error, and the failing test never runs — so an f2p set that spans a new
+  module and an existing one leaves the existing module's ids unobservable, and
+  the gate refuses rather than accept ids nobody checked. Split such a
+  candidate, or cut the PR that touches one module.
 
 ### Grading
 

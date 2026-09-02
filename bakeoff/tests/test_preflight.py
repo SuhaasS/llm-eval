@@ -907,8 +907,20 @@ _COLLECTION_ERROR_OUT = (
 )
 
 
+@pytest.mark.parametrize("exit_code,f2p_entry", [
+    # 4: `_Runner.select` passes node ids positionally, and pytest answers a
+    # selected node id whose module will not import with a usage error --
+    # this is the shape preflight's f2p run actually makes (row A).
+    (4, "tests/a.py::test_one"),
+    # 2: unpinned before this task -- reachable when an author declares a
+    # BARE MODULE as an f2p entry, so `_Runner.select` collects the module
+    # path rather than a node id and gets the collection-interrupted exit a
+    # directory/module-path run gives (row B). `f2p_modules` splits on "::"
+    # regardless, so the confinement equality holds identically either way.
+    (2, "tests/a.py"),
+])
 def test_an_f2p_module_that_will_not_import_is_accepted_when_p2p_is_green(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, exit_code, f2p_entry
 ):
     """The broadening. A PR that ADDS a symbol puts it in the solution half, so
     the test half cannot import at the start state and pytest exits 4 -- the
@@ -922,16 +934,16 @@ def test_an_f2p_module_that_will_not_import_is_accepted_when_p2p_is_green(
     `test_a_collection_error_after_the_reference_fix_is_still_a_refusal`).
     This container scripts all three healthy, which is what makes it a GO.
     """
-    task = _FakeTask()
+    task = _FakeTask(tests=_FakeTests(f2p=(f2p_entry,)))
     container = _ScriptedContainer(
         start_sha="s" * 40, tests=task.tests, present=("tests/",),
-        f2p_before=_Exec(exit_code=4, stdout=_COLLECTION_ERROR_OUT),
+        f2p_before=_Exec(exit_code=exit_code, stdout=_COLLECTION_ERROR_OUT),
     )
 
     result = _run_preflight(monkeypatch, tmp_path, task, container)
 
     assert result.ok, result.problems
-    assert result.evidence["f2p_before_exit"] == 4
+    assert result.evidence["f2p_before_exit"] == exit_code
     assert result.evidence["f2p_red_kind"] == "collection_error"
     assert result.evidence["f2p_collection_errors"] == ["tests/a.py"]
     assert result.evidence["p2p_before_ignored"] == ["tests/a.py"]

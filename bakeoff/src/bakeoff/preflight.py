@@ -611,6 +611,19 @@ def preflight(
                 + (green.stdout or green.stderr)[-2000:]
             )
         elif red.exit_code != EXIT_TESTS_FAILED:
+            # `collected` is `None` for two different reasons, and the message
+            # must not say "empty" for both: the parse ran and found nothing
+            # (exit code was a collection failure, but `collection_error_modules`
+            # saw no bare-module ERROR lines) versus the parse never ran at all
+            # (this exit code -- e.g. 5, EXIT_NOTHING_COLLECTED, or a timeout --
+            # is outside EXIT_COLLECTION_FAILURES). "empty" for the second case
+            # would read as "pytest reported nothing", when what actually
+            # happened is that this branch never looked.
+            reported_desc = (
+                sorted(collected) if collected
+                else "empty" if red.exit_code in EXIT_COLLECTION_FAILURES
+                else f"not parsed (exit {red.exit_code} is not a collection failure)"
+            )
             problems.append(
                 f"the f2p tests did not run at the start state -- "
                 f"{_explain(red.exit_code)}. This is the Phase 0c failure: a "
@@ -618,7 +631,7 @@ def preflight(
                 "reading the output cannot tell it from the bug. A collection "
                 "error IS accepted, but only when every reported ERROR names a "
                 "declared f2p module and no other, and here the reported set "
-                f"is {sorted(collected) if collected else 'empty'} against "
+                f"is {reported_desc} against "
                 f"declared {sorted(f2p_modules(tests.f2p))}.\n"
                 + (red.stdout or red.stderr)[-2000:]
             )

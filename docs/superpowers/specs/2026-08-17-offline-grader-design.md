@@ -186,7 +186,7 @@ records.
 | 2 | Test restore | see below | `apply_failed` |
 | 3 | Build | argv from the manifest's `grading.build`, else `not_configured` | `build_failed` |
 | 4 | Type check | argv from the manifest's `grading.typecheck`, else `not_configured` | `typecheck_failed` |
-| 5 | **F2P** | `_Runner.select(task.tests.f2p)` exits 0 | `f2p_failed` |
+| 5 | **F2P** | `_Runner.select(task.tests.f2p)` exits 0. A non-{0,1} exit whose reported `ERROR` lines are all bare module paths **contained in** the declared f2p modules is `f2p_failed` (the submission left an import broken — see broadening 2); anything else is an environment error | `f2p_failed` |
 | 6 | **P2P** | `pass_to_pass` scoped to `tests.paths`, quarantine deselected, exits 0 | `p2p_regression` |
 | 7 | Lint | argv from the manifest's `grading.lint`, else `not_configured` | `lint_failed` |
 | 8 | Secret scan | gitleaks over the submission's added lines, path-preserving, digest-pinned container | `secret_found` |
@@ -454,7 +454,10 @@ environment_error: str | None                # stderr head, free text
 environment_error_check: str | None          # which check — typed, not parsed
 f2p_declared: int | None                     # len(tests.f2p): configuration,
                                              # named as such
-f2p_failed_node_ids: tuple | None
+f2p_failed_node_ids: tuple | None            # on a collection error these are
+                                             # MODULE paths (no `::`) -- what
+                                             # pytest reported; a module is a
+                                             # node id, the collector node
 p2p_quarantine_requested: int | None         # len(quarantine): configuration
 p2p_deselect_requested: int | None           # what pytest was actually asked:
                                              # f2p + quarantine on the deselect

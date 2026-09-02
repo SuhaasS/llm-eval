@@ -268,13 +268,21 @@ and rejects a whole class of candidate:
 
 A PR that *adds* a function and tests for it puts that symbol in the solution
 half, so the test module raises `ImportError` during collection and pytest
-exits **2** — which preflight reads as a broken environment, not as a present
-bug. There is no way to rescue such a task; the exit-1 requirement is exactly
-the check that stops a broken environment counting as evidence the bug is
-there. Measured on `trucking-doc-extraction` #3.
+exits **4** (a selected node id whose module will not import; a directory run
+gives 2). Since `PREFLIGHT_VERSION` 4 that is an **accepted** task shape, under
+a narrow condition you can check by eye before cutting anything: the reported
+`ERROR` lines must name **exactly** the modules holding your declared f2p ids —
+so an f2p set that spans a module the PR adds *and* a module that already
+imports cannot work, because a collection error stops the run before the second
+module's tests are ever attempted. Measured on `trucking-doc-extraction` #3.
 
-The heuristic that follows: **prefer a PR that changes the behaviour of an
-existing symbol over one that adds a symbol.**
+What you are choosing between is what the agent reads: an assertion message on
+an exit-1 task, `ImportError: cannot import name …` on this one. Both are what
+the human who filed the issue read, so neither is the "wrong" kind of task —
+but an exit-1 task gives per-test signal from the first run and this one gives
+none until the import works, so **prefer a PR that changes the behaviour of an
+existing symbol when you have the choice**, and reach for this shape when you
+do not.
 
 Also reject: tests that are flaky, tests that depend on wall-clock time or
 network, and PRs whose "fix" is a version bump or a pure refactor.
@@ -331,6 +339,26 @@ git checkout --detach <base_sha>
 git apply <(git diff <base_sha> <merge_commit> -- tests/)
 python -m pytest -q -p no:cacheprovider tests/ 2>&1 | grep -E '^(FAILED|ERROR)'
 ```
+
+**If that command prints `ERROR <module>` with no `::` and nothing else, the
+test half does not import at the start state** — the PR adds a symbol its tests
+call. That is an accepted shape, and the ids still come from the **post-fix**
+run, never from the red one: the red run cannot name them, because a collection
+error stops pytest before anything is collected. Get them from the state the
+grader will grade:
+
+```bash
+git checkout --detach <merge_commit>
+python -m pytest -q -p no:cacheprovider tests/ | tail -3   # must be all green
+python -m pytest -q -p no:cacheprovider --collect-only -q <the new test module>
+```
+
+Every id `--collect-only` prints for the module(s) the PR adds is an f2p
+candidate. Then check the constraint the gate enforces: **every module holding
+a declared f2p id must be one of the modules that errored** in the red run. If
+the PR also changes a test in a module that already imports, that test's id
+cannot be in `f2p` for this task — a collection error hides it, so preflight
+would be accepting an id nobody checked, and it refuses instead.
 
 Copy those ids exactly. Preflight asserts every declared id appears in pytest's
 FAILED/ERROR lines at the start state, so a typo is caught — but a *missing* id
@@ -466,7 +494,9 @@ capability.
 | nothing under `tests.paths` | `tests.paths` does not match where this repo keeps its tests |
 | nothing left for the fix | every file landed in the test half or `allow_extra_paths` |
 | a rename crosses the test/solution boundary | the file would be both the agent's oracle and part of its submission. Pick a different PR |
-| f2p exits 2 / 4 / 5 at the start state | broken environment, not a present bug — missing dependency, collection error. Fix `image.pip` / `image.apt` |
+| f2p exits 5 at the start state, or 2/4 with `ERROR: not found:` | a declared node id does not exist — a typo, or the id changed shape (parametrization) |
+| f2p exits 2/4 and the reported `ERROR` modules are not exactly the declared f2p modules | a module errored that no f2p id names (broken environment: fix `image.pip`/`image.apt`), or a declared f2p module did not error (its ids are unobservable behind another module's collection error — narrow `f2p` to the modules that actually error, or pick a different PR) |
+| f2p could not be collected AND p2p is not green | the confinement parse cannot tell a missing symbol from a missing interpreter; p2p is the evidence that separates them, so fix the environment first |
 | f2p exits 0 at the start state | the test half did not actually land, or the bug is already fixed at `base_sha` |
 | a declared f2p id is not in FAILED/ERROR | typo, or the id changed shape (parametrization) |
 | p2p not green at the start state | a regression check against an already-red suite means nothing. Usually a missing dependency |
@@ -634,7 +664,9 @@ raise.
 | the agent cannot verify its own work | no test runner in the image, or the fixture is not importable. The eval measures a loop ending in "runs tests, sees failures, self-corrects"; without a runner it scores one unverified guess |
 | a fix is applied, the source is correct on disk, pytest is still red | stale `.pyc`. CPython invalidates on (mtime in whole seconds, size) and both halves are ordinary — an operator swap preserves byte count, and an agent edits and re-runs inside one second. The image sets `PYTHONDONTWRITEBYTECODE=1`; do not remove it |
 | a task passes preflight, then the dry run reports a huge `diff=` for an agent that edited nothing | a committed venv, build output or vendored tree tracked at `base_sha`. §5.6 stages everything, so it lands in every submission and diff size measures that tree. Preflight's tree-clean check only covers what the *suite* writes — screen with `git ls-tree -r --name-only <base_sha> \| wc -l` before cutting |
-| a candidate PR's f2p exits 2 at the start state with `error during collection` | the test half imports a symbol the fix introduces. Not repairable — pick a PR that changes an existing symbol instead (§3.1) |
+| a candidate PR's f2p exits **4** at the start state with `ERROR <module>` and no `::` | the test half imports a symbol the fix introduces. **Repairable — this is an accepted shape** if every reported `ERROR` names a declared f2p module, p2p is green there, and f2p goes green after the fix (§3.1, §3.4) |
+| a collection-error candidate is refused with "the rest of the suite is not green — no tests were collected" | ignoring the erroring module left the sweep empty: this repo's test tree holds no regression baseline outside that module. Not repairable by configuration; pick a PR in a repo with a wider suite |
+| a collection-error candidate is refused and the printed argv shows an `--ignore` that did not take | the ignore paths come from pytest's **rootdir**-relative `ERROR` lines and `--ignore` resolves against the **working directory**. They coincide when rootdir is `/repo`; a `pyproject.toml` in a subdirectory or a `--rootdir` in `tests.runner` breaks it |
 | `smoke_bedrock.py` reports `MISSING BAKEOFF_MANTLE_TOKEN` / `SKIP` on four arms | the gate reads the env var and does not mint a token; `run_matrix.py` derives one itself. Re-run with `--derive-mantle-token` before concluding anything about credentials (§1.6) |
 | the driver says creds are good for 12 h and they die in under one | static keys in `.env` expose no `_expiry_time`, so the window falls back to the mantle token's nominal TTL. The abort streaks are the real backstop; size the invocation yourself or use `AWS_PROFILE` (§1.6) |
 | turns, tokens and cost all zero in an otherwise fine record | a model name the price book does not know. `model_name` in `litellm_config.yaml` doubles as the `PRICE_BOOK` key |

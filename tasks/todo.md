@@ -2574,3 +2574,79 @@ Confound recorded in HARVESTING.md rather than in code: the humans who wrote
 the PR had the stripped file. A repository whose `CLAUDE.md` shaped how its
 contributors worked is not quite the repository the models are handed once it
 is gone, and that belongs in each manifest's comments as a §6.4 caveat.
+
+## Broadening 2 — f2p that cannot be COLLECTED at the start state — 2026-09-01
+
+A task whose fix ADDS a symbol has always had a real shape: the test half
+raises `ImportError` at the start state instead of an assertion failing, and
+preflight refused it outright as a broken environment. This broadening accepts
+it, under a measured, narrow condition — and the plan's own first draft got
+the mechanics wrong twice before landing.
+
+- **The brief said exit 2; the gate sees exit 4.** `_Runner.select` passes node
+  ids positionally, and pytest answers a node id whose module raises on import
+  with a usage error. Exit 2 is a directory or module-path run — how the
+  `trucking-doc-extraction` #3 measurement was taken. An acceptance written for
+  2 alone would have been dead code on every task preflight actually
+  runs. Measured against pytest 9.1.1 and 8.3.5; they agree on every row.
+- **`--continue-on-collection-errors` was measured and rejected.** Exit 4 on
+  the f2p selection with and without it, byte-identical. It does rescue the
+  p2p run, but only to exit 1, and applying it to the *graded* p2p would turn a
+  broken import anywhere in the tree from an environment error into a
+  `p2p_regression` — an accusation manufactured out of the environment.
+  `--ignore=<module>` on preflight's p2p-before, the one p2p argv the grader
+  never makes, gives exit 0 instead.
+- **The confinement parse alone is `returncode != 0` wearing a regex.** The
+  f2p selection imports only the f2p modules, so a missing interpreter
+  dependency produces exactly the confined error set the task shape produces.
+  The p2p baseline is the second conjunct, and it is why the f2p verdict is
+  deferred until after the p2p run rather than the runs being reordered.
+- **Equality in preflight, containment in the grader.** Preflight must account
+  for every declared id and a partial collection error hides the rest of the
+  selection (measured), so equality is the id-level rule at module
+  granularity. The grader must never accuse for anything outside the task, so
+  a partially fixed submission errors on a subset and is still `f2p_failed`,
+  while a stranger module stays an environment error.
+- **The mis-bucketing the grader change fixes was directional.** A do-nothing
+  arm graded NOT GRADED and a half-fixing arm graded `False`, so the arm that
+  did nothing was invisible in every view counting `False`.
+- **The acceptance is a THREE-way conjunction, and the first draft of this
+  plan claimed two.** A dependency imported *only* by the f2p module is
+  confined (the f2p selection imports nothing else) and leaves p2p green (p2p
+  never imports it), so neither of the first two conjuncts can see it.
+  **Green-after is the environment discriminator** — and the existing Phase 0c
+  integration fixture is that shape exactly.
+- **The Phase 0c end-to-end pin had to be rewritten, and its mutation anchor
+  repointed.** That fixture's broken import lives in the declared f2p module,
+  so it became *confined* and was intercepted by the new branch — the
+  assertion no longer matched and, worse, `mutation_check`'s revert of
+  `elif red.exit_code != EXIT_TESTS_FAILED:` became **inert**, i.e. green on a
+  reverted guarantee. The replacement puts the missing module in
+  `tests/conftest.py`: measured, that exits 4 with no `short test summary
+  info` section at all, so the reported set is empty and the run is
+  unconfined.
+- **The new `MUTATIONS` entry anchors on the equality, not on the
+  `and p2p_green` conjunct.** `if not p2p_green:` is unconditional, so
+  reverting that conjunct changes the refusal *message* and not the verdict;
+  dropping the equality flips a NO-GO into a GO.
+- **What was NOT relaxed:** green-after (pinned by its own test), check 6,
+  `oracle._classify`, the graded p2p argv, and `tests.runner` must contain
+  `pytest`.
+- **Operator note carried into `HANDOFF`-style prose rather than left
+  implicit:** `GRADER_VERSION` 2 → 3 makes `scripts/grade.py`'s resume gate
+  re-grade **every stored run**, into a fresh `v3` artifacts directory beside
+  the existing one. That is intended (a verdict derived under a different
+  ladder is a new line whose disagreement with the old one is the finding),
+  and it costs a full grading pass per event log — budget for it rather than
+  discovering it mid-run.
+- `PREFLIGHT_VERSION` 3 → 4, `GRADER_VERSION` 2 → 3, `SCHEMA_VERSION` unmoved,
+  no manifest key, `click-3360`'s `start_sha` unmoved.
+
+Two small fixes folded in with the docs, from this task's own review: the
+red-before refusal message used to print `sorted(collected) if collected else
+'empty'`, but `collected` is also `None` when the exit code fell outside
+`EXIT_COLLECTION_FAILURES` and the parse never ran — a case that used to read
+as "pytest reported nothing" when the branch never looked. The message now
+says which. And `test_an_f2p_module_that_will_not_import_is_accepted_when_p2p_is_green`
+is parametrized over exit codes `[4, 2]` — the exit-2 arm, reachable via a
+bare-module f2p entry, was unpinned.
