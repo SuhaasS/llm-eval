@@ -25,6 +25,7 @@ from bakeoff.preflight import (
     EXIT_ALL_PASSED,
     EXIT_COLLECTION_FAILURES,
     EXIT_COLLECTION_INTERRUPTED,
+    EXIT_NOTHING_COLLECTED,
     EXIT_TESTS_FAILED,
     EXIT_USAGE_ERROR,
     collection_error_modules,
@@ -478,18 +479,21 @@ def test_a_suite_that_dirties_the_tree_is_refused(tmp_path, agent_image):
 
 
 @pytest.mark.integration
-def test_a_task_whose_tests_cannot_even_run_is_refused(tmp_path, agent_image):
-    """The Phase 0c failure, reproduced end to end.
+def test_a_confined_collection_error_with_no_p2p_baseline_is_refused(
+    tmp_path, agent_image
+):
+    """The Phase 0c fixture, and what broadening 2 made of it.
 
-    The f2p test here imports a module the image does not have, so pytest
-    exits 2 with a collection error. That is non-zero, and `assert
-    returncode != 0` reads it as "the bug is present" -- which is exactly
-    what happened for the whole of Phase 0c: `python3 tests/test_calc.py`
-    raised ModuleNotFoundError with the bug fixed and unfixed alike, Gemma
-    burned 30 of 30 turns on it, and the 9/9 was recorded as capability.
+    Its broken import lives INSIDE the declared f2p module, so the error set is
+    confined and the exit-code branch no longer owns this input. What refuses
+    it now is the second conjunct: this fixture's `tests/` holds only that one
+    module, so ignoring it leaves the rootdir sweep with nothing to collect
+    (pytest exit 5) and there is no regression baseline at all.
 
-    Refusing here costs a message. Accepting it costs a matrix.
-    """
+    Kept as an integration test rather than folded into the scripted ones
+    because the exit codes it turns on -- 4 from the selection, 5 from the
+    ignored sweep -- are the real runner's, in the real image, and that is the
+    whole reason this file has an integration half."""
     test_half = (
         "diff --git a/tests/test_calc.py b/tests/test_calc.py\n"
         "--- a/tests/test_calc.py\n"
@@ -516,7 +520,8 @@ def test_a_task_whose_tests_cannot_even_run_is_refused(tmp_path, agent_image):
         "+    return a + b\n"
     )
     task = load_task(
-        _smoke_task(tmp_path, "def add(a, b):\n    return a - b\n", test_half + solution)
+        _smoke_task(tmp_path, "def add(a, b):\n    return a - b\n",
+                    test_half + solution)
     )
     repo = tmp_path / "run" / "repo"
     start = materialize(task, repo, tmp_path / "cache")
@@ -524,6 +529,50 @@ def test_a_task_whose_tests_cannot_even_run_is_refused(tmp_path, agent_image):
     result = preflight(task, image=agent_image, repo_path=repo, start_sha=start)
 
     assert not result.ok
+    assert result.evidence["f2p_red_kind"] == "collection_error"
+    assert result.evidence["p2p_before_ignored"] == ["tests/test_calc.py"]
+    assert result.evidence["p2p_before_exit"] == EXIT_NOTHING_COLLECTED
+    assert any("could not be collected" in p and "p2p" in p
+               for p in result.problems), result.problems
+    # And green-after refuses it independently: the dependency is still absent.
+    assert result.evidence["f2p_after_exit"] != EXIT_ALL_PASSED
+
+
+@pytest.mark.integration
+def test_a_task_whose_tests_cannot_even_run_is_refused(tmp_path, agent_image):
+    """The Phase 0c failure, reproduced end to end -- with a fixture broadening
+    2 cannot absorb.
+
+    Same defect as before: a module the image does not have. It lives in
+    `tests/conftest.py` rather than in the f2p module, which is what keeps the
+    exit-code branch owning this input. Measured 2026-09-01, pytest 9.1.1 and
+    8.3.5 alike: a broken conftest under a node-id selection exits 4 and prints
+    NO `short test summary info` section at all -- no `ERROR <path>` line -- so
+    the reported set is EMPTY, `collection_error_modules` returns `None`, and
+    the run is unconfined.
+
+    That is what `assert returncode != 0` reads as "the bug is present", which
+    is exactly what happened for the whole of Phase 0c: `python3
+    tests/test_calc.py` raised ModuleNotFoundError with the bug fixed and
+    unfixed alike, Gemma burned 30 of 30 turns on it, and the 9/9 was recorded
+    as capability.
+
+    Refusing here costs a message. Accepting it costs a matrix."""
+    task = load_task(_smoke_task(
+        tmp_path, "def add(a, b):\n    return a - b\n",
+        _reference(fix_source=True),
+        extra_files={"tests/conftest.py":
+                     "import a_module_this_image_does_not_have\n"},
+    ))
+    repo = tmp_path / "run" / "repo"
+    start = materialize(task, repo, tmp_path / "cache")
+
+    result = preflight(task, image=agent_image, repo_path=repo, start_sha=start)
+
+    assert not result.ok
+    assert result.evidence["f2p_red_kind"] == "unknown"
+    assert result.evidence["f2p_collection_errors"] == []
+    assert result.evidence["p2p_before_ignored"] == []
     assert any("did not run at the start state" in p for p in result.problems), (
         result.problems
     )
@@ -658,6 +707,23 @@ def test_ignore_lands_as_one_flag_per_path_after_the_deselects():
     ]
 
 
+def test_ignore_reaches_the_explicit_p2p_branch_too():
+    """One splice point, both branches -- pinned, because "emitted and inert"
+    is a claim about the argv and not about the flag's effect. On this branch
+    the ignore cannot change what is collected (node ids import only the
+    modules they name), so nothing else would notice a guard that dropped it,
+    and the two branches would drift with no test going red."""
+    from bakeoff.preflight import _Runner
+
+    recorder = _Recorder()
+    tests = _Tests(p2p=("tests/b.py::test_two",))
+    _Runner(recorder, tests.runner, 60).pass_to_pass(
+        tests, ignore=("tests/new.py",)
+    )
+
+    assert recorder.commands[0][-1] == "--ignore=tests/new.py"
+
+
 def test_the_quarantine_rides_as_deselect_flags():
     """The flake quarantine is a set of node ids the grader subtracts from
     check 6, and it has to reach pytest the same way the f2p deselects do --
@@ -720,7 +786,8 @@ class _ScriptedContainer:
     """
 
     def __init__(self, *, start_sha, tests, present=(), dangling=(),
-                 scoped_exit=0, grading_exits=None):
+                 scoped_exit=0, grading_exits=None,
+                 f2p_before=None, f2p_after=None, p2p_before=None):
         self.commands = []
         self.start_sha = start_sha
         self.tests = tests
@@ -730,6 +797,14 @@ class _ScriptedContainer:
         self.grading_exits = dict(grading_exits or {})
         self.f2p_runs = 0
         self.scoped_runs = 0
+        #: Override the default red-before / green-after / p2p-before answers.
+        #: Defaults stay the healthy exit-1 task so a test states only the one
+        #: thing it is about.
+        self.f2p_before = f2p_before
+        self.f2p_after = f2p_after
+        self.p2p_before = p2p_before
+        self.p2p_runs = 0
+        self.p2p_argvs = []
 
     def __enter__(self):
         return self
@@ -770,14 +845,18 @@ class _ScriptedContainer:
         if rest == list(self.tests.f2p):
             self.f2p_runs += 1
             if self.f2p_runs == 1:  # red before the reference fix
-                return _Exec(
+                return self.f2p_before or _Exec(
                     exit_code=EXIT_TESTS_FAILED,
                     stdout="".join(f"FAILED {n}\n" for n in self.tests.f2p),
                 )
-            return _Exec()
+            return self.f2p_after or _Exec()
         if any(arg in self.tests.paths for arg in rest):
             self.scoped_runs += 1
             return _Exec(exit_code=self.scoped_exit)
+        self.p2p_runs += 1
+        self.p2p_argvs.append(list(rest))
+        if self.p2p_runs == 1 and self.p2p_before is not None:
+            return self.p2p_before
         return _Exec()
 
 
@@ -807,6 +886,171 @@ def _run_preflight(monkeypatch, tmp_path, task, container):
     )
     return preflight(task, image="sha256:x", repo_path=tmp_path,
                      start_sha="s" * 40)
+
+
+#: What pytest prints, under the pinned `-q -p no:cacheprovider`, when the
+#: module holding a selected node id raises on import. Measured 2026-09-01,
+#: pytest 9.1.1 and 8.3.5 identically -- the `ERROR:` lines carry a colon and
+#: are not node ids; the summary line names the MODULE with no `::`.
+_COLLECTION_ERROR_OUT = (
+    "ERROR: found no collectors for /repo/tests/a.py::test_one\n"
+    "\n"
+    "==================================== ERRORS ===================================\n"
+    "________________________ ERROR collecting tests/a.py __________________________\n"
+    "ImportError while importing test module '/repo/tests/a.py'.\n"
+    "tests/a.py:1: in <module>\n"
+    "    from app import added_symbol\n"
+    "E   ImportError: cannot import name 'added_symbol' from 'app'\n"
+    "=========================== short test summary info ===========================\n"
+    "ERROR tests/a.py\n"
+    "1 error in 0.01s\n"
+)
+
+
+def test_an_f2p_module_that_will_not_import_is_accepted_when_p2p_is_green(
+    monkeypatch, tmp_path
+):
+    """The broadening. A PR that ADDS a symbol puts it in the solution half, so
+    the test half cannot import at the start state and pytest exits 4 -- the
+    code that also means "a broken image".
+
+    Acceptance is a THREE-way conjunction and never a parse: the errors are
+    confined to the declared f2p modules, p2p is green before, AND f2p is green
+    after. The f2p selection imports ONLY the f2p modules, so a dependency that
+    only that module needs is confined AND leaves p2p green -- the first two
+    conjuncts cannot see it and green-after is what refuses it (see
+    `test_a_collection_error_after_the_reference_fix_is_still_a_refusal`).
+    This container scripts all three healthy, which is what makes it a GO.
+    """
+    task = _FakeTask()
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=task.tests, present=("tests/",),
+        f2p_before=_Exec(exit_code=4, stdout=_COLLECTION_ERROR_OUT),
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert result.ok, result.problems
+    assert result.evidence["f2p_before_exit"] == 4
+    assert result.evidence["f2p_red_kind"] == "collection_error"
+    assert result.evidence["f2p_collection_errors"] == ["tests/a.py"]
+    assert result.evidence["p2p_before_ignored"] == ["tests/a.py"]
+    # The ignore reached the run that needed it, and only that run.
+    assert "--ignore=tests/a.py" in container.p2p_argvs[0]
+    assert all("--ignore=tests/a.py" not in argv
+               for argv in container.p2p_argvs[1:])
+
+
+def test_an_ordinary_red_task_records_the_other_red_kind(monkeypatch, tmp_path):
+    """Absence is recorded, never implied. "This task has no collection errors"
+    and "the gate did not look" render identically as a missing key, so both
+    keys are written on every path -- which is also what lets a reader of a
+    cached verdict tell the two task shapes apart."""
+    task = _FakeTask()
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=("tests/",))
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert result.ok, result.problems
+    assert result.evidence["f2p_red_kind"] == "failed"
+    assert result.evidence["f2p_collection_errors"] == []
+    assert result.evidence["p2p_before_ignored"] == []
+    assert all("--ignore" not in " ".join(argv) for argv in container.p2p_argvs)
+
+
+def test_a_collection_error_with_a_red_p2p_is_still_refused(monkeypatch, tmp_path):
+    """The second conjunct, and what it does and does not rule out.
+
+    p2p-green-before rules out a GLOBALLY broken image and establishes the
+    regression baseline -- a p2p check against an already-red suite means
+    nothing. It does NOT rule out a dependency imported only by the f2p module:
+    that one is confined AND leaves p2p green, and green-after is what catches
+    it. Naming the wrong conjunct here is how the first draft of this plan
+    talked itself into a two-way guarantee.
+
+    Note what this test does NOT assert: that the task is a NO-GO. It would be
+    one either way, because the `if not p2p_green:` block below is
+    unconditional. What the branch buys is a refusal that NAMES the coupling
+    and prints the argv it ran, instead of an author on a collection-error task
+    reading a bare "p2p is not green" with no way to know the two are related
+    -- which is why the assertion is on the message and why the MUTATIONS entry
+    for this broadening anchors on the equality instead."""
+    task = _FakeTask()
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=task.tests, present=("tests/",),
+        f2p_before=_Exec(exit_code=4, stdout=_COLLECTION_ERROR_OUT),
+        p2p_before=_Exec(exit_code=EXIT_TESTS_FAILED,
+                         stdout="FAILED tests/z.py::test_other\n"),
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert not result.ok
+    assert any("could not be collected" in p and "p2p" in p
+               for p in result.problems), result.problems
+    assert result.evidence["f2p_red_kind"] == "collection_error"
+
+
+def test_a_collection_error_outside_the_declared_f2p_modules_is_refused(
+    monkeypatch, tmp_path
+):
+    """Equality, not containment, and in both directions.
+
+    A module erroring that no f2p id names is a broken environment. A declared
+    f2p module that did NOT error is a declared id nobody checked -- and
+    measured, a partial collection error hides the rest of the selection
+    entirely, so an id-level rule is unsatisfiable and a subset rule would
+    silently accept the gap the id-level rule existed to close."""
+    tests = _FakeTests(f2p=("tests/a.py::test_one", "tests/b.py::test_two"))
+    task = _FakeTask(tests=tests)
+
+    stranger = _ScriptedContainer(
+        start_sha="s" * 40, tests=tests, present=("tests/",),
+        f2p_before=_Exec(exit_code=4, stdout="ERROR tests/zzz.py\n"),
+    )
+    result = _run_preflight(monkeypatch, tmp_path, task, stranger)
+    assert not result.ok
+    assert any("did not run at the start state" in p for p in result.problems)
+
+    partial = _ScriptedContainer(
+        start_sha="s" * 40, tests=tests, present=("tests/",),
+        f2p_before=_Exec(exit_code=4, stdout="ERROR tests/a.py\n"),
+    )
+    result = _run_preflight(monkeypatch, tmp_path, task, partial)
+    assert not result.ok
+    assert any("did not run at the start state" in p for p in result.problems)
+
+
+def test_a_typoed_f2p_id_still_stops_the_matrix(monkeypatch, tmp_path):
+    """Same exit code, opposite verdict. `ERROR: not found:` carries a colon,
+    so nothing is reported and the confinement predicate refuses -- which is
+    what keeps a manifest naming a renamed test from being read as a task
+    shape to accept."""
+    task = _FakeTask()
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=task.tests, present=("tests/",),
+        f2p_before=_Exec(
+            exit_code=4,
+            stdout="ERROR: not found: /repo/tests/a.py::test_one\n"
+                   "(no match in any of [<Module a.py>])\n\nno tests ran\n",
+        ),
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert not result.ok
+    assert any("did not run at the start state" in p for p in result.problems)
+
+
+def test_the_preflight_version_moved_with_what_the_gate_asserts():
+    """It is in `preflight_cache_key`, and none of the other three components
+    moves when this file changes: a manifest digest describes the task, an
+    image id the environment, a start sha the tree. Without the bump every warm
+    cache serves a verdict written by a gate that refused this task shape."""
+    from bakeoff.preflight import PREFLIGHT_VERSION
+
+    assert PREFLIGHT_VERSION == "4"
 
 
 def test_a_scope_that_collects_nothing_is_a_named_problem_code(monkeypatch, tmp_path):

@@ -84,7 +84,11 @@ _FAILED_LINE = re.compile(r"^(?:FAILED|ERROR)\s+(\S+)", re.MULTILINE)
 #: every verdict cached before the scoped-p2p and grading assertions landed.
 #: 3 adds the `strip_paths` assertion: a verdict cached under 2 was written
 #: by a gate that never looked at that key at all.
-PREFLIGHT_VERSION: str = "3"
+#: 4 accepts an f2p run that could not COLLECT (broadening 2). A verdict
+#: cached under 3 was written by a gate that refused that task shape outright,
+#: and one cached under 4 was written by a gate whose p2p-before run carries
+#: `--ignore` on exactly those tasks.
+PREFLIGHT_VERSION: str = "4"
 
 
 def preflight_cache_key(task, image: str, start_sha: str) -> str:
@@ -333,14 +337,15 @@ class _Runner:
         benefit. Reading the field only when it is non-empty is what keeps it
         from being a manifest key that looks like a measurement and is not.
 
-        The two keyword parameters exist for the offline grader and default to
-        inert: `extra_deselect` appends --deselect for the flake quarantine, and
-        `scope` prepends path prefixes to the deselect branch so check 6 grades
-        the repo's declared suite rather than whatever scratch files an agent
-        left at the rootdir (measured: eight of them in one stored record). With
-        both empty, the argv is byte-identical to what preflight validated --
-        a test pins that, because the moment the graded command and the gated
-        command drift apart, the oracle stops describing the thing being graded.
+        The first two keyword parameters exist for the offline grader and
+        default to inert: `extra_deselect` appends --deselect for the flake
+        quarantine, and `scope` prepends path prefixes to the deselect branch
+        so check 6 grades the repo's declared suite rather than whatever
+        scratch files an agent left at the rootdir (measured: eight of them in
+        one stored record). With both empty, the argv is byte-identical to what
+        preflight validated -- a test pins that, because the moment the graded
+        command and the gated command drift apart, the oracle stops describing
+        the thing being graded.
 
         `ignore` appends `--ignore=<path>` and has exactly ONE caller:
         preflight's p2p run at the START state, on a task whose f2p module does
@@ -501,21 +506,120 @@ def preflight(
 
         runner = _Runner(container, tests.runner, timeout_s)
 
-        # --- red before
+        # --- red before, and the p2p baseline it is judged against
+        #
+        # Two runs, ONE verdict, and the verdict comes last. A task whose fix
+        # ADDS a symbol puts that symbol in the solution half, so the test half
+        # raises ImportError at the start state and pytest exits 4 (measured
+        # 2026-09-01, pytest 9.1.1 and 8.3.5: a positional NODE ID whose module
+        # will not import is a usage error, not the collection-interrupted 2 a
+        # directory sweep gives). That is a real task shape -- section 3.3's
+        # loop still runs, the agent just reads an ImportError instead of an
+        # assertion, which is exactly what the human who filed the issue read.
+        #
+        # It is accepted only under a THREE-way conjunction, because the parse
+        # alone cannot carry it -- the f2p selection imports ONLY the f2p
+        # modules, so an environment defect there produces exactly the confined
+        # error set the task shape produces. The three, and what each one and
+        # only it can see:
+        #
+        #   (i)   the errors are confined to the declared f2p modules -- no
+        #         stranger module errored, and no declared module stayed quiet;
+        #   (ii)  p2p is green BEFORE -- a globally broken image is refused
+        #         here, and the regression baseline exists at all;
+        #   (iii) f2p is green AFTER -- and this is the ONLY one that refuses a
+        #         dependency imported solely by the f2p module, which is
+        #         confined under (i) and leaves (ii) green. That is exactly the
+        #         Phase 0c integration fixture.
+        #
+        # (iii) is asserted unconditionally by the green-after block further
+        # down and needs nothing here. It is named here because a reader who
+        # believes (i) and (ii) suffice will eventually simplify it away.
+        #
+        # The runs stay in this order -- their order is what each sees of the
+        # tree -- and the JUDGEMENT is deferred instead. Problems are collected
+        # rather than raised, so nothing else about this function has to move.
 
         red = runner.select(tests.f2p)
         evidence["f2p_before_exit"] = red.exit_code
+
+        collected = (
+            collection_error_modules(red.stdout + red.stderr)
+            if red.exit_code in EXIT_COLLECTION_FAILURES else None
+        )
+        # EQUALITY, in both directions. A module erroring that no f2p id names
+        # is a broken environment; a declared f2p module that did NOT error is
+        # a declared id nobody checked -- and measured, a partial collection
+        # error hides the rest of the selection entirely, so the id-level rule
+        # ("every declared f2p id appears in FAILED/ERROR") is unsatisfiable
+        # here and this is that same claim at module granularity.
+        confined = collected is not None and collected == f2p_modules(tests.f2p)
+        # Written on every path, all three keys: "this task has no collection
+        # errors" and "the gate did not look" render identically as a missing
+        # key, and a cached verdict outlives the code that wrote it.
+        evidence["f2p_collection_errors"] = sorted(collected or ())
+        # Four values, not three: "the task is already done" and "the gate
+        # could not classify this run" are different facts about a cached
+        # verdict, and one name for both is the defect one layer down that
+        # "absence is recorded, never implied" exists to prevent.
+        evidence["f2p_red_kind"] = (
+            "collection_error" if confined
+            else "failed" if red.exit_code == EXIT_TESTS_FAILED
+            else "passed" if red.exit_code == EXIT_ALL_PASSED
+            else "unknown"
+        )
+
+        # `--ignore` on THIS run only. Without it the erroring module aborts
+        # collection of the whole rootdir sweep before `--deselect` is applied
+        # (measured: exit 2 on the p2p-before argv verbatim), so the baseline
+        # this acceptance depends on cannot be observed at all. Safe here
+        # because preflight's p2p-BEFORE is not an argv the grader makes: the
+        # graded run is at the post-submission state, matched by p2p-AFTER,
+        # which gets no ignore -- and the one thing the ignore hides, a non-f2p
+        # test inside the ignored module, is measured by that same p2p-after
+        # run once the reference lands.
+        ignore = tuple(sorted(collected)) if confined else ()
+        evidence["p2p_before_ignored"] = list(ignore)
+        green = runner.pass_to_pass(tests, ignore=ignore)
+        evidence["p2p_before_exit"] = green.exit_code
+        p2p_green = green.exit_code == EXIT_ALL_PASSED
+
         if red.exit_code == EXIT_ALL_PASSED:
             problems.append(
                 "the f2p tests PASS at the start state: the task is already "
                 "done, and every arm would be scored on work it did not do"
+            )
+        elif confined and p2p_green:
+            pass  # accepted: the bug is a collection error, and it is confined
+        elif confined:
+            problems.append(
+                "the f2p tests could not be collected at the start state "
+                f"({', '.join(sorted(collected))}), which is an accepted task "
+                "shape ONLY while the rest of the suite is green there -- and "
+                "the p2p run exited "
+                f"{green.exit_code} ({_explain(green.exit_code)}). The f2p "
+                "selection imports only the f2p modules, so a broken image "
+                "produces exactly this error set; p2p is what separates them. "
+                "If the run below collected nothing, this task's test tree "
+                "holds no regression baseline outside the erroring module. If "
+                "it still reports that module, the --ignore missed: those "
+                "paths come from pytest's ROOTDIR-relative ERROR lines and "
+                "--ignore resolves against the working directory, and an "
+                "--ignore naming a path that does not exist is accepted "
+                "silently (measured).\n"
+                f"  {' '.join(runner.last_argv)}\n"
+                + (green.stdout or green.stderr)[-2000:]
             )
         elif red.exit_code != EXIT_TESTS_FAILED:
             problems.append(
                 f"the f2p tests did not run at the start state -- "
                 f"{_explain(red.exit_code)}. This is the Phase 0c failure: a "
                 "broken environment is also a non-zero exit, and an agent "
-                "reading the output cannot tell it from the bug.\n"
+                "reading the output cannot tell it from the bug. A collection "
+                "error IS accepted, but only when every reported ERROR names a "
+                "declared f2p module and no other, and here the reported set "
+                f"is {sorted(collected) if collected else 'empty'} against "
+                f"declared {sorted(f2p_modules(tests.f2p))}.\n"
                 + (red.stdout or red.stderr)[-2000:]
             )
         else:
@@ -527,11 +631,7 @@ def preflight(
                     + ", ".join(sorted(missing))
                 )
 
-        # --- p2p green before
-
-        green = runner.pass_to_pass(tests)
-        evidence["p2p_before_exit"] = green.exit_code
-        if green.exit_code != EXIT_ALL_PASSED:
+        if not p2p_green:
             problems.append(
                 f"the rest of the suite is not green at the start state -- "
                 f"{_explain(green.exit_code)}. A p2p regression check against "

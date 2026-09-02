@@ -727,12 +727,30 @@ MUTATIONS = [
         # The Phase 0c failure in one operator: ModuleNotFoundError is also a
         # non-zero exit, so `!= 0` accepts a broken environment as "the bug is
         # present" and every arm is scored on a task that was never runnable.
+        # The verifying fixture's broken import is in `tests/conftest.py`, NOT
+        # in the f2p module: since PREFLIGHT_VERSION 4 a confined collection
+        # error is an accepted task shape and is handled by an EARLIER branch,
+        # so a fixture that is confined would leave this mutation inert.
         "preflight: accept any non-zero exit as evidence the bug is present",
         "src/bakeoff/preflight.py",
         "        elif red.exit_code != EXIT_TESTS_FAILED:",
         "        elif False:",
         "tests/test_preflight.py -k cannot_even_run",
         "integration",
+    ),
+    (
+        # The confinement equality is the whole of the acceptance. Without it
+        # `collected is not None` is true for any collection error at all, so a
+        # module no f2p id names -- a dependency the image lost -- reads as the
+        # task shape, and a DECLARED f2p module that never errored reads as
+        # checked when a collection error hid it. Both are GO under the
+        # mutation, with the rest of the gate green.
+        "preflight: accept any collection error, not one confined to the f2p modules",
+        "src/bakeoff/preflight.py",
+        "        confined = collected is not None and collected == f2p_modules(tests.f2p)",
+        "        confined = collected is not None",
+        "tests/test_preflight.py -k outside_the_declared_f2p_modules",
+        "not integration",
     ),
     (
         # Measured against litellm 1.95.0: _map_bedrock_exception matches auth
