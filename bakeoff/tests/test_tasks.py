@@ -37,6 +37,19 @@ NEW_TEST = (
     "def test_new():\n    assert add(2, 3) == 5\n"
 )
 
+# A chunk for a file the fix commit does not touch, appended to a reference so
+# a test can exercise the three-class split. `git apply --numstat` PARSES a
+# chunk rather than applying it -- the same property the `_chunks_of` tests
+# further down already rely on.
+CHANGELOG_CHUNK = (
+    "diff --git a/CHANGES.md b/CHANGES.md\n"
+    "--- a/CHANGES.md\n"
+    "+++ b/CHANGES.md\n"
+    "@@ -1 +1,2 @@\n"
+    " changelog\n"
+    "+- fixed add()\n"
+)
+
 
 def _sh(*args: str, cwd: Path) -> str:
     return subprocess.run(
@@ -58,6 +71,18 @@ def upstream(tmp_path):
     (repo / "calc.py").write_text(BUGGY)
     (repo / "tests" / "test_calc.py").write_text(OLD_TEST)
     (repo / ".gitignore").write_text("__pycache__/\n")
+    # A repository whose base_sha carries an agent file, a vendored tree and a
+    # changelog is the shape `strip_paths` exists for, and all three were
+    # measured on real repositories (sqlglot's CLAUDE.md, the internal repo's
+    # committed venv, click's CHANGES.rst). None of them is touched by the fix
+    # commit, so the reference diff below is unchanged and every other test in
+    # this module sees exactly the halves it saw before.
+    (repo / "CLAUDE.md").write_text("# project notes\n")
+    (repo / ".claude").mkdir()
+    (repo / ".claude" / "settings.json").write_text("{}\n")
+    (repo / "vendor").mkdir()
+    (repo / "vendor" / "dep.py").write_text("VERSION = '1.0'\n")
+    (repo / "CHANGES.md").write_text("changelog\n")
     _sh("git", "init", "-q", cwd=repo)
     _sh("git", "config", "user.email", "t@t.test", cwd=repo)
     _sh("git", "config", "user.name", "t", cwd=repo)
@@ -373,12 +398,23 @@ def test_a_manifest_with_no_strip_paths_still_loads(tmp_path, upstream):
 
 
 @pytest.mark.parametrize(
-    "bad",
-    ["", " CLAUDE.md", "/etc/passwd", "../outside", ".", "./", ".git",
-     ".git/hooks", "*.log", "docs/*", ":(glob)**/x"],
+    "bad, match",
+    [
+        ("", "empty or padded"),
+        (" CLAUDE.md", "empty or padded"),
+        ("/etc/passwd", "relative and free of"),
+        ("../outside", "relative and free of"),
+        (".", "names the whole tree"),
+        ("./", "names the whole tree"),
+        (".git", "own .git"),
+        (".git/hooks", "own .git"),
+        ("*.log", "pathspec magic"),
+        ("docs/*", "pathspec magic"),
+        (":(glob)**/x", "pathspec magic"),
+    ],
 )
 def test_a_strip_path_that_would_remove_the_wrong_thing_is_refused(
-    tmp_path, upstream, bad
+    tmp_path, upstream, bad, match
 ):
     """This key's effect is a DELETE, so the validation is stricter than
     `_validate_prefixes` alone.
@@ -390,13 +426,73 @@ def test_a_strip_path_that_would_remove_the_wrong_thing_is_refused(
     would take the repository the submission diff is computed against. Glob
     and pathspec magic would make what gets removed a property of the tree
     rather than of the manifest, and the existence check in `materialize`
-    would then pass on one accidental match."""
+    would then pass on one accidental match.
+
+    `match` pins the specific refusal, not just the `where` prefix every
+    message carries -- a generic `match="strip_paths"` would pass even if
+    every branch below raised the same message."""
     task_dir = _write_task(
         tmp_path / "set", upstream, extra_yaml=f"strip_paths: [{bad!r}]",
     )
 
-    with pytest.raises(TaskError, match="strip_paths"):
+    with pytest.raises(TaskError, match=match):
         load_task(task_dir)
+
+
+def test_a_stripped_path_in_the_solution_half_is_refused(tmp_path, upstream):
+    """Strip does NOT imply exclusion, and this is why.
+
+    Dropping the chunk silently would make `solution_diff` something other
+    than the merged PR (section 3.2's verbatim reference), and preflight would
+    only notice when the missing hunk happened to be one the f2p tests need.
+    The surviving case is a reference that is no longer a reference, with
+    every gate green."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream, extra_yaml='strip_paths: ["calc.py"]',
+    )
+
+    with pytest.raises(TaskError, match=r"strip_paths.*calc\.py.*solution"):
+        load_task(task_dir)
+
+
+def test_a_stripped_path_in_the_test_half_is_refused(tmp_path, upstream):
+    """The worse direction: the oracle shrinks, and every arm is then graded
+    against less than the task says it is graded against."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream, extra_yaml='strip_paths: ["tests"]',
+    )
+
+    with pytest.raises(TaskError, match=r"strip_paths.*test_calc\.py.*test"):
+        load_task(task_dir)
+
+
+def test_a_stripped_path_excluded_from_both_halves_loads(tmp_path, upstream):
+    """The sanctioned combination, and the one HARVESTING.md already sends an
+    author to: `allow_extra_paths` puts the file in neither half, so nothing
+    tries to apply a patch onto a path the strip removed -- and `extra_files`
+    still names it, so the combination is visible rather than inferred from
+    two keys that never mention each other.
+
+    Load-only here on purpose: the refusal this task adds is a load-time one,
+    and the strip that makes the combination true end to end lands in Task 3.
+    `test_a_stripped_extra_path_is_gone_from_the_start_state` there is the
+    other half."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream,
+        extra_yaml=(
+            '  allow_extra_paths: ["CHANGES.md"]\n'
+            'strip_paths: ["CHANGES.md"]'
+        ),
+    )
+    (task_dir / "reference.diff").write_text(
+        upstream["reference"] + CHANGELOG_CHUNK
+    )
+
+    task = load_task(task_dir)
+
+    assert task.extra_files == ("CHANGES.md",)
+    assert "CHANGES.md" not in task.solution_diff
+    assert "CHANGES.md" not in task.test_diff
 
 
 # --- provenance --------------------------------------------------------------

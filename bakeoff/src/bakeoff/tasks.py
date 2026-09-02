@@ -547,6 +547,45 @@ def split_reference_diff(
     )
 
 
+def _refuse_stripped_halves(
+    test_files: tuple[str, ...],
+    solution_files: tuple[str, ...],
+    strip_paths: tuple[str, ...],
+    where: str,
+) -> None:
+    """A path the strip removes and the reference diff changes is refused.
+
+    STRIP DOES NOT IMPLY EXCLUSION, deliberately. Silently dropping the chunk
+    would make `solution_diff` something other than the merged PR that section
+    3.2 requires verbatim, and preflight would only notice when the missing
+    hunk happened to be one the f2p tests need -- so the case that survives
+    every gate is a reference that is no longer a reference. From the TEST
+    half it is worse: the oracle shrinks and every arm is graded against less
+    than the manifest says.
+
+    `allow_extra_paths` is the declared way to say "neither half", it is what
+    taskset/HARVESTING.md already tells an author to reach for here, and it
+    leaves the file named in `extra_files` -- so the combination stays visible
+    instead of being inferred from two keys that never mention each other.
+
+    Called from `load_task` rather than from `split_reference_diff`: that
+    function is a three-class partition of a diff by path and takes no
+    manifest, and a fourth prefix argument would invite exactly the reading
+    this refusal rejects. Renames need no special case, because
+    `split_reference_diff` puts both endpoints into the file lists.
+    """
+    for half, files in (("test", test_files), ("solution", solution_files)):
+        caught = sorted(path for path in files if _under(path, strip_paths))
+        if caught:
+            raise TaskError(
+                f"{where}: strip_paths removes {', '.join(caught)}, which the "
+                f"reference diff's {half} half also changes -- the patch would "
+                "be applied onto a path that no longer exists. List those "
+                "paths in tests.allow_extra_paths to keep them out of both "
+                "halves, or narrow the strip."
+            )
+
+
 # --- loading -----------------------------------------------------------------
 
 
@@ -737,6 +776,7 @@ def load_task(task_dir: Path, set_commit: str = "") -> TaskManifest:
             f"under tests.paths {list(test_paths)} or "
             f"allow_extra_paths {list(extra_paths)}"
         )
+    _refuse_stripped_halves(test_files, solution_files, strip_paths, where)
 
     return TaskManifest(
         task_id=task_id,
