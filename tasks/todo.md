@@ -3535,3 +3535,156 @@ why nobody has run it yet.
 No manifest, `HARVESTING.md`, or `docs/BUILDING-A-TASK-SET.md` change was
 made by the measurement itself; folding the findings in was a separate docs
 commit.
+
+---
+
+## A submodule the suite never reads is declared, not populated — 2026-09-02
+
+Round 2 item 2. Plan:
+[docs/superpowers/plans/2026-09-03-round2-2-unneeded-submodule.md](../docs/superpowers/plans/2026-09-03-round2-2-unneeded-submodule.md),
+four review rounds folded in.
+
+**The measured defect.** `sqlglot-8225-mysql-key-constraint` at `base_sha`
+`05eed63b281f7ac020045e2b792beef8fad8d3ee` never reached preflight — exit 1,
+111 s, no image, no cache entry:
+
+```
+bakeoff.tasks.TaskError: sqlglot-8225-mysql-key-constraint: submodule
+sqlglot-integration-tests declares url 'git@github.com:fivetran/...'; only
+https:// urls can be fetched by this eval.
+```
+
+`tobymao/sqlglot` added that `.gitmodules` in `3a930dad6` (PR #7167, merged
+2026-02-27) and it is still at HEAD, so **every** `base_sha` at or after that
+date was closed — the richest single source in the screened corpus, for a
+suite that never reads the submodule. `strip_paths` cannot lift it: a strip
+covering a submodule path is itself refused, and for good reason.
+
+**What shipped.** Top-level `submodules_unneeded: ["<path>"]`. A flat list of
+paths, not a block and not a boolean: a block invites sub-keys (a url
+override, a sha pin) that would each restate what `base_sha` already pins,
+and a boolean cannot be checked against the tree, so a `base_sha` bumped to
+one carrying a *second* submodule would silently stop populating it. Paths
+rather than `[submodule "NAME"]` names, because git does not require the two
+to match and only the path comes from `git ls-tree` — which is also the one
+reader a declared-unneeded submodule is allowed to be missing a `.gitmodules`
+stanza for.
+
+**What it does NOT relax, and the placement is anchored.** Four of the six
+submodule refusals become conditional; two do not. A `strip_paths` entry
+covering the path still fires (the strip removes the gitlink and moves
+`start_sha`), and a reference diff touching the path still fires (`git add
+-A` stages nothing for a gitlink path in *either* state, so a fix living
+there is ungradable by construction — the key makes that more true, not
+less). Both live OUTSIDE the `if not sub.declared_unneeded:` guard, and
+mutation entries 3 and 4 anchor exactly the edit a later editor tidying them
+inside would make.
+
+**Three measurements shaped the design.**
+
+- **git is blind inside a gitlink path, in any state.** A file written into
+  an uninitialised submodule directory is invisible to `git status
+  --porcelain` (with or without `-uall`), to `git ls-files -o` and to `git
+  add -A`. So preflight's clean-tree check cannot see a suite that writes in
+  there, and `HARVESTING.md`'s "a suite that writes inside the submodule is
+  out" rule had **no enforcement at all** for the new case. That bullet was
+  asserting an enforcement that does not exist; it is corrected, and the
+  enforcement is now two `ls -A` reads, before the suite and after it.
+- **The suite guards, it does not require.** `git grep
+  sqlglot-integration-tests <base_sha> -- tests/` finds exactly two files and
+  both sit behind `os.path.isdir(...)`. That is what makes the declaration
+  truthful here — and it is also what bounds the claim: the suite silently
+  *shrinks* rather than failing, and no collected-test count is recorded, so
+  the gate cannot tell a guarded suite from one that lost tests. Filed in
+  `TASKS.md` rather than closed, because recording that count is a
+  runner-adapter change across three frameworks.
+- **A tree with gitlinks and NO `.gitmodules` blob exits 128, not 1.** That
+  is a sixth refusal, reached ahead of the per-path url one, and the first
+  draft of the plan neither counted it nor exempted it. Both `.gitmodules`
+  refusals are now exempted through one derived `needed_gitlinks` set, so one
+  line carries the exemption and one mutation reverts both.
+
+**The cross-item blocker, and it was the whole reason for a fourth review
+round.** `container.snapshot_diff` stages into a **scratch** index
+(`GIT_INDEX_FILE`), and a scratch index starts EMPTY — so `git add -A` builds
+it from a worktree scan that cannot see a gitlink, and the diff against the
+start state reports an uninitialised submodule as **deleted**. Measured on
+the real vehicle, materialized, clean tree, agent having done nothing:
+
+```
+UNSEEDED   237 bytes   names: sqlglot-integration-tests
+           diff --git a/sqlglot-integration-tests b/sqlglot-integration-tests
+           deleted file mode 160000
+           -Subproject commit 4d539e4369b07cba70d8249924136d0826cf7ea5
+SEEDED       0 bytes   names: (none)
+```
+
+`grader._GITLINK_MODE` matches `^deleted file mode 160000$`, so without the
+seed **every run of this task — including a clean one — would have graded
+`SUBMODULE_GITLINK_UNGRADABLE`** and left the denominator with a verdict that
+reads as the agent's doing. The fix is one line before the staging loop,
+`git read-tree <base_sha>` into the same scratch index, `checked_exec` so a
+failed seed raises rather than falling through to the accusation.
+
+It is unconditional, because `container.py` holds no manifest and must not
+gain one; that is affordable because a repository with no gitlink diffs
+byte-identically either way (pinned by an integration test). The rejected
+alternative — re-staging the gitlink with `git update-index --cacheinfo`
+after `add -A` — was refused by measurement, not taste: it fails with
+`'vendor/libdep' appears as both a file and as a directory` in exactly the
+case that matters, an agent that wrote into the empty directory.
+
+**One line, two phantoms.** The same empty index also reported a file that is
+tracked at the start state and *also* matches `.gitignore` as deleted.
+Measured: `eemeli/yaml` carries **15** such files (`.editorconfig`,
+`.github/workflows/*`, and `.gitignore` and `.gitmodules` themselves) and
+`bidict` **1** (`.coveragerc`) — both round-2 verification vehicles. So a
+pre-fix record of `yaml-474` asserted fifteen deletions that never happened,
+and the offline grader *applies* `final_diff`, so the ladder really did
+delete them in the grading tree before running the suite. That is an existing
+field changing what it asserts, which is why `SCHEMA_VERSION` moved.
+
+**What the gate proves, at its real width.** Not "the submodule is unneeded".
+It proves the declared f2p ids are red before the reference fix and green
+after it, and the p2p sweep is green, **with the directory empty** — plus,
+new here, that the directory exists, is empty and reads marker `-`, before
+and after the suite.
+
+**Verification.**
+
+| step | result |
+|---|---|
+| unit | `1624 passed, 67 deselected` (from `1588 / 63`) |
+| integration | `64 passed, 3 skipped` |
+| `verify_logger.py` | GATE PASSED |
+| `mutation_check.py` | **176/176** (from 165) |
+| sqlglot-8225 gate | **PASS**, `start_sha 4b61ee5603e7ffc0cac8d127e709a0a14150fdff` |
+| tomlkit-514 re-gate | PASS, `start_sha e1d72b883d2e452ca14835047e2fa7db02cdc4d8` — unchanged |
+| click-3360 re-gate | PASS, `start_sha 33575cc0b75608fa5cbcb1d3ae3347b81eac437f` — unchanged |
+| self-grade | reference `resolved: true` (9/9 ladder, three `not_configured`), empty `EMPTY_PATCH`. **Not** `SUBMODULE_GITLINK_UNGRADABLE` |
+
+The gated evidence, verbatim from
+`~/.cache/bakeoff/preflight/sqlglot-8225-mysql-key-constraint.json`:
+
+```json
+"submodules": [{"path": "sqlglot-integration-tests",
+                "sha": "4d539e4369b07cba70d8249924136d0826cf7ea5",
+                "initialised": false, "marker": "-",
+                "declared_unneeded": true, "empty": true}],
+"submodules_orphaned": [],
+"submodules_empty_after_suite": {"sqlglot-integration-tests": true},
+"stripped_paths": ["CLAUDE.md", "AGENTS.md"],
+"stripped_paths_present": [],
+"dirty_after_tests": ""
+```
+
+`PREFLIGHT_VERSION` 15 → 16 (the evidence shape moved for **every** task, not
+only declaring ones, and those manifests' digests do not move) and
+`SCHEMA_VERSION` 3.8.0 → 3.9.0. `start_sha`, `ORACLE_VERSION`,
+`GRADER_VERSION` and `GRADE_SCHEMA_VERSION` do not move.
+
+**Still open, and filed rather than closed.** An agent that writes *into* the
+declared-unneeded directory produces a 0-byte diff post-seed while `ls -A`
+sees the file — the submission cannot carry it and neither can a checkpoint.
+Preflight's two reads refuse the *task*; capturing it during a *run* is round
+2 item 17's job, and a `TASKS.md` entry names the gap until that lands.

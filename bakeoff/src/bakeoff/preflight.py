@@ -208,7 +208,23 @@ _PYTEST_ADAPTER = for_framework("pytest")
 #: verdicts across this bump must not read that growth as a regression.
 #: No pytest verdict moves: `pytest_adapter` emits one group whose argv is the
 #: v14 argv, and `file_filter_matches` cannot fire there.
-PREFLIGHT_VERSION: str = "15"
+#: 15 -> 16: `submodules_unneeded` (round 2 item 2, 2026-09-02), and the
+#: EVIDENCE SHAPE is the reason, not the new assertion. Every `submodules`
+#: entry now carries `declared_unneeded` and `empty`, on every task whether or
+#: not it declares the key, and a new top-level `submodules_empty_after_suite`
+#: joins `submodules` and `submodules_orphaned`. None of those manifests'
+#: digests move, so a warm v15 blob and a fresh v16 blob would otherwise sit in
+#: one cache describing different shapes -- and a reader who cannot tell them
+#: apart reads an absent field as a positive negative claim.
+#: The residual is narrower and comes second: a v15 verdict on a manifest that
+#: already DECLARED the key. `preflight_cache_key` runs through
+#: `manifest_digest`, which hashes the manifest bytes, so adding the key
+#: changes the digest and no v15 verdict can be served in the ordinary case.
+#: It is reachable only because `load_task` has no top-level unknown-key
+#: refusal: a manifest could have carried `submodules_unneeded` before this
+#: code shipped, been gated at 15 (which ignored it and NO-GOed on `stale`),
+#: and that stale NO-GO would otherwise be served forever.
+PREFLIGHT_VERSION: str = "16"
 
 
 def preflight_cache_key(task, image: str, start_sha: str) -> str:
@@ -558,6 +574,35 @@ def _gitlink_paths(container) -> tuple[str, ...] | None:
             if path:
                 paths.append(path)
     return tuple(paths)
+
+
+def _directory_is_empty(container, path: str) -> bool | None:
+    """Whether `path` in the container is an existing, EMPTY directory.
+
+    `None` is "could not be read", never `False`. `container.exec` with an
+    explicit exit-code branch rather than `_checked_exec`, for the reason
+    `_gitlink_paths` documents: this gate COLLECTS problems and its caller
+    does not wrap it, so a raise here is a traceback instead of a NO-GO.
+
+    This exists because git is BLIND here. Measured 2026-09-02 (git 2.50.1):
+    a file inside an UNINITIALISED submodule directory is reported by neither
+    `git status --porcelain`, nor `-uall`, nor `git ls-files -o`, nor
+    `git add -A` followed by `git diff --cached <base_sha>` (zero bytes) --
+    git does not descend into a gitlink path in any state. So the clean-tree
+    check next door cannot see a suite that writes in there, and the only
+    reader that can is the filesystem.
+
+    `ls -A` answers both halves in one exec: a non-zero exit is "absent or
+    unreadable" and empty stdout at exit 0 is "present and empty". The exit
+    code is not compared against a literal -- a missing directory and a
+    permission error are both answers this gate cannot interpret. `--` guards
+    a path beginning with a dash, and `container.exec` runs with
+    `workdir=REPO_MOUNT`, so a repo-relative path resolves.
+    """
+    result = container.exec(["ls", "-A", "--", path])
+    if result.exit_code != 0:
+        return None
+    return not result.stdout.strip()
 
 
 def _declared_grading(task) -> list[tuple[str, tuple[str, ...]]]:
@@ -1021,6 +1066,14 @@ def preflight(
     #: evidence files could not tell the two apart.
     evidence["submodules"] = None
     evidence["submodules_orphaned"] = None
+    #: Beside the two above so the three submodule keys keep answering
+    #: together. At the top level `None` is "not measured" (this early return)
+    #: and `{}` is "measured, this task declares no unneeded submodules"; per
+    #: path the value is `True` (empty), `False` (has content) or `None` (the
+    #: read failed). A mapping rather than a list, so the stored evidence
+    #: itself tells `False` from `None` per path instead of leaving that to
+    #: the problem text.
+    evidence["submodules_empty_after_suite"] = None
 
     # Written here, before any container starts, for the reason
     # `image_env_observed` is: three of these are measured inside the scoped
@@ -1409,6 +1462,13 @@ def preflight(
                 "submission diff."
             )
 
+        # `getattr`, like the strip check's two screens up: this function
+        # takes an untyped `task`, and a manifest object predating the key
+        # must not make the gate raise `AttributeError` -- a traceback instead
+        # of a NO-GO. Read once, used by the per-entry join below and by the
+        # post-suite read further down.
+        unneeded = frozenset(getattr(task, "submodules_unneeded", ()))
+
         # The submodules, read back out of the container the suite will run
         # in. `materialize` has its own post-condition on the host and it is
         # not this one: a tree can be emptied, re-copied or rebuilt between
@@ -1451,6 +1511,21 @@ def preflight(
         elif status.exit_code == 0:
             submodules, unmatched = _parse_submodule_status(status.stdout,
                                                             gitlinks)
+            # Filled in the CALLER, in one pass, and NOT inside
+            # `_parse_submodule_status`: that function's docstring states the
+            # principle -- it is an OBSERVATION, not a restatement of the
+            # manifest -- and `declared_unneeded` is manifest data.
+            #
+            # `empty` is measured for EVERY submodule, needed ones included.
+            # Measured only for declared paths, `None` would carry two
+            # meanings ("the read failed" and "the read was not attempted"),
+            # which is "a null says which kind of null it is" broken. Both
+            # keys are written for every entry, `False` included: a reader who
+            # cannot see the field on the other entries cannot tell "this task
+            # declared none" from "this gate did not know about the key".
+            for entry in submodules:
+                entry["declared_unneeded"] = entry["path"] in unneeded
+                entry["empty"] = _directory_is_empty(container, entry["path"])
             evidence["submodules"] = submodules
             if unmatched:
                 # NOT resolved by falling back to the display line's own text:
@@ -1539,8 +1614,63 @@ def preflight(
                     f"{declared_subs.exit_code}): "
                     f"{(declared_subs.stdout or declared_subs.stderr)[:500]}"
                 )
+            # The declared state, asserted rather than assumed. Every one of
+            # these replaces something `stale` used to say about these paths,
+            # and the exclusion two blocks down is what turns the NO-GO into a
+            # GO.
+            for entry in submodules:
+                if entry["empty"] is None:
+                    problems.append(
+                        f"could not list {entry['path']} to check whether it "
+                        "is empty. Whether the directory is empty is unknown, "
+                        "and for a declared-unneeded submodule that is the "
+                        "only claim this gate can check."
+                    )
+                if not entry["declared_unneeded"]:
+                    continue
+                if entry["marker"] != "-":
+                    problems.append(
+                        f"the manifest declares {entry['path']} unneeded, but "
+                        "`git submodule status` reports marker "
+                        f"{entry['marker']!r} -- something populated a path "
+                        "the harness was told to leave alone, so the suite is "
+                        "reading content this task was not cut against. The "
+                        "run tree is bind-mounted over the image's own /repo, "
+                        "so this can only have been written into the run tree "
+                        "after materialization."
+                    )
+                if entry["empty"] is False:
+                    problems.append(
+                        f"the manifest declares {entry['path']} unneeded, but "
+                        "the directory is not empty. git cannot see in there "
+                        "-- measured 2026-09-02, a file inside an "
+                        "uninitialised submodule directory is invisible to "
+                        "`git status --porcelain`, to `git ls-files -o` and "
+                        "to `git add -A`, so no other check in this gate and "
+                        "no submission diff would report it. A suite that "
+                        "writes inside a submodule is out of the corpus."
+                    )
+            # `derive_submodules` refuses this on the HOST, so reaching it
+            # means the container's tree is not the one that was derived --
+            # recorded as an observation rather than trusted to the host-side
+            # refusal, for the reason `_parse_submodule_status`'s docstring
+            # gives about not restating configuration.
+            declared_missing = sorted(unneeded - set(gitlinks))
+            if declared_missing:
+                problems.append(
+                    "the manifest declares "
+                    + ", ".join(declared_missing)
+                    + " unneeded, but the container's index carries no "
+                    "gitlink there. The manifest and the tree the suite will "
+                    "run against disagree about this path."
+                )
+        # A declared-unneeded submodule is EXCLUDED, and this is the one line
+        # that turns the NO-GO into a GO. Everything `stale` says about such a
+        # path is wrong by construction: it is uninitialised on purpose, and
+        # the three problems above assert the state the declaration promises
+        # instead.
         stale = [entry["path"] for entry in submodules
-                 if not entry["initialised"]]
+                 if not entry["initialised"] and not entry["declared_unneeded"]]
         if stale:
             problems.append(
                 "submodules are not initialised at their gitlink: "
@@ -1924,6 +2054,39 @@ def preflight(
                 + "\nSection 5.6 stages everything, so these land in every "
                 "submission diff and diff size measures the interpreter rather "
                 "than the agent. Add them to the manifest's gitignore_extra."
+            )
+
+        # The SECOND emptiness read, and it exists because the check
+        # immediately above cannot see into a gitlink path. Measured
+        # 2026-09-02: `git status --porcelain` reports nothing for a file
+        # written inside an uninitialised submodule directory, so "the suite
+        # ran with the directory empty" is an assumption without this and an
+        # observation with it. A MAPPING, so the stored evidence tells `False`
+        # (has content) from `None` (the read failed) per path rather than
+        # leaving that to the problem text; `{}` is "this task declares none".
+        after = {path: _directory_is_empty(container, path)
+                 for path in sorted(unneeded)}
+        evidence["submodules_empty_after_suite"] = after
+        not_empty = sorted(p for p, ok in after.items() if ok is False)
+        unreadable = sorted(p for p, ok in after.items() if ok is None)
+        if not_empty:
+            problems.append(
+                "running the suite left content in "
+                + ", ".join(not_empty)
+                + ", which the manifest declares unneeded. `git status "
+                "--porcelain` -- the check immediately above -- cannot see "
+                "into a gitlink path, so this is the only reader that can. A "
+                "suite that writes inside a submodule is out of the corpus."
+            )
+        if unreadable:
+            problems.append(
+                "could not list "
+                + ", ".join(unreadable)
+                + " after the suite ran, so whether the suite wrote into a "
+                "declared-unneeded submodule is UNKNOWN -- the read failed, "
+                "which is not the same answer as the directory having "
+                "content. `git status --porcelain` cannot see into a gitlink "
+                "path, so nothing else in this gate answers it either."
             )
 
         # --- green after

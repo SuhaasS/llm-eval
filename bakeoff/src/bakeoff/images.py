@@ -429,10 +429,20 @@ def _extract_submodules(task, repo_dir: Path, cache_root: Path) -> None:
     the tree is `base_sha`'s, so the test half -- the oracle -- is still absent;
     that is why this is two archives rather than a copy of a materialized run
     tree, which would carry both.
+
+    A submodule declared unneeded in the manifest is skipped: no mirror, no
+    archive, no `mkdir`. The empty directory the image needs is already in the
+    context -- measured 2026-09-02, `git archive <base_sha> | tar -x` creates
+    the gitlink's path as an empty directory -- so re-creating it here would
+    make the image's tree an artifact of this function rather than of
+    `base_sha`'s, which is not the same claim the moment anything reorders
+    around the strip.
     """
     from bakeoff.tasks import ensure_pruned_mirror, task_submodules
 
     for sub in task_submodules(task, cache_root):
+        if sub.declared_unneeded:
+            continue
         mirror = ensure_pruned_mirror(sub.url, sub.sha, cache_root)
         target = Path(repo_dir) / sub.path
         target.mkdir(parents=True, exist_ok=True)

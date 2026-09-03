@@ -2020,6 +2020,151 @@ MUTATIONS = [
         "tests/test_fault_injection.py -k different_config_dirs",
         "not integration",
     ),
+    # --- round 2 item 2: submodules_unneeded ---------------------------------
+    (
+        # Without the filter, `_init_submodules` populates a path the manifest
+        # declared unneeded -- which for the shape the key exists for means
+        # `ensure_pruned_mirror` against an ssh url, so the whole task is
+        # refused again and the key buys nothing.
+        "tasks: populate a submodule the manifest declared unneeded",
+        "src/bakeoff/tasks.py",
+        "    needed = tuple(sub for sub in subs if not sub.declared_unneeded)",
+        "    needed = tuple(subs)",
+        "tests/test_tasks.py -k leaves_a_declared_unneeded_submodule_empty",
+        "not integration",
+    ),
+    (
+        # The item itself. Without the guard the url refusal fires on a
+        # declared path and `tobymao/sqlglot` stays closed at every base_sha
+        # after 2026-02-27.
+        "tasks: refuse a declared-unneeded submodule for its url",
+        "src/bakeoff/tasks.py",
+        "        if not sub.declared_unneeded:",
+        "        if True:",
+        "tests/test_tasks.py -k not_refused_for_its_url",
+        "not integration",
+    ),
+    (
+        # The PLACEMENT of the first kept refusal, not the guard. This is the
+        # exact edit a later editor tidying the two kept refusals inside the
+        # guard would make, and it is valid Python -- the bracket balance
+        # survives the existing continuation line. A strip covering the path
+        # still removes the gitlink and still moves start_sha.
+        "tasks: move the strip refusal inside the unneeded guard",
+        "src/bakeoff/tasks.py",
+        "        stripped = [p for p in task.strip_paths",
+        "        stripped = [] if sub.declared_unneeded else "
+        "[p for p in task.strip_paths",
+        "tests/test_tasks.py -k strip_path_covering_a_declared_unneeded",
+        "not integration",
+    ),
+    (
+        # The PLACEMENT of the second kept refusal. `git add -A` stages
+        # nothing for a gitlink path in either state, so a task whose fix
+        # lives there is ungradable however the manifest declares it.
+        "tasks: move the reference-diff refusal inside the unneeded guard",
+        "src/bakeoff/tasks.py",
+        "        touched = [p for p in (*task.test_files, *task.solution_files,",
+        "        touched = [] if sub.declared_unneeded else "
+        "[p for p in (*task.test_files, *task.solution_files,",
+        "tests/test_tasks.py -k reference_diff_touching_a_declared_unneeded",
+        "not integration",
+    ),
+    (
+        # TWO LINES, and that is not stylistic: `mutation_check` applies
+        # `replace(find, replace, 1)` with no uniqueness check, and
+        # `    if unknown:` appears three times in tasks.py (the `image.*` and
+        # `grading.*` unknown-key refusals in `load_task`, both far above
+        # `derive_submodules`). A one-line anchor would mutate the image-key
+        # refusal, leave the typo refusal intact, let the selector pass, and
+        # report MISSED -- loud, but not a caught mutation.
+        "tasks: accept an unneeded declaration naming no gitlink",
+        "src/bakeoff/tasks.py",
+        "    unknown = sorted(set(task.submodules_unneeded) - set(gitlinks))\n"
+        "    if unknown:",
+        "    unknown = sorted(set(task.submodules_unneeded) - set(gitlinks))\n"
+        "    if False:",
+        "tests/test_tasks.py -k naming_no_gitlink_is_refused",
+        "not integration",
+    ),
+    (
+        # ONE line covering BOTH `.gitmodules` exemptions, which is why the
+        # design routes them through one derived set: a tree whose only
+        # gitlinks are declared is workable with no readable `.gitmodules` at
+        # all, and the unfetchable check reads the same set.
+        "tasks: refuse a declared-unneeded gitlink that has no url",
+        "src/bakeoff/tasks.py",
+        "    needed_gitlinks = set(gitlinks) - set(task.submodules_unneeded)",
+        "    needed_gitlinks = set(gitlinks)",
+        "tests/test_tasks.py -k survives_an_unreadable_gitmodules",
+        "not integration",
+    ),
+    (
+        # The original defect, at image-build time: without the `continue` the
+        # ssh url is cloned while building the task image, before preflight
+        # and before any container.
+        "images: clone a mirror for a submodule declared unneeded",
+        "src/bakeoff/images.py",
+        "        if sub.declared_unneeded:\n            continue",
+        "        if False:\n            continue",
+        "tests/test_images.py -k no_second_archive_is_taken",
+        "not integration",
+    ),
+    (
+        # The one line that turns the NO-GO into a GO. Written out verbatim
+        # with its continuation line because the `old` string does not exist
+        # until this item's preflight change has landed.
+        "preflight: keep a declared-unneeded submodule in the stale list",
+        "src/bakeoff/preflight.py",
+        '        stale = [entry["path"] for entry in submodules\n'
+        '                 if not entry["initialised"] '
+        'and not entry["declared_unneeded"]]',
+        '        stale = [entry["path"] for entry in submodules\n'
+        '                 if not entry["initialised"]]',
+        "tests/test_preflight.py -k unneeded_submodule_is_a_GO",
+        "not integration",
+    ),
+    (
+        # git is BLIND inside a gitlink path, so the filesystem read is the
+        # only enforcement HARVESTING's "a suite that writes inside the
+        # submodule is out" rule has left once the submodule is uninitialised.
+        "preflight: skip the start-state emptiness read",
+        "src/bakeoff/preflight.py",
+        '                entry["empty"] = _directory_is_empty(container, '
+        'entry["path"])',
+        '                entry["empty"] = True',
+        "tests/test_preflight.py -k declared_unneeded_submodule_with_content",
+        "not integration",
+    ),
+    (
+        # The post-suite half. `git status --porcelain` next door reports
+        # nothing for a file written inside an uninitialised submodule, so
+        # without this read "the suite ran with the directory empty" is an
+        # assumption rather than an observation.
+        "preflight: skip the post-suite emptiness read",
+        "src/bakeoff/preflight.py",
+        "        after = {path: _directory_is_empty(container, path)",
+        "        after = {path: True",
+        "tests/test_preflight.py -k writes_into_a_declared_unneeded_submodule",
+        "not integration",
+    ),
+    (
+        # Without the seed the scratch index is built by `git add -A` alone,
+        # which never descends into a gitlink path -- so an uninitialised
+        # submodule is a `deleted file mode 160000` chunk on a CLEAN tree
+        # (measured 239 bytes on tobymao/sqlglot, agent having done nothing)
+        # and every run of a declared-unneeded task grades
+        # SUBMODULE_GITLINK_UNGRADABLE. `new` is a DIFFERENT exec rather than
+        # a deletion so the mutated file still parses and the failure is the
+        # missing seed, not a syntax error. The selector is the unit
+        # argv-order test, because this gate runs under "not integration".
+        "container: stage the snapshot into an unseeded scratch index",
+        "src/bakeoff/container.py",
+        '        self.checked_exec(["git", "read-tree", base_sha], env=env)',
+        '        self.checked_exec(["git", "--version"], env=env)',
+        "tests/test_container.py -k seeded_from_base_before_staging",
+        "not integration",
+    ),
 ]
 
 

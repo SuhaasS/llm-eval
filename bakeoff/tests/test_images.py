@@ -265,6 +265,7 @@ def test_build_task_image_strips_the_context_it_unpacks(tmp_path, monkeypatch):
         # it is rendering for (D15).
         tests = type("T", (), {"framework": "pytest"})()
         strip_paths = ("CLAUDE.md", ".claude")
+        submodules_unneeded = ()
         test_files = ()
         solution_files = ()
         extra_files = ()
@@ -326,7 +327,7 @@ def _submodule_fixture(tmp_path):
     return {"sup": sup, "lib": lib, "base": base, "pinned": pinned}
 
 
-def _sub_task_stub(fixture, strip_paths=()):
+def _sub_task_stub(fixture, strip_paths=(), submodules_unneeded=()):
     class _Image:
         apt = ()
         pip = ()
@@ -345,11 +346,13 @@ def _sub_task_stub(fixture, strip_paths=()):
         # it is rendering for (D15).
         tests = type("T", (), {"framework": "pytest"})()
         strip_paths = ()
+        submodules_unneeded = ()
         test_files = ()
         solution_files = ()
         extra_files = ()
 
     _Task.strip_paths = tuple(strip_paths)
+    _Task.submodules_unneeded = tuple(submodules_unneeded)
     return _Task()
 
 
@@ -425,6 +428,60 @@ def test_an_ancestor_strip_path_coexists_with_the_submodule_extract(
     assert (repo / ".gitmodules").exists()   # the strip touches nothing else
 
 
+def test_no_second_archive_is_taken_for_a_declared_unneeded_submodule(
+        tmp_path, monkeypatch):
+    """`test_the_build_context_carries_submodule_content`, inverted.
+
+    The directory the image needs is already in the context -- measured
+    2026-09-02, `git archive <base_sha> | tar -x` creates the gitlink's path as
+    an EMPTY directory -- so the image is correct with no second archive, and
+    no mirror is built, which is what makes an ssh url cost nothing.
+    """
+    fixture = _submodule_fixture(tmp_path)
+    monkeypatch.setattr("bakeoff.images._run", lambda *a, **k: "sha256:fake")
+    monkeypatch.setattr(tasks, "_SUBMODULE_URL_PREFIX", "")
+    pruned = []
+    real_pruned = tasks.ensure_pruned_mirror
+    monkeypatch.setattr(
+        tasks, "ensure_pruned_mirror",
+        lambda url, sha, cache: (pruned.append((url, sha)),
+                                 real_pruned(url, sha, cache))[1],
+    )
+
+    build_task_image(
+        _sub_task_stub(fixture, submodules_unneeded=("vendor/libdep",)),
+        "sha256:base", tmp_path / "build", tmp_path / "cache")
+
+    repo = tmp_path / "build" / "image-t" / "repo"
+    sub = repo / "vendor" / "libdep"
+    assert sub.is_dir()
+    assert list(sub.iterdir()) == []
+    assert str(fixture["lib"]) not in [url for url, _sha in pruned]
+
+
+def test_a_declared_unneeded_submodule_leaves_no_dotgit_in_the_context(
+        tmp_path, monkeypatch):
+    """The house form of `test_the_build_context_still_carries_no_git_directory`,
+    over the skipped path: a skip that reached for a `git clone` instead of a
+    `git archive` would leave one.
+
+    `rglob(".git")`, never `rglob(".git*")` against a one-element list: that
+    also matches `.gitignore` and `.gitattributes`, and `rglob`'s order is
+    unspecified.
+    """
+    fixture = _submodule_fixture(tmp_path)
+    monkeypatch.setattr("bakeoff.images._run", lambda *a, **k: "sha256:fake")
+    monkeypatch.setattr(tasks, "_SUBMODULE_URL_PREFIX", "")
+
+    build_task_image(
+        _sub_task_stub(fixture, submodules_unneeded=("vendor/libdep",)),
+        "sha256:base", tmp_path / "build", tmp_path / "cache")
+
+    repo = tmp_path / "build" / "image-t" / "repo"
+    assert [p for p in repo.rglob(".git")] == []
+    assert (repo / ".gitmodules").exists()
+
+
 def test_a_task_with_no_submodules_takes_no_extra_archive(tmp_path, monkeypatch):
     """Backwards compatibility. `pallets/click` at its base_sha has no gitlink,
     and a zero-submodule task must not gain a git call against the mirror.
@@ -461,6 +518,7 @@ def test_a_task_with_no_submodules_takes_no_extra_archive(tmp_path, monkeypatch)
         # it is rendering for (D15).
         tests = type("T", (), {"framework": "pytest"})()
         strip_paths = ()
+        submodules_unneeded = ()
         test_files = ()
         solution_files = ()
         extra_files = ()
@@ -580,6 +638,7 @@ def test_build_task_image_passes_the_manifests_env_through(tmp_path,
         # it is rendering for (D15).
         tests = type("T", (), {"framework": "pytest"})()
         strip_paths = ()
+        submodules_unneeded = ()
         test_files = ()
         solution_files = ()
         extra_files = ()
@@ -860,6 +919,7 @@ def _runtime_task_stub(framework):
         image = _Image()
         tests = _Tests()
         strip_paths = ()
+        submodules_unneeded = ()
         test_files = ()
         solution_files = ()
         extra_files = ()

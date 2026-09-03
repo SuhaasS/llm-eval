@@ -281,7 +281,26 @@ from typing import Any
 # hold three distinct values over the same four `run_id`s -- so the field
 # changed meaning at this version and the log has no update API. Read a
 # pre-3.8.0 `collection_id` as an invocation, not as an episode.
-SCHEMA_VERSION = "3.8.0"
+#
+# 3.9.0 is the version at which `artifacts.final_diff` and every
+# `Checkpoint.diff` stopped asserting deletions that never happened.
+# `container.snapshot_diff` stages into a scratch index, and before this
+# version that index was built by `git add -A` alone -- which skips a file that
+# is tracked at the start state but also matches `.gitignore`, and never
+# descends into a gitlink path. Both absences read as DELETIONS against
+# `base_sha`. Measured 2026-09-02: `eemeli/yaml` carries 15 such tracked-but-
+# ignored files (`.editorconfig`, `.github/workflows/*`, `.gitignore` and
+# `.gitmodules` among them) and `bidict` 1 (`.coveragerc`), so a pre-3.9.0
+# record of either task asserts deletions the agent never made -- and the
+# offline grader APPLIES that diff, so the ladder really did delete them in the
+# grading tree before running the suite. An uninitialised submodule directory
+# (`submodules_unneeded`) produced the same shape as a `deleted file mode
+# 160000` chunk, which `grader._gitlinks_touched` refuses outright. No field is
+# added and none is removed; an existing field changed what it asserts, which
+# is why the constant moves. No stored record carries either phantom: all ten
+# event logs under `~/.cache/bakeoff` hold `click-3360-write-usage-empty-args`
+# only, and click has 0 tracked-but-ignored files at its `base_sha`.
+SCHEMA_VERSION = "3.9.0"
 
 
 class Outcome(str, Enum):

@@ -249,11 +249,19 @@ def test_the_image_and_the_run_tree_carry_the_same_submodule_blob(
     #    here would be an observation of "there are none" -- which is what the
     #    check wrote for every task before this broadening, and is exactly the
     #    false negative a bare `result.ok` would let through.
+    #    `declared_unneeded` and `empty` are written for EVERY entry, declared
+    #    or not, so a reader who cannot see the fields on the other entries
+    #    cannot mistake "this task declared none" for "this gate did not know
+    #    about the key". `empty: False` here is the real `ls -A` against a
+    #    real populated submodule, in the real container.
     assert result.evidence["submodules"] == [
         {"path": SUB_PATH, "sha": superproject["pinned"],
-         "initialised": True, "marker": " "}
+         "initialised": True, "marker": " ",
+         "declared_unneeded": False, "empty": False}
     ]
     assert result.evidence["submodules_orphaned"] == []
+    # `{}` is "measured, this task declares no unneeded submodules".
+    assert result.evidence["submodules_empty_after_suite"] == {}
 
     # 3. THE COMPARISON THIS FILE EXISTS FOR. Two archives of two objects,
     #    from two functions, and nothing else in the codebase puts them side

@@ -482,23 +482,58 @@ pass-to-pass, 1.4 s suite. **What remains for Gate 1 is the dataset itself**
   repository's own ignore list on the one run that used it.
   `PREFLIGHT_VERSION` 15, `GRADER_VERSION` 10, `ORACLE_VERSION` 5.
 
-- [ ] **The sqlglot ssh-submodule refusal blocks a suite that never reads the
-  submodule, and there is no manifest lever to say so.** `tobymao/sqlglot`
-  added `.gitmodules` naming an ssh url on 2026-02-27 (`3a930dad6`, #7167);
-  every `base_sha` at or after it is refused before preflight ever runs, even
-  for a task whose suite never touches the submodule's content at all. A
-  manifest key to declare a submodule as unneeded — leave the gitlink in the
-  index, never populate it, never refuse on its url scheme — would reopen
-  post-2026-02-27 sqlglot (and any repository shaped like it) without
-  weakening the existing rule that a task whose *fix* touches submodule
-  content is refused. Not already expressible: the strip_paths-over-submodule
-  refusal (`HARVESTING.md`, "The image") exists precisely because a strip
-  cannot safely remove a submodule path without leaving `.gitmodules` naming
-  a directory that was never created, and the same reasoning is why no
-  existing lever routes around this one either. Filed here for the same
-  reason the duplicate-`fullName` item above was filed here: it bounds which
-  `base_sha`s are harvestable, not a gap safe to close once collection is
-  underway.
+- [x] **The sqlglot ssh-submodule refusal blocks a suite that never reads the
+  submodule, and there is no manifest lever to say so.** Shipped 2026-09-02
+  (round 2 item 2) as top-level `submodules_unneeded: ["<path>"]`. The gitlink
+  stays in the index and the tree exactly as at `base_sha`, the directory is
+  never populated, its url scheme is never checked, a readable `.gitmodules`
+  is not required for it, and no pruned mirror is built. It relaxes four of
+  the six submodule refusals and **neither of the two that protect grading**:
+  a `strip_paths` entry covering the path, and a reference diff touching it,
+  are refused with the key exactly as without it. Preflight stops calling a
+  declared path `stale` and instead asserts what the declaration promises —
+  marker `-`, the directory present and EMPTY, re-read after the suite,
+  because git does not descend into a gitlink path in any state and `git
+  status --porcelain` cannot see a file written in there. `container.snapshot_diff`
+  now seeds its scratch index with `git read-tree <base_sha>`: without it an
+  uninitialised gitlink is a phantom `deleted file mode 160000` on a clean
+  tree (measured 239 bytes on `tobymao/sqlglot`) and the offline grader
+  refused every such submission as `SUBMODULE_GITLINK_UNGRADABLE`. That one
+  line also removed a pre-existing phantom — a file tracked at the start
+  state that also matches `.gitignore` was reported deleted in every
+  submission and checkpoint (`eemeli/yaml` carries 15, `bidict` 1).
+  `PREFLIGHT_VERSION` 15 → 16, `SCHEMA_VERSION` 3.8.0 → 3.9.0; `start_sha`,
+  `ORACLE_VERSION`, `GRADER_VERSION` and `GRADE_SCHEMA_VERSION` do not move.
+
+- [ ] **The unneeded-submodule gate records no collected-test count, so it
+  cannot tell a guarded suite from a silently shrinking one.** What
+  `submodules_unneeded` proves is narrower than its name: the declared f2p ids
+  are red-before/green-after and the p2p sweep is green *with the directory
+  empty*. A repository that carries an optional submodule guards on its
+  presence — measured on `tobymao/sqlglot`, `tests/sqlglot/__init__.py` and
+  `tests/test_integration_loader.py` both sit behind `os.path.isdir(...)` and
+  append nothing when the directory is empty — so the suite silently
+  *shrinks* rather than failing, and every verdict the gate records is
+  consistent with that. Closing it means recording a collected-test count for
+  the p2p sweep, which is a runner-adapter change across pytest, vitest and
+  jest and belongs with that work rather than bolted onto a manifest key. It
+  is a bound on external validity, not a correctness gap: every arm sees the
+  identical tree.
+
+- [ ] **What an agent writes inside an uninitialised submodule directory is
+  invisible at run time.** Measured 2026-09-02 after the snapshot-index seed:
+  a file the agent creates under a `submodules_unneeded` path diffs to **0
+  bytes** and names nothing, while `ls -A` sees it — git does not descend into
+  a gitlink path in any state, and the seeded index does not either. So the
+  §5.6 submission and every §5.5 checkpoint are silent about it. Within item 2
+  the only enforcement is preflight's two `ls -A` reads, which refuse the
+  *task* rather than scoring a *run*: a task that gates clean and an agent
+  that writes in there mid-run are two different moments. Capturing it at run
+  time is round-2 item 17's job
+  (`docs/superpowers/plans/2026-09-03-round2-17-submodule-dirty-capture.md`):
+  an `ls -A` over uninitialised gitlink directories, recorded in
+  `submodules_dirty` and refused by the grader. Filed here because item 17 had
+  not landed when item 2 shipped; delete this entry when it does.
 
 - [ ] **The test half is applied at setup, and that is a methodology choice.**
   A real bug-fix PR carries the test that proves the fix, so at `base_sha` the

@@ -167,6 +167,58 @@ tests:
 # Section 6.4 confound, to be recorded here by any task that uses it: the
 # humans who wrote the PR had the stripped file.
 
+# submodules_unneeded: NOT USED by this task -- pallets/click carries no
+# submodule at this base_sha. Shown because this manifest is the
+# documentation for the key.
+#
+# Top-level, beside strip_paths and gitignore_extra, for the same reason:
+# it is a modification the harness makes rather than a statement about
+# upstream, and `repo:` holds only what can be checked against GitHub. Its
+# truth is a property of THIS TASK's suite, not of the repository.
+#
+#   submodules_unneeded: ["sqlglot-integration-tests"]
+#
+# Each entry is a submodule path at base_sha -- a path, not a
+# [submodule "NAME"] name, because git does not require the two to match and
+# only the path comes from `git ls-tree`. The gitlink stays in the index and
+# the tree exactly as it is; the directory is created empty by the checkout
+# and by `git archive`, is never populated, its .gitmodules url is never
+# checked -- nor does a readable .gitmodules have to exist for it at all --
+# and no mirror is built for it. Declaring it does NOT move start_sha:
+# nothing here takes part in the setup commit, and submodules are initialised
+# after start_sha is settled.
+#
+# What it does NOT relax: a strip_paths entry covering the submodule is
+# still refused (the strip removes the gitlink and moves start_sha), and a
+# reference diff touching the submodule path -- either half -- is still
+# refused (`git add -A` stages nothing for a gitlink path in any state, so a
+# fix living there is ungradable by construction). A submission that moves
+# the gitlink is still refused by the offline grader.
+#
+# Refused at load: an absolute path, "..", ".", ".git", a glob, a repeat.
+# Refused when the mirror exists: a path the tree at base_sha has no gitlink
+# at -- a typo must not silently declare nothing.
+#
+# What the gate CHECKS, and it is narrower than the key's name: the
+# directory exists, is EMPTY and `git submodule status` reads `-`; the
+# declared f2p ids are red before the reference fix and green after it; and
+# the p2p sweep is green -- all with the directory empty. It re-reads
+# emptiness after the suite, because git does not descend into a gitlink
+# path and `git status --porcelain` cannot see a file written in there. What
+# it CANNOT check is that no test anywhere needed the submodule: a suite
+# that guards on its presence silently collects fewer tests, and no
+# collected-test count is recorded.
+#
+# The submission diff carries NOTHING for the path -- but only because
+# `container.snapshot_diff` seeds its scratch index from the start state
+# first. Without that seed an uninitialised gitlink reads as a DELETION
+# against an index `git add -A` built from a worktree scan, and the offline
+# grader refuses every such submission as submodule_gitlink_ungradable
+# (measured 2026-09-02: 239 bytes on this repository, clean tree).
+#
+# Section 6.4 confound, to be recorded here by any task that uses it: the
+# humans who wrote the PR had the submodule.
+
 image:
   # python: "3.12"
   #

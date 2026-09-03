@@ -174,6 +174,84 @@ def upstream_submodule(tmp_path):
 
 
 @pytest.fixture
+def upstream_two_submodules(tmp_path):
+    """`upstream_submodule` with a SECOND gitlink, at `vendor/other`.
+
+    Beside that fixture rather than parameterising it: every existing test in
+    the submodule section depends on `upstream_submodule`'s exact halves, and
+    a second gitlink changes the derivation's output for all of them.
+
+    Yields a builder taking one keyword, `stanzas: int = 2`. At `stanzas=1`
+    the fixture rewrites `.gitmodules` to carry the `vendor/libdep` stanza
+    ALONE and commits that, which is the readable-but-no-stanza tree D4 row 2
+    is about: `vendor/other` keeps its gitlink and loses its url, and is
+    workable only when the manifest declares it unneeded.
+
+    `-c protocol.file.allow=always` on every submodule-touching command, for
+    the reason `upstream_submodule`'s docstring gives.
+    """
+    def _build(stanzas: int = 2):
+        libs = {}
+        for name in ("libdep", "other"):
+            lib = tmp_path / f"two-{name}"
+            (lib / name).mkdir(parents=True)
+            (lib / name / "__init__.py").write_text(SUB_LIB)
+            _sh("git", "init", "-q", cwd=lib)
+            _sh("git", "config", "user.email", "t@t.test", cwd=lib)
+            _sh("git", "config", "user.name", "t", cwd=lib)
+            _sh("git", "add", "-A", cwd=lib)
+            _sh("git", "commit", "-q", "-m", f"{name} v1", cwd=lib)
+            libs[name] = (lib, _sh("git", "rev-parse", "HEAD", cwd=lib))
+
+        repo = tmp_path / "super-two"
+        (repo / "tests").mkdir(parents=True)
+        (repo / "calc.py").write_text(BUGGY)
+        (repo / "tests" / "test_calc.py").write_text(OLD_TEST)
+        _sh("git", "init", "-q", cwd=repo)
+        _sh("git", "config", "user.email", "t@t.test", cwd=repo)
+        _sh("git", "config", "user.name", "t", cwd=repo)
+        _sh("git", "add", "-A", cwd=repo)
+        _sh("git", "commit", "-q", "-m", "base", cwd=repo)
+        for name, path in (("libdep", "vendor/libdep"),
+                           ("other", "vendor/other")):
+            _sh("git", "-c", "protocol.file.allow=always", "submodule", "add",
+                "-q", str(libs[name][0]), path, cwd=repo)
+        _sh("git", "add", "-A", cwd=repo)
+        _sh("git", "commit", "-q", "-m", "pin both submodules", cwd=repo)
+        if stanzas == 1:
+            # The `vendor/libdep` stanza ALONE. `vendor/other` keeps its
+            # gitlink and loses its url, which is the one shape the
+            # `by_path.get` fallback in `derive_submodules` exists for.
+            (repo / ".gitmodules").write_text(
+                '[submodule "vendor/libdep"]\n'
+                "\tpath = vendor/libdep\n"
+                f"\turl = {libs['libdep'][0]}\n"
+            )
+            _sh("git", "add", ".gitmodules", cwd=repo)
+            _sh("git", "commit", "-q", "-m", "drop the other stanza", cwd=repo)
+        base = _sh("git", "rev-parse", "HEAD", cwd=repo)
+
+        (repo / "calc.py").write_text(FIXED)
+        (repo / "tests" / "test_calc.py").write_text(NEW_TEST)
+        _sh("git", "add", "-A", cwd=repo)
+        _sh("git", "commit", "-q", "-m", "fix", cwd=repo)
+        head = _sh("git", "rev-parse", "HEAD", cwd=repo)
+        reference = subprocess.run(
+            ["git", "diff", base, head], cwd=repo, check=True,
+            capture_output=True, text=True,
+        ).stdout
+        return {
+            "path": repo, "base": base, "head": head, "reference": reference,
+            "lib": libs["libdep"][0], "pinned": libs["libdep"][1],
+            "sub_path": "vendor/libdep",
+            "other_lib": libs["other"][0], "other_pinned": libs["other"][1],
+            "sub_path_other": "vendor/other",
+        }
+
+    return _build
+
+
+@pytest.fixture
 def local_urls(monkeypatch):
     """Accept the fixtures' local-path submodule urls.
 
@@ -2543,6 +2621,14 @@ def test_a_gitlink_with_no_gitmodules_url_is_refused(tmp_path,
     """The quiet shape: no url, so the directory would simply stay empty and
     the suite would fail to collect on every arm -- with `git status
     --porcelain` reporting the tree as clean throughout.
+
+    It `git rm --cached`s `.gitmodules`, so the refusal it actually reaches is
+    the UNREADABLE-BLOB one (measured 2026-09-02: `git config --blob
+    <sha>:.gitmodules --list -z` exits 128), not the per-path
+    gitlink-with-no-stanza one. The neighbouring
+    `test_a_gitlink_whose_only_gitmodules_stanza_names_another_path_is_refused`
+    covers that second shape. Both stay refused for a submodule the manifest
+    does NOT declare unneeded.
     """
     up = upstream_submodule
     _sh("git", "rm", "-q", "--cached", ".gitmodules", cwd=up["path"])
@@ -2939,6 +3025,346 @@ def test_a_submodule_left_at_the_wrong_commit_is_refused(
     assert up["pinned"] in str(excinfo.value)
 
 
+# --- submodules_unneeded ------------------------------------------------------
+#
+# The manifest lever that lets a task be cut from a repository whose base_sha
+# carries a submodule the suite never reads. The key reaches a fixture manifest
+# through `extra_yaml=`, which is the established route for a TOP-LEVEL key
+# (`_manifest` has no keyword for it and must not gain one); a test needing two
+# top-level keys concatenates them with a newline.
+
+
+def _ssh_url_fixture(up):
+    """`upstream_submodule` with the submodule url rewritten to an ssh one.
+
+    The measured defect verbatim: `tobymao/sqlglot` declares
+    `git@github.com:fivetran/sqlglot-integration-tests.git`, which
+    `_refuse_submodule_conflicts` refuses before any container starts.
+
+    Returns a dict UPDATE, not just a sha, because the rewrite lands on top of
+    the fixture's own fix commit: the new base has to carry the BUGGY halves
+    again and a new head has to carry the fixed ones, or the reference diff
+    the manifest ships no longer applies at the base it names.
+    """
+    repo = up["path"]
+
+    def commit(message):
+        _sh("git", "add", "-A", cwd=repo)
+        _sh("git", "-c", "user.email=t@t.test", "-c", "user.name=t",
+            "commit", "-q", "-m", message, cwd=repo)
+        return _sh("git", "rev-parse", "HEAD", cwd=repo)
+
+    (repo / ".gitmodules").write_text(
+        '[submodule "vendor/libdep"]\n'
+        "\tpath = vendor/libdep\n"
+        "\turl = git@example.invalid:x/y.git\n"
+    )
+    (repo / "calc.py").write_text(BUGGY)
+    (repo / "tests" / "test_calc.py").write_text(OLD_TEST)
+    base = commit("an ssh url, back at the buggy state")
+    (repo / "calc.py").write_text(FIXED)
+    (repo / "tests" / "test_calc.py").write_text(NEW_TEST)
+    head = commit("fix")
+    reference = subprocess.run(
+        ["git", "diff", base, head], cwd=repo, check=True,
+        capture_output=True, text=True,
+    ).stdout
+    return {**up, "base": base, "head": head, "reference": reference}
+
+
+def test_a_declared_unneeded_submodule_is_not_refused_for_its_url(
+        tmp_path, upstream_submodule):
+    """The item, in one test.
+
+    Deliberately WITHOUT `local_urls`: that fixture empties
+    `_SUBMODULE_URL_PREFIX`, under which the url refusal cannot fire at all
+    and this test would pass with the exemption deleted.
+    """
+    up = _ssh_url_fixture(upstream_submodule)
+    task = _sub_task(tmp_path, up,
+                     extra_yaml='submodules_unneeded: ["vendor/libdep"]')
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"],
+                                 tmp_path / "cache")
+
+    (sub,) = tasks.derive_submodules(task, mirror)
+
+    assert sub.declared_unneeded is True
+    assert sub.url == "git@example.invalid:x/y.git"
+
+
+def test_an_unneeded_declaration_naming_no_gitlink_is_refused(
+        tmp_path, upstream_submodule, local_urls):
+    """A typo declares NOTHING: the submodule it was meant to name is still
+    populated, or still refused for its url, and nothing downstream would say
+    the key did not apply."""
+    up = upstream_submodule
+    task = _sub_task(tmp_path, up,
+                     extra_yaml='submodules_unneeded: ["vendor/typo"]')
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"],
+                                 tmp_path / "cache")
+
+    with pytest.raises(TaskError, match="vendor/typo") as excinfo:
+        tasks.derive_submodules(task, mirror)
+
+    assert "no gitlink" in str(excinfo.value)
+
+
+def test_the_typo_refusal_beats_the_url_refusal(tmp_path, upstream_submodule):
+    """The typo check's POSITION is the message. It runs immediately after the
+    gitlink scan and before anything reads `.gitmodules`, so an author who
+    misspells the path of the very submodule they are exempting is told about
+    the typo rather than about a url they were trying to opt out of."""
+    up = _ssh_url_fixture(upstream_submodule)
+    task = _sub_task(tmp_path, up,
+                     extra_yaml='submodules_unneeded: ["vendor/libdeps"]')
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"],
+                                 tmp_path / "cache")
+
+    with pytest.raises(TaskError) as excinfo:
+        tasks.derive_submodules(task, mirror)
+
+    assert "submodules_unneeded" in str(excinfo.value)
+    assert "git@example.invalid" not in str(excinfo.value)
+
+
+def test_the_typo_refusal_beats_the_unreadable_gitmodules_refusal(
+        tmp_path, upstream_submodule, local_urls):
+    """The other ordering half. Together with the row above this pins the
+    typo check to ONE line rather than to a range: either of the two
+    `.gitmodules`-derived refusals winning means the check moved."""
+    up = upstream_submodule
+    _sh("git", "rm", "-q", "--cached", ".gitmodules", cwd=up["path"])
+    _sh("git", "-c", "user.email=t@t.test", "-c", "user.name=t",
+        "commit", "-q", "-m", "drop .gitmodules", cwd=up["path"])
+    base = _sh("git", "rev-parse", "HEAD", cwd=up["path"])
+    task = _sub_task(tmp_path, {**up, "base": base},
+                     extra_yaml='submodules_unneeded: ["vendor/typo"]')
+    mirror = tasks.ensure_mirror(str(up["path"]), base, tmp_path / "cache")
+
+    with pytest.raises(TaskError) as excinfo:
+        tasks.derive_submodules(task, mirror)
+
+    assert "submodules_unneeded" in str(excinfo.value)
+    assert "no readable .gitmodules" not in str(excinfo.value)
+
+
+def test_a_declared_unneeded_gitlink_survives_an_unreadable_gitmodules(
+        tmp_path, upstream_submodule, local_urls):
+    """Measured 2026-09-02: a tree with gitlinks and no `.gitmodules` BLOB
+    makes `git config --blob <sha>:.gitmodules --list -z` exit 128, which is a
+    refusal of its own and reached ahead of the per-path url one. A tree whose
+    only gitlinks are declared is fully workable with no `.gitmodules` at all,
+    because nothing is fetched for them."""
+    up = upstream_submodule
+    _sh("git", "rm", "-q", "--cached", ".gitmodules", cwd=up["path"])
+    _sh("git", "-c", "user.email=t@t.test", "-c", "user.name=t",
+        "commit", "-q", "-m", "drop .gitmodules", cwd=up["path"])
+    base = _sh("git", "rev-parse", "HEAD", cwd=up["path"])
+    task = _sub_task(tmp_path, {**up, "base": base},
+                     extra_yaml='submodules_unneeded: ["vendor/libdep"]')
+    mirror = tasks.ensure_mirror(str(up["path"]), base, tmp_path / "cache")
+
+    (sub,) = tasks.derive_submodules(task, mirror)
+
+    assert sub.declared_unneeded is True
+    assert sub.url == ""
+    assert sub.name == "vendor/libdep"
+
+
+def test_a_declared_unneeded_gitlink_with_no_stanza_in_a_readable_gitmodules(
+        tmp_path, upstream_two_submodules, local_urls):
+    """The narrower shape the `by_path.get` fallback was justified for:
+    `.gitmodules` is READABLE and carries a stanza for the first gitlink only,
+    so the second has a gitlink and no url -- fatal when it is needed, fine
+    when it is declared."""
+    up = upstream_two_submodules(stanzas=1)
+    task = _sub_task(tmp_path, up,
+                     extra_yaml='submodules_unneeded: ["vendor/other"]')
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"],
+                                 tmp_path / "cache")
+
+    subs = tasks.derive_submodules(task, mirror)
+
+    assert [s.path for s in subs] == ["vendor/libdep", "vendor/other"]
+    other = subs[1]
+    assert other.declared_unneeded is True
+    assert other.url == ""
+    assert subs[0].declared_unneeded is False
+
+
+def test_a_strip_path_covering_a_declared_unneeded_submodule_is_still_refused(
+        tmp_path, upstream_submodule, local_urls):
+    """KEPT, and outside the guard. A strip is unrelated to population:
+    `_strip_paths_from_tree`'s `git rm -r` still removes the gitlink, still
+    leaves `.gitmodules` naming a path that no longer exists, and moves
+    `start_sha` while doing it."""
+    up = upstream_submodule
+    task = _sub_task(
+        tmp_path, up,
+        extra_yaml=('strip_paths: ["vendor/libdep"]\n'
+                    'submodules_unneeded: ["vendor/libdep"]'),
+    )
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"],
+                                 tmp_path / "cache")
+
+    with pytest.raises(TaskError, match="strip_paths"):
+        tasks.derive_submodules(task, mirror)
+
+
+def test_a_reference_diff_touching_a_declared_unneeded_submodule_is_still_refused(
+        tmp_path, upstream_submodule, local_urls):
+    """KEPT, and the reason is STRONGER here rather than weaker: `git add -A`
+    stages nothing for a gitlink path in either state, so a task whose fix
+    lives there is ungradable by construction however the manifest declares
+    it."""
+    up = upstream_submodule
+    reference = up["reference"] + (
+        "diff --git a/vendor/libdep/tests/test_sub.py"
+        " b/vendor/libdep/tests/test_sub.py\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/vendor/libdep/tests/test_sub.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+def test_sub():\n"
+    )
+    task = _sub_task(tmp_path, {**up, "reference": reference},
+                     extra_yaml='submodules_unneeded: ["vendor/libdep"]')
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"],
+                                 tmp_path / "cache")
+
+    with pytest.raises(TaskError, match="ungradable"):
+        tasks.derive_submodules(task, mirror)
+
+
+@pytest.mark.parametrize("bad", [
+    "/abs", "../up", ".", "./", ".git", ".git/modules", "vendor/*",
+    ":(exclude)v", "", " v",
+])
+def test_an_unneeded_declaration_is_shape_validated_at_load(
+        tmp_path, upstream, bad):
+    """The SHAPE half runs offline, with no repository at all -- these
+    manifests carry `base_sha` `"0" * 40` against a repo that does not exist.
+    The existence half cannot run here and lives in `derive_submodules`,
+    exactly as `strip_paths`' does in `_strip_paths_from_tree`."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream,
+        extra_yaml=f"submodules_unneeded: [{bad!r}]",
+    )
+
+    with pytest.raises(TaskError):
+        load_task(task_dir)
+
+
+def test_a_duplicated_unneeded_declaration_is_refused(tmp_path, upstream):
+    """The refusal `strip_paths` does not have. This key is consumed as a SET,
+    so a repeat is invisible to every downstream comparison -- it cannot
+    change any behaviour, which makes a manifest carrying one a statement the
+    key cannot express."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream,
+        extra_yaml='submodules_unneeded: ["vendor/libdep", "vendor/libdep"]',
+    )
+
+    with pytest.raises(TaskError, match="listed twice"):
+        load_task(task_dir)
+
+
+def test_materialize_leaves_a_declared_unneeded_submodule_empty(
+        tmp_path, upstream_submodule, local_urls):
+    """The shape the run tree ALREADY has when `_init_submodules` does nothing.
+
+    Measured 2026-09-02, git 2.50.1: `materialize`'s `git clean -xfd` does not
+    remove the directory, `git status --porcelain` reports the tree clean, the
+    index gitlink is untouched, and `git submodule status` reads `-<sha>`.
+    Nothing new is built to produce the state; what changed is the verdict
+    rendered over it.
+    """
+    up = upstream_submodule
+    _, run, _ = _materialize_sub(
+        tmp_path, up, extra_yaml='submodules_unneeded: ["vendor/libdep"]')
+    sub = run / "vendor" / "libdep"
+
+    assert sub.is_dir()
+    assert list(sub.iterdir()) == []
+    # NOT `_sh`, which strips -- the leading character is the assertion.
+    status = subprocess.run(["git", "submodule", "status"], cwd=run,
+                            check=True, capture_output=True, text=True).stdout
+    assert status.startswith("-")
+    assert _sh("git", "status", "--porcelain", cwd=run) == ""
+    assert f"160000 {up['pinned']}" in _sh("git", "ls-files", "-s", cwd=run)
+    assert not (run / ".git" / "modules").exists()
+
+
+def test_no_pruned_mirror_is_built_for_a_declared_unneeded_submodule(
+        tmp_path, upstream_submodule):
+    """The `if not needed: return` above the mirror comprehension is what makes
+    this a property of the code rather than of an empty comprehension.
+
+    The ssh-url variant, so a mirror attempt would also fail loudly rather
+    than quietly succeeding against a path that happens to exist.
+    """
+    up = _ssh_url_fixture(upstream_submodule)
+    calls = []
+    real = tasks.ensure_pruned_mirror
+
+    def recording(url, sha, cache_root):
+        calls.append((url, sha))
+        return real(url, sha, cache_root)
+
+    task = _sub_task(tmp_path, up,
+                     extra_yaml='submodules_unneeded: ["vendor/libdep"]')
+    original = tasks.ensure_pruned_mirror
+    tasks.ensure_pruned_mirror = recording
+    try:
+        materialize(task, tmp_path / "run", tmp_path / "cache")
+    finally:
+        tasks.ensure_pruned_mirror = original
+
+    assert "git@example.invalid:x/y.git" not in [url for url, _sha in calls]
+    # The superproject's own mirror IS built, so an assertion that simply
+    # counted zero calls would pass with `_init_submodules` deleted entirely.
+    assert calls
+
+
+def test_declaring_an_unneeded_submodule_does_not_move_start_sha(
+        tmp_path, upstream_submodule, local_urls):
+    """D8's pin. Nothing this key changes is an input to the setup commit --
+    `start_sha` is base_sha + strip_paths + the committed test half +
+    gitignore_extra -- and `_init_submodules` runs AFTER `start_sha` is
+    computed and compared."""
+    up = upstream_submodule
+    declared = _sub_task(tmp_path / "a", up,
+                         extra_yaml='submodules_unneeded: ["vendor/libdep"]')
+    plain = _sub_task(tmp_path / "b", up)
+
+    assert materialize(declared, tmp_path / "ra", tmp_path / "ca") == \
+        materialize(plain, tmp_path / "rb", tmp_path / "cb")
+
+
+def test_a_mixed_task_populates_the_needed_submodule_and_not_the_other(
+        tmp_path, upstream_two_submodules, local_urls):
+    """The filter is per ENTRY, not per task: a repository can carry two
+    submodules of which one is needed (`eemeli/yaml` carries four), which is
+    why the key is a list of paths rather than a boolean."""
+    up = upstream_two_submodules()
+    task = _sub_task(tmp_path, up,
+                     extra_yaml='submodules_unneeded: ["vendor/other"]')
+    materialize(task, tmp_path / "run", tmp_path / "cache")
+    run = tmp_path / "run"
+
+    assert list((run / "vendor" / "other").iterdir()) == []
+    assert (run / "vendor" / "libdep" / "libdep" / "__init__.py").exists()
+    # NOT `_sh`, which strips: the leading character is the whole assertion.
+    # `-` is uninitialised, a space is initialised at the gitlink. The path is
+    # field 2; an initialised line carries a `(heads/main)` suffix after it.
+    status = subprocess.run(["git", "submodule", "status"], cwd=run,
+                            check=True, capture_output=True, text=True).stdout
+    markers = {line.split()[1]: line[0]
+               for line in status.splitlines() if line}
+    assert markers["vendor/other"] == "-"
+    assert markers["vendor/libdep"] == " "
+
+
 # --- tests.framework ----------------------------------------------------------
 
 
@@ -3207,3 +3633,7 @@ def test_the_click_task_still_loads_and_its_start_sha_has_not_moved(tmp_path):
     assert task.tests.framework == "pytest"
     assert task.declared_start_sha == (
         "33575cc0b75608fa5cbcb1d3ae3347b81eac437f")
+    # `pallets/click` carries no gitlink at this base_sha, and the key it does
+    # not declare must load as the empty tuple rather than as anything a
+    # downstream `set()` could mistake for a declaration.
+    assert task.submodules_unneeded == ()

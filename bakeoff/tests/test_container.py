@@ -1,6 +1,7 @@
 import os
 import shutil
 import stat
+import subprocess
 import threading
 import time
 
@@ -140,6 +141,10 @@ def test_snapshot_diff_raises_when_git_fails(alpine_container):
     a Checkpoint stores as "the agent had changed nothing by this turn."
     That is a fabricated measurement feeding the cost-at-budget-K curve, not
     a visible error. Fail instead.
+
+    The FIRST command that touches git is now the scratch-index seed (`git
+    read-tree <base_sha>`), not `git add -A`, so that is where this raises;
+    the assertion is unchanged because both name git.
     """
     with pytest.raises(ContainerError, match="git"):
         alpine_container.snapshot_diff("abc123")
@@ -410,12 +415,49 @@ class _AddSequence:
         return ExecResult(0, "diff-body", "", 1)
 
 
+class _SnapshotCalls:
+    """Records (argv, env) per exec and can fail one command by prefix.
+
+    `_FakeContainer` cannot serve the seed tests: its `exec_run(cmd, **_kw)`
+    discards `environment=` and records nothing, so neither "read-tree before
+    add" nor "the read-tree carried GIT_INDEX_FILE" is observable through it.
+    """
+
+    def __init__(self, fail_on: list[str] | None = None,
+                 exit_code: int = 1, message: str = "boom"):
+        self.calls: list[tuple[list[str], dict | None]] = []
+        self.fail_on = fail_on
+        self.exit_code = exit_code
+        self.message = message
+
+    def __call__(self, cmd, env=None):
+        from bakeoff.container import ExecResult
+
+        self.calls.append((list(cmd), dict(env) if env else None))
+        if self.fail_on and cmd[:len(self.fail_on)] == self.fail_on:
+            return ExecResult(self.exit_code, "", self.message, 1)
+        return ExecResult(0, "diff-body", "", 1)
+
+    @property
+    def argv(self) -> list[list[str]]:
+        return [cmd for cmd, _env in self.calls]
+
+
 def _container_with(exec_stub) -> RunContainer:
+    """The REAL `checked_exec` over a stubbed `exec`, deliberately.
+
+    This helper used to fake `checked_exec` too, with a lambda that never
+    looked at the exit code -- so a stub returning non-zero for the snapshot
+    index seed would be swallowed and `test_a_failed_seed_raises_rather_than_diffing`
+    would assert nothing. `RunContainer.checked_exec` calls `self.exec`, which
+    IS stubbed, so removing the override exercises the production check
+    through the same stub. Both `_AddSequence` users return exit 0 for every
+    non-`add` command, so the real check is a no-op for them.
+    """
     container = RunContainer(
         image="sha256:" + "0" * 64, repo_path="/tmp/x", base_sha="abc"
     )
     container.exec = exec_stub  # type: ignore[method-assign]
-    container.checked_exec = lambda cmd, env=None: exec_stub(cmd, env)  # type: ignore
     return container
 
 
@@ -464,7 +506,168 @@ def test_an_unrelated_git_failure_is_not_retried():
     assert stub.add_calls == 1
 
 
-# --- HostSampler: the host block is measured, or says it was not -------------
+# --- the snapshot index is SEEDED from the start state -----------------------
+#
+# `GIT_INDEX_FILE` starts empty and `git add -A` does not descend into a
+# gitlink path, so an uninitialised submodule diffed against `base_sha` reads
+# as `deleted file mode 160000` on a clean tree -- measured 2026-09-02, 199
+# bytes on a fixture and 239 on `tobymao/sqlglot`, agent having done nothing.
+# `grader._GITLINK_MODE` matches that line, so every such submission would be
+# refused SUBMODULE_GITLINK_UNGRADABLE.
+
+
+def test_the_snapshot_index_is_seeded_from_base_before_staging():
+    """ORDER, not presence: a read-tree issued after the staging is a seed the
+    `git add -A` never saw, and the index it wrote would already be the one
+    built from a worktree scan that cannot see the gitlink."""
+    stub = _SnapshotCalls()
+    container = _container_with(stub)
+
+    container.snapshot_diff("abc")
+
+    assert stub.argv[0] == ["git", "read-tree", "abc"]
+    assert stub.argv[1] == ["git", "add", "-A"]
+
+
+def test_the_seed_writes_the_scratch_index_not_the_agents_own():
+    """Without `env=` the read-tree writes the repository's OWN `.git/index`,
+    which is the agent's staging area and runs concurrently with it -- the
+    exact thing `snapshot_diff`'s docstring says it must never touch. That is
+    worse than the bug being fixed, so the env is pinned and not only the
+    argv."""
+    from bakeoff.container import SNAPSHOT_INDEX
+
+    stub = _SnapshotCalls()
+    container = _container_with(stub)
+
+    container.snapshot_diff("abc")
+
+    seed_argv, seed_env = stub.calls[0]
+    assert seed_argv == ["git", "read-tree", "abc"]
+    assert seed_env == {"GIT_INDEX_FILE": SNAPSHOT_INDEX}
+
+
+def test_a_failed_seed_raises_rather_than_diffing():
+    """The fallback for a silently failed seed IS the phantom deletion, which
+    is an accusation the agent deleted a submodule it never touched -- the
+    same argument `grader._refresh_index` makes for raising. Containment lives
+    one layer up in `checkpoints.maybe_capture`."""
+    stub = _SnapshotCalls(fail_on=["git", "read-tree"])
+    container = _container_with(stub)
+
+    with pytest.raises(ContainerError):
+        container.snapshot_diff("abc")
+
+    assert not any(cmd[:2] == ["git", "diff"] for cmd in stub.argv)
+
+
+def _fabricate_gitlink(repo, path="vendor/libdep", sha="1" * 40):
+    """A `160000` index entry over an empty directory, with no second
+    repository and no file transport.
+
+    Measured 2026-09-02, git 2.50.1: this gives a tree whose `git ls-files -s`
+    carries the gitlink, an empty directory at that path, and `git status
+    --porcelain` empty -- exactly the declared-unneeded state.
+    """
+    (repo / path).mkdir(parents=True)
+    subprocess.run(
+        ["git", "update-index", "--add", "--cacheinfo",
+         f"160000,{sha},{path}"],
+        cwd=repo, check=True, capture_output=True,
+    )
+
+
+@integration
+def test_an_uninitialised_gitlink_is_not_reported_as_a_deletion(
+        git_container_factory):
+    """The blocker this seed exists for. Measured UNSEEDED on this exact
+    fixture: 199 bytes, naming `["vendor/libdep"]`, on a clean tree the agent
+    never touched."""
+    def build(repo):
+        (repo / "calc.py").write_text("x = 1\n")
+        _fabricate_gitlink(repo)
+
+    container, start = git_container_factory(build)
+
+    assert container.snapshot_diff(start) == ("", [])
+
+
+@integration
+def test_a_repo_with_no_submodules_snapshots_byte_identically(git_container):
+    """The pin for the seed's UNCONDITIONALITY. `container.py` has no manifest
+    and must not gain one, which is affordable only because a repository with
+    no gitlink diffs identically either way.
+
+    The unseeded reference is produced IN THE TEST with raw `container.exec`
+    against a second scratch index: `snapshot_diff` always seeds after this
+    change, so it cannot produce its own control.
+    """
+    sha = git_container.base_sha
+    git_container.exec(["sh", "-c", "echo modified > /repo/tests/test_a.py"])
+    git_container.exec(["sh", "-c", "echo added > /repo/added.py"])
+    git_container.exec(["sh", "-c", "echo '*.log' > /repo/.gitignore"])
+    git_container.exec(["sh", "-c", "echo noise > /repo/scratch.log"])
+
+    unseeded_env = {"GIT_INDEX_FILE": "/tmp/bakeoff-unseeded-index"}
+    git_container.exec(["git", "add", "-A"], env=unseeded_env)
+    unseeded = git_container.exec(
+        ["git", "diff", "--cached", sha], env=unseeded_env
+    ).stdout
+
+    seeded, _files = git_container.snapshot_diff(sha)
+
+    assert seeded == unseeded
+    assert "added.py" in seeded
+
+
+@integration
+def test_a_tracked_file_matching_gitignore_is_not_reported_as_deleted(
+        git_container_factory):
+    """A PRE-EXISTING phantom the same empty index produced, and the shape
+    `eemeli/yaml` carries fifteen of (`.editorconfig`, `.github/workflows/*`,
+    `.gitignore` and `.gitmodules` themselves) and `bidict` one
+    (`.coveragerc`). From an empty index every path is untracked and `add -A`
+    honours the ignore rules, so a file tracked at the start state and also
+    matching `.gitignore` was absent from the index and reported DELETED.
+    Measured unseeded: names `[".coveragerc"]`.
+    """
+    def build(repo):
+        (repo / "calc.py").write_text("x = 1\n")
+        (repo / ".gitignore").write_text(".coveragerc\n")
+        (repo / ".coveragerc").write_text("[run]\n")
+        subprocess.run(["git", "add", "-f", ".coveragerc"], cwd=repo,
+                       check=True, capture_output=True)
+
+    container, start = git_container_factory(build)
+
+    _diff, files = container.snapshot_diff(start)
+
+    assert ".coveragerc" not in files
+
+
+@integration
+def test_a_moved_gitlink_still_reaches_the_submission(git_container_factory):
+    """D7's guarantee, pinned rather than assumed: the seed must not make the
+    grader's gitlink refusal unreachable. An agent handed an empty tracked
+    directory may well `git init` in it, and the content then lives in the run
+    tree's `.git/modules` and nowhere else -- so the ladder would grade the
+    original tree and stamp `resolved: False` on work it could not see.
+    """
+    def build(repo):
+        (repo / "calc.py").write_text("x = 1\n")
+        _fabricate_gitlink(repo)
+
+    container, start = git_container_factory(build)
+    container.exec(["sh", "-c",
+                    "cd /repo/vendor/libdep && git init -q "
+                    "&& git config user.email a@b.c && git config user.name a "
+                    "&& echo hi > f.txt && git add -A "
+                    "&& git commit -q -m inner"])
+
+    diff, files = container.snapshot_diff(start)
+
+    assert "vendor/libdep" in files
+    assert "160000" in diff
 
 
 def test_a_first_stream_frame_yields_no_percentage():

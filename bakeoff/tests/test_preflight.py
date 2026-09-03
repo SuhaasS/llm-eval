@@ -890,6 +890,7 @@ class _ScriptedContainer:
                  python="Python 3.12.13",
                  submodule_status="", submodule_status_exit=0,
                  gitlinks=(), gitmodules_declared=None, gitmodules_exit=None,
+                 ls_entries=None, ls_exits=None,
                  reports=None, bare_runner=None):
         self.commands = []
         #: The JSON report each suite invocation writes, keyed by which run it
@@ -947,6 +948,21 @@ class _ScriptedContainer:
         #: how a test reaches the >1 branch, where the file exists and could
         #: not be read -- the answer that must not be reported as "no orphans".
         self.gitmodules_exit = gitmodules_exit
+        #: What `ls -A -- <path>` reports, keyed by path. An ABSENT key is an
+        #: empty directory at exit 0, which is the state every existing test
+        #: in this module is in. A value may be a tuple of tuples, in which
+        #: case it is consumed BY CALL INDEX on that path -- preflight reads a
+        #: declared path twice (before the suite and after it) and the whole
+        #: point of the second read is that its answer can differ.
+        self.ls_entries = dict(ls_entries or {})
+        #: A non-zero exit for `ls -A -- <path>`, keyed by path. The "could
+        #: not be read" answer, which must reach the evidence as `None` and
+        #: never as the measured claim `False`. A value may be a tuple, read
+        #: by call index, for the same reason `ls_entries` may be.
+        self.ls_exits = dict(ls_exits or {})
+        #: How many times each path has been listed, so the by-call-index
+        #: scripting above has something to index on.
+        self.ls_calls: dict[str, int] = {}
         self.scoped_exit = scoped_exit
         self.grading_exits = dict(grading_exits or {})
         self.f2p_runs = 0
@@ -1010,6 +1026,28 @@ class _ScriptedContainer:
                 # adapter classifies as an ENVIRONMENT outcome.
                 return _Exec(exit_code=1, stderr="No such file or directory\n")
             return _Exec(stdout=self._report_text)
+        if cmd[:3] == ["ls", "-A", "--"]:
+            path = cmd[3]
+            index = self.ls_calls.get(path, 0)
+            self.ls_calls[path] = index + 1
+
+            def _at(value, per_call):
+                # `per_call` is True when the scripted value is a SEQUENCE of
+                # per-call answers. The last element repeats, so a test that
+                # scripts one read need not script the other.
+                if not per_call:
+                    return value
+                return value[min(index, len(value) - 1)]
+
+            exit_code = self.ls_exits.get(path, 0)
+            exit_code = _at(exit_code, isinstance(exit_code, tuple))
+            if exit_code:
+                return _Exec(exit_code=exit_code,
+                             stderr=f"ls: cannot access '{path}'\n")
+            entries = self.ls_entries.get(path, ())
+            entries = _at(entries, bool(entries)
+                          and isinstance(entries[0], tuple))
+            return _Exec(stdout="".join(f"{name}\n" for name in entries))
         if cmd[:2] == ["id", "-u"]:
             return _Exec(stdout="1000\n")
         if cmd[0] == "claude":
@@ -1279,6 +1317,7 @@ class _FakeTask:
     manifest_digest: str = "d"
     solution_diff: str = "diff --git a/x b/x\n"
     strip_paths: tuple = ()
+    submodules_unneeded: tuple = ()
 
 
 def _run_preflight(monkeypatch, tmp_path, task, container):
@@ -2318,10 +2357,22 @@ def test_the_preflight_version_moved_with_the_new_assertion():
     `duplicate_full_names`' CONTENT grows for an unchanged task -- group 0 now
     runs the f2p files' siblings unfiltered where v14's global deselection
     skipped them -- so a reader diffing two cached verdicts across this bump
-    must not read that growth as a regression."""
+    must not read that growth as a regression.
+
+    15 -> 16 is `submodules_unneeded` (round 2 item 2, 2026-09-02), and the
+    EVIDENCE SHAPE is the reason rather than the new assertion. Every
+    `submodules` entry gained `declared_unneeded` and `empty`, on every task
+    whether or not it declares the key, and a new top-level
+    `submodules_empty_after_suite` joined `submodules` and
+    `submodules_orphaned`. Those manifests' digests do not move, so a warm v15
+    blob and a fresh v16 blob would otherwise sit in one cache describing
+    different shapes. The narrower residual comes second: a v15 NO-GO on a
+    manifest that already declared the key -- reachable only because
+    `load_task` has no top-level unknown-key refusal -- would otherwise be
+    served forever."""
     from bakeoff.preflight import PREFLIGHT_VERSION
 
-    assert PREFLIGHT_VERSION == "15"
+    assert PREFLIGHT_VERSION == "16"
 
 
 # --- fix 2: the bare-runner probe ---------------------------------------------
@@ -2634,6 +2685,11 @@ def test_an_initialised_submodule_at_its_gitlink_is_a_GO(monkeypatch, tmp_path):
             " 942c381d88cecca36be86b2e902f554ad145ec44 vendor/libdep"
             " (heads/main)\n"
         ),
+        # An INITIALISED submodule has content, and `empty` is measured for
+        # every entry rather than only declared ones -- so that a `None` there
+        # can only ever mean "the read failed" and never "the read was not
+        # attempted".
+        ls_entries={"vendor/libdep": ("libdep",)},
     )
 
     result = _run_preflight(monkeypatch, tmp_path, _FakeTask(), container)
@@ -2642,9 +2698,13 @@ def test_an_initialised_submodule_at_its_gitlink_is_a_GO(monkeypatch, tmp_path):
     assert result.evidence["submodules"] == [
         {"path": "vendor/libdep",
          "sha": "942c381d88cecca36be86b2e902f554ad145ec44",
-         "initialised": True, "marker": " "}
+         "initialised": True, "marker": " ",
+         "declared_unneeded": False, "empty": False}
     ]
     assert result.evidence["submodules_orphaned"] == []
+    # `{}` is "measured, this task declares no unneeded submodules"; `None` is
+    # "not measured", which is the pre-container early return.
+    assert result.evidence["submodules_empty_after_suite"] == {}
 
 
 def test_an_uninitialised_submodule_is_a_preflight_problem(monkeypatch,
@@ -2667,7 +2727,7 @@ def test_an_uninitialised_submodule_is_a_preflight_problem(monkeypatch,
     assert any("vendor/libdep" in p for p in result.problems)
     assert result.evidence["submodules"] == [
         {"path": "vendor/libdep", "sha": "0" * 40, "initialised": False,
-         "marker": "-"}
+         "marker": "-", "declared_unneeded": False, "empty": True}
     ]
 
 
@@ -2689,7 +2749,7 @@ def test_a_submodule_at_the_wrong_commit_is_a_preflight_problem(monkeypatch,
     assert any("not initialised at their gitlink" in p for p in result.problems)
     assert result.evidence["submodules"] == [
         {"path": "vendor/libdep", "sha": "1" * 40, "initialised": False,
-         "marker": "+"}
+         "marker": "+", "declared_unneeded": False, "empty": True}
     ]
 
 
@@ -2888,7 +2948,8 @@ def test_an_unreadable_gitmodules_is_not_reported_as_no_orphans(monkeypatch,
     assert result.evidence["submodules"] == [
         {"path": "vendor/libdep",
          "sha": "942c381d88cecca36be86b2e902f554ad145ec44",
-         "initialised": True, "marker": " "}
+         "initialised": True, "marker": " ",
+         "declared_unneeded": False, "empty": True}
     ]
     assert any(".gitmodules" in p for p in result.problems)
 
@@ -2906,6 +2967,190 @@ def test_the_submodule_keys_are_written_on_the_early_return(tmp_path):
 
     assert result.evidence["submodules"] is None
     assert result.evidence["submodules_orphaned"] is None
+    assert result.evidence["submodules_empty_after_suite"] is None
+
+
+# --- submodules_unneeded: the gate asserts the declared state ----------------
+
+
+def _unneeded_task(*paths):
+    return _FakeTask(submodules_unneeded=tuple(paths))
+
+
+def test_a_declared_unneeded_submodule_is_a_GO_while_uninitialised(
+        monkeypatch, tmp_path):
+    """The item, at the gate. `-` and an EMPTY directory are what
+    `materialize` leaves when `_init_submodules` skips the path, and that is
+    now the asserted state rather than the `stale` NO-GO.
+    """
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=_FakeTests(), present=("tests/",),
+        gitlinks=("vendor/libdep",),
+        submodule_status=("-" + "0" * 40 + " vendor/libdep\n"),
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path,
+                            _unneeded_task("vendor/libdep"), container)
+
+    assert result.ok, result.problems
+    assert result.evidence["submodules"] == [
+        {"path": "vendor/libdep", "sha": "0" * 40, "initialised": False,
+         "marker": "-", "declared_unneeded": True, "empty": True}
+    ]
+    assert result.evidence["submodules_empty_after_suite"] == \
+        {"vendor/libdep": True}
+
+
+def test_a_needed_submodule_that_is_uninitialised_is_still_a_problem(
+        monkeypatch, tmp_path):
+    """The regression this change could silently take out: the same tree with
+    NOTHING declared is the Phase 0c shape arriving through the dataset, and
+    `stale` still has to fire on it."""
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=_FakeTests(), present=("tests/",),
+        gitlinks=("vendor/libdep",),
+        submodule_status=("-" + "0" * 40 + " vendor/libdep\n"),
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, _FakeTask(), container)
+
+    assert not result.ok
+    assert any("not initialised at their gitlink" in p for p in result.problems)
+
+
+def test_a_declared_unneeded_submodule_that_is_populated_is_a_problem(
+        monkeypatch, tmp_path):
+    """Something populated a path the harness was told to leave alone, so the
+    suite is reading content this task was not cut against. The run tree is
+    bind-mounted over the image's own /repo, so only a host-side write after
+    materialization can produce it."""
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=_FakeTests(), present=("tests/",),
+        gitlinks=("vendor/libdep",),
+        submodule_status=(
+            " 942c381d88cecca36be86b2e902f554ad145ec44 vendor/libdep"
+            " (heads/main)\n"
+        ),
+        ls_entries={"vendor/libdep": ("libdep",)},
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path,
+                            _unneeded_task("vendor/libdep"), container)
+
+    assert not result.ok
+    assert any("leave alone" in p for p in result.problems)
+
+
+def test_a_declared_unneeded_submodule_with_content_is_a_problem(
+        monkeypatch, tmp_path):
+    """HARVESTING's "a suite that writes inside the submodule is out" rule,
+    enforced at the only place it still can be. Measured 2026-09-02: a file
+    inside an UNINITIALISED submodule directory is invisible to `git status
+    --porcelain`, to `git ls-files -o` and to `git add -A`, so the marker is
+    still `-` and every other check in this gate is silent."""
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=_FakeTests(), present=("tests/",),
+        gitlinks=("vendor/libdep",),
+        submodule_status=("-" + "0" * 40 + " vendor/libdep\n"),
+        ls_entries={"vendor/libdep": ("junk.txt",)},
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path,
+                            _unneeded_task("vendor/libdep"), container)
+
+    assert not result.ok
+    assert any("not empty" in p for p in result.problems)
+    assert result.evidence["submodules"][0]["empty"] is False
+
+
+def test_an_unlistable_submodule_directory_records_None_and_a_problem(
+        monkeypatch, tmp_path):
+    """`None`, never `False`. An unlistable directory is the "not measured"
+    absence, and rendering it as the measured claim `False` would let a
+    permission error read as "the gate checked and the directory is empty"."""
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=_FakeTests(), present=("tests/",),
+        gitlinks=("vendor/libdep",),
+        submodule_status=("-" + "0" * 40 + " vendor/libdep\n"),
+        ls_exits={"vendor/libdep": 2},
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path,
+                            _unneeded_task("vendor/libdep"), container)
+
+    assert not result.ok
+    assert result.evidence["submodules"][0]["empty"] is None
+    assert any("could not list vendor/libdep" in p for p in result.problems)
+
+
+def test_an_unneeded_declaration_the_index_has_no_gitlink_for_is_a_problem(
+        monkeypatch, tmp_path):
+    """`derive_submodules` refuses this on the HOST, so reaching it means the
+    container's tree is not the one that was derived. Recorded as an
+    observation rather than trusted to the host-side refusal, for the reason
+    `_parse_submodule_status`'s docstring gives about not restating
+    configuration."""
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=_FakeTests(), present=("tests/",),
+        gitlinks=("vendor/libdep",),
+        submodule_status=(
+            " 942c381d88cecca36be86b2e902f554ad145ec44 vendor/libdep"
+            " (heads/main)\n"
+        ),
+        ls_entries={"vendor/libdep": ("libdep",)},
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path,
+                            _unneeded_task("vendor/gone"), container)
+
+    assert not result.ok
+    assert any("vendor/gone" in p and "disagree" in p for p in result.problems)
+
+
+def test_a_suite_that_writes_into_a_declared_unneeded_submodule_is_a_problem(
+        monkeypatch, tmp_path):
+    """The SECOND read is the whole test: empty before the suite and not empty
+    after it. `git status --porcelain` -- the dirty-tree check immediately
+    above this one -- cannot see into a gitlink path, so without this read
+    "the suite ran with the directory empty" is an assumption."""
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=_FakeTests(), present=("tests/",),
+        gitlinks=("vendor/libdep",),
+        submodule_status=("-" + "0" * 40 + " vendor/libdep\n"),
+        ls_entries={"vendor/libdep": ((), ("scratch.db",))},
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path,
+                            _unneeded_task("vendor/libdep"), container)
+
+    assert not result.ok
+    assert result.evidence["submodules_empty_after_suite"] == \
+        {"vendor/libdep": False}
+    assert any("left content in vendor/libdep" in p for p in result.problems)
+
+
+def test_an_unreadable_directory_after_the_suite_is_not_reported_as_content(
+        monkeypatch, tmp_path):
+    """A mapping, not a list, and this is why: an entry built from `empty is
+    None or not empty` would mean either "measured, has content" or "the read
+    failed", collapsing two absences at the top level. The problem text has to
+    say which of the two it is, and so does the evidence."""
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=_FakeTests(), present=("tests/",),
+        gitlinks=("vendor/libdep",),
+        submodule_status=("-" + "0" * 40 + " vendor/libdep\n"),
+        ls_exits={"vendor/libdep": (0, 2)},
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path,
+                            _unneeded_task("vendor/libdep"), container)
+
+    assert not result.ok
+    assert result.evidence["submodules_empty_after_suite"] == \
+        {"vendor/libdep": None}
+    assert any("UNKNOWN" in p and "the read failed" in p
+               for p in result.problems)
+    assert not any("left content in" in p for p in result.problems)
 
 
 @pytest.mark.integration

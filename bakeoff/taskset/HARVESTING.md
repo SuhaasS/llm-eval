@@ -615,7 +615,7 @@ rather than by reasoning:
   version that cannot install vitest or jest at the pinned string fails the
   base build itself); add the string to `tasks._NODE_VERSIONS` with the date;
   add the row here.
-- **Submodules are supported, with six limits.**
+- **Submodules are supported, with seven limits.**
   - The path, url and pinned commit are derived from `base_sha` — nothing goes
     in the manifest. Two git readers are involved (`git ls-tree` for the
     gitlink, `.gitmodules` for the url) and the two directions of disagreement
@@ -643,11 +643,40 @@ rather than by reasoning:
     and grades the original content. The loader refuses a reference diff
     touching a submodule path, and the grader refuses such a submission as
     not-graded.
-  - **A suite that writes inside the submodule is out.** An untracked file
-    there makes the superproject's `git status --porcelain` report
-    ` M <path>`, which is preflight's clean-tree NO-GO, and `gitignore_extra`
-    cannot fix it — that key writes the superproject's `.gitignore`, and the
-    rule would have to live inside the submodule's own tree.
+  - **A submodule the task's suite never reads can be declared unneeded.**
+    `submodules_unneeded: ["<path>"]`, top-level. The gitlink stays in the
+    index and the tree exactly as at `base_sha`, the directory is never
+    populated, **its url is never checked** — which is what reopens an
+    ssh-url repository — and a readable `.gitmodules` is not required for it
+    either. No mirror is built and no network read is made for it, and
+    `start_sha` does not move. It relaxes four of the six refusals above and
+    **neither of the two that protect grading**: a `strip_paths` entry
+    covering the path and a reference diff touching it are refused with the
+    key exactly as without it. What the gate checks is narrower than the
+    key's name: the directory exists, is EMPTY and `git submodule status`
+    reads `-`; the declared f2p ids are red-before/green-after; and the p2p
+    sweep is green — all with the directory empty. It records no
+    collected-test count, so it **cannot** tell a suite that guards on the
+    submodule's presence from one that silently collects fewer tests
+    (`TASKS.md`). Section 6.4 confound: the humans who wrote the PR had the
+    submodule, so upstream's own suite was strictly larger than any arm's.
+  - **A suite that writes inside the submodule is out** — and the enforcement
+    depends on whether the submodule is populated. For a POPULATED one an
+    untracked file there makes the superproject's `git status --porcelain`
+    report ` M <path>`, which is preflight's clean-tree NO-GO, and
+    `gitignore_extra` cannot fix it (that key writes the superproject's
+    `.gitignore`, and the rule would have to live inside the submodule's own
+    tree). For an UNINITIALISED one — which is every `submodules_unneeded`
+    path — git reports **nothing at all**: measured 2026-09-02, a file inside
+    an uninitialised submodule directory is invisible to `git status
+    --porcelain` (with or without `-uall`), to `git ls-files -o` and to
+    `git add -A`, because git does not descend into a gitlink path in any
+    state. The enforcement there is preflight's `ls -A` read, taken before
+    and after the suite. What the agent writes in there reaches neither the
+    submission nor a checkpoint **because `container.snapshot_diff` seeds its
+    scratch index from the start state**; before that seed the submission
+    carried the agent's file *and* a phantom `deleted file mode 160000` that
+    the offline grader refused outright.
   - **A suite, a conftest or an `image.build` step that runs `git submodule
     update --remote`, or deinits first, is out.** A *plain* `git submodule
     update` is fine and this bullet used to claim otherwise: measured
@@ -832,7 +861,7 @@ has not yet been shown to grow the corpus.
 
 | repo | what it needs | result | PRs |
 |---|---|---|---|
-| tobymao/sqlglot | `pip: [duckdb, pytz, pandas, python-dateutil]` and `SETUPTOOLS_SCM_PRETEND_VERSION` in `build:` | 1,217 passed, 19,201 subtests, 41.5 s | **795** |
+| tobymao/sqlglot | `pip: [duckdb, pytz, pandas, python-dateutil]` and `SETUPTOOLS_SCM_PRETEND_VERSION` in `build:`; at a `base_sha` after 2026-02-27 also `submodules_unneeded: ["sqlglot-integration-tests"]` and `strip_paths: ["CLAUDE.md", "AGENTS.md"]` | 1,217 passed, 19,201 subtests, 41.5 s. Open at ANY `base_sha` with those levers — the ssh submodule is no longer a floor | **795** |
 | pygments/pygments | `pip: ["wcag_contrast_ratio"]` | 1 collection error without it; re-screened 2026-09-02 — green (5330 passed, 16 skipped) identically on 3.11/3.12/3.13 | 64 |
 | Textualize/rich | `pip: ["attrs"]` | 1 collection error without it; re-screened 2026-09-02 — 8 failures, identical on 3.11/3.12/3.13, all Pygments-syntax-highlighting snapshot mismatches driven by which Pygments release is on PyPI, not by the interpreter | 40 |
 | python-humanize/humanize | `SETUPTOOLS_SCM_PRETEND_VERSION` (the editable install produces no `humanize._version`) plus `image.pip: ["freezegun"]` | diagnosed 2026-09-02 — the "6 import errors" are two ordinary shapes, identical on 3.11/3.12/3.13, neither version-dependent; not yet measured with either lever declared | 21 |
@@ -925,9 +954,27 @@ submodule bullets under *The image* below). So a plain (non-submodule-aware)
 `strip_paths` task from this repo is only usable with `base_sha` strictly
 **between** `a65c8701a306` (2026-02-02) and `3a930dad6` (2026-02-27) — at
 which point `AGENTS.md` does not exist yet and `CLAUDE.md` is a plain file, so
-`strip_paths: ["CLAUDE.md"]` alone suffices. Cutting after 2026-02-27 needs the
-manifest lever in `TASKS.md` (a submodule declared unneeded) that does not
-exist yet.
+`strip_paths: ["CLAUDE.md"]` alone suffices.
+
+**Cutting after 2026-02-27 is open, with `submodules_unneeded:
+["sqlglot-integration-tests"]`.** That key declines to populate the path: its
+url is never checked, so the ssh one costs nothing, and the gitlink stays in
+the index and the tree. It is truthful here because this suite guards on the
+submodule's presence rather than requiring it — measured at
+`05eed63b281f7ac020045e2b792beef8fad8d3ee`, `git grep
+sqlglot-integration-tests <base_sha> -- tests/` finds exactly two files and
+both are behind an existence test:
+`tests/sqlglot/__init__.py` appends the integration package to `__path__`
+only `if os.path.isdir(<submodule>/tests/sqlglot)`, and
+`tests/test_integration_loader.py`'s `load_tests` discovers additional tests
+under the same guard. With the directory empty neither appends anything and
+there is no collection error. At a post-2026-02-27 `base_sha` the manifest
+also needs `strip_paths: ["CLAUDE.md", "AGENTS.md"]` — **both** names,
+because `CLAUDE.md` is a symlink to `AGENTS.md` there (the "at which point
+`AGENTS.md` does not exist yet" sentence applies only to the older window)
+and preflight does not catch a target-only strip. Section 6.4 confound: the
+humans who wrote the PR had the submodule populated by `make install`, so
+upstream's own `make test` ran a strictly larger suite than any arm will.
 
 Also measured 2026-09-02: sqlglot's dialect tests wrap every assertion in
 `unittest.TestCase.subTest()` via the shared `validate_all` helper — pervasive
@@ -940,7 +987,9 @@ gate as authored.
 
 `strip_paths: ["CLAUDE.md", "AGENTS.md"]` lifts the first floor — both are agent
 files and neither is touched by a bug-fix PR — which reopens candidates in the
-window above, up to the submodule commit. List **both** names: `CLAUDE.md` is a
+window above, and beyond the submodule commit when the manifest also carries
+`submodules_unneeded: ["sqlglot-integration-tests"]`. List **both** names:
+`CLAUDE.md` is a
 symlink to `AGENTS.md` there, and preflight does NOT catch a target-only strip.
 `strip_paths: ["AGENTS.md"]` alone removes the target and leaves `CLAUDE.md` a
 dangling link an agent's `ls` still shows — the strip probe only looks at the

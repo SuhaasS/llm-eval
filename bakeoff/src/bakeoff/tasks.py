@@ -292,12 +292,21 @@ class Submodule:
 
     `name` is not `path`: the `[submodule "NAME"]` header is what
     `submodule.<name>.url` keys on, and git does not require the two to match.
+
+    `declared_unneeded` is the one field that is NOT derived. It is the
+    manifest's `submodules_unneeded` list, joined onto the derived entry by
+    path, and it is carried here rather than consulted separately so that every
+    reader of a `Submodule` -- the initialiser, the image builder, the gate's
+    evidence -- sees one answer instead of three lookups that can disagree. The
+    entry is kept in the tuple rather than filtered out: a filtered submodule
+    renders as a tree with no gitlink there, which is a different tree.
     """
 
     name: str
     path: str
     url: str
     sha: str
+    declared_unneeded: bool = False
 
 
 #: The only submodule url shape the eval can fetch. A relative url ("../x.git")
@@ -337,6 +346,16 @@ class TaskManifest:
     #: `start_sha`, rather than in a rewritten history a reader diffing
     #: against upstream would not find there.
     strip_paths: tuple[str, ...] = ()
+    #: Submodule paths this task declares it does not need. The gitlink stays
+    #: in the index and the tree exactly as at `base_sha`; the directory is
+    #: never populated, its `.gitmodules` url is never checked -- nor is a
+    #: readable `.gitmodules` required to exist for it at all -- and no pruned
+    #: mirror is built for it. What lifts a repository's submodule floor
+    #: without rewriting history: `tobymao/sqlglot` carries an ssh-url
+    #: submodule from 2026-02-27 that closed every later `base_sha`, for
+    #: suites that guard on its presence and never read it. Section 6.4
+    #: confound: the humans who wrote the PR had the submodule.
+    submodules_unneeded: tuple[str, ...] = ()
     provenance: dict[str, Any] = field(default_factory=dict)
     #: Git commit of the task-set repository, `-dirty` when the task set has
     #: uncommitted changes. This is what makes a stored record re-derivable
@@ -934,6 +953,61 @@ def _validate_strip_paths(paths: tuple[str, ...], where: str) -> None:
             )
 
 
+def _validate_unneeded_submodules(paths: tuple[str, ...], where: str) -> None:
+    """The SHAPE half of `submodules_unneeded`, which is all that can run here.
+
+    `load_task` runs on the host, offline, with no repository and no cache
+    root, so the question that matters most -- is this path a gitlink at
+    `base_sha`? -- cannot be asked at load time at all. It is asked in
+    `derive_submodules`, which holds the mirror, exactly as `strip_paths`'
+    "names nothing tracked" check lives in `_strip_paths_from_tree` rather
+    than here. What is left for this function is the shape.
+
+    `_validate_prefixes` covers empty, padded, absolute and `..`-bearing
+    entries. The three after it are the same three `_validate_strip_paths`
+    refuses and for the same reasons one key over: `.`/`./` names the whole
+    tree and a tree is not a gitlink, a `.git`-rooted path is inside the
+    repository's own metadata where no tree entry lives, and pathspec magic
+    would make which submodules are left unpopulated a property of the tree
+    rather than of the manifest.
+
+    The DUPLICATE refusal is the one `strip_paths` does not have, and it is
+    here because this key is consumed as a SET -- `set(task.submodules_unneeded)`
+    in `derive_submodules`, a `frozenset` in `preflight`. A repeat is
+    therefore invisible to every downstream comparison: it cannot change any
+    behaviour, so a manifest carrying one means something the key cannot
+    express, and saying nothing is how an author's actual intent gets lost.
+    """
+    _validate_prefixes(paths, where)
+    seen: set[str] = set()
+    for path in paths:
+        parts = PurePosixPath(path).parts
+        if not parts:
+            raise TaskError(
+                f"{where}: {path!r} names the whole tree; this key names one "
+                "submodule path per entry, and a tree is not a gitlink"
+            )
+        if parts[0] == ".git":
+            raise TaskError(
+                f"{where}: {path!r} is inside the repository's own .git; a "
+                "gitlink is a tree entry, and nothing under .git is one"
+            )
+        if path.startswith(":") or any(ch in path for ch in _PATHSPEC_MAGIC):
+            raise TaskError(
+                f"{where}: {path!r} carries pathspec magic; this key names "
+                "paths, and a pattern would make which submodules are left "
+                "unpopulated a property of the tree rather than of the "
+                "manifest"
+            )
+        if path in seen:
+            raise TaskError(
+                f"{where}: {path!r} is listed twice; the second entry cannot "
+                "change anything, so a manifest carrying it means something "
+                "the key cannot express"
+            )
+        seen.add(path)
+
+
 def split_reference_diff(
     diff: str, test_paths: tuple[str, ...], *, extra_paths: tuple[str, ...] = ()
 ) -> tuple[str, str, tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
@@ -1330,6 +1404,12 @@ def load_task(task_dir: Path, set_commit: str = "") -> TaskManifest:
     # preflight cache entry.
     strip_paths = _strs(data.get("strip_paths"), f"{where}:strip_paths")
     _validate_strip_paths(strip_paths, f"{where}:strip_paths")
+    submodules_unneeded = _strs(
+        data.get("submodules_unneeded"), f"{where}:submodules_unneeded"
+    )
+    _validate_unneeded_submodules(
+        submodules_unneeded, f"{where}:submodules_unneeded"
+    )
     test_diff, solution_diff, test_files, solution_files, extra_files = (
         split_reference_diff(reference, test_paths, extra_paths=extra_paths)
     )
@@ -1422,6 +1502,7 @@ def load_task(task_dir: Path, set_commit: str = "") -> TaskManifest:
         declared_start_sha=str(declared_start),
         gitignore_extra=_strs(data.get("gitignore_extra"), f"{where}:gitignore_extra"),
         strip_paths=strip_paths,
+        submodules_unneeded=submodules_unneeded,
         provenance=dict(data.get("provenance") or {}),
         task_set_commit=set_commit,
         manifest_digest=hashlib.sha256(raw_manifest + raw_reference).hexdigest()[:16],
@@ -1618,16 +1699,35 @@ def derive_submodules(task: TaskManifest, mirror: Path) -> tuple[Submodule, ...]
             continue
         gitlinks[path] = rest.split(" ")[-1]
 
+    # FIRST, before anything reads `.gitmodules`. Both of the refusals below
+    # are derived from that file, and an author who misspells the path of the
+    # very submodule they are exempting must be told about the typo rather
+    # than about a url or an unreadable blob. The position is the message.
+    unknown = sorted(set(task.submodules_unneeded) - set(gitlinks))
+    if unknown:
+        raise TaskError(
+            f"{task.task_id}: submodules_unneeded names "
+            f"{', '.join(unknown)}, which the tree at {task.base_sha} has no "
+            "gitlink at. A typo declares nothing: the submodule it was meant "
+            "to name is still populated (or still refused for its url), and "
+            "nothing downstream would say the key did not apply."
+        )
+    # ONE derived set for BOTH `.gitmodules` refusals, not two subtractions,
+    # because they are the same claim: nothing is fetched for a declared path,
+    # so neither a url nor a readable `.gitmodules` is needed for it. One line
+    # carries the exemption and one mutation can revert both.
+    needed_gitlinks = set(gitlinks) - set(task.submodules_unneeded)
+
     declared: dict[str, dict[str, str]] = {}
     if gitlinks or _has_gitmodules(mirror, task.base_sha):
         listing = _git("config", "--blob", f"{task.base_sha}:.gitmodules",
                        "--list", "-z", cwd=mirror, check=False)
-        if listing.returncode != 0 and gitlinks:
+        if listing.returncode != 0 and needed_gitlinks:
             raise TaskError(
                 f"{task.task_id}: {task.base_sha} carries gitlinks "
-                f"({', '.join(sorted(gitlinks))}) but no readable .gitmodules, "
-                "so no url exists to fetch them from and the directories would "
-                "arrive empty."
+                f"({', '.join(sorted(needed_gitlinks))}) but no readable "
+                ".gitmodules, so no url exists to fetch them from and the "
+                "directories would arrive empty."
             )
         for record in listing.stdout.split("\0"):
             key, _, value = record.partition("\n")
@@ -1650,7 +1750,7 @@ def derive_submodules(task: TaskManifest, mirror: Path) -> tuple[Submodule, ...]
     # records those names as `submodules_orphaned` instead -- a key with no
     # producer until Task 4 computes it inside the container, where it is an
     # observation of the tree rather than a re-derivation on the host.
-    unfetchable = sorted(set(gitlinks) - set(by_path))
+    unfetchable = sorted(needed_gitlinks - set(by_path))
     if unfetchable:
         raise TaskError(
             f"{task.task_id}: the tree at {task.base_sha} carries gitlinks "
@@ -1660,9 +1760,16 @@ def derive_submodules(task: TaskManifest, mirror: Path) -> tuple[Submodule, ...]
             "--porcelain` clean, so nothing downstream would say so."
         )
 
+    # `by_path.get(path, (path, {}))` is what lets a DECLARED-UNNEEDED gitlink
+    # construct an entry with no stanza at all, and even with no readable
+    # `.gitmodules`: `name` falls back to the path and `url` to `""`. That
+    # combination is unreachable for a needed submodule, because the two
+    # refusals above rule it out.
+    unneeded = set(task.submodules_unneeded)
     subs = tuple(
-        Submodule(name=by_path[path][0], path=path,
-                  url=by_path[path][1].get("url", ""), sha=sha)
+        Submodule(name=by_path.get(path, (path, {}))[0], path=path,
+                  url=by_path.get(path, (path, {}))[1].get("url", ""), sha=sha,
+                  declared_unneeded=path in unneeded)
         for path, sha in sorted(gitlinks.items())
     )
     _refuse_submodule_conflicts(task, subs, mirrors={})
@@ -1676,7 +1783,29 @@ def _has_gitmodules(mirror: Path, sha: str) -> bool:
 
 def _refuse_submodule_conflicts(task: TaskManifest, subs: tuple[Submodule, ...],
                                 mirrors: dict[str, Path]) -> None:
-    """The four refusals that are not about the two readers agreeing.
+    """The four refusals that are not about the two readers agreeing -- two of
+    which a `submodules_unneeded` declaration skips, and two of which it does
+    NOT.
+
+    SKIPPED for a declared path: the url check (nothing is fetched for it, so
+    no url is needed) and the nested-submodule check (no pruned mirror is
+    built for it, so `mirrors.get` returns `None` and the check already
+    no-ops; the guard makes that explicit rather than leaving it to the
+    coincidence).
+
+    KEPT for a declared path, and both are OUTSIDE the guard on purpose:
+
+    - a `strip_paths` entry covering the path. Unrelated to population --
+      `_strip_paths_from_tree`'s `git rm -r` still removes the gitlink, still
+      leaves `.gitmodules` naming a path that no longer exists, and still
+      moves `start_sha` while doing it.
+    - a reference diff touching the path. `git add -A` stages NOTHING for a
+      gitlink path in either state, so a task whose fix lives there is
+      ungradable by construction however the manifest declares it.
+
+    `mutation_check.py` anchors the PLACEMENT of both, not only the guard: the
+    edit a later editor reaches for is tidying them inside it, which would
+    silently drop the two refusals the key promises to keep.
 
     `mirrors` maps a submodule path to its pruned mirror, and is `{}` wherever
     no mirror exists yet -- `derive_submodules` runs with no cache root, and
@@ -1705,30 +1834,36 @@ def _refuse_submodule_conflicts(task: TaskManifest, subs: tuple[Submodule, ...],
     for it -- the checkpoint diff is zero bytes).
     """
     for sub in subs:
-        # `no url` rather than `url ''`: an empty value is what a `.gitmodules`
-        # stanza carrying a `path` and nothing else yields, and quoting the
-        # empty string reads as a url that is present and strange rather than
-        # as a field the author never wrote.
-        stated = f"url {sub.url!r}" if sub.url else "no url"
-        if not sub.url.startswith(_SUBMODULE_URL_PREFIX):
-            raise TaskError(
-                f"{task.task_id}: submodule {sub.path} declares {stated}; only "
-                f"{_SUBMODULE_URL_PREFIX} urls can be fetched by this eval. A "
-                "relative url resolves against a remote the run tree does not "
-                "have, and ssh/file urls cannot be fetched at all."
-            )
-        # FIRST after the url check, and the only refusal that needs an
-        # artifact rather than a comparison -- hence `mirrors`, and hence the
-        # skip wherever no mirror exists.
-        mirror_for = mirrors.get(sub.path)
-        if mirror_for is not None and _has_gitmodules(mirror_for, sub.sha):
-            raise TaskError(
-                f"{task.task_id}: submodule {sub.path} at {sub.sha} declares "
-                "submodules of its own. `git submodule update --init` does not "
-                "recurse, so the inner directory would arrive empty -- and an "
-                "empty submodule directory leaves `git status --porcelain` "
-                "clean, so nothing downstream would say so."
-            )
+        # NOT a `continue` at the top of the loop. That is the shape a later
+        # editor reaches for, and it would silently drop the two refusals
+        # below -- which are the two this key promises to keep.
+        if not sub.declared_unneeded:
+            # `no url` rather than `url ''`: an empty value is what a
+            # `.gitmodules` stanza carrying a `path` and nothing else yields,
+            # and quoting the empty string reads as a url that is present and
+            # strange rather than as a field the author never wrote.
+            stated = f"url {sub.url!r}" if sub.url else "no url"
+            if not sub.url.startswith(_SUBMODULE_URL_PREFIX):
+                raise TaskError(
+                    f"{task.task_id}: submodule {sub.path} declares {stated}; "
+                    f"only {_SUBMODULE_URL_PREFIX} urls can be fetched by this "
+                    "eval. A relative url resolves against a remote the run "
+                    "tree does not have, and ssh/file urls cannot be fetched "
+                    "at all."
+                )
+            # FIRST after the url check, and the only refusal that needs an
+            # artifact rather than a comparison -- hence `mirrors`, and hence
+            # the skip wherever no mirror exists.
+            mirror_for = mirrors.get(sub.path)
+            if mirror_for is not None and _has_gitmodules(mirror_for, sub.sha):
+                raise TaskError(
+                    f"{task.task_id}: submodule {sub.path} at {sub.sha} "
+                    "declares submodules of its own. `git submodule update "
+                    "--init` does not recurse, so the inner directory would "
+                    "arrive empty -- and an empty submodule directory leaves "
+                    "`git status --porcelain` clean, so nothing downstream "
+                    "would say so."
+                )
         # BOTH DIRECTIONS, and the ancestor one is the half that used to fall
         # through. `_under` is `PurePosixPath.is_relative_to`, so the first
         # conjunct already matches the path itself and an `or p == sub.path`
@@ -2404,8 +2539,22 @@ def _init_submodules(task: TaskManifest, dest: Path,
     never written is a `TaskError` naming the task rather than a
     `FileNotFoundError` out of `subprocess.run`; the HEAD comparison stays
     below, where it has a repository to ask.
+
+    A submodule the manifest declared UNNEEDED is skipped here entirely, and
+    the `if not needed: return` above the mirror comprehension is what makes
+    "no pruned mirror is built for it" a property of the code rather than of
+    an empty comprehension. Its url is never read, so an ssh or relative url
+    costs nothing; its directory stays as `git checkout` left it, which is
+    present and empty (measured 2026-09-02, git 2.50.1: `git clean -xfd` does
+    not remove it, `git status --porcelain` reports the tree clean, and `git
+    submodule status` reads `-<sha>`). The refusals still run over the FULL
+    tuple, because two of them -- a strip covering the path, and a reference
+    diff touching it -- are unrelated to whether the directory is populated.
     """
     if not subs:
+        return
+    needed = tuple(sub for sub in subs if not sub.declared_unneeded)
+    if not needed:
         return
     # `materialize`'s own `_repo_lock` critical section has long exited by the
     # time this runs (it wraps the clone only), so `ensure_pruned_mirror`'s
@@ -2413,10 +2562,10 @@ def _init_submodules(task: TaskManifest, dest: Path,
     # with a same-process deadlock on the same slug.
     mirrors = {
         sub.path: ensure_pruned_mirror(sub.url, sub.sha, cache_root)
-        for sub in subs
+        for sub in needed
     }
     _refuse_submodule_conflicts(task, subs, mirrors=mirrors)
-    for sub in subs:
+    for sub in needed:
         key = f"submodule.{sub.name}.url"
         _git("config", key, str(mirrors[sub.path]), cwd=dest)
         _git("-c", "protocol.file.allow=always",

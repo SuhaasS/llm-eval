@@ -454,8 +454,42 @@ class RunContainer:
         lost from the section 5.5 curve. The failure is preserved and raised
         if it survives every attempt: a stat error that is not a race is a
         broken container and must not be smoothed over.
+
+        THE SCRATCH INDEX IS SEEDED FROM `base_sha` FIRST, and it is not an
+        optimisation. `GIT_INDEX_FILE` starts EMPTY, and `git add -A` does not
+        descend into a gitlink path -- so for a submodule left uninitialised on
+        purpose (`submodules_unneeded`) the staged index has no entry and the
+        diff reports the gitlink as DELETED. Measured 2026-09-02, git 2.50.1:
+        199 bytes on a clean fixture tree and 239 on `tobymao/sqlglot` at
+        `05eed63b...`, `deleted file mode 160000`, with the agent having done
+        nothing. `grader._GITLINK_MODE` matches that line, so every such
+        submission would be refused as SUBMODULE_GITLINK_UNGRADABLE and every
+        checkpoint would carry a phantom the section 5.5 curve cannot tell
+        from a real deletion. `git read-tree <base_sha>` makes the index start
+        as the tree the diff is about to be taken against, so `add -A` UPDATES
+        it rather than rebuilding it from a scan that cannot see the gitlink.
+        The seed and the diff read the SAME parameter, so they can never
+        disagree -- and the parameter named `base_sha` holds `start_sha` at run
+        time (`matrix` -> `runner` -> `checkpoints`), which is why the
+        committed test half does not appear as additions: `add -A` reconciles
+        every worktree-visible path anyway, so the seed survives only where git
+        is blind, which is the gitlink and nothing else. Measured 0 bytes
+        seeding from either sha. Unconditional, because this class has no
+        manifest and must not gain one: measured, a repository with no
+        submodule diffs BYTE-IDENTICALLY either way (384 bytes,
+        `cmp`-identical, over a modification, an addition, a deletion and an
+        ignored untracked file). It also removes a second phantom that predates
+        any of this -- a file tracked at `base_sha` that also matches a
+        `.gitignore` pattern is skipped by `add -A` from an empty index and was
+        reported DELETED (460 bytes vs 135, measured).
+
+        `checked_exec`, so a failed seed RAISES rather than falling through:
+        the fallback for a silent failure here is the phantom deletion, which
+        is the accusation this paragraph exists to prevent. Containment
+        already lives one layer up in `checkpoints.maybe_capture`.
         """
         env = {"GIT_INDEX_FILE": SNAPSHOT_INDEX}
+        self.checked_exec(["git", "read-tree", base_sha], env=env)
         for attempt in range(_ADD_ATTEMPTS):
             result = self.exec(["git", "add", "-A"], env=env)
             if result.exit_code == 0:
