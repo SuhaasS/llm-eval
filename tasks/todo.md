@@ -5169,7 +5169,7 @@ the gitlink refusal and before `materialize`, as
 
 **Verification.**
 
-- Unit: **1908 passed, 76 deselected** (+20 over `f3aab32`'s 1888; the 21st new
+- Unit: **1908 passed, 77 deselected** (+20 over `f3aab32`'s 1888; the 21st new
   test is the integration one).
 - `scripts/mutation_check.py`: **223/223**, including all eight new anchors.
 - `scripts/verify_logger.py`: **GATE PASSED** — the record shape changed, so

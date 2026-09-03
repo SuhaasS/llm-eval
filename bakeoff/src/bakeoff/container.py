@@ -56,7 +56,11 @@ _ADD_RETRY_DELAY_S = 0.2
 # real index would stage the agent's in-progress work under it: a later
 # commit by the agent would sweep in files it never staged, and its
 # `git status` would disagree with reality. Nothing here writes to
-# .git/index at all.
+# .git/index at all -- the SUPERPROJECT's index, which is the one this rule
+# is about. A submodule's is a different file: measured 2026-09-03, the
+# `git add -A` below refreshes `.git/modules/<name>/index`'s stat cache
+# (content md5 unchanged), which `git --no-optional-locks add -A` would
+# suppress at byte-identical output. Filed in `TASKS.md`.
 SNAPSHOT_INDEX = "/tmp/bakeoff-snapshot-index"
 
 
@@ -166,8 +170,12 @@ _GITLINK_ARGV = ["git", "ls-files", "-s", "-z"]
 #:
 #: `[ -e "$p/.git" ]` is the INITIALISED test: a modern submodule has a `.git`
 #: FILE there and an older one a directory, so `-e` covers both. It also
-#: excludes an agent who ran `git init` in the directory -- that shape stages a
-#: `160000` chunk and `grader._gitlinks_touched` already owns it.
+#: excludes an agent who ran `git init` in a de-initialised gitlink directory,
+#: and the reader that owns THAT shape is the first one, not the diff: measured
+#: 2026-09-03, the v2 stream reads `1 .M S..U ... vendor/libdep` while
+#: `snapshot_diff` stages 0 bytes and carries no `160000` line at all. The shape
+#: `grader._gitlinks_touched` owns is the other one -- a `git init` in a TRACKED,
+#: non-gitlink subdirectory, which stages `new file mode 160000`.
 #:
 #: `find -mindepth 1 -maxdepth 1 -print -quit` rather than `ls -A`: it stops at
 #: the first entry, and its output is empty-or-not rather than a list that has

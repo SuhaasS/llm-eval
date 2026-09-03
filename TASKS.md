@@ -899,6 +899,22 @@ size. Two exceptions are marked CAPTURE and should ride along with Gate 1.
   Note that a diff cut with `--binary` re-applies without any of this, which
   means the grader's binary branch stays as defence for records already written.
 
+- [ ] **`snapshot_diff`'s `git add -A` writes a submodule's index, and the fix is
+  one inert flag.** `SNAPSHOT_INDEX` exists so a checkpoint never writes the
+  repository's index, and that rule holds for the SUPERPROJECT's; a submodule's
+  index is a different file and `git add -A` refreshes it. Measured 2026-09-03,
+  both indexes stamped to `1577865600` before each run, same tree, same image:
+  `GIT_INDEX_FILE=snap git add -A` leaves super=`1577865600` and
+  sub=`1788461947`, 0 bytes of diff; the same command with
+  `git --no-optional-locks add -A` leaves BOTH at `1577865600`, still 0 bytes;
+  and with a commit made inside the submodule it emits the full 245-byte gitlink
+  chunk unchanged. So the flag is inert on output and what it suppresses is a
+  stat-cache write (the index's content md5 is identical either way). The
+  exposure is small — a lock race against an agent running git inside a
+  submodule — which is why this is filed rather than shipped inside item 17: it
+  is a change to the capture command every run makes, and it deserves its own
+  integration leg.
+
 - [ ] **DERIVATION. Fields that are permanently zero and read as measurements.**
   `retry_backoff_ms`, `ToolCallStats.malformed` (so `malformation_rate` is always
   0.0 and `TOOL_MALFORMATION`/`ADAPTER_FAILURE` can never fire),

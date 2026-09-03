@@ -1542,8 +1542,10 @@ invariant, at the end:
 > One character, never a forged four-character `S…` shape: git's sub-state is
 > always four characters beginning `S`, so the marker says which reader spoke
 > and keeps `len(state) == 4` a claim about git. The two readers are measured
-> disjoint — the probe skips every path with a `.git`, which is exactly the set
-> v2 reports on — and the probe does not run at all on a tree with no gitlinks.
+> disjoint by the DIRECTORY test, not by the `.git` test: on a `.git`-less path
+> v2 fires only when the directory is absent and the probe only when it is
+> non-empty, so no path can be filed twice — and the probe does not run at all
+> on a tree with no gitlinks.
 > The whole read is contained inside `_capture`, not in `maybe_capture` — so a
 > failure names itself in `checkpoint_error` on both paths, `force_capture` can
 > never lose the submission to a supplementary observation, and a partial read

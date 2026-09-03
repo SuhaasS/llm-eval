@@ -714,25 +714,28 @@ def not_graded_gate(record: RunRecord) -> tuple[NotGradedReason, str] | None:
     return None
 
 
-#: The states a submission diff cannot carry, from either reader. Measured
-#: 2026-09-02 (git 2.50.1) through `snapshot_diff`'s own command sequence, with
-#: the `read-tree` seed in place: it stages ZERO BYTES for an uncommitted edit
-#: (`S.M.`), for an untracked file (`S..U`) and for a `rm` of tracked content
-#: (`S.M.`) inside an INITIALISED submodule -- and zero bytes for content
-#: inside an UNINITIALISED one (`?`), which git does not report either. So the
-#: stored diff describes a tree that is not the one the agent produced.
-#:
-#: The states NOT here are the ones with neither `M` nor `U` set, and both are
-#: already somebody else's: `SC..` (the gitlink moved by a commit inside --
-#: staged as a 245-byte chunk) and `S...` (the directory removed -- staged as a
-#: `deleted file mode 160000`, 199 bytes per path and seed-invariant). The diff
-#: carries both, so `_gitlinks_touched` refuses them by name. Two refusals,
-#: disjoint.
-#:
-#: The sub-state is git's `S<c><m><u>` grammar -- eight values, of which seven
-#: are measured -- so this tests the two BITS and never a list of spellings.
-#: `S.MU` and `SCMU` are reachable and are refused on `M` exactly as `S.M.` is.
 def _submodule_edits(record: RunRecord) -> tuple[str, ...]:
+    """The submodule paths whose state a submission diff cannot carry.
+
+    Measured 2026-09-02 (git 2.50.1) through `snapshot_diff`'s own command
+    sequence, with the `read-tree` seed in place: it stages ZERO BYTES for an
+    uncommitted edit (`S.M.`), for an untracked file (`S..U`) and for a `rm` of
+    tracked content (`S.M.`) inside an INITIALISED submodule -- and zero bytes
+    for content inside an UNINITIALISED one (`?`), which git does not report
+    either. So the stored diff describes a tree that is not the one the agent
+    produced.
+
+    The states NOT refused here are the ones with neither `M` nor `U` set, and
+    both are already somebody else's: `SC..` (the gitlink moved by a commit
+    inside -- staged as a 245-byte chunk) and `S...` (the directory removed --
+    staged as a `deleted file mode 160000`, 199 bytes per path and
+    seed-invariant). The diff carries both, so `_gitlinks_touched` refuses them
+    by name. Two refusals, disjoint.
+
+    The sub-state is git's `S<c><m><u>` grammar -- eight values, of which seven
+    are measured -- so this tests the two BITS and never a list of spellings.
+    `S.MU` and `SCMU` are reachable and are refused on `M` exactly as `S.M.` is.
+    """
     states = record.submodules_dirty_at_exit
     # `None` (pre-3.10.0, or a contained read failure) and `{}` (read, nothing
     # dirty) collapse HERE and only here. The VERDICT treats them alike --
