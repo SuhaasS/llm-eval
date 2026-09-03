@@ -4197,14 +4197,14 @@ mutation anchors) was transcribed as written; no other defect was found.
 Verified: `.venv/bin/python -m pytest tests/ -q` — `1717 passed, 67
 deselected`, exactly baseline `1706` + the plan's stated `+11` (§4.2's eight,
 §4.3's two, §4.4(12); §4.4(11) and the two concrete edits in §4.4(13) edit
-existing tests without adding to the count). Two additional pre-existing
-version-pin tests not named in the plan's own file list needed their
-literals moved for the same reason `test_the_preflight_version_moved_with_the_new_assertion`
+existing tests without adding to the count). One additional pre-existing
+version-pin test not named in the plan's own file list needed its
+literal moved for the same reason `test_the_preflight_version_moved_with_the_new_assertion`
 needed it in item 7: `test_the_grader_version_moved_with_what_check_5_means`
-(`"10"` -> `"11"`, plus a new `10 -> 11` paragraph) and
-`test_the_grade_schema_version_moved_with_what_the_record_means` (`"1.3.0"`
--> `"1.4.0"`, plus a new paragraph) — both would otherwise have been left
-red by a version bump neither test's own plan owned.
+(`"10"` -> `"11"`, plus a new `10 -> 11` paragraph). §4.4(11) named the
+other, `test_the_grade_schema_version_moved_with_what_the_record_means`
+(`"1.3.0"` -> `"1.4.0"`, plus a new paragraph), explicitly — both would
+otherwise have been left red by a version bump neither test's own plan owned.
 `tests/test_preflight.py -k argv_preflight_validated` green with no edit, as
 required (§4.5). `.venv/bin/python scripts/mutation_check.py` run solo:
 **194/194 caught**, 0 stale (191 + the 3 new anchors), tree byte-clean

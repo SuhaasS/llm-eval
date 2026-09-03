@@ -2573,9 +2573,8 @@ def test_a_pytest_p2p_run_never_reports_ids_as_not_run():
 def test_the_ids_that_did_not_run_are_recorded_as_a_tuple_not_only_in_a_message():
     """The anchor for the second mutation. A node `fullName` containing TWO
     `", "` sequences makes the joined message not losslessly splittable back
-    into ids -- one comma alone would still split into the right pieces by
-    accident on a single-id message -- so the tuple is not redundant with
-    the prose. (Deviation from the plan's exact fullName text, which carried
+    into ids -- so the tuple is not redundant with the prose. (Deviation
+    from the plan's exact fullName text, which carried
     only one comma and so split back cleanly; the id here is chosen to make
     the plan's own stated assertion -- more than two parts -- literally
     true.)"""

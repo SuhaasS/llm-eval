@@ -298,10 +298,9 @@ non-quarantined id with no terminal status: a stale manifest; a rename the
 harness cannot see; a selection argv the harness built wrong; or a runner
 config the submission edited outside `tests.paths` (a root `vitest.config.ts`
 / `jest.config.js` / `package.json` `exclude`, `testMatch` or `setupFiles`) —
-the restore step (check 2) puts every *tracked file* under `tests.paths` back,
-but a config file the submission edited there is put back too, so this fourth
-cause is really "the id lives under a scope the restore does not narrow to a
-single file". The branch outranks `KIND_PASSED` (a green report would absorb
+check 2 restores tracked files under `tests.paths`, and a config file outside
+that prefix is not among them, which is why this fourth cause survives the
+restore. The branch outranks `KIND_PASSED` (a green report would absorb
 the loss silently), `KIND_FAILED` (a partially-executed selection is not the
 run "the declared p2p set still passes" describes, even when one id in it did
 fail) and the timeout branch (doubly not a statement about the model) alike.

@@ -1428,8 +1428,9 @@ def _check_p2p(state: _State, task, env, oracle: Oracle | None) -> None:
     # applied to `(*f2p, *p2p)` in `tasks.py` -- and check 2 restores
     # `tests.paths` to the start state before this check runs. So a deleted or
     # renamed test file is NOT an available explanation. What is left is: a
-    # stale manifest; a rename the harness cannot see; a selection argv this
-    # harness built wrong; or a runner CONFIG the submission edited outside
+    # stale manifest, or a declared id naming a test the suite itself skips; a
+    # rename the harness cannot see; a selection argv this harness built
+    # wrong; or a runner CONFIG the submission edited outside
     # `tests.paths` and the restore therefore did not put back (a root
     # `vitest.config.ts` / `jest.config.js` / `package.json` `exclude`,
     # `testMatch` or `setupFiles`). The fourth is submission-caused and the
