@@ -105,9 +105,13 @@ class FakeContainer:
     """Stands in for RunContainer. `fail_snapshot_after` models a disk
     filling up mid-run: the first N snapshots succeed, the next raises."""
 
-    def __init__(self, fail_snapshot_after: int | None = None) -> None:
+    def __init__(self, fail_snapshot_after: int | None = None,
+                 states: dict[str, str] | None = None) -> None:
         self.fail_snapshot_after = fail_snapshot_after
         self.snapshots = 0
+        # `{}` and not `None`: `{}` is the measurement "read, nothing dirty",
+        # which is a real container's answer on a tree with no submodule.
+        self.states = {} if states is None else states
 
     def __enter__(self):
         return self
@@ -147,6 +151,13 @@ class FakeContainer:
         ):
             raise OSError("No space left on device")
         return (f"diff-{self.snapshots}", [f"file{self.snapshots}.py"])
+
+    def submodule_states(self) -> dict[str, str]:
+        # A double MISSING this method does not fail loudly --
+        # `SupportsSnapshot` is a Protocol and is not runtime-checked, so the
+        # `AttributeError` lands inside `_capture`'s containment and the test
+        # goes on passing with a spurious `recorder.errors` entry.
+        return self.states
 
 
 class FakeRunner:
@@ -2052,6 +2063,28 @@ def test_the_minimal_record_keeps_the_submission_diff(task, tmp_path, monkeypatc
 
     assert record.checkpoints, "the per-turn diffs exist nowhere else"
     assert record.artifacts.final_diff is not None
+
+
+def test_the_minimal_record_carries_the_submodule_state_too(
+    task, tmp_path, monkeypatch
+):
+    """`_minimal_record`'s own rule: every field it defaults is a claim it
+    fabricates. The rescue path carries real checkpoints, so it can carry
+    this honestly -- and defaulting it to `None` on a run whose capture DID
+    read a dirty submodule would hand the offline grader "nobody looked" and
+    let the row grade as `EMPTY_PATCH`, which is exactly the accusation the
+    field exists to stop."""
+    import bakeoff.runner as runner_module
+
+    monkeypatch.setattr(
+        runner_module, "assemble_record", lambda **_k: (_ for _ in ()).throw(
+            ValueError("nope")
+        )
+    )
+    box = FakeContainer(states={"vendor/libdep": "S..U"})
+    record = _fake_run(monkeypatch, task, tmp_path, container=box)
+
+    assert record.submodules_dirty_at_exit == {"vendor/libdep": "S..U"}
 
 
 def test_the_minimal_record_does_not_manufacture_a_safety_claim(

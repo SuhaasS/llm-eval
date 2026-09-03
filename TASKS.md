@@ -1567,22 +1567,6 @@ These need a call, not code. Most are cheap to make and expensive to make late.
   leaves the inner directory empty, which reads as clean. A deferral, not a
   defect (broadening 6).
 
-- [ ] **A pure-gitlink submission is refused; a pure-gitlink *edit* is
-  invisible.** The grader catches the agent who COMMITS inside a submodule
-  (`SUBMODULE_GITLINK_UNGRADABLE`, read out of the submission's own chunks).
-  It cannot catch the agent who edits and does not commit: `git add -A` stages
-  nothing for a submodule, so the submission diff is **zero bytes** and the
-  ladder stops at `EMPTY_PATCH` — a `GradeFailure` that stamps
-  `resolved: False`. That is byte-identical to an honest empty run (a model
-  that read the repo, concluded nothing needed changing and stopped), and no
-  field distinguishes them, because the harness never observed the edit.
-  Refusing tasks whose *reference* fix touches submodule content keeps this
-  off the tasks where it would be the expected path, but it stays reachable on
-  any task with a submodule, since what an agent chooses to edit is not
-  something a manifest can constrain. Closing it means capturing per-submodule
-  state at checkpoint time — a change to what a run RECORDS, not to how one is
-  graded — so it needs its own plan. Measured 2026-09-01 (broadening 6, M8).
-
 - [x] **A pure gitlink rename is invisible to the grader's gitlink refusal.**
   `grader._chunk_is_gitlink` reads the chunk header for a `160000` mode line
   (`new file mode`, `deleted file mode`, `old mode`/`new mode`, `index …

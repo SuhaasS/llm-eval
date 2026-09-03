@@ -115,7 +115,12 @@ from bakeoff.runners.pytest_adapter import (  # noqa: F401
     _SUMMARY_LINE,
     parse_deselected,
 )
-from bakeoff.schema import Outcome, RunRecord, Severity
+from bakeoff.schema import (
+    SUBMODULE_UNINITIALISED_CONTENT,
+    Outcome,
+    RunRecord,
+    Severity,
+)
 from bakeoff.tasks import (
     TaskError,
     _chunk_path,
@@ -306,7 +311,32 @@ from bakeoff.tasks import (
 #: It costs a full re-grade into a fresh `v12` artifacts directory per event
 #: log. No verdict on today's corpus changes: measured 2026-09-02, 0 of 115
 #: stored records carry a rename chunk of any kind.
-GRADER_VERSION: str = "12"
+#:
+#: 12 -> 13: `_submodule_edits`. A run whose tree carried an uncommitted edit,
+#: an untracked file or an `rm` of tracked content inside an INITIALISED
+#: submodule -- or content inside an UNINITIALISED one -- is now refused as
+#: `SUBMODULE_EDIT_UNGRADABLE` rather than graded. Measured 2026-09-02 (git
+#: 2.50.1) through `container.snapshot_diff`'s own command sequence: `git add
+#: -A` stages ZERO BYTES for every one of those, so the submission is empty
+#: and the ladder stopped at `EMPTY_PATCH` -- a `GradeFailure`, hence
+#: `resolved: False`, an accusation that the model changed nothing, over a
+#: limitation of the harness's own capture. It is byte-identical to an honest
+#: empty run and no field distinguished them, because nothing observed the
+#: edit; `RunRecord.submodules_dirty_at_exit` (schema 3.10.0) is what does.
+#:
+#: No verdict on today's corpus changes: no stored record carries that field,
+#: so `_submodule_edits` returns `()` for all of them and the ladder runs
+#: exactly as under 12. The version moves anyway, on the same argument the
+#: `4 -> 5` entry makes in full -- the bump has to land with the code that
+#: makes the divergence possible, not with the run that first exercises it,
+#: because `scripts/grade.py`'s resume gate keys on `(run_id,
+#: GRADER_VERSION)` alone. Without it every already-graded row keeps its
+#: verdict, including any row this refusal would now take out of the
+#: denominator, and no line says the two were measured under different rules.
+#:
+#: Operator cost: one full re-grade per event log, into a fresh `v13`
+#: artifacts directory beside the existing one. Schedulable, not urgent.
+GRADER_VERSION: str = "13"
 
 #: Wall clock for the HOST-side gitleaks scan, and for nothing else.
 #: `_ContainerEnv.scan_secrets` shells out to `docker run` rather than through
@@ -682,6 +712,40 @@ def not_graded_gate(record: RunRecord) -> tuple[NotGradedReason, str] | None:
         # copied onto the GradeRecord. `eventlog.py:120-126` already litigated
         # the blanket gate.
     return None
+
+
+#: The states a submission diff cannot carry, from either reader. Measured
+#: 2026-09-02 (git 2.50.1) through `snapshot_diff`'s own command sequence, with
+#: the `read-tree` seed in place: it stages ZERO BYTES for an uncommitted edit
+#: (`S.M.`), for an untracked file (`S..U`) and for a `rm` of tracked content
+#: (`S.M.`) inside an INITIALISED submodule -- and zero bytes for content
+#: inside an UNINITIALISED one (`?`), which git does not report either. So the
+#: stored diff describes a tree that is not the one the agent produced.
+#:
+#: The states NOT here are the ones with neither `M` nor `U` set, and both are
+#: already somebody else's: `SC..` (the gitlink moved by a commit inside --
+#: staged as a 245-byte chunk) and `S...` (the directory removed -- staged as a
+#: `deleted file mode 160000`, 199 bytes per path and seed-invariant). The diff
+#: carries both, so `_gitlinks_touched` refuses them by name. Two refusals,
+#: disjoint.
+#:
+#: The sub-state is git's `S<c><m><u>` grammar -- eight values, of which seven
+#: are measured -- so this tests the two BITS and never a list of spellings.
+#: `S.MU` and `SCMU` are reachable and are refused on `M` exactly as `S.M.` is.
+def _submodule_edits(record: RunRecord) -> tuple[str, ...]:
+    states = record.submodules_dirty_at_exit
+    # `None` (pre-3.10.0, or a contained read failure) and `{}` (read, nothing
+    # dirty) collapse HERE and only here. The VERDICT treats them alike --
+    # "not measured" is not evidence of an edit, and every stored record
+    # predates the field, so fail-closed would refuse the whole corpus. The
+    # RECORD keeps them apart permanently; do not "fix" it to match this.
+    if not states:
+        return ()
+    return tuple(sorted(
+        path for path, state in states.items()
+        if state == SUBMODULE_UNINITIALISED_CONTENT
+        or (len(state) == 4 and (state[2] == "M" or state[3] == "U"))
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -2202,6 +2266,17 @@ def grade_run(record: RunRecord, task, image: str, oracle: Oracle | None,
     also called by `run_ladder` and asks only whether a submission EXISTS,
     while this one reads the submission's contents.
 
+    TWO submodule refusals now sit before `materialize`, and they are disjoint
+    by construction. `_gitlinks_touched` reads the SUBMISSION's chunks and
+    names a moved or removed gitlink -- the two states `git add -A` does stage.
+    `_submodule_edits` reads the RECORD's `submodules_dirty_at_exit` and names
+    the states it stages nothing for: the `M`/`U` bits inside an initialised
+    submodule, and the `?` marker for content in an uninitialised one. The
+    gitlink one runs first because a submission can be both (a commit inside a
+    submodule with edits left behind is `SCM.` and carries a 245-byte chunk),
+    and of the two descriptions it is the more specific and the one already in
+    the stored vocabulary.
+
     It is in TWO PLACES, and the split is a measurement rather than a
     preference. Every shape that carries a `160000` mode line is refused
     before the artifacts wipe and before `materialize`, so those rows cost no
@@ -2256,6 +2331,25 @@ def grade_run(record: RunRecord, task, image: str, oracle: Oracle | None,
             "referenced commit exists only in the run tree that produced it, "
             "and applying the diff moves the index without moving any content "
             "into the graded tree",
+        )))
+
+    # AFTER the gitlink refusal, and the order is deliberate. State E (a
+    # commit inside a submodule with further edits left behind) is `SCM.` AND
+    # stages a 245-byte `index ...160000` chunk, so both refusals are true of
+    # it; the gitlink reason is the more specific description -- it names the
+    # commit that exists only in the run tree -- and it is the one already in
+    # the stored vocabulary (GRADE_SCHEMA 1.2.0). Keeping it first also keeps
+    # it reachable for the uninitialised-gitlink shape it takes on a task with
+    # a declared-unneeded submodule.
+    edits = _submodule_edits(record)
+    if edits:
+        return build_grade_record(record, task, image, oracle, _gated_result((
+            NotGradedReason.SUBMODULE_EDIT_UNGRADABLE,
+            f"the run tree's submodule(s) {', '.join(edits)} carried changes "
+            "git stages nothing for when the agent exited "
+            f"({record.submodules_dirty_at_exit}); the stored submission "
+            "cannot reproduce that tree, so grading it would grade a "
+            "different tree than the agent produced",
         )))
 
     artifacts_dir = Path(artifacts_root) / record.run_id / f"v{GRADER_VERSION}"

@@ -7,12 +7,18 @@ from bakeoff.container import ContainerError
 class FakeContainer:
     """Records calls and returns a synthetic diff per turn."""
 
-    def __init__(self):
+    def __init__(self, states=None):
         self.calls = 0
+        # `{}` and not `None`: `{}` is the measurement "read, nothing dirty",
+        # which is what a real container answers on a tree with no submodule.
+        self.states = {} if states is None else states
 
     def snapshot_diff(self, base_sha):
         self.calls += 1
         return (f"diff-{self.calls}", [f"file{self.calls}.py"])
+
+    def submodule_states(self):
+        return self.states
 
 
 def test_captures_every_turn_when_k_is_one():
@@ -73,6 +79,11 @@ class ExplodingContainer:
             )
         return (f"diff-{self.calls}", [f"file{self.calls}.py"])
 
+    def submodule_states(self):
+        # The DIFF is what this double fails. Its submodule read works, so
+        # every test below keeps asserting exactly what it asserted.
+        return {}
+
 
 def test_a_failed_mid_run_snapshot_does_not_destroy_the_run():
     """The defect this containment exists for, measured on 2026-08-12.
@@ -127,3 +138,80 @@ def test_the_final_snapshot_is_still_allowed_to_fail_loudly():
 
     with pytest.raises(ContainerError):
         recorder.force_capture(turn=9, elapsed_ms=0)
+
+
+# --- round 2 item 17: the submodule state the diff cannot carry ---
+
+
+class _StatesRaise:
+    """A container whose diff works and whose submodule read does not."""
+
+    def snapshot_diff(self, base_sha):
+        return ("diff-body", ["calc.py"])
+
+    def submodule_states(self):
+        raise ContainerError("boom")
+
+
+def test_a_checkpoint_records_the_submodule_state_the_diff_cannot_carry():
+    """Measured 2026-09-02 (git 2.50.1) through `snapshot_diff`'s own command
+    sequence -- scratch-index `git add -A`, then `git diff --cached <base>`:
+    a tracked file edited inside an initialised submodule and NOT committed
+    stages ZERO BYTES, while `git status --porcelain=v2
+    --ignore-submodules=none` reports `1 .M S.M. ... vendor/libdep`. So the
+    diff is not the authority on that tree and the checkpoint carries the
+    state beside it -- beside, never instead of."""
+    container = FakeContainer(states={"vendor/libdep": "S.M."})
+    recorder = CheckpointRecorder(container, base_sha="abc", every_k_turns=1)
+
+    checkpoint = recorder.maybe_capture(1, elapsed_ms=0)
+
+    assert checkpoint.submodules_dirty == {"vendor/libdep": "S.M."}
+    assert checkpoint.diff_vs_base == "diff-1"
+
+
+def test_no_dirty_submodule_is_an_empty_mapping_not_a_none():
+    """`{}` is a measurement -- read, nothing dirty, which includes a tree
+    with no submodule at all -- and `None` is "not read". Collapsing them is
+    the defect this field exists to avoid one level down: a reader could not
+    tell a clean tree from a read that never happened."""
+    recorder = CheckpointRecorder(
+        FakeContainer(states={}), base_sha="abc", every_k_turns=1
+    )
+
+    checkpoint = recorder.maybe_capture(1, elapsed_ms=0)
+
+    assert checkpoint.submodules_dirty == {}
+    assert recorder.errors == []
+
+
+def test_a_failed_submodule_read_is_contained_and_named():
+    """A supplementary read must not cost the checkpoint that carries it. The
+    diff survives, the mapping says `None` -- not read -- and the failure
+    names itself in `errors`, which `runner._collect_checkpoints` joins into
+    `checkpoint_error`."""
+    recorder = CheckpointRecorder(_StatesRaise(), base_sha="abc",
+                                  every_k_turns=1)
+
+    checkpoint = recorder.maybe_capture(1, elapsed_ms=0)
+
+    assert checkpoint is not None
+    assert checkpoint.diff_vs_base == "diff-body"
+    assert checkpoint.submodules_dirty is None
+    assert recorder.errors == ["turn 1: submodule state: ContainerError: boom"]
+
+
+def test_the_final_capture_survives_a_failed_submodule_read():
+    """The containment is inside `_capture` and not in `maybe_capture`, and
+    this is why. `force_capture`'s DIFF is the submission and is still
+    allowed to raise -- see the test above this section -- but losing that
+    submission to a supplementary observation would invert the trade the
+    whole module rests on."""
+    recorder = CheckpointRecorder(_StatesRaise(), base_sha="abc",
+                                  every_k_turns=1)
+
+    checkpoint = recorder.force_capture(turn=1, elapsed_ms=0)
+
+    assert checkpoint.diff_vs_base == "diff-body"
+    assert checkpoint.submodules_dirty is None
+    assert recorder.errors == ["turn 1: submodule state: ContainerError: boom"]

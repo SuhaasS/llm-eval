@@ -793,7 +793,13 @@ rather than by reasoning:
     commits inside the submodule produces a gitlink diff that applies green
     and grades the original content. The loader refuses a reference diff
     touching a submodule path, and the grader refuses such a submission as
-    not-graded.
+    not-graded. Since round 2 item 17 the harness also **records** what it
+    cannot capture — `RunRecord.submodules_dirty_at_exit`, taken from the last
+    checkpoint — and the grader refuses such a run as
+    `submodule_edit_ungradable` rather than letting it land as `EMPTY_PATCH` →
+    `resolved: False`, an accusation that the model changed nothing. The rule
+    stands anyway: a refused row is still a lost observation, and what an
+    agent chooses to edit is not something a manifest can constrain.
   - **A submodule the task's suite never reads can be declared unneeded.**
     `submodules_unneeded: ["<path>"]`, top-level. The gitlink stays in the
     index and the tree exactly as at `base_sha`, the directory is never

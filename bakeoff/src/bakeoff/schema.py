@@ -309,7 +309,22 @@ from typing import Any
 # (`grades.jsonl`, `resolved: False`, `GRADER_VERSION 2`), so the ladder
 # applied those 2,902 deletions in the grading tree before running the suite.
 # Pre-3.9.0 records are readable only with that in hand.
-SCHEMA_VERSION = "3.9.0"
+#
+# 3.10.0 adds `Checkpoint.submodules_dirty`, `RunRecord.
+# submodules_dirty_at_exit` and the marker `SUBMODULE_UNINITIALISED_CONTENT`
+# they can carry -- what a submission diff cannot say. Measured 2026-09-02
+# (git 2.50.1) through `container.snapshot_diff`'s own command sequence: `git
+# add -A` stages ZERO BYTES for an uncommitted edit, for an untracked file and
+# for an `rm` of tracked content inside an INITIALISED submodule, and zero for
+# content inside an UNINITIALISED one, while a commit inside one stages 245
+# bytes and a removed gitlink directory 199 per path. So a run that edited a
+# submodule was byte-identical to one that changed nothing, and the offline
+# grader stamped `EMPTY_PATCH` -- a `GradeFailure`, hence `resolved: False`,
+# an accusation -- on it. The bump is what keeps an ABSENT field on a 3.9.0
+# record from reading as `{}`: absent means nobody looked, on exactly the
+# records where looking was impossible, and `{}` is the measurement "read,
+# nothing dirty". A 3.9.0 reader has neither the fields nor the marker.
+SCHEMA_VERSION = "3.10.0"
 
 
 class Outcome(str, Enum):
@@ -483,6 +498,20 @@ class TestResult:
     stdout_ref: str | None = None
 
 
+#: What `Checkpoint.submodules_dirty` records for a gitlink directory that git
+#: will not describe: uninitialised, and holding content anyway.
+#:
+#: ONE CHARACTER, and deliberately not a four-character `S...` shape. git's own
+#: sub-state is always exactly four characters beginning with `S`, and
+#: `container._parse_status_v2` files nothing else -- so a reader can always
+#: tell which of the two readers spoke, and `grader._submodule_edits`'
+#: `len(state) == 4` guard stays a statement about what GIT said. Writing
+#: `"S..U"` here would forge a verdict git never issued, which is the
+#: configuration-reported-as-observation family; `?` borrows git's own
+#: porcelain vocabulary for untracked, which is exactly what this is.
+SUBMODULE_UNINITIALISED_CONTENT = "?"
+
+
 @dataclass(frozen=True)
 class Checkpoint:
     turn: int
@@ -491,6 +520,24 @@ class Checkpoint:
     elapsed_ms: int
     tests_pass: bool | None = None
     per_test: list[TestResult] = field(default_factory=list)
+    # Per-gitlink dirt the diff above cannot carry, from
+    # `container.submodule_states` -- `{path: sub_state}`, git's own
+    # four-character `S<c><m><u>` for an initialised submodule and the single
+    # character `SUBMODULE_UNINITIALISED_CONTENT` for an uninitialised
+    # directory holding content.
+    #
+    # Three values, and the difference between the first two is the point:
+    # `None` is NOT READ (the read failed and `checkpoint_error` names it, or
+    # the checkpoint predates this field), `{}` is READ AND NOTHING DIRTY, and
+    # a non-empty mapping is what was observed.
+    #
+    # The asymmetry that makes two readers necessary, measured 2026-09-02 (git
+    # 2.50.1) through `snapshot_diff`'s own command sequence: an INITIALISED
+    # submodule's uncommitted edit is in the v2 record and not in the diff (0
+    # bytes), while an UNINITIALISED one's stray file is in neither -- `git
+    # add -A` does not descend through the gitlink boundary once the scratch
+    # index carries it, and git reports nothing for a path it will not enter.
+    submodules_dirty: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -824,6 +871,26 @@ class RunRecord:
     tool_calls: ToolCallStats = field(default_factory=ToolCallStats)
     truncation_events: list[dict[str, Any]] = field(default_factory=list)
     destructive_events: list[DestructiveEvent] = field(default_factory=list)
+
+    # The LAST capture's `Checkpoint.submodules_dirty`, so the states
+    # `artifacts.final_diff` cannot carry are in the record beside it.
+    #
+    # The LAST capture, not necessarily the final one: on a run that crashed
+    # mid-loop this is a mid-run snapshot, exactly as `artifacts.final_diff`
+    # -- the same expression -- is. A reader who needs "at exit" specifically
+    # has the test `grader.not_graded_gate` performs,
+    # `checkpoints[-1].turn == turns_streamed`, whose comment records two
+    # wrong formulations of it.
+    #
+    # `None` is "nobody looked" -- no capture at all, a contained read
+    # failure, or a record written before schema 3.10.0 -- and `{}` is "read,
+    # nothing dirty". Producing `{}` from the absence of any observation would
+    # be a positive claim manufactured by a failure.
+    #
+    # On `RunRecord` and not on `Artifacts`: that block holds paths that are
+    # existence- AND ownership-checked, and a mapping of observed states is
+    # not that kind of thing.
+    submodules_dirty_at_exit: dict[str, str] | None = None
 
     # True only when the agent ran inside the pinned container with no route
     # off the host except the recording proxy (spec section 5.1). A run with

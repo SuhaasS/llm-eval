@@ -430,14 +430,24 @@ def superproject_under_test_prefix(workspace) -> dict:
     return {"task_dir": task_dir}
 
 
-def _record_with_diff(task, diff: str) -> RunRecord:
+def _record_with_diff(
+    task, diff: str, *, run_id: str | None = None,
+    collection_id: str = "integration-submodule-test-prefix",
+    submodules_dirty_at_exit: dict[str, str] | None = None,
+) -> RunRecord:
     """Copied from `test_integration_node_task._record_with_diff` rather than
     imported -- that one hardcodes the node fixture's task id. `run_id` is
     namespaced to this fixture so a shared artifacts cache never collides
     with `test_integration_node_task`'s rows.
+
+    The three keyword parameters default to what every existing call already
+    produced, so no caller changes. They exist because a SECOND test building
+    an empty-diff record would otherwise reuse `sub-int-002-empty` -- the
+    collision this namespacing exists to prevent -- and would inherit the
+    fix-1 fixture's collection id while using a different fixture's tree.
     """
     return RunRecord(
-        run_id=f"sub-int-002-{'empty' if not diff else 'reference'}",
+        run_id=run_id or f"sub-int-002-{'empty' if not diff else 'reference'}",
         task_id=task.task_id,
         task_version=task.task_version,
         model="claude-sonnet-5",
@@ -452,13 +462,14 @@ def _record_with_diff(task, diff: str) -> RunRecord:
         terminated_by=TerminationReason.AGENT_FINISH,
         turns_used=4,
         turns_streamed=4,
-        collection_id="integration-submodule-test-prefix",
+        collection_id=collection_id,
         checkpoints=[
             Checkpoint(turn=4, diff_vs_base=diff, files_touched=[],
                        elapsed_ms=0)
         ],
         artifacts=Artifacts(final_diff=diff),
         versions=Versions(),
+        submodules_dirty_at_exit=submodules_dirty_at_exit,
     )
 
 
@@ -506,6 +517,111 @@ def test_the_grader_resolves_a_reference_fix_whose_submodule_is_under_tests(
     )
     assert grade.framework == "pytest"
     assert grade.f2p_failed_node_ids == ()
+
+
+# ---------------------------------------------------------------------------
+# round-2 item 17: the in-submodule edit the submission diff cannot carry
+# ---------------------------------------------------------------------------
+
+
+def test_an_uncommitted_edit_inside_a_submodule_is_recorded_then_refused(
+    workspace, superproject, local_urls, tmp_path_factory,
+):
+    """The defect and its closure, in a real container against a real
+    submodule.
+
+    `git add -A` stages NOTHING for a tracked file edited inside an
+    initialised submodule, so `container.snapshot_diff` returns zero bytes --
+    byte-identical to an agent that changed nothing. The offline grader then
+    stops at `EMPTY_PATCH`, which is a `GradeFailure`: `resolved: False`, an
+    accusation that the model produced nothing, over a limitation of the
+    harness's own capture, in an append-only file. `assert
+    checkpoint.diff_vs_base == ""` below is that defect, and it is the
+    assertion that would have caught it.
+
+    A SEPARATE run tree from the first test's. Module-scoped fixtures run in
+    an unspecified order, and `fresh_tree`'s rule -- a host path that has been
+    bind-mounted once is never bind-mounted again -- applies to these mounts
+    too.
+
+    The TASK image, not the base image: `RunContainer.__enter__` asserts
+    non-root and no `ENTRYPOINT`, and a failure of either on the base image
+    would read as this item's defect. Docker's layer cache makes the second
+    build of an image the first test already built a no-op.
+    """
+    from bakeoff.checkpoints import CheckpointRecorder
+    from bakeoff.container import RunContainer
+    from bakeoff.grade_schema import NotGradedReason
+    from bakeoff.grader import grade_run
+
+    task = load_task(superproject["task_dir"])
+    cache = workspace / "cache"
+    run_tree = workspace / "run-edit"
+    start_sha = materialize(task, run_tree, cache)
+
+    base = build_base_images(REPO_ROOT, [task_runtime(task)])[
+        task_runtime(task)].image_id
+    image = build_task_image(task, base, workspace / "build", cache)
+
+    stamps = [".git/index", f".git/modules/{SUB_PATH}/index"]
+    with RunContainer(image=image, repo_path=str(run_tree),
+                      base_sha=start_sha) as container:
+        container.exec(
+            ["sh", "-c", f"echo EDITED >> {SUB_PATH}/libdep/__init__.py"]
+        )
+
+        recorder = CheckpointRecorder(container, start_sha, every_k_turns=1)
+        checkpoint = recorder.force_capture(turn=1, elapsed_ms=0)
+
+        # `--no-optional-locks`, in the environment that matters. Stamped
+        # AFTER the capture and read after a second `submodule_states()`, so
+        # the assertion is about THIS read and nothing else.
+        #
+        # Measured 2026-09-03 in this image, one command per stamp:
+        #
+        #     read-tree   super=1577865600  sub=1577865600
+        #     add -A      super=1577865600  sub=REWRITTEN
+        #     diff        super=1577865600  sub=1577865600
+        #     status v2   super=1577865600  sub=1577865600
+        #     ls-files    super=1577865600  sub=1577865600
+        #
+        # So the SUBMODULE's index is refreshed by `git add -A` -- which is
+        # `snapshot_diff`'s and predates this field entirely: `add -A` stats
+        # the gitlink to decide whether it moved, and what it refreshes is a
+        # stat cache and not content. The superproject's own `.git/index` is
+        # untouched throughout, which is the rule `SNAPSHOT_INDEX`'s comment
+        # states. Asserting the whole capture sequence leaves both alone
+        # would be asserting something false, about a command this item did
+        # not add.
+        container.exec(["touch", "-d", "@1577865600", *stamps])
+        container.submodule_states()
+        mtimes = container.exec(["stat", "-c", "%Y", *stamps]).stdout.split()
+        assert mtimes == ["1577865600", "1577865600"], mtimes
+
+    assert checkpoint.diff_vs_base == "", (
+        "the defect: `git add -A` stages nothing for an in-submodule edit, so "
+        "the submission is byte-identical to an agent that changed nothing"
+    )
+    assert checkpoint.submodules_dirty == {SUB_PATH: "S.M."}
+    assert recorder.errors == []
+
+    # The grader half. `_record_with_diff` sets `submodules_dirty_at_exit`
+    # DIRECTLY, because this test does not run `assemble_record` and so the
+    # record field does not appear on its own from the Checkpoint above.
+    record = _record_with_diff(
+        task, "", run_id="sub-int-003-edit",
+        collection_id="integration-submodule-edit",
+        submodules_dirty_at_exit=dict(checkpoint.submodules_dirty),
+    )
+
+    grade = grade_run(record, task, image, None, cache,
+                      tmp_path_factory.mktemp("artifacts-sub-int-003"))
+
+    assert grade.resolved is None
+    assert grade.not_graded_reason == \
+        NotGradedReason.SUBMODULE_EDIT_UNGRADABLE.value
+    assert grade.grade_failure is None
+    assert SUB_PATH in grade.not_graded_detail
 
 
 # ---------------------------------------------------------------------------

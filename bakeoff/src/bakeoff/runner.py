@@ -799,7 +799,29 @@ def assemble_record(
         artifacts=_artifacts_block(
             artifacts_root, checkpoints, wire_log_error, trajectory_path
         ),
+        submodules_dirty_at_exit=_submodules_at_exit(checkpoints),
     )
+
+
+def _submodules_at_exit(checkpoints: list[Checkpoint]) -> dict[str, str] | None:
+    """The LAST capture's submodule state, or `None` when there is none.
+
+    The last capture, not necessarily the final one: on a run that crashed
+    mid-loop this is a mid-run snapshot, exactly as `artifacts.final_diff` --
+    the same expression -- is. A reader who needs "at exit" specifically has
+    the test `not_graded_gate` performs, `checkpoints[-1].turn ==
+    turns_streamed`, whose comment in `grader.py` records two wrong
+    formulations of it.
+
+    `None` rather than `{}` when there is no capture at all: `{}` is the
+    measurement "read, nothing dirty", and producing it from the absence of
+    any observation is a positive claim manufactured by a failure.
+
+    A module-level helper rather than the expression written twice, because
+    `assemble_record` and `_minimal_record` both need it and two copies of a
+    rule are two places for it to drift.
+    """
+    return checkpoints[-1].submodules_dirty if checkpoints else None
 
 
 def _artifacts_block(
@@ -968,6 +990,7 @@ def _minimal_record(
         finalize_error=finalize_error,
         wire_malformed_lines=wire_malformed_lines,
         assembly_error=assembly_error,
+        submodules_dirty_at_exit=_submodules_at_exit(checkpoints),
     )
 
 

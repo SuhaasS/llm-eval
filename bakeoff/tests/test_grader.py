@@ -34,6 +34,7 @@ from bakeoff.grader import (
 )
 from bakeoff.oracle import Oracle
 from bakeoff.schema import (
+    SUBMODULE_UNINITIALISED_CONTENT,
     Artifacts,
     Checkpoint,
     DestructiveCategory,
@@ -485,7 +486,8 @@ def test_an_ungraded_record_does_not_claim_an_empty_quarantine(tmp_path):
 
 # --------------------------------------------------------------------------
 # 1b. the gitlink refusals: the mode-line one before materialize, the rename
-#     one after
+#     one after -- and the edit refusal, which reads the record rather than
+#     the submission
 # --------------------------------------------------------------------------
 
 #: Shape 1: a DECLARED submodule whose gitlink the agent moved by committing
@@ -863,6 +865,114 @@ def test_a_start_state_listing_that_fails_stops_the_grade(monkeypatch):
             _GITLINK_RENAME_SUBMISSION, Path("/some/repo"), START_SHA
         )
     assert "not a tree object" in str(excinfo.value)
+
+
+# --- round 2 item 17: the states the submission diff cannot carry ---
+
+
+def test_a_dirty_submodule_at_exit_is_not_graded_rather_than_failed(tmp_path):
+    """Measured 2026-09-02 (git 2.50.1) through `container.snapshot_diff`'s
+    own command sequence: a tracked file edited inside an initialised
+    submodule and not committed stages ZERO BYTES, so the submission is empty
+    and the ladder stops at `EMPTY_PATCH` -- a `GradeFailure`, hence
+    `resolved: False`, an accusation that the model changed nothing, over a
+    limitation of the harness's own capture. `submodules_dirty_at_exit` is
+    what makes the row distinguishable from an honest empty run, and the
+    refusal takes it out of the denominator instead.
+
+    The submission here is an ORDINARY non-empty `TEXT_DIFF`, so nothing
+    about the diff is what triggers this.
+    """
+    graded = grade_run(
+        _record(submodules_dirty_at_exit={"vendor/libdep": "S.M."}),
+        _task(), "sha256:x", None, tmp_path / "cache", tmp_path / "artifacts",
+    )
+
+    assert graded.resolved is None
+    assert graded.not_graded_reason == \
+        NotGradedReason.SUBMODULE_EDIT_UNGRADABLE.value
+    assert graded.grade_failure is None
+    assert "vendor/libdep" in graded.not_graded_detail
+    assert not (tmp_path / "cache" / "grade-tree").exists()
+
+
+def test_an_untracked_file_inside_a_submodule_is_refused_too(tmp_path):
+    """The `U` bit, and it stages zero bytes exactly as the `M` bit does
+    (measured 2026-09-02). It is also the state `HARVESTING.md`'s "a suite
+    that writes inside the submodule is out" rule is about, whose consequence
+    is now grade-visible: such a task would refuse every collected run."""
+    graded = grade_run(
+        _record(submodules_dirty_at_exit={"vendor/libdep": "S..U"}),
+        _task(), "sha256:x", None, tmp_path / "cache", tmp_path / "artifacts",
+    )
+
+    assert graded.resolved is None
+    assert graded.not_graded_reason == \
+        NotGradedReason.SUBMODULE_EDIT_UNGRADABLE.value
+
+
+def test_the_states_the_diff_carries_are_left_to_the_gitlink_refusal():
+    """The two sub-states with neither `M` nor `U` set, and `git add -A`
+    stages a chunk for each: `SC..` is the gitlink moved by a commit inside,
+    245 bytes; `S...` is the directory removed, a `deleted file mode 160000`
+    at 199 bytes per path and identical seeded or unseeded. The diff carries
+    both, so `_gitlinks_touched` names them and this predicate must not --
+    two refusals for one shape is the mistake `not_graded_gate`'s docstring
+    already records."""
+    assert grader._submodule_edits(
+        _record(submodules_dirty_at_exit={"v": "SC.."})) == ()
+    assert grader._submodule_edits(
+        _record(submodules_dirty_at_exit={"v": "S..."})) == ()
+
+
+def test_a_record_that_never_measured_its_submodules_is_still_graded():
+    """`None` is "nobody looked" and `{}` is "read, nothing dirty", and the
+    VERDICT collapses them -- only here. Every stored record predates schema
+    3.10.0 and `MIN_GRADABLE_SCHEMA` is `"3.0.0"`, so a fail-closed reading
+    would refuse the whole corpus. The RECORD keeps the two apart
+    permanently."""
+    assert grader._submodule_edits(_record(submodules_dirty_at_exit=None)) == ()
+    assert grader._submodule_edits(_record(submodules_dirty_at_exit={})) == ()
+
+
+def test_the_gitlink_refusal_wins_when_a_submission_does_both(tmp_path):
+    """A commit inside a submodule with further edits left behind is `SCM.`
+    AND stages a 245-byte `index ...160000` chunk, so both refusals are true
+    of it. The gitlink reason is the more specific description -- it names
+    the commit that exists only in the run tree -- and it is the one already
+    in the stored vocabulary (GRADE_SCHEMA 1.2.0)."""
+    graded = grade_run(
+        _record(diff=_GITLINK_SUBMISSION,
+                submodules_dirty_at_exit={"vendor/libdep": "SCM."}),
+        _task(), "sha256:x", None, tmp_path / "cache", tmp_path / "artifacts",
+    )
+
+    assert graded.not_graded_reason == \
+        NotGradedReason.SUBMODULE_GITLINK_UNGRADABLE.value
+
+
+def test_content_in_an_uninitialised_submodule_is_refused_too(tmp_path):
+    """The second reader's marker, and refusing it is the same claim as
+    refusing `M`/`U`. With the scratch index seeded from `base_sha`, a file
+    an agent writes into an uninitialised submodule directory stages 0 bytes
+    and git emits no record for it -- and `grade_run` RE-MATERIALIZES the
+    tree, so that directory arrives empty and the content exists in neither
+    the diff nor the graded tree.
+
+    The marker is imported rather than typed: it is `schema`'s value space,
+    and a test that spelled it out would go on passing if the producer and
+    the consumer disagreed about it.
+    """
+    graded = grade_run(
+        _record(submodules_dirty_at_exit={
+            "vendor/libdep": SUBMODULE_UNINITIALISED_CONTENT}),
+        _task(), "sha256:x", None, tmp_path / "cache", tmp_path / "artifacts",
+    )
+
+    assert graded.resolved is None
+    assert graded.not_graded_reason == \
+        NotGradedReason.SUBMODULE_EDIT_UNGRADABLE.value
+    assert "vendor/libdep" in graded.not_graded_detail
 
 
 # --------------------------------------------------------------------------
@@ -1519,10 +1629,22 @@ def test_the_grader_version_moved_with_what_check_5_means():
     submodule's files at the old path with an empty directory at the new one
     -- so the ladder graded a tree the agent's move never reached and the
     verdict was `resolved: False`, an accusation over content the harness's
-    own diff capture could not carry."""
+    own diff capture could not carry.
+
+    `12 -> 13` is `_submodule_edits` (round 2 item 17, 2026-09-03). A run
+    whose tree carried an uncommitted edit, an untracked file or an `rm` of
+    tracked content inside an INITIALISED submodule -- or content inside an
+    UNINITIALISED one -- is refused as `SUBMODULE_EDIT_UNGRADABLE` rather
+    than graded. `git add -A` stages ZERO BYTES for every one of those
+    (measured 2026-09-02, git 2.50.1), so under 12 the submission was empty
+    and the ladder stopped at `EMPTY_PATCH` -- a `GradeFailure`, hence
+    `resolved: False`. No verdict on today's corpus changes, because no
+    stored record carries `submodules_dirty_at_exit`; the bump lands with the
+    code that makes the divergence possible, on the `4 -> 5` argument, since
+    the resume gate keys on `(run_id, GRADER_VERSION)` alone."""
     from bakeoff.grader import GRADER_VERSION
 
-    assert GRADER_VERSION == "12"
+    assert GRADER_VERSION == "13"
 
 
 def test_the_grade_says_which_runner_produced_its_numbers():

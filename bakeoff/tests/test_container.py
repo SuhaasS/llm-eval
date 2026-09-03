@@ -678,6 +678,226 @@ def test_a_moved_gitlink_still_reaches_the_submission(git_container_factory):
     assert "deleted file mode 160000" not in diff
 
 
+# --- round 2 item 17: the submodule state the diff cannot carry -------------
+
+
+class _ArgvRecorder:
+    """Records every argv it is handed and answers with canned stdout."""
+
+    def __init__(self, stdout: str = "", exit_code: int = 0, stderr: str = ""):
+        self.argvs: list[list[str]] = []
+        self._result = (exit_code, stdout, stderr)
+
+    def __call__(self, cmd, env=None):
+        from bakeoff.container import ExecResult
+
+        self.argvs.append(list(cmd))
+        return ExecResult(*self._result, 1)
+
+
+class _StatesDispatch(_ArgvRecorder):
+    """Three canned answers, one per argv `submodule_states` issues.
+
+    The second reader needs a stub that tells the three apart, which
+    `_ArgvRecorder` alone cannot: it answers every argv identically.
+    """
+
+    def __init__(self, status: str = "", ls_files: str = "", probe: str = ""):
+        super().__init__()
+        self._answers = {"status": status, "ls_files": ls_files,
+                         "probe": probe}
+
+    def __call__(self, cmd, env=None):
+        from bakeoff.container import ExecResult
+
+        self.argvs.append(list(cmd))
+        if cmd[0] == "sh":
+            out = self._answers["probe"]
+        elif cmd[:2] == ["git", "ls-files"]:
+            out = self._answers["ls_files"]
+        else:
+            out = self._answers["status"]
+        return ExecResult(0, out, "", 1)
+
+
+def test_the_submodule_state_argv_is_pinned_word_for_word():
+    """Every token was measured on 2026-09-02 (git 2.50.1).
+
+    `--no-optional-locks`: `git status` REWRITES the index, and the
+    submodule's index too. Both were stamped to `1577865600` and the command
+    re-run --
+
+        after --no-optional-locks:  super=1577865600  sub=1577865600
+        after plain status:         super=1788384510  sub=1788384510
+
+    -- so a plain `status` breaks the one rule `SNAPSHOT_INDEX`'s comment
+    states, in a method called from inside the agent's stdout loop while the
+    agent's own git is running.
+
+    `--ignore-submodules=none`: three config sites silence the entry
+    completely without it, each measured in isolation in a dirty state --
+    `submodule.<name>.ignore=all` in `.git/config`, `diff.ignoreSubmodules
+    =all` in `.git/config`, and `submodule.<name>.ignore=all` in
+    `.gitmodules`. The third is REPOSITORY-AUTHORED: it ships in the upstream
+    tree the task was cut from, so without the flag a file the task author
+    never wrote disarms the record.
+
+    `-z`: the path field is C-quoted under `core.quotePath` and
+    space-delimited otherwise.
+    """
+    stub = _ArgvRecorder(stdout="")
+    container = _container_with(stub)
+
+    container.submodule_states()
+
+    assert stub.argvs[0] == [
+        "git", "--no-optional-locks", "status",
+        "--porcelain=v2", "--ignore-submodules=none", "-z",
+    ]
+
+
+def test_a_submodule_state_read_takes_paths_and_states_from_the_nul_stream():
+    """The forged-record shape, measured 2026-09-02 (git 2.50.1).
+
+    A `2` (rename/copy) record occupies TWO NUL items -- the new path, then
+    the ORIGINAL. That second item is a path, which is repository-authored
+    text, and a path may be NAMED so that it reads as a record. A tracked file
+    named
+
+        `1 .M S.M. 160000 160000 160000 aaaaaaa bbbbbbb sneakysub`
+
+    renamed to `ordinary.py` puts exactly that string in the second slot:
+
+        2 R. N... 100644 100644 100644 <h> <h> R100 ordinary.py\0
+        1 .M S.M. 160000 160000 160000 aaaaaaa bbbbbbb sneakysub\0
+
+    A parser that advances by ONE reads that second item at the top of its
+    loop, matches `"1 "`, and files a submodule state for `sneakysub` on a
+    repository with no submodule at that path -- content reaching column zero
+    of a record, the failure `grader._GITLINK_MODE` states one level down.
+    `"sneakysub" not in states` is the assertion that goes red under
+    `index += 1`.
+
+    The ordinary file is excluded by its `N` sub-field, and the untracked
+    `a dir/` shows the field split is by COUNT and not fooled by a space.
+    """
+    stream = "\0".join([
+        "1 .M S.M. 160000 160000 160000 aaaa bbbb vendor/libdep",
+        "1 .M N... 100644 100644 100644 cccc dddd calc.py",
+        "2 R. N... 100644 100644 100644 eeee ffff R100 ordinary.py",
+        "1 .M S.M. 160000 160000 160000 aaaaaaa bbbbbbb sneakysub",
+        "? a dir/",
+        "",
+    ])
+    container = _container_with(_ArgvRecorder(stdout=stream))
+
+    states = container.submodule_states()
+
+    assert states == {"vendor/libdep": "S.M."}
+    assert "sneakysub" not in states
+
+
+def test_a_failed_submodule_state_read_raises_rather_than_reporting_a_clean_tree():
+    """`checked_exec`, never `exec`: an empty stdout from a failed
+    `git status` is byte-identical to a tree with no dirty submodule, so
+    reading that silence as "clean" fabricates the measurement this whole
+    field exists to make honestly.
+
+    `_container_with` stubs `exec` ONLY and leaves the production
+    `checked_exec` in place, which is what makes it usable here -- it used to
+    replace that method too, and under the old helper this test would have
+    asserted nothing.
+    """
+    container = _container_with(
+        _ArgvRecorder(exit_code=1, stderr="fatal: not a git repository")
+    )
+
+    with pytest.raises(ContainerError) as excinfo:
+        container.submodule_states()
+
+    assert "fatal: not a git repository" in str(excinfo.value)
+
+
+def test_content_in_an_uninitialised_submodule_is_recorded_as_a_distinct_marker():
+    """The state NOTHING else can see, measured 2026-09-02.
+
+    With the scratch index seeded from `base_sha`, `git add -A` does not
+    descend through a gitlink boundary -- so a file an agent writes into an
+    UNINITIALISED submodule directory stages 0 bytes, and git emits no v2
+    record for it either, because the path is a boundary git will not enter.
+    Recorded nowhere at all without this second reader.
+
+    The marker is ONE CHARACTER and deliberately not a four-character `S...`
+    shape: git's sub-state is always four characters beginning with `S`, so a
+    forged `S..U` would be a verdict git never issued passing
+    `grader._submodule_edits`' `len(state) == 4` guard silently.
+    """
+    from bakeoff.schema import SUBMODULE_UNINITIALISED_CONTENT
+
+    stub = _StatesDispatch(
+        status="", ls_files="160000 " + "a" * 40 + " 0\tvendor/libdep\0",
+        probe="vendor/libdep\0",
+    )
+    container = _container_with(stub)
+
+    states = container.submodule_states()
+
+    assert states == {"vendor/libdep": SUBMODULE_UNINITIALISED_CONTENT}
+    assert states["vendor/libdep"] != "S..U"
+
+
+def test_an_initialised_submodule_is_left_to_git_and_not_probed():
+    """The probe cannot overwrite a git verdict, and M7's disjointness is why
+    it never tries. The rule is a DIRECTORY test, not a `.git` test: on a
+    path with no `.git`, v2 fires only when the directory is ABSENT (a removed
+    gitlink gives `1 .D S...`) and the probe only when it is NON-EMPTY, which
+    are mutually exclusive. The `.git` test is what makes the probe cheap --
+    an initialised path is skipped without a `find` -- and the real script
+    prints nothing here for exactly that reason."""
+    stub = _StatesDispatch(
+        status="1 .M S.M. 160000 160000 160000 aaaa bbbb vendor/libdep\0",
+        ls_files="160000 " + "a" * 40 + " 0\tvendor/libdep\0",
+        probe="",
+    )
+    container = _container_with(stub)
+
+    assert container.submodule_states() == {"vendor/libdep": "S.M."}
+
+
+def test_the_uninitialised_probe_argv_is_pinned_word_for_word():
+    """Paths go through `"$@"` and never through string interpolation, so a
+    gitlink path containing a space, a quote or a `$` is passed verbatim --
+    `vendor/lib dep` was measured coming back whole. `"sh"` fills the `$0`
+    slot, which is what makes `"$@"` start at the first real path."""
+    from bakeoff.container import _UNINITIALISED_CONTENT_SH
+
+    stub = _StatesDispatch(
+        status="", ls_files="160000 " + "a" * 40 + " 0\tvendor/libdep\0",
+        probe="",
+    )
+    container = _container_with(stub)
+
+    container.submodule_states()
+
+    assert stub.argvs[-1] == [
+        "sh", "-c", _UNINITIALISED_CONTENT_SH, "sh", "vendor/libdep",
+    ]
+
+
+def test_a_tree_with_no_gitlinks_never_runs_the_probe():
+    """The short-circuit that keeps the cost off every task in today's corpus
+    but one: `ls-files` returns nothing, `_uninitialised_with_content` returns
+    before the exec, and the tree pays one extra `ls-files` and nothing
+    more."""
+    stub = _StatesDispatch(status="", ls_files="", probe="unreachable\0")
+    container = _container_with(stub)
+
+    states = container.submodule_states()
+
+    assert states == {}
+    assert not any(argv[0] == "sh" for argv in stub.argvs)
+
+
 def test_a_first_stream_frame_yields_no_percentage():
     """Measured against docker SDK 7.2.0 / daemon 29.5.2: the FIRST frame of a
     stats stream has `precpu_stats.cpu_usage.total_usage == 0` and NO

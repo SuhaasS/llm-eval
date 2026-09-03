@@ -85,7 +85,13 @@ from typing import Any
 # so the joined form cannot be split back -- the field's absence on such a
 # line is the writer's vocabulary, not a measurement, which is the same
 # reason `SCHEMA_VERSION` moves for additive bumps.
-GRADE_SCHEMA_VERSION = "1.4.0"
+# 1.5.0 adds `NotGradedReason.SUBMODULE_EDIT_UNGRADABLE`. Additive in fields
+# and not in meaning, exactly as 1.2.0 was: `not_graded_reason` can now carry
+# a value no earlier writer could produce, so its absence on an older line is
+# a gap in that writer's vocabulary and not a measurement. Every such run
+# graded under 1.4.0 or below landed as `EMPTY_PATCH` -- a `GradeFailure`,
+# hence `resolved: False`.
+GRADE_SCHEMA_VERSION = "1.5.0"
 
 # The oldest `RunRecord` schema whose fields mean what `from_dict` and the
 # ladder were written to assume. Below it the run is not graded and
@@ -138,10 +144,11 @@ def schema_at_least(version: str, floor: str) -> bool:
     """Is `version` at or above `floor`, compared as integer components?
 
     Not `version >= floor`. String comparison puts `"3.10.0"` BELOW `"3.9.0"`,
-    and `SCHEMA_VERSION` is at 3.8.0 -- two additive bumps from the wrap. The
-    defect would arrive with a schema bump rather than with a code change, and
-    it fails in the silent direction: every record written by the newer harness
-    is refused as "too old" and the whole collection reads as ungradable.
+    and `SCHEMA_VERSION` IS 3.10.0 -- the wrap has arrived, so this is no
+    longer insurance. Under `>=` every record this harness writes would be
+    refused as "too old" against a 3.9.0-or-below floor, and the failure
+    arrives with a schema bump rather than with a code change: it is silent
+    and it makes a whole collection read as ungradable.
 
     Components are compared as tuples, padded so `"3.8"` and `"3.8.0"` agree.
     A version that is not dotted integers raises `ValueError` rather than being
@@ -193,7 +200,10 @@ class NotGradedReason(str, Enum):
       fixed the bug and the harness cannot see the content. Either a declared
       submodule the agent committed inside, or a repository the agent created
       itself with `git init`/`git clone` in a tracked subdirectory, which
-      produces the same chunk on a task with no submodules at all);
+      produces the same chunk on a task with no submodules at all), and
+      `SUBMODULE_EDIT_UNGRADABLE` -- where a submission exists but the tree it
+      was taken from carried changes `git add -A` stages nothing for, so the
+      stored diff is not a description of what the agent produced;
     * the grading environment broke (`ENVIRONMENT_ERROR`,
       `SCOPE_COLLECTED_NOTHING`, `PREFLIGHT_FAILED`, `ORACLE_FAILED`,
       `TASK_SETUP_FAILED`);
@@ -211,6 +221,7 @@ class NotGradedReason(str, Enum):
     BINARY_HUNK_UNAPPLIABLE = "binary_hunk_unappliable"
     LOSSY_DIFF_UNAPPLIABLE = "lossy_diff_unappliable"
     SUBMODULE_GITLINK_UNGRADABLE = "submodule_gitlink_ungradable"
+    SUBMODULE_EDIT_UNGRADABLE = "submodule_edit_ungradable"
     ENVIRONMENT_ERROR = "environment_error"
     SCOPE_COLLECTED_NOTHING = "scope_collected_nothing"
     PREFLIGHT_FAILED = "preflight_failed"

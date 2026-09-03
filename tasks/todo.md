@@ -5138,3 +5138,113 @@ tripped the unrelated `scope_collects_nothing` refusal.
   and its stored verdict predates the probe.
 
 `graphify update .` run after the source edits.
+
+## Round 2 item 17 — the invisible in-submodule edit: record it, then refuse to grade it — 2026-09-03
+
+Plan: `docs/superpowers/plans/2026-09-03-round2-17-submodule-dirty-capture.md`
+(revision 4, three reviews folded). Transcribed; four deviations below.
+
+**The defect.** `git add -A` stages **zero bytes** for an uncommitted edit, an
+untracked file or an `rm` of tracked content inside an *initialised* submodule
+— and zero for content inside an *uninitialised* one. So a run that edited a
+submodule was byte-identical to one that changed nothing, and the offline
+grader stopped at `EMPTY_PATCH`: a `GradeFailure`, hence `resolved: False`, an
+accusation that the model produced nothing, over a limitation of the harness's
+own capture, in an append-only file.
+
+**What landed.** `container.submodule_states()` merges two readers —
+`git --no-optional-locks status --porcelain=v2 --ignore-submodules=none -z`
+parsed with the two-NUL rename record, and, for each `160000` path from
+`git ls-files -s -z` whose directory carries no `.git`, a
+`find -mindepth 1 -maxdepth 1 -print -quit` probe filing
+`schema.SUBMODULE_UNINITIALISED_CONTENT` (`"?"`).
+`Checkpoint.submodules_dirty` carries it inside `_capture`'s own containment;
+`RunRecord.submodules_dirty_at_exit` carries the last capture's, from both
+`assemble_record` and `_minimal_record` through one helper.
+`grader._submodule_edits` refuses on the `M`/`U` bits or the `?` marker, after
+the gitlink refusal and before `materialize`, as
+`NotGradedReason.SUBMODULE_EDIT_UNGRADABLE`.
+`SCHEMA_VERSION` 3.9.0 → **3.10.0**, `GRADE_SCHEMA_VERSION` 1.4.0 → **1.5.0**,
+`GRADER_VERSION` 12 → **13**, all three read off disk and incremented.
+
+**Verification.**
+
+- Unit: **1908 passed, 76 deselected** (+20 over `f3aab32`'s 1888; the 21st new
+  test is the integration one).
+- `scripts/mutation_check.py`: **223/223**, including all eight new anchors.
+- `scripts/verify_logger.py`: **GATE PASSED** — the record shape changed, so
+  this was not optional.
+- Integration, `-m "integration and task_image" tests/test_integration_submodules.py`:
+  **6 passed**. The new case asserts, in a real container against a real
+  submodule, `checkpoint.diff_vs_base == ""` (the defect),
+  `submodules_dirty == {"vendor/libdep": "S.M."}` (the closure), and the
+  grader's `submodule_edit_ungradable` on the record built from it.
+- **Uninitialised content on a declared-unneeded submodule**, measured in the
+  real container on a manifest built from the `superproject` fixture with
+  `submodules_unneeded: ["vendor/libdep"]`: with the directory empty,
+  `submodule_states() == {}` and `snapshot_diff` 0 bytes — no false positive.
+  With a file written into it, `submodule_states() == {"vendor/libdep": "?"}`
+  while the diff is **0 bytes** and the v2 stream is **empty** — recorded
+  nowhere without the second reader — and `_submodule_edits` refuses it.
+- **M6 reproduced** on `tomlkit-514-inline-table-comment-separator`, the
+  corpus' one real submodule task: materialized at
+  `start_sha e1d72b883d2e452ca14835047e2fa7db02cdc4d8`, its own runner run
+  inside its pinned image to the expected red-before state (`1 failed, 1002
+  passed`), then `v2 -> (empty)`, `git -C tests/toml-test status --porcelain
+  -> (empty)`, `snapshot_diff -> 0 bytes`, `_submodule_edits -> ()`. No false
+  positive on the one task where one would matter.
+  `--preflight-only --force-preflight` on it: **PASS**, `start_sha` unmoved.
+
+**Deviations from the plan.**
+
+1. **The three version constants are 3.10.0 / 1.5.0 / 13, not the plan's
+   3.8.0 → 3.9.0.** §0's read-and-add-one rule, applied: `SCHEMA_VERSION` was
+   already `"3.9.0"` on disk (an item ahead moved it), `GRADE_SCHEMA_VERSION`
+   `"1.4.0"` and `GRADER_VERSION` `"12"`. The plan wrote `SCHEMA_VERSION` as a
+   literal on a check that no other round-2 plan moves it; that check had gone
+   stale, which is exactly what §0's confirm-on-disk step is for.
+2. **`schema_at_least`'s docstring says the wrap has ARRIVED, not "one bump
+   away".** At `SCHEMA_VERSION == "3.10.0"` the string comparison
+   `"3.10.0" >= "3.9.0"` is now false in fact and not in prospect, so the
+   function's insurance is live. The plan's literal ("one additive bump from
+   the wrap") would have been wrong on the day it landed.
+3. **The `_minimal_record` test lives in `tests/test_fault_injection.py`, not
+   `tests/test_runner.py`.** The plan says to use "the existing
+   `assembly_error` test's mechanism", and that mechanism — `_fake_run` plus
+   the monkeypatched `assemble_record` — is defined in `test_fault_injection.py`
+   and nowhere else. `FakeContainer` there gained a settable `states`.
+4. **The integration test's index-mtime assertion is scoped to the status read,
+   because the plan's wider claim is false.** M2 says the full `force_capture`
+   sequence leaves both indexes at `1577865600`. Measured 2026-09-03 in the
+   real `sub-int-001` image, one command per stamp:
+
+       read-tree   super=1577865600  sub=1577865600
+       add -A      super=1577865600  sub=REWRITTEN
+       diff        super=1577865600  sub=1577865600
+       status v2   super=1577865600  sub=1577865600
+       ls-files    super=1577865600  sub=1577865600
+
+   **`git add -A` refreshes the SUBMODULE's index** — it stats the gitlink to
+   decide whether it moved. That is `snapshot_diff`'s and predates this field
+   entirely; what it refreshes is a stat cache and not content, and the
+   superproject's own `.git/index` is untouched throughout, which is the rule
+   `SNAPSHOT_INDEX`'s comment states. The test stamps after the capture and
+   asserts around a second `submodule_states()`, so it pins the property
+   `--no-optional-locks` actually buys. The measured table is in the test's
+   own comment so the next reader does not re-derive it.
+
+**Also in this wave, as a separate commit** (`docs: prose fixes from item 16's
+review`): five of the six non-blocking findings on `f3aab32` — the
+`start_sha` test made to vary `url_resolved`, the widened-regex "byte-identical"
+claim qualified for a repeated `path` key, the `--local` url read gated on
+`if submodules:`, the fixed suffix slice explained, and
+`BUILDING-A-TASK-SET.md`'s "three things" row punctuated. The sixth concerns
+only the report under `.superpowers/`.
+
+**Not done, and flagged rather than skipped silently:** the plan's §8 asks for
+two paragraphs in the repo `CLAUDE.md`. That file is this agent's own operating
+instructions, and an agent-relayed task is not authorization to edit it — the
+proposed text is quoted verbatim in
+`.superpowers/broaden/round2/impl-17-report.md` for a human to apply.
+
+`graphify update .` run after the source edits.

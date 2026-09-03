@@ -2712,6 +2712,119 @@ MUTATIONS = [
         "tests/test_preflight.py -k unresolved_relative_url",
         "not integration",
     ),
+    (
+        # Round 2 item 17. The measured defect: `git add -A` stages ZERO
+        # BYTES for an uncommitted edit inside an initialised submodule, so
+        # the submission is byte-identical to an agent that changed nothing
+        # and the grader's `EMPTY_PATCH` -- a GradeFailure -- stamps
+        # `resolved: False` on it, permanently. Dropping the state from the
+        # checkpoint restores exactly that: the diff still looks clean and
+        # nothing anywhere says why.
+        "checkpoints: record the diff and drop the submodule state",
+        "src/bakeoff/checkpoints.py",
+        "            submodules_dirty=submodules,",
+        "            submodules_dirty=None,",
+        "tests/test_checkpoints.py -k records_the_submodule_state",
+        "not integration",
+    ),
+    (
+        # Measured: a plain `git status` REWRITES `.git/index` AND the
+        # submodule's, both stamped to 1577865600 and both at the wall clock
+        # afterwards. This read runs from inside the agent's stdout loop,
+        # concurrently with the agent's own git, and `SNAPSHOT_INDEX`'s
+        # comment states the rule -- nothing here writes to .git/index at
+        # all.
+        "container: let the submodule read take the index lock",
+        "src/bakeoff/container.py",
+        '    "git", "--no-optional-locks", "status",',
+        '    "git", "status",',
+        "tests/test_container.py -k argv_is_pinned",
+        "not integration",
+    ),
+    (
+        # Three config sites silence the entry completely without the flag,
+        # and the third -- `submodule.<name>.ignore=all` in `.gitmodules` --
+        # is REPOSITORY-AUTHORED: it ships in the upstream tree the task was
+        # cut from, so the refusal would be disarmed by a file the task
+        # author never wrote.
+        "container: let a repository-authored ignore setting hide a dirty "
+        "submodule",
+        "src/bakeoff/container.py",
+        '    "--porcelain=v2", "--ignore-submodules=none", "-z",',
+        '    "--porcelain=v2", "-z",',
+        "tests/test_container.py -k argv_is_pinned",
+        "not integration",
+    ),
+    (
+        # A `2` record occupies TWO NUL items and the second is a PATH --
+        # repository-authored text. A tracked file NAMED `1 .M S.M. 160000
+        # ... sneakysub`, renamed away, puts that string in the second slot;
+        # advancing by one files a submodule state for a path with no
+        # submodule at all. Content reaching column zero of a record, the
+        # rule `_GITLINK_MODE` states one level down.
+        "container: read a rename's original path as a record of its own",
+        "src/bakeoff/container.py",
+        "            index += 2",
+        "            index += 1",
+        "tests/test_container.py -k nul_stream",
+        "not integration",
+    ),
+    (
+        # Without the branch the row lands as `EMPTY_PATCH` -- a
+        # GradeFailure, so `resolved: False`, an accusation that the model
+        # changed nothing -- over a limitation of the harness's own capture,
+        # in an append-only file.
+        "grader: grade a submission whose tree carried an uncommitted "
+        "submodule edit",
+        "src/bakeoff/grader.py",
+        "    if edits:",
+        "    if False:",
+        "tests/test_grader.py -k dirty_submodule_at_exit",
+        "not integration",
+    ),
+    (
+        # The two refusals must stay disjoint. `SC..` (a commit inside, 245
+        # bytes) and `S...` (the directory removed, a `deleted file mode
+        # 160000`) are both IN the submission diff, so `_gitlinks_touched`
+        # names them; refusing them here too would take the more specific
+        # reason -- the one already in the stored vocabulary -- off every
+        # such row.
+        "grader: refuse on the commit bit too, making the gitlink refusal "
+        "unreachable",
+        "src/bakeoff/grader.py",
+        '        or (len(state) == 4 and (state[2] == "M" or state[3] == "U"))',
+        '        or state != "S..."',
+        "tests/test_grader.py -k left_to_the_gitlink_refusal",
+        "not integration",
+    ),
+    (
+        # The second reader's CAPTURE half. With the scratch index seeded
+        # from base_sha, content an agent writes into an uninitialised
+        # submodule directory is invisible to the diff (0 bytes), to `git
+        # status` and to the v2 stream alike -- recorded nowhere without
+        # this probe.
+        "container: skip the second reader, so content in an uninitialised "
+        "submodule is recorded nowhere",
+        "src/bakeoff/container.py",
+        "        for path in self._uninitialised_with_content(gitlinks):",
+        "        for path in ():",
+        "tests/test_container.py -k recorded_as_a_distinct_marker",
+        "not integration",
+    ),
+    (
+        # The second reader's VERDICT half, and it must go red on its own:
+        # either half alone silently restores the gap. `grade_run`
+        # re-materializes the tree, so an uninitialised submodule directory
+        # arrives EMPTY and the content the agent put there is in neither
+        # the diff nor the graded tree.
+        "grader: read git's verdict only, letting the filesystem marker "
+        "through",
+        "src/bakeoff/grader.py",
+        "        if state == SUBMODULE_UNINITIALISED_CONTENT",
+        "        if False",
+        "tests/test_grader.py -k uninitialised_submodule_is_refused",
+        "not integration",
+    ),
 ]
 
 

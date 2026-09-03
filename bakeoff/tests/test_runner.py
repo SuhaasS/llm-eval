@@ -800,3 +800,50 @@ def test_no_successful_call_yields_none_not_an_empty_string():
     values."""
     assert terminal_finish_reason([_entry("stop", failed=True)]) is None
     assert finish_reasons([]) == {}
+
+
+# --- round 2 item 17: the submodule state at exit ---
+
+
+def _sub_checkpoint(turn, submodules):
+    return Checkpoint(
+        turn=turn, diff_vs_base=f"diff-{turn}", files_touched=["src/a.py"],
+        elapsed_ms=turn * 1000, submodules_dirty=submodules,
+    )
+
+
+def test_the_record_carries_the_last_captures_submodule_state(task, tmp_path):
+    """The LAST capture's, the same expression `artifacts.final_diff` uses --
+    so the state the submission diff cannot carry sits in the record beside
+    the submission itself, and an offline view does not have to re-derive
+    which checkpoint was final."""
+    record = assemble_record(
+        task=task, model="gemma-4-31b", sample_index=0,
+        started_at="2026-08-04T00:00:00Z", finished_at="2026-08-04T00:05:00Z",
+        trajectory_path=None, runner_result=None,
+        checkpoints=[
+            _sub_checkpoint(1, {}),
+            _sub_checkpoint(2, {"tests/toml-test": "S..U"}),
+            _sub_checkpoint(3, {"tests/toml-test": "S.M."}),
+        ],
+        destructive_events=[], artifacts_root=tmp_path,
+    )
+
+    assert record.submodules_dirty_at_exit == {"tests/toml-test": "S.M."}
+
+
+def test_no_checkpoints_reports_no_submodule_state_rather_than_a_clean_one(
+        task, tmp_path):
+    """`{}` here would be a positive claim -- "read, nothing dirty" --
+    manufactured by there being no observation at all. It sits beside
+    `artifacts.final_diff`'s `None` for the same reason and off the same
+    guard."""
+    record = assemble_record(
+        task=task, model="gemma-4-31b", sample_index=0,
+        started_at="2026-08-04T00:00:00Z", finished_at="2026-08-04T00:05:00Z",
+        trajectory_path=None, runner_result=None, checkpoints=[],
+        destructive_events=[], artifacts_root=tmp_path,
+    )
+
+    assert record.submodules_dirty_at_exit is None
+    assert record.artifacts.final_diff is None

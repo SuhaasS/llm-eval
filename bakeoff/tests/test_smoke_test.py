@@ -63,6 +63,9 @@ class _CapturingContainer:
     def snapshot_diff(self, base_sha: str) -> tuple[str, list[str]]:
         return ("", [])
 
+    def submodule_states(self) -> dict[str, str]:
+        return {}
+
 
 class _NoopRunner:
     def __init__(self, stdout: str = "") -> None:

@@ -43,8 +43,15 @@ def test_the_grade_schema_version_moved_with_what_the_record_means():
     1.3.0 -> 1.4.0 adds `GradeRecord.not_run_node_ids`, a value a reader of a
     1.3.0 line could not have met -- on such a line the ids a run failed to
     execute exist only inside `environment_error`'s prose, so its absence is
-    the writer's vocabulary and not a measurement."""
-    assert GRADE_SCHEMA_VERSION == "1.4.0"
+    the writer's vocabulary and not a measurement.
+
+    1.4.0 -> 1.5.0 adds `NotGradedReason.SUBMODULE_EDIT_UNGRADABLE`, exactly
+    as 1.2.0 added the gitlink one: a value a reader of the
+    `not_graded_reason` field can now meet and could not before. Every run
+    that would carry it graded as `EMPTY_PATCH` under 1.4.0 and below -- a
+    `GradeFailure`, hence `resolved: False` -- so its absence on an older
+    line is a gap in that writer's vocabulary, not a measurement."""
+    assert GRADE_SCHEMA_VERSION == "1.5.0"
 
 
 def test_the_gitlink_refusal_is_a_not_graded_reason_and_not_a_failure():

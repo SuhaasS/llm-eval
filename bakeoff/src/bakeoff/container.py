@@ -33,7 +33,7 @@ from typing import Any, Callable
 
 import docker
 
-from bakeoff.schema import HostMetrics
+from bakeoff.schema import SUBMODULE_UNINITIALISED_CONTENT, HostMetrics
 
 REPO_MOUNT = "/repo"
 
@@ -147,6 +147,113 @@ def _sweep_stale_trees(parent: Path, max_age_s: float = STALE_TREE_AGE_S) -> Non
                 shutil.rmtree(entry.path, ignore_errors=True)
         except OSError:
             continue
+
+
+#: The submodule-state read, word for word. Every token is load-bearing and
+#: each was measured on 2026-09-02 (git 2.50.1); see `submodule_states`.
+_SUBMODULE_STATUS_ARGV = [
+    "git", "--no-optional-locks", "status",
+    "--porcelain=v2", "--ignore-submodules=none", "-z",
+]
+
+#: The gitlink path set, same rule and same reason as
+#: `preflight._gitlink_paths`: paths come from git, NUL-delimited, never from
+#: a display line. It is also the short-circuit -- no gitlinks, no probe.
+_GITLINK_ARGV = ["git", "ls-files", "-s", "-z"]
+
+#: Which declared gitlink directories hold content, for the paths passed as
+#: "$@". POSIX sh, no bashisms, every branch measured 2026-09-02 (M7).
+#:
+#: `[ -e "$p/.git" ]` is the INITIALISED test: a modern submodule has a `.git`
+#: FILE there and an older one a directory, so `-e` covers both. It also
+#: excludes an agent who ran `git init` in the directory -- that shape stages a
+#: `160000` chunk and `grader._gitlinks_touched` already owns it.
+#:
+#: `find -mindepth 1 -maxdepth 1 -print -quit` rather than `ls -A`: it stops at
+#: the first entry, and its output is empty-or-not rather than a list that has
+#: to be parsed. Command substitution strips trailing newlines, which is why
+#: the test is `-n` on ONE printed entry and never a count of lines. A missing
+#: directory writes to stderr, which is discarded, and prints nothing.
+#:
+#: `if`/`then` blocks and a closing `exit 0`, never `[ ... ] && continue`: the
+#: loop's last command decides the script's exit status, so a trailing false
+#: test makes `checked_exec` raise on a healthy tree.
+_UNINITIALISED_CONTENT_SH = '''
+for p in "$@"; do
+  if [ -e "$p/.git" ]; then
+    continue
+  fi
+  if [ -n "$(find "$p" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
+    printf '%s\\0' "$p"
+  fi
+done
+exit 0
+'''
+
+
+def _parse_status_v2(out: str) -> dict[str, str]:
+    """Submodule sub-states out of `git status --porcelain=v2 -z`.
+
+    Records are NUL-terminated, and the count of items per record is NOT
+    uniform: a `2` (rename/copy) record occupies TWO -- the new path, then the
+    original. Measured 2026-09-02 (git 2.50.1); the five shapes are in round 2
+    item 17's plan under M3.
+
+    ADVANCING BY TWO AFTER A `2` IS LOAD-BEARING, not hygiene. The second item
+    is a PATH, which is repository-authored text, and a path may be named so
+    that it reads as a record: a file named
+
+        `1 .M S.M. 160000 160000 160000 aaaaaaa bbbbbbb sneakysub`
+
+    renamed to `ordinary.py` puts exactly that string in the second slot, and a
+    parser that reads it as a record files a submodule state for `sneakysub` on
+    a repository that has no submodule at all. Same rule as `_GITLINK_MODE`'s:
+    content must never reach column zero of a record.
+
+    Fields are split by COUNT (`split(" ", 8)` / `split(" ", 9)`), so a path
+    containing spaces survives -- verified against `a dir/f.txt` and against
+    the forged name above. A record too short to index contributes nothing
+    rather than raising: this is called from the agent's stdout loop, and
+    `preflight._gitlink_paths`'s `partition` comment records what an
+    unadvertised `IndexError` costs there.
+    """
+    items = out.split("\0")
+    states: dict[str, str] = {}
+    index = 0
+    while index < len(items):
+        item = items[index]
+        if item.startswith("2 "):
+            index += 2
+            fields = item.split(" ", 9)
+            path_at = 9
+        elif item.startswith("1 "):
+            index += 1
+            fields = item.split(" ", 8)
+            path_at = 8
+        else:
+            # `u`, `?`, `!`, a `#` header this argv never asks for, and the
+            # trailing empty item after the final NUL. One item, no entry.
+            index += 1
+            continue
+        if len(fields) > path_at and fields[2].startswith("S"):
+            states[fields[path_at]] = fields[2]
+    return states
+
+
+def _gitlinks_from_ls_files(out: str) -> tuple[str, ...]:
+    """Every 160000 entry's path, from `git ls-files -s -z`.
+
+    `partition`, never `split("\\t", 1)[1]`: a record beginning `160000 ` with
+    no TAB makes the indexed form raise `IndexError`, and this is called from
+    the agent's stdout loop. A record that yields no path contributes none.
+    """
+    paths = []
+    for record in out.split("\0"):
+        if record.startswith("160000 "):
+            _meta, _tab, path = record.partition("\t")
+            if path:
+                paths.append(path)
+    return tuple(paths)
 
 
 @dataclass(frozen=True)
@@ -514,6 +621,126 @@ class RunContainer:
         )
         files = [line for line in names.stdout.splitlines() if line.strip()]
         return diff.stdout, files
+
+    def submodule_states(self) -> dict[str, str]:
+        """What the submission diff cannot carry: per-gitlink dirt.
+
+        `snapshot_diff` normalizes over everything the agent did OUTSIDE a
+        gitlink boundary and nothing inside one. Measured 2026-09-02 (git
+        2.50.1) through this class's own command sequence -- scratch-index
+        `git add -A`, then `git diff --cached <base>`: an uncommitted edit to a
+        tracked file inside an INITIALISED submodule stages **0 bytes**, an
+        untracked file inside one stages 0 bytes, and an `rm` of tracked
+        content inside one stages 0 bytes. A commit inside one stages 245
+        bytes (an `index <old>..<new> 160000` chunk plus `Subproject commit`),
+        and a gitlink whose directory has been REMOVED stages a `deleted file
+        mode 160000` chunk, 199 bytes per path. So the two states the diff
+        carries are exactly the two `grader._gitlinks_touched` already refuses,
+        and the states it does not carry are recorded here instead. Without
+        this field a run that edited a submodule is byte-identical to one that
+        did nothing, and the offline grader stamps `EMPTY_PATCH` --
+        `resolved: False`, an accusation -- on it, permanently.
+
+        EVERY TOKEN OF THE ARGV IS LOAD-BEARING.
+
+        `--no-optional-locks`, because a plain `git status` REWRITES the index
+        -- and the submodule's index too. Both were stamped to `1577865600`
+        and the command re-run: after this argv both are still `1577865600`,
+        after a plain `status` both read the wall clock. `SNAPSHOT_INDEX`'s own
+        comment states the rule this protects -- *nothing here writes to
+        .git/index at all* -- and it is not hygiene: this runs from inside the
+        agent's stdout loop, concurrently with the agent's own git.
+
+        `--ignore-submodules=none`, because three config sites silence the
+        entry completely without it, measured each in isolation:
+        `submodule.<name>.ignore=all` in `.git/config`, `diff.ignoreSubmodules
+        =all` in `.git/config`, and `submodule.<name>.ignore=all` in
+        **`.gitmodules`** -- which is repository-authored and ships in the
+        upstream tree the task was cut from. Without the flag a file the task
+        author never wrote disarms the record.
+
+        `-z`, the same rule `preflight._gitlink_paths` and `tasks._numstat`
+        follow: the path field is C-quoted under `core.quotePath` and
+        space-delimited otherwise, so paths come from git's own delimiter and
+        never from a regex over a display line.
+
+        `git submodule status` is REJECTED, not merely unused: it reports a
+        **space** marker for all three states this method exists for, because
+        it compares the submodule's HEAD against the index gitlink and says
+        nothing about the submodule's working tree. Its `+` fires only on the
+        one state the diff already carries. It also costs ~91 ms against this
+        argv's ~14 ms (100 iterations, warm), so the cheaper read is also the
+        strictly more informative one.
+
+        A SECOND READER SITS BESIDE IT, because git sees only half of this.
+        With the scratch index seeded from `base_sha`, `git add -A` does not
+        descend through a gitlink boundary -- so content an agent writes into
+        an UNINITIALISED submodule directory is invisible to the diff, to
+        `git status` and to the v2 stream alike: recorded nowhere. So each
+        `160000` path from `git ls-files -s -z` whose directory carries no
+        `.git` is probed with `find -mindepth 1 -maxdepth 1 -print -quit`, and
+        one that prints anything is filed under
+        `schema.SUBMODULE_UNINITIALISED_CONTENT`.
+
+        The two readers are measured disjoint, and the rule is a DIRECTORY
+        test rather than a `.git` test: on a path with no `.git`, v2 fires only
+        when the directory is **absent** (it emits `1 .D S... ...` for a removed
+        gitlink) and the probe fires only when it is **non-empty**. Absent and
+        non-empty are mutually exclusive, so no path can be filed twice. The
+        `.git` test is what makes the probe CHEAP -- an initialised path is
+        never probed at all -- not what keeps the two apart.
+
+        The value space of the first reader is git's own `S<c><m><u>` grammar,
+        each slot its letter or `.`: eight values, of which seven are measured
+        (`S...`, `S.M.`, `S..U`, `SC..`, `SCM.`, `S.MU`, `SCMU`; `SC.U` follows
+        from the grammar and was not constructed). Recorded raw and
+        unenumerated, for the reason `_parse_submodule_status` keeps `marker`
+        beside `initialised`: the record is an observation and the verdict is
+        derived from it elsewhere. Here the marker also says WHICH READER
+        spoke -- git's is always four characters beginning `S`, the
+        filesystem's is one character.
+
+        `checked_exec`, never `exec`: an empty stdout from a failed
+        `git status` is byte-identical to a tree with no dirty submodule, and
+        reading that silence as "clean" is the fabricated measurement
+        `checked_exec` exists to prevent.
+
+        ONE METHOD, ONE CONTAINMENT, ONE RESULT. `{}` is a measurement --
+        "read, nothing dirty", which includes "no submodules" and an
+        uninitialised submodule whose directory is genuinely empty. This
+        method never returns `None`: it either returns a complete mapping or
+        raises, so a half-read can never present itself as a whole one. The
+        containment is `checkpoints._capture`'s, and `None` there means "not
+        read".
+        """
+        states = _parse_status_v2(
+            self.checked_exec(list(_SUBMODULE_STATUS_ARGV)).stdout
+        )
+        gitlinks = _gitlinks_from_ls_files(
+            self.checked_exec(list(_GITLINK_ARGV)).stdout
+        )
+        for path in self._uninitialised_with_content(gitlinks):
+            states[path] = SUBMODULE_UNINITIALISED_CONTENT
+        return states
+
+    def _uninitialised_with_content(
+        self, gitlinks: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        """The declared gitlink directories that hold content git will not
+        report. Empty tuple without an exec when the tree has no gitlink at
+        all, which is every task in today's corpus but one.
+
+        `sh -c <script> sh <paths...>` -- the paths go through `"$@"` and never
+        through string interpolation, so a gitlink path containing a space, a
+        quote or a `$` is passed verbatim (the space is measured). `"sh"` in
+        the `$0` slot is what makes `"$@"` start at the first real path.
+        """
+        if not gitlinks:
+            return ()
+        result = self.checked_exec(
+            ["sh", "-c", _UNINITIALISED_CONTENT_SH, "sh", *gitlinks]
+        )
+        return tuple(path for path in result.stdout.split("\0") if path)
 
     def restore_paths(self, base_sha: str, paths: list[str]) -> None:
         """Overwrite paths with their base_sha contents. Used to restore
