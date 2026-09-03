@@ -4977,3 +4977,164 @@ evidence available from this vehicle and is what was recorded instead.
   transcribed from the plan, naming the deleted constant's history).
 
 `graphify update .` run after the source edits.
+
+## Round 2 item 14 — `image.build` writes into `/repo` are discarded by the bind mount — 2026-09-03
+
+`image.build` runs against the build-time scaffold (`git archive base_sha`)
+and `tasks.materialize` builds the run tree separately; the bind mount
+replaces `/repo` with the run tree in full, so a file the build generated
+reaches no process after the build. Believed loud (a `ModuleNotFoundError` at
+gate time); measured 2026-09-02 it is not: `sqlglot-6927`'s gate passes green
+while every arm silently loses `sqlglot.__version__`, and `pytest-10210`'s
+bare `python -m pytest` an agent naturally types dies at exit **1**, which
+sat in the bare-runner probe's accepted set on the theory "1 cannot happen
+with `--co`" — true for a test failure, false for an interpreter that never
+starts.
+
+**The fix (decision A — measure and record; refuse only the one shape that
+is measurably inadmissible).** `images.scaffold_only_paths(image, run_tree)`
+(new: `_repo_paths_in_image` via `docker create --entrypoint true` +
+`docker cp … | tarfile`, streamed, no `.git` filter on the image side;
+`_tree_paths` via `os.walk` pruning `.git` on the TREE side only, since the
+run tree's `.git` is that clone's own metadata and must not cancel build
+residue by path name) reports the set difference, sorted. `preflight` runs it
+once per gate, after the runner-gate early return (which pays no docker
+call) and before `RunContainer` starts (the scan's own container is never
+started and has no mount — the placement is a cost/shape choice, not a
+correctness one). Three evidence keys —
+`build_generated_paths`/`_count`/`_state` — with a four-way state schema
+(`"not_attempted"`, `"scanned"`, `"truncated: N paths, first 100 listed"`,
+`"failed: <exc>"`) seeded from `_evidence_seed()` (a third exception beside
+`bounded_run_durations_s`, since this key's absence is never a bare `None`).
+**This measurement refuses nothing**: "generated" and "required" are
+different claims and no path name separates them — `sqlglot-6927` is a
+perfectly good task. What refuses is D9: the bare-runner probe drops
+`EXIT_TESTS_FAILED` from its accepted tuple and gives exit 1 its own branch,
+quoting the last non-empty line of stderr (or naming that stderr was empty,
+reachable — `chimera-228`'s bare `--co` exits 4 with none) and pointing at
+`evidence.build_generated_paths`. Measured across seven python task images
+plus three deliberately-broken shapes: a module-level import error and a
+syntax error both exit 2, a conftest.py import error exits 4, and only the
+one whose suite imports a build-generated module answers 1 — so nothing a
+legitimately red start state does reaches this branch. `run_matrix`'s
+`resolve_tasks` prints a `note` line on both the fresh-gate path (PASS or
+NO-GO) and the cached path (read off `cache/preflight/<task_id>.json`,
+best-effort), because a warm gate is the normal case once a task is
+authored. `PREFLIGHT_VERSION` moved 22 → 23: three keys join the evidence
+schema **and** the GO/NO-GO changes, so a cached PASS may describe a task
+this gate now refuses.
+
+**Alternatives rejected**, all with a measurement behind the rejection: (B)
+running `image.build` at container start instead is a per-repo property, not
+a harness rule — click's `flit_core` backend cannot install offline in
+either form, pytest's can, and the claimed benefit (fixing the import path)
+does not exist, since an editable install already points at `/repo` by
+absolute path; it would also unpin `container_image_digest` and multiply the
+build cost per cell instead of per task. (C) copying gitignored
+build-generated files into the run tree at container start has no cheap
+channel from build to container start, must fire identically in the agent's
+container/preflight/oracle/grader or the model is graded on an environment
+it never saw, and an agent's own `git clean -xfd` would remove it
+differentially. (D) a substring check of `build_generated_paths` against the
+declared `tests.runner` was considered and not built — strictly weaker than
+D9, and it would measure the author's prose rather than the run.
+
+**Review 1** raised 18 findings, 3 blocking, all adopted: (1) the `.git`
+handling was inconsistent between the two measurement paths — the named test
+could not pass on correct code, so `.git` is filtered on the run-tree side
+only, with the justification upgraded from "walk cost" to the real one (the
+clone's own metadata must not cancel build residue by path name). (2) the
+stated reason for not fixing the exit-1 branch was measurably false — the
+refusal was built in this item, per D9, rather than deferred. (3) the plan's
+own earlier draft stated a gate result that had never actually been
+produced — §7.7 (below) is what turns that inference into an observation.
+**Review 2** found 4 mechanical LOW findings (a mis-transcribed anchor quote,
+the empty-stderr message rendering as a bare full stop, a test helper
+needing an `evidence` parameter, §7.7's dependency on an unversioned local
+directory) and approved.
+
+**A necessary deviation from the plan's literal text, found by running the
+tests, not by design.** §6's instruction to extend `_preflight_result(task,
+kw, problems=())` with `evidence=evidence or {}` would raise inside
+`PreflightResult.__post_init__` for the file's two PRE-EXISTING callers,
+which never pass `evidence` and would then pass a bare `{}` explicitly
+(overriding the dataclass's own `default_factory=_evidence_seed` rather than
+falling through to it) — `set(self.evidence) != set(EVIDENCE_KEYS)` raises
+unconditionally on an empty dict. Implemented as `evidence=evidence or
+_evidence_seed()` instead: the two existing callers keep getting a valid,
+fully-seeded dict exactly as before this parameter existed, and the three
+new tests pass `_evidence_seed() | {...}` — the same pattern
+`test_the_gate_totals_the_bounded_time_it_spent` already uses in this file.
+
+**A second, mechanical deviation.** The plan's exact fixture command,
+`printf 'GENERATED = 1\n' > calc_generated.py`, corrupts the rendered
+Dockerfile the moment it is written into the manifest's YAML: a
+DOUBLE-quoted YAML scalar processes `\n` as a real newline escape at LOAD
+time, splitting one `RUN cd /repo && <command>` line into two —
+`dockerfile parse error on line 8: unknown instruction`, measured. Replaced
+with `echo 'GENERATED = 1' > calc_generated.py`, which needs no backslash
+and demonstrates the identical class of defect. The fixture's test file also
+needed a second, never-edited test (mirroring `test_integration_submodules.py`'s
+OLD_TEST/NEW_TEST) so the p2p sweep has something to collect once the f2p id
+is deselected — with only one test declared, p2p collected nothing and
+tripped the unrelated `scope_collects_nothing` refusal.
+
+**Verification.**
+- `cd bakeoff && .venv/bin/python -m pytest tests/ -q` — **1839 passed, 75
+  deselected** (1822/73 baseline + **17 passed, +2 deselected**, matching the
+  plan's revised §7.1 exactly: 6 new `def`s in `test_images.py`, 8 in
+  `test_preflight.py`, 3 in `test_run_matrix.py`, 2 in the new
+  `test_integration_build_outputs.py` module which collect and are then
+  deselected by `addopts = "-m 'not integration'"`).
+- `.venv/bin/python scripts/verify_logger.py` — **GATE PASSED**. Its
+  integration leg selects `-m "integration and not task_image"`; confirmed
+  by `pytest --collect-only -q -m "integration and not task_image"` finding
+  zero references to `test_integration_build_outputs`.
+- `.venv/bin/python scripts/mutation_check.py`, solo — **207/207 caught**
+  (204 baseline + this item's 3 new anchors: `images: report what the run
+  tree has and the image does not`, `images: let the run tree's own git
+  metadata cancel build residue`, `preflight: accept a bare pytest that
+  cannot start as a failing suite`).
+- `.venv/bin/python -m pytest -v -m "integration and task_image" -k
+  build_outputs --basetemp="$HOME/.cache/bakeoff-pytest"` — **2 passed**:
+  the generated file is confirmed present in the image's own `/repo`
+  (`images._repo_paths_in_image`) and absent from the materialized run tree,
+  and the real `preflight` records it (`build_generated_state: "scanned"`,
+  `build_generated_count: 1`) while still passing.
+- **click, the reference task, expecting an empty measurement**
+  (`--preflight-only --force-preflight --tasks click-3360-write-usage-empty-args`):
+  `preflight PASS`, no `note` line, `build_generated_paths: []`,
+  `build_generated_count: 0`, `build_generated_state: "scanned"` — matching
+  §1.2's measured 0 added paths and §1.7's measured exit 0. Re-run without
+  `--force-preflight`: `preflight cached PASS`, still no note. Scan overhead
+  measured directly (`_repo_paths_in_image` against click's image): **0.108
+  s** — well under 1 s, matching the plan's 0.11–0.26 s.
+- **sqlglot-6927, expecting the six measured paths and a PASS**
+  (`~/.cache/bakeoff-probe/taskset`): `preflight PASS`, `note      the image
+  build wrote 6 file(s) into /repo …`, `build_generated_count: 6`, and
+  `build_generated_paths` in exactly the plan's predicted order (`.` sorts
+  before `/`): `sqlglot.egg-info/{PKG-INFO,SOURCES.txt,dependency_links.txt,
+  requires.txt,top_level.txt}` then `sqlglot/_version.py`. Re-run without
+  `--force-preflight`: `preflight cached PASS` plus the same note, read off
+  disk (D7's "both sites").
+- **MANDATORY — pytest-10210, turning §1.4's inference into an observation**
+  (`~/.cache/bakeoff-probe/taskset`, ~5 min wall): **`preflight NO-GO`**.
+  Quoted verbatim: *"the bare pytest collection (`timeout 240 python -m
+  pytest --co -q`) exited 1, which under --co cannot mean a failing test: no
+  test is executed, so 1 means `python -m pytest` could not start in this
+  image -- and that is the command the agent will naturally type. Last line
+  of stderr: ModuleNotFoundError: No module named '_pytest._version'.
+  Measured 2026-09-02: a module-level import error in a test file exits 2, a
+  syntax error exits 2 and a conftest.py import error exits 4, so nothing a
+  legitimately red start state does reaches this branch. The measured cause
+  is an import of a module the IMAGE BUILD generated inside /repo, which the
+  run tree does not have -- see evidence.build_generated_paths."* Preceded
+  by `note      the image build wrote 7 file(s) into /repo … src/_pytest
+  /_version.py, src/pytest.egg-info/PKG-INFO …`. Before this item no gate run
+  had ever produced this result (the stored verdict predates the bare-runner
+  probe entirely); this run is that observation.
+- `chimera-228-equinox-numeric` NOT re-gated here (§7.9): its bare `--co`
+  already exits 4, a pre-existing usage-error NO-GO unrelated to this item,
+  and its stored verdict predates the probe.
+
+`graphify update .` run after the source edits.

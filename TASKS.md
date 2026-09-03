@@ -1105,20 +1105,19 @@ size. Two exceptions are marked CAPTURE and should ride along with Gate 1.
   manifest stamps a false `TASK_NOT_FOUND` into the append-only grades file at
   exit code 0.
 
-- [ ] **Files an `image.build` step writes INTO `/repo` are discarded by the
-  runtime bind mount, and which side should own the fix is still an open
-  decision, not a bug to patch quietly.** Measured 2026-09-02
-  (`pytest-dev/pytest`, whose editable install generates
-  `src/_pytest/_version.py` at build time via setuptools_scm): the generated
-  file exists only in the image's build-time scaffold copy of `/repo`, because
-  at run time the materialized run tree — built separately by `materialize()`,
-  which never sees anything `image.build` wrote — is bind-mounted over `/repo`
-  in full. A runner that needs such a file has to regenerate it itself every
-  invocation (this task's `tests.runner` does, via a heredoc reproducing the
-  build-time content verbatim). Decide whether `image.build` should instead
-  run against the materialized tree (which would invert the current
-  build-before-materialize order), or whether the scaffold/tree split should
-  simply be documented as the contract every such task has to work around.
+- [ ] **Two findings against the 2026-09-02 probe task set, from round-2 item 14.**
+  `pytest-10210-approx-nested-container` is **not a valid task**: its suite imports
+  `src/_pytest/_version.py`, which the image build generates and the bind mount discards, so the
+  bare `python -m pytest` an agent types raises `ModuleNotFoundError` from turn one; its
+  `tests.runner` heredoc fixes the gate, the oracle and the grader and cannot reach the agent.
+  Since item 14 the gate refuses it (bare-runner exit 1) — re-gate to confirm, then drop or
+  re-cut it. Separately, `sqlglot-6927-dremio-trycast` is **kept**: its
+  `try/except ImportError` around the same kind of generated module is the admissible shape, its
+  suite is green and its fix is unrelated to versioning — but every arm runs with
+  `sqlglot.__version__` missing and `"Unable to set __version__"` logged on each import, which is
+  what `evidence.build_generated_paths` now records. Do not re-discover either as a model failure.
+  Also expect `chimera-228-equinox-numeric` to NO-GO on re-gate for an unrelated, pre-existing
+  reason (bare `--co` exits 4, a usage error; its stored verdict predates the probe).
 
 ### The judge channel — parked by the round-2 review (2026-08-20)
 

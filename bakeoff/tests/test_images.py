@@ -1430,3 +1430,95 @@ def test_every_copy_of_the_default_node_version_says_the_same_thing():
     assert f"ARG BASE_NODE_VERSION={tasks._DEFAULT_NODE}\n" in dockerfile
     assert "FROM node:${BASE_NODE_VERSION}-bookworm-slim\n" in dockerfile
     assert tasks._DEFAULT_NODE in tasks._NODE_VERSIONS
+
+
+# --- round 2, item 14: scaffold_only_paths -- what an `image.build` step
+# wrote into the image's /repo that the run tree, bind-mounted over it at
+# container start, does not have. All six monkeypatch `_repo_paths_in_image`
+# to a literal set and build the run tree on disk under `tmp_path`, so none
+# of them reach a daemon.
+
+def test_a_path_only_the_image_has_is_reported(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        images, "_repo_paths_in_image",
+        lambda image: {"src/pkg/_version.py", "src/pkg/__init__.py"},
+    )
+    tree = tmp_path / "tree"
+    (tree / "src" / "pkg").mkdir(parents=True)
+    (tree / "src" / "pkg" / "__init__.py").write_text("")
+
+    assert images.scaffold_only_paths("img", tree) == ["src/pkg/_version.py"]
+
+
+def test_a_path_both_sides_have_is_not_reported(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        images, "_repo_paths_in_image",
+        lambda image: {"src/pkg/_version.py", "src/pkg/__init__.py"},
+    )
+    tree = tmp_path / "tree"
+    (tree / "src" / "pkg").mkdir(parents=True)
+    (tree / "src" / "pkg" / "__init__.py").write_text("")
+    (tree / "src" / "pkg" / "_version.py").write_text("")
+
+    # A file the build rewrote IN PLACE is invisible here by design (see
+    # `scaffold_only_paths`'s docstring, "does NOT detect a build step that
+    # MODIFIES a file"): the name is present on both sides.
+    assert images.scaffold_only_paths("img", tree) == []
+
+
+def test_only_the_run_tree_has_it_and_it_is_not_reported(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        images, "_repo_paths_in_image", lambda image: {"src/pkg/__init__.py"},
+    )
+    tree = tmp_path / "tree"
+    (tree / "src" / "pkg").mkdir(parents=True)
+    (tree / "src" / "pkg" / "__init__.py").write_text("")
+    (tree / "tests").mkdir()
+    (tree / "tests" / "test_new.py").write_text("")
+
+    assert images.scaffold_only_paths("img", tree) == []
+
+
+def test_git_residue_in_the_image_is_reported_and_the_trees_own_git_is_not(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(
+        images, "_repo_paths_in_image",
+        lambda image: {".git/config", "calc.py"},
+    )
+    tree = tmp_path / "tree"
+    (tree / ".git" / "objects" / "ab").mkdir(parents=True)
+    (tree / ".git" / "config").write_text("")
+    (tree / ".git" / "objects" / "ab" / "cdef").write_text("")
+    (tree / "calc.py").write_text("")
+
+    # The image's build residue survives the difference; the run tree's own
+    # git metadata neither appears in the report nor cancels the residue by
+    # sharing its path.
+    assert images.scaffold_only_paths("img", tree) == [".git/config"]
+
+
+def test_the_report_is_sorted(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        images, "_repo_paths_in_image",
+        lambda image: {"b.py", "a.py", "c/d.py"},
+    )
+    tree = tmp_path / "tree"
+    tree.mkdir()
+
+    assert images.scaffold_only_paths("img", tree) == ["a.py", "b.py", "c/d.py"]
+
+
+def test_a_symlink_in_the_run_tree_counts_as_present(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        images, "_repo_paths_in_image", lambda image: {"link.py"},
+    )
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "target.py").write_text("")
+    (tree / "link.py").symlink_to(tree / "target.py")
+
+    # The walk records the symlink itself rather than skipping it into a
+    # false "generated" -- `_tree_paths` treats a symlink as present without
+    # following it.
+    assert images.scaffold_only_paths("img", tree) == []

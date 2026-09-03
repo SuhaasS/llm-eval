@@ -2576,6 +2576,43 @@ MUTATIONS = [
         "tests/test_images.py -k image_labels_answers_three_ways",
         "not integration",
     ),
+    (
+        # The reversed set is every file the test half added plus everything
+        # `export-ignore` kept out of `git archive` -- a long, plausible,
+        # entirely wrong list, printed by the gate as "what will vanish".
+        "images: report what the run tree has and the image does not",
+        "src/bakeoff/images.py",
+        "    return sorted(_repo_paths_in_image(image) - _tree_paths(Path(run_tree)))",
+        "    return sorted(_tree_paths(Path(run_tree)) - _repo_paths_in_image(image))",
+        "tests/test_images.py -k only_the_run_tree_has",
+        "not integration",
+    ),
+    (
+        # The run tree always has a `.git`; the image normally has none.
+        # Under the mutation the tree's metadata enters the subtrahend and
+        # cancels, by path name, the residue an `image.build` step that ran
+        # `git init` left in the image -- the one case where the image side
+        # carries `.git` paths at all, and the one this prune exists to keep
+        # visible.
+        "images: let the run tree's own git metadata cancel build residue",
+        "src/bakeoff/images.py",
+        '        dirnames[:] = [name for name in dirnames if name != ".git"]',
+        "        dirnames[:] = list(dirnames)",
+        "tests/test_images.py -k git_residue",
+        "not integration",
+    ),
+    (
+        # The mutation sends exit 1 to the catch-all, which renders it as
+        # "tests failed" -- the words `_PROCESS_EXIT_MEANING` has for a code
+        # that under `--co` cannot mean that, and the exact reading that let
+        # pytest-10210's broken agent-side command through.
+        "preflight: accept a bare pytest that cannot start as a failing suite",
+        "src/bakeoff/preflight.py",
+        "            elif bare.exit_code == EXIT_TESTS_FAILED:",
+        "            elif False:",
+        "tests/test_preflight.py -k cannot_start",
+        "not integration",
+    ),
 ]
 
 

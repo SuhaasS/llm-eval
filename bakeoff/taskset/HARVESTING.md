@@ -835,7 +835,44 @@ rather than by reasoning:
 - **No VCS-derived version**, unless `build:` supplies a pretend-version. Same
   cause: `git archive` leaves no `.git`, and `setuptools_scm` refuses with
   *"unable to detect version"*. Measured across 12 candidates, only
-  `setuptools_scm` is strict about this — `hatch-vcs` builds fine without it.
+  `setuptools_scm` is strict about this — `hatch-vcs` builds fine without it
+  — and note that a pretend-version fixes the BUILD and nothing else: the file
+  `setuptools_scm` then generates still does not reach the run. That is exactly the
+  escape hatch `pytest-10210` took (`SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PYTEST=9.0.0
+  pip install -e .`) on its way to a task whose agent-side `python -m pytest` is broken
+  from turn one. See the next bullet before using it.
+- **Nothing an `image.build` step writes into `/repo` reaches the run.** The image's `/repo` is
+  a scaffold (`images.py`); at run time the materialized run tree is bind-mounted over it in
+  full, and `materialize` has never seen anything the build wrote. Measured 2026-09-02 across
+  nine gated images: **two** generate files this way, both `setuptools_scm` plus an egg-info —
+  `sqlglot-6927` (`sqlglot/_version.py` and five `sqlglot.egg-info/*`) and `pytest-10210`
+  (`src/_pytest/_version.py` and six `src/pytest.egg-info/*`) — and the other seven generate
+  nothing. `click`'s `flit_core` backend writes into site-packages only, which is why the worked
+  example has never surfaced this and why a `setuptools` repo will.
+
+  Neither shape is a build failure, and what the missing file costs is a property of the
+  repository:
+
+  - `sqlglot` imports the generated module inside `try/except ImportError`, so the task is
+    admissible and its suite is green — but every `import sqlglot` in the run logs *"Unable to
+    set `__version__`, run `pip install -e .` ... first."* and `sqlglot.__version__` does not
+    exist, on every arm, on a task whose gate passes. Measured.
+  - `pytest` imports it unconditionally (`src/_pytest/assertion/rewrite.py:42`), so
+    `python -m pytest` — the command §3.3's loop is built on — dies in the run tree with
+    `ModuleNotFoundError: No module named '_pytest._version'` at exit **1**. Regenerating the
+    file inside `tests.runner` fixes preflight's five invocations, the oracle's two and the
+    grader's ladder, and fixes nothing for the agent, which never runs `tests.runner`. **A repo
+    whose suite cannot import without a build-generated file is out**; a `--deselect`, a narrower
+    `tests.paths` or a heredoc in the runner does not make it in.
+
+  Two things now enforce that. The gate **records** what a build wrote —
+  `build_generated_paths`, `build_generated_count` and `build_generated_state` in the preflight
+  evidence, with `run_matrix --preflight-only` printing a `note` line naming the files, on a warm
+  gate as well as a cold one. It does not refuse on that list: "generated" and "required" are
+  different claims and no path name separates them. What it **refuses** is the consequence — the
+  bare-runner probe no longer accepts exit 1, which under `--co` cannot mean a failing test
+  (measured 2026-09-02: a module-level import error exits 2, a syntax error 2, a `conftest.py`
+  import error 4; of seven python task images only the one above answers 1).
 - **The suite is fast enough — or the manifest says how slow.** Preflight runs
   the suite **five** times (f2p before, p2p before, f2p after, p2p after, and
   the scoped p2p the grader will make — four when `tests.p2p` is declared
@@ -890,9 +927,11 @@ ancestors of `base_sha` are kept**, so `git describe` still resolves and a
 abbreviated SHA shortens — `8.3.3-69-g63274a79` becomes `8.3.3-69-g63274a7`,
 measured — because `core.abbrev` auto-sizes to the smaller object count. A
 package installed at image-build time and one the agent rebuilds in the run tree
-therefore disagree on version string. Nothing asserts this: preflight already
-runs the suite inside the image, so a mismatch that breaks anything surfaces
-there.
+therefore disagree on version string. Nothing asserts this: preflight runs the suite in the
+image's *environment* but against the **run tree** — `/repo` is bind-mounted, never the image's
+own copy — so a version string derived at image-build time and one derived in the run tree can
+disagree, and the generated file that carried it may not be in the run tree at all. That is the
+class the build-writes-into-`/repo` bullet above names, and it is why that bullet exists.
 
 A submodule's history is pruned the same way, to its gitlink: the run tree's
 `.git/modules/<path>` is hardlink-cloned from a mirror built and verified

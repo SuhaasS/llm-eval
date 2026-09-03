@@ -40,7 +40,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
+import tarfile
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -113,6 +115,95 @@ def image_entrypoint(tag: str) -> list[str]:
     raw = _run(["docker", "inspect", "--format", "{{json .Config.Entrypoint}}", tag])
     value = json.loads(raw)
     return list(value or [])
+
+
+def _repo_paths_in_image(image: str) -> set[str]:
+    # "/repo" is render_dockerfile's `COPY repo /repo`, which is the only place
+    # this path is decided.
+    #
+    # No `.git` filter here, on purpose: `git archive` never writes one, so in
+    # the normal case there is nothing to filter, and an `image.build` step that
+    # ran `git init` leaves residue `docker cp` DOES export (measured
+    # 2026-09-02) and an author does need to see. `_tree_paths` prunes the run
+    # tree's own `.git` instead -- that is the clone's metadata, not repository
+    # content, and letting it cancel build residue by name would hide exactly
+    # this case.
+    container = _run(["docker", "create", "--entrypoint", "true", image])
+    try:
+        proc = subprocess.Popen(
+            ["docker", "cp", f"{container}:/repo/.", "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        paths: set[str] = set()
+        try:
+            with tarfile.open(mode="r|", fileobj=proc.stdout) as tar:
+                for member in tar:
+                    if not (member.isfile() or member.issym() or member.islnk()):
+                        continue
+                    name = member.name[2:] if member.name.startswith("./") else member.name
+                    if name:
+                        paths.add(name)
+        finally:
+            # stderr is read only after the stream is drained or closed. Docker
+            # writes progress to stderr, so a pipe that filled DURING the stream
+            # would deadlock -- measured 2026-09-02 across all nine probe images
+            # (up to 15 MB streamed, 0.08-1.75 s, `wait()` 0 every time, no
+            # truncation and no hang), and closing stdout first gives `docker cp`
+            # an EPIPE rather than a reader that never returns.
+            if proc.stdout is not None:
+                proc.stdout.close()
+            stderr = proc.stderr.read().decode("utf-8", "replace") if proc.stderr else ""
+            code = proc.wait()
+        if code != 0:
+            raise ImageError(f"docker cp {image}:/repo failed (exit {code}):\n{stderr}")
+        return paths
+    finally:
+        subprocess.run(["docker", "rm", "-f", container], capture_output=True)
+
+
+def _tree_paths(root: Path) -> set[str]:
+    paths: set[str] = set()
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [name for name in dirnames if name != ".git"]
+        here = Path(dirpath)
+        for name in filenames:
+            if name == ".git":       # a submodule's gitfile
+                continue
+            paths.add((here / name).relative_to(root).as_posix())
+        for name in dirnames:
+            if (here / name).is_symlink():
+                paths.add((here / name).relative_to(root).as_posix())
+    return paths
+
+
+def scaffold_only_paths(image: str, run_tree: Path) -> list[str]:
+    """Paths the built task image's `/repo` has that the run tree does not.
+
+    `image.build` (`build_task_image`, below) runs against the build-time
+    scaffold -- a `git archive base_sha` context -- and `tasks.materialize`
+    builds the run tree separately, from a `--local` clone of the pruned
+    mirror, and has never seen anything the build wrote. `container.
+    RunContainer.__enter__` bind-mounts the run tree over `/repo` in full, so
+    a file the build generated is visible only during the build and to no
+    process afterward -- not the agent's `claude`, not the commands it
+    invents, not preflight's suite runs, not the oracle's, not the grader's.
+
+    Measured 2026-09-02: click (`flit_core` backend) writes nothing into the
+    tree it built from -- its 149 build-context files and its image's 149
+    `/repo` files agree name for name. `sqlglot-6927` and `pytest-10210`
+    (both `setuptools`/`setuptools_scm`) write a `_version.py` plus an
+    `*.egg-info/` apiece -- six and seven paths -- because `setuptools_scm`
+    derives a version at build time and writes it into the tree, where
+    `flit_core` writes into site-packages and never touches `/repo` at all.
+
+    THIS MEASUREMENT REFUSES NOTHING. "The build generated this path" and
+    "the run needs this path" are different claims, and no property of a
+    path name tells them apart -- `sqlglot-6927` is a perfectly good task
+    that generates six files whose absence its own `try/except ImportError`
+    tolerates. What refuses is `preflight`'s bare-runner exit-code check,
+    which measures the CONSEQUENCE rather than the path list.
+    """
+    return sorted(_repo_paths_in_image(image) - _tree_paths(Path(run_tree)))
 
 
 @dataclass(frozen=True)

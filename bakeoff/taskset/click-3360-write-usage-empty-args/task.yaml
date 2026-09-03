@@ -261,6 +261,15 @@ image:
   # EDITABLE, and it has to be. A plain `pip install .` resolves imports to
   # site-packages, so nothing the agent writes to /repo takes effect and every
   # arm fails identically -- preflight's green-after check is what catches it.
+  #
+  # And nothing this step writes into /repo survives it: at run time the
+  # materialized tree is bind-mounted over the image's scaffold copy, so a
+  # file the build generated is simply absent from every command the agent,
+  # the gate, the oracle and the grader run. Measured 2026-09-02 -- click's
+  # flit_core backend writes nothing into the tree (the image's /repo and the
+  # build context agree file for file, 149 each), which is why this worked
+  # example never hit it and a setuptools_scm repo does. See HARVESTING.md,
+  # "The image".
   build: ["pip install -e ."]
   # env: NOT USED by this task -- click's suite is example-based, so nothing
   # here needs pinning. Shown because this manifest is the documentation for

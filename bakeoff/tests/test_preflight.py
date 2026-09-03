@@ -56,6 +56,20 @@ from bakeoff.tasks import (
 FIXTURE = Path(__file__).resolve().parent.parent / "fixtures" / "smoke_task"
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _scaffold_scan_is_stubbed_by_default():
+    """`scaffold_only_paths` shells out to `docker create`, and a unit suite
+    that reaches a daemon is a unit suite that stops running offline -- and
+    on a machine with no `docker` binary it would take the
+    `FileNotFoundError` path rather than the one under test. Stubbed to `[]`
+    -- "the build wrote nothing into the scaffold" -- for every test in this
+    module; the five evidence tests below override it explicitly."""
+    mp = pytest.MonkeyPatch()
+    mp.setattr("bakeoff.preflight.scaffold_only_paths", lambda *a, **k: [])
+    yield
+    mp.undo()
+
+
 # --- the distinction the gate is built on ------------------------------------
 
 
@@ -2790,10 +2804,144 @@ def test_the_preflight_version_moved_with_the_new_assertion():
     place of it, and never refused on: the interpreter read-back stays the
     sole authority on whether a python task may run. No verdict moves: a
     cached 21 PASS was a PASS for the same reasons, so what the bump adds
-    is a second, independent fact a reader can compare the first against."""
+    is a second, independent fact a reader can compare the first against.
+
+    22 -> 23 is round 2, item 14. Three evidence keys join the schema --
+    `build_generated_paths`, `build_generated_count`, `build_generated_state`
+    -- recording what an `image.build` step wrote into the image's `/repo`
+    that the run tree, bind-mounted over it in full at container start, does
+    not have. AND the gate's GO/NO-GO changes: the bare-runner probe no
+    longer accepts exit 1 from `python -m pytest --co -q`, which under
+    collect-only cannot mean a failing test -- measured 2026-09-02, a
+    module-level import error and a syntax error in a test file both exit 2,
+    a conftest.py import error exits 4, and of seven python task images only
+    the one whose suite imports a module the image build generated answers
+    1. A verdict cached under 22 may describe a task this gate now refuses,
+    so a cached PASS is stale and must be re-gated; a cached NO-GO is
+    unaffected, since nothing here turns a NO-GO into a GO."""
     from bakeoff.preflight import PREFLIGHT_VERSION
 
-    assert PREFLIGHT_VERSION == "22"
+    assert PREFLIGHT_VERSION == "23"
+
+
+# --- round 2, item 14: what an image.build step wrote into the scaffold ------
+
+
+def test_the_gate_records_what_the_build_wrote_into_the_scaffold(
+    monkeypatch, tmp_path
+):
+    """sqlglot-6927's measured shape (2026-09-02): the build's
+    `setuptools_scm` step writes `sqlglot/_version.py` into the image's
+    `/repo`, and the run tree -- bind-mounted over it at container start --
+    never has it."""
+    monkeypatch.setattr(
+        "bakeoff.preflight.scaffold_only_paths",
+        lambda *a, **k: ["sqlglot/_version.py"],
+    )
+    task = _FakeTask()
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=("tests/",))
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert result.evidence["build_generated_paths"] == ["sqlglot/_version.py"]
+    assert result.evidence["build_generated_count"] == 1
+    assert result.evidence["build_generated_state"] == "scanned"
+
+
+def test_the_gate_does_not_refuse_a_task_whose_build_wrote_into_the_scaffold(
+    monkeypatch, tmp_path
+):
+    """"Generated" and "required" are different claims, and no property of a
+    path name separates them -- sqlglot-6927 is a perfectly good task. This
+    measurement refuses nothing; what refuses is the bare-runner exit-code
+    check below, keyed on the CONSEQUENCE and not the path list."""
+    monkeypatch.setattr(
+        "bakeoff.preflight.scaffold_only_paths",
+        lambda *a, **k: ["sqlglot/_version.py"],
+    )
+    task = _FakeTask()
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=("tests/",))
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert result.ok, result.problems
+    assert not any("_version.py" in p for p in result.problems)
+
+
+def test_a_scan_that_could_not_run_says_so_rather_than_reporting_nothing(
+    monkeypatch, tmp_path
+):
+    """A missing docker binary, a daemon that went away mid-gate, a malformed
+    tar -- each is a statement about this MACHINE, not about the task, and
+    turning any of them into a NO-GO would let a diagnostic break a gate that
+    was otherwise green (D4). The state string is what keeps the containment
+    from being silent."""
+    import bakeoff.images as images
+
+    def _raise(*a, **k):
+        raise images.ImageError("daemon gone")
+
+    monkeypatch.setattr("bakeoff.preflight.scaffold_only_paths", _raise)
+    task = _FakeTask()
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=("tests/",))
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert result.evidence["build_generated_paths"] is None
+    assert result.evidence["build_generated_count"] is None
+    assert result.evidence["build_generated_state"].startswith("failed: ")
+    assert "daemon gone" in result.evidence["build_generated_state"]
+    assert result.ok, result.problems
+
+
+def test_a_long_list_is_truncated_and_the_count_survives(monkeypatch, tmp_path):
+    """`_BUILD_GENERATED_LIMIT` bounds the VERDICT, not the transfer (D3): a
+    build that ran `npm install` inside `/repo` must not put twenty thousand
+    paths in a preflight blob."""
+    generated = [f"generated/{i:04d}.py" for i in range(101)]
+    monkeypatch.setattr(
+        "bakeoff.preflight.scaffold_only_paths", lambda *a, **k: generated,
+    )
+    task = _FakeTask()
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=("tests/",))
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert result.evidence["build_generated_paths"] == generated[:100]
+    assert len(result.evidence["build_generated_paths"]) == 100
+    assert result.evidence["build_generated_count"] == 101
+    assert result.evidence["build_generated_state"] == (
+        "truncated: 101 paths, first 100 listed"
+    )
+
+
+def test_the_runner_gate_early_return_says_the_scan_was_not_attempted(
+    monkeypatch, tmp_path
+):
+    """The early return starts no container and pays no docker call -- a
+    manifest that is already refused should not pay for a scan whose result
+    it cannot use. The seeded `"not_attempted"` is left as is rather than
+    the runner-gate branch writing its own reason string, unlike
+    `bare_runner_skipped` one seed above it: that triple has two distinct
+    skip reasons to tell apart and this scan has exactly one."""
+    calls = []
+    monkeypatch.setattr(
+        "bakeoff.preflight.scaffold_only_paths",
+        lambda *a, **k: calls.append(1) or [],
+    )
+    task = _FakeTask(tests=_FakeTests(runner=("go", "test", "./...")))
+
+    result = preflight(task, image="sha256:x", repo_path=tmp_path,
+                       start_sha="s" * 40)
+
+    assert calls == []
+    assert result.evidence["build_generated_state"] == "not_attempted"
+    assert result.evidence["build_generated_paths"] is None
+    assert result.evidence["build_generated_count"] is None
 
 
 # --- fix 2: the bare-runner probe ---------------------------------------------
@@ -2879,6 +3027,83 @@ def test_a_bare_exit_code_outside_the_accepted_set_is_a_problem(
         "127" in p and "not on PATH" in p for p in result.problems
     ), result.problems
     assert result.evidence["bare_runner_exit"] == 127
+
+
+def test_a_bare_pytest_that_cannot_start_is_refused(monkeypatch, tmp_path):
+    """pytest-10210's measured shape (round 2, item 14; 2026-09-02): the
+    suite imports a module the image build generated into `/repo`, which the
+    run tree does not have, and the interpreter dies before pytest starts.
+    Under `--co` no test is ever executed, so 1 cannot mean a failing test --
+    it means `python -m pytest` could not start in this image, which is the
+    command the agent will naturally type."""
+    task = _FakeTask()
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=task.tests, present=("tests/",),
+        bare_runner=_Exec(
+            exit_code=EXIT_TESTS_FAILED,
+            stderr=(
+                "  File \"<frozen runpy>\", line 112\n"
+                "ModuleNotFoundError: No module named '_pytest._version'\n"
+            ),
+        ),
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert result.ok is False
+    assert any(
+        "exited 1, which under --co cannot mean a failing test" in p
+        for p in result.problems
+    ), result.problems
+    assert result.evidence["bare_runner_exit"] == EXIT_TESTS_FAILED
+
+
+def test_the_refusal_quotes_the_last_line_of_stderr_not_the_first(
+    monkeypatch, tmp_path
+):
+    """Measured: the usage-error branch's `": error:"` selector matches
+    nothing in this stderr, which is why this branch selects the LAST
+    non-empty line rather than the first -- the runpy frame names no cause,
+    and the `ModuleNotFoundError` line does."""
+    task = _FakeTask()
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=task.tests, present=("tests/",),
+        bare_runner=_Exec(
+            exit_code=EXIT_TESTS_FAILED,
+            stderr=(
+                "  File \"<frozen runpy>\", line 112\n"
+                "ModuleNotFoundError: No module named '_pytest._version'\n"
+            ),
+        ),
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    joined = " ".join(result.problems)
+    assert (
+        "Last line of stderr: ModuleNotFoundError: No module named "
+        "'_pytest._version'" in joined
+    )
+    assert "<frozen runpy>" not in joined
+
+
+def test_the_refusal_says_so_when_stderr_is_empty(monkeypatch, tmp_path):
+    """chimera-228's bare `--co` exits 4 with an empty stderr (measured), so
+    an exit that leaves nothing behind is a real shape on this corpus, not a
+    hypothetical -- and a refusal whose only human-readable clue renders as a
+    bare full stop is exactly the shape this file's other messages are
+    written against."""
+    task = _FakeTask()
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=task.tests, present=("tests/",),
+        bare_runner=_Exec(exit_code=EXIT_TESTS_FAILED, stderr=""),
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    joined = " ".join(result.problems)
+    assert "stderr was empty" in joined
+    assert "Last line of stderr: ." not in joined
 
 
 def test_a_node_task_never_runs_a_bare_pytest_at_all(monkeypatch, tmp_path):

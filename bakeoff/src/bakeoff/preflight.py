@@ -36,7 +36,7 @@ from dataclasses import fields as dataclass_fields
 from pathlib import Path
 
 from bakeoff.container import RunContainer
-from bakeoff.images import base_tag, image_labels
+from bakeoff.images import base_tag, image_labels, scaffold_only_paths
 from bakeoff.runners import (
     KIND_FAILED,
     KIND_LOAD_ERROR,
@@ -334,7 +334,28 @@ _PYTEST_ADAPTER = for_framework("pytest")
 #: gate that recorded what the interpreter answered and not what the image
 #: claimed to be, so a base whose labels and interpreter disagree is
 #: indistinguishable in the older file from one where they agree.
-PREFLIGHT_VERSION: str = "22"
+#:
+#: 22 -> 23: round 2, item 14. Three evidence keys join the schema
+#: (`build_generated_paths`, `build_generated_count`, `build_generated_state`)
+#: recording what an `image.build` step wrote into the image's `/repo` that
+#: the run tree -- bind-mounted over it at container start -- does not have.
+#: AND the gate's GO/NO-GO changes: the bare-runner probe no longer accepts
+#: exit 1 from `python -m pytest --co -q`, which under collect-only cannot
+#: mean a failing test (measured 2026-09-02: a module-level import error and
+#: a syntax error both exit 2, a conftest.py import error exits 4; the one
+#: image that answers 1 is the one whose suite imports a module the image
+#: build generated and the run tree does not have). A verdict cached under 22
+#: may describe a task this gate now refuses -- a cached PASS is therefore
+#: stale and must be re-gated; a cached NO-GO is unaffected, since nothing
+#: here turns a NO-GO into a GO.
+PREFLIGHT_VERSION: str = "23"
+
+#: Bounds the VERDICT, not the transfer: `docker cp` has no names-only mode,
+#: so `scaffold_only_paths` streams the whole image `/repo` regardless of this
+#: cap. A build that ran `npm install` inside `/repo` would otherwise put
+#: thousands of paths in a preflight blob; measured worst case in the probe
+#: corpus is 1842 paths / 1.75s (`yaml-474`), well short of that.
+_BUILD_GENERATED_LIMIT: int = 100
 
 
 def preflight_cache_key(task, image: str, start_sha: str) -> str:
@@ -504,6 +525,7 @@ EVIDENCE_KEYS: tuple[str, ...] = (
     "submodules", "submodules_orphaned", "submodules_empty_after_suite",
     "runner_cache_flags", "runner_cache_flags_missing",
     "bare_runner_argv", "bare_runner_exit", "bare_runner_skipped",
+    "build_generated_paths", "build_generated_count", "build_generated_state",
     "uid", "claude_version", "head",
     "stripped_paths", "stripped_paths_present",
     "suite_timeout_s",
@@ -548,7 +570,12 @@ def _evidence_seed() -> dict:
     Every key is seeded to the absence ITS OWN schema defines: `None`
     for a scalar, and for `bounded_run_durations_s` -- whose value is a key
     set -- the all-null dict, because "this run did not happen" has to be a
-    null inside that dict and never a missing entry.
+    null inside that dict and never a missing entry. `build_generated_state`
+    is the third exception: its schema is four strings, none of them `None`
+    (round 2, item 14), so its absence is the string `"not_attempted"` rather
+    than a bare null -- which is also why the runner-gate early return, unlike
+    `bare_runner_skipped`, writes no reason string of its own: the seed
+    already carries the only reason this scan has for not running.
 
     The inner dict is built HERE, per call, and never a module-level
     constant: a shared mutable would alias one dict across every
@@ -557,6 +584,7 @@ def _evidence_seed() -> dict:
     """
     seed = dict.fromkeys(EVIDENCE_KEYS)
     seed["bounded_run_durations_s"] = dict.fromkeys(BOUNDED_RUN_KEYS)
+    seed["build_generated_state"] = "not_attempted"
     return seed
 
 
@@ -1648,6 +1676,31 @@ def preflight(
             problem_codes=tuple(problem_codes),
         )
 
+    # AFTER the runner-gate early return (which starts no container and records
+    # `not_attempted` honestly) and before the run container, so a manifest that
+    # is already refused pays no docker call. NOT because the bind mount would
+    # hide anything: `scaffold_only_paths` creates its own container from the
+    # image and never starts it, and that container has no mount -- the same set
+    # comes back called before, inside or after the block below.
+    #
+    # Measured 2026-09-02 -- sqlglot-6927's build writes sqlglot/_version.py, the
+    # run tree has no such file, and `import sqlglot` logs "Unable to set
+    # __version__" on every arm of a task whose gate is green. Nothing HERE
+    # refuses: "generated" and "required" cannot be told apart from a path list.
+    # The refusal that can be made is the bare-runner exit code below.
+    try:
+        scaffold_only = scaffold_only_paths(image, Path(repo_path))
+    except Exception as exc:  # noqa: BLE001 -- a diagnostic may not break a gate
+        evidence["build_generated_state"] = f"failed: {exc}"
+    else:
+        evidence["build_generated_paths"] = scaffold_only[:_BUILD_GENERATED_LIMIT]
+        evidence["build_generated_count"] = len(scaffold_only)
+        evidence["build_generated_state"] = (
+            "scanned" if len(scaffold_only) <= _BUILD_GENERATED_LIMIT
+            else f"truncated: {len(scaffold_only)} paths, "
+                 f"first {_BUILD_GENERATED_LIMIT} listed"
+        )
+
     with RunContainer(image=image, repo_path=str(repo_path),
                       base_sha=start_sha) as container:
         # --- the environment, because each of these reads as a model failure
@@ -1916,8 +1969,38 @@ def preflight(
                     f"{timeout_s}s: this task's own configuration cannot "
                     "be trusted to even collect in this image"
                 )
+            elif bare.exit_code == EXIT_TESTS_FAILED:
+                stderr_lines = [
+                    line for line in bare.stderr.strip().splitlines() if line.strip()
+                ]
+                last_line = stderr_lines[-1] if stderr_lines else ""
+                # A refusal whose only human-readable clue renders as a bare full
+                # stop is the shape this file's comments call out elsewhere. The
+                # bare command can write its diagnostic to stdout or to nothing at
+                # all, and the exit code plus evidence.bare_runner_exit still carry
+                # the refusal -- so say that rather than printing "stderr: .".
+                clue = (
+                    f"Last line of stderr: {last_line}" if last_line
+                    else "stderr was empty -- the diagnostic went to stdout or "
+                         "nowhere, so the exit code and evidence.bare_runner_exit "
+                         "are the whole of it"
+                )
+                problems.append(
+                    "the bare pytest collection "
+                    f"(`{' '.join(bare_argv)}`) exited 1, which under --co "
+                    "cannot mean a failing test: no test is executed, so 1 "
+                    "means `python -m pytest` could not start in this image -- "
+                    "and that is the command the agent will naturally type. "
+                    f"{clue}. Measured 2026-09-02: a "
+                    "module-level import error in a test file exits 2, a syntax "
+                    "error exits 2 and a conftest.py import error exits 4, so "
+                    "nothing a legitimately red start state does reaches this "
+                    "branch. The measured cause is an import of a module the "
+                    "IMAGE BUILD generated inside /repo, which the run tree does "
+                    "not have -- see evidence.build_generated_paths."
+                )
             elif bare.exit_code not in (
-                EXIT_ALL_PASSED, EXIT_TESTS_FAILED, EXIT_COLLECTION_INTERRUPTED,
+                EXIT_ALL_PASSED, EXIT_COLLECTION_INTERRUPTED,
                 EXIT_NOTHING_COLLECTED,
             ):
                 # Everything else used to fall through here in silence: 3
@@ -1938,11 +2021,20 @@ def preflight(
                     f"{bare.exit_code} ({meaning})"
                 )
             # 0, 2, 5 are not a problem: 2 is a collection error the task
-            # may legitimately carry at the start state (broadening 2), 5 is
-            # "no tests collected", which the f2p checks judge on their own,
-            # and 1 cannot happen with --co (kept in the accepted set anyway,
-            # since `--co` never selecting tests is a property of the argv
-            # this probe controls, not one worth re-deriving here).
+            # may legitimately carry at the start state (broadening 2), and 5
+            # is "no tests collected", which the f2p checks judge on their
+            # own. 1 is no longer in that set. It used to be, on the theory
+            # that "1 cannot happen with --co" -- under collect-only no test
+            # is ever run, so a legitimately red start state cannot reach it.
+            # Measured 2026-09-02 (round 2, item 14) across seven python task
+            # images plus three deliberately-broken shapes: a module-level
+            # import error and a syntax error in a test file both exit 2, a
+            # conftest.py import error exits 4, and only one image -- whose
+            # suite imports a module the IMAGE BUILD generated into /repo,
+            # which the run tree (bind-mounted over it at container start)
+            # does not have -- answers 1. So 1 is not a defensive accept for
+            # a code that "cannot happen"; it is the one code that means the
+            # interpreter died before pytest started, which is refused above.
         else:
             evidence["bare_runner_skipped"] = (
                 f"{adapter.name} has no addopts analogue: a broken config, "

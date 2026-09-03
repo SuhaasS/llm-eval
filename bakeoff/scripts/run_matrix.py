@@ -324,6 +324,33 @@ def cached_verdict(cache: Path, task_id: str, key: str) -> dict | None:
     return blob if verdict_matches_key(blob, key) else None
 
 
+def _stored_evidence(path: Path) -> dict:
+    """The verdict beside the cache key, or {}.
+
+    Best-effort by design: the note below is a courtesy and may not break a
+    warm gate whose verdict file was hand-deleted, truncated or written by a
+    driver that predates these keys.
+    """
+    try:
+        return json.loads(Path(path).read_text()).get("evidence") or {}
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return {}
+
+
+def _print_build_generated(evidence: dict) -> None:
+    generated = (evidence or {}).get("build_generated_paths") or []
+    if not generated:
+        return
+    total = (evidence or {}).get("build_generated_count") or len(generated)
+    shown = ", ".join(generated[:5])
+    more = " ..." if total > 5 else ""
+    print(
+        f"note      the image build wrote {total} file(s) into /repo that the "
+        f"run tree does not have; nothing the agent, the gate, the oracle or "
+        f"the grader runs will see them: {shown}{more}"
+    )
+
+
 def resolve_tasks(tasks, bases, expected_version, cache, force):
     """Build each task's image, materialize its start state, and preflight.
 
@@ -389,6 +416,8 @@ def resolve_tasks(tasks, bases, expected_version, cache, force):
             key = preflight_cache_key(task, image, start_sha)
             if cached.get(task.task_id, {}).get("key") == key:
                 print("preflight cached PASS (--force-preflight to re-run)")
+                _print_build_generated(
+                    _stored_evidence(cache / "preflight" / f"{task.task_id}.json"))
                 blob = cached_verdict(cache, task.task_id, key)
                 if blob is not None:
                     print(f"          {suite_time_line(blob)}")
@@ -415,6 +444,7 @@ def resolve_tasks(tasks, bases, expected_version, cache, force):
             # about, one line up.
             gate_seconds += _measured_total(blob)
             gate_tasks += 1
+            _print_build_generated(result.evidence)
             if not result.ok:
                 print("preflight NO-GO")
                 for problem in result.problems:

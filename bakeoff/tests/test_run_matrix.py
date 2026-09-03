@@ -468,8 +468,15 @@ def _stub_resolve_tasks(monkeypatch, rm, on_preflight):
     monkeypatch.setattr(rm, "preflight", on_preflight)
 
 
-def _preflight_result(task, kw, problems=()):
-    from bakeoff.preflight import PreflightResult
+def _preflight_result(task, kw, problems=(), evidence=None):
+    # `evidence` defaults through to `_evidence_seed()` -- never a bare `{}`,
+    # which `PreflightResult.__post_init__` (item 5) refuses as a schema that
+    # is not the schema -- so the two existing callers that never pass
+    # `evidence` keep getting a valid, fully-seeded dict exactly as they did
+    # before this parameter existed. round 2 item 14's three tests pass a
+    # seed overridden with `build_generated_*` instead of transcribing a
+    # fourth copy of this constructor's field list.
+    from bakeoff.preflight import PreflightResult, _evidence_seed
 
     return PreflightResult(
         task_id=task.task_id, task_version=task.task_version,
@@ -477,6 +484,7 @@ def _preflight_result(task, kw, problems=()):
         manifest_digest=task.manifest_digest,
         problems=problems,
         preflight_version=PREFLIGHT_VERSION,
+        evidence=evidence or _evidence_seed(),
     )
 
 
@@ -814,3 +822,99 @@ def test_the_gate_totals_the_bounded_time_it_spent(monkeypatch, tmp_path, capsys
         "suite time  slowest 240.0s of the 240s bound; 240.0s over 1 of the "
         "schema's 9 bounded runs"
     ) in out
+
+
+# --- round 2 item 14: what an image.build step wrote into the scaffold ------
+
+
+def test_the_driver_prints_what_the_build_wrote_into_the_scaffold(
+    tmp_path, monkeypatch, capsys
+):
+    """The note is printed on the fresh-gate path, PASS or NO-GO -- a task
+    whose gate fails BECAUSE of a vanished file is exactly this line's
+    reader."""
+    from bakeoff.preflight import _evidence_seed
+    import scripts.run_matrix as rm
+
+    evidence = _evidence_seed() | {
+        "build_generated_paths": ["sqlglot/_version.py", "sqlglot.egg-info/PKG-INFO"],
+        "build_generated_count": 2,
+        "build_generated_state": "scanned",
+    }
+    _stub_resolve_tasks(
+        monkeypatch, rm,
+        lambda task, **kw: _preflight_result(task, kw, evidence=evidence),
+    )
+    task = _ResolvableTask()
+
+    rm.resolve_tasks([task], {("python", "3.12"): "sha256:B"}, "2.1.220",
+                     tmp_path, force=True)
+
+    out = capsys.readouterr().out
+    assert "the image build wrote 2 file(s) into /repo" in out
+    assert "sqlglot/_version.py" in out
+    assert "sqlglot.egg-info/PKG-INFO" in out
+
+
+def test_the_driver_prints_nothing_when_the_build_wrote_nothing(
+    tmp_path, monkeypatch, capsys
+):
+    """Seven of the nine tasks measured in the plan's §1.2 hit this branch --
+    the ordinary case must stay silent."""
+    from bakeoff.preflight import _evidence_seed
+    import scripts.run_matrix as rm
+
+    evidence = _evidence_seed() | {
+        "build_generated_paths": [], "build_generated_count": 0,
+        "build_generated_state": "scanned",
+    }
+    _stub_resolve_tasks(
+        monkeypatch, rm,
+        lambda task, **kw: _preflight_result(task, kw, evidence=evidence),
+    )
+    task = _ResolvableTask()
+
+    rm.resolve_tasks([task], {("python", "3.12"): "sha256:B"}, "2.1.220",
+                     tmp_path, force=True)
+
+    out = capsys.readouterr().out
+    assert "the image build wrote" not in out
+
+
+def test_a_cached_pass_still_prints_what_the_build_wrote(
+    tmp_path, monkeypatch, capsys
+):
+    """The note is off DISK on this path, not out of a `PreflightResult` --
+    `resolve_tasks` returns from the cached branch before `preflight()` is
+    ever called, so the courtesy has to come from the stored verdict."""
+    from bakeoff.preflight import _evidence_seed
+    import scripts.run_matrix as rm
+
+    _stub_resolve_tasks(monkeypatch, rm, lambda task, **kw: (_ for _ in ()).throw(
+        AssertionError("preflight() must not run on a cache hit")))
+    task = _ResolvableTask()
+    image = "sha256:img"
+    start_sha = "s" * 40
+    key = preflight_cache_key(task, image, start_sha)
+
+    (tmp_path / "preflight").mkdir(parents=True)
+    (tmp_path / "preflight" / f"{task.task_id}.json").write_text(json.dumps({
+        "ok": True,
+        "manifest_digest": task.manifest_digest, "image": image,
+        "start_sha": start_sha, "preflight_version": PREFLIGHT_VERSION,
+        "evidence": _evidence_seed() | {
+            "build_generated_paths": ["sqlglot/_version.py"],
+            "build_generated_count": 1,
+            "build_generated_state": "scanned",
+        },
+    }))
+    (tmp_path / "preflight.json").write_text(
+        json.dumps({task.task_id: {"key": key}}))
+
+    rm.resolve_tasks([task], {("python", "3.12"): "sha256:B"}, "2.1.220",
+                     tmp_path, force=False)
+
+    out = capsys.readouterr().out
+    assert "preflight cached PASS" in out
+    assert "the image build wrote 1 file(s) into /repo" in out
+    assert "sqlglot/_version.py" in out
