@@ -4091,3 +4091,124 @@ counts (`1706 passed, 67 deselected` in the unit phase, `44 passed`
 integration, each run). Flagged here rather than silently discarded, since
 this repository already tracks at least one other flaky fixture (`git log`,
 "record the flaky fixture in the wave's review log").
+
+## Round 2 item 8 — `_check_p2p` gains the `not_run` branch — 2026-09-03
+
+Plan: [docs/superpowers/plans/2026-09-03-round2-8-p2p-not-run.md](../docs/superpowers/plans/2026-09-03-round2-8-p2p-not-run.md).
+
+**What was found (already measured by the plan, restated for this log).**
+`grader._check_f2p` has read `outcome.not_run` and routed a non-empty set to
+`state.environment(...)` since 5 -> 6; `_check_p2p` had no such branch. On a
+node task with an explicit `tests.p2p`, a `-t` pattern naming a test that no
+longer matches exits **0** on both vitest and jest with every test in the
+file reported skipped (measured 2026-09-01). So a *partly* stale p2p
+selection ran what still matched, passed, and reached
+`state.passed("p2p")` at exit 0 — `resolved: True` over a regression check
+part of which never ran, invisible to the exit code, to `p2p_deselected`
+and to `p2p_failed_node_ids`. The plan's own bullet-in-`TASKS.md` was itself
+half-stale: `preflight._Runner.pass_to_pass` has written
+`self._selected = tuple(tests.p2p)` on the explicit branch since `59f4488`,
+so the data was not structurally absent as the old bullet claimed — only
+unread by `_check_p2p`.
+
+**What was built.** `_check_p2p` gained a `not_run` branch mirrored from
+`_check_f2p`, inserted immediately before the `KIND_PASSED` check and so
+ahead of `KIND_PASSED`, `KIND_FAILED` and the timeout branch alike (D4): a
+partially-executed selection is not the run any of those three claims to
+describe. `GradeRecord` and the ladder's `LadderResult`/`_State` gained one
+new field, `not_run_node_ids: tuple[str, ...] | None`, written by both
+`_check_f2p` and `_check_p2p` (only one can ever reach it, since both raise
+`_Stop` through `state.environment`) — beside the message rather than
+instead of it, because a node `fullName` may itself contain `", "` and the
+joined prose is not losslessly splittable back into ids.
+
+The blocking fix (D1a) is upstream of the grader: `preflight._Runner.pass_to_pass`'s
+explicit branch used to set `self._selected = tuple(tests.p2p)` verbatim,
+which included the quarantine — and `p2p_args` folds a quarantined id into
+the same `-t` as a negative lookahead, so it is SKIPPED, carries no terminal
+status, and is invisible to `executed_names`. Left unfixed, the new branch
+would have graded `not_graded` on every healthy node run of any task with
+one flake. Fixed at the source: `_selected` is now `tests.p2p` **minus**
+`extra_deselect`, which is identity at every preflight and oracle call site
+(`grader.py`'s p2p check is the only caller that ever passes
+`extra_deselect`), so `PREFLIGHT_VERSION` did not move.
+`GRADER_VERSION` "10" -> "11" (round-2 item 1 had already moved it from
+"9"); `GRADE_SCHEMA_VERSION` "1.3.0" -> "1.4.0". No `ORACLE_VERSION` or
+`SCHEMA_VERSION` move — no oracle field and no `RunRecord` field changed.
+
+**Verification vehicle A — no-regression proof on a real pytest task
+(`werkzeug-3037-duplicate-rule-error`).** Preflight PASS on
+`~/.cache/bakeoff-probe/taskset`. Built an `extra.diff` as `solution_diff`
+verbatim plus a hunk deleting `tests/test_routing.py` (the task's entire
+declared `tests.paths`), via the plan's recipe: materialize, apply
+`solution_diff`, `git rm tests/test_routing.py`, `git add -A`,
+`git diff --cached <start_sha>`. Self-graded against
+`~/.cache/bakeoff-probe/eventlog-r2i8`: both the reference run and the
+`-extra` run (agent deleted its own p2p test file) graded **`resolved: True`**
+identically — `agent_modified_tests` `False` on the reference and `True` on
+`-extra`, `not_run_node_ids: null` on both. Confirms §1.5(c)'s ruling: check
+2's restore (`git rm -r` + `git checkout <start_sha> --
+tests/test_routing.py`) puts the file back before check 6 runs, so "the
+agent deleted a p2p test" never reaches the new branch.
+
+**Verification vehicle B — the branch itself, on a real node task.** No
+gated manifest declares an explicit `tests.p2p` (checked: the two node
+manifests in `~/.cache/bakeoff-probe/taskset` both carry `p2p: []`), so a
+scratch copy (`~/.cache/bakeoff-probe/ts-r2i8`, reverted afterward) edited
+only `ufo-214-without-trailing-slash-query/task.yaml`: `tests.p2p` from `[]`
+to two ids in `test/trailing-slash.test.ts` (under `tests.paths`, neither
+colliding with the task's one `tests.f2p` id) — one real
+(`... bar`, read out of the materialized tree) and one invented
+(`... this-test-does-not-exist`). `run_matrix.py --preflight-only
+--force-preflight` on the scratch task set gated **GO** despite the invented
+id, exactly as the plan predicted (§8.5): preflight's p2p-after site reads
+only `runner.classify(after_p2p).kind != KIND_PASSED` and never looks at
+`not_run` — the asymmetry filed as this item's second new `TASKS.md`
+bullet. Self-graded the reference run: `not_graded_reason: environment_error`,
+`environment_error_check: "p2p"`, `not_run_node_ids` naming exactly the
+invented id, `environment_error` reading "these declared p2p ids did not run:
+test/trailing-slash.test.ts::withoutTrailingSlash, queryParams: true
+this-test-does-not-exist" — matching the plan's predicted verdict exactly.
+
+**Verification vehicle C — not run.** Forcing the quarantine through
+`derive_quarantine` on the scratch task (two full suite runs plus deriving a
+real flake) was not attempted; the plan explicitly permits recording this
+step as not run with the unit pin (§4.2(3),
+`test_a_quarantined_p2p_id_is_not_reported_as_not_run`) standing in its
+place, which is what was done. Not recorded as passed.
+
+**Deviation from the plan.** §4.3's test 9
+(`test_the_ids_that_did_not_run_are_recorded_as_a_tuple_not_only_in_a_message`)
+specified the id `"tests/b.test.js::formats a, b and c"`, asserting both
+`not_run_node_ids == (id,)` (length 1) and
+`environment_error.split(", ")` yielding more than two parts. That id
+carries exactly one `", "`, so the message it produces splits into exactly
+two parts, not more than two — the two assertions as written are not
+simultaneously satisfiable with a single comma. Used
+`"tests/b.test.js::formats a, b, and c"` instead (an added Oxford comma,
+two `", "` occurrences), which makes both of the plan's stated assertions
+literally true while preserving the test's intent unchanged.
+
+Everything else in the plan (D1a's comment block, D1b's branch and comment,
+D2's field and docstring, D3, D4's ordering, D5's K=1 fixture constraint, D6's
+refusal, the version-bump paragraphs, all thirteen named tests, all three
+mutation anchors) was transcribed as written; no other defect was found.
+
+Verified: `.venv/bin/python -m pytest tests/ -q` — `1717 passed, 67
+deselected`, exactly baseline `1706` + the plan's stated `+11` (§4.2's eight,
+§4.3's two, §4.4(12); §4.4(11) and the two concrete edits in §4.4(13) edit
+existing tests without adding to the count). Two additional pre-existing
+version-pin tests not named in the plan's own file list needed their
+literals moved for the same reason `test_the_preflight_version_moved_with_the_new_assertion`
+needed it in item 7: `test_the_grader_version_moved_with_what_check_5_means`
+(`"10"` -> `"11"`, plus a new `10 -> 11` paragraph) and
+`test_the_grade_schema_version_moved_with_what_the_record_means` (`"1.3.0"`
+-> `"1.4.0"`, plus a new paragraph) — both would otherwise have been left
+red by a version bump neither test's own plan owned.
+`tests/test_preflight.py -k argv_preflight_validated` green with no edit, as
+required (§4.5). `.venv/bin/python scripts/mutation_check.py` run solo:
+**194/194 caught**, 0 stale (191 + the 3 new anchors), tree byte-clean
+after (`git status` showed only the intended diff). `scripts/verify_logger.py`:
+**GATE PASSED** — unit `1717 passed, 67 deselected` in 83.12s, integration
+`44 passed, 1740 deselected` in 112.30s, dry run OK, offline smoke GO.
+`graphify update .` run after the source edits.

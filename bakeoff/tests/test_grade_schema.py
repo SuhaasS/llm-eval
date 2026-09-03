@@ -17,7 +17,7 @@ def _record(run_id: str = "r1", **kw) -> GradeRecord:
         graded_at="2026-08-17T00:00:00Z", grader_version="1",
         checks=(CheckResult(name="patch_non_empty", status="pass"),),
         resolved=True, quarantined=("tests/test_a.py::test_flaky",),
-        f2p_declared=3,
+        f2p_declared=3, not_run_node_ids=("tests/b.test.js::x",),
     )
     base.update(kw)
     return GradeRecord(**base)
@@ -38,8 +38,13 @@ def test_the_grade_schema_version_moved_with_what_the_record_means():
     `f2p_failed_node_ids` and `p2p_failed_node_ids` have framework-dependent
     shapes and units and a reader summing them across a mixed task set with
     no way to tell pytest's numbers from a node adapter's gets a total that
-    is not a count of anything."""
-    assert GRADE_SCHEMA_VERSION == "1.3.0"
+    is not a count of anything.
+
+    1.3.0 -> 1.4.0 adds `GradeRecord.not_run_node_ids`, a value a reader of a
+    1.3.0 line could not have met -- on such a line the ids a run failed to
+    execute exist only inside `environment_error`'s prose, so its absence is
+    the writer's vocabulary and not a measurement."""
+    assert GRADE_SCHEMA_VERSION == "1.4.0"
 
 
 def test_the_gitlink_refusal_is_a_not_graded_reason_and_not_a_failure():
@@ -65,12 +70,13 @@ def test_round_trip_preserves_every_field_and_type():
 
 def test_round_trip_keeps_none_distinct_from_empty():
     ungraded = _record(quarantined=None, f2p_declared=None, resolved=None,
-                       binary_chunks_dropped=None,
+                       binary_chunks_dropped=None, not_run_node_ids=None,
                        not_graded_reason=NotGradedReason.EXCLUDED.value)
     back = GradeRecord.from_dict(ungraded.to_dict())
     assert back.quarantined is None
     assert back.f2p_declared is None
     assert back.binary_chunks_dropped is None
+    assert back.not_run_node_ids is None
 
 
 def test_from_dict_drops_unknown_keys_instead_of_crashing():
@@ -138,6 +144,24 @@ def test_a_1_2_0_line_loads_with_no_framework_rather_than_a_fabricated_one(
     records, malformed = load_grades(p)
     assert malformed == 0
     assert records[0].framework == ""
+
+
+def test_a_1_3_0_line_loads_with_no_not_run_ids_rather_than_an_empty_tuple(
+    tmp_path: Path,
+):
+    """`not_run_node_ids` arrived in 1.4.0, and every line written before it
+    predates the field. `_build` filters to the dataclass's own fields, so
+    such a line loads and the field defaults to `None` -- never `()`, which
+    would be the claim that the run executed every id it asked for."""
+    data = _record().to_dict()
+    data["grade_schema_version"] = "1.3.0"
+    del data["not_run_node_ids"]
+    p = tmp_path / "grades.jsonl"
+    p.write_text(json.dumps(data) + "\n", encoding="utf-8")
+
+    records, malformed = load_grades(p)
+    assert malformed == 0
+    assert records[0].not_run_node_ids is None
 
 
 def test_append_then_load_returns_both_records(tmp_path: Path):

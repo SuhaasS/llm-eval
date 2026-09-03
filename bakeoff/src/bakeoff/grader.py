@@ -255,7 +255,37 @@ from bakeoff.tasks import (
 #: from which identically-titled tests in other files had been silently
 #: removed, so `p2p_failed_node_ids` and `resolved` can both differ. No pytest
 #: grade changes: that adapter emits one group whose argv is the v9 argv.
-GRADER_VERSION: str = "10"
+#: 10 -> 11: `_check_p2p` gains the `did not run` environment branch
+#: `_check_f2p` has carried since 5 -> 6, both checks now record the ids in
+#: `GradeRecord.not_run_node_ids`, and `preflight._Runner.pass_to_pass`
+#: subtracts `extra_deselect` from `_selected` on the explicit branch so a
+#: quarantined id is not reported as one that did not run. Under 10, a node
+#: task with an explicit `tests.p2p` whose declared ids had PARTLY stopped
+#: matching ran what still matched, passed, and reached
+#: `state.passed("p2p")` at exit 0 -- a `resolved: True` verdict over a
+#: regression check part of which never ran, invisible to the exit code, to
+#: `p2p_deselected` (nothing was deselected -- the ids were selected and
+#: matched nothing) and to `p2p_failed_node_ids`. That is a change to what a
+#: check MEANS on an input the ladder already accepted, so the version moves
+#: whether or not anything was graded under 10.
+#:
+#: Two vocabulary changes ride with it, and neither touches a stored line. A
+#: wholly-stale explicit selection now reads `environment_error` where it
+#: read `scope_collected_nothing`; and a run where one declared id failed
+#: while another went stale now reads `environment_error` where it read
+#: `p2p_regression` -- both are the partially-executed-selection ruling, and
+#: the second is the only one that changes a `resolved` value (`False` ->
+#: `None`).
+#:
+#: It costs a full re-grade into a fresh `v11` artifacts directory. No
+#: verdict on today's corpus changes: `not_run` is structurally empty on
+#: pytest (`report_path()` is `None`, so `_Runner.classify` never asks
+#: `verify_selected`), every stored run is a pytest one, and of the gated
+#: node manifests neither declares an explicit `tests.p2p`. It has to land
+#: with the code that makes the divergence possible rather than with the
+#: first run that exercises it, because the resume gate in
+#: `scripts/grade.py` keys on `(run_id, GRADER_VERSION)` alone.
+GRADER_VERSION: str = "11"
 
 #: Wall clock for the HOST-side gitleaks scan, and for nothing else.
 #: `_ContainerEnv.scan_secrets` shells out to `docker run` rather than through
@@ -368,6 +398,11 @@ class LadderResult:
     p2p_deselect_requested: int | None = None
     p2p_deselected: int | None = None
     p2p_failed_node_ids: tuple[str, ...] | None = None
+    #: Declared ids the run did not execute, from `Outcome.not_run`. Written by
+    #: `_check_f2p` and `_check_p2p`; only one of them can ever reach it,
+    #: because both write it on a `state.environment` path and that raises
+    #: `_Stop`. `environment_error_check` says which.
+    not_run_node_ids: tuple[str, ...] | None = None
     suite_timeout_s: int | None = None
     #: Which runner adapter produced this ladder's numbers. `None` when the
     #: ladder was refused before it read `task.tests.framework` at all -- the
@@ -409,6 +444,11 @@ class _State:
     p2p_deselect_requested: int | None = None
     p2p_deselected: int | None = None
     p2p_failed_node_ids: tuple[str, ...] | None = None
+    #: Declared ids the run did not execute, from `Outcome.not_run`. Written by
+    #: `_check_f2p` and `_check_p2p`; only one of them can ever reach it,
+    #: because both write it on a `state.environment` path and that raises
+    #: `_Stop`. `environment_error_check` says which.
+    not_run_node_ids: tuple[str, ...] | None = None
     #: The bound the LAST bounded command carried, read off its own argv.
     #: Last-writer-wins across checks 3-7 rather than "every command": all of
     #: them read one manifest value, so the three writes agree -- but the
@@ -508,6 +548,7 @@ class _State:
             p2p_deselect_requested=self.p2p_deselect_requested,
             p2p_deselected=self.p2p_deselected,
             p2p_failed_node_ids=self.p2p_failed_node_ids,
+            not_run_node_ids=self.not_run_node_ids,
             suite_timeout_s=self.suite_timeout_s,
             framework=self.framework,
         )
@@ -1205,6 +1246,7 @@ def _check_f2p(state: _State, task, env) -> None:
         # reason: a green report would absorb it. Stamping F2P_FAILED here
         # would be an accusation the model did not earn, permanently, in an
         # append-only store.
+        state.not_run_node_ids = tuple(sorted(outcome.not_run))
         state.environment(
             "f2p",
             "these declared f2p ids did not run: "
@@ -1281,6 +1323,18 @@ def _check_p2p(state: _State, task, env, oracle: Oracle | None) -> None:
     the restore step above already tolerates being absent. The exit-5 route
     stays unconditional: that one is about what pytest actually collected, and
     it is reachable on both branches.
+
+    Also gates on `outcome.not_run`, mirroring `_check_f2p`'s branch, and for
+    a sharper reason: a p2p selection that PARTLY stopped matching still runs
+    everything that does match, passes, and reaches this function's
+    `KIND_PASSED` branch at exit 0 -- so without this check the record reads
+    `resolved: True` over a regression check part of which never ran. The
+    branch outranks `KIND_PASSED`, `KIND_FAILED` and the timeout branch alike
+    (a partially-executed selection is not the run any of those three claims
+    to describe), and it reads `not_run` AFTER the quarantine has already been
+    subtracted out of it: `pass_to_pass` removes `extra_deselect` from
+    `_selected` on the explicit branch, because a quarantined id was asked NOT
+    to run and would otherwise be reported here as one that did not.
     """
     # `None` when no oracle was consulted, mirroring `GradeRecord.quarantined`
     # -- `0` is a derivation that found nothing to quarantine, which is the
@@ -1353,6 +1407,46 @@ def _check_p2p(state: _State, task, env, oracle: Oracle | None) -> None:
     # constant surplus is readable as configuration rather than as drift.
     state.p2p_deselected = adapter.parse_deselected(
         stdout=result.stdout, report=runner.last_report)
+
+    # BEFORE the KIND_PASSED branch, for the reason `_check_f2p` states one
+    # function up and for a sharper one here: a PARTLY stale selection runs the
+    # ids that still match, they pass, and the report that reaches this point
+    # is green at exit 0 -- so a green-first ladder absorbs it and the record
+    # says `resolved: True` over a regression check part of which never ran.
+    # It also precedes KIND_FAILED and the timeout branch; see D4.
+    #
+    # `not_run` here excludes the quarantine, because `pass_to_pass` subtracts
+    # `extra_deselect` from `_selected` on this branch -- a quarantined id is
+    # skipped by the same argv's negative lookahead and would otherwise be
+    # reported as not-run on every healthy node run of a task with one flake.
+    #
+    # ENVIRONMENT, never a `GradeFailure`. `not_run` is non-empty only on the
+    # explicit-`tests.p2p` branch (`pass_to_pass` resets `_selected` to `()` on
+    # the deselect one) and only on a framework that writes a report (pytest's
+    # `report_path()` is `None`). Every id on that branch is validated at LOAD
+    # time to live under `tests.paths` -- `node_adapter.validate_node_id`,
+    # applied to `(*f2p, *p2p)` in `tasks.py` -- and check 2 restores
+    # `tests.paths` to the start state before this check runs. So a deleted or
+    # renamed test file is NOT an available explanation. What is left is: a
+    # stale manifest; a rename the harness cannot see; a selection argv this
+    # harness built wrong; or a runner CONFIG the submission edited outside
+    # `tests.paths` and the restore therefore did not put back (a root
+    # `vitest.config.ts` / `jest.config.js` / `package.json` `exclude`,
+    # `testMatch` or `setupFiles`). The fourth is submission-caused and the
+    # ruling is unchanged BECAUSE the grader has no channel that separates it
+    # from the other three: P2P_REGRESSION is the claim that the model's patch
+    # broke a passing test, permanent, in an append-only store, over an
+    # ambiguity the model never saw. `resolved: None` is still strictly
+    # harsher than what HEAD does with that submission, which is grade it
+    # `resolved: True`.
+    if outcome.not_run:
+        state.not_run_node_ids = tuple(sorted(outcome.not_run))
+        state.environment(
+            "p2p",
+            "these declared p2p ids did not run: "
+            + ", ".join(sorted(outcome.not_run)),
+            result,
+        )
 
     if outcome.kind == KIND_PASSED:
         state.p2p_failed_node_ids = ()
@@ -1874,6 +1968,7 @@ def build_grade_record(record: RunRecord, task, image: str,
         p2p_deselect_requested=ladder.p2p_deselect_requested,
         p2p_deselected=ladder.p2p_deselected,
         p2p_failed_node_ids=ladder.p2p_failed_node_ids,
+        not_run_node_ids=ladder.not_run_node_ids,
         suite_timeout_s=ladder.suite_timeout_s,
         framework=ladder.framework or "",
         artifacts_dir=artifacts_dir,

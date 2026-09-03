@@ -1043,11 +1043,12 @@ class _Runner:
         #: a report cannot tell a test that was SKIPPED from one that was never
         #: selected.
         #:
-        #: Written by `select` and by `pass_to_pass`'s explicit branch, and
-        #: reset to `()` by its DESELECT branch. That reset is load-bearing
-        #: rather than tidy: a leftover value there would make a correct scoped
-        #: run report the f2p ids as "did not run", which is exactly what a
-        #: correct p2p run does to them.
+        #: Written by `select` and by `pass_to_pass`'s explicit branch -- minus
+        #: what the same argv deselects, since a deselected id was asked NOT to
+        #: run -- and reset to `()` by its DESELECT branch. That reset is
+        #: load-bearing rather than tidy: a leftover value there would make a
+        #: correct scoped run report the f2p ids as "did not run", which is
+        #: exactly what a correct p2p run does to them.
         #:
         #: Initialised HERE, at construction, for the reason the rest of this
         #: file initialises its absences: a field that appears on first use
@@ -1270,14 +1271,36 @@ class _Runner:
         `()`. A leftover selection there would make a correct scoped run
         report the f2p ids as "did not run" -- which is precisely what a
         correct p2p run does to them. On the explicit branch it is the p2p
-        list, so a renamed entry in it is answered by the same rule that
-        answers a renamed f2p id.
+        list MINUS `extra_deselect`, so a renamed entry in it is answered by
+        the same rule that answers a renamed f2p id, and a quarantined entry
+        -- asked not to run by this same argv -- is not.
         """
         if tests.p2p:
             result = self.run(self.adapter.p2p_argvs(
                 selected=tuple(tests.p2p), scope=(),
                 deselected=tuple(extra_deselect), ignored=tuple(ignore)))
-            self._selected = tuple(tests.p2p)
+            # MINUS what this same argv deselects. `_selected` is "what the
+            # last invocation asked for BY ID", and a quarantined id was asked
+            # NOT to run: `p2p_args` folds `deselected` into a negative
+            # lookahead inside the single `-t`, so those tests are SKIPPED,
+            # carry no terminal status, and `executed_names` -- which yields
+            # only `passed`/`failed` -- never sees them. Left unsubtracted they
+            # fall straight through `verify_selected` into `Outcome.not_run`,
+            # and on this branch the quarantine is a SUBSET of `tests.p2p` by
+            # construction (`derive_quarantine` derives it from two
+            # `pass_to_pass` runs over that same list). The grader's `did not
+            # run` branch would then fire on every healthy node run of any task
+            # carrying one flake -- `not_graded` on every cell of every arm,
+            # permanently, in an append-only file.
+            #
+            # `ignore` is deliberately NOT subtracted. It has exactly one
+            # caller -- preflight's p2p run at the START state -- which reads
+            # no `not_run` at all, and the grader never passes it. Subtracting
+            # it here would be a rule with no reader.
+            self._selected = tuple(
+                node_id for node_id in tests.p2p
+                if node_id not in extra_deselect
+            )
             return result
         result = self.run(self.adapter.p2p_argvs(
             selected=(), scope=tuple(scope),

@@ -1324,17 +1324,87 @@ judge runs after one — which is why they sit here rather than above.
   bound a function of the quarantine, so two tasks declaring the same number
   would get different ones. `SCHEMA_VERSION` did not move for this.
 
-- [ ] **`_check_p2p` has no `not_run` branch, and the data it would need is
-  structurally absent too.** `grader.py`'s `_check_f2p` reads
-  `outcome.not_run` and routes a non-empty set to `state.environment(...)`
-  rather than `state.fail(...)`, so a node id that stopped matching (M1:
-  `-t` matching nothing exits 0 with every test skipped) is not stamped on
-  the model. `_check_p2p`, forty-odd lines below, has no such branch — and it
-  would not fire if added, as written: `preflight._Runner.classify` only
-  fills `Outcome.not_run` when `self._selected` is set, and `_selected` is
-  written by `_Runner.select` alone; `_check_p2p` calls `pass_to_pass`, which
-  never touches it. So a p2p id that silently stopped matching is invisible
-  on both counts — no check reads it, and no code path populates it.
+- [x] **`_check_p2p` has no `not_run` branch, and the data it would need is
+  structurally absent too.** Closed 2026-09-03 (round 2 item 8),
+  `GRADER_VERSION` 10 -> 11, `GRADE_SCHEMA_VERSION` 1.3.0 -> 1.4.0. This
+  bullet's second half went stale before it closed:
+  `preflight._Runner.pass_to_pass` has written
+  `self._selected = tuple(tests.p2p)` on the explicit branch since
+  `59f4488` ("refuse the three node task shapes that read as a green gate"),
+  so the data was already present there, not structurally absent everywhere.
+  What was still true, and is what item 8 fixed: `_check_p2p` had no branch
+  reading it, so a node task with an explicit `tests.p2p` whose declared ids
+  had *partly* stopped matching (M1: a `-t` pattern naming a test that no
+  longer exists exits 0 on both vitest and jest with every test in the file
+  reported skipped) ran what still matched, passed, and reached
+  `state.passed("p2p")` at exit 0 — `resolved: True` over a regression check
+  part of which never ran, invisible to the exit code, to `p2p_deselected`
+  and to `p2p_failed_node_ids`. Fixed by mirroring `_check_f2p`'s branch into
+  `_check_p2p`, ahead of `KIND_PASSED`, `KIND_FAILED` and the timeout branch
+  alike, and recording the stale ids in the new `GradeRecord.not_run_node_ids`
+  from both checks. That branch can fire only on the explicit-`tests.p2p`
+  branch (the deselect branch resets `_selected` to `()`) and only on a
+  framework that writes a report (pytest's `report_path()` is `None`, so
+  `not_run` is structurally empty there regardless). A blocking finding
+  against the first draft caught a real defect this uncovered: `_selected`
+  held the *whole* declared `tests.p2p`, quarantined ids included, while the
+  quarantine is simultaneously deselected out of the same argv — so a
+  quarantined id would have been reported as one that did not run on every
+  healthy node run of a task with one flake. Fixed at the source:
+  `pass_to_pass`'s explicit branch now subtracts `extra_deselect` from
+  `_selected`, which is identity at every preflight and oracle call site (the
+  grader is the only caller that ever passes `extra_deselect`), so
+  `PREFLIGHT_VERSION` did not move. Unreachable on today's stored corpus:
+  every stored run is pytest, and of the gated node manifests neither
+  declares an explicit `tests.p2p` — verified live on a scratch copy of
+  `ufo-214-without-trailing-slash-query` with an invented p2p id (see
+  `tasks/todo.md`'s round-2 item 8 section for the grade line).
+
+- [ ] **A p2p sweep that silently collects fewer tests than the baseline is
+  invisible on the deselect branch.** `tests.p2p: []` declares no id list, so
+  `_check_p2p`'s `not_run` branch (round 2 item 8) cannot fire there by
+  construction, and pytest reports no executed ids to compare against
+  anything — `report_path()` is `None` and `report_args()` returns `[]`
+  deliberately, because a JUnit report needs `classname` mapped back to a
+  node id and a dotted segment is a package or a class with nothing in the
+  XML saying which. Two of the three ways the set could shrink are already
+  closed: `_check_test_restore` puts every tracked file under `tests.paths`
+  back to the start state and the deselect branch's scope is a subset of
+  that, so a deletion or rename cannot shrink it; an import break exits
+  non-zero and is routed. What remains is *configuration the restore does
+  not cover* — the task's own root `conftest.py` `collect_ignore` or
+  `addopts` marker filter, a `skipif` injected into an imported source
+  module, **or a tracked runner config the SUBMISSION edits outside
+  `tests.paths`** (`vitest.config.ts`, `jest.config.js`, `package.json`:
+  `exclude` / `testMatch` / `setupFiles`) — all at exit 0. The only detector
+  in the record is `p2p_deselected` against `p2p_deselect_requested`, which
+  `_check_p2p`'s own comment records as vacuous on any task whose config
+  deselects (`pallets/click`: 30,007 measured against 7 requested). Closing
+  it means an executed-**item count** with a baseline stored on the
+  `Oracle` — a new field and an `ORACLE_VERSION` bump that re-derives every
+  cached quarantine at two full suite runs per task, which is why it is its
+  own item.
+
+- [ ] **`preflight` is blind to a declared p2p id that does not run, and the
+  grader is not.** `preflight` refuses a task whose f2p ids did not run
+  (`if not_run and red_outcome.kind != KIND_LOAD_ERROR`), and makes no such
+  check on either p2p run — the p2p-after site reads only
+  `runner.classify(after_p2p).kind != KIND_PASSED` and never looks at
+  `not_run`. That is the same f2p/p2p asymmetry round-2 item 8 closed in the
+  grader, one layer earlier, and it matters more here: the repo is pinned at
+  `base_sha` and the test half is committed, so a declared p2p id cannot go
+  stale over time — the reachable causes are a manifest authoring error and
+  a submission-caused config change. For the first, the gate could refuse
+  the task for free, before an image, a proxy or a token; instead item 8's
+  branch fires at grade time on **every run of every arm** of that task,
+  after the money is spent. `CLAUDE.md`: *"a precondition, not a run
+  criterion, because by the time a record exists the tokens are spent"*, and
+  *"a task must be shown to discriminate, per task, in its own image"*. The
+  proof that it is open: item 8's own verification vehicle B deliberately
+  gave `ufo-214` an invented p2p id and the gate returned **GO** (measured
+  2026-09-03). Closing it is one `if` at the p2p-after classification site
+  plus a `PREFLIGHT_VERSION` bump, which invalidates every cached preflight
+  verdict — hence its own item.
 
 ---
 

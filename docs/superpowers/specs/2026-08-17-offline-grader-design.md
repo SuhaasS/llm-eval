@@ -284,6 +284,31 @@ lives where the oracle's files live) and the scoped preflight assertion above
 is what checks the second job. The explicit-`p2p`-list branch is unchanged
 (node ids already scope it).
 
+On the explicit-`tests.p2p` branch, a declared id that produced no terminal
+status routes to the environment path **ahead of** the pass, fail and timeout
+branches — the quarantine excluded, because a quarantined id was asked not to
+run by the same argv and is not evidence of anything going wrong. The measured
+shape (round-2 item 8): a `-t` pattern naming a test that no longer matches
+exits **0** on both vitest and jest with every test in the file reported
+skipped, so a PARTLY stale selection runs what still matches, passes, and
+reaches this check at exit 0 — a `resolved: True` verdict over a regression
+check part of which never ran, invisible to the exit code, to
+`p2p_deselected`, and to `p2p_failed_node_ids`. What can explain a
+non-quarantined id with no terminal status: a stale manifest; a rename the
+harness cannot see; a selection argv the harness built wrong; or a runner
+config the submission edited outside `tests.paths` (a root `vitest.config.ts`
+/ `jest.config.js` / `package.json` `exclude`, `testMatch` or `setupFiles`) —
+the restore step (check 2) puts every *tracked file* under `tests.paths` back,
+but a config file the submission edited there is put back too, so this fourth
+cause is really "the id lives under a scope the restore does not narrow to a
+single file". The branch outranks `KIND_PASSED` (a green report would absorb
+the loss silently), `KIND_FAILED` (a partially-executed selection is not the
+run "the declared p2p set still passes" describes, even when one id in it did
+fail) and the timeout branch (doubly not a statement about the model) alike.
+`GradeRecord.not_run_node_ids` carries the ids beside the message, because a
+node `fullName` may itself contain `", "` and the joined prose is not
+losslessly splittable back into ids.
+
 **Execution discipline** (checks 2–7 run inside the pinned image; 1 and 9
 read the record; 8 runs in its own gitleaks container): no network
 (`RunContainer`'s default is `network_mode="none"`), non-root,
@@ -465,6 +490,10 @@ p2p_deselect_requested: int | None           # what pytest was actually asked:
                                              # explicit branch
 p2p_deselected: int | None                   # pytest's own count: observation
 p2p_failed_node_ids: tuple | None
+not_run_node_ids: tuple | None               # declared ids with no terminal
+                                             # status, quarantine excluded;
+                                             # None on pytest, where the exit
+                                             # code carries this instead
 artifacts_dir: str | None                    # per-check gzipped output, at
                                              # artifacts_root/<run_id>/v<GRADER_VERSION>,
                                              # emptied before the ladder so the

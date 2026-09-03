@@ -1248,10 +1248,24 @@ def test_the_grader_version_moved_with_what_check_5_means():
     ignore list on the one run that used it. A node grade produced under 9 was
     made against a regression check with identically-titled tests silently
     removed from it, so `p2p_failed_node_ids` and `resolved` can both
-    differ."""
+    differ.
+
+    `10 -> 11` gives check 6 the `did not run` environment branch check 5 has
+    carried since 5 -> 6 (round 2 item 8, 2026-09-03), records the stale ids
+    in `GradeRecord.not_run_node_ids` from both checks, and subtracts the
+    quarantine from `_selected` at the source so a quarantined id is not
+    reported as one that did not run. Under 10, a node task with an explicit
+    `tests.p2p` whose declared ids had PARTLY stopped matching ran what still
+    matched, passed, and reached `state.passed("p2p")` at exit 0 -- a
+    `resolved: True` verdict over a regression check part of which never ran.
+    Two vocabulary changes ride with it: a wholly-stale explicit selection now
+    reads `environment_error` where it read `scope_collected_nothing`, and a
+    run where one declared id failed while another went stale now reads
+    `environment_error` where it read `p2p_regression` -- the second is the
+    only one that changes a `resolved` value (`False` -> `None`)."""
     from bakeoff.grader import GRADER_VERSION
 
-    assert GRADER_VERSION == "10"
+    assert GRADER_VERSION == "11"
 
 
 def test_the_grade_says_which_runner_produced_its_numbers():
@@ -2310,8 +2324,8 @@ def test_a_confined_load_error_is_still_an_f2p_failure():
     assert state.f2p_failed_node_ids == ("tests/new.py",)
 
 
-def _node_task(f2p=("tests/a.test.js::does a thing",)):
-    task = _task(f2p=f2p)
+def _node_task(f2p=("tests/a.test.js::does a thing",), p2p=()):
+    task = _task(f2p=f2p, p2p=p2p)
     task.tests.framework = "vitest"
     task.tests.runner = ("/node_modules/.bin/vitest", "run", "--no-cache")
     return task
@@ -2373,6 +2387,220 @@ def test_a_node_f2p_id_that_DID_run_and_failed_is_still_the_models_failure():
     assert state.not_graded_reason is None
     assert state.grade_failure == "f2p_failed"
     assert state.f2p_failed_node_ids == ("tests/a.test.js::does a thing",)
+
+
+# --------------------------------------------------------------------------
+# 6b. the p2p `not_run` branch (round-2 item 8)
+# --------------------------------------------------------------------------
+
+# Both in one file, per `_run_node_p2p_with`'s docstring constraint.
+_P2P_A = "tests/b.test.js::keeps working"
+_P2P_B = "tests/b.test.js::renamed away"
+
+
+def _p2p_report(*entries):
+    """A one-file node report: `entries` is `(node_id, status)` pairs for
+    every id the run reached a terminal verdict for. An id declared but
+    absent from `entries` is exactly what a stale `-t` selection SKIPS --
+    which is what a rename or a quarantine both produce, and this builder
+    cannot and does not distinguish them; the caller's choice of `entries`
+    is what states which case a given test is about."""
+    file = entries[0][0].partition("::")[0]
+    return {
+        "testResults": [{
+            "name": "/repo/" + file,
+            "status": "passed",
+            "assertionResults": [
+                {"status": status, "fullName": node_id.partition("::")[2]}
+                for node_id, status in entries
+            ],
+        }],
+    }
+
+
+def _run_node_p2p_with(*, p2p, p2p_report, f2p_report=None, oracle=None,
+                       f2p=("tests/a.test.js::does a thing",)):
+    """One ladder run whose f2p AND p2p invocations left these reports
+    behind.
+
+    The `cat` rule is served a LIST, in order. The f2p and the p2p
+    invocations read the SAME `REPORT_PATH` -- `_Runner.run` writes a fixed
+    path so the gated argv equals the graded argv, and deletes the file
+    before each invocation. So the fake's `cat` rule takes a list of
+    results: the first read is check 5's, the second is check 6's. One
+    report for both would make check 5 read check 6's ids and refuse before
+    check 6 ever ran -- a fixture bug that looks exactly like the branch
+    under test firing.
+
+    Every declared id in these fixtures shares one file, so each check
+    issues one runner group and therefore one `cat`. That is a constraint,
+    not a coincidence: after round-2 item 1, `_Runner.run` reads one report
+    PER GROUP, and a multi-file id list would consume the ordered list above
+    in the wrong order.
+    """
+    from bakeoff.runners.node_adapter import REPORT_PATH
+
+    if f2p_report is None:
+        # Every declared f2p id present with "passed", so check 5 passes and
+        # control reaches check 6. Shape is `_run_node_f2p_with`'s verbatim.
+        f2p_report = _p2p_report(*((node_id, "passed") for node_id in f2p))
+    env = FakeEnv(rules=[
+        (lambda argv: argv[:1] == ["cat"] and argv[-1] == REPORT_PATH,
+         [(0, json.dumps(f2p_report), ""), (0, json.dumps(p2p_report), "")]),
+    ])
+    return _ladder(task=_node_task(f2p=f2p, p2p=p2p), env=env,
+                   oracle=oracle if oracle is not None else _oracle())
+
+
+def test_a_p2p_id_that_never_ran_is_the_graders_problem_not_the_models():
+    """The partial-staleness shape (`M1`, `verify_selected`'s docstring): a
+    `-t` pattern naming a test that no longer exists exits 0 with every test
+    reported skipped, so a renamed p2p id vanishes from the report rather
+    than producing any exit code a check could catch."""
+    state = _run_node_p2p_with(
+        p2p=(_P2P_A, _P2P_B), p2p_report=_p2p_report((_P2P_A, "passed")))
+
+    assert state.grade_failure is None
+    assert state.not_graded_reason == "environment_error"
+    assert state.environment_error_check == "p2p"
+    assert "did not run" in state.environment_error
+    assert _P2P_B in state.environment_error
+    assert state.not_run_node_ids == (_P2P_B,)
+
+
+def test_a_partly_stale_p2p_selection_is_not_absorbed_by_a_green_report():
+    """The ordering pin against `KIND_PASSED`. The ids that still match RUN,
+    PASS, and produce a report that is green at exit 0 -- so a ladder testing
+    `KIND_PASSED` first would return `resolved: True` over a regression check
+    part of which never ran."""
+    state = _run_node_p2p_with(
+        p2p=(_P2P_A, _P2P_B), p2p_report=_p2p_report((_P2P_A, "passed")))
+
+    assert state.resolved is None
+    assert _check(state, "p2p").status == "fail"
+
+
+def test_a_quarantined_p2p_id_is_not_reported_as_not_run():
+    """The blocking-finding pin (D1a / section 1.4 of the plan). `p2p_args`
+    folds the quarantine into the same `-t` as a negative lookahead, so a
+    quarantined test is SKIPPED, carries no terminal status, and is invisible
+    to `executed_names`. Without `pass_to_pass` subtracting `extra_deselect`
+    from `_selected`, every healthy node run of a task with one flake would
+    grade `not_graded` instead of `resolved: True`."""
+    state = _run_node_p2p_with(
+        p2p=(_P2P_A, _P2P_B), p2p_report=_p2p_report((_P2P_A, "passed")),
+        oracle=_oracle(quarantined=(_P2P_B,)))
+
+    assert state.not_graded_reason is None
+    assert state.resolved is True
+    assert state.not_run_node_ids is None
+
+
+def test_a_node_p2p_selection_that_wholly_missed_names_its_cause():
+    """D4 vs `KIND_NOTHING_RAN`. Both verdicts are `resolved: None`, so
+    nothing said about the model changes -- what changes is that the row
+    names the cause: the explicit branch has no SCOPE, so a wholly-empty
+    result is the *selection* matching nothing, a stale manifest, not a
+    declared scope that collected nothing."""
+    state = _run_node_p2p_with(
+        p2p=(_P2P_A, _P2P_B),
+        p2p_report={"testResults": [{
+            "name": "/repo/tests/b.test.js", "status": "passed",
+            "assertionResults": [],
+        }]})
+
+    assert state.not_graded_reason == "environment_error"
+    assert state.resolved is None
+    assert state.not_run_node_ids == (_P2P_A, _P2P_B)
+
+
+def test_a_node_p2p_id_that_DID_run_and_failed_is_still_the_models_failure():
+    """The other half, so the branch above cannot be a blanket refusal of
+    every node p2p run. Both declared ids present, one of them failing, is
+    exactly what the regression check exists to catch."""
+    state = _run_node_p2p_with(
+        p2p=(_P2P_A, _P2P_B),
+        p2p_report=_p2p_report((_P2P_A, "passed"), (_P2P_B, "failed")))
+
+    assert state.not_graded_reason is None
+    assert state.grade_failure == "p2p_regression"
+    assert state.p2p_failed_node_ids == (_P2P_B,)
+    assert state.not_run_node_ids is None
+
+
+def test_a_p2p_id_that_failed_beside_one_that_never_ran_is_still_not_graded():
+    """D4 vs `KIND_FAILED`. The failing id DID run -- that one piece of
+    evidence is unambiguous -- and the verdict is downgraded anyway, because
+    the check's claim is "the declared p2p set still passes" and a
+    partially-executed selection is not the run that claim describes."""
+    state = _run_node_p2p_with(
+        p2p=(_P2P_A, _P2P_B), p2p_report=_p2p_report((_P2P_A, "failed")))
+
+    assert state.not_graded_reason == "environment_error"
+    assert state.grade_failure is None
+    assert state.p2p_failed_node_ids is None
+    assert state.not_run_node_ids == (_P2P_B,)
+
+
+def test_the_deselect_branch_reports_no_p2p_ids_as_not_run():
+    """Today's default `_task()` (pytest, `p2p=()`), a clean `FakeEnv()`.
+    Pins that the branch cannot fire where no id list is declared -- the
+    leftover-`_selected` hazard `pass_to_pass`'s reset exists for."""
+    result = _ladder()
+
+    assert result.resolved is True
+    assert result.not_run_node_ids is None
+
+
+def test_a_pytest_p2p_run_never_reports_ids_as_not_run():
+    """The framework half of the test above. `test_grader.py`'s `is_p2p`
+    matcher is *pytest in argv AND `--deselect` in argv*, and on the explicit
+    branch with an EMPTY quarantine `pytest_adapter.p2p_args` emits
+    `list(selected)` and no `--deselect` -- so `is_p2p` would never fire and
+    an `is_f2p` rule would answer this check too. Deliberately no rule at
+    all: `FakeEnv`'s documented default (unmatched argv -> exit 0, empty
+    output) is what makes `resolved is True` reachable here. `not_run` is
+    structurally empty on pytest regardless -- `report_path()` is `None`, so
+    `_Runner.classify` never asks `verify_selected` -- and the exit code
+    (4, `ERROR: not found:`) carries this there instead."""
+    task = _task(p2p=("tests/test_calc.py::test_b",))
+    result = _ladder(task=task)
+
+    assert result.not_run_node_ids is None
+    assert result.resolved is True
+
+
+def test_the_ids_that_did_not_run_are_recorded_as_a_tuple_not_only_in_a_message():
+    """The anchor for the second mutation. A node `fullName` containing TWO
+    `", "` sequences makes the joined message not losslessly splittable back
+    into ids -- one comma alone would still split into the right pieces by
+    accident on a single-id message -- so the tuple is not redundant with
+    the prose. (Deviation from the plan's exact fullName text, which carried
+    only one comma and so split back cleanly; the id here is chosen to make
+    the plan's own stated assertion -- more than two parts -- literally
+    true.)"""
+    weird_id = "tests/b.test.js::formats a, b, and c"
+    state = _run_node_p2p_with(
+        p2p=(weird_id,),
+        p2p_report={"testResults": [{
+            "name": "/repo/tests/b.test.js", "status": "passed",
+            "assertionResults": [],
+        }]})
+
+    assert state.not_run_node_ids == (weird_id,)
+    assert len(state.not_run_node_ids) == 1
+    assert len(state.environment_error.split(", ")) > 2
+
+
+def test_only_one_check_can_write_the_ids_that_did_not_run():
+    """`_check_p2p` never runs at all once `_check_f2p` has raised `_Stop`
+    through `state.environment` -- so an f2p `not_run` is the only kind a
+    line can carry, and `environment_error_check` says which."""
+    result = _run_node_f2p_with(report_shape="t_nomatch")
+
+    assert result.environment_error_check == "f2p"
+    assert result.not_run_node_ids == ("tests/a.test.js::does a thing",)
+    assert _check(result, "p2p").status == "skipped"
 
 
 def test_two_grades_of_one_run_mount_different_host_paths(monkeypatch, tmp_path):

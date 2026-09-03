@@ -2371,6 +2371,69 @@ MUTATIONS = [
         "tests/test_run_matrix.py -k from_another_gate_is_not_printed",
         "not integration",
     ),
+    (
+        # A `-t` pattern naming a test that no longer exists exits 0 with every
+        # test reported skipped (measured 2026-09-01, vitest and jest both). A
+        # PARTLY stale p2p selection therefore runs what still matches, passes,
+        # and arrives here as a green report -- so without this branch the
+        # record says `resolved: True` over a regression check part of which
+        # never ran.
+        "grader: absorb a partly-stale p2p selection into a green report",
+        "src/bakeoff/grader.py",
+        '    if outcome.not_run:\n'
+        '        state.not_run_node_ids = tuple(sorted(outcome.not_run))\n'
+        '        state.environment(\n            "p2p",',
+        '    if False:\n'
+        '        state.not_run_node_ids = tuple(sorted(outcome.not_run))\n'
+        '        state.environment(\n            "p2p",',
+        # BOTH ordering pins under one anchor: the `if False:` mutation makes
+        # 4.2(2) (vs KIND_PASSED) and 4.2(6) (vs KIND_FAILED) red alike, so one
+        # anchor proves both of D4's claims. This is the first selector in the
+        # file to use an `or`, and the mechanism handles it -- but THE QUOTES
+        # ARE REQUIRED: `run()` splits on " -k ", strips one layer of quoting
+        # off the remainder, and passes what is left as a SINGLE `-k`
+        # argument, so an unquoted expression would be split on the space and
+        # select nothing.
+        'tests/test_grader.py -k "partly_stale_p2p_selection or '
+        'failed_beside_one"',
+        "not integration",
+    ),
+    (
+        # A node `fullName` is free text and may contain ", ", so the joined
+        # message is not losslessly splittable back into ids. Without the
+        # tuple, a reader counting how often a task set's manifests went stale
+        # is grepping prose -- the well-formed-verdict-beside-a-lying-evidence-
+        # field shape GRADER_VERSION 7 -> 8 already moved for.
+        "grader: report the stale p2p ids only in a message",
+        "src/bakeoff/grader.py",
+        '        state.not_run_node_ids = tuple(sorted(outcome.not_run))\n'
+        '        state.environment(\n            "p2p",',
+        '        state.environment(\n            "p2p",',
+        "tests/test_grader.py -k recorded_as_a_tuple",
+        "not integration",
+    ),
+    (
+        # `p2p_args` folds the quarantine into the same `-t` as a negative
+        # lookahead, so a quarantined test is SKIPPED, carries no terminal
+        # status, and is invisible to `executed_names`. Without the
+        # subtraction it falls through `verify_selected` into `not_run`, and
+        # the grader's branch above then grades `not_graded` on every cell of
+        # every arm of any node task with one flake -- permanently, in an
+        # append-only file.
+        # The label names BOTH files on purpose: the mutated file is
+        # `preflight.py` while the defect it guards is the grader's verdict,
+        # so an operator scanning labels for preflight coverage has to be able
+        # to find it.
+        "preflight/grader: report a quarantined p2p id as one that did not run",
+        "src/bakeoff/preflight.py",
+        "            self._selected = tuple(\n"
+        "                node_id for node_id in tests.p2p\n"
+        "                if node_id not in extra_deselect\n"
+        "            )",
+        "            self._selected = tuple(tests.p2p)",
+        "tests/test_grader.py -k quarantined_p2p_id_is_not_reported",
+        "not integration",
+    ),
 ]
 
 

@@ -43,6 +43,11 @@ Null semantics, in the order they are easiest to get wrong:
   defaults to `()` rather than `None` only because a `GradeRecord` is written by
   the ladder, which appends as it goes: an empty tuple is "the ladder ran no
   check", which on this path is a measurement.
+* `not_run_node_ids is None` means NOT MEASURED -- either the ladder never
+  reached a check that reads `Outcome.not_run`, or it did and the framework
+  reports no executed ids at all (pytest, where the exit code carries this
+  instead). A non-empty tuple is an observation. It never round-trips as `()`:
+  the branch that writes it only runs when the set is non-empty.
 
 `grader_version` is what gates resume (a run already graded under the current
 grader is skipped); `grader_commit` carries `runner.harness_commit()` including
@@ -74,7 +79,13 @@ from typing import Any
 # field's own docstring), and a reader that cannot tell this version apart
 # from 1.2.0 has no way to know whether a line's numbers came from pytest or
 # a node adapter -- the same reason `SCHEMA_VERSION` moves for additive bumps.
-GRADE_SCHEMA_VERSION = "1.3.0"
+# 1.4.0 adds `GradeRecord.not_run_node_ids`: the declared f2p or p2p ids a run
+# did not execute. On a 1.3.0 line those ids exist only inside
+# `environment_error`'s prose, and a node `fullName` may itself contain ", ",
+# so the joined form cannot be split back -- the field's absence on such a
+# line is the writer's vocabulary, not a measurement, which is the same
+# reason `SCHEMA_VERSION` moves for additive bumps.
+GRADE_SCHEMA_VERSION = "1.4.0"
 
 # The oldest `RunRecord` schema whose fields mean what `from_dict` and the
 # ladder were written to assume. Below it the run is not graded and
@@ -279,6 +290,7 @@ _TUPLE_FIELDS: tuple[str, ...] = (
     "binary_chunks_dropped",
     "f2p_failed_node_ids",
     "p2p_failed_node_ids",
+    "not_run_node_ids",
 )
 
 
@@ -388,6 +400,30 @@ class GradeRecord:
     p2p_deselect_requested: int | None = None
     p2p_deselected: int | None = None
     p2p_failed_node_ids: tuple[str, ...] | None = None
+
+    #: Declared f2p or p2p node ids the run did not execute -- `Outcome.not_run`,
+    #: which is "requested, and no terminal status came back". `None` is NOT
+    #: MEASURED (the ladder never got here, or the framework reports no
+    #: executed ids -- pytest, where the exit code carries this instead); a
+    #: non-empty tuple is an observation. It never round-trips as `()`: the
+    #: branch that writes it only runs when the set is non-empty.
+    #:
+    #: On the p2p side the quarantine is already subtracted, upstream, by
+    #: `preflight._Runner.pass_to_pass` -- a quarantined id was asked NOT to
+    #: run, so reporting it here would be a defect, not evidence.
+    #:
+    #: `environment_error_check` says which check produced it, and ONE field is
+    #: enough because only one check can ever write it -- both branches go
+    #: through `state.environment`, which raises `_Stop`, so an f2p `not_run`
+    #: means `_check_p2p` never ran at all.
+    #:
+    #: Beside the message rather than instead of it, for the reason
+    #: `f2p_failed_node_ids` exists: a node `fullName` is free text and may
+    #: contain ", ", so `environment_error`'s joined form is not losslessly
+    #: splittable, and a reader counting how often a task set's manifests went
+    #: stale would be grepping prose. GRADER_VERSION 7 -> 8 moved for exactly
+    #: this shape -- a well-formed verdict beside a lying evidence field.
+    not_run_node_ids: tuple[str, ...] | None = None
 
     #: The `timeout` bound every command in this ladder carried, from
     #: `task.budget.suite_timeout_s`. `None` when no bounded command ran.
