@@ -245,7 +245,21 @@ _PYTEST_ADAPTER = for_framework("pytest")
 #: NO VERDICT MOVES across this boundary: a cached 16 PASS was a PASS for the
 #: same reasons and a 16 NO-GO is still a NO-GO. What is re-run is the
 #: READING, not the judgement.
-PREFLIGHT_VERSION: str = "17"
+#:
+#: 17 -> 18: the gate records how long its own bounded runs took. A verdict
+#: written before this carries `suite_timeout_s` -- the bound the argv held
+#: -- beside nothing at all saying what the run under it cost, so every
+#: `budget.suite_timeout_s` in the task set was sized from a number measured
+#: by hand in a shell, outside the image the gate runs in
+#: (`~/.cache/bakeoff-probe/reports/d4-suite-timeout.md`, 2026-09-02:
+#: `pytest-10210` at 106.34 s by `time docker run`, declared at 240 s). Since
+#: 18 every verdict carries `bounded_run_durations_s` -- one entry per
+#: bounded invocation, `null` for a run that did not happen -- and
+#: `bounded_run_duration_max_s`. NO VERDICT MOVES across this boundary: a
+#: cached PASS was a PASS for the same reasons and a NO-GO is still a NO-GO.
+#: What is re-run is the MEASUREMENT, not the judgement, and re-running it is
+#: the point.
+PREFLIGHT_VERSION: str = "18"
 
 
 def preflight_cache_key(task, image: str, start_sha: str) -> str:
@@ -266,8 +280,48 @@ def preflight_cache_key(task, image: str, start_sha: str) -> str:
     collection driver a dependency of the offline grader for one f-string. Two
     COPIES would be worse still: that is how a verdict written under one gate
     gets served to another.
+
+    The join itself moved to `_key_parts`, shared with `verdict_matches_key`,
+    so the two cannot drift.
     """
-    return f"{task.manifest_digest}|{image}|{start_sha}|{PREFLIGHT_VERSION}"
+    return _key_parts(task.manifest_digest, image, start_sha, PREFLIGHT_VERSION)
+
+
+def _key_parts(manifest_digest: str, image: str, start_sha: str,
+               preflight_version: str) -> str:
+    """The ONE encoding of a preflight cache key.
+
+    Two callers derive it from different places -- `preflight_cache_key` from
+    a live task and the module constant, `verdict_matches_key` from a stored
+    blob's own fields -- and a second copy of the join is how a verdict
+    written under one gate gets served to another. The same rule
+    `_declared_grading` and `EVIDENCE_KEYS` already follow: derive, never
+    restate.
+    """
+    return f"{manifest_digest}|{image}|{start_sha}|{preflight_version}"
+
+
+def verdict_matches_key(verdict: dict, key: str) -> bool:
+    """Whether a STORED verdict blob describes what `key` names.
+
+    `<cache>/preflight/<task_id>.json` is keyed on the task id and nothing
+    else: it is overwritten by every preflight run of that task, PASS or
+    NO-GO, under any manifest, image, tree or gate version -- and it is
+    written BEFORE the `ok` test, while `preflight.json` is written only on
+    PASS. So the two can disagree, and a reader that took seconds out of the
+    blob because the FILENAME matched would publish an earlier gate's
+    measurement under this run's line, which resolves and is therefore worse
+    than the null it replaced.
+
+    Reads the blob's four fields under the names `to_dict` writes them;
+    the join itself is `_key_parts`, shared with `preflight_cache_key`.
+    """
+    return _key_parts(
+        str(verdict.get("manifest_digest", "")),
+        str(verdict.get("image", "")),
+        str(verdict.get("start_sha", "")),
+        str(verdict.get("preflight_version", "")),
+    ) == key
 
 #: A declared `tests.paths` prefix that does not exist at the post-fix state.
 #: NOT a problem: `PreflightResult.ok` is `not problems`, and the grader's
@@ -333,6 +387,34 @@ EARLY_RETURN_RUNNER_MISMATCH = "runner_does_not_match_framework"
 #: against this tuple is on sets, so order is presentation at both ends and
 #: nothing depends on it. A new key is APPENDED to its group -- the AST
 #: test above proves membership, not position.
+#:
+#: Every bounded invocation `preflight` can make, in the order the gate makes
+#: them. The grading entries come off `tasks._GRADING_KEYS` for the reason
+#: `_declared_grading` and `EVIDENCE_KEYS` both give: a hand-listed copy goes
+#: stale the first time a check is added to `TaskGrading`, and that failure is
+#: the silent one.
+#:
+#: The order is the order the gate MAKES them, which is not the order the
+#: manifest declares: the bare-runner probe runs before the f2p selection, and
+#: the scoped p2p runs last, after the grading commands, because the grader's
+#: ladder runs build and typecheck before p2p and a grading command can write
+#: into the tree.
+#:
+#: `bare_runner` is a COLLECTION (`--co -q`), not a suite run, and it is in
+#: here anyway -- which is why these are "bounded runs" and not "suite runs".
+#: It carries the same `timeout <suite_timeout_s>` prefix, it has its own exit
+#: 124 branch, and a count of the gate's bounded commands that leaves one out
+#: is wrong about the number the one-hour SSO window is spent on. That is the
+#: same off-by-one this commit corrects in three documents.
+BOUNDED_RUN_KEYS: tuple[str, ...] = (
+    "bare_runner",
+    "f2p_before", "p2p_before",
+    "f2p_after", "p2p_after",
+    *(f"grading_{key}" for key in _GRADING_KEYS),
+    "p2p_scoped_after",
+)
+
+
 EVIDENCE_KEYS: tuple[str, ...] = (
     "early_return", "framework",
     "image_env_declared", "image_env_observed", "image_env_mismatch",
@@ -344,6 +426,9 @@ EVIDENCE_KEYS: tuple[str, ...] = (
     "uid", "claude_version", "head",
     "stripped_paths", "stripped_paths_present",
     "suite_timeout_s",
+    # Listed beside the bound rather than at the sites they are filled from,
+    # because the only reading either supports is against that bound.
+    "bounded_run_durations_s", "bounded_run_duration_max_s",
     "f2p_before_exit", "f2p_before_not_run",
     "f2p_collection_errors", "f2p_red_kind",
     "p2p_before_ignored", "p2p_before_exit",
@@ -376,8 +461,20 @@ def _evidence_seed() -> dict:
     hides the drift instead of failing it, and a key nothing ever touches
     still does not appear in `to_dict()` -- which leaves the reader this
     schema exists for exactly where they started.
+
+    Every key is seeded to the absence ITS OWN schema defines: `None`
+    for a scalar, and for `bounded_run_durations_s` -- whose value is a key
+    set -- the all-null dict, because "this run did not happen" has to be a
+    null inside that dict and never a missing entry.
+
+    The inner dict is built HERE, per call, and never a module-level
+    constant: a shared mutable would alias one dict across every
+    `PreflightResult` in the process, and one gate's measurements would
+    appear in the next gate's verdict.
     """
-    return dict.fromkeys(EVIDENCE_KEYS)
+    seed = dict.fromkeys(EVIDENCE_KEYS)
+    seed["bounded_run_durations_s"] = dict.fromkeys(BOUNDED_RUN_KEYS)
+    return seed
 
 
 # Files that would give one task a different agent context from another, and
@@ -489,6 +586,32 @@ class PreflightResult:
                 "written on one path and not another cannot be read across a "
                 "set of cached verdicts, which outlive the code that wrote "
                 "them."
+            )
+        # AFTER the outer key-set check above, which is what guarantees this
+        # key exists at all before these two clauses read it -- one layer
+        # down, where a nested value is exactly where the outer check stops
+        # being enforced.
+        durations = self.evidence["bounded_run_durations_s"]
+        if not isinstance(durations, dict):
+            raise ValueError(
+                "preflight evidence['bounded_run_durations_s'] is "
+                f"{type(durations).__name__}, not a dict of "
+                f"{len(BOUNDED_RUN_KEYS)} bounded runs. `_evidence_seed` fills "
+                "the shape on every path, including the pre-container early "
+                "return, so a non-dict here is a caller that built `evidence` "
+                "some other way."
+            )
+        if set(durations) != set(BOUNDED_RUN_KEYS):
+            raise ValueError(
+                "preflight evidence['bounded_run_durations_s'] is not the "
+                f"schema: missing "
+                f"{sorted(set(BOUNDED_RUN_KEYS) - set(durations))}, unlisted "
+                f"{sorted(set(durations) - set(BOUNDED_RUN_KEYS))}. Every "
+                "bounded invocation the gate can make is seeded from "
+                "BOUNDED_RUN_KEYS so that 'this run did not happen' is a "
+                "null and never an absent key -- the same rule the outer "
+                "schema follows, one layer down, where a nested dict is "
+                "exactly where it stops being enforced."
             )
 
     @property
@@ -788,6 +911,33 @@ def _declared_grading(task) -> list[tuple[str, tuple[str, ...]]]:
         for spec in dataclass_fields(grading)
         if getattr(grading, spec.name)
     ]
+
+
+def _elapsed_s(result) -> float:
+    """The wall-clock seconds one bounded invocation took, off its own result.
+
+    Measured by `RunContainer.exec` with `time.monotonic()` around
+    `exec_run` ON THE HOST, so it INCLUDES the docker exec round trip and
+    the demux of both streams. That is the right number and not an
+    approximation of a better one: `budget.suite_timeout_s` bounds a
+    `timeout` INSIDE the container, but what the one-hour SSO window is
+    spent on -- and what an operator waits for -- is the host-side interval,
+    and sizing a bound against the smaller number is how a suite that fits
+    the gate is killed under the grader.
+
+    Not a `time.monotonic()` taken here. `CheckResult.duration_s` is already
+    built from this field one subsystem over (`grader._timing`), and a second
+    clock around the same call is a second thing that can be wrong about one
+    interval.
+
+    Attribute access, NOT `getattr(result, "duration_ms", None)` --
+    which is what `grader._timing` does, for a reason that does not apply
+    here. That helper is called with `result=None` on the rungs that ran no
+    command; every call site below holds a real `ExecResult`, and a default
+    there would let a stub that forgot the field record `None` as though it
+    were a measurement.
+    """
+    return result.duration_ms / 1000.0
 
 
 #: Exit codes that OUTRANK an ordinary test failure when one check is several
@@ -1463,6 +1613,15 @@ def preflight(
             evidence["bare_runner_argv"] = bare_argv
             bare = container.exec(bare_argv)
             evidence["bare_runner_exit"] = bare.exit_code
+            # Written on the same statement pair as the exit code, at every
+            # one of these sites and nowhere else. A recorded exit with no
+            # duration beside it means the gate ran a command and lost what
+            # it cost, and the pairing is what makes that unrepresentable
+            # rather than merely tested for -- there is no second "did this
+            # run happen?" branch to keep in step. Seven pairs cover nine
+            # invocations: the grading pair is a loop body and runs once per
+            # declared `grading.*` key.
+            evidence["bounded_run_durations_s"]["bare_runner"] = _elapsed_s(bare)
             if bare.exit_code == EXIT_USAGE_ERROR:
                 # NOT literally line 1. Measured against the real image
                 # (2026-09-02): argparse's own `error()` prints the usage
@@ -1997,6 +2156,7 @@ def preflight(
         # of a cached verdict can tell that from a run that was bounded.
         evidence["suite_timeout_s"] = runner.last_timeout_s
         evidence["f2p_before_exit"] = red.exit_code
+        evidence["bounded_run_durations_s"]["f2p_before"] = _elapsed_s(red)
         red_outcome = _note(runner.classify(red))
 
         # Every declared f2p id must have RUN, not merely not-passed. Node
@@ -2074,6 +2234,7 @@ def preflight(
         evidence["p2p_before_ignored"] = list(ignore)
         green = runner.pass_to_pass(tests, ignore=ignore)
         evidence["p2p_before_exit"] = green.exit_code
+        evidence["bounded_run_durations_s"]["p2p_before"] = _elapsed_s(green)
         # Classified IMMEDIATELY after its own invocation: `classify` reads
         # `_Runner.last_report`, which the next `run` overwrites.
         p2p_green = _note(runner.classify(green)).kind == KIND_PASSED
@@ -2241,6 +2402,7 @@ def preflight(
         else:
             after_f2p = runner.select(tests.f2p)
             evidence["f2p_after_exit"] = after_f2p.exit_code
+            evidence["bounded_run_durations_s"]["f2p_after"] = _elapsed_s(after_f2p)
             if _note(runner.classify(after_f2p)).kind != KIND_PASSED:
                 problems.append(
                     f"the f2p tests do NOT pass after the reference fix -- "
@@ -2254,6 +2416,7 @@ def preflight(
                 )
             after_p2p = runner.pass_to_pass(tests)
             evidence["p2p_after_exit"] = after_p2p.exit_code
+            evidence["bounded_run_durations_s"]["p2p_after"] = _elapsed_s(after_p2p)
             if _note(runner.classify(after_p2p)).kind != KIND_PASSED:
                 problems.append(
                     "the reference fix regresses the rest of the suite -- "
@@ -2278,6 +2441,7 @@ def preflight(
             for key, argv in _declared_grading(task):
                 checked = container.exec(["timeout", str(timeout_s), *argv])
                 evidence[f"grading_{key}_exit"] = checked.exit_code
+                evidence["bounded_run_durations_s"][f"grading_{key}"] = _elapsed_s(checked)
                 if checked.exit_code != EXIT_ALL_PASSED:
                     problems.append(
                         f"the declared grading.{key} command exits "
@@ -2322,6 +2486,7 @@ def preflight(
                 else:
                     scoped = runner.pass_to_pass(tests, scope=scope)
                     evidence["p2p_scoped_after_exit"] = scoped.exit_code
+                    evidence["bounded_run_durations_s"]["p2p_scoped_after"] = _elapsed_s(scoped)
                     # Classified IMMEDIATELY after its own invocation, and
                     # bound to a name: three assertions read this one run, and
                     # `classify` reads `_Runner.last_report`, which the next
@@ -2491,6 +2656,16 @@ def preflight(
             "repo, or declare an explicit tests.p2p that does not reach either "
             "file; see taskset/HARVESTING.md."
         )
+
+    # ONE null-aware maximum, here, rather than at each reader. `max(())`
+    # raises ValueError and `max([1.0, None])` raises TypeError, so a reader
+    # computing this for itself gets it wrong on exactly the two verdicts
+    # that matter: the task where a run was skipped and the gate that never
+    # started a container. Unreached on the early return, where the seed's
+    # `None` is the honest answer -- nothing ran.
+    measured = [v for v in evidence["bounded_run_durations_s"].values()
+                if v is not None]
+    evidence["bounded_run_duration_max_s"] = max(measured) if measured else None
 
     return PreflightResult(
         task_id=task.task_id,

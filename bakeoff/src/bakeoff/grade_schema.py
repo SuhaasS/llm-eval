@@ -403,8 +403,14 @@ class GradeRecord:
     #: whether the grader's host was busier than the gate's: there is no host
     #: or contention block here (`RunRecord.host` has one; a grade does not),
     #: and `duration_s` at a timeout is just this number again. The figure
-    #: that would settle it -- preflight's OBSERVED suite duration, against
-    #: which this is the margin -- is not recorded anywhere yet (`TASKS.md`).
+    #: it is the margin against -- preflight's OBSERVED suite duration in the
+    #: same image -- is recorded since `PREFLIGHT_VERSION` 18, in
+    #: `<cache>/preflight/<task_id>.json` under `bounded_run_durations_s`;
+    #: join on `task_id` and date the gate with `graded_under_preflight_version`.
+    #: It is not copied onto this record, and deliberately: it is a property
+    #: of the task, it would go stale the moment the task is re-preflighted,
+    #: and a stale copy of a measurement is configuration reported as
+    #: observation.
     #: So read a `timed_out` grade as "this bound was hit", never as "this
     #: suite needs more than this bound".
     suite_timeout_s: int | None = None

@@ -25,6 +25,7 @@ from unittest import mock
 import pytest
 
 from bakeoff.preflight import (
+    BOUNDED_RUN_KEYS,
     EARLY_RETURN_RUNNER_MISMATCH,
     EVIDENCE_KEYS,
     EXIT_ALL_PASSED,
@@ -42,6 +43,8 @@ from bakeoff.preflight import (
     f2p_modules,
     failed_node_ids,
     preflight,
+    preflight_cache_key,
+    verdict_matches_key,
 )
 from bakeoff.tasks import (
     TaskGrading,
@@ -874,10 +877,25 @@ def test_the_gate_and_the_grader_bound_one_manifest_by_one_number(
 
 
 class _Exec:
-    def __init__(self, exit_code=0, stdout="", stderr=""):
+    def __init__(self, exit_code=0, stdout="", stderr="", duration_ms=0):
         self.exit_code = exit_code
         self.stdout = stdout
         self.stderr = stderr
+        # The field `RunContainer.exec` fills from `time.monotonic()` on the
+        # host. Defaulted to 0 rather than omitted so every scripted answer
+        # carries it: `preflight._elapsed_s` reads the attribute directly (no
+        # `getattr` default), which is what makes a forgotten field a loud
+        # `AttributeError` in a test rather than a `None` recorded as if it
+        # were a measurement.
+        #
+        # The other result stubs in this module do NOT need it and must not
+        # be given it: `_Recorder`'s `_R` and `_TablessIndex` are driven
+        # through `_Runner` or a single git command directly and never reach
+        # `preflight()`, so `_elapsed_s` never sees one. If a red test says
+        # otherwise, the fix is to give THAT stub the field -- never to relax
+        # `_elapsed_s` to a `getattr` default, which is the line D2 exists to
+        # hold.
+        self.duration_ms = duration_ms
 
 
 class _ScriptedContainer:
@@ -900,7 +918,8 @@ class _ScriptedContainer:
                  submodule_status="", submodule_status_exit=0,
                  gitlinks=(), gitmodules_declared=None, gitmodules_exit=None,
                  ls_entries=None, ls_exits=None,
-                 reports=None, bare_runner=None, apply_exit=0):
+                 reports=None, bare_runner=None, apply_exit=0,
+                 durations_ms=None):
         self.commands = []
         #: The JSON report each suite invocation writes, keyed by which run it
         #: is: `f2p_before`, `f2p_after`, `p2p_before`, `p2p_after`, `scoped`.
@@ -1020,12 +1039,28 @@ class _ScriptedContainer:
         #: three scope keys -- and the catch-all `git` branch below answered it
         #: a bare exit 0, so no test in this module could reach it.
         self.apply_exit = apply_exit
+        #: What each bounded invocation "took", in milliseconds, keyed by the
+        #: run this container already tells apart. String keys for the five
+        #: suite runs and the bare-runner probe; a TUPLE key for a grading
+        #: argv, exactly as `grading_exits` is keyed, because that branch is
+        #: discriminated by argv and not by name. Absent means 0, so every
+        #: test that does not care records `0.0` and stays unedited.
+        #:
+        #: The vocabulary is this container's, not the evidence's: the scoped
+        #: run is `scoped` here and `p2p_scoped_after` there. The one test
+        #: that asserts exact seconds maps them in its own body, which is
+        #: what keeps the mapping readable instead of implied.
+        self.durations_ms = dict(durations_ms or {})
 
     def __enter__(self):
         return self
 
     def __exit__(self, *exc):
         return False
+
+    def _timed(self, key, result):
+        result.duration_ms = self.durations_ms.get(key, 0)
+        return result
 
     def exec(self, cmd, env=None):
         self.commands.append(list(cmd))
@@ -1169,7 +1204,10 @@ class _ScriptedContainer:
         if cmd[0] == "timeout" and "--co" in cmd:
             self.bare_runner_calls += 1
             self.bare_runner_argvs.append(list(cmd))
-            return self.bare_runner if self.bare_runner is not None else _Exec()
+            return self._timed(
+                "bare_runner",
+                self.bare_runner if self.bare_runner is not None else _Exec(),
+            )
         if cmd[0] == "timeout":
             return self._timeout(cmd[2:])
         raise AssertionError(f"unscripted exec: {cmd!r}")
@@ -1177,26 +1215,33 @@ class _ScriptedContainer:
     def _timeout(self, argv):
         runner = list(self.tests.runner)
         if argv[: len(runner)] != runner:
-            return _Exec(exit_code=self.grading_exits.get(tuple(argv), 0))
+            return self._timed(
+                tuple(argv),
+                _Exec(exit_code=self.grading_exits.get(tuple(argv), 0)),
+            )
         rest = argv[len(runner):]
         if self.reports is not None:
             return self._node_timeout(rest)
         if rest == list(self.tests.f2p):
             self.f2p_runs += 1
             if self.f2p_runs == 1:  # red before the reference fix
-                return self.f2p_before or _Exec(
-                    exit_code=EXIT_TESTS_FAILED,
-                    stdout="".join(f"FAILED {n}\n" for n in self.tests.f2p),
+                return self._timed(
+                    "f2p_before",
+                    self.f2p_before or _Exec(
+                        exit_code=EXIT_TESTS_FAILED,
+                        stdout="".join(f"FAILED {n}\n" for n in self.tests.f2p),
+                    ),
                 )
-            return self.f2p_after or _Exec()
+            return self._timed("f2p_after", self.f2p_after or _Exec())
         if any(arg in self.tests.paths for arg in rest):
             self.scoped_runs += 1
-            return _Exec(exit_code=self.scoped_exit)
+            return self._timed("scoped", _Exec(exit_code=self.scoped_exit))
         self.p2p_runs += 1
         self.p2p_argvs.append(list(rest))
         if self.p2p_runs == 1 and self.p2p_before is not None:
-            return self.p2p_before
-        return _Exec()
+            return self._timed("p2p_before", self.p2p_before)
+        key = "p2p_before" if self.p2p_runs == 1 else "p2p_after"
+        return self._timed(key, _Exec())
 
     def _node_timeout(self, rest):
         """The same five suite CHECKS, each of which is now one or more commands.
@@ -1294,7 +1339,7 @@ class _ScriptedContainer:
         # file argument and a broken config with 1 alike, and a `-t` matching
         # nothing with 0. A test that could set it independently could pin a
         # classification the real runner cannot produce.
-        return _Exec(exit_code=_node_exit(report))
+        return self._timed(key, _Exec(exit_code=_node_exit(report)))
 
 
 @dataclass(frozen=True)
@@ -2410,10 +2455,21 @@ def test_the_preflight_version_moved_with_the_new_assertion():
     every verdict carries every key of `EVIDENCE_KEYS`, `None` where the gate
     did not look, and `early_return` names the pre-container refusal. No
     verdict moves: a cached 16 PASS was a PASS for the same reasons, so what
-    the bump re-runs is the READING and not the judgement."""
+    the bump re-runs is the READING and not the judgement.
+
+    17 -> 18 is the gate recording how long its own bounded runs took (round 2
+    item 7, 2026-09-03), and it is the SHAPE again: a v17 verdict carries
+    `suite_timeout_s` -- the bound the argv held -- beside nothing at all
+    saying what the run under it cost, so every `budget.suite_timeout_s` in
+    the task set was sized from a number measured by hand in a shell, outside
+    the image the gate runs in. Since 18 every verdict carries
+    `bounded_run_durations_s` -- one entry per bounded invocation, `null` for
+    a run that did not happen -- and `bounded_run_duration_max_s` beside it.
+    No verdict moves: a cached 17 PASS was a PASS for the same reasons, so
+    what the bump re-runs is the MEASUREMENT and not the judgement."""
     from bakeoff.preflight import PREFLIGHT_VERSION
 
-    assert PREFLIGHT_VERSION == "17"
+    assert PREFLIGHT_VERSION == "18"
 
 
 # --- fix 2: the bare-runner probe ---------------------------------------------
@@ -4333,7 +4389,22 @@ def test_evidence_keys_lists_exactly_what_preflight_writes():
     `ast.Starred` check reads the definition to prove the derivation is still
     a derivation, which is the one thing neither this equality nor
     `test_the_grading_evidence_keys_read_the_grading_dataclass_and_not_a_copy`
-    can see."""
+    can see.
+
+    `bounded_run_durations_s` is never a top-level Store target of `evidence`
+    -- round 2 item 7 seeds its shape from `_evidence_seed()` and writes only
+    INTO it, `evidence["bounded_run_durations_s"]["bare_runner"] = ...`, which
+    parses as a Subscript of a Subscript: the OUTER node's `.value` is a
+    Subscript (not the Name `evidence`, so the direct check below misses it)
+    and the INNER node -- `evidence["bounded_run_durations_s"]`, the outer
+    node's own `.value` -- carries `ctx=Load`, because in a chained
+    assignment target only the outermost Subscript is `Store` (verified
+    2026-09-03 with `ast.dump` against exactly this shape). So a Store-only
+    filter finds neither node for this key, which is what the second
+    comprehension below exists to fix: it reads the same chain from the
+    OUTER Store node's `.value` instead of requiring `ctx=Store` on the inner
+    one directly.
+    """
     import ast
     import pathlib
 
@@ -4347,6 +4418,17 @@ def test_evidence_keys_lists_exactly_what_preflight_writes():
                and isinstance(n.value, ast.Name) and n.value.id == "evidence"
                and isinstance(n.slice, ast.Constant)
                and isinstance(n.ctx, ast.Store)}
+    # A chained subscript assignment, `evidence["outer"]["inner"] = value`,
+    # nests `evidence["outer"]` -- ctx=Load -- inside the outer Store node's
+    # `.value`. Read it from there rather than requiring `ctx=Store` on the
+    # inner node, which it never carries.
+    written |= {
+        n.value.slice.value for n in ast.walk(fn)
+        if isinstance(n, ast.Subscript) and isinstance(n.ctx, ast.Store)
+        and isinstance(n.value, ast.Subscript)
+        and isinstance(n.value.value, ast.Name) and n.value.value.id == "evidence"
+        and isinstance(n.value.slice, ast.Constant)
+    }
     written |= {f"grading_{key}_exit" for key in _GRADING_KEYS}
 
     assert set(pf.EVIDENCE_KEYS) == written
@@ -4361,6 +4443,215 @@ def test_evidence_keys_lists_exactly_what_preflight_writes():
                   if isinstance(n, ast.AnnAssign)
                   and getattr(n.target, "id", None) == "EVIDENCE_KEYS")
     assert any(isinstance(e, ast.Starred) for e in assign.value.elts)
+
+
+# --- round 2 item 7: the gate records how long its own bounded runs took ---
+
+def test_the_bounded_run_keys_include_every_declared_grading_command():
+    """Adding a check to `TaskGrading` must move this tuple, because
+    `preflight` writes `grading_<key>` off the same dataclass and a key it
+    writes but does not list is refused by its own schema."""
+    assert {f"grading_{k}" for k in _GRADING_KEYS} <= set(BOUNDED_RUN_KEYS)
+    assert len(BOUNDED_RUN_KEYS) == 6 + len(_GRADING_KEYS)
+    assert len(BOUNDED_RUN_KEYS) == len(set(BOUNDED_RUN_KEYS))
+
+
+def test_a_bounded_run_dict_that_is_not_the_schema_is_refused():
+    """The third construction is the one that matters: a guard that merely
+    SKIPPED a non-dict would accept `[]`, and `PREFLIGHT_VERSION` 11 exists
+    because `[]` claimed a measurement never made."""
+    with pytest.raises(ValueError, match="missing.*unlisted"):
+        PreflightResult(
+            task_id="t", task_version=1, start_sha="s" * 40, image="i",
+            manifest_digest="d",
+            evidence=_evidence_seed() | {
+                "bounded_run_durations_s": {"f2p_before": 1.0}},
+        )
+    with pytest.raises(ValueError, match="invented"):
+        PreflightResult(
+            task_id="t", task_version=1, start_sha="s" * 40, image="i",
+            manifest_digest="d",
+            evidence=_evidence_seed() | {
+                "bounded_run_durations_s":
+                    dict.fromkeys(BOUNDED_RUN_KEYS) | {"invented": 1.0}},
+        )
+    with pytest.raises(ValueError, match="list"):
+        PreflightResult(
+            task_id="t", task_version=1, start_sha="s" * 40, image="i",
+            manifest_digest="d",
+            evidence=_evidence_seed() | {"bounded_run_durations_s": []},
+        )
+
+
+def test_the_seed_carries_the_full_bounded_run_schema():
+    """A module-level constant here would alias one mutable dict across every
+    `PreflightResult` in the process, and one gate's measurements would
+    surface in the next gate's verdict -- the aliasing bug that never fails
+    in a single-task test run."""
+    assert _evidence_seed()["bounded_run_durations_s"] == dict.fromkeys(
+        BOUNDED_RUN_KEYS)
+    assert (_evidence_seed()["bounded_run_durations_s"] is not
+            _evidence_seed()["bounded_run_durations_s"])
+
+
+def test_a_fresh_verdict_matches_the_key_it_was_written_under():
+    """With `_key_parts` shared, the join cannot drift -- what this pins is
+    the half a shared formatter cannot cover, that `verdict_matches_key`
+    reads the blob's four fields under the names `to_dict` writes them."""
+    container, task = _pytest_container()
+    result = _preflight_over((container, task))
+    image = "sha256:x"
+    start_sha = "s" * 40
+    key = preflight_cache_key(task, image, start_sha)
+
+    assert verdict_matches_key(result.to_dict(), key)
+    assert not verdict_matches_key(result.to_dict() | {"image": "sha256:other"}, key)
+    assert not verdict_matches_key(result.to_dict() | {"start_sha": "t" * 40}, key)
+    assert not verdict_matches_key(
+        result.to_dict() | {"preflight_version": "0"}, key)
+
+
+def test_every_bounded_run_records_its_own_wall_clock():
+    task = _FakeTask(grading=TaskGrading(build=("make",),
+                                         typecheck=("mypy", "src"),
+                                         lint=("ruff", "check")))
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=task.tests, present=("tests/",),
+        grading_exits={("make",): 0, ("mypy", "src"): 0, ("ruff", "check"): 0},
+    )
+    result = _preflight_over((container, task))
+
+    durations = result.evidence["bounded_run_durations_s"]
+    assert set(durations) == set(BOUNDED_RUN_KEYS)
+    assert all(isinstance(v, float) for v in durations.values())
+
+
+def test_a_bounded_run_that_never_happened_records_no_duration():
+    """The outer key set is item 5's schema test's claim and is not
+    re-asserted here -- what this asserts is that a run that did not happen
+    is a null INSIDE the dict rather than a missing entry, which is the same
+    rule one layer down and the layer where a nested value stops being
+    covered."""
+    refused = _preflight_over(_pytest_container(runner=("go", "test", "./...")))
+    durations = refused.evidence["bounded_run_durations_s"]
+    assert set(durations) == set(BOUNDED_RUN_KEYS)
+    assert all(v is None for v in durations.values())
+    assert refused.evidence["bounded_run_duration_max_s"] is None
+
+    apply_failed = _preflight_over(_apply_fails())
+    durations = apply_failed.evidence["bounded_run_durations_s"]
+    ran = {"bare_runner", "f2p_before", "p2p_before"}
+    for key in BOUNDED_RUN_KEYS:
+        if key in ran:
+            assert isinstance(durations[key], float), key
+        else:
+            assert durations[key] is None, key
+
+
+def test_the_recorded_duration_is_the_execs_own_clock():
+    """Distinct values per run, so a duration copied from the wrong result --
+    or a constant -- fails rather than passing on nine equal numbers.
+
+    Vocabulary note: the scripted container calls the scoped run `scoped`;
+    the evidence calls it `p2p_scoped_after`.
+    """
+    task = _FakeTask(grading=TaskGrading(typecheck=("mypy", "src")))
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=task.tests, present=("tests/",),
+        grading_exits={("mypy", "src"): 0},
+        durations_ms={
+            "bare_runner": 500, "f2p_before": 12_300, "p2p_before": 41_000,
+            "f2p_after": 1_500, "p2p_after": 2_250, "scoped": 999,
+            ("mypy", "src"): 7_000,
+        },
+    )
+    result = _preflight_over((container, task))
+
+    assert result.evidence["bounded_run_durations_s"] == {
+        "bare_runner": 0.5,
+        "f2p_before": 12.3,
+        "p2p_before": 41.0,
+        "f2p_after": 1.5,
+        "p2p_after": 2.25,
+        "grading_build": None,
+        "grading_typecheck": 7.0,
+        "grading_lint": None,
+        "p2p_scoped_after": 0.999,
+    }
+
+
+def test_the_slowest_bounded_run_is_recorded():
+    """The max is what `run_matrix` prints beside the bound and what a
+    `timed_out` grade is read against; it is computed once, in the gate,
+    because a null-aware maximum over a dict with skipped runs in it is the
+    computation a reader gets wrong, and a scripted 60 s for a run that never
+    happened is what proves it is skipping rather than defaulting."""
+    task = _FakeTask(grading=TaskGrading(typecheck=("mypy", "src")))
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=task.tests, present=("tests/",),
+        grading_exits={("mypy", "src"): 0},
+        durations_ms={
+            "bare_runner": 500, "f2p_before": 12_300, "p2p_before": 41_000,
+            "f2p_after": 1_500, "p2p_after": 2_250, "scoped": 999,
+            ("mypy", "src"): 7_000,
+        },
+    )
+    result = _preflight_over((container, task))
+    assert result.evidence["bounded_run_duration_max_s"] == 41.0
+
+    # The container's LARGEST scripted number (60 s) belongs to the scoped
+    # run, and an explicit tests.p2p means that run never happens.
+    tests = _FakeTests(p2p=("tests/b.py::test_two",))
+    task2 = _FakeTask(tests=tests)
+    container2 = _ScriptedContainer(
+        start_sha="s" * 40, tests=tests, present=("tests/",),
+        durations_ms={
+            "bare_runner": 500, "f2p_before": 3_000, "p2p_before": 9_000,
+            "f2p_after": 2_000, "p2p_after": 4_000, "scoped": 60_000,
+        },
+    )
+    result2 = _preflight_over((container2, task2))
+    assert result2.evidence["bounded_run_durations_s"]["p2p_scoped_after"] is None
+    assert result2.evidence["bounded_run_duration_max_s"] == 9.0
+
+
+@pytest.mark.parametrize("build", [route[1] for route in _SCHEMA_ROUTES],
+                         ids=[route[0] for route in _SCHEMA_ROUTES])
+def test_a_recorded_exit_code_always_has_a_duration_beside_it(build):
+    """Seven statement pairs covering nine invocations, one rule: a recorded
+    exit code always has a duration beside it. The failure this catches is a
+    tenth bounded command added later with an exit code and no clock, which
+    is how the gate got to nine commands and eight documented ones."""
+    result = _preflight_over(build())
+    evidence = result.evidence
+    pairs = [
+        ("bare_runner_exit", "bare_runner"),
+        ("f2p_before_exit", "f2p_before"),
+        ("p2p_before_exit", "p2p_before"),
+        ("f2p_after_exit", "f2p_after"),
+        ("p2p_after_exit", "p2p_after"),
+        *[(f"grading_{k}_exit", f"grading_{k}") for k in _GRADING_KEYS],
+        ("p2p_scoped_after_exit", "p2p_scoped_after"),
+    ]
+    for exit_key, duration_key in pairs:
+        assert (evidence[exit_key] is None) == (
+            evidence["bounded_run_durations_s"][duration_key] is None), (
+            exit_key, duration_key)
+
+
+def test_the_durations_move_no_verdict():
+    """This commit changes what a stored verdict SAYS, never what it
+    DECIDES; that is what makes the `PREFLIGHT_VERSION` bump a re-read
+    rather than a re-judgement."""
+    happy = _preflight_over(_pytest_container())
+    assert happy.ok
+    assert happy.problem_codes == ()
+    assert len(happy.problems) == 0
+
+    refused = _preflight_over(_pytest_container(runner=("go", "test", "./...")))
+    assert not refused.ok
+    assert refused.problem_codes == ()
+    assert len(refused.problems) == 1
 
 
 def test_the_early_return_names_itself():

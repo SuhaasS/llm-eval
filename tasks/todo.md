@@ -3783,7 +3783,7 @@ implementer would have had to invent, so the plan names them exactly.
 | "exactly two absence assertions in the tree" (review 1 grepped it) | **three** — item 1 landed a third `assert "p2p_scoped_after_exit" not in result.evidence` in `test_ambiguous_file_filters_is_measured_off_the_f2p_run_too`. Converted the same way |
 | the three hand constructions in `test_grade_script.py` | **five**, counting two in the same file's `fake_preflight` stubs and one in `test_run_matrix.py`. None passes `evidence=`, so the property the plan relied on holds and all five pass unedited |
 | no test named that pins `PREFLIGHT_VERSION` | `test_the_preflight_version_moved_with_the_new_assertion` asserts the literal and carries a running docstring of every bump. Updated to "17" with a 16 → 17 paragraph in the file's own style |
-| D2: a write-order tuple so `<cache>/preflight/<task_id>.json` "reads top to bottom in the order a reader would walk the gate" | **false for the artifact.** `matrix.write_json` dumps with `sort_keys=True`, so the stored blob is alphabetical from `ambiguous_file_filters` — verified against the click-3360 gate. The tuple stays in write order (that is the right shape for the constant and for `to_dict()`), and its docstring now says plainly that the order does not survive to the file, rather than transcribing a claim the artifact refutes |
+| D2: a write-order tuple so `<cache>/preflight/<task_id>.json` "reads top to bottom in the order a reader would walk the gate" | **false for the artifact.** `matrix.write_json` dumps with `sort_keys=True`, so the stored blob is alphabetical from `ambiguous_file_filters` — verified against the click-3360 gate. The tuple stays in write order (that is the right shape for the constant and for `to_dict()`) *(superseded by a048693: membership, not order)*, and its docstring now says plainly that the order does not survive to the file, rather than transcribing a claim the artifact refutes |
 
 **Also gated, and it did not pass — for a reason that is not this commit's.**
 The plan named `bidict-389-putall-rollback-clean` as its vehicle. It gates
@@ -3874,3 +3874,119 @@ test). Both mutation anchors for this section (`evidence: dict =
 _evidence_seed()` and `if set(self.evidence) != set(EVIDENCE_KEYS):`)
 re-checked present and unique in `preflight.py` by `grep -c`; neither line
 moved, so `mutation_check.py` was not re-run.
+
+## Round 2 item 7 — the gate records how long its own bounded runs took — 2026-09-03
+
+Plan: [docs/superpowers/plans/2026-09-03-round2-7-suite-durations.md](../docs/superpowers/plans/2026-09-03-round2-7-suite-durations.md).
+
+**What was found.** `~/.cache/bakeoff/preflight/*.json` carried 21 stored
+verdicts and not one key whose name contained `dur` — every author sized
+`budget.suite_timeout_s` from a number measured by hand in a shell (`time
+docker run`), outside the image the gate actually runs in. The item's own
+count was wrong by one in three places (`HARVESTING.md`, `docs/BUILDING-A-
+TASK-SET.md`, the click manifest's comment): preflight makes **nine** bounded
+commands on a pytest task, not eight — the five suite runs and up to three
+`grading.*` argvs, plus the bare pytest collection `PREFLIGHT_VERSION` 13
+added, which carries the same `timeout` prefix and was left out of every
+count. And half the item's own framing was already stale: `grader._timing`
+already fills `CheckResult.duration_s` from every rung that ran a command
+(`_State.passed`, `_State.fail`, `_State.environment`) — what was actually
+missing was the *reference* measurement, preflight's own, not a new
+`GradeRecord` field.
+
+**What was built.** `preflight.BOUNDED_RUN_KEYS`, a 9-entry tuple (6 fixed +
+`_GRADING_KEYS`, derived rather than restated), and two new evidence keys,
+`bounded_run_durations_s` (a dict keyed by `BOUNDED_RUN_KEYS`, `null` per run
+that did not happen) and `bounded_run_duration_max_s`. Both are seeded by
+`_evidence_seed()` — the inner dict built fresh per call, never a shared
+mutable — and `PreflightResult.__post_init__` gained two clauses, after item
+5's outer key-set check, refusing a non-dict or a mismatched inner key set.
+`_elapsed_s(result)` reads `result.duration_ms / 1000.0` off the same
+`ExecResult` `RunContainer.exec` already times with `time.monotonic()` on the
+host — no second clock. Seven statement pairs (the grading one a loop body)
+write all nine durations beside their exit codes; one null-aware maximum is
+computed once, after the container block, before the final return.
+`preflight_cache_key`'s join was extracted to `_key_parts`, shared with the
+new `verdict_matches_key`, so the two cache-key derivations cannot drift.
+`run_matrix.suite_time_line` prints the slowest run beside the bound on every
+task's line — cached, PASS and NO-GO alike, the NO-GO deliberately included
+since a `timeout`-killed task burns the full bound up to nine times and is the
+largest single contributor to the gate's own cost — and totals the gate at
+the end, with a caveat that image build, materialization and container start
+are not in that number. `cached_verdict` re-checks a stored blob against the
+key before trusting it, because `<cache>/preflight/<task_id>.json` is written
+before the `ok` test while `preflight.json` (the PASS cache) is written only
+on PASS, so the two can disagree on a `--force-preflight` run that NO-GOes.
+`PREFLIGHT_VERSION` "17" → "18". No `GradeRecord` field, no
+`GRADE_SCHEMA_VERSION` / `GRADER_VERSION` / `ORACLE_VERSION` move, no
+`_Runner` edit — the gated and graded argv stay byte-identical, and the
+grader's fake envs need no `duration_ms`.
+
+**Real-gate numbers — the first measurement of the gate's own cost this
+repository has.** `pytest-10210-approx-nested-container`
+(`~/.cache/bakeoff-probe/taskset`), `--preflight-only --force-preflight`:
+PASS, `suite time  slowest 114.4s of the 240s bound; 320.9s over 6 of the
+schema's 9 bounded runs`, `gate suite time  320.9s across 1 task(s)`. The
+stored blob (`~/.cache/bakeoff/preflight/pytest-10210-approx-nested-
+container.json`) carries all nine `bounded_run_durations_s` entries: `bare_runner
+0.075`, `f2p_before 0.745`, `p2p_before 114.388`, `f2p_after 0.57`, `p2p_after
+104.602`, all three `grading_*` `null` (this manifest declares none),
+`p2p_scoped_after 100.506`; `bounded_run_duration_max_s: 114.388`, equal to
+`p2p_before`, the largest entry. The manifest's own hand-measured comparison
+(`~/.cache/bakeoff-probe/reports/d4-suite-timeout.md`, "4470 passed... in
+106.34s") is close to but not the same interval as any single one of these —
+consistent with D2's argument that the host-side `docker exec` round trip is
+the right number and not an approximation of the container-internal one. A
+warm re-run (no `--force-preflight`) hit the cached-PASS branch and printed
+the **identical** suite-time line out of the stored blob, with `, 1 from
+cached verdicts` appended to the gate total — confirming `cached_verdict` /
+`verdict_matches_key` read the right file.
+
+**A plan defect found and fixed, not merely transcribed.** D7's claim that
+item 5's AST walk (`test_evidence_keys_lists_exactly_what_preflight_writes`)
+would find `bounded_run_durations_s` "through the inner subscript" of
+`evidence["bounded_run_durations_s"]["bare_runner"] = ...` is false as
+written: `ast.dump` on exactly that shape shows the *inner* Subscript node
+carries `ctx=Load`, not `Store` — only the outermost node in a chained
+assignment target is `Store`. The landed test filters on
+`isinstance(n.ctx, ast.Store)`, so neither the outer node (`.value` is a
+Subscript, not the Name `evidence`) nor the inner one (wrong ctx) matched, and
+the test failed with `bounded_run_durations_s` reported as an extra key on
+first run. The plan's own instruction — "verify that by running it, not by
+reasoning about it" — is what caught this; reasoning about the described
+behaviour would have shipped it broken. Fixed by adding a second comprehension
+to the walk that reads the OUTER Store node's `.value` (itself a Subscript on
+`evidence`) instead of requiring `Store` on the inner node directly — this
+realizes D7's stated intent rather than replacing it, and no top-level write
+of the shape was added to `preflight()` to work around it.
+
+**Deviations from the plan.**
+
+| what the plan said | what was done |
+|---|---|
+| T3.2 (the AST walk) "needs no change — verify that by running it" | needed a change; see above. The fix is additive (a second comprehension), so the existing walk's coverage of every other key is untouched |
+| D9's cached-branch code snippet included `resolved[task.task_id] = {"image": image, "start_sha": start_sha, "repo": work / "repo"}` | the tree's actual `resolved` dict shape (both branches, before this item) carries no `"repo"` key and nothing downstream reads one — kept it that way; adding an unused key to a dict a different item's design owns would be an unrequested, unreviewed change to a struct this item does not otherwise touch |
+| a pre-existing mutation anchor, "preflight: serve a verdict from an older preflight forever", targeted the literal line `return f"{task.manifest_digest}|{image}|{start_sha}|{PREFLIGHT_VERSION}"` | D10's `_key_parts` extraction removes that exact line from `preflight_cache_key`'s body (it now calls `_key_parts(...)`), so the anchor went STALE on the first mutation run (186/187). Moved the anchor to `_key_parts`'s own f-string — the one place the version is now dropped from — re-ran mutation_check.py solo a second time: 187/187, no stale anchors |
+| — | `test_the_preflight_version_moved_with_the_new_assertion` (a pre-existing version-pin test the plan's File Structure did not name) needed its literal `"17"` → `"18"` and a new 17→18 paragraph in the file's own running-narrative style; not doing so would have left a red test unrelated to any listed task |
+
+**Rejected alternatives**, per the plan's own D3/D4/D10 and confirmed still
+correct against the landed tree: a `GradeRecord.suite_duration_s` field
+(duplicates `CheckResult.duration_s`, forces `GRADE_SCHEMA_VERSION`); timing
+the oracle's two suite runs (forces `ORACLE_VERSION`, buys two full suite runs
+per task for a reading neither (a) nor (b) needs); storing the seconds in
+`preflight.json` beside the cache key instead of in the per-task verdict
+(needs no re-check but puts a derived copy where `grade.py`'s
+`record_preflight_pass` would never carry it); and a `suite_*`-prefixed key
+name (rejected because the bare-runner probe is a collection, not a suite
+run, and "bounded run" is what the tuple actually enumerates).
+
+Verified: `.venv/bin/python -m pytest tests/ -q` — `1674 passed, 67
+deselected` (baseline 1652 + 18 in `test_preflight.py` [4 + 5 unparametrized +
+9 parametrized over `_SCHEMA_ROUTES`] + 4 in `test_run_matrix.py`, matching the
+plan's own formula exactly). `test_grade_script.py` and `test_grader.py`
+untouched and green. `.venv/bin/python scripts/mutation_check.py` run solo
+twice (once to find the stale anchor above, once clean): **187/187 caught**,
+zero stale, up from the round's opening 183. `scripts/verify_logger.py` run
+(unchanged code path, run anyway per the plan's Verification list): **GATE
+PASSED**, `GO (offline criteria): every arm completed a loop on all 1 of 1
+run(s).` Real gate: see numbers above.

@@ -709,12 +709,25 @@ rather than by reasoning:
 
   **~40 s is still the practical ceiling, and raising the key is not a way
   around it.** `click`'s 1.4 s is what comfortable looks like. Raising
-  `suite_timeout_s` multiplies through: the worst case is 8 × the value for
-  one task's gate, all of it spent **before the proxy starts** and inside the
-  same one-hour SSO session the matrix itself needs (measured twice — the
-  window is one hour, not the eight an earlier note claimed). A task set of
-  slow suites can therefore burn the credential window on the gate and leave
-  nothing for the cells.
+  `suite_timeout_s` multiplies through: the worst case is **9 ×** the value
+  for one task's gate on a pytest task (8 × on a node one) — the five suite
+  runs and up to three `grading.*` argvs, **plus the bare pytest collection
+  the gate makes on every pytest task** — all of it spent **before the proxy
+  starts** and inside the same one-hour SSO session the matrix itself needs
+  (measured twice — the window is one hour, not the eight an earlier note
+  claimed). A task set of slow suites can therefore burn the credential
+  window on the gate and leave nothing for the cells.
+
+  **Size the key from the gate's own measurement, not from a shell.** Every
+  verdict written under `PREFLIGHT_VERSION` 18 or later carries
+  `bounded_run_durations_s` — host wall-clock seconds for each of those
+  bounded runs, `null` for the ones that did not happen — and
+  `bounded_run_duration_max_s`, in `<cache>/preflight/<task_id>.json`.
+  `run_matrix` prints the slowest beside the bound on every task's line, PASS
+  or NO-GO, and totals the gate at the end. That total, not the worst case,
+  is the number to check the one-hour SSO window against; a bound sized on a
+  hand-run `time docker run` outside the task image is measuring a different
+  environment than the one that will kill the suite.
 
   `budget.suite_timeout_s` may not exceed `budget.wall_clock_timeout_s`, and
   `load_task` refuses the manifest with the arithmetic when it does: the agent

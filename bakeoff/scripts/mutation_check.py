@@ -1699,10 +1699,16 @@ MUTATIONS = [
         # cache serves a verdict written by the OLD gate -- the pruned
         # mirror's "an older revision's output is served forever" defect, one
         # subsystem over. Two drivers now read this key.
+        #
+        # Round 2 item 7 (D10) extracted the join into `_key_parts`, shared by
+        # `preflight_cache_key` and `verdict_matches_key` so the two cannot
+        # drift -- the anchor moves to the ONE place the version is now
+        # dropped from, rather than staying on a call site that no longer
+        # spells the f-string itself.
         "preflight: serve a verdict from an older preflight forever",
         "src/bakeoff/preflight.py",
-        '    return f"{task.manifest_digest}|{image}|{start_sha}|{PREFLIGHT_VERSION}"',
-        '    return f"{task.manifest_digest}|{image}|{start_sha}"',
+        '    return f"{manifest_digest}|{image}|{start_sha}|{preflight_version}"',
+        '    return f"{manifest_digest}|{image}|{start_sha}"',
         "tests/test_run_matrix.py -k older_preflight_is_not_served",
         "not integration",
     ),
@@ -2258,6 +2264,48 @@ MUTATIONS = [
         "        if set(self.evidence) != set(EVIDENCE_KEYS):",
         "        if False:",
         "tests/test_preflight.py -k not_the_schema_is_refused",
+        "not integration",
+    ),
+    ( # The clock, not a constant. `duration_ms` is on every ExecResult and the
+      # bug that matters is reading the wrong one -- or none -- while the key
+      # set still looks complete. A verdict full of zeroes reads as a suite
+      # that costs nothing, which is the number an author sizes a bound from.
+        "preflight: record a constant instead of the exec's own clock",
+        "src/bakeoff/preflight.py",
+        "    return result.duration_ms / 1000.0",
+        "    return 0.0",
+        "tests/test_preflight.py -k the_execs_own_clock",
+        "not integration",
+    ),
+    ( # The one null-aware maximum. `max(())` raises and `max([1.0, None])`
+      # raises, so the alternative to computing it here is every reader getting
+      # it wrong on exactly the two verdicts that matter.
+        "preflight: report the slowest bounded run as if nothing ran",
+        "src/bakeoff/preflight.py",
+        '    evidence["bounded_run_duration_max_s"] = max(measured) if measured else None',
+        '    evidence["bounded_run_duration_max_s"] = None',
+        "tests/test_preflight.py -k slowest_bounded_run",
+        "not integration",
+    ),
+    ( # The inner schema. Seeded `None`, the shape exists only on the paths
+      # that measure something -- which is the two-families defect item 5
+      # closed, one layer down inside the one key whose value is a key set.
+        "preflight: seed the bounded-run durations as a bare None",
+        "src/bakeoff/preflight.py",
+        '    seed["bounded_run_durations_s"] = dict.fromkeys(BOUNDED_RUN_KEYS)',
+        '    seed["bounded_run_durations_s"] = None',
+        "tests/test_preflight.py -k never_happened_records_no_duration",
+        "not integration",
+    ),
+    ( # <cache>/preflight/<task_id>.json is keyed on the task id and nothing
+      # else, and is written before the `ok` test while preflight.json is
+      # written only on PASS. Trusting it because the filename matched
+      # publishes a refusing gate's seconds under a passing run's line.
+        "run_matrix: trust a stored verdict because the filename matched",
+        "scripts/run_matrix.py",
+        "    return blob if verdict_matches_key(blob, key) else None",
+        "    return blob",
+        "tests/test_run_matrix.py -k from_another_gate_is_not_printed",
         "not integration",
     ),
 ]

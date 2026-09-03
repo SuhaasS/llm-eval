@@ -550,3 +550,153 @@ def test_run_matrix_stops_before_any_image_when_a_selected_manifest_is_broken(
     assert rm.main() == 1
     out = capsys.readouterr().out
     assert out.startswith("task set: ")
+
+
+# --- round 2 item 7: the gate records how long its own bounded runs took ---
+
+
+def test_the_gate_prints_the_slowest_run_beside_the_bound():
+    """The format is asserted whole because it is the artifact -- an author
+    reads this line and edits a manifest from it. The denominator is the
+    schema's nine and not this task's ceiling, which is eight on a node task
+    and lower again with an explicit `tests.p2p`; the phrase "the schema's"
+    is what keeps that from being read as a per-task worst case, which is
+    the exact 9-vs-8 conflation this commit corrects in three documents."""
+    from bakeoff.preflight import BOUNDED_RUN_KEYS
+    import scripts.run_matrix as rm
+
+    durations = dict.fromkeys(BOUNDED_RUN_KEYS) | {
+        "f2p_before": 106.3, "p2p_before": 98.0,
+    }
+    verdict = {
+        "evidence": {
+            "suite_timeout_s": 240,
+            "bounded_run_durations_s": durations,
+            "bounded_run_duration_max_s": 106.3,
+        },
+    }
+
+    assert rm.suite_time_line(verdict) == (
+        "suite time  slowest 106.3s of the 240s bound; 204.3s over 2 of "
+        "the schema's 9 bounded runs"
+    )
+
+
+def test_the_line_says_which_kind_of_absence_it_is():
+    """Three absences that render identically are the defect this whole
+    round is about, and a print is where they are easiest to collapse."""
+    from bakeoff.preflight import BOUNDED_RUN_KEYS
+    import scripts.run_matrix as rm
+
+    all_null = {
+        "evidence": {
+            "suite_timeout_s": 240,
+            "bounded_run_durations_s": dict.fromkeys(BOUNDED_RUN_KEYS),
+            "bounded_run_duration_max_s": None,
+        },
+    }
+    assert rm.suite_time_line(all_null) == "suite time  no bounded command ran"
+
+    no_key = {"evidence": {}, "preflight_version": "13"}
+    assert rm.suite_time_line(no_key) == (
+        "suite time  not recorded: written by preflight_version 13"
+    )
+
+    unrecorded_bound = {
+        "evidence": {
+            "suite_timeout_s": None,
+            "bounded_run_durations_s": dict.fromkeys(BOUNDED_RUN_KEYS) | {
+                "f2p_before": 1.0},
+            "bounded_run_duration_max_s": 1.0,
+        },
+    }
+    assert "unrecorded bound" in rm.suite_time_line(unrecorded_bound)
+
+
+def test_a_cached_verdict_from_another_gate_is_not_printed(tmp_path):
+    """Name the concrete disagreement -- the blob is written before the `ok`
+    test and `preflight.json` only on PASS, so the two files can disagree
+    and a filename is not evidence about which gate wrote it."""
+    import scripts.run_matrix as rm
+
+    blob = {
+        "manifest_digest": "d", "image": "sha256:img", "start_sha": "s" * 40,
+        "preflight_version": "18", "ok": True,
+    }
+    path = tmp_path / "preflight" / "t.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(__import__("json").dumps(blob))
+
+    key = preflight_cache_key(
+        type("T", (), {"manifest_digest": "d"})(), "sha256:img", "s" * 40)
+
+    assert rm.cached_verdict(tmp_path, "t", key) == blob
+    assert rm.cached_verdict(
+        tmp_path, "t",
+        preflight_cache_key(type("T", (), {"manifest_digest": "d"})(),
+                            "sha256:other", "s" * 40),
+    ) is None
+    assert rm.cached_verdict(
+        tmp_path, "t",
+        preflight_cache_key(type("T", (), {"manifest_digest": "d"})(),
+                            "sha256:img", "t" * 40),
+    ) is None
+    assert rm.cached_verdict(
+        tmp_path, "t",
+        preflight_cache_key(type("T", (), {"manifest_digest": "d"})(),
+                            "sha256:img", "s" * 40) + "x",
+    ) is None
+    not_pass_path = tmp_path / "preflight" / "u.json"
+    not_pass_path.write_text(__import__("json").dumps(blob | {"ok": False}))
+    assert rm.cached_verdict(tmp_path, "u", key) is None
+    assert rm.cached_verdict(tmp_path, "nonexistent", key) is None
+
+
+def test_the_gate_totals_the_bounded_time_it_spent(monkeypatch, tmp_path, capsys):
+    """The per-task max answers "is this task's bound sized right"; only the
+    total answers the question the item asks first, which is whether the
+    gate fits inside the credential window -- and the NO-GO row is in the
+    total because a task killed by `timeout` is the largest contributor to
+    it, not an excluded one."""
+    from bakeoff.preflight import BOUNDED_RUN_KEYS, PreflightResult, _evidence_seed
+    import scripts.run_matrix as rm
+
+    monkeypatch.setattr(rm, "build_task_image",
+                        lambda task, base, build_root, cache: "sha256:img-" + task.task_id)
+    monkeypatch.setattr(rm, "image_entrypoint", lambda image: [])   # FALSY -- see below
+    monkeypatch.setattr(rm, "materialize", lambda task, repo, cache: "s" * 40)
+
+    def _canned(task_id, ok, suite_timeout_s, durations, problems=()):
+        evidence = _evidence_seed() | {
+            "suite_timeout_s": suite_timeout_s,
+            "bounded_run_durations_s": dict.fromkeys(BOUNDED_RUN_KEYS) | durations,
+            "bounded_run_duration_max_s": max(durations.values()),
+        }
+        return PreflightResult(
+            task_id=task_id, task_version=1, start_sha="s" * 40,
+            image="sha256:img-" + task_id, manifest_digest="d",
+            problems=problems, evidence=evidence, preflight_version="18",
+        )
+
+    _CANNED = {
+        "a": _canned("a", True, 600, {"f2p_before": 5.0, "p2p_before": 7.0}),
+        "b": _canned("b", True, 600, {"f2p_before": 1.0, "p2p_before": 2.0}),
+        "c": _canned("c", False, 240, {"f2p_before": 240.0},
+                     problems=("the f2p run timed out",)),
+    }
+    monkeypatch.setattr(rm, "preflight", lambda task, **kw: _CANNED[task.task_id])
+
+    tasks = [_ResolvableTask(task_id=t) for t in ("a", "b", "c")]
+    rm.resolve_tasks(tasks, {("python", "3.12"): "sha256:B"}, "2.1.220",
+                     tmp_path, force=True)
+
+    out = capsys.readouterr().out
+    assert (
+        "gate suite time  255.0s across 3 task(s)\n"
+        "                 bounded runs only -- image build, materialization "
+        "and container start are NOT in this number"
+    ) in out
+    assert (
+        "suite time  slowest 240.0s of the 240s bound; 240.0s over 1 of the "
+        "schema's 9 bounded runs"
+    ) in out

@@ -1556,20 +1556,26 @@ These need a call, not code. Most are cheap to make and expensive to make late.
   applied to `suite_timeout_s` only; extending it to the other two could refuse
   a manifest that loads today, so it is its own change.
 
-- [ ] **Preflight's observed suite duration is not recorded, and it is the
-  figure two separate readings need.** (a) `budget.suite_timeout_s` multiplies
-  through up to 8× per task at the gate, all of it before the proxy starts and
-  inside the one-hour SSO window, and nothing records how long the gate
-  actually took — so the interaction with `credential_window` can only be
-  documented (`HARVESTING.md`), never checked; a gate on the worst case would
-  refuse task sets that run fine. (b) A `timed_out` grade is a `GradeFailure`
-  stamped on the model, and `GradeRecord.suite_timeout_s` says only which bound
-  was hit — the **headroom**, the gap between what the suite needs and what it
-  was given, is the thing a reader actually wants, and it is unrecorded on both
-  sides. `GradeRecord` also carries no host or contention block
-  (`RunRecord.host` does), so nothing on the line can say the grader's host was
-  busier than the gate's. One measurement — preflight's per-run elapsed suite
-  time in the evidence — answers both.
+- [x] **Preflight's observed suite duration is not recorded, and it is the
+  figure two separate readings need.** Closed 2026-09-03 (round 2 item 7). The
+  bounded-command count in the older wording above was wrong by one: the gate
+  makes **nine** bounded commands per pytest task (8 on a node one), not 8 —
+  the five suite runs and up to three `grading.*` argvs, plus the bare pytest
+  collection `PREFLIGHT_VERSION` 13 added, which carries the same `timeout`
+  prefix and was left out of every count in `HARVESTING.md`,
+  `docs/BUILDING-A-TASK-SET.md` and the click manifest's own comment.
+  Reading (b)'s grader-side half was also already there: `CheckResult.duration_s`
+  is filled from every rung that ran a command (`grader._timing`, three call
+  sites) — what was actually missing was the *reference* measurement, not a
+  new `GradeRecord` field. So this closes with no `GradeRecord` field and no
+  `GRADE_SCHEMA_VERSION` / `GRADER_VERSION` / `ORACLE_VERSION` move: `preflight`
+  now writes `bounded_run_durations_s` (one entry per bounded invocation,
+  `null` for a run that did not happen) and `bounded_run_duration_max_s` into
+  its own evidence, seeded by `_evidence_seed()` and enforced by
+  `PreflightResult.__post_init__` the same way item 5's outer schema is.
+  `run_matrix` prints the slowest beside the bound on every task's line — PASS,
+  NO-GO or cache hit — and totals the gate at the end, bounded runs only.
+  `PREFLIGHT_VERSION` 18.
 
 - [ ] **`fresh_tree`'s husks are collected under two of six keys, and the empty
   key directories are never collected.** `container._sweep_stale_trees` runs at

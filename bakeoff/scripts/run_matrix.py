@@ -63,7 +63,11 @@ from bakeoff.matrix import (  # noqa: E402
     to_task_spec,
     write_json,
 )
-from bakeoff.preflight import preflight, preflight_cache_key  # noqa: E402
+from bakeoff.preflight import (  # noqa: E402
+    preflight,
+    preflight_cache_key,
+    verdict_matches_key,
+)
 from bakeoff.proxy import (  # noqa: E402
     EVAL_ARMS,
     SSO_LOGIN_HINT,
@@ -223,6 +227,83 @@ def prepare_bases(tasks) -> tuple[dict[tuple[str, str], str], str]:
     return bases, expected
 
 
+def suite_time_line(verdict: dict) -> str:
+    """One line: what the gate's bounded runs cost, against the bound they carried.
+
+    The bound comes from `evidence["suite_timeout_s"]`, which
+    `_Runner.last_timeout_s` read off the ARGV, and never from
+    `task.budget.suite_timeout_s`, which is in scope at both call sites.
+    They can disagree, and printing the configured number beside a measured
+    duration is configuration reported as observation -- in the one line
+    whose entire purpose is to let an author compare the two.
+
+    The denominator is the SCHEMA's size, not this task's worst case, and
+    the wording says so: a node task can make at most eight of these nine
+    (the bare-runner probe is pytest-only) and a task with an explicit
+    `tests.p2p` never makes the scoped one. "2 of the schema's 9" is a
+    statement about the key set; the ceiling for a given task is not
+    derivable from a verdict and is not claimed here.
+
+    Three answers, because the absences differ. A verdict written before
+    the bump in this commit has no durations at all and says so with the
+    version that wrote it; a verdict whose runs are all null is a gate that
+    started nothing; anything else is a measurement.
+    """
+    evidence = verdict.get("evidence") or {}
+    durations = evidence.get("bounded_run_durations_s")
+    if not isinstance(durations, dict):
+        return ("suite time  not recorded: written by preflight_version "
+                f"{verdict.get('preflight_version') or '?'}")
+    slowest = evidence.get("bounded_run_duration_max_s")
+    if slowest is None:
+        return "suite time  no bounded command ran"
+    measured = [v for v in durations.values() if v is not None]
+    bound = evidence.get("suite_timeout_s")
+    return (
+        f"suite time  slowest {slowest:.1f}s of the "
+        + (f"{bound}s bound" if bound is not None else "unrecorded bound")
+        + f"; {sum(measured):.1f}s over {len(measured)} of the schema's "
+        + f"{len(durations)} bounded runs"
+    )
+
+
+def _measured_total(verdict: dict) -> float:
+    """The bounded seconds a verdict recorded, 0.0 when it recorded none.
+
+    Reads the same two keys `suite_time_line` reads, the same tolerant way
+    -- `.get` at both levels -- so neither helper can raise out of
+    `resolve_tasks` on a truncated, hand-edited or future-shaped blob. A
+    reporting affordance may not be the thing that stops a matrix.
+    """
+    evidence = verdict.get("evidence") or {}
+    durations = evidence.get("bounded_run_durations_s") or {}
+    return sum(v for v in durations.values() if v is not None)
+
+
+def cached_verdict(cache: Path, task_id: str, key: str) -> dict | None:
+    """The stored verdict blob for THIS key, or `None` -- never a raise.
+
+    `<cache>/preflight/<task_id>.json` is filed under the task id alone and
+    is written BEFORE the `ok` test, while `preflight.json` -- the cache
+    that decides a PASS -- is written only on PASS. So a --force-preflight
+    run that NO-GOes leaves a stale PASS key in the one file and its own
+    NO-GO blob in the other, and a later warm invocation would read seconds
+    from a verdict that refused the task. `preflight.verdict_matches_key`
+    plus `ok is True` is what catches it.
+
+    A miss on anything -- absent, unreadable, not JSON, wrong key, not a
+    PASS -- is `None`, and the caller prints nothing.
+    """
+    path = Path(cache) / "preflight" / f"{task_id}.json"
+    try:
+        blob = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(blob, dict) or blob.get("ok") is not True:
+        return None
+    return blob if verdict_matches_key(blob, key) else None
+
+
 def resolve_tasks(tasks, bases, expected_version, cache, force):
     """Build each task's image, materialize its start state, and preflight.
 
@@ -261,6 +342,9 @@ def resolve_tasks(tasks, bases, expected_version, cache, force):
 
     resolved: dict[str, dict] = {}
     failures: list[str] = []
+    gate_seconds = 0.0
+    gate_tasks = 0
+    gate_cached = 0
     for task in tasks:
         print(f"\n=== {task.task_id} ===", flush=True)
         image = build_task_image(task, bases[task_runtime(task)],
@@ -285,6 +369,12 @@ def resolve_tasks(tasks, bases, expected_version, cache, force):
             key = preflight_cache_key(task, image, start_sha)
             if cached.get(task.task_id, {}).get("key") == key:
                 print("preflight cached PASS (--force-preflight to re-run)")
+                blob = cached_verdict(cache, task.task_id, key)
+                if blob is not None:
+                    print(f"          {suite_time_line(blob)}")
+                    gate_seconds += _measured_total(blob)
+                    gate_cached += 1
+                    gate_tasks += 1
                 resolved[task.task_id] = {"image": image,
                                           "start_sha": start_sha}
                 continue
@@ -293,12 +383,23 @@ def resolve_tasks(tasks, bases, expected_version, cache, force):
                 task, image=image, repo_path=work / "repo", start_sha=start_sha,
                 expected_claude_version=expected_version,
             )
-            write_json(cache / "preflight" / f"{task.task_id}.json",
-                       result.to_dict())
+            blob = result.to_dict()
+            write_json(cache / "preflight" / f"{task.task_id}.json", blob)
+            # Totalled BEFORE the verdict branch, and the NO-GO branch prints
+            # its line too. A task refused because a bounded run hit `timeout`
+            # burned the FULL suite_timeout_s, up to nine times -- the largest
+            # single contributor to the number this total exists to check the
+            # one-hour SSO window against, and the exact task whose bound an
+            # author is about to resize. A total that quietly meant "the
+            # tasks that passed" is the defect the caveat line below warns
+            # about, one line up.
+            gate_seconds += _measured_total(blob)
+            gate_tasks += 1
             if not result.ok:
                 print("preflight NO-GO")
                 for problem in result.problems:
                     print(f"  - {problem}")
+                print(f"          {suite_time_line(blob)}")
                 failures.append(
                     f"{task.task_id}: {len(result.problems)} problem(s)")
                 continue
@@ -306,6 +407,7 @@ def resolve_tasks(tasks, bases, expected_version, cache, force):
                 "preflight PASS  f2p red at start, green after the reference; "
                 "p2p green both ways; tree clean"
             )
+            print(f"          {suite_time_line(blob)}")
             cached[task.task_id] = {"key": key}
             resolved[task.task_id] = {"image": image, "start_sha": start_sha}
         finally:
@@ -314,6 +416,16 @@ def resolve_tasks(tasks, bases, expected_version, cache, force):
             # `fresh_tree` will never reissue the name -- which is the whole
             # difference from the shape this replaces.
             shutil.rmtree(work, ignore_errors=True)
+
+    if gate_tasks:
+        print(
+            f"\ngate suite time  {gate_seconds:.1f}s across {gate_tasks} task(s)"
+            + (f", {gate_cached} from cached verdicts" if gate_cached else "")
+        )
+        print(
+            "                 bounded runs only -- image build, materialization "
+            "and container start are NOT in this number"
+        )
 
     write_json(cache_path, cached)
     return resolved, failures

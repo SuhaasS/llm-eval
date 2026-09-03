@@ -358,8 +358,15 @@ budget:
   # agent re-runs this suite inside that budget, so a longer one describes a
   # task no arm could verify even once. Raising it multiplies the gate's wall
   # cost: preflight runs the suite five times (four when tests.p2p is
-  # declared) plus once per declared grading.* argv, all before the proxy
-  # starts and inside the same one-hour SSO session the matrix needs.
+  # declared) plus once per declared grading.* argv plus the bare pytest
+  # collection the gate makes on every pytest task -- 9x worst case on a
+  # pytest task (8x on a node one) -- all before the proxy starts and inside
+  # the same one-hour SSO session the matrix needs.
+  #
+  # Size it from bounded_run_durations_s in the cached verdict
+  # (<cache>/preflight/<task_id>.json), which is what the gate itself
+  # observed in this image -- not from a `time docker run` on the host,
+  # which measures a different environment than the one the bound kills in.
 
 provenance:
   repo: pallets/click

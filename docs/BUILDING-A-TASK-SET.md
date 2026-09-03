@@ -243,7 +243,7 @@ What you are looking for, and what each answer disqualifies:
 | observation | verdict |
 |---|---|
 | suite green, under ~40 s | usable. Preflight runs it five times per task (four with an explicit `tests.p2p`) plus once per declared `grading.*` argv, the oracle twice more, and the agent re-runs it inside its own timeout |
-| suite green but slow | usable only with `budget.suite_timeout_s` raised — and it must stay ≤ `budget.wall_clock_timeout_s`, or `load_task` refuses the manifest. Costs up to 8× the value per task at the gate, before the proxy starts and inside the one-hour SSO window |
+| suite green but slow | usable only with `budget.suite_timeout_s` raised — and it must stay ≤ `budget.wall_clock_timeout_s`, or `load_task` refuses the manifest. Costs up to 9× the value per task at the gate (8× on a node task), before the proxy starts and inside the one-hour SSO window — and the gate records what it actually cost in `bounded_run_durations_s` |
 | collection errors | usually one missing test dependency. Fixable by declaring it in `image.pip` — note which |
 | `git status` dirty after the suite | the suite writes into the tree. Every submission diff then carries the droppings and diff size measures the interpreter rather than the agent. Fixable with `gitignore_extra` |
 | needs a git submodule | usable. The submodule is derived from `base_sha` and populated from its own pruned mirror; check three things before cutting: the `.gitmodules` url is `https://`, the submodule has no submodules of its own, and the suite does not write inside it (an untracked file there shows as ` M <path>` in the superproject and is a preflight NO-GO that `gitignore_extra` cannot fix). If the suite does **not** need the submodule, `submodules_unneeded: ["<path>"]` declines to populate it and none of the three checks applies to that path. §6.4 confound to record in the manifest either way: the humans who wrote the PR had the submodule, so upstream's own suite was larger than any arm's |
@@ -474,7 +474,9 @@ budget:
   wall_clock_timeout_s: 900
   # suite_timeout_s: 600   # the timeout on every command preflight, the
   #                        # oracle and the grader run in the container.
-  #                        # Must not exceed wall_clock_timeout_s.
+  #                        # Must not exceed wall_clock_timeout_s. Size it
+  #                        # from bounded_run_durations_s in the cached
+  #                        # verdict, not from a hand-run `time docker run`.
 
 provenance:
   repo: <owner>/<repo>
