@@ -324,20 +324,16 @@ def cached_verdict(cache: Path, task_id: str, key: str) -> dict | None:
     return blob if verdict_matches_key(blob, key) else None
 
 
-def _stored_evidence(path: Path) -> dict:
-    """The verdict beside the cache key, or {}.
-
-    Best-effort by design: the note below is a courtesy and may not break a
-    warm gate whose verdict file was hand-deleted, truncated or written by a
-    driver that predates these keys.
-    """
-    try:
-        return json.loads(Path(path).read_text()).get("evidence") or {}
-    except (OSError, json.JSONDecodeError, AttributeError):
-        return {}
-
-
 def _print_build_generated(evidence: dict) -> None:
+    state = str((evidence or {}).get("build_generated_state") or "")
+    if state.startswith("failed: "):
+        # A scan that could not run and a scan that found nothing are both
+        # `build_generated_paths` falsy -- `_evidence_seed`'s whole point is
+        # that those two absences must not render identically, and the
+        # console is the one place an author actually looks. Checked first,
+        # so a failed scan is never silently reported as "nothing found".
+        print(f"note      the build-output scan did not complete: {state[8:]}")
+        return
     generated = (evidence or {}).get("build_generated_paths") or []
     if not generated:
         return
@@ -416,10 +412,9 @@ def resolve_tasks(tasks, bases, expected_version, cache, force):
             key = preflight_cache_key(task, image, start_sha)
             if cached.get(task.task_id, {}).get("key") == key:
                 print("preflight cached PASS (--force-preflight to re-run)")
-                _print_build_generated(
-                    _stored_evidence(cache / "preflight" / f"{task.task_id}.json"))
                 blob = cached_verdict(cache, task.task_id, key)
                 if blob is not None:
+                    _print_build_generated(blob.get("evidence") or {})
                     print(f"          {suite_time_line(blob)}")
                     gate_seconds += _measured_total(blob)
                     gate_cached += 1

@@ -832,7 +832,11 @@ def test_the_driver_prints_what_the_build_wrote_into_the_scaffold(
 ):
     """The note is printed on the fresh-gate path, PASS or NO-GO -- a task
     whose gate fails BECAUSE of a vanished file is exactly this line's
-    reader."""
+    reader. `problems` is non-empty here (the real pytest-10210 shape: the
+    bare collection exits 1 on a `ModuleNotFoundError` for a build-generated
+    module), so the NO-GO ordering the code implies -- the note BEFORE the
+    `preflight NO-GO` block -- is actually exercised rather than left to a
+    default `problems=()` that never takes that branch."""
     from bakeoff.preflight import _evidence_seed
     import scripts.run_matrix as rm
 
@@ -843,7 +847,10 @@ def test_the_driver_prints_what_the_build_wrote_into_the_scaffold(
     }
     _stub_resolve_tasks(
         monkeypatch, rm,
-        lambda task, **kw: _preflight_result(task, kw, evidence=evidence),
+        lambda task, **kw: _preflight_result(
+            task, kw, evidence=evidence,
+            problems=("the bare pytest collection (`timeout 240 python -m "
+                      "pytest --co -q`) exited 1",)),
     )
     task = _ResolvableTask()
 
@@ -854,6 +861,7 @@ def test_the_driver_prints_what_the_build_wrote_into_the_scaffold(
     assert "the image build wrote 2 file(s) into /repo" in out
     assert "sqlglot/_version.py" in out
     assert "sqlglot.egg-info/PKG-INFO" in out
+    assert out.index("the image build wrote") < out.index("preflight NO-GO")
 
 
 def test_the_driver_prints_nothing_when_the_build_wrote_nothing(
@@ -878,6 +886,34 @@ def test_the_driver_prints_nothing_when_the_build_wrote_nothing(
                      tmp_path, force=True)
 
     out = capsys.readouterr().out
+    assert "the image build wrote" not in out
+
+
+def test_a_scan_that_failed_prints_a_note_instead_of_nothing(
+    tmp_path, monkeypatch, capsys
+):
+    """`build_generated_paths` is falsy on BOTH "nothing found" (the ordinary
+    case, above) and "the scan could not run" (`build_generated_state` is
+    `"failed: ..."`, the key left `None`) -- the two absences must not render
+    identically on the console, the one place an author actually looks, or a
+    failed scan reads as a clean one."""
+    from bakeoff.preflight import _evidence_seed
+    import scripts.run_matrix as rm
+
+    evidence = _evidence_seed() | {
+        "build_generated_state": "failed: docker cp exit 1",
+    }
+    _stub_resolve_tasks(
+        monkeypatch, rm,
+        lambda task, **kw: _preflight_result(task, kw, evidence=evidence),
+    )
+    task = _ResolvableTask()
+
+    rm.resolve_tasks([task], {("python", "3.12"): "sha256:B"}, "2.1.220",
+                     tmp_path, force=True)
+
+    out = capsys.readouterr().out
+    assert "the build-output scan did not complete: docker cp exit 1" in out
     assert "the image build wrote" not in out
 
 

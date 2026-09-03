@@ -1522,3 +1522,24 @@ def test_a_symlink_in_the_run_tree_counts_as_present(tmp_path, monkeypatch):
     # false "generated" -- `_tree_paths` treats a symlink as present without
     # following it.
     assert images.scaffold_only_paths("img", tree) == []
+
+
+def test_a_symlinked_directory_in_the_run_tree_counts_as_present(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        images, "_repo_paths_in_image", lambda image: {"link"},
+    )
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    real = tree / "real"
+    real.mkdir()
+    (tree / "link").symlink_to(real, target_is_directory=True)
+
+    # os.walk reports a symlink to a DIRECTORY in `dirnames`, not
+    # `filenames` -- the sibling test above only exercises the filenames
+    # branch (a symlink to a FILE). Without `_tree_paths`'s dirnames loop,
+    # this symlinked directory is invisible to the tree side and every
+    # symlinked directory in a real run tree (a `docs/_static -> ../static`,
+    # say) would read as build-generated.
+    assert images.scaffold_only_paths("img", tree) == []

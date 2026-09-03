@@ -130,33 +130,46 @@ def _repo_paths_in_image(image: str) -> set[str]:
     # this case.
     container = _run(["docker", "create", "--entrypoint", "true", image])
     try:
-        proc = subprocess.Popen(
+        with subprocess.Popen(
             ["docker", "cp", f"{container}:/repo/.", "-"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
-        paths: set[str] = set()
-        try:
-            with tarfile.open(mode="r|", fileobj=proc.stdout) as tar:
-                for member in tar:
-                    if not (member.isfile() or member.issym() or member.islnk()):
-                        continue
-                    name = member.name[2:] if member.name.startswith("./") else member.name
-                    if name:
-                        paths.add(name)
-        finally:
-            # stderr is read only after the stream is drained or closed. Docker
-            # writes progress to stderr, so a pipe that filled DURING the stream
-            # would deadlock -- measured 2026-09-02 across all nine probe images
-            # (up to 15 MB streamed, 0.08-1.75 s, `wait()` 0 every time, no
-            # truncation and no hang), and closing stdout first gives `docker cp`
-            # an EPIPE rather than a reader that never returns.
-            if proc.stdout is not None:
-                proc.stdout.close()
-            stderr = proc.stderr.read().decode("utf-8", "replace") if proc.stderr else ""
-            code = proc.wait()
-        if code != 0:
-            raise ImageError(f"docker cp {image}:/repo failed (exit {code}):\n{stderr}")
-        return paths
+        ) as proc:
+            paths: set[str] = set()
+            # `tarfile.TarError` is caught rather than let escape: every
+            # `docker cp` failure writes NOTHING to stdout (measured
+            # 2026-09-03, against an image with no `/repo`: `tarfile.open`
+            # raises "empty file" before `code` is ever inspected), so an
+            # escaped TarError would discard the one text that names the
+            # cause -- `stderr` -- in favour of the tar module's opaque one.
+            tar_error: tarfile.TarError | None = None
+            try:
+                with tarfile.open(mode="r|", fileobj=proc.stdout) as tar:
+                    for member in tar:
+                        if not (member.isfile() or member.issym() or member.islnk()):
+                            continue
+                        name = member.name[2:] if member.name.startswith("./") else member.name
+                        if name:
+                            paths.add(name)
+            except tarfile.TarError as exc:
+                tar_error = exc
+            finally:
+                # stderr is read only after the stream is drained or closed. Docker
+                # writes progress to stderr, so a pipe that filled DURING the stream
+                # would deadlock -- measured 2026-09-02 across all nine probe images
+                # (up to 15 MB streamed, 0.08-1.75 s, `wait()` 0 every time, no
+                # truncation and no hang), and closing stdout first gives `docker cp`
+                # an EPIPE rather than a reader that never returns.
+                if proc.stdout is not None:
+                    proc.stdout.close()
+                stderr = proc.stderr.read().decode("utf-8", "replace") if proc.stderr else ""
+                code = proc.wait()
+            if code != 0:
+                raise ImageError(f"docker cp {image}:/repo failed (exit {code}):\n{stderr}")
+            if tar_error is not None:
+                raise ImageError(
+                    f"docker cp {image}:/repo produced an unreadable tar: {tar_error}"
+                )
+            return paths
     finally:
         subprocess.run(["docker", "rm", "-f", container], capture_output=True)
 
@@ -564,6 +577,12 @@ def render_dockerfile(base_image: str, apt: list[str], pip: list[str],
     # run time, and present only so `pip install -e .` has a project to read.
     lines.append("COPY repo /repo")
     for command in build:
+        # No newline guard on `command`: a double-quoted YAML scalar turns a
+        # literal `\n` into a real newline, which splits this single RUN into
+        # two Dockerfile lines and fails with an opaque "dockerfile parse
+        # error ... unknown instruction" that never names YAML (measured
+        # 2026-09-02, `tests/test_integration_build_outputs.py`). Write
+        # `build:` entries as single-quoted or block YAML scalars.
         lines.append(f"RUN cd /repo && {command}")
     # AFTER the last image.build step, because that is what it is checking, and
     # ONLY for a node base -- so a python task image renders byte-identically
