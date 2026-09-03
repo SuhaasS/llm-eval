@@ -2916,6 +2916,19 @@ MUTATIONS = [
         "tests/test_preflight.py -k uninitialised_parent_is_not_descended_into",
         "not integration",
     ),
+    (
+        # The third disagreement is only visible because the descent RECORDS
+        # the path it declined. Without the record `disagreed` is always
+        # empty and a status line claiming a directory is an initialised
+        # submodule, against a `--show-prefix` that says it is not a
+        # repository at all, passes the gate in silence.
+        "preflight: forget the paths the descent declined",
+        "src/bakeoff/preflight.py",
+        "                        not_own.append(path)",
+        "                        pass",
+        "tests/test_preflight.py -k not_a_repository",
+        "not integration",
+    ),
 ]
 
 

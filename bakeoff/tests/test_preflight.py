@@ -6348,3 +6348,28 @@ def test_one_unreadable_level_makes_submodules_orphaned_none(
     assert result.evidence["submodules_orphaned"] is None
     assert any("reading .gitmodules inside the submodule vendor/lib failed "
                "(exit 128)" in p for p in result.problems)
+
+
+def test_a_status_initialised_path_that_is_not_a_repository_is_a_problem(
+        monkeypatch, tmp_path):
+    """THE THIRD DISAGREEMENT, and the only one the recursion can see. A
+    leading-space status line says "initialised, HEAD at the gitlink"; a
+    non-empty `--show-prefix` says the directory is not a repository at all.
+    One reader is wrong about the tree the suite will run in, and the descent
+    stopped there, so anything below is unread."""
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=_FakeTests(), present=("tests/",),
+        gitlinks=("vendor/lib",),
+        submodule_status=(
+            " 1111111111111111111111111111111111111111 vendor/lib"
+            " (heads/main)\n"
+        ),
+        own_repo={"vendor/lib": False},
+        ls_entries={"vendor/lib": ("libdep",)},
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, _FakeTask(), container)
+
+    assert not result.ok
+    assert any("is not a repository of its own" in p and "vendor/lib" in p
+               for p in result.problems)

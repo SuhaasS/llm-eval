@@ -2304,7 +2304,7 @@ def preflight(
                     break
                 frontier = deeper
             gitlinks = None if probe_failed else tuple(depth_by_path)
-        if status.exit_code == 0 and gitlinks is None and probe_failed:
+        if status.exit_code == 0 and gitlinks is None and probe_failed is not None:
             # A level was reached and could not be interrogated. Same shape as
             # the two branches around it: `None` evidence and a problem, never
             # a shorter positive list.
@@ -2559,7 +2559,15 @@ def preflight(
                         )
                         continue
                     if persisted_by_name is None:
-                        continue
+                        # A prior level already nulled the whole read (round 2
+                        # item 18's review, finding 3). `break`, not
+                        # `continue`: once `None`, every remaining level's
+                        # exec above runs for nothing -- its parse result is
+                        # unreachable through the `is None` fallback on
+                        # `url_persisted` -- and a level that ALSO fails
+                        # appends a second, redundant problem for a state
+                        # already reported.
+                        break
                     for record in persisted.stdout.split("\0"):
                         if not record:
                             continue
