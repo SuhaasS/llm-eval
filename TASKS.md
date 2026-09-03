@@ -1105,23 +1105,6 @@ size. Two exceptions are marked CAPTURE and should ride along with Gate 1.
   manifest stamps a false `TASK_NOT_FOUND` into the append-only grades file at
   exit code 0.
 
-- [ ] **`run_matrix.py --preflight-only` rebuilds every base image
-  unconditionally before `resolve_tasks` runs, so `preflight.py`'s
-  base-tag-mismatch refusal cannot be exercised through the one command the
-  docs name for running the gate.** `prepare_bases` calls
-  `images.build_base_image` with no existence check, and a cache-hit
-  `docker build -t <tag>` silently retags the correct image back onto a
-  manually mutated tag before preflight's own `python --version` read-back
-  ever runs inside it. Measured 2026-09-02: mutating
-  `bakeoff-eval-agent:base-python-3.13` to point at the 3.11 image, then
-  running the documented gate command, printed `preflight PASS` with
-  `python_observed: Python 3.13.15` — the mutation was undone before the
-  read-back could see it. The refusal code itself is real and was verified
-  working when it was written; record this as "defence exists, not reachable
-  via the driver," not as dead code — exercising it needs either mutating
-  between `prepare_bases` and `resolve_tasks` inside one process (not
-  triggerable from outside) or calling `preflight()` directly.
-
 - [ ] **Files an `image.build` step writes INTO `/repo` are discarded by the
   runtime bind mount, and which side should own the fix is still an open
   decision, not a bug to patch quietly.** Measured 2026-09-02
@@ -1514,6 +1497,36 @@ judge runs after one — which is why they sit here rather than above.
   bump, hence a decision rather than a patch. The blind spot is named in
   `_supersedes`'s docstring and in rule 2's prose until it is closed.
 
+- [ ] **The node base image's id is minted fresh on every `docker build`, and
+  nobody knows why.** Measured 2026-09-02 (Docker 29.5.2, legacy builder), two
+  independent runs of six consecutive `docker build -q --build-arg
+  BASE_NODE_VERSION=22 -f docker/eval-agent-node.Dockerfile`: **six different
+  image ids each time** (`6369b7fd`, `bf7f559d`, `edd8d5da`, `8f4b71d3`,
+  `a04c9675`, `5867d905`; and `fa169de6`, `2d8051bd`, `cd4e0b99`, `c4cf77a6`,
+  `4cd1be5f`, `55f2fdc9`), 3.1–4.7 s each. The step log is identical on every
+  run: steps 1–15 report `---> Using cache`, including the `npm install` and
+  the `curl … install.sh`, and **`Step 16/16 : ENTRYPOINT []` reports `--->
+  Running in …`** and mints a new image. The parent is stable (`WORKDIR /repo`
+  → `4c2027501df2`) and dozens of matching children of it already exist, so
+  the cache lookup misses with candidates available. **The identical
+  instruction on the python base caches**: three builds of
+  `eval-agent.Dockerfile` at 3.13 → `sha256:4eb69f78dc68` three times, `Step
+  14/14 : ENTRYPOINT [] ---> Using cache`; and a throwaway python Dockerfile
+  ending in `LABEL` is stable across three builds, so it is the chain and not
+  the instruction. **Appending the `bakeoff.base.*` LABEL block does not fix
+  it** (three builds: `d905b550`, `76a654fa`, `a6300e5b`). Round 2 item 13
+  routes *around* this — `build_base_images` now reuses a labelled base, so
+  the repeat invocation stops building at all — but every cold path still
+  churns: a machine with no node base, a new `_NODE_VERSIONS` entry, any edit
+  to `eval-agent-node.Dockerfile`, `docker rmi`, `--pull --no-cache`. Each
+  mints a fresh id, which re-renders `FROM <base id>` in every node task's
+  Dockerfile and invalidates `preflight_cache_key` and `oracle_fingerprint`
+  for that runtime, and each leaks a dangling image (713 on the machine that
+  measured this). Not urgent — nothing is *wrong*, only rebuilt — but the next
+  person to watch a node base id move should not have to re-derive any of
+  this. Cleaning up the accumulated dangling images is an operator
+  `docker image prune`, not a harness action.
+
 These need a call, not code. Most are cheap to make and expensive to make late.
 
 - [ ] **`NotGradedReason` may want a `RECORD_SCHEMA_UNREADABLE` member.** The
@@ -1758,22 +1771,6 @@ These need a call, not code. Most are cheap to make and expensive to make late.
   plaintext values**, annotated in-file as an expired STS session superseded by
   the SSO profile. Inert and gitignored, but a real secret-key / session-token
   pair sitting on disk with no expiry tracking. Delete the lines.
-
-- [ ] **`images.py` carries two dead pieces from broadening 5's single-runtime
-  signature.** `_DEFAULT_PYTHON` (a module constant, restated from
-  `tasks._DEFAULT_PYTHON` for the import-cycle reason its own comment gives)
-  used to be `build_base_image`'s default argument; broadening 7 made the
-  runtime and version explicit at every call site, so the default is never
-  exercised. It is not fully unread, though — `test_images.py`'s
-  `test_every_copy_of_the_default_version_says_the_same_thing` still asserts
-  `images._DEFAULT_PYTHON == tasks._DEFAULT_PYTHON`, which is the drift pin
-  the constant exists for, so removing it would need that test rewritten
-  first, not just deleted. `build_base_image`'s `tag: str | None = None`
-  parameter is the other half: every caller in `bakeoff/src`, `scripts/` and
-  `tests/` passes only `(repo_root, runtime, version)`, so the parameter's
-  default is exercised on every call and its non-default branch never is.
-  Left in place when found (broadening 7, Task 5) to keep that diff to its
-  subject.
 
 - [ ] **A stored record graded before `SCHEMA_VERSION` 3.9.0 carries the
   tracked-but-ignored phantom, and its verdict was computed over it.**

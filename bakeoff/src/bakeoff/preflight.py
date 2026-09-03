@@ -36,6 +36,7 @@ from dataclasses import fields as dataclass_fields
 from pathlib import Path
 
 from bakeoff.container import RunContainer
+from bakeoff.images import base_tag, image_labels
 from bakeoff.runners import (
     KIND_FAILED,
     KIND_LOAD_ERROR,
@@ -328,7 +329,12 @@ _PYTEST_ADAPTER = for_framework("pytest")
 #: behaviourally inert on an empty list. No evidence key is added or
 #: removed; what moves is which argv every existing key was measured
 #: against.
-PREFLIGHT_VERSION: str = "21"
+#:
+#: 21 -> 22: `base_image_labels`: a verdict cached under 21 was written by a
+#: gate that recorded what the interpreter answered and not what the image
+#: claimed to be, so a base whose labels and interpreter disagree is
+#: indistinguishable in the older file from one where they agree.
+PREFLIGHT_VERSION: str = "22"
 
 
 def preflight_cache_key(task, image: str, start_sha: str) -> str:
@@ -488,6 +494,13 @@ EVIDENCE_KEYS: tuple[str, ...] = (
     "image_env_declared", "image_env_observed", "image_env_mismatch",
     "hypothesis_importable", "hypothesis_imported_by_suite",
     "python_declared", "python_observed",
+    #: Read HOST-side and needing no container, yet deliberately written
+    #: beside the interpreter probe rather than earlier where it could be:
+    #: reading it before the runner-gate early return would leave that path
+    #: carrying a label observation beside a `python_observed: None` -- one
+    #: evidence family answering on a path the other cannot, which is the
+    #: asymmetry a reader diffing two verdicts cannot resolve.
+    "base_image_labels",
     "submodules", "submodules_orphaned", "submodules_empty_after_suite",
     "runner_cache_flags", "runner_cache_flags_missing",
     "bare_runner_argv", "bare_runner_exit", "bare_runner_skipped",
@@ -849,12 +862,14 @@ def _declared_python(task) -> str:
     untyped `task`, and a manifest object predating the key must not crash the
     gate.
 
-    The fallback is IMPORTED, never restated. Three copies of the default
-    already exist (the Dockerfile's ARG, `tasks._DEFAULT_PYTHON`,
-    `images._DEFAULT_PYTHON`) and are pinned equal to each other by
-    tests/test_images.py; a fourth one here would be the only unpinned copy,
-    and it sits in the gate that exists to catch exactly this class of
-    disagreement.
+    The fallback is IMPORTED, never restated. TWO copies of the default exist --
+    the Dockerfile's `ARG BASE_PYTHON_VERSION` and `tasks._DEFAULT_PYTHON` --
+    and they are pinned equal by
+    tests/test_images.py::test_every_copy_of_the_default_version_says_the_same_thing.
+    This module restates neither; a third copy here would be the only unpinned
+    one, and it would sit in the gate that exists to catch exactly this class of
+    disagreement. (There were three: `images._DEFAULT_PYTHON` was the other, and
+    round 2 item 15 removed it -- it had no reader but its own pin.)
     """
     return getattr(getattr(task, "image", None), "python", "") or _DEFAULT_PYTHON
 
@@ -1669,6 +1684,26 @@ def preflight(
         # worst shape this repository knows -- the suite runs, the gate is
         # green, and the interpreter is not the one the task was cut for.
         #
+        # ONE OF THE THREE SHAPES BELOW IS NO LONGER REACHABLE THROUGH THE
+        # DRIVER, and that is deliberate rather than a gap. A hand-mutated base
+        # TAG is now repaired by `images.build_base_images` before this
+        # container starts -- it reads the tag's own `bakeoff.base.*` labels,
+        # finds they are not this base's, and rebuilds, naming the reason.
+        # Measured 2026-09-02, BEFORE that check existed the driver repaired it
+        # anyway, silently, via a cache-hit `docker build -t` retag, and a probe
+        # of this very refusal recorded PASS on a base it had deliberately
+        # broken. A tag cannot carry FORGED labels either: `docker tag` writes a
+        # name and not a config, so the only way to a lying label is to build an
+        # image -- and measured, such an image still answers 3.11.16 here and
+        # still lands on this refusal. The other two shapes -- a task image
+        # built against the wrong entry of the bases map, an `image.build`
+        # putting another interpreter first on PATH -- are reachable through the
+        # driver and are what a real task set produces. THIS PROBE IS
+        # PYTHON-ONLY; the node analogue is `images._NODE_RUNNER_REASSERTION`,
+        # re-run at every task image build. `tests/test_preflight.py
+        # ::test_an_interpreter_that_is_not_the_declared_one_is_refused` drives
+        # `preflight()` directly and is what pins the refusal itself.
+        #
         # Plain `python`, deliberately, and NOT the runner's interpreter.
         # `image.python` is a claim about the BASE image, and `python` is what
         # the Dockerfile's ARG selects; a task whose `tests.runner` names
@@ -1687,6 +1722,33 @@ def preflight(
         # OBSERVATION -- and refuses every node task in the set for the
         # absence of an interpreter its manifest is forbidden from declaring
         # (D12). `None` is the correct answer there: the gate did not look.
+
+        # WHAT THE IMAGE SAYS ABOUT ITSELF, beside what the interpreter says.
+        # A task image is `FROM <base image id>` and docker propagates a
+        # parent's labels verbatim (measured 2026-09-02), so these are the base
+        # image's own three keys read off the artifact under test -- no second
+        # lookup of which base tag produced it, and correct for a node task,
+        # which makes no interpreter claim at all.
+        #
+        # RECORDED, NEVER REFUSED ON, and the asymmetry is the point. A label is
+        # configuration the build stamped; `python_observed` below is an
+        # observation. When they disagree the interpreter is the authority and
+        # this file carries both, because a verdict cached under this key
+        # outlives the code that wrote it and "the image claimed 3.11 and ran
+        # 3.13" is a finding a reader has to be able to reconstruct.
+        #
+        # `{}` is an image carrying no `bakeoff.base.*` keys -- every base built
+        # before those labels existed, and every task image derived from one.
+        # `None` is "nobody could be asked": no such image, or no docker binary
+        # to ask with. Two absences that render identically are the same defect
+        # one layer down; these two do not.
+        base_seen = image_labels(image)
+        evidence["base_image_labels"] = (
+            None if base_seen is None
+            else {k: v for k, v in base_seen.items()
+                  if k.startswith("bakeoff.base.")}
+        )
+
         python = (container.exec(["python", "--version"])
                   if runtime == "python" else None)
         if python is None:
@@ -1720,7 +1782,14 @@ def preflight(
                     "base rather than a manifest error: rebuild the bases "
                     "(`run_matrix.py --preflight-only` builds the set the task "
                     "set needs) and rebuild this task's image against the "
-                    "right one"
+                    "right one. That command REUSES a base whose "
+                    "`bakeoff.base.*` labels already match what its Dockerfile "
+                    "would stamp, so if it does not fix this, delete the tag "
+                    f"first -- `docker rmi {base_tag('python', declared_python)}`"
+                    " -- or rebuild it with "
+                    "`--pull --no-cache`, which is the only way to pick up a "
+                    "republished upstream image, a changed claude.ai installer "
+                    "or a moved apt/pip package"
                 )
 
         for tool in ("git", "rg"):

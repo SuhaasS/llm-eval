@@ -351,13 +351,18 @@ def task_resolver(cache: Path, force_preflight: bool = False) -> Callable:
     to grade a collection that is already paid for. `resolve_task`'s own
     `base_image` parameter is unchanged: it takes one image, and the caller
     decides which.
+
+    `build_base_images` returns a `BaseImage` per key and this unwraps to the
+    id: the grader has no banner to print the reused/built decision on, and a
+    driver that runs after the money is spent has nothing to do with it.
     """
     built: dict[tuple[str, str], str] = {}
 
     def resolve(task) -> TaskSetup:
         key = task_runtime(task)
         if key not in built:
-            built.update(build_base_images(REPO, [key]))
+            built.update({key: base.image_id for key, base
+                          in build_base_images(REPO, [key]).items()})
         return resolve_task(task, cache, built[key], force_preflight)
 
     return resolve

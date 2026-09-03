@@ -24,6 +24,9 @@
 # Build:
 #   docker build -f docker/eval-agent-node.Dockerfile \
 #     --build-arg BASE_NODE_VERSION=22 -t bakeoff-eval-agent:base-node-22 .
+#
+# The DRIVERS build these. A hand build passes no BAKEOFF_BASE_DOCKERFILE_SHA,
+# so the image stamps an empty sha and the next driver run rebuilds it.
 
 # BASE_NODE_VERSION, never NODE_VERSION. The official node: images set their
 # own `ENV NODE_VERSION` (measured 22.23.2), and ENV beats a redeclared ARG
@@ -218,3 +221,14 @@ WORKDIR /repo
 # RunContainer overrides this with `sleep infinity` and drives the container
 # through exec; an image-declared ENTRYPOINT would prefix that command.
 ENTRYPOINT []
+
+# What this image says about itself. See eval-agent.Dockerfile's copy of this
+# block for why it is last, why the `ARG` must be redeclared here (without it
+# the label stamps the empty string, silently), why the ARG name carries the
+# BASE_ prefix (`ENV NODE_VERSION=22.23.2` on this base, measured; this label
+# reads "22"), and why it is not a gate.
+ARG BASE_NODE_VERSION
+ARG BAKEOFF_BASE_DOCKERFILE_SHA=""
+LABEL bakeoff.base.runtime="node" \
+      bakeoff.base.version="${BASE_NODE_VERSION}" \
+      bakeoff.base.dockerfile_sha="${BAKEOFF_BASE_DOCKERFILE_SHA}"

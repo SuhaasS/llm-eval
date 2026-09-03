@@ -121,7 +121,9 @@ def _short_base_label(key) -> str:
 
     Kept distinct from `_base_label` so the python line reads exactly as it did
     before node existed -- `base py3.12  sha256:...` is what every stored
-    preflight log and every runbook shows.
+    preflight log and every runbook shows. The line now carries a trailing
+    `(reused)` or `(built: <reason>)`, appended by `prepare_bases`; this
+    function's own return value is unchanged.
     """
     runtime, version = key
     return f"py{version}" if runtime == "python" else f"{runtime}{version}"
@@ -215,15 +217,28 @@ def prepare_bases(tasks) -> tuple[dict[tuple[str, str], str], str]:
     indexing on that key hands a vitest task the python base. That image builds
     and that container starts; the runner is simply absent, and it reaches the
     model as exit 127 on every arm.
+
+    A base the daemon already carries is REUSED rather than rebuilt, and the
+    banner says which happened AND why. `images.build_base_images` decides that
+    by reading the three `bakeoff.base.*` labels off the tag; anything that does
+    not say it is exactly this base -- a mutated tag, an unlabelled image, no
+    such tag -- is rebuilt with the reason named. That reason is the whole point
+    of returning the decision rather than asking for it twice: `(built)` alone
+    reads identically on a cold machine and on a tag someone mistagged, and the
+    second is the case a probe of preflight's read-back was silently defeated by
+    on 2026-09-02.
     """
     keys = sorted({task_runtime(task) for task in tasks})
     print(f"\nbuilding {len(keys)} base image(s): "
           f"{', '.join(_base_label(k) for k in keys)} ...", flush=True)
-    bases = build_base_images(REPO, keys)
+    built = build_base_images(REPO, keys)
+    bases = {key: base.image_id for key, base in built.items()}
     expected = assert_one_agent(bases)
     for key in keys:
-        print(f"base {_short_base_label(key)}  {bases[key][:19]}...  "
-              f"claude {expected}")
+        base = built[key]
+        state = "reused" if base.reused else f"built: {base.reason}"
+        print(f"base {_short_base_label(key)}  {base.image_id[:19]}...  "
+              f"claude {expected}  ({state})")
     return bases, expected
 
 

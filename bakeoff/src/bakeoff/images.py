@@ -38,21 +38,14 @@ check exists rather than being assumed.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import subprocess
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 
 PROXY_TAG = "bakeoff-litellm-proxy:matrix"
-
-#: Restated rather than imported: `build_task_image` already imports `tasks`
-#: locally rather than at module scope, and a module-scope import here would
-#: undo that. Pinned equal to `tasks._DEFAULT_PYTHON` AND to the Dockerfile's
-#: `ARG BASE_PYTHON_VERSION` default by
-#: tests/test_images.py::test_every_copy_of_the_default_version_says_the_same_thing
-#: -- three copies that can drift is a manifest declaring nothing loading as a
-#: task whose base nobody built.
-_DEFAULT_PYTHON = "3.12"
-
 
 #: One Dockerfile and one build arg per runtime. A dict rather than an
 #: if/else so adding a runtime is one entry and the two facts about it cannot
@@ -118,14 +111,163 @@ def image_id(tag: str) -> str:
 
 def image_entrypoint(tag: str) -> list[str]:
     raw = _run(["docker", "inspect", "--format", "{{json .Config.Entrypoint}}", tag])
-    import json
-
     value = json.loads(raw)
     return list(value or [])
 
 
-def build_base_image(repo_root: Path, runtime: str, version: str,
-                     tag: str | None = None) -> str:
+@dataclass(frozen=True)
+class BaseImage:
+    """One base, whether this invocation had to build it, and why.
+
+    A bare id cannot carry the second fact, and the driver's banner is the only
+    place an operator learns that a Dockerfile edit was picked up -- or that a
+    tag was found saying it was something else. `(built)` alone would not do
+    that: it is byte-identical between a cold machine and a mutated tag, which
+    is the "two absences that render identically" shape this repository refuses
+    everywhere else. Returning the reason is also what keeps `prepare_bases`
+    from asking the same question a second time for its message (the plan's
+    section 2.7).
+
+    `reason` is `None` exactly when `reused` is True.
+    """
+    image_id: str
+    reused: bool
+    reason: str | None = None
+
+
+def base_fingerprint(repo_root: Path, runtime: str, version: str) -> str:
+    """Every input to this base image that this harness controls, hashed.
+
+    The Dockerfile TEXT plus the one build arg that reaches it. Deliberately
+    NOT the build context: neither base file has a COPY (measured 2026-09-02),
+    so the context contributes no layer, and hashing `bakeoff/` would rebuild
+    both bases for an edit to `costs.py`.
+
+    Deliberately NOT the upstream `python:`/`node:` tag's content, the
+    claude.ai installer, apt or npm -- and `docker build` cannot see those
+    either. The legacy builder's cache is keyed on the instruction STRING, so a
+    rebuild that hits cache is a retag and not a freshness guarantee (measured
+    2026-09-02: a mutated tag was restored to the original image id in 0.04 s).
+    Picking up upstream drift needs `--pull --no-cache`, which no driver here
+    has ever passed; preflight's mismatch refusal and
+    `docs/BUILDING-A-TASK-SET.md` section 3.6 both name that command rather than
+    hiding it behind a flag.
+    """
+    # `base_tag` FIRST, for the reason `build_base_image` gives: it carries the
+    # named refusal for an unknown runtime, and indexing `_BASES` before it
+    # would answer with a bare KeyError.
+    base_tag(runtime, version)
+    dockerfile, build_arg = _BASES[runtime]
+    text = (Path(repo_root) / "docker" / dockerfile).read_bytes()
+    return hashlib.sha256(
+        text + b"\0" + f"{build_arg}={version}".encode()
+    ).hexdigest()
+
+
+def base_labels(repo_root: Path, runtime: str, version: str) -> dict[str, str]:
+    """What a base built from this Dockerfile at this version must say it is.
+
+    ONE definition, read twice: `build_base_image` passes the sha in as a build
+    arg and `base_is_current` compares what came back. The label keys are
+    spelled in the Dockerfiles too, which is a second copy that can drift --
+    tests/test_images.py::test_the_label_the_dockerfile_stamps_is_the_one_the_harness_expects
+    reads both files and pins them, because a key spelled two ways here is a
+    base that is rebuilt on every invocation forever and nothing that says so.
+    """
+    return {
+        "bakeoff.base.runtime": runtime,
+        "bakeoff.base.version": version,
+        "bakeoff.base.dockerfile_sha": base_fingerprint(repo_root, runtime, version),
+    }
+
+
+def image_labels(image: str) -> dict[str, str] | None:
+    """The labels an image carries, or `None` when nobody could be asked.
+
+    TWO absences, not three, and they are named together on purpose. `None`
+    covers both "nothing resolves under that name" -- `docker image inspect`
+    exits 1 with `Error response from daemon: No such image: <name>` -- and
+    "the probe could not run at all", which is what an absent `docker` binary
+    gives: `subprocess.run` raises `FileNotFoundError` rather than returning
+    non-zero, and this function is called from `preflight`, which runs inside an
+    OFFLINE unit suite where no daemon is assumed. Both mean "this tag told us
+    nothing", and both mean rebuild.
+
+    `{}` is the third state and is a real observation: an image that exists and
+    declares no labels. That is what EVERY base built before this change
+    reports -- measured 2026-09-02 against the real
+    `bakeoff-eval-agent:base-python-3.13`, `--format '{{json .Config.Labels}}'`
+    prints the four bytes `null`. Collapsing `{}` into `None` makes an
+    unlabelled image and an absent one the same fact in `preflight`'s evidence,
+    where only one of them says the gate looked.
+
+    Takes an id as readily as a tag, which is what lets `preflight` read the
+    labels a TASK image inherited from its base: docker propagates a parent's
+    labels verbatim into a derived image (measured 2026-09-02).
+
+    `subprocess.run` and not `_run`, because `_run` raises on a non-zero exit
+    and "no such image" is an answer here rather than a failure.
+    """
+    try:
+        probe = subprocess.run(
+            ["docker", "image", "inspect", "--format", "{{json .Config.Labels}}",
+             image],
+            capture_output=True, text=True,
+        )
+    except OSError:
+        return None
+    if probe.returncode != 0:
+        return None
+    return json.loads(probe.stdout.strip() or "null") or {}
+
+
+def base_is_current(repo_root: Path, runtime: str,
+                    version: str) -> tuple[str | None, str | None]:
+    """The id the base tag resolves to when the IMAGE says it is this base.
+
+    Returns `(image_id, None)` or `(None, reason)` -- exactly one is not None.
+    The reason is carried so the driver's banner can distinguish a cold machine
+    from a tag that was found saying something else; a bare "built" cannot.
+
+    THE LABELS DESCRIBE ANCESTRY, NOT IDENTITY. Docker propagates a parent's
+    labels verbatim, so an image DERIVED from this base claims to be it --
+    every `bakeoff-task-*` image does, since `render_dockerfile` emits no LABEL
+    of its own. There is no cheap discriminator (every label is inherited, and
+    entrypoint, workdir and layer count separate nothing here), so the residue
+    is named rather than papered over: a base tag hand-mistagged onto a task
+    image is accepted here, and the unconditional build this replaced did heal
+    that one state. See the plan's section 10.
+
+    A SUBSET comparison: an image may legitimately carry other labels, and these
+    three are the only ones this harness has an opinion about.
+    """
+    tag = base_tag(runtime, version)
+    labels = image_labels(tag)
+    if labels is None:
+        return None, "the tag names no image"
+    expected = base_labels(repo_root, runtime, version)
+    if not any(key in labels for key in expected):
+        return None, "the tag carries no bakeoff.base.* labels"
+    for key, want in expected.items():
+        if labels.get(key) == want:
+            continue
+        # The sha is 64 hex on both sides and says nothing to a reader in a
+        # banner; the other two keys are the whole message. Named, not printed.
+        #
+        # A PARTIALLY labelled image renders `the tag said
+        # bakeoff.base.version=None, this base is '3.13'`. That reads like a
+        # value and is not one -- docker label values are always strings, so
+        # `None` here can only mean the key is absent, which is why it is left
+        # as the bare repr rather than dressed up in a sentinel a real label
+        # could collide with.
+        if key == "bakeoff.base.dockerfile_sha":
+            return None, "the tag was built from a different base Dockerfile"
+        return None, (f"the tag said {key}={labels.get(key)!r}, "
+                      f"this base is {want!r}")
+    return image_id(tag), None
+
+
+def build_base_image(repo_root: Path, runtime: str, version: str) -> str:
     """Build one runtime's base Dockerfile at one version and return its ID.
 
     The version reaches the build as `--build-arg BASE_<RUNTIME>_VERSION`,
@@ -143,12 +285,18 @@ def build_base_image(repo_root: Path, runtime: str, version: str,
     """
     # `base_tag` FIRST: it carries the named refusal for an unknown runtime,
     # and indexing `_BASES` before it would answer with a bare KeyError.
-    tag = tag or base_tag(runtime, version)
+    tag = base_tag(runtime, version)
     dockerfile, build_arg = _BASES[runtime]
     _run(
         [
             "docker", "build", "-q",
             "--build-arg", f"{build_arg}={version}",
+            # What the image will then say it is. `base_is_current` compares
+            # what came back against `base_labels`, so this argument and that
+            # comparison read ONE definition.
+            "--build-arg",
+            f"BAKEOFF_BASE_DOCKERFILE_SHA="
+            f"{base_fingerprint(repo_root, runtime, version)}",
             "-f", str(Path(repo_root) / "docker" / dockerfile),
             "-t", tag, str(repo_root),
         ]
@@ -158,26 +306,37 @@ def build_base_image(repo_root: Path, runtime: str, version: str,
 
 def build_base_images(repo_root: Path,
                       runtimes: Iterable[tuple[str, str]],
-                      ) -> dict[tuple[str, str], str]:
-    """Every base a task set needs, built once per distinct pair.
+                      ) -> dict[tuple[str, str], BaseImage]:
+    """Every base a task set needs, built once per distinct pair -- and only
+    when the daemon does not already carry it.
 
-    Keyed by `(runtime, version)` because that is what identifies a base now.
-    Broadening 5 keyed it by version alone and said in as many words that when
-    node arrived the key would become whatever tuple identifies a base, and
-    that this function and `base_tag` would be the only places that changed.
+    THE SKIP IS NOT AN OPTIMISATION ALONE. `run_matrix.main` calls this before
+    `resolve_tasks`, so an unconditional `docker build -t` retags the correct
+    image over a mutated tag before preflight's read-back ever runs inside it --
+    measured 2026-09-02, which is how a probe of that read-back recorded PASS on
+    a base it had deliberately broken. Reading the image's own labels makes the
+    repair a DECISION the driver reports instead of a side effect.
 
-    Callers pass one entry per TASK; this deduplicates. Building per task pays
-    a full image build for every duplicate, and on a 60-task set that turns
-    the free offline half of `--preflight-only` into something nobody waits
-    for.
-
-    Sorted, so a build log reads the same way twice and a failure names the
-    same base first.
+    A cache-hit rebuild is cheap but not free, and on the node chain it is not
+    idempotent: measured 2026-09-02, six consecutive builds of
+    eval-agent-node.Dockerfile reported `Using cache` for steps 1-15 and minted
+    a NEW image id at step 16 every time. `build_task_image` renders
+    `FROM <base image id>`, and `preflight_cache_key` and `oracle_fingerprint`
+    both hash the resulting task image, so that churn rebuilt every node task
+    image and invalidated every warm node verdict on every invocation of the
+    offline half documented as free. The skip removes that from the REPEAT
+    invocation; a genuine rebuild still mints a fresh node id, and that is
+    correct rather than regrettable.
     """
-    return {
-        pair: build_base_image(repo_root, *pair)
-        for pair in sorted(set(runtimes))
-    }
+    built: dict[tuple[str, str], BaseImage] = {}
+    for pair in sorted(set(runtimes)):
+        current, reason = base_is_current(repo_root, *pair)
+        built[pair] = (
+            BaseImage(current, reused=True) if current is not None
+            else BaseImage(build_base_image(repo_root, *pair), reused=False,
+                           reason=reason)
+        )
+    return built
 
 
 def build_proxy_image(repo_root: Path, tag: str = PROXY_TAG) -> str:

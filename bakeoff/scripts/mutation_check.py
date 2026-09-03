@@ -2549,6 +2549,33 @@ MUTATIONS = [
         "tests/test_preflight.py -k names_more_than_one_test",
         "not integration",
     ),
+    (
+        # The measured defect, as a mutation. Accepting a tag whose labels say
+        # something else is what an unconditional cache-hit `docker build -t`
+        # did in reverse -- it repaired the mutation silently, seconds before
+        # preflight's read-back could see it (measured 2026-09-02). With the
+        # comparison never firing, a tag pointing anywhere is accepted as this
+        # base and nothing downstream re-derives it.
+        "images: accept a base tag whose labels say it is something else",
+        "src/bakeoff/images.py",
+        "        if labels.get(key) == want:",
+        "        if True:",
+        "tests/test_images.py -k mutated_to_another_version_is_rebuilt",
+        "not integration",
+    ),
+    (
+        # `null` from the daemon and a non-zero exit are different facts: an
+        # image that exists and declares no labels versus nobody to ask. Both
+        # rebuild, so the mutation is invisible in the DECISION -- it shows up
+        # in `preflight`'s evidence, where `{}` says the gate looked and found
+        # nothing and `None` says it could not look.
+        "images: collapse an unlabelled image into an absent one",
+        "src/bakeoff/images.py",
+        '    return json.loads(probe.stdout.strip() or "null") or {}',
+        '    return json.loads(probe.stdout.strip() or "null")',
+        "tests/test_images.py -k image_labels_answers_three_ways",
+        "not integration",
+    ),
 ]
 
 

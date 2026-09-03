@@ -4853,3 +4853,127 @@ correctness problem this fix wave leaves open.
   deviation 2 could not previously show.
 
 `graphify update .` run after the source edits.
+
+## Round 2 items 13+15 — the base image says what it is, and two dead pieces go — 2026-09-03
+
+Item 13 (`prepare_bases` rebuilds every base unconditionally before
+`resolve_tasks` runs, so a hand-mutated base tag is repaired silently by a
+cache-hit `docker build -t` retag before preflight's own read-back can see
+it — measured 2026-09-02, which is how a probe of that read-back recorded
+PASS on a base it had deliberately broken) and item 15 (`images._DEFAULT_PYTHON`
+and `build_base_image`'s dead `tag: str | None = None` parameter, both left
+over from broadening 5/7) closed together — both are `images.py` housekeeping
+touching the same three functions.
+
+**The fix.** Both base Dockerfiles gain a trailing `LABEL` block —
+`bakeoff.base.runtime`, `bakeoff.base.version`, `bakeoff.base.dockerfile_sha`
+(a new `ARG BAKEOFF_BASE_DOCKERFILE_SHA`, computed by the harness over the
+Dockerfile text plus the one build arg) — placed LAST so the fingerprint
+change reuses every cached layer, with the `ARG` redeclared after `FROM` in
+both files (without it the label stamps the empty string, silently, and the
+base would be rebuilt forever with nothing saying why). `images.py` gains
+`BaseImage` (`image_id`, `reused`, `reason: str | None`, `reason is None` iff
+`reused`), `base_fingerprint`, `base_labels`, `image_labels` (three answers:
+`None` for "no such image" and "no docker binary", `{}` for "exists, no
+labels", a dict for real labels), and `base_is_current`, which reads a tag's
+own labels and returns `(image_id, None)` or `(None, reason)`.
+`build_base_images` now calls `base_is_current` per pair and only rebuilds
+when it says no — the four rebuild reasons are `"the tag names no image"`,
+`"the tag carries no bakeoff.base.* labels"`, `"the tag was built from a
+different base Dockerfile"`, and `"the tag said <key>=<got>, this base is
+<want>"`. `prepare_bases` unwraps `BaseImage.image_id` before handing
+`bases` to `assert_one_agent` and its own caller, so nothing downstream of it
+changed shape, and prints the reason on every line: `base py3.13
+sha256:...  claude 2.1.220  (reused)` / `(built: <reason>)`. `preflight`
+records the task image's inherited labels as `evidence["base_image_labels"]`
+beside `python_observed` — recorded, never refused on; the interpreter
+read-back stays the sole authority on whether a python task may run, and the
+labels describe ancestry (docker propagates them into every derived image)
+rather than identity, which is named as the one residual gap the
+unconditional rebuild used to paper over (a base tag hand-mistagged onto a
+*task* image passes `base_is_current`). `PREFLIGHT_VERSION` moved 21 → 22.
+The interpreter-mismatch refusal now also names `docker rmi
+bakeoff-eval-agent:base-python-<declared>` and `--pull --no-cache`, since
+after the skip the label check cannot see upstream drift (a republished
+`python:` image, a changed installer, a moved apt/pip package) and the
+old remedy text would otherwise be a no-op.
+
+Item 15: `images._DEFAULT_PYTHON` deleted along with its `#:` comment block;
+`test_every_copy_of_the_default_version_says_the_same_thing` (test_images.py)
+rewritten FIRST to keep the two copies that are still read (the Dockerfile's
+`ARG BASE_PYTHON_VERSION` default and `tasks._DEFAULT_PYTHON`) rather than
+just deleted, so the drift pin survives the constant's removal.
+`preflight._declared_python`'s docstring, which named the now-deleted
+constant, was rewritten in the same commit rather than left stranded.
+`build_base_image`'s `tag: str | None = None` parameter and its `tag = tag or
+base_tag(...)` line are gone; every caller in `src/`, `scripts/` and `tests/`
+already passed exactly `(repo_root, runtime, version)`, so no caller changed.
+
+**Deviations from the plan, both mechanical and found by running the
+suite, not by design.** (1) Two pre-existing tests
+(`test_build_base_image_passes_the_version_as_a_build_arg`,
+`test_the_arg_is_not_named_PYTHON_VERSION`) and two more
+(`test_one_build_per_distinct_version_not_per_request`'s sibling
+`test_build_base_images_builds_each_pair_exactly_once`,
+`test_each_runtime_gets_its_own_dockerfile_and_build_arg`) called
+`build_base_image`/`build_base_images` against a fake root
+(`Path("/repo_root")`, `Path("/repo")`) that the plan did not flag: once
+`build_base_image` also computes `base_fingerprint` (to pass
+`BAKEOFF_BASE_DOCKERFILE_SHA` as a build arg), that call reads the real
+Dockerfile off `repo_root` even when `_run` is faked, and a nonexistent root
+raises `FileNotFoundError` before the fake ever runs. Fixed by pointing each
+at `_REPO_ROOT` (the plan's own fixture for exactly this class of problem);
+not a design change, `base_fingerprint`'s behavior is exactly as specified.
+(2) The plan's §8 step 8 vehicle (`yaml-474-single-newline-empty-value`)
+NO-GOes by design (round 2 item 12's fast-check refusal, unrelated to this
+item), so "preflight cached PASS" on the second invocation could not be
+observed directly; the node base id and the task image id staying identical
+across three consecutive invocations — reused `sha256:8131a1e4c918...` and
+task image `sha256:cf41936f38c8...` all three times — is the equivalent
+evidence available from this vehicle and is what was recorded instead.
+
+**Verification.**
+- `.venv/bin/python -m pytest tests/ -q` — **1822 passed, 73 deselected**
+  (1797/71 baseline + 25 passed, +2 deselected: 14 new offline tests in
+  `test_images.py` + 8 in `test_preflight.py` + 3 in `test_run_matrix.py`,
+  and 2 new `integration`+`task_image` tests in `test_images.py`).
+- `PATH=/usr/bin:/bin .venv/bin/python -m pytest tests/test_preflight.py -q`
+  — **212 passed, 8 deselected**, with no `docker` binary on `PATH`: the
+  `_run_preflight` helper fakes `image_labels` for all 58 existing tests that
+  reach the container block, and `image_labels`'s own `except OSError` is the
+  belt to that braces.
+- `.venv/bin/python scripts/mutation_check.py`, solo, no other process
+  touching the tree — **204/204 caught** (202 baseline + this item's 2 new
+  anchors: `images: accept a base tag whose labels say it is something else`,
+  `images: collapse an unlabelled image into an absent one`).
+- `.venv/bin/python scripts/verify_logger.py` — **GATE PASSED**.
+- `.venv/bin/python -m pytest -v -m integration --basetemp="$HOME/.cache/
+  bakeoff-pytest" tests/test_images.py` — **4 passed** (2 pre-existing + the
+  2 new: `test_a_built_base_really_carries_the_labels_the_harness_expects`,
+  `test_a_node_base_is_reused_rather_than_reminted`).
+- **The measured defect, end to end**
+  (`~/.cache/bakeoff-probe/ts-py/werkzeug-3037-py313`). Cold: `base py3.13
+  sha256:6c466c40f81f...  claude 2.1.220  (built: the tag names no image)`,
+  preflight PASS. Warm re-run: `(reused)`, same sha, cached PASS. Mutated
+  (`docker tag base-python-3.11 base-python-3.13`, whose labels said
+  `bakeoff.base.version="3.11"`): `(built: the tag said
+  bakeoff.base.version='3.11', this base is '3.13')` — Finding 1, reproduced
+  and now named instead of silently repaired — then preflight PASS again
+  after the rebuild. Restored: `docker run --entrypoint python
+  bakeoff-eval-agent:base-python-3.13 --version` → `Python 3.13.15`.
+- **The M4 churn, routed around**
+  (`~/.cache/bakeoff-probe/taskset/yaml-474-single-newline-empty-value`,
+  three consecutive `--preflight-only` invocations): `base node22
+  sha256:8131a1e4c918...  (reused)` on every run, task image
+  `sha256:cf41936f38c8...` unchanged across all three — before this item, six
+  unconditional builds of `eval-agent-node.Dockerfile` gave six different
+  ids (measured 2026-09-02).
+- `python -c "…evidence['base_image_labels']…"` against the cached
+  `werkzeug-3037-py313.json` — `{'bakeoff.base.dockerfile_sha': '...',
+  'bakeoff.base.runtime': 'python', 'bakeoff.base.version': '3.13'}` beside
+  `python_observed: 'Python 3.13.15'`, `preflight_version: 22`.
+- `git grep _DEFAULT_PYTHON` — six files, no live `images.` attribute access
+  anywhere (the two `images._DEFAULT_PYTHON` mentions left are prose, both
+  transcribed from the plan, naming the deleted constant's history).
+
+`graphify update .` run after the source edits.

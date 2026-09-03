@@ -149,7 +149,7 @@ def click_image(click_task, grader_cache) -> str:
     # the one its manifest names, never a default that happens to match.
     base = build_base_images(REPO_ROOT, [task_runtime(click_task)])[
         task_runtime(click_task)
-    ]
+    ].image_id
     image = build_task_image(click_task, base, grader_cache / "build",
                              grader_cache)
     assert image.startswith("sha256:"), (
@@ -626,7 +626,7 @@ def test_a_task_images_env_reaches_both_the_gates_exec_and_the_agents(
         task_id=click_task.task_id + "-envprobe",
         image=dataclasses.replace(click_task.image, env=declared),
     )
-    base = build_base_images(REPO_ROOT, [task_runtime(task)])[task_runtime(task)]
+    base = build_base_images(REPO_ROOT, [task_runtime(task)])[task_runtime(task)].image_id
     image = build_task_image(task, base, grader_cache / "build",
                              grader_cache)
 

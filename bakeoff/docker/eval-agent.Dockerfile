@@ -20,6 +20,9 @@
 # Build:
 #   docker build -f docker/eval-agent.Dockerfile -t bakeoff-eval-agent .
 #
+# The DRIVERS build these. A hand build passes no BAKEOFF_BASE_DOCKERFILE_SHA,
+# so the image stamps an empty sha and the next driver run rebuilds it.
+#
 # Then pin by digest, never by tag, when handing it to RunContainer:
 #   docker inspect --format '{{.Id}}' bakeoff-eval-agent
 #
@@ -47,11 +50,14 @@
 # redeclaration behaves: `[3.11] vs image ENV [3.11.16]`.
 #
 # The default matches `bakeoff.tasks._DEFAULT_PYTHON` and is pinned equal by
-# tests/test_images.py. Measured: with no --build-arg this file builds to the
+# tests/test_images.py. Measured: with no --build-arg this file built to the
 # byte-identical image id it built before the ARG existed
-# (sha256:dfd2cc069bad6346465ec1ecfe0a704faac3cb0e86ddbcfbc424b60f9380915a),
-# so no stored record's container_image_digest and no cached preflight verdict
-# moves.
+# (sha256:dfd2cc069bad6346465ec1ecfe0a704faac3cb0e86ddbcfbc424b60f9380915a), so
+# the ARG itself moved no stored record's container_image_digest and no cached
+# preflight verdict. THAT ID HELD UNTIL 2026-09-03, when the bakeoff.base.*
+# LABEL block at the end of this file moved it once, deliberately -- see that
+# block, and the "one-time costs" note in
+# docs/superpowers/plans/2026-09-03-round2-13-base-rebuild-and-dead-code.md.
 ARG BASE_PYTHON_VERSION=3.12
 FROM python:${BASE_PYTHON_VERSION}-slim-bookworm
 
@@ -160,3 +166,41 @@ WORKDIR /repo
 # through exec, but an image-declared ENTRYPOINT would otherwise prefix that
 # command. Cleared so the override behaves the same way for every task image.
 ENTRYPOINT []
+
+# WHAT THIS IMAGE SAYS ABOUT ITSELF, so a driver can tell a base it already has
+# from a tag that merely resolves. The tag is local and mutable: `docker tag`
+# moves it, an earlier Dockerfile leaves a stale one behind, and a cache-hit
+# `docker build -t` silently retags the right image back on top of a wrong one
+# -- measured 2026-09-02 at 0.04 s, which is how the base-tag mutability probe's
+# own mutation was undone before preflight could see it.
+#
+# LAST IN THE FILE ON PURPOSE. `LABEL` invalidates every instruction below it,
+# so higher up this would re-run apt, pip and the installer on any fingerprint
+# change instead of reusing the cached layers.
+#
+# THE `ARG` REDECLARE BELOW IS LOAD-BEARING. Measured 2026-09-02: without it
+# `${BASE_PYTHON_VERSION}` expands to the EMPTY STRING here, with no warning --
+# and an empty version can never match, so the driver would rebuild this base on
+# every invocation forever and nothing would say why.
+#
+# `${BASE_PYTHON_VERSION}` and not `${PYTHON_VERSION}`, for the reason the ARG
+# comment at the top of this file gives: the official image sets its own
+# `ENV PYTHON_VERSION` and ENV beats a redeclared ARG, so the other name would
+# stamp the PATCH level here. Measured 2026-09-02: this label reads "3.13", the
+# image's ENV reads "3.13.15".
+#
+# THE LABEL IS NOT A GATE. It decides whether the driver rebuilds; whether the
+# task may RUN is decided by preflight's `python --version` read-back inside the
+# container, which is never skipped and never compared against this value. Both
+# are recorded -- `base_image_labels` beside `python_observed` -- because a claim
+# the build stamped and an answer the interpreter gave are different kinds of
+# fact and a disagreement between them is the finding.
+#
+# It describes ANCESTRY, not identity: docker propagates these keys into every
+# derived image, so a task image built FROM this base claims to be it. See
+# `images.base_is_current`.
+ARG BASE_PYTHON_VERSION
+ARG BAKEOFF_BASE_DOCKERFILE_SHA=""
+LABEL bakeoff.base.runtime="python" \
+      bakeoff.base.version="${BASE_PYTHON_VERSION}" \
+      bakeoff.base.dockerfile_sha="${BAKEOFF_BASE_DOCKERFILE_SHA}"

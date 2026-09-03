@@ -225,7 +225,7 @@ def test_the_image_and_the_run_tree_carry_the_same_submodule_blob(
     # the one its MANIFEST names, never a default that happens to match.
     # Broadening 5 made the base per version, and a hard-coded "3.12" here
     # would go on passing while testing a base the task never asked for.
-    base = build_base_images(REPO_ROOT, [task_runtime(task)])[task_runtime(task)]
+    base = build_base_images(REPO_ROOT, [task_runtime(task)])[task_runtime(task)].image_id
     image = build_task_image(task, base, workspace / "build", cache)
     assert image.startswith("sha256:"), (
         f"{image!r} is not a content pin; RunContainer refuses a tag"
@@ -477,7 +477,7 @@ def test_the_grader_resolves_a_reference_fix_whose_submodule_is_under_tests(
     task = load_task(superproject_under_test_prefix["task_dir"])
     cache = workspace / "cache2"
 
-    base = build_base_images(REPO_ROOT, [task_runtime(task)])[task_runtime(task)]
+    base = build_base_images(REPO_ROOT, [task_runtime(task)])[task_runtime(task)].image_id
     image = build_task_image(task, base, workspace / "build2", cache)
     assert image.startswith("sha256:"), (
         f"{image!r} is not a content pin; RunContainer refuses a tag"

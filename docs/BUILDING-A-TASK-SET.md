@@ -586,8 +586,41 @@ cd bakeoff && .venv/bin/python scripts/run_matrix.py --preflight-only \
   --task-set ~/my-taskset --tasks <task_id>
 ```
 
-The first run builds the base image, mirrors the upstream repo, builds the task
-image and materializes the start state. It prints, among other things:
+The first run builds the base image, mirrors the upstream repo, builds the
+task image and materializes the start state. Later runs **reuse** a base the
+daemon already carries: each base stamps three labels on itself
+(`bakeoff.base.runtime`, `bakeoff.base.version`, `bakeoff.base.dockerfile_sha`,
+a hash of the base Dockerfile and its build arg), and the driver rebuilds only
+when the tag does not say it is exactly that base. The banner says which
+happened, and why when it rebuilt:
+
+```
+base py3.12  sha256:<12 hex>...  claude 2.1.220  (reused)
+base py3.13  sha256:<12 hex>...  claude 2.1.220  (built: the tag names no image)
+```
+
+Editing `docker/eval-agent.Dockerfile` or `docker/eval-agent-node.Dockerfile`
+moves the sha and is picked up on the next run without a flag. What the label
+**cannot** see is upstream drift — a republished `python:3.12-slim-bookworm`,
+a new `claude.ai/install.sh`, a moved apt or npm package — and neither could
+the unconditional rebuild it replaced, whose cache is keyed on the instruction
+string. To take those:
+
+```bash
+docker rmi bakeoff-eval-agent:base-python-3.12     # next run rebuilds
+# or, to re-pull the upstream base and re-run every step:
+cd bakeoff && docker build --pull --no-cache --build-arg BASE_PYTHON_VERSION=3.12 \
+  -f docker/eval-agent.Dockerfile -t bakeoff-eval-agent:base-python-3.12 .
+```
+
+Preflight's interpreter-mismatch refusal names the same two commands, because
+that is where an operator meets the problem.
+
+A base image built by hand without
+`--build-arg BAKEOFF_BASE_DOCKERFILE_SHA` carries an empty sha and will be
+rebuilt by the next driver run. That is intended: the drivers own these tags.
+
+It prints, among other things:
 
 ```
 start_sha <40 hex>  (base <12 hex> + test half)
@@ -842,6 +875,7 @@ raise.
 | a node task's runner is exit 127 on every arm after a build that reported success | `npm ci` ran at the `/` prefix and deleted the pinned vitest/jest. Its documented contract is to remove `node_modules` before installing, and whether it fires depends on which `package.json`/`package-lock.json` pair npm resolves for the prefix and cwd — a convention that is right only under an unstated cwd. Use `npm install`, never `npm ci`, in `image.build` |
 | a node quarantine removes a test you never named, and `p2p_deselected` agrees | on **vitest**, one executed file's repo-relative path is contained in another's. The per-file positional is a substring filter no anchoring reaches, so the group carries its name pattern into the second file. Preflight refuses it as `ambiguous_file_filters`; rename or move one of the files, narrow `tests.paths`, or cut the task on jest (HARVESTING.md's JavaScript screening subsection). A plain cross-file duplicate `fullName` is no longer this failure — since 2026-09-03 a node selection is one invocation per file — and is recorded rather than refused |
 | preflight says a declared id *names more than one test in its own file* | two tests in that file share a `fullName`. The id carries no positional index, so it names both — `-t` runs both and deselects both. Declare a different test, or cut the task from a PR whose tests are uniquely titled |
+| a base tag pointing at the wrong image | `docker tag` moves it and nothing in a record names the base. Before round 2 the driver repaired it silently via a cache-hit rebuild, which is how a probe of preflight's `python --version` read-back recorded PASS on a base it had deliberately broken (2026-09-02). The driver now names what it found — `(built: the tag said bakeoff.base.version='3.11', this base is '3.13')` — and preflight's read-back, which the label never substitutes for, remains the authority on what a python container actually runs. On node there is no interpreter read-back; the equivalent is the runner-pin re-assertion every task image build re-runs |
 
 ---
 

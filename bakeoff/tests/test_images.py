@@ -31,6 +31,13 @@ from bakeoff.images import (
     render_dockerfile,
 )
 
+#: The real repo root, because `base_fingerprint` reads
+#: docker/eval-agent{,-node}.Dockerfile off disk and the reuse tests compare
+#: against `base_labels(_REPO_ROOT, ...)` computed from the same root. The
+#: `Path("/repo")` roots the older tests in this file use are safe only where
+#: `image_labels` is faked to `None`, which returns before the read.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
 
 def _lines(**kwargs) -> list[str]:
     kwargs.setdefault("base_image", "sha256:base")
@@ -665,7 +672,10 @@ def test_build_base_image_passes_the_version_as_a_build_arg(monkeypatch):
     monkeypatch.setattr(images, "_run", lambda args, cwd=None: calls.append(args) or "")
     monkeypatch.setattr(images, "image_id", lambda tag: "sha256:" + tag)
 
-    images.build_base_image(Path("/repo_root"), "python", "3.11")
+    # `_REPO_ROOT`, not a fake path: `build_base_image` now also computes
+    # `base_fingerprint`, which reads the real Dockerfile off disk, before
+    # `_run` (faked here) ever runs.
+    images.build_base_image(_REPO_ROOT, "python", "3.11")
 
     argv = calls[0]
     assert "--build-arg" in argv
@@ -685,7 +695,8 @@ def test_the_arg_is_not_named_PYTHON_VERSION(monkeypatch):
     monkeypatch.setattr(images, "_run", lambda args, cwd=None: calls.append(args) or "")
     monkeypatch.setattr(images, "image_id", lambda tag: "sha256:" + tag)
 
-    images.build_base_image(Path("/repo_root"), "python", "3.13")
+    # `_REPO_ROOT`, for the reason given in the test above.
+    images.build_base_image(_REPO_ROOT, "python", "3.13")
 
     assert "PYTHON_VERSION=3.13" not in calls[0]
 
@@ -693,8 +704,16 @@ def test_the_arg_is_not_named_PYTHON_VERSION(monkeypatch):
 def test_one_build_per_distinct_version_not_per_request(monkeypatch):
     """The drivers call this with one entry per TASK. Building per task pays
     an image build for every duplicate, and on a 60-task set that is the
-    difference between a preflight pass and one nobody waits for."""
+    difference between a preflight pass and one nobody waits for.
+
+    `Path("/r")` stays a correct root here BECAUSE `image_labels` is faked to
+    `None`: `base_is_current` returns before `base_labels` ever reads a
+    Dockerfile off it. Left unpatched, `base_is_current` would issue a real
+    `docker image inspect` per pair -- and on a machine that already has the
+    real labelled tags it would then call `base_labels(Path("/r"), ...)` and
+    raise `FileNotFoundError`."""
     built = []
+    monkeypatch.setattr(images, "image_labels", lambda image: None)
     monkeypatch.setattr(
         images, "build_base_image",
         lambda root, runtime, version: built.append((runtime, version))
@@ -708,28 +727,36 @@ def test_one_build_per_distinct_version_not_per_request(monkeypatch):
     )
 
     assert sorted(built) == [("python", "3.11"), ("python", "3.12")]
-    assert bases == {("python", "3.11"): "sha256:3.11",
-                     ("python", "3.12"): "sha256:3.12"}
+    assert {key: base.image_id for key, base in bases.items()} == {
+        ("python", "3.11"): "sha256:3.11",
+        ("python", "3.12"): "sha256:3.12",
+    }
 
 
 def test_every_copy_of_the_default_version_says_the_same_thing():
-    """THREE copies of "3.12" exist by the end of this broadening -- the
-    Dockerfile's ARG default, `tasks._DEFAULT_PYTHON` (which is
-    `TaskImage.python`'s default), and `images._DEFAULT_PYTHON` (restated
-    because this module cannot import `tasks` at module scope). Two that can
-    drift means a manifest declaring no `python:` loads as a task whose base
-    nobody built -- the build succeeds, the suite runs, and the interpreter is
-    not the one the default named.
+    """TWO copies of "3.12" remain, and the pin is between them: the
+    Dockerfile's `ARG BASE_PYTHON_VERSION` default and `tasks._DEFAULT_PYTHON`
+    (which is `TaskImage.python`'s default). Two that can drift means a
+    manifest declaring no `python:` loads as a task whose base nobody built --
+    the build succeeds, the suite runs, and the interpreter is not the one the
+    default named.
 
-    `preflight` is deliberately NOT a fourth copy: it imports
-    `_DEFAULT_PYTHON` from `tasks` (Task 4)."""
+    There were THREE. `images._DEFAULT_PYTHON` was the third, restated in that
+    module because it cannot import `tasks` at module scope; broadening 7 made
+    the runtime and version explicit at every call site, which left it with no
+    reader but this assertion. A constant kept alive by the test that pins it
+    is not a pin -- it is a second copy of a value with a test guaranteeing the
+    copy exists. Removed in round 2, item 15; this test keeps the two copies
+    that are still read.
+
+    `preflight` is deliberately not a copy either: it imports
+    `_DEFAULT_PYTHON` from `tasks`."""
     from bakeoff.tasks import _DEFAULT_PYTHON as manifest_default
 
     dockerfile = (
         Path(__file__).resolve().parent.parent / "docker" / "eval-agent.Dockerfile"
     ).read_text()
 
-    assert images._DEFAULT_PYTHON == manifest_default
     assert f"ARG BASE_PYTHON_VERSION={manifest_default}\n" in dockerfile
     assert "FROM python:${BASE_PYTHON_VERSION}-slim-bookworm\n" in dockerfile
 
@@ -740,6 +767,228 @@ def test_every_allowlisted_version_is_a_tag_this_module_can_name():
     tags = {images.base_tag("python", v) for v in _PYTHON_VERSIONS}
 
     assert len(tags) == len(_PYTHON_VERSIONS)
+
+
+# --- round 2, item 13: the base image says what it is -------------------------
+#
+# All offline unless marked `integration`. The reuse tests monkeypatch
+# `images.image_labels` (not `images._run`), so the decision `base_is_current`
+# makes is exercised without a daemon.
+
+
+def test_a_base_whose_labels_match_is_not_rebuilt(monkeypatch):
+    monkeypatch.setattr(
+        images, "image_labels",
+        lambda image: images.base_labels(_REPO_ROOT, "python", "3.12"),
+    )
+    monkeypatch.setattr(
+        images, "_run",
+        lambda args, cwd=None: (_ for _ in ()).throw(
+            AssertionError(f"docker build should not have run: {args}")
+        ),
+    )
+    monkeypatch.setattr(images, "image_id", lambda tag: "sha256:existing")
+
+    built = images.build_base_images(_REPO_ROOT, [("python", "3.12")])
+
+    base = built[("python", "3.12")]
+    assert base == images.BaseImage("sha256:existing", reused=True, reason=None)
+
+
+def test_a_base_tag_that_names_nothing_is_built(monkeypatch):
+    monkeypatch.setattr(images, "image_labels", lambda image: None)
+    calls = []
+    monkeypatch.setattr(images, "_run", lambda args, cwd=None: calls.append(args))
+    monkeypatch.setattr(images, "image_id", lambda tag: "sha256:built")
+
+    built = images.build_base_images(_REPO_ROOT, [("python", "3.12")])
+
+    base = built[("python", "3.12")]
+    assert calls
+    assert base.reused is False
+    assert base.reason == "the tag names no image"
+    assert base.image_id == "sha256:built"
+
+
+def test_a_base_carrying_no_labels_is_rebuilt(monkeypatch):
+    """`{}` is every base on every machine that predates this change."""
+    monkeypatch.setattr(images, "image_labels", lambda image: {})
+    calls = []
+    monkeypatch.setattr(images, "_run", lambda args, cwd=None: calls.append(args))
+    monkeypatch.setattr(images, "image_id", lambda tag: "sha256:built")
+
+    built = images.build_base_images(_REPO_ROOT, [("python", "3.12")])
+
+    base = built[("python", "3.12")]
+    assert calls
+    assert base.reused is False
+    assert base.reason == "the tag carries no bakeoff.base.* labels"
+
+
+def test_a_tag_mutated_to_another_version_is_rebuilt(monkeypatch):
+    """The probe's Finding 1, as a test: a `bakeoff-eval-agent:base-python-3.13`
+    tag whose labels say `bakeoff.base.version="3.11"`."""
+    monkeypatch.setattr(
+        images, "image_labels",
+        lambda image: images.base_labels(_REPO_ROOT, "python", "3.11"),
+    )
+    calls = []
+    monkeypatch.setattr(images, "_run", lambda args, cwd=None: calls.append(args))
+    monkeypatch.setattr(images, "image_id", lambda tag: "sha256:built")
+
+    built = images.build_base_images(_REPO_ROOT, [("python", "3.13")])
+
+    base = built[("python", "3.13")]
+    assert calls
+    assert base.reused is False
+    assert base.reason == (
+        "the tag said bakeoff.base.version='3.11', this base is '3.13'"
+    )
+
+
+def test_a_tag_carrying_a_stale_dockerfile_sha_is_rebuilt(monkeypatch):
+    def _labels(image):
+        real = images.base_labels(_REPO_ROOT, "python", "3.12")
+        real["bakeoff.base.dockerfile_sha"] = "0" * 64
+        return real
+
+    monkeypatch.setattr(images, "image_labels", _labels)
+    calls = []
+    monkeypatch.setattr(images, "_run", lambda args, cwd=None: calls.append(args))
+    monkeypatch.setattr(images, "image_id", lambda tag: "sha256:built")
+
+    built = images.build_base_images(_REPO_ROOT, [("python", "3.12")])
+
+    base = built[("python", "3.12")]
+    assert calls
+    assert base.reused is False
+    # The sha itself is not printed -- 64 hex characters says nothing to a
+    # reader in a banner.
+    assert base.reason == "the tag was built from a different base Dockerfile"
+
+
+def test_a_base_carrying_extra_labels_is_still_reused(monkeypatch):
+    """A SUBSET comparison: an image may legitimately carry other labels."""
+    def _labels(image):
+        real = images.base_labels(_REPO_ROOT, "python", "3.12")
+        real["org.opencontainers.image.source"] = "https://example.invalid"
+        return real
+
+    monkeypatch.setattr(images, "image_labels", _labels)
+    monkeypatch.setattr(
+        images, "_run",
+        lambda args, cwd=None: (_ for _ in ()).throw(
+            AssertionError(f"docker build should not have run: {args}")
+        ),
+    )
+    monkeypatch.setattr(images, "image_id", lambda tag: "sha256:existing")
+
+    built = images.build_base_images(_REPO_ROOT, [("python", "3.12")])
+
+    assert built[("python", "3.12")].reused is True
+
+
+def test_a_reused_base_names_no_reason_and_a_built_one_always_does(monkeypatch):
+    """The `BaseImage` invariant, so the banner cannot print `built: None`."""
+    monkeypatch.setattr(
+        images, "image_labels",
+        lambda image: images.base_labels(_REPO_ROOT, "python", "3.12"),
+    )
+    monkeypatch.setattr(images, "_run", lambda args, cwd=None: None)
+    monkeypatch.setattr(images, "image_id", lambda tag: "sha256:x")
+
+    reused = images.build_base_images(_REPO_ROOT, [("python", "3.12")])
+    assert reused[("python", "3.12")].reused is True
+    assert reused[("python", "3.12")].reason is None
+
+    monkeypatch.setattr(images, "image_labels", lambda image: None)
+    built = images.build_base_images(_REPO_ROOT, [("python", "3.12")])
+    assert built[("python", "3.12")].reused is False
+    assert built[("python", "3.12")].reason is not None
+
+
+def test_the_fingerprint_moves_when_the_dockerfile_does(tmp_path):
+    (tmp_path / "docker").mkdir()
+    dockerfile = tmp_path / "docker" / "eval-agent.Dockerfile"
+    dockerfile.write_text("ARG BASE_PYTHON_VERSION=3.12\n")
+
+    before = images.base_fingerprint(tmp_path, "python", "3.12")
+    dockerfile.write_text(dockerfile.read_text() + "\n# one more byte\n")
+    after = images.base_fingerprint(tmp_path, "python", "3.12")
+
+    assert before != after
+
+
+def test_the_fingerprint_covers_the_build_arg_and_not_only_the_file(tmp_path):
+    (tmp_path / "docker").mkdir()
+    (tmp_path / "docker" / "eval-agent.Dockerfile").write_text(
+        "ARG BASE_PYTHON_VERSION=3.12\n"
+    )
+
+    a = images.base_fingerprint(tmp_path, "python", "3.11")
+    b = images.base_fingerprint(tmp_path, "python", "3.12")
+
+    assert a != b
+
+
+def test_the_fingerprint_refuses_an_unknown_runtime():
+    with pytest.raises(ImageError, match="ruby"):
+        images.base_fingerprint(_REPO_ROOT, "ruby", "3.3")
+
+
+def test_the_sha_the_harness_computes_is_the_one_the_build_stamps(monkeypatch):
+    calls = []
+    monkeypatch.setattr(images, "_run", lambda args, cwd=None: calls.append(args))
+    monkeypatch.setattr(images, "image_id", lambda tag: "sha256:x")
+
+    images.build_base_image(_REPO_ROOT, "python", "3.12")
+
+    argv = calls[0]
+    expected = images.base_fingerprint(_REPO_ROOT, "python", "3.12")
+    assert f"BAKEOFF_BASE_DOCKERFILE_SHA={expected}" in argv
+
+
+def test_the_label_the_dockerfile_stamps_is_the_one_the_harness_expects():
+    """The offline drift pin between `images.py` and the two Dockerfiles."""
+    for runtime, (dockerfile_name, build_arg) in images._BASES.items():
+        text = (_REPO_ROOT / "docker" / dockerfile_name).read_text()
+        # Without this the label expands to the empty string, silently, and
+        # the base would be rebuilt on every invocation forever.
+        assert f"ARG {build_arg}\n" in text
+        assert f'bakeoff.base.runtime="{runtime}"' in text
+        assert f'bakeoff.base.version="${{{build_arg}}}"' in text
+        assert 'bakeoff.base.dockerfile_sha="${BAKEOFF_BASE_DOCKERFILE_SHA}"' in text
+        for key in images.base_labels(_REPO_ROOT, runtime, "0"):
+            assert key in text
+
+
+def test_image_labels_answers_three_ways(monkeypatch):
+    def _run(args, capture_output, text):
+        class _R:
+            pass
+        r = _R()
+        if args[-1] == "missing":
+            r.returncode, r.stdout, r.stderr = 1, "", "No such image: missing"
+        elif args[-1] == "unlabelled":
+            r.returncode, r.stdout = 0, "null\n"
+        else:
+            r.returncode, r.stdout = 0, '{"bakeoff.base.runtime":"python"}\n'
+        return r
+
+    monkeypatch.setattr(images.subprocess, "run", _run)
+
+    assert images.image_labels("missing") is None
+    assert images.image_labels("unlabelled") == {}
+    assert images.image_labels("labelled") == {"bakeoff.base.runtime": "python"}
+
+
+def test_image_labels_survives_a_missing_docker_binary(monkeypatch):
+    def _run(args, capture_output, text):
+        raise FileNotFoundError("docker")
+
+    monkeypatch.setattr(images.subprocess, "run", _run)
+
+    assert images.image_labels("anything") is None
 
 
 @pytest.mark.integration
@@ -768,6 +1017,24 @@ def test_a_non_default_base_really_builds_and_carries_the_pins():
     assert probe.stdout.rstrip().endswith("1000")
 
 
+@pytest.mark.integration
+@pytest.mark.task_image
+def test_a_built_base_really_carries_the_labels_the_harness_expects():
+    """No churn claim here -- the python chain is stable with and without the
+    fix (three builds, one id, measured 2026-09-02), so an id assertion would
+    pass either way. `test_a_node_base_is_reused_rather_than_reminted` is the
+    real M4 control."""
+    repo_root = Path(__file__).resolve().parent.parent
+    image = images.build_base_image(repo_root, "python", "3.11")
+
+    seen = images.image_labels(images.base_tag("python", "3.11"))
+    expected = images.base_labels(repo_root, "python", "3.11")
+
+    assert seen is not None
+    assert expected.items() <= seen.items()
+    assert image  # still the id build_base_image returned
+
+
 # --- per-runtime base images --------------------------------------------------
 
 
@@ -787,11 +1054,17 @@ def test_build_base_images_builds_each_pair_exactly_once(monkeypatch):
     calls = []
     from bakeoff import images
 
+    # `image_labels` -> `None` so both pairs are treated as cold and build,
+    # regardless of what real base tags this machine happens to carry.
+    # `_REPO_ROOT`, not a fake path: a "cold" pair now goes through
+    # `build_base_image`, which computes `base_fingerprint` and reads the
+    # real Dockerfile off this root before `_run` (faked here) ever runs.
+    monkeypatch.setattr(images, "image_labels", lambda image: None)
     monkeypatch.setattr(images, "_run", lambda args, cwd=None: calls.append(args))
     monkeypatch.setattr(images, "image_id", lambda tag: f"sha256:{tag}")
 
     built = images.build_base_images(
-        Path("/repo"),
+        _REPO_ROOT,
         {("python", "3.12"), ("node", "22"), ("python", "3.12")},
     )
 
@@ -811,7 +1084,9 @@ def test_each_runtime_gets_its_own_dockerfile_and_build_arg(monkeypatch):
     monkeypatch.setattr(images, "_run", lambda args, cwd=None: seen.append(args))
     monkeypatch.setattr(images, "image_id", lambda tag: "sha256:x")
 
-    images.build_base_image(Path("/repo"), "node", "22")
+    # `_REPO_ROOT`, not a fake path: `base_fingerprint` reads the real
+    # Dockerfile off it before `_run` (faked here) ever runs.
+    images.build_base_image(_REPO_ROOT, "node", "22")
 
     argv = " ".join(seen[0])
     assert "eval-agent-node.Dockerfile" in argv
@@ -1022,6 +1297,25 @@ def test_the_node_base_really_builds_and_carries_the_pins():
     assert "/node_modules/.bin/vitest" in out
     assert "/node_modules/.bin/jest" in out
     assert "3.2.7 30.5.0" in out                    # the exported pins, for D15
+
+
+@pytest.mark.integration
+@pytest.mark.task_image
+def test_a_node_base_is_reused_rather_than_reminted():
+    """The real M4 control. Measured 2026-09-02: six unconditional builds of
+    eval-agent-node.Dockerfile gave six different image ids, and appending the
+    LABEL block alone did not change that (M4a) -- only the skip does. Warm on
+    any machine that has run the node task tests above."""
+    repo_root = Path(__file__).resolve().parent.parent
+
+    built = images.build_base_images(repo_root, [("node", "22")])
+    first = built[("node", "22")]
+
+    built_again = images.build_base_images(repo_root, [("node", "22")])
+    second = built_again[("node", "22")]
+
+    assert second.reused is True
+    assert second.image_id == first.image_id
 
 
 def test_neither_runner_is_pinned_against_its_cli_version():

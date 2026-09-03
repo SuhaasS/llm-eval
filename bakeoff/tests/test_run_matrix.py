@@ -109,8 +109,16 @@ def test_the_version_set_comes_from_the_task_set_not_from_the_allowlist(
     """The driver builds what the TASKS need. Deriving it from
     `tasks._PYTHON_VERSIONS` instead would build every allowed interpreter on
     every invocation -- three image builds for a task set that uses one, in
-    the offline half that is supposed to be free."""
+    the offline half that is supposed to be free.
+
+    This is the only test in the tree that fakes `build_base_images` and
+    calls `prepare_bases` -- `_fake_build` now returns `BaseImage`s, since
+    `prepare_bases` unwraps `.image_id` before handing `bases` to
+    `assert_one_agent` and to its caller. The `bases ==` assertion below stays
+    against PLAIN STRINGS, unchanged: that is itself the pin that
+    `prepare_bases` still hands id strings downstream."""
     import scripts.run_matrix as rm
+    from bakeoff.images import BaseImage
 
     asked = {}
 
@@ -121,7 +129,9 @@ def test_the_version_set_comes_from_the_task_set_not_from_the_allowlist(
     # fake rather than on the code.
     def _fake_build(root, versions):
         asked["versions"] = sorted(versions)
-        return {pair: "sha256:" + pair[1] for pair in versions}
+        return {pair: BaseImage("sha256:" + pair[1], reused=False,
+                                reason="the tag names no image")
+                for pair in versions}
 
     monkeypatch.setattr(rm, "build_base_images", _fake_build)
     monkeypatch.setattr(rm, "base_claude_version", lambda image: "2.1.220")
@@ -134,6 +144,108 @@ def test_the_version_set_comes_from_the_task_set_not_from_the_allowlist(
     assert bases == {("python", "3.11"): "sha256:3.11",
                      ("python", "3.12"): "sha256:3.12"}
     assert expected == "2.1.220"
+
+
+def test_the_driver_says_which_bases_it_built_and_which_it_reused(
+    monkeypatch, capsys
+):
+    import scripts.run_matrix as rm
+    from bakeoff.images import BaseImage
+
+    def _fake_build(root, versions):
+        return {
+            ("python", "3.11"): BaseImage("sha256:reused11", reused=True),
+            ("python", "3.13"): BaseImage(
+                "sha256:built13", reused=False,
+                reason="the tag said bakeoff.base.version='3.11', "
+                       "this base is '3.13'",
+            ),
+        }
+
+    monkeypatch.setattr(rm, "build_base_images", _fake_build)
+    monkeypatch.setattr(rm, "base_claude_version", lambda image: "2.1.220")
+
+    rm.prepare_bases(
+        [_PyTask("a", "3.11"), _PyTask("b", "3.13")]
+    )
+
+    out = capsys.readouterr().out
+    lines = [line for line in out.splitlines() if line.startswith("base py3.11")]
+    assert lines and lines[0].startswith("base py3.11  sha256:")
+    assert lines[0].endswith("(reused)")
+    built_lines = [line for line in out.splitlines() if line.startswith("base py3.13")]
+    assert built_lines and built_lines[0].startswith("base py3.13  sha256:")
+    assert built_lines[0].endswith(
+        "(built: the tag said bakeoff.base.version='3.11', this base is '3.13')"
+    )
+
+
+def test_a_cold_machine_and_a_mutated_tag_do_not_print_the_same_line(
+    monkeypatch, capsys
+):
+    """The 'two absences that render identically' pin, and the reason
+    finding 1 exists."""
+    import scripts.run_matrix as rm
+    from bakeoff.images import BaseImage
+
+    monkeypatch.setattr(rm, "base_claude_version", lambda image: "2.1.220")
+
+    monkeypatch.setattr(
+        rm, "build_base_images",
+        lambda root, versions: {
+            ("python", "3.11"): BaseImage(
+                "sha256:x", reused=False, reason="the tag names no image"
+            )
+        },
+    )
+    rm.prepare_bases([_PyTask("a", "3.11")])
+    cold_line = next(
+        line for line in capsys.readouterr().out.splitlines()
+        if line.startswith("base py3.11")
+    )
+
+    monkeypatch.setattr(
+        rm, "build_base_images",
+        lambda root, versions: {
+            ("python", "3.11"): BaseImage(
+                "sha256:x", reused=False,
+                reason="the tag said bakeoff.base.version='3.9', "
+                       "this base is '3.11'",
+            )
+        },
+    )
+    rm.prepare_bases([_PyTask("a", "3.11")])
+    mutated_line = next(
+        line for line in capsys.readouterr().out.splitlines()
+        if line.startswith("base py3.11")
+    )
+
+    assert cold_line != mutated_line
+
+
+def test_prepare_bases_hands_assert_one_agent_ids_not_wrappers(monkeypatch):
+    """Pins that the unwrap happens before `assert_one_agent`, so
+    `resolve_tasks`, `assert_one_agent` and `resolve_task` stay untouched."""
+    import scripts.run_matrix as rm
+    from bakeoff.images import BaseImage
+
+    monkeypatch.setattr(
+        rm, "build_base_images",
+        lambda root, versions: {
+            ("python", "3.11"): BaseImage("sha256:x", reused=True)
+        },
+    )
+    seen = {}
+
+    def _fake_assert(bases):
+        seen["bases"] = bases
+        return "2.1.220"
+
+    monkeypatch.setattr(rm, "assert_one_agent", _fake_assert)
+
+    rm.prepare_bases([_PyTask("a", "3.11")])
+
+    assert all(isinstance(v, str) for v in seen["bases"].values())
 
 
 def test_two_bases_that_disagree_on_the_agent_stop_the_invocation(monkeypatch):

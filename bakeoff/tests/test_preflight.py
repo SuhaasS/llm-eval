@@ -1487,6 +1487,12 @@ def _run_preflight(monkeypatch, tmp_path, task, container):
         "bakeoff.preflight.RunContainer",
         lambda **kwargs: container,
     )
+    # `preflight` now inspects the image's own labels, host-side. This suite is
+    # documented as offline and `verify_logger.py` runs it as the section 6.6
+    # gate, so the subprocess is faked here rather than 58 times; the tests that
+    # care override it afterwards. `{}` is the honest default: an image that
+    # exists and carries no bakeoff.base.* labels.
+    monkeypatch.setattr("bakeoff.preflight.image_labels", lambda image: {})
     return preflight(task, image="sha256:x", repo_path=tmp_path,
                      start_sha="s" * 40)
 
@@ -2452,6 +2458,159 @@ def test_the_evidence_keys_exist_on_the_path_that_never_starts_a_container(
     assert result.evidence["python_observed"] is None
 
 
+# --- round 2, item 13: the base image says what it is -------------------------
+
+
+def test_the_image_labels_are_recorded_beside_the_interpreter(monkeypatch, tmp_path):
+    task = _FakeTask(image=_FakeImage(python="3.11"))
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=("tests/",), python="Python 3.11.16")
+    labels = {
+        "bakeoff.base.runtime": "python",
+        "bakeoff.base.version": "3.11",
+        "bakeoff.base.dockerfile_sha": "a" * 64,
+    }
+    monkeypatch.setattr("bakeoff.preflight.RunContainer", lambda **kwargs: container)
+    monkeypatch.setattr("bakeoff.preflight.image_labels", lambda image: labels)
+
+    result = preflight(task, image="sha256:x", repo_path=tmp_path,
+                       start_sha="s" * 40)
+
+    assert result.ok, result.problems
+    assert result.evidence["base_image_labels"] == labels
+    assert result.evidence["python_observed"] == "Python 3.11.16"
+
+
+def test_a_label_that_disagrees_with_the_interpreter_is_recorded_and_not_refused(
+    monkeypatch, tmp_path
+):
+    """Pins that the label is not a gate and the read-back is the authority."""
+    task = _FakeTask(image=_FakeImage(python="3.13"))
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=("tests/",), python="Python 3.13.15")
+    labels = {
+        "bakeoff.base.runtime": "python",
+        "bakeoff.base.version": "3.11",
+        "bakeoff.base.dockerfile_sha": "a" * 64,
+    }
+    monkeypatch.setattr("bakeoff.preflight.RunContainer", lambda **kwargs: container)
+    monkeypatch.setattr("bakeoff.preflight.image_labels", lambda image: labels)
+
+    result = preflight(task, image="sha256:x", repo_path=tmp_path,
+                       start_sha="s" * 40)
+
+    assert result.ok, result.problems
+    assert result.evidence["base_image_labels"] == labels
+    assert result.evidence["python_observed"] == "Python 3.13.15"
+
+
+def test_a_label_that_agrees_does_not_rescue_a_wrong_interpreter(
+    monkeypatch, tmp_path
+):
+    """The converse: the label cannot vouch for the interpreter."""
+    task = _FakeTask(image=_FakeImage(python="3.11"))
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=("tests/",), python="Python 3.13.15")
+    labels = {
+        "bakeoff.base.runtime": "python",
+        "bakeoff.base.version": "3.11",
+        "bakeoff.base.dockerfile_sha": "a" * 64,
+    }
+    monkeypatch.setattr("bakeoff.preflight.RunContainer", lambda **kwargs: container)
+    monkeypatch.setattr("bakeoff.preflight.image_labels", lambda image: labels)
+
+    result = preflight(task, image="sha256:x", repo_path=tmp_path,
+                       start_sha="s" * 40)
+
+    assert not result.ok
+    assert any("3.11" in p and "3.13" in p for p in result.problems)
+
+
+def test_the_mismatch_refusal_names_a_remedy_that_still_works_after_the_skip(
+    monkeypatch, tmp_path
+):
+    task = _FakeTask(image=_FakeImage(python="3.11"))
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=("tests/",), python="Python 3.13.15")
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    assert not result.ok
+    problem = next(p for p in result.problems if "3.11" in p and "3.13" in p)
+    assert "docker rmi bakeoff-eval-agent:base-python-3.11" in problem
+    assert "--pull --no-cache" in problem
+
+
+def test_only_the_bakeoff_base_keys_are_recorded(monkeypatch, tmp_path):
+    task = _FakeTask(image=_FakeImage(python="3.11"))
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=("tests/",), python="Python 3.11.16")
+    labels = {
+        "bakeoff.base.runtime": "python",
+        "bakeoff.base.version": "3.11",
+        "bakeoff.base.dockerfile_sha": "a" * 64,
+        "maintainer": "someone",
+        "org.opencontainers.image.source": "https://example.invalid",
+    }
+    monkeypatch.setattr("bakeoff.preflight.RunContainer", lambda **kwargs: container)
+    monkeypatch.setattr("bakeoff.preflight.image_labels", lambda image: labels)
+
+    result = preflight(task, image="sha256:x", repo_path=tmp_path,
+                       start_sha="s" * 40)
+
+    assert result.evidence["base_image_labels"] == {
+        "bakeoff.base.runtime": "python",
+        "bakeoff.base.version": "3.11",
+        "bakeoff.base.dockerfile_sha": "a" * 64,
+    }
+
+
+def test_an_image_with_no_bakeoff_labels_records_an_empty_set_not_a_null(
+    monkeypatch, tmp_path
+):
+    task = _FakeTask(image=_FakeImage(python="3.11"))
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=("tests/",), python="Python 3.11.16")
+    monkeypatch.setattr("bakeoff.preflight.RunContainer", lambda **kwargs: container)
+    monkeypatch.setattr("bakeoff.preflight.image_labels", lambda image: {})
+
+    result = preflight(task, image="sha256:x", repo_path=tmp_path,
+                       start_sha="s" * 40)
+
+    assert result.evidence["base_image_labels"] == {}
+    assert result.evidence["base_image_labels"] is not None
+
+
+def test_a_label_probe_that_could_not_answer_is_a_null_not_an_empty_set(
+    monkeypatch, tmp_path
+):
+    task = _FakeTask(image=_FakeImage(python="3.11"))
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=("tests/",), python="Python 3.11.16")
+    monkeypatch.setattr("bakeoff.preflight.RunContainer", lambda **kwargs: container)
+    monkeypatch.setattr("bakeoff.preflight.image_labels", lambda image: None)
+
+    result = preflight(task, image="sha256:x", repo_path=tmp_path,
+                       start_sha="s" * 40)
+
+    assert result.evidence["base_image_labels"] is None
+    assert result.ok, result.problems
+
+
+def test_the_label_evidence_is_none_on_the_path_that_never_starts_a_container(
+    tmp_path
+):
+    task = _FakeTask(tests=_FakeTests(runner=("nose",)),
+                     image=_FakeImage(python="3.11"))
+
+    result = preflight(task, image="sha256:x", repo_path=tmp_path,
+                       start_sha="s" * 40)
+
+    assert result.evidence["base_image_labels"] is None
+    assert result.evidence["python_observed"] is None
+    assert result.evidence["early_return"] == EARLY_RETURN_RUNNER_MISMATCH
+
+
 def test_the_preflight_version_moved_with_the_new_assertion():
     """It is in the cache key, and it is the only component that moves when
     THIS file changes -- a manifest digest describes the task, an image id the
@@ -2616,10 +2775,25 @@ def test_the_preflight_version_moved_with_the_new_assertion():
     report args this code does not read back. A cached PASS under 20 on a
     node task whose `tests.runner` carries a trailing array-valued flag is
     stale. No PYTEST verdict moves, since `PytestAdapter.report_args` is
-    `[]` and the reorder is inert on an empty list."""
+    `[]` and the reorder is inert on an empty list.
+
+    21 -> 22 is `base_image_labels` (round 2 items 13+15, 2026-09-03). A
+    verdict cached under 21 was written by a gate that recorded what the
+    interpreter answered and never what the image CLAIMED to be: the base
+    tag is local and mutable, and before this round the driver's own
+    unconditional `docker build -t` silently repaired a hand-mutated tag by
+    a cache-hit retag -- measured 2026-09-02, which is how a probe of this
+    very read-back recorded PASS on a base it had deliberately broken.
+    Since 22 the gate reads the task image's own `bakeoff.base.*` labels
+    (inherited verbatim from its base, since `render_dockerfile` emits no
+    LABEL of its own) and records them BESIDE `python_observed` -- never in
+    place of it, and never refused on: the interpreter read-back stays the
+    sole authority on whether a python task may run. No verdict moves: a
+    cached 21 PASS was a PASS for the same reasons, so what the bump adds
+    is a second, independent fact a reader can compare the first against."""
     from bakeoff.preflight import PREFLIGHT_VERSION
 
-    assert PREFLIGHT_VERSION == "21"
+    assert PREFLIGHT_VERSION == "22"
 
 
 # --- fix 2: the bare-runner probe ---------------------------------------------
