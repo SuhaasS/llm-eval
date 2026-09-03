@@ -4124,7 +4124,12 @@ def test_the_orphan_set_is_unchanged_by_the_widened_regex(
         monkeypatch, tmp_path):
     """The `.gitmodules` regex now matches `.path` AND `.url`; `declared_paths`
     is still built from exactly the `path` half, so the orphan set this
-    section's other tests already pin is byte-identical."""
+    section's other tests already pin is byte-identical -- except on one
+    shape, a stanza that repeats its own `path` key. `--get-regexp` returns
+    BOTH records (measured 2026-09-03, git 2.50.1), so the old union filed
+    both values while `path_by_name[name] = value` is last-wins. Last-wins is
+    git's own reading and `derive_submodules`' too, so the two parses now
+    agree where before they could not."""
     container = _ScriptedContainer(
         start_sha="s" * 40, tests=_FakeTests(), present=("tests/",),
         gitlinks=("vendor/libdep",),

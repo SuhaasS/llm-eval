@@ -2241,6 +2241,18 @@ def preflight(
                 # itself contain a dot, so the split has to happen at the
                 # LAST one -- exactly `derive_submodules`' own parse of this
                 # same blob.
+                #
+                # The orphan set this produces is byte-identical to the
+                # pre-item-16 `declared_paths.add(value)` union EXCEPT on one
+                # shape: a stanza that repeats its own `path` key. Measured
+                # 2026-09-03 (git 2.50.1) -- `--get-regexp` returns BOTH
+                # records, so the union filed both values as declared paths
+                # while `path_by_name[name] = value` is last-wins and files
+                # only the second. Last-wins is git's own reading and is what
+                # `derive_submodules`' `declared.setdefault(name, {})[field]`
+                # has always done, so the two now agree where before they
+                # could not; the consequence is that a repeated first `path`
+                # with no gitlink stops being reported as an orphan.
                 for record in declared_subs.stdout.split("\0"):
                     if not record:
                         continue
@@ -2271,26 +2283,46 @@ def preflight(
             # initialised submodule -- collapsing it with >1 would report an
             # unreadable config as the measured claim "no submodule has a
             # url".
-            persisted = container.exec(
-                ["git", "config", "--local", "--get-regexp", "-z",
-                 r"^submodule\..*\.url$"]
-            )
+            #
+            # `if submodules:` gates the whole read, because the enclosing
+            # branch is entered for EVERY task: `git submodule status` exits
+            # 0 with empty stdout on a repository with none, so `submodules`
+            # is `[]` there. Without the gate every gate in the corpus pays
+            # an exec it has nothing to learn from, and a `>1` exit would
+            # file a problem -- a NO-GO -- over a key that describes nothing
+            # in that task. With it, `persisted_by_name` stays `{}` and the
+            # entry loop below reads `None` out of an empty dict exactly as
+            # it would have, so no evidence value changes.
             persisted_by_name: dict[str, str] | None = {}
-            if persisted.exit_code in (0, 1):
-                for record in persisted.stdout.split("\0"):
-                    if not record:
-                        continue
-                    key, sep, value = record.partition("\n")
-                    if sep:
-                        persisted_by_name[
-                            key[len("submodule."):-len(".url")]] = value
-            else:
-                persisted_by_name = None
-                problems.append(
-                    "reading the run tree's submodule urls failed (exit "
-                    f"{persisted.exit_code}): "
-                    f"{(persisted.stdout or persisted.stderr)[:500]}"
+            if submodules:
+                persisted = container.exec(
+                    ["git", "config", "--local", "--get-regexp", "-z",
+                     r"^submodule\..*\.url$"]
                 )
+                if persisted.exit_code in (0, 1):
+                    for record in persisted.stdout.split("\0"):
+                        if not record:
+                            continue
+                        key, sep, value = record.partition("\n")
+                        if sep:
+                            # A FIXED suffix slice here, unlike the
+                            # `rpartition` above, and it is exact rather than
+                            # a shortcut: this regex matches only `.url`, so
+                            # the last four characters of every key it
+                            # returns are that suffix -- a name that itself
+                            # ends in `.url` gives `submodule.a.url.url` and
+                            # comes back as `a.url`, which is the name. The
+                            # read above matches `.path` OR `.url` and has no
+                            # such fixed suffix to strip.
+                            persisted_by_name[
+                                key[len("submodule."):-len(".url")]] = value
+                else:
+                    persisted_by_name = None
+                    problems.append(
+                        "reading the run tree's submodule urls failed (exit "
+                        f"{persisted.exit_code}): "
+                        f"{(persisted.stdout or persisted.stderr)[:500]}"
+                    )
             # `url_declared`/`url_persisted` on every entry, and the one
             # assertion this pair of reads exists for (round 2 item 16). The
             # join key is the submodule NAME (both files key on it); the

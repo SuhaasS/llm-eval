@@ -4325,20 +4325,28 @@ def test_start_sha_does_not_move_when_a_relative_url_is_resolved(
         tmp_path, upstream_submodule, local_urls):
     """D9: `_init_submodules` -- where the resolved url is built and
     persisted -- runs AFTER `start_sha` is computed and pinned, so nothing
-    about resolving a relative url can feed back into it. Pinned by
-    determinism rather than by a cross-fixture comparison (the two fixtures'
-    `.gitmodules` blobs differ in content, so their commit shas differ too,
-    which any such comparison would conflate with a real regression here):
-    two independent materializations of the SAME relative-url task, into
-    fresh trees and caches, return the identical `start_sha` -- the "pure
-    function of the manifest" property CLAUDE.md states for it."""
+    about resolving a relative url can feed back into it.
+
+    The comparison has to VARY `url_resolved` while holding everything else
+    identical, which rules out two shapes. A cross-FIXTURE comparison is
+    unsound: the relative-url fixture's `.gitmodules` blob differs from the
+    absolute one's, so their commits differ too and a correct implementation
+    fails it. Two materializations of the SAME task are merely a determinism
+    check -- both resolve `../libdep` to the same string, so a regression
+    that fed `url_resolved` into the setup commit yields two equal shas and
+    stays green. This uses the sound pattern
+    `test_declaring_an_unneeded_submodule_does_not_move_start_sha` already
+    carries: two manifests over ONE tree, hence one `.gitmodules` blob and
+    one `base_sha`, differing only in what `url_resolved` becomes -- the
+    resolved local path on one side and `None` on the other, because item
+    2's key means a declared-unneeded submodule is never resolved at all."""
     up = _relative_url_fixture(upstream_submodule)
-    task = _sub_task(tmp_path, up)
+    resolved = _sub_task(tmp_path / "a", up)
+    never = _sub_task(tmp_path / "b", up,
+                      extra_yaml='submodules_unneeded: ["vendor/libdep"]')
 
-    first = materialize(task, tmp_path / "ra", tmp_path / "ca")
-    second = materialize(task, tmp_path / "rb", tmp_path / "cb")
-
-    assert first == second
+    assert materialize(resolved, tmp_path / "ra", tmp_path / "ca") == \
+        materialize(never, tmp_path / "rb", tmp_path / "cb")
 
 
 def test_the_image_context_uses_the_resolved_url(
