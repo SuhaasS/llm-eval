@@ -511,7 +511,7 @@ def test_run_matrix_prints_the_unselected_refusals_as_warnings(
 
     out = capsys.readouterr().out
     assert "WARNING" in out
-    assert "b" in out
+    assert str(tmp_path / "set" / "b") in out
     assert "is not an allowed image.env key" in out
 
 

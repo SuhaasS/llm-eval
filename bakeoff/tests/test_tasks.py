@@ -3697,10 +3697,17 @@ def test_a_broken_manifest_that_is_selected_still_refuses(tmp_path, upstream):
     the load falls through to the `missing` check, and it still raises a
     TaskError whose message says "no such task(s)" instead -- a bare
     `pytest.raises(TaskError)` would pass over that mutation, which is why
-    the message is asserted."""
+    the message is asserted.
+
+    A second, unselected broken sibling (`t-003`, uncommitted like `t-002`
+    in this non-repo set) makes this the one test where a load produces both
+    a fatal refusal and a skippable one in the same collection --
+    `_refusal_report`'s `skippable` line is otherwise unreached in the suite,
+    since every other refusal test's load has exactly one refusal."""
     root = tmp_path / "set"
     _write_task(root, upstream, name="t-001", task_id="t-001")
     _write_broken_task(root, upstream)
+    _write_broken_task(root, upstream, name="t-003")
 
     with pytest.raises(TaskError) as excinfo:
         load_task_set_with_refusals(root, only=["t-002"])
@@ -3708,6 +3715,7 @@ def test_a_broken_manifest_that_is_selected_still_refuses(tmp_path, upstream):
     message = str(excinfo.value)
     assert "SELECTED by --tasks as 't-002'" in message
     assert "is not an allowed image.env key" in message
+    assert "further manifest(s)" in message
 
 
 def test_no_tasks_selection_refuses_on_any_invalid_manifest(tmp_path, upstream):
@@ -3799,6 +3807,12 @@ def test_an_untracked_broken_sibling_warns_inside_a_git_task_set(
     assert len(refusals) == 1
     assert refusals[0].committed is False
 
+    text = "\n".join(refusal_warnings(refusals, root=root, selected={"t-001"}))
+    assert (
+        "this directory is in no repository, the manifest is untracked or "
+        "ignored there, or it is modified since the last commit"
+    ) in text
+
 
 def test_an_ignored_task_set_inside_a_repo_is_not_committed(tmp_path, upstream):
     """Finding 2's measurement, and the anchor for the `ls-files` term. A
@@ -3828,6 +3842,12 @@ def test_an_ignored_task_set_inside_a_repo_is_not_committed(tmp_path, upstream):
     assert len(refusals) == 1
     assert refusals[0].committed is False
 
+    text = "\n".join(refusal_warnings(refusals, root=root, selected={"t-001"}))
+    assert (
+        "this directory is in no repository, the manifest is untracked or "
+        "ignored there, or it is modified since the last commit"
+    ) in text
+
 
 def test_a_modified_broken_manifest_in_a_committed_set_is_not_committed(
     tmp_path, upstream
@@ -3852,6 +3872,19 @@ def test_a_modified_broken_manifest_in_a_committed_set_is_not_committed(
     assert [t.task_id for t in tasks] == ["t-001"]
     assert len(refusals) == 1
     assert refusals[0].committed is False
+
+    # This is the tracked-but-modified shape: `t-002` IS tracked in the set's
+    # revision, just edited since the commit. Finding 1 (round 2 item 4
+    # review): the old wording ("it has none, or the directory is not tracked
+    # there") is FALSE here on both alternatives, since the set has a
+    # revision and the directory is tracked in it. Guard against regressing
+    # to that claim, and pin the wording that is true on every shape.
+    text = "\n".join(refusal_warnings(refusals, root=root, selected={"t-001"}))
+    assert (
+        "this directory is in no repository, the manifest is untracked or "
+        "ignored there, or it is modified since the last commit"
+    ) in text
+    assert "it has none, or the directory is not tracked there" not in text
 
 
 def test_a_manifest_that_is_not_valid_yaml_is_a_refusal_not_a_traceback(

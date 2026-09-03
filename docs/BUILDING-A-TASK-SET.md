@@ -620,8 +620,14 @@ named only the sibling.
 manifests were skipped: a scratch task set that is not a git repository
 records `task_set_commit` as `""` — the honest blank meaning this result is
 not re-derivable against a revision — and a warned run looks like any other
-run over such a directory. Keep the driver's output if you need to reconstruct
-what a drafting run did, and gate the whole set before you commit it.
+run over such a directory. When the drafting directory instead sits *ignored*
+inside an enclosing repository, the blank is not what you get: `task_set_commit`
+returns that enclosing repository's clean HEAD — a sha that names a revision
+the task set is not even part of — so a warned run there is indistinguishable
+from a clean one by anything the record carries, and the driver's output is
+the only evidence that a manifest was skipped. Keep the driver's output if you
+need to reconstruct what a drafting run did, and gate the whole set before you
+commit it.
 
 ### 3.7 Reading a preflight refusal
 

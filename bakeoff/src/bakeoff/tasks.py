@@ -1590,11 +1590,14 @@ def _manifest_committed(root: Path, task_dir: Path) -> bool:
     from inside the collector's `except` block, where a raise would chain onto
     the manifest's own error and escape `load_task_set_with_refusals` as an
     exception no driver catches -- the traceback this change exists to remove,
-    reintroduced one layer over.
+    reintroduced one layer over. Both `resolve()` calls are inside the same
+    guard as the `ls-files` call, not ahead of it: `resolve()` is non-strict
+    and will not raise on a missing path, but it can raise `OSError` on a
+    pathological one, and the totality claim above covers that too.
     """
-    root = Path(root).resolve()
-    task_dir = Path(task_dir).resolve()
     try:
+        root = Path(root).resolve()
+        task_dir = Path(task_dir).resolve()
         tracked = subprocess.run(
             ["git", "ls-files", "--error-unmatch", "--", str(task_dir)],
             cwd=root, capture_output=True, text=True,
@@ -1685,8 +1688,13 @@ def refusal_warnings(refusals: list[RefusedManifest], *, root: Path,
     The middle clause claims only what was measured. "Uncommitted work in
     progress" would be an overclaim about a directory in a tree that is not a
     git repository at all, where nothing is known about work in progress; what
-    IS known is that no such refusal is committed in this task set's revision,
-    because there is none or because the directory is not tracked in it.
+    IS known is that no such refusal is committed in this task set's revision
+    -- because the directory is in no repository, because the manifest is
+    untracked or ignored there, or because it is tracked but modified since
+    the last commit (the ordinary drafting loop: editing an existing tracked
+    task rather than adding a new one). All three collapse to the same
+    observable fact -- `_manifest_committed` returned False -- and the
+    parenthetical below states exactly those three, not just the first two.
 
     Empty whenever `refusals` is: `load_task_set_with_refusals` returns a
     non-empty list only on the branch that was allowed to proceed.
@@ -1697,7 +1705,9 @@ def refusal_warnings(refusals: list[RefusedManifest], *, root: Path,
         f"WARNING: {len(refusals)} manifest(s) under {root} did not load and "
         f"were skipped. None of them is a selected task "
         f"({', '.join(sorted(selected))}), and none is committed in this task "
-        "set's revision (it has none, or the directory is not tracked there):"
+        "set's revision (this directory is in no repository, the manifest is "
+        "untracked or ignored there, or it is modified since the last "
+        "commit):"
     ]
     lines += [f"  - {refusal.error}" for refusal in refusals]
     lines.append(
