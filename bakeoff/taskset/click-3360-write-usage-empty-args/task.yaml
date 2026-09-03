@@ -365,12 +365,12 @@ budget:
   # task no arm could verify even once. That comparison runs only after all
   # three keys above have been validated, so a bad wall_clock_timeout_s is
   # refused as itself rather than surfacing here as this key exceeding it.
-  # Raising it multiplies the gate's wall
-  # cost: preflight runs the suite five times (four when tests.p2p is
-  # declared) plus once per declared grading.* argv plus the bare pytest
-  # collection the gate makes on every pytest task -- 9x worst case on a
-  # pytest task (8x on a node one) -- all before the proxy starts and inside
-  # the same one-hour SSO session the matrix needs.
+  # Raising it multiplies the gate's wall cost: preflight runs the suite
+  # five times (four when tests.p2p is declared) plus once per declared
+  # grading.* argv plus the bare pytest collection the gate makes on every
+  # pytest task -- 9x worst case on a pytest task (8x on a node one) -- all
+  # before the proxy starts and inside the same one-hour SSO session the
+  # matrix needs.
   #
   # Size it from bounded_run_durations_s in the cached verdict
   # (<cache>/preflight/<task_id>.json), which is what the gate itself

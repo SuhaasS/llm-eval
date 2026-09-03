@@ -1343,8 +1343,8 @@ def load_task(task_dir: Path, set_commit: str = "") -> TaskManifest:
         adapter.validate_node_id(node_id, test_paths, where)
     adapter.validate_id_set((*f2p, *p2p), where)
 
-    # `is None`, NOT `or {}`, for the reason given at `budget_raw` above and
-    # at `grading_raw` below -- and this section is the one where a silently
+    # `is None`, NOT `or {}`, for the reason given at `budget_raw` and
+    # `grading_raw` below -- and this section is the one where a silently
     # discarded body costs the most. Measured 2026-09-02: `image: []`, `: 0`
     # and `: ""` all loaded as the default python with EMPTY apt, pip and
     # build, so one stray bracket throws away `build: ["pip install -e ."]`
@@ -1567,6 +1567,10 @@ def load_task(task_dir: Path, set_commit: str = "") -> TaskManifest:
         gitignore_extra=_strs(data.get("gitignore_extra"), f"{where}:gitignore_extra"),
         strip_paths=strip_paths,
         submodules_unneeded=submodules_unneeded,
+        # `or {}` deliberately: an empty and an absent provenance are the
+        # same field, nothing branches on it, and `is None` would hand
+        # `provenance: 0` to `dict(0)` -- a bare `TypeError`, the opposite of
+        # what the sibling refusals (`image`, `budget`, `grading`) are for.
         provenance=dict(data.get("provenance") or {}),
         task_set_commit=set_commit,
         manifest_digest=hashlib.sha256(raw_manifest + raw_reference).hexdigest()[:16],

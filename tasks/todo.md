@@ -4045,7 +4045,12 @@ cases against the plan's own stated arithmetic of 32 (`2.1`'s 9 + `2.2`'s 2 +
 1 + `2.11`'s 3 = 32) — so the null check was folded into the same
 parametrized test instead, running once per parametrize case rather than as
 its own node. Both options were explicitly offered by the plan; this is the
-one that keeps the arithmetic exact.
+one that keeps the arithmetic exact. A second deviation: by the time this
+item was implemented, round-2 item 7 had already edited the click manifest's
+`budget:` comments and `docs/BUILDING-A-TASK-SET.md`'s prose, so T4.1's and
+T5.2's quoted "before" blocks no longer matched either file byte-for-byte;
+both edits were made by applying the plan's stated intent to the drifted
+text rather than by literal transcription.
 
 Verified: `.venv/bin/python -m pytest tests/ -q` — `1706 passed, 67
 deselected`, exactly baseline `1674` + the plan's stated `32`.
@@ -4070,10 +4075,19 @@ true` case no longer mentions `suite_timeout_s`.
 `scripts/verify_logger.py` (offline logger gate, unchanged code path):
 **GATE PASSED** on a clean re-run (`1706 passed, 67 deselected` in the unit
 phase, `44 passed` integration, dry run OK, offline smoke GO). One earlier
-invocation reported `GATE FAILED: unit suite` while a background job whose
-tail output was truncated to 30 lines was being inspected; re-run
+invocation reported `GATE FAILED: unit suite`, but the failing test itself
+was not captured: the invocation was piped through `tail -30`, and
+`verify_logger.py` prints its `GATE FAILED: {failures}` summary only at the
+very end, so the tail carried the verdict and none of the pytest output that
+would identify it. The cause is therefore unknown, not a confirmed flake —
+`scripts/mutation_check.py` had just been run solo and backgrounded past the
+tool's timeout, waited out with `until ! pgrep`, and a unit phase that
+overlapped a still-mutated tree would produce exactly this signature (unit
+suite red, every later phase green) without being a flake at all. Re-run
 immediately after with full output captured showed a clean pass across all
-four phases with no code changes in between, which reads as a transient
-flake rather than a regression — flagged here rather than silently
-discarded, since this repository already tracks at least one other flaky
-fixture (`git log`, "record the flaky fixture in the wave's review log").
+four phases with no code changes in between; item 6's own code review
+independently re-ran the gate twice more, both `GATE PASSED` with identical
+counts (`1706 passed, 67 deselected` in the unit phase, `44 passed`
+integration, each run). Flagged here rather than silently discarded, since
+this repository already tracks at least one other flaky fixture (`git log`,
+"record the flaky fixture in the wave's review log").
