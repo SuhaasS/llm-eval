@@ -4388,3 +4388,115 @@ raise-don't-fall-through, D7's rejected refactor and its correction from review
 transcribed as written; no other defect was found.
 
 `graphify update .` run after the source edits.
+
+## Round 2 item 10 — the submodule leak guards are made total, and given a post-condition — 2026-09-03
+
+Plan: `docs/superpowers/plans/2026-09-03-round2-10-submodule-leak-guards.md`
+(reviewed twice, APPROVED, 0 open findings after review 2). Transcribed as
+written; no deviation disputed the design.
+
+**What changed, in one paragraph.** `TASKS.md`'s own P3 bullet on this item
+said "Leave the code as it is... What is missing is the measurement, not the
+fix" — the plan's M4 inverts that conclusion. Measured, git 2.50.1: a clone
+always gets a remote, so "origin does not exist on a submodule git chose not
+to give a remote" does not exist as a shape; the only way a remote is not
+called `origin` is an operator's `clone.defaultRemoteName`, and in exactly
+that case `git remote remove origin` exits 2, the old `check=False` swallowed
+it, and `.git/config` plus `.git/modules/<name>/config` rode into the run
+tree carrying the host cache path with materialization reporting success and
+`git status --porcelain` clean. So the one reachable failure of that guard
+WAS the leak it existed to prevent. Fixed by listing remotes and removing
+each by name, at `check=True` on both the listing and the removal, in both
+`_init_submodules` (the submodule half) and `materialize` (the superproject
+half, which M5 showed leaks the identical way from the identical cause).
+`materialize` also gained a post-condition, `_refuse_host_mirror_path`, that
+walks the whole `.git` subtree of the finished run tree in 1 MiB chunks and
+raises `TaskError` naming the first file that still carries
+`<cache_root>/repos` — a property re-checked against the artifact itself,
+the same move `CLAUDE.md` already makes for the pruned mirror's own cache.
+
+**Confirmed against the tree before starting.** Round-2 item 2
+(`submodules_unneeded`) landed first, as the plan required: `_init_submodules`
+filters to `needed = tuple(sub for sub in subs if not sub.declared_unneeded)`
+and returns early when `needed` is empty (`tasks.py:2914-2915`), so a
+submodule declared unneeded is never initialised and neither leak guard runs
+for it — exactly what the plan's "Composition with item 2" section predicted,
+and the reason the post-condition lives in `materialize` rather than inside
+`_init_submodules` (D4): the latter returns early for a growing set of tasks,
+and the superproject's own two guards ran before it was ever called.
+
+**Deviations from the plan, and why.**
+
+1. **V3 (red-before-green on the new `clone.defaultRemoteName` test) was not
+   run as a standalone step**, because the fix was implemented as one
+   sequential edit rather than test-then-code; running it would have meant
+   reverting Task 2/3's edits, running the test alone, and reapplying. The
+   defect it would have shown is already the plan's own M4 measurement
+   (reproduced independently by review 1), and V4 below gives the equivalent
+   assurance from the other direction — that the fake genuinely raises rather
+   than the test passing for a reason it does not state.
+2. **The V4 probe was run as a temporary, uncommitted test appended to
+   `test_tasks.py`**, executed with `pytest -k`, confirmed to fail with
+   exactly `TaskError: git reflog expire --expire=now --all failed (exit 1):
+   boom` escaping `materialize` uncaught (not swallowed, not miscaught), then
+   deleted before the real commit. This is the plan's own V4 step, run
+   literally: "run one of them with the fake in place and no `pytest.raises`,
+   confirm a `TaskError` escapes with the expected message."
+3. **The `clone.defaultRemoteName=upstream` end-to-end check (V10) does NOT
+   refuse.** It succeeds cleanly, with zero leaking files anywhere under
+   `.git`. This is correct and is what the plan's own design predicts —
+   D1 explicitly rejects "refuse instead of fix" as worse than the
+   alternative, and review 1's re-measurement (quoted in the plan) already
+   says so: "removing every listed remote in both the run tree and the
+   submodule clears both files and the dangling `[branch "main"]` section,
+   the whole-`.git` scan then comes back clean." Reproduced independently
+   here on the real `tomlkit-514-inline-table-comment-separator` task from
+   `~/.cache/bakeoff-probe/taskset-w6-isolated`, fresh cache and run tree,
+   `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=clone.defaultRemoteName
+   GIT_CONFIG_VALUE_0=upstream`: `materialize` returned `start_sha
+   e1d72b883d2e452ca14835047e2fa7db02cdc4d8` (unchanged), `git remote -v` in
+   both the run tree and `tests/toml-test` printed nothing, and neither
+   `.git/config` nor `.git/modules/tests/toml-test/config` carries a `[remote
+   ...]` section of any name — the section is gone entirely, not merely
+   renamed. A whole-`.git` byte scan for `<cache>/repos` returned zero hits.
+   The post-condition's REFUSING behaviour is exercised instead by the unit
+   tests that synthesize a guard that silently no-ops (`returncode=0`) —
+   `test_a_host_mirror_path_surviving_in_the_submodules_reflog_is_refused`
+   and its superproject counterpart — which is the only way to observe the
+   post-condition catching something, precisely because Task 2/3's fix closes
+   the one measured real-world path to a leak.
+
+**Verification.**
+- `.venv/bin/python -m pytest tests/ -q` — **1734 passed, 69 deselected**,
+  exactly baseline `1725`/`67` + **9 passed** (4.1-4.7, 4.9, 4.10; 4.8 is a
+  rename+widen of an existing test, not an addition) and **+2 deselected**
+  (5.1, 5.2 — the two new integration tests, deselected by `-m "not
+  integration"`, proving they were collected with both markers).
+- `.venv/bin/python scripts/mutation_check.py`, run solo — **198/198 caught**
+  (195 baseline + the 3 new anchors), including the three this item adds:
+  `tasks: stop refusing a run tree that carries the host mirror path`,
+  `tasks: remove only a remote literally named origin` (the mutant keeps
+  `check=True`, so it is louder than the pre-fix code and goes red on the
+  raise rather than on a remote assertion), and `tasks: let the leak scan
+  skip a directory it cannot list`. Tree byte-clean afterward (`git status`
+  shows only the intended source edits, no `if False:` or other mutation
+  residue).
+- `.venv/bin/python scripts/run_matrix.py --preflight-only --force-preflight
+  --task-set ~/.cache/bakeoff-probe/taskset --tasks
+  tomlkit-514-inline-table-comment-separator` — `start_sha
+  e1d72b883d2e452ca14835047e2fa7db02cdc4d8` (unchanged from before this
+  commit), `preflight PASS`, f2p red-then-green, p2p green both ways, tree
+  clean. Confirms D7's claim end to end: nothing in this item moves an
+  object, a ref, the index or a tracked file, only already-scrubbed `.git`
+  metadata.
+- The `clone.defaultRemoteName=upstream` real-task check (V10), detailed in
+  deviation 3 above: clean materialize, zero leaks, `start_sha` unchanged.
+
+Everything else in the plan (D2's superproject symmetry, D3's chunked-read and
+`os.walk(onerror=)` reasoning, D5's naming, D6's widened test, D7's
+version-constant argument, the M6 corpus table, the M7 non-vacuity correction
+distinguishing the submodule's 0-byte `logs/HEAD` from the superproject's
+non-empty one, and the OQ1/OQ4 rulings) was transcribed as written; no other
+defect was found.
+
+`graphify update .` run after the source edits.

@@ -2861,6 +2861,11 @@ def _init_submodules(task: TaskManifest, dest: Path,
     -- the config files are clean without it, so a check that greps only those
     passes with the leak in place. It runs `check=True`.
 
+    Both guards are `check=True` and neither is the last word: `materialize`
+    calls `_refuse_host_mirror_path` over the finished tree, which is what makes
+    "no host path survives" a property re-checked against the artifact rather
+    than an inference from four commands having exited zero.
+
     THE URL IS PERSISTED, THEN REWRITTEN. A transient `-c submodule.<n>.url=`
     populates the tree but leaves `git submodule status` reading `-<sha>` --
     uninitialised -- because `submodule init` skips its registration step when
@@ -2952,15 +2957,38 @@ def _init_submodules(task: TaskManifest, dest: Path,
                 "environment defect."
             )
 
-        _git("remote", "remove", "origin", cwd=dest / sub.path, check=False)
+        # EVERY remote, by the name GIT gave it -- not the literal "origin",
+        # and not `check=False`. Measured 2026-09-02, git 2.50.1: a clone
+        # ALWAYS gets a remote, so "a submodule git chose not to give a
+        # remote" does not exist; the only way it is not called `origin` is
+        # an operator with `clone.defaultRemoteName` set, and in exactly that
+        # case `git remote remove origin` exits 2 ("error: No such remote:
+        # 'origin'"), the old `check=False` swallowed it, and
+        # `.git/modules/<name>/config` rode into the run tree carrying the
+        # host cache path with `git status --porcelain` clean. So the one
+        # reachable failure of this guard WAS the leak it exists to remove.
+        # Listing and removing instead of refusing fixes that case rather
+        # than stopping the matrix on it. `check=True` on the LISTING too,
+        # and for a narrower reason than "a listing that fails": at
+        # check=False a failed listing returns stdout="", which is
+        # byte-identical to a repository with no remotes, so the loop would
+        # iterate zero times and the guard would report success having done
+        # nothing.
+        for remote in _git("remote", cwd=checked).stdout.splitlines():
+            if remote.strip():
+                _git("remote", "remove", remote.strip(), cwd=checked)
         # check=True (the default). This is a LEAK GUARD, not tidiness:
         # measured 2026-09-01, the submodule's `logs/HEAD` AND
         # `logs/refs/heads/main` each carry `clone: from <host cache path>`
         # after the two rewrites above -- the pruned mirror publishes
         # `refs/heads/main`, so the clone creates a local branch and logs the
         # source twice -- and this expire is the only thing that removes them.
-        # `.git/modules/<name>/config` is clean either way, which is why a
-        # config-only check sees nothing.
+        # There is a THIRD reflog, `logs/refs/remotes/origin/HEAD`, and the
+        # removal above is what clears it (measured 2026-09-02, git 2.50.1).
+        # `.git/modules/<name>/config` is clean here ONLY BECAUSE that removal
+        # ran: it is the one file the removal exists for, which is why a
+        # config-only check placed after both sees nothing, and why the
+        # removal is no longer allowed to fail quietly.
         _git("reflog", "expire", "--expire=now", "--all", cwd=dest / sub.path)
 
         head = _git("rev-parse", "HEAD", cwd=checked, check=False)
@@ -2973,6 +3001,124 @@ def _init_submodules(task: TaskManifest, dest: Path,
                 "would simply fail to collect and every arm would be scored on "
                 "an environment defect."
             )
+
+
+#: Chunk size for the run-tree leak scan. Measured 2026-09-02: the largest
+#: single file under a run tree's `.git` across the probe corpus is a 40.3 MB
+#: hardlinked pack (`pytest-10210`), and a whole-file `read_bytes()` peaks the
+#: process at 109 MB for it. Chunking bounds the peak at this constant instead
+#: of at the corpus.
+_LEAK_SCAN_CHUNK = 1 << 20
+
+
+def _file_contains(path: Path, needle: bytes) -> bool:
+    """`needle in path`'s bytes, without reading the whole file into memory.
+
+    The `len(needle) - 1` byte carry-over is the whole reason this is not a
+    loop over `read()`: a needle that straddles a chunk boundary is invisible
+    to a per-chunk test, and the run tree's largest files are exactly the ones
+    that need more than one chunk. Verified at every offset 0..39 against an
+    8-byte chunk before it was written down.
+
+    The empty-needle guard is not defensive decoration. `overlap` would be
+    -1, which is TRUTHY, so the carry-over would evaluate `[-(-1):]` == `[1:]`
+    and keep all but one byte of everything read so far -- the whole file in
+    memory, which is the one property this function exists to avoid. The
+    caller's needle is `<cache_root>/repos` and can never be empty, so the
+    guard is unreachable today; it is here because the failure it prevents is
+    silent growth rather than an exception, and the next caller does not
+    inherit the caller's guarantee.
+    """
+    if not needle:
+        raise ValueError("_file_contains needs a non-empty needle")
+    overlap = len(needle) - 1
+    tail = b""
+    with path.open("rb") as handle:
+        while chunk := handle.read(_LEAK_SCAN_CHUNK):
+            if needle in tail + chunk:
+                return True
+            tail = (tail + chunk)[-overlap:] if overlap else b""
+    return False
+
+
+def _refuse_host_mirror_path(dest: Path, cache_root: Path, task_id: str) -> None:
+    """No file under the run tree's `.git` may name the operator's mirror cache.
+
+    THE POST-CONDITION FOR EVERY LEAK GUARD IN THIS MODULE'S RUN-TREE PATH.
+    `materialize` and `_init_submodules` between them run four scrubs -- two
+    `git remote remove` loops and two `git reflog expire`s -- and every one of
+    them could fail, or miss, in a way `git status --porcelain` renders as a
+    clean tree. Measured 2026-09-02, git 2.50.1: an operator with
+    `clone.defaultRemoteName = upstream` in their global config gets a run
+    tree whose `.git/config` AND `.git/modules/<name>/config` both carry
+    `[remote "upstream"] url = <host cache path>`, with materialization
+    reporting success and the working tree clean. The path is two defects at
+    once: a host path the container cannot resolve (an error surface the agent
+    is scored on) and a publication of the operator's cache layout.
+
+    The needle is `<cache_root>/repos`, NOT `cache_root`, and that is
+    load-bearing: all five `materialize` call sites put run trees UNDERNEATH
+    the cache root (`preflight-tree`, `artifacts`, `oracle-tree`,
+    `grade-tree`, `grade-preflight-tree`), so a whole-cache-root needle is a
+    prefix of the tree's own path. `mirror_path` and `pruned_mirror_path` both
+    land under `repos/` and nothing else does, so one needle covers the
+    superproject's mirror and every submodule's, pruned and unpruned.
+
+    `os.walk` with `onerror`, NOT `Path.rglob`: pathlib's recursive glob
+    SUPPRESSES the PermissionError a directory it cannot list raises, so the
+    leaking files under it are skipped with no exception and no trace
+    (measured -- `rglob('*')` returns the mode-000 directory and nothing
+    inside it, while `os.walk(..., onerror=)` reports errno 13). A "clean"
+    verdict produced by a directory this function never entered is the exact
+    silence it exists to remove, so the WALK raising is as load-bearing as the
+    READ raising. Entries are sorted so the first leak reported is
+    deterministic.
+
+    Bytes, never text: a decode would need `errors="replace"`, and a replaced
+    byte is a match this check would miss. `objects/` is scanned rather than
+    skipped -- packs are compressed and contribute nothing either way, but
+    `objects/info/alternates` is plain text, and while `materialize` checks
+    the superproject's own copy by name, NOTHING checks
+    `.git/modules/<name>/objects/info/alternates`. Measured cost: 0.005-0.013 s
+    across the probe corpus against a `materialize` of 0.29-0.35 s.
+    """
+    needle = str(Path(cache_root) / "repos").encode()
+    base = Path(dest) / ".git"
+
+    def _refuse_walk_error(exc: OSError) -> None:
+        raise TaskError(
+            f"{task_id}: {exc.filename} under the run tree's .git could not "
+            f"be listed ({exc}), so the host-path leak check could not "
+            "complete. A clean verdict here would be a claim this process is "
+            "not in a position to make."
+        )
+
+    for root, dirnames, filenames in os.walk(base, onerror=_refuse_walk_error):
+        dirnames.sort()
+        for name in sorted(filenames):
+            path = Path(root) / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                hit = _file_contains(path, needle)
+            except OSError as exc:
+                raise TaskError(
+                    f"{task_id}: {path} under the run tree's .git could not "
+                    f"be read ({exc}), so the host-path leak check could not "
+                    "complete. A clean verdict here would be a claim this "
+                    "process is not in a position to make."
+                ) from exc
+            if hit:
+                raise TaskError(
+                    f"{task_id}: {path.relative_to(dest)} in the run tree "
+                    f"carries the host mirror path {needle.decode()}. That is "
+                    "a path the container cannot resolve and a publication of "
+                    "the operator's cache layout, and `git status "
+                    "--porcelain` is clean either way -- so nothing "
+                    "downstream would notice. One of materialization's leak "
+                    "guards (`git remote remove`, `git reflog expire`) did "
+                    "not remove it."
+                )
 
 
 def materialize(task: TaskManifest, dest: Path, cache_root: Path) -> str:
@@ -2988,11 +3134,16 @@ def materialize(task: TaskManifest, dest: Path, cache_root: Path) -> str:
     while still removing the future. Pruning here instead would repack the
     whole store per run and break the hardlink.
 
-    `origin` is then removed -- it points at a host path that does not exist
+    Every remote is then removed -- not only one literally named `origin`,
+    because an operator with `clone.defaultRemoteName` set gets a clone whose
+    remote is called something else, and `git remote remove origin` on that
+    machine exits 2. A remote points at a host path that does not exist
     inside the container, which is both a confusing error surface for the
     agent and a host path leaked into the run. The reflog is expired for the
     same reason: the clone records `clone: from <host cache path>` in
     `.git/logs/HEAD`, which now carries the cache layout and `base_sha`.
+    `_refuse_host_mirror_path` is the post-condition over the finished tree
+    that both guards, and their submodule counterparts, are checked against.
 
     `strip_paths` is applied first and lands in the same setup commit, so the
     commit's SHA stays a pure function of (base_sha, strip_paths, test half,
@@ -3023,8 +3174,25 @@ def materialize(task: TaskManifest, dest: Path, cache_root: Path) -> str:
     with _repo_lock(task.repo_url, cache_root):
         _git("clone", "--local", "--no-checkout", str(mirror), str(dest))
     _git("checkout", "--detach", task.base_sha, cwd=dest)
-    _git("remote", "remove", "origin", cwd=dest, check=False)
-    _git("reflog", "expire", "--expire=now", "--all", cwd=dest, check=False)
+    # Same shape as `_init_submodules`, one level up, and for the same
+    # measured reason (2026-09-02, git 2.50.1): under an operator's
+    # `clone.defaultRemoteName` the remote is not called `origin`,
+    # `git remote remove origin` exits 2, and `check=False` used to let
+    # `.git/config` reach the agent carrying the host cache path.
+    for remote in _git("remote", cwd=dest).stdout.splitlines():
+        if remote.strip():
+            _git("remote", "remove", remote.strip(), cwd=dest)
+    # `check=True` (the default) here too. No failure shape was found for
+    # this call -- it runs in a repository created one statement ago -- but
+    # a leak guard that is allowed to fail quietly is the defect this whole
+    # item is about, and raising is affordable for the same reason the
+    # alternates check below gives: `materialize` runs before the container,
+    # so it costs setup time and zero tokens, and `run_matrix` catches per
+    # cell. NOTE the ordering: the setup commit further down appends to
+    # `.git/logs/HEAD` AFTER this expire, so that file is non-empty in the
+    # finished tree -- non-empty and needle-free, which is what the tests
+    # assert rather than a size of zero.
+    _git("reflog", "expire", "--expire=now", "--all", cwd=dest)
 
     # Every other check in the object-leak path is a check on the CACHE. This
     # one is on the artifact the agent actually receives, and it is the only
@@ -3104,4 +3272,10 @@ def materialize(task: TaskManifest, dest: Path, cache_root: Path) -> str:
     # clean -xfd` above does NOT wipe an initialised submodule (that needs
     # `-ffd`), so the order is safe in the other direction too.
     _init_submodules(task, dest, derive_submodules(task, mirror), cache_root)
+    # AFTER `_init_submodules`, which is the last thing that writes into
+    # `.git`, and in `materialize` rather than inside it: `_init_submodules`
+    # returns early for a task with no submodules (and, since item 2, for one
+    # whose submodules are all declared unneeded), and the superproject's own
+    # two guards ran long before it was called.
+    _refuse_host_mirror_path(dest, cache_root, task.task_id)
     return start_sha

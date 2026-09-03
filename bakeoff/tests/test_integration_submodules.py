@@ -501,3 +501,76 @@ def test_the_grader_resolves_a_reference_fix_whose_submodule_is_under_tests(
     )
     assert grade.framework == "pytest"
     assert grade.f2p_failed_node_ids == ()
+
+
+# ---------------------------------------------------------------------------
+# round-2 item 10: the leak guards are total, and given a post-condition
+# ---------------------------------------------------------------------------
+
+
+def test_the_materialized_run_tree_carries_no_host_mirror_path_under_dot_git(
+        workspace, superproject, local_urls):
+    """The real init this item asks for, on the module's real superproject
+    rather than a function-scoped scratch one.
+    """
+    task = load_task(superproject["task_dir"])
+    run_tree = workspace / "run-leak"
+    cache = workspace / "cache"
+
+    materialize(task, run_tree, cache)
+
+    needle = str(cache / "repos").encode()
+    hits = [
+        path for path in (run_tree / ".git").rglob("*")
+        if path.is_file() and not path.is_symlink()
+        and needle in path.read_bytes()
+    ]
+    assert hits == []
+
+    # Non-vacuity, in the corrected per-file form: the submodule's
+    # `logs/HEAD` -- whose expire is the last write to it -- is present at
+    # 0 bytes; the superproject's is present, NON-EMPTY (the setup commit
+    # appends to it after the expire runs) and needle-free.
+    sub_head = run_tree / ".git" / "modules" / SUB_PATH / "logs" / "HEAD"
+    assert sub_head.is_file() and sub_head.stat().st_size == 0
+
+    super_head = run_tree / ".git" / "logs" / "HEAD"
+    assert super_head.is_file() and super_head.stat().st_size > 0
+
+
+def test_a_skipped_reflog_expire_is_refused_on_a_real_run_tree(
+        workspace, superproject, local_urls):
+    """The red half. `tasks.subprocess.run` is swapped by hand in a
+    try/finally -- the module's fixtures are module-scoped and `monkeypatch`
+    is function-scoped, so the neighbouring `local_urls` fixture already
+    restores an attribute this way.
+
+    Considered and rejected: asserting from INSIDE a `RunContainer` with
+    `grep -rlF <cache>/repos /repo/.git`. `/repo` is a bind mount of exactly
+    the tree the host-side scan reads, so the container makes no independent
+    observation, and `grep`'s presence in the eval-agent image is not
+    something this plan measured. The bind-mount identity is already covered
+    by this module's blob-comparison test.
+    """
+    task = load_task(superproject["task_dir"])
+    run_tree = workspace / "run-leak-red"
+    cache = workspace / "cache"
+    dest_sub = run_tree / SUB_PATH
+
+    real_run = subprocess.run
+
+    def fake(*popenargs, **kwargs):
+        argv = popenargs[0]
+        if (list(argv[:2]) == ["git", "reflog"]
+                and str(kwargs.get("cwd")) == str(dest_sub)):
+            return subprocess.CompletedProcess(list(argv), 0, "", "")
+        return real_run(*popenargs, **kwargs)
+
+    tasks.subprocess.run = fake
+    try:
+        with pytest.raises(tasks.TaskError, match=r"logs/HEAD") as excinfo:
+            materialize(task, run_tree, cache)
+    finally:
+        tasks.subprocess.run = real_run
+
+    assert task.task_id in str(excinfo.value)

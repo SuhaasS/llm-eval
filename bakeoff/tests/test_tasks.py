@@ -3114,30 +3114,254 @@ def test_the_materialized_tree_is_clean_after_initialisation(
     assert status.startswith(f" {up['pinned']}")
 
 
-def test_the_run_tree_carries_no_host_cache_path_for_the_submodule(
-        tmp_path, upstream_submodule, local_urls):
-    """The WHOLE `.git/modules` subtree, not the config files.
+def _fake_run(monkeypatch, predicate, returncode=1, stderr="boom"):
+    """Make `tasks`' own `subprocess.run` fail (or no-op) for ONE git call.
 
-    Measured 2026-09-01, git 2.50.1: after `remote remove origin` and the url
+    `predicate(argv, cwd)` selects it. Everything else, including this file's
+    `_sh` helper, delegates to the real `subprocess.run`.
+
+    Patching `subprocess.run` rather than `tasks._git` is what makes the
+    asserted message OBSERVED: `_git`'s `check=True` branch is what formats
+    `git <argv> failed (exit N): <stderr>`, and a fake that replaced `_git`
+    would never reach it.
+    """
+    real_run = subprocess.run
+
+    def run(*popenargs, **kwargs):
+        argv = popenargs[0]
+        if predicate(list(argv), str(kwargs.get("cwd"))):
+            return subprocess.CompletedProcess(list(argv), returncode,
+                                               "", stderr)
+        return real_run(*popenargs, **kwargs)
+
+    monkeypatch.setattr(tasks.subprocess, "run", run)
+
+
+def test_a_submodule_remote_git_did_not_name_origin_is_still_removed(
+        tmp_path, upstream_submodule, local_urls, monkeypatch):
+    """Red before Task 2/3 lands. Measured 2026-09-02, git 2.50.1: a clone
+    always gets a remote, and the only way it is not called `origin` is an
+    operator's `clone.defaultRemoteName`, in which case `remote remove
+    origin` exits 2 and the old `check=False` swallowed it -- leaking
+    `.git/modules/vendor/libdep/config` and `.git/config`, with
+    materialization reporting success.
+    """
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "clone.defaultRemoteName")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "upstream")
+    up = upstream_submodule
+
+    _, run, _ = _materialize_sub(tmp_path, up)
+
+    assert _sh("git", "-C", "vendor/libdep", "remote", cwd=run) == ""
+    assert _sh("git", "remote", cwd=run) == ""
+    needle = str(tmp_path / "cache").encode()
+    leaking = [
+        path for path in (run / ".git").rglob("*")
+        if path.is_file() and not path.is_symlink()
+        and needle in path.read_bytes()
+    ]
+    assert leaking == []
+
+
+def test_a_failed_submodule_remote_listing_is_a_task_error(
+        tmp_path, upstream_submodule, local_urls, monkeypatch):
+    """Pins `check=True` on the LISTING. Its absence would let the D1
+    silence back in: at `check=False` a failed listing returns `""`,
+    byte-identical to a repository with no remotes, so the loop below it
+    would iterate zero times and materialization would simply succeed.
+    """
+    up = upstream_submodule
+    _fake_run(
+        monkeypatch,
+        lambda argv, cwd: argv == ["git", "remote"]
+        and cwd == str(tmp_path / "run" / "vendor" / "libdep"),
+    )
+
+    with pytest.raises(TaskError, match=r"git remote failed \(exit 1\): boom"):
+        _materialize_sub(tmp_path, up)
+
+
+def test_a_failed_submodule_remote_removal_is_a_task_error(
+        tmp_path, upstream_submodule, local_urls, monkeypatch):
+    up = upstream_submodule
+    _fake_run(
+        monkeypatch,
+        lambda argv, cwd: argv[:3] == ["git", "remote", "remove"]
+        and cwd == str(tmp_path / "run" / "vendor" / "libdep"),
+    )
+
+    with pytest.raises(
+        TaskError, match=r"git remote remove \S+ failed \(exit 1\): boom"
+    ):
+        _materialize_sub(tmp_path, up)
+
+
+def test_a_failed_submodule_reflog_expire_is_a_task_error(
+        tmp_path, upstream_submodule, local_urls, monkeypatch):
+    """The predicate is positive and exact, never `cwd != dest`. Measured:
+    `reflog expire` runs THREE times under one `materialize` --
+    `_build_pruned_mirror` runs it for the superproject's mirror and again
+    for the submodule's, both `cwd=<cache>/repos/prune-...tmp`, both
+    `check=False` -- so `cwd != dest` would intercept all three and this
+    test would be green for a reason it does not state.
+    """
+    up = upstream_submodule
+    _fake_run(
+        monkeypatch,
+        lambda argv, cwd: argv[:2] == ["git", "reflog"]
+        and cwd == str(tmp_path / "run" / "vendor" / "libdep"),
+    )
+
+    with pytest.raises(
+        TaskError,
+        match=r"git reflog expire --expire=now --all failed \(exit 1\): boom",
+    ):
+        _materialize_sub(tmp_path, up)
+
+
+def test_a_failed_superproject_reflog_expire_is_a_task_error(
+        tmp_path, upstream, monkeypatch):
+    """Pins Task 3's tightening, on a task with no submodules."""
+    task = load_task(_write_task(tmp_path / "set", upstream))
+    repo = tmp_path / "run" / "repo"
+    _fake_run(
+        monkeypatch,
+        lambda argv, cwd: argv[:2] == ["git", "reflog"] and cwd == str(repo),
+    )
+
+    with pytest.raises(
+        TaskError,
+        match=r"git reflog expire --expire=now --all failed \(exit 1\): boom",
+    ):
+        materialize(task, repo, tmp_path / "cache")
+
+
+def test_a_host_mirror_path_surviving_in_the_submodules_reflog_is_refused(
+        tmp_path, upstream_submodule, local_urls, monkeypatch):
+    """Exit 0, so `_git`'s own `check=True` cannot fire -- the
+    POST-CONDITION is the thing under test. The `match=` is what separates
+    this failure from the previous test's; both raise `TaskError`.
+    """
+    up = upstream_submodule
+    _fake_run(
+        monkeypatch,
+        lambda argv, cwd: argv[:2] == ["git", "reflog"]
+        and cwd == str(tmp_path / "run" / "vendor" / "libdep"),
+        returncode=0,
+        stderr="",
+    )
+
+    with pytest.raises(
+        TaskError, match=r"\.git/modules/vendor/libdep/logs/HEAD"
+    ):
+        _materialize_sub(tmp_path, up)
+
+
+def test_a_host_mirror_path_surviving_in_the_superprojects_reflog_is_refused(
+        tmp_path, upstream, monkeypatch):
+    """Pins D4: the post-condition is in `materialize`, not inside
+    `_init_submodules`, and it runs for a submodule-free task.
+    """
+    task = load_task(_write_task(tmp_path / "set", upstream))
+    repo = tmp_path / "run" / "repo"
+    _fake_run(
+        monkeypatch,
+        lambda argv, cwd: argv[:2] == ["git", "reflog"] and cwd == str(repo),
+        returncode=0,
+        stderr="",
+    )
+
+    with pytest.raises(TaskError, match=r"\.git/logs/HEAD"):
+        materialize(task, repo, tmp_path / "cache")
+
+
+def test_the_run_tree_carries_no_host_cache_path_anywhere_under_dot_git(
+        tmp_path, upstream_submodule, local_urls):
+    """The WHOLE `.git` subtree, not `.git/modules` and not the config files
+    alone.
+
+    Measured 2026-09-01/02, git 2.50.1: after `remote remove` and the url
     rewrite the config files are already clean, and the cache path survives in
-    `logs/HEAD` and `logs/refs/heads/main` as `clone: from /…/cache/repos/…`.
-    A config-only assertion therefore passes with the leak present -- which is
-    exactly what the first draft of this test did. The `reflog expire` in
-    `_init_submodules` is what clears both, so this test is what makes that
-    call load-bearing rather than deletable.
+    `logs/HEAD` and `logs/refs/heads/main` as `clone: from /…/cache/repos/…`
+    -- a config-only assertion passes with the leak present, which is exactly
+    what the first draft of this test did. Widened further: `.git/logs/*` is
+    the SUPERPROJECT's own leak surface, from the identical cause one level up
+    in `materialize`'s two guards, and a `.git/modules`-only scan cannot see
+    it. The removal clears `logs/refs/remotes/origin/HEAD` and
+    `.git/modules/<n>/config`; the expire clears `logs/HEAD` and
+    `logs/refs/heads/main`; between them nothing survives.
     """
     up = upstream_submodule
     _, run, _ = _materialize_sub(tmp_path, up)
     cache = str(tmp_path / "cache")
+    needle = cache.encode()
 
     leaking = [
-        path for path in (run / ".git" / "modules").rglob("*")
-        if path.is_file() and cache in path.read_text(errors="replace")
+        path for path in (run / ".git").rglob("*")
+        if path.is_file() and not path.is_symlink()
+        and needle in path.read_bytes()
     ]
 
     assert leaking == []
     assert cache not in (run / ".git" / "config").read_text()
     assert str(up["lib"]) in (run / ".git" / "config").read_text()
+
+    # NOT vacuous, and the two files need DIFFERENT assertions. Measured
+    # 2026-09-02, git 2.50.1: `reflog expire` TRUNCATES rather than unlinks,
+    # so the submodule's `logs/HEAD` -- whose expire is the last write to it
+    # -- is present at 0 bytes. The superproject's is NOT: `materialize`'s
+    # expire runs before the setup commit, and that commit appends 160 bytes
+    # ("commit: bakeoff: task setup (test oracle)"). So the superproject file
+    # is asserted present, NON-EMPTY and needle-free, which is strictly
+    # stronger non-vacuity than a size of zero.
+    sub_head = run / ".git" / "modules" / "vendor" / "libdep" / "logs" / "HEAD"
+    assert sub_head.is_file() and sub_head.stat().st_size == 0
+
+    super_head = run / ".git" / "logs" / "HEAD"
+    assert super_head.is_file() and super_head.stat().st_size > 0
+    assert cache not in super_head.read_text()
+
+
+def test_an_alternates_file_under_a_submodule_is_refused(
+        tmp_path, upstream_submodule, local_urls):
+    """Not covered by the two reflog-refusal tests above: `materialize`'s
+    dedicated alternates check is `dest/.git/objects/info/alternates` only
+    and runs BEFORE `_init_submodules`, so the submodule's own copy is
+    checked by nothing else, and a later narrowing of the walk to skip
+    `objects/` would leave every other test in this set green.
+    """
+    up = upstream_submodule
+    _, run, _ = _materialize_sub(tmp_path, up)
+
+    alternates = (run / ".git" / "modules" / "vendor" / "libdep"
+                  / "objects" / "info" / "alternates")
+    alternates.parent.mkdir(parents=True, exist_ok=True)
+    alternates.write_text(f"{tmp_path / 'cache' / 'repos' / 'x.git'}/objects\n")
+
+    with pytest.raises(TaskError, match=r"objects/info/alternates"):
+        tasks._refuse_host_mirror_path(run, tmp_path / "cache", "t-001")
+
+
+def test_a_directory_under_dot_git_that_cannot_be_listed_is_refused(
+        tmp_path, upstream_submodule, local_urls):
+    """The anchor for the `os.walk(..., onerror=)` decision. Measured:
+    `Path.rglob` returns the mode-000 directory and nothing inside it, with
+    no error; `os.walk(..., onerror=)` reports errno 13.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory permissions")
+    up = upstream_submodule
+    _, run, _ = _materialize_sub(tmp_path, up)
+
+    blocked = run / ".git" / "modules" / "vendor" / "libdep" / "logs"
+    mode = blocked.stat().st_mode
+    os.chmod(blocked, 0o000)
+    try:
+        with pytest.raises(TaskError, match=r"could not be listed"):
+            tasks._refuse_host_mirror_path(run, tmp_path / "cache", "t-001")
+    finally:
+        os.chmod(blocked, mode)
 
 
 def test_an_unreachable_submodule_mirror_is_a_task_error(
@@ -4140,3 +4364,4 @@ def test_a_selected_id_no_directory_supplies_names_the_refused_manifests(
     assert "t-999" in message
     assert "DIRECTORY NAME only" in message
     assert str(root / "t-002") in message
+

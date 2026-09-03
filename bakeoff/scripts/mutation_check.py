@@ -1861,6 +1861,48 @@ MUTATIONS = [
         "not integration",
     ),
     (
+        # The post-condition, deleted. Every unit test that drives a HEALTHY
+        # materialization stays green -- the tree is clean, so the check never
+        # fires -- while a run tree whose guards silently missed goes to the
+        # agent carrying the operator's cache layout and a remote the container
+        # cannot resolve, with `git status --porcelain` clean.
+        "tasks: stop refusing a run tree that carries the host mirror path",
+        "src/bakeoff/tasks.py",
+        "            if hit:",
+        "            if False:",
+        "tests/test_tasks.py -k host_mirror_path_surviving",
+        "not integration",
+    ),
+    (
+        # Back to the literal "origin", KEEPING check=True -- so the mutant is
+        # louder than the pre-fix code, not identical to it, and the arm goes
+        # red on the raise rather than on a remote assertion. Measured
+        # 2026-09-02, git 2.50.1: an operator with `clone.defaultRemoteName`
+        # set gets a submodule whose only remote has another name, so `git
+        # remote remove origin` exits 2 -- which the pre-fix `check=False`
+        # swallowed while `.git/modules/<name>/config` kept the host cache
+        # path. Only the arm that sets that config sees either version.
+        "tasks: remove only a remote literally named origin",
+        "src/bakeoff/tasks.py",
+        "        for remote in _git(\"remote\", cwd=checked).stdout.splitlines():",
+        "        for remote in (\"origin\",):",
+        "tests/test_tasks.py -k did_not_name_origin",
+        "not integration",
+    ),
+    (
+        # The walk's error handler, dropped. Measured 2026-09-02: `Path.rglob`
+        # suppresses the PermissionError a mode-000 directory raises and
+        # returns the directory with nothing inside it, so the scan reports
+        # CLEAN over files it never opened -- the same silence the whole item
+        # removes, arriving through the walk instead of through a guard.
+        "tasks: let the leak scan skip a directory it cannot list",
+        "src/bakeoff/tasks.py",
+        "    for root, dirnames, filenames in os.walk(base, onerror=_refuse_walk_error):",
+        "    for root, dirnames, filenames in os.walk(base):",
+        "tests/test_tasks.py -k cannot_be_listed",
+        "not integration",
+    ),
+    (
         # Without this the ladder applies a gitlink diff GREEN (measured:
         # exit 0), grades a tree the agent's work is absent from, and stamps
         # `resolved: False` -- an accusation -- on work the harness could not

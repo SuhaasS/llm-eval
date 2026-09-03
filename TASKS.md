@@ -1420,6 +1420,33 @@ judge runs after one — which is why they sit here rather than above.
   because one commit must not change both what is measured and what is
   graded.
 
+- [ ] **Three cache-side `git remote remove origin` / `fetch … origin` calls
+  still hard-code the literal name, with different, non-run-tree
+  consequences.** Round 2 item 10 made the two RUN-TREE leak guards
+  (`tasks._init_submodules`, `tasks.materialize`) remove every remote by the
+  name git actually gave it, at `check=True`, and gave the finished tree a
+  post-condition (`_refuse_host_mirror_path`) that re-checks the invariant
+  against the artifact itself. It deliberately left three CACHE-side sites
+  untouched, because none of them reaches the run tree and their failure
+  shapes differ from each other: `ensure_mirror`'s `fetch --prune origin`
+  and `fetch origin <base_sha>` are a **dead refresh path** under an
+  operator's `clone.defaultRemoteName` — measured exit 128, `fatal: 'origin'
+  does not appear to be a git repository` — so a cached mirror that does not
+  yet hold `base_sha` can never be refreshed (loud, via `ensure_mirror`'s own
+  `cat-file -e`, but an unexplained mid-matrix refusal for a preventable
+  condition); `_build_pruned_mirror`'s `remote remove origin` is a **future-
+  restoration hazard** instead — the swallowed exit 2 leaves the published
+  mirror carrying `remote.upstream.fetch=+refs/*:refs/*` and `mirror=true`,
+  `_verify_pruned` asserts nothing about remotes, and measured, it does
+  **not** reach the run tree (`clone --local` writes its own remote and
+  copies neither config nor reflogs). Both are gated by `HANDOFF.md` — its
+  scope line covers `ensure_mirror`, and its "Still open" item 2 names that
+  function directly. What is genuinely open for `_build_pruned_mirror` is
+  not "remove every remote there" but "decide what `_verify_pruned` should
+  assert about remotes", a fourth term in a post-condition `HANDOFF.md`
+  spends three rounds warning against adding terms to casually — whoever
+  picks this up needs that measurement first.
+
 ---
 
 ## P3 — Decisions to settle before numbers are published
@@ -1528,18 +1555,6 @@ These need a call, not code. Most are cheap to make and expensive to make late.
   `git ls-tree <start_sha>` for the source's mode — a question that needs a
   tree, so it runs after `materialize` and before the container, unlike the
   mode-line refusal it sits beside. `GRADER_VERSION` 11 → 12.
-
-- [ ] **The submodule's `remote remove` is `check=False` and the `reflog
-  expire` beside it is `check=True`; nothing measured the asymmetry.** Both
-  calls in `tasks._init_submodules` are leak guards over the same object — a
-  host cache path, in `.git/config` and in `logs/HEAD` respectively — so
-  tolerating a non-zero exit on one half means a leak that guard exists to
-  remove can survive in silence. **Leave the code as it is.** The tolerant
-  call is the one whose failure is ordinary ("origin does not exist" on a
-  submodule git chose not to give a remote), and tightening it without first
-  measuring which exit codes git actually produces there would trade a quiet
-  leak for a loud false refusal mid-matrix. What is missing is the
-  measurement, not the fix (broadening 6, final review).
 
 - [ ] **Record the Sonnet transport asymmetry as a §6.4 confound.** Sonnet 5
   signs SigV4 against bedrock-runtime while all three candidates go through the
