@@ -361,7 +361,7 @@ def task_resolver(cache: Path, force_preflight: bool = False) -> Callable:
     def resolve(task) -> TaskSetup:
         key = task_runtime(task)
         if key not in built:
-            built.update({key: base.image_id for key, base
+            built.update({k: b.image_id for k, b
                           in build_base_images(REPO, [key]).items()})
         return resolve_task(task, cache, built[key], force_preflight)
 

@@ -134,6 +134,13 @@ class BaseImage:
     reused: bool
     reason: str | None = None
 
+    def __post_init__(self) -> None:
+        if (self.reason is None) is not self.reused:
+            raise ValueError(
+                f"reused={self.reused} with reason={self.reason!r}: a built base "
+                "must name why, and a reused one has nothing to name"
+            )
+
 
 def base_fingerprint(repo_root: Path, runtime: str, version: str) -> str:
     """Every input to this base image that this harness controls, hashed.
@@ -327,6 +334,14 @@ def build_base_images(repo_root: Path,
     offline half documented as free. The skip removes that from the REPEAT
     invocation; a genuine rebuild still mints a fresh node id, and that is
     correct rather than regrettable.
+
+    Callers pass one entry per TASK; this deduplicates. Building per task pays
+    a full image build for every duplicate, and on a 60-task set that turns
+    the free offline half of `--preflight-only` into something nobody waits
+    for.
+
+    Sorted, so a build log reads the same way twice and a failure names the
+    same base first.
     """
     built: dict[tuple[str, str], BaseImage] = {}
     for pair in sorted(set(runtimes)):

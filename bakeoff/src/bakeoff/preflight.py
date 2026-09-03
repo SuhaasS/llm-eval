@@ -1674,6 +1674,32 @@ def preflight(
                 "agents and the comparison across them is not one"
             )
 
+        # WHAT THE IMAGE SAYS ABOUT ITSELF, beside what the interpreter says.
+        # A task image is `FROM <base image id>` and docker propagates a
+        # parent's labels verbatim (measured 2026-09-02), so these are the base
+        # image's own three keys read off the artifact under test -- no second
+        # lookup of which base tag produced it, and correct for a node task,
+        # which makes no interpreter claim at all.
+        #
+        # RECORDED, NEVER REFUSED ON, and the asymmetry is the point. A label is
+        # configuration the build stamped; `python_observed` below is an
+        # observation. When they disagree the interpreter is the authority and
+        # this file carries both, because a verdict cached under this key
+        # outlives the code that wrote it and "the image claimed 3.11 and ran
+        # 3.13" is a finding a reader has to be able to reconstruct.
+        #
+        # `{}` is an image carrying no `bakeoff.base.*` keys -- every base built
+        # before those labels existed, and every task image derived from one.
+        # `None` is "nobody could be asked": no such image, or no docker binary
+        # to ask with. Two absences that render identically are the same defect
+        # one layer down; these two do not.
+        base_seen = image_labels(image)
+        evidence["base_image_labels"] = (
+            None if base_seen is None
+            else {k: v for k, v in base_seen.items()
+                  if k.startswith("bakeoff.base.")}
+        )
+
         # The interpreter, read back out of the container rather than trusted
         # from the manifest. `image.python` selects which base the drivers
         # build, and the tag they build it under is MUTABLE and LOCAL: a stale
@@ -1722,32 +1748,6 @@ def preflight(
         # OBSERVATION -- and refuses every node task in the set for the
         # absence of an interpreter its manifest is forbidden from declaring
         # (D12). `None` is the correct answer there: the gate did not look.
-
-        # WHAT THE IMAGE SAYS ABOUT ITSELF, beside what the interpreter says.
-        # A task image is `FROM <base image id>` and docker propagates a
-        # parent's labels verbatim (measured 2026-09-02), so these are the base
-        # image's own three keys read off the artifact under test -- no second
-        # lookup of which base tag produced it, and correct for a node task,
-        # which makes no interpreter claim at all.
-        #
-        # RECORDED, NEVER REFUSED ON, and the asymmetry is the point. A label is
-        # configuration the build stamped; `python_observed` below is an
-        # observation. When they disagree the interpreter is the authority and
-        # this file carries both, because a verdict cached under this key
-        # outlives the code that wrote it and "the image claimed 3.11 and ran
-        # 3.13" is a finding a reader has to be able to reconstruct.
-        #
-        # `{}` is an image carrying no `bakeoff.base.*` keys -- every base built
-        # before those labels existed, and every task image derived from one.
-        # `None` is "nobody could be asked": no such image, or no docker binary
-        # to ask with. Two absences that render identically are the same defect
-        # one layer down; these two do not.
-        base_seen = image_labels(image)
-        evidence["base_image_labels"] = (
-            None if base_seen is None
-            else {k: v for k, v in base_seen.items()
-                  if k.startswith("bakeoff.base.")}
-        )
 
         python = (container.exec(["python", "--version"])
                   if runtime == "python" else None)
