@@ -76,8 +76,9 @@ from bakeoff.proxy import (  # noqa: E402
 from bakeoff.session import effective_config  # noqa: E402
 from bakeoff.tasks import (  # noqa: E402
     TaskError,
-    load_task_set,
+    load_task_set_with_refusals,
     materialize,
+    refusal_warnings,
     task_runtime,
 )
 
@@ -453,10 +454,11 @@ def main() -> int:
 
     from bakeoff.eventlog import EventLog
 
+    selected = args.tasks.split(",") if args.tasks else None
     try:
-        tasks = load_task_set(Path(args.task_set), only=(
-            args.tasks.split(",") if args.tasks else None
-        ))
+        tasks, refusals = load_task_set_with_refusals(
+            Path(args.task_set), only=selected
+        )
     except TaskError as exc:
         print(f"task set: {exc}")
         return 1
@@ -472,6 +474,10 @@ def main() -> int:
     print(f"arms      {', '.join(models)}")
     print(f"repeats   {args.repeats}   seed {args.seed}")
     print(f"event log {args.event_log}")
+
+    for line in refusal_warnings(refusals, root=Path(args.task_set),
+                                 selected=set(selected or ())):
+        print(line)
 
     try:
         bases, expected_version = prepare_bases(tasks)

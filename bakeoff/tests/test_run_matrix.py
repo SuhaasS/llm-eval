@@ -211,8 +211,8 @@ def test_main_stops_before_any_task_image_when_the_bases_disagree(
     import scripts.run_matrix as rm
 
     monkeypatch.setattr(
-        rm, "load_task_set",
-        lambda path, only=None: [_PyTask("a", "3.11"), _PyTask("b", "3.12")],
+        rm, "load_task_set_with_refusals",
+        lambda path, only=None: ([_PyTask("a", "3.11"), _PyTask("b", "3.12")], []),
     )
     monkeypatch.setattr(
         rm, "prepare_bases",
@@ -473,3 +473,80 @@ def test_two_runs_of_one_cell_mount_different_host_paths(tmp_path, monkeypatch):
     # itself), and the returned path is what `main` writes into the row.
     assert Path(kept).parent.is_dir()
     assert list((run_root / "tree").iterdir()) == [Path(kept).parent]
+
+
+def test_run_matrix_prints_the_unselected_refusals_as_warnings(
+    monkeypatch, tmp_path, capsys
+):
+    """A `--tasks` selection that loads past an uncommitted broken sibling
+    must say so on stdout -- `load_task_set_with_refusals`'s whole point is
+    that the skip is otherwise recorded nowhere. Modelled on
+    `test_main_stops_before_any_task_image_when_the_bases_disagree`:
+    `prepare_bases` is stubbed to raise immediately after the banner, so the
+    warning is observable without building anything."""
+    from bakeoff.tasks import RefusedManifest
+    import scripts.run_matrix as rm
+
+    refused = RefusedManifest(
+        directory=tmp_path / "set" / "b",
+        error=f"{tmp_path / 'set' / 'b' / 'task.yaml'}: is not an allowed "
+              "image.env key",
+        committed=False,
+    )
+    monkeypatch.setattr(
+        rm, "load_task_set_with_refusals",
+        lambda path, only=None: ([_PyTask("a", "3.11")], [refused]),
+    )
+    monkeypatch.setattr(
+        rm, "prepare_bases",
+        lambda tasks: (_ for _ in ()).throw(rm.ImageError("stop")),
+    )
+    monkeypatch.setattr(
+        sys, "argv",
+        ["run_matrix.py", "--preflight-only", "--tasks", "a",
+         "--event-log", str(tmp_path / "log")],
+    )
+
+    rm.main()
+
+    out = capsys.readouterr().out
+    assert "WARNING" in out
+    assert "b" in out
+    assert "is not an allowed image.env key" in out
+
+
+def test_run_matrix_stops_before_any_image_when_a_selected_manifest_is_broken(
+    monkeypatch, tmp_path, capsys
+):
+    """The refusal path -- a manifest the selection itself names -- must stop
+    before any image is built, exactly like the base-disagreement refusal
+    already tested above. `prepare_bases` and `resolve_tasks` are sentinels
+    that fail the test if reached at all."""
+    from bakeoff.tasks import TaskError
+    import scripts.run_matrix as rm
+
+    def _load(path, only=None):
+        raise TaskError(
+            f"{tmp_path / 'set'}: 1 manifest(s) in this task set did not "
+            "load, and every one of them is required here:\n"
+            "  - [SELECTED by --tasks as 'a']\n"
+            "    is not an allowed image.env key"
+        )
+
+    def _must_not_run(*args, **kwargs):
+        raise AssertionError(
+            "an image-building call ran after a selected manifest refused"
+        )
+
+    monkeypatch.setattr(rm, "load_task_set_with_refusals", _load)
+    monkeypatch.setattr(rm, "prepare_bases", _must_not_run)
+    monkeypatch.setattr(rm, "resolve_tasks", _must_not_run)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["run_matrix.py", "--preflight-only", "--tasks", "a",
+         "--event-log", str(tmp_path / "log")],
+    )
+
+    assert rm.main() == 1
+    out = capsys.readouterr().out
+    assert out.startswith("task set: ")

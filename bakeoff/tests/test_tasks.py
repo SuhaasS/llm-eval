@@ -21,13 +21,16 @@ import pytest
 
 from bakeoff import tasks
 from bakeoff.tasks import (
+    RefusedManifest,
     TaskBudget,
     TaskError,
     TaskGrading,
     diff_chunks,
     load_task,
     load_task_set,
+    load_task_set_with_refusals,
     materialize,
+    refusal_warnings,
     split_reference_diff,
     task_set_commit,
 )
@@ -320,6 +323,37 @@ def _write_task(root: Path, upstream, name="t-001", **overrides) -> Path:
     (task_dir / "task.yaml").write_text(_manifest(**fields))
     (task_dir / "reference.diff").write_text(upstream["reference"])
     return task_dir
+
+
+_BROKEN_IMAGE_ENV = (
+    "image:\n"
+    "  env:\n"
+    "    SETUPTOOLS_SCM_PRETEND_VERSION: '1.0'\n"
+)
+
+
+def _write_broken_task(root: Path, upstream, name="t-002") -> Path:
+    """A sibling that refuses exactly the way the 2026-09-02 measurement did.
+
+    The `image.env` allowlist is the real defect the probe hit; any refusal
+    would exercise the collector, but this one keeps the test and the report
+    describing one thing. `task_id` is set to the directory name because
+    `_manifest`'s default is a fixed `t-001` and these tests turn on the
+    selection matching directories by name.
+    """
+    return _write_task(root, upstream, name=name, task_id=name,
+                       extra_yaml=_BROKEN_IMAGE_ENV)
+
+
+def _git_task_set(root: Path, *, commit: str = "tasks") -> None:
+    """Make the task-set directory a git repository with everything in it
+    committed. Separate from the `upstream` fixture's repo: this one is the
+    SET, and `_manifest_committed` reads its status."""
+    _sh("git", "init", "-q", cwd=root)
+    _sh("git", "config", "user.email", "t@t.test", cwd=root)
+    _sh("git", "config", "user.name", "t", cwd=root)
+    _sh("git", "add", "-A", cwd=root)
+    _sh("git", "commit", "-q", "-m", commit, cwd=root)
 
 
 def _write_node_task(root: Path, upstream, *, paths=("tests/",), f2p=None,
@@ -3633,3 +3667,236 @@ def test_the_click_task_still_loads_and_its_start_sha_has_not_moved(tmp_path):
     # not declare must load as the empty tuple rather than as anything a
     # downstream `set()` could mistake for a declaration.
     assert task.submodules_unneeded == ()
+
+
+def test_a_tasks_selection_loads_past_an_uncommitted_broken_sibling(
+    tmp_path, upstream
+):
+    """The item's headline test. Measured 2026-09-02 in a shared drafting
+    directory (`~/.cache/bakeoff-probe/taskset/`, not a git repository):
+    worker 6's `--tasks tomlkit-514-...` gate was blocked by a different
+    worker's in-progress `image.env` typo, and the error named only the
+    sibling. A `--tasks` selection must be able to load past an uncommitted
+    broken manifest it did not ask for."""
+    root = tmp_path / "set"
+    _write_task(root, upstream, name="t-001", task_id="t-001")
+    _write_broken_task(root, upstream)
+
+    tasks, refusals = load_task_set_with_refusals(root, only=["t-001"])
+
+    assert [t.task_id for t in tasks] == ["t-001"]
+    assert len(refusals) == 1
+    assert refusals[0].directory.name == "t-002"
+    assert refusals[0].committed is False
+    assert "is not an allowed image.env key" in refusals[0].error
+
+
+def test_a_broken_manifest_that_is_selected_still_refuses(tmp_path, upstream):
+    """A selection naming the broken sibling must refuse -- and for the right
+    reason. With the selection term dropped from `fatal`, `fatal` is empty,
+    the load falls through to the `missing` check, and it still raises a
+    TaskError whose message says "no such task(s)" instead -- a bare
+    `pytest.raises(TaskError)` would pass over that mutation, which is why
+    the message is asserted."""
+    root = tmp_path / "set"
+    _write_task(root, upstream, name="t-001", task_id="t-001")
+    _write_broken_task(root, upstream)
+
+    with pytest.raises(TaskError) as excinfo:
+        load_task_set_with_refusals(root, only=["t-002"])
+
+    message = str(excinfo.value)
+    assert "SELECTED by --tasks as 't-002'" in message
+    assert "is not an allowed image.env key" in message
+
+
+def test_no_tasks_selection_refuses_on_any_invalid_manifest(tmp_path, upstream):
+    """The full-set path -- no `--tasks` at all -- is the path `grade.py` and
+    `judge.py` are on, and it must refuse on any invalid manifest regardless
+    of committed-ness. The second assertion pins that their unedited call
+    site, the `load_task_set` wrapper, inherits the same refusal."""
+    root = tmp_path / "set"
+    _write_task(root, upstream, name="t-001", task_id="t-001")
+    _write_broken_task(root, upstream)
+
+    with pytest.raises(TaskError) as excinfo:
+        load_task_set_with_refusals(root, only=None)
+    message = str(excinfo.value)
+    assert "no --tasks selection was given" in message
+    assert "task_set_commit" in message
+    assert "is not an allowed image.env key" in message
+
+    with pytest.raises(TaskError):
+        load_task_set(root)
+
+
+def test_the_refusal_text_names_the_sibling_and_the_selected_tasks(
+    tmp_path, upstream
+):
+    """"The error text names both." A shared drafting directory holding two
+    valid tasks and one broken sibling, exercised on both the warning path
+    (broken sibling unselected) and the refusal path (broken sibling
+    selected)."""
+    root = tmp_path / "set"
+    _write_task(root, upstream, name="t-001", task_id="t-001")
+    _write_task(root, upstream, name="t-003", task_id="t-003")
+    _write_broken_task(root, upstream)
+
+    tasks, refusals = load_task_set_with_refusals(
+        root, only=["t-001", "t-003"]
+    )
+    lines = refusal_warnings(refusals, root=root, selected={"t-001", "t-003"})
+    text = "\n".join(lines)
+    assert str(root / "t-002" / "task.yaml") in text
+    assert "None of them is a selected task (t-001, t-003)" in text
+    assert "A run without --tasks" in text
+
+    with pytest.raises(TaskError) as excinfo:
+        load_task_set_with_refusals(root, only=["t-002"])
+    message = str(excinfo.value)
+    assert str(root / "t-002" / "task.yaml") in message
+    assert "SELECTED by --tasks as 't-002'" in message
+
+
+def test_a_committed_broken_sibling_refuses_even_under_a_selection(
+    tmp_path, upstream
+):
+    """M4: a task set that is committed and carries a broken manifest is not
+    work in progress -- the set's own revision does not load whole, and
+    `grade.py`, which has no `--tasks`, would grade every record naming that
+    task TASK_NOT_FOUND at exit code 0. So a selection cannot skip it, and
+    the refusal names the selection -- the item's remedy (b) on the branch
+    this change creates."""
+    root = tmp_path / "set"
+    _write_task(root, upstream, name="t-001", task_id="t-001")
+    _write_broken_task(root, upstream)
+    _git_task_set(root)
+
+    with pytest.raises(TaskError) as excinfo:
+        load_task_set_with_refusals(root, only=["t-001"])
+
+    message = str(excinfo.value)
+    assert "committed, and NOT the task you selected (t-001)" in message
+    assert "is not an allowed image.env key" in message
+
+
+def test_an_untracked_broken_sibling_warns_inside_a_git_task_set(
+    tmp_path, upstream
+):
+    """The pair to the committed test, and the one that catches the pathspec
+    trap: `t-001` is committed first, and the broken `t-002` is added
+    afterward, uncommitted. Without a resolved pathspec `git status` would
+    match nothing against a relative path plus `cwd=root` and report the
+    untracked directory as committed."""
+    root = tmp_path / "set"
+    _write_task(root, upstream, name="t-001", task_id="t-001")
+    _git_task_set(root)
+    _write_broken_task(root, upstream)
+
+    tasks, refusals = load_task_set_with_refusals(root, only=["t-001"])
+
+    assert [t.task_id for t in tasks] == ["t-001"]
+    assert len(refusals) == 1
+    assert refusals[0].committed is False
+
+
+def test_an_ignored_task_set_inside_a_repo_is_not_committed(tmp_path, upstream):
+    """Finding 2's measurement, and the anchor for the `ls-files` term. A
+    scratch task set living inside an OUTER repository, under a directory the
+    outer repository ignores. `task_set_commit` returns the enclosing repo's
+    HEAD, so the empty-commit guard does not fire; `git status --porcelain`
+    says nothing about an ignored path and would read as committed; only
+    `git ls-files --error-unmatch` reports the truth. With the `ls-files`
+    term removed, this test fails with a TaskError tagged `committed`."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    (outer / ".gitignore").write_text("scratch/\n")
+    _sh("git", "init", "-q", cwd=outer)
+    _sh("git", "config", "user.email", "t@t.test", cwd=outer)
+    _sh("git", "config", "user.name", "t", cwd=outer)
+    _sh("git", "add", "-A", cwd=outer)
+    _sh("git", "commit", "-q", "-m", "outer", cwd=outer)
+
+    root = outer / "scratch" / "taskset"
+    root.mkdir(parents=True)
+    _write_task(root, upstream, name="t-001", task_id="t-001")
+    _write_broken_task(root, upstream)
+
+    tasks, refusals = load_task_set_with_refusals(root, only=["t-001"])
+
+    assert [t.task_id for t in tasks] == ["t-001"]
+    assert len(refusals) == 1
+    assert refusals[0].committed is False
+
+
+def test_a_modified_broken_manifest_in_a_committed_set_is_not_committed(
+    tmp_path, upstream
+):
+    """The branch `status --porcelain` decides on its own, and the ordinary
+    drafting loop: editing an existing tracked task rather than adding a new
+    one. Both tasks start valid and committed; `t-002/task.yaml` is then
+    rewritten to be broken, without a new commit. Without this test a
+    refactor that dropped the `status --porcelain` half entirely would keep
+    every other test in this plan green."""
+    root = tmp_path / "set"
+    _write_task(root, upstream, name="t-001", task_id="t-001")
+    _write_task(root, upstream, name="t-002", task_id="t-002")
+    _git_task_set(root)
+    (root / "t-002" / "task.yaml").write_text(
+        _manifest(task_id="t-002", url=str(upstream["path"]),
+                  base_sha=upstream["base"], extra_yaml=_BROKEN_IMAGE_ENV)
+    )
+
+    tasks, refusals = load_task_set_with_refusals(root, only=["t-001"])
+
+    assert [t.task_id for t in tasks] == ["t-001"]
+    assert len(refusals) == 1
+    assert refusals[0].committed is False
+
+
+def test_a_manifest_that_is_not_valid_yaml_is_a_refusal_not_a_traceback(
+    tmp_path, upstream
+):
+    """M3: `yaml.safe_load` raises `yaml.YAMLError`, not `TaskError`, so a
+    sibling with malformed YAML used to escape both drivers' `except
+    TaskError` as a bare traceback. The qualified name is asserted on
+    purpose -- `YAMLError` is a base class that is never the concrete type,
+    and asserting it would fail against the plan's own formatter."""
+    root = tmp_path / "set"
+    _write_task(root, upstream, name="t-001", task_id="t-001")
+    broken = root / "t-002"
+    broken.mkdir(parents=True)
+    (broken / "task.yaml").write_text("task_id: [\n")
+
+    tasks, refusals = load_task_set_with_refusals(root, only=["t-001"])
+    assert len(refusals) == 1
+    assert str(broken / "task.yaml") in refusals[0].error
+    assert "yaml.parser.ParserError" in refusals[0].error
+
+    # `only=None` raises TaskError -- not yaml.YAMLError -- which is what
+    # both drivers' `except TaskError` catches.
+    with pytest.raises(TaskError):
+        load_task_set_with_refusals(root, only=None)
+
+
+def test_a_selected_id_no_directory_supplies_names_the_refused_manifests(
+    tmp_path, upstream
+):
+    """D8: a refused directory is matched against `only` by directory name,
+    because a manifest that did not load has no readable `task_id`. A
+    selection naming an id no loaded task carries, with a refusal present,
+    must name every refused directory as one that could not be checked for
+    that id -- the residual hole D8 accepts, closed loudly rather than
+    papered over."""
+    root = tmp_path / "set"
+    _write_task(root, upstream, name="t-001", task_id="t-001")
+    _write_broken_task(root, upstream)
+
+    with pytest.raises(TaskError) as excinfo:
+        load_task_set_with_refusals(root, only=["t-999"])
+
+    message = str(excinfo.value)
+    assert "no such task(s)" in message
+    assert "t-999" in message
+    assert "DIRECTORY NAME only" in message
+    assert str(root / "t-002") in message

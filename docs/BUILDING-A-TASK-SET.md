@@ -125,6 +125,13 @@ Uncommitted changes record as `-dirty`, which is honest but not reproducible.
 
 **Commit the task set before every collection run.**
 
+That rule now has teeth in the loader: a manifest that does not load is fatal
+to every command over that directory once it is **tracked in the enclosing
+repository**, because that revision is what a record's `task_set_commit`
+names. Only work in progress can be skipped — a directory that is untracked,
+ignored, or in no repository at all — and only by a `--tasks` selection that
+does not name it.
+
 ### 1.6 Credentials — only for the live step
 
 Nothing until step 7 needs these. When you get there:
@@ -596,6 +603,26 @@ version), so re-running is cheap; `--force-preflight` re-runs anyway.
 
 Drop `--tasks` to gate the whole set at once.
 
+**Drafting beside other tasks.** The loader validates every manifest under
+`--task-set`, not just the ones `--tasks` names — that is what makes the whole
+set loadable before a collection. With a `--tasks` selection, a sibling that
+does not load is downgraded to a `WARNING` naming the offending `task.yaml`,
+provided it is not itself selected and is not *tracked* in this directory's
+revision (untracked, ignored, or in a directory that is not a git repository
+at all). A manifest that **is** tracked and does not load refuses whatever you
+select, because the set's own revision is then broken and `grade.py` — which
+has no `--tasks` — will refuse to grade anything collected against it.
+Measured 2026-09-02: before this rule, one worker's in-progress `image.env`
+typo blocked every other worker's gate in a shared directory, and the error
+named only the sibling.
+
+**The warning is the only record of the skip.** Nothing in the run record says
+manifests were skipped: a scratch task set that is not a git repository
+records `task_set_commit` as `""` — the honest blank meaning this result is
+not re-derivable against a revision — and a warned run looks like any other
+run over such a directory. Keep the driver's output if you need to reconstruct
+what a drafting run did, and gate the whole set before you commit it.
+
 ### 3.7 Reading a preflight refusal
 
 Every check maps to a defect that would otherwise be recorded as model
@@ -765,6 +792,13 @@ its own.
   hours apart, at temperature 1.0 and N=1 — between-run variance larger than the
   between-arm spread. At N=3 a discriminating task can present as a floor. That
   argues for more repeats in the pilot, not for a looser drop rule.
+- **The set must load whole before a collection, not just the tasks you are
+  running.** `--tasks` is a drafting affordance: it will skip an untracked
+  sibling that does not load, with a warning that exists only in the driver's
+  output. It will not skip a tracked one, and `grade.py` has no `--tasks` at
+  all — so a set with one broken committed manifest collects fine under
+  `--tasks` and then grades nothing, at exit code 0. Gate the whole set
+  (`--preflight-only`, no `--tasks`) before you commit it.
 
 ---
 

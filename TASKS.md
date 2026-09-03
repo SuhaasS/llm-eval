@@ -1080,7 +1080,7 @@ size. Two exceptions are marked CAPTURE and should ride along with Gate 1.
   depends on which model gets entitled — a non-gpt-5 neutral judge (deepseek,
   qwen, mistral, grok) hits no such guard and needs no change at all.
 
-- [ ] **`load_task_set` validates every manifest in the task-set root before
+- [x] **`load_task_set` validates every manifest in the task-set root before
   `--tasks` filters, so one broken sibling manifest blocks every other task's
   gate and grade.** Measured 2026-09-02, twice independently: a sibling's
   `image.env` key typo (an unrelated in-progress manifest in the same
@@ -1092,6 +1092,18 @@ size. Two exceptions are marked CAPTURE and should ride along with Gate 1.
   directory. Either a `--tasks` selection should load only the named
   manifests, or the error should name the offending sibling AND say
   explicitly that it is not the selected task.
+  **Resolved:** the third remedy, gated on committed-ness. Refusals are
+  collected rather than raised where found; a `--tasks` selection loads past a
+  sibling that fails to load only when that sibling is not itself selected AND
+  is not tracked in the task set's enclosing revision (untracked, ignored, or
+  in no repository at all), with a WARNING naming both the sibling and the
+  selection. A tracked-and-broken sibling, or any run with no `--tasks` at
+  all, still refuses — with the improved text on every path: the offending
+  manifest, why it is fatal, and (when applicable) the selection it is not
+  part of. `grade.py` gaining a `--tasks` flag was designed and deferred (see
+  the round-2 plan's D6/Q2): every way to let it proceed past an unreadable
+  manifest stamps a false `TASK_NOT_FOUND` into the append-only grades file at
+  exit code 0.
 
 - [ ] **`run_matrix.py --preflight-only` rebuilds every base image
   unconditionally before `resolve_tasks` runs, so `preflight.py`'s

@@ -2165,6 +2165,73 @@ MUTATIONS = [
         "tests/test_container.py -k seeded_from_base_before_staging",
         "not integration",
     ),
+    (
+        # `fatal` drives which refusals raise. Dropping the selection term
+        # lets a SELECTED broken manifest fall through to the "no such task"
+        # check instead of refusing on its own load error -- still a
+        # TaskError, so the test asserts the message rather than the type.
+        "task set: let a selected broken manifest through as a warning",
+        "src/bakeoff/tasks.py",
+        "    fatal = [r for r in refusals\n"
+        "             if wanted is None or r.committed or r.directory.name in wanted]",
+        "    fatal = [r for r in refusals\n"
+        "             if wanted is None or r.committed]",
+        "tests/test_tasks.py -k broken_manifest_that_is_selected",
+        "not integration",
+    ),
+    (
+        # Forces `committed` to False unconditionally, so a manifest tracked
+        # in the enclosing revision is treated as work in progress and a
+        # selection can skip it -- exactly the M4 hazard this item exists to
+        # close.
+        "task set: treat a committed broken sibling as work in progress",
+        "src/bakeoff/tasks.py",
+        "                committed=(bool(commit)\n"
+        "                           and _manifest_committed(root, task_dir)),",
+        "                committed=False,",
+        "tests/test_tasks.py -k committed_broken_sibling",
+        "not integration",
+    ),
+    (
+        # The full-set path (no --tasks) must refuse on ANY invalid manifest.
+        # This replacement keeps `fatal` total (no TypeError on `in None`)
+        # while removing the "no selection means the whole set is required"
+        # rule -- proving the guard, not just tripping an exception.
+        "task set: let the full-set path proceed past a manifest that did not load",
+        "src/bakeoff/tasks.py",
+        "    fatal = [r for r in refusals\n"
+        "             if wanted is None or r.committed or r.directory.name in wanted]",
+        "    fatal = [r for r in refusals\n"
+        "             if wanted is not None and (r.committed or r.directory.name in wanted)]",
+        "tests/test_tasks.py -k no_tasks_selection_refuses",
+        "not integration",
+    ),
+    (
+        # `pass` rather than deleting the branch, so the mutated code stays
+        # syntactically valid and falls through to `git status`, which says
+        # nothing about an ignored path and reads it as committed -- the
+        # "status alone" predicate finding 2 measured as wrong.
+        "task set: judge committed-ness from git status alone, refusing an ignored drafting directory",
+        "src/bakeoff/tasks.py",
+        "    if not tracked:\n"
+        "        return False",
+        "    if not tracked:\n"
+        "        pass",
+        "tests/test_tasks.py -k ignored_task_set_inside_a_repo",
+        "not integration",
+    ),
+    (
+        # The other half of the predicate: every TRACKED directory reads as
+        # committed regardless of modification, which is the branch
+        # `status --porcelain` decides on its own -- the ordinary drafting
+        # edit of an already-committed manifest.
+        "task set: call a tracked-but-modified manifest committed, refusing the ordinary drafting edit",
+        "src/bakeoff/tasks.py",
+        "    return not status",
+        "    return True",
+        "tests/test_tasks.py -k modified_broken_manifest",
+        "not integration",
+    ),
 ]
 
 

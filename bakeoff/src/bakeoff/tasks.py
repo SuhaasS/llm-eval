@@ -1509,32 +1509,298 @@ def load_task(task_dir: Path, set_commit: str = "") -> TaskManifest:
     )
 
 
-def load_task_set(root: Path, only: list[str] | None = None) -> list[TaskManifest]:
-    """Every task under `root`, validated, in a stable order.
+@dataclass(frozen=True)
+class RefusedManifest:
+    """One task directory under a task-set root whose manifest did not load.
+
+    `error` is the message the load raised. A `TaskError` already opens with
+    the absolute path of the offending `task.yaml` (`load_task`'s `where`), so
+    a caller printing these never has to reconstruct which file is meant; the
+    collector prefixes the path itself for the exception types that do not
+    carry one.
+
+    `committed` is the whole reason a refusal can ever be downgraded to a
+    warning, and it is stated per DIRECTORY rather than per set: it means
+    "this directory is part of the revision a record would name". A directory
+    that is untracked, ignored, or in no repository at all is work in progress
+    -- `docs/BUILDING-A-TASK-SET.md` section 1.5 says to commit the task set
+    before every collection, so an uncommitted one is by definition not the
+    thing a collection runs against. A TRACKED manifest that does not load is
+    a different animal: the set's own revision is broken, every record written
+    against it names a sha that promises a set which does not load whole, and
+    `grade.py` -- which has no `--tasks` and loads the set whole -- grades
+    every record naming that task as TASK_NOT_FOUND, at exit code 0. So such a
+    refusal is fatal whatever the selection says, and the drafting affordance
+    cannot be used to carry a broken task set through a collection.
+    """
+
+    directory: Path
+    error: str
+    committed: bool
+
+
+def _manifest_committed(root: Path, task_dir: Path) -> bool:
+    """True when this task directory is part of the revision a record names.
+
+    TWO facts, in this order, because one of them alone answers a different
+    question. `git status --porcelain -- <dir>` reports what the enclosing
+    repository has to SAY about a path, and it says nothing about an IGNORED
+    path -- measured, git 2.50.1: a scratch task set inside a repo whose
+    `.gitignore` holds `scratch/` gets exit 0 and empty stdout, while `git
+    ls-files --error-unmatch` on the same path exits non-zero because nothing
+    there is tracked. Status alone therefore calls an untracked drafting
+    directory "committed" and hard-refuses it under a message asserting the
+    opposite of the truth -- which re-breaks the exact workflow the warning
+    path exists to allow. So: tracked decides whether the path is in the
+    index at all, and only then does clean decide whether it is modified.
+
+    Pathspec discipline, learned the way `task_set_commit` learned it: `git
+    status -- <pathspec>` resolves the pathspec against the CWD, so a relative
+    path plus `cwd=root` asks about `<root>/<root>/...`, matches nothing, and
+    git prints nothing and exits 0 -- every directory would read as committed.
+    Here that is not cosmetic: it would flip every warning back into the
+    refusal this function exists to lift. Both paths are resolved first, for
+    both calls.
+
+    The status half fails CLOSED. Once a path is known to be tracked, a `git
+    status` that cannot run leaves us unable to prove the manifest is work in
+    progress, and guessing permissively is how a committed task set that does
+    not load whole reaches the end of a collection.
+
+    "Committed" means committed to whatever repository ENCLOSES this path.
+    `task_set_commit` names the enclosing repo, which for the in-repo task set
+    (`bakeoff/taskset/`) is the harness repo rather than a task-set repo. That
+    is pre-existing, and this is the first code to turn it into a refuse/warn
+    decision.
+
+    The caller does not call this when the set has no commit at all -- an
+    empty `task_set_commit` means not a git repository, or git unusable, or no
+    commits yet -- and that guard is NOT what makes the non-repo case correct.
+    Measured, git 2.50.1: called on a root outside any repository this returns
+    `False` on its own, because `ls-files` exits non-zero and the path reads as
+    untracked before the status half is reached. The guard is kept because
+    asking git twice about a directory in no repository spends two subprocesses
+    to learn nothing, and because the caller is the layer that already knows
+    the set has no revision. Do not read it as the thing that covers a non-repo
+    root: under the SUPERSEDED one-term predicate it was, and removing the
+    `ls-files` term on that reading reintroduces the ignored-directory refusal
+    above.
+
+    TOTAL: returns a bool for every input and raises for none. It is called
+    from inside the collector's `except` block, where a raise would chain onto
+    the manifest's own error and escape `load_task_set_with_refusals` as an
+    exception no driver catches -- the traceback this change exists to remove,
+    reintroduced one layer over.
+    """
+    root = Path(root).resolve()
+    task_dir = Path(task_dir).resolve()
+    try:
+        tracked = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "--", str(task_dir)],
+            cwd=root, capture_output=True, text=True,
+        ).returncode == 0
+    except OSError:
+        return True
+    if not tracked:
+        return False
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--", str(task_dir)],
+            cwd=root, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+    except (subprocess.CalledProcessError, OSError):
+        return True
+    return not status
+
+
+def _fatal_reason(refusal: RefusedManifest, wanted: set[str] | None) -> str:
+    """Why THIS refusal cannot be skipped. Order is precedence, not taste:
+    a directory that is both selected and committed is refused because it was
+    asked for, which is the fact the operator can act on.
+
+    The third branch names the SELECTION, not just the sibling. `TASKS.md`
+    states the remedy as "the error should name the offending sibling AND say
+    explicitly that it is not the selected task", and the committed-unselected
+    branch is the one a curated task set hits every time -- the branch this
+    change creates. Without the selection in the text it reproduces exactly
+    the operator experience the probe reported: a message about a sibling,
+    with no mention of what was actually asked for.
+    """
+    if wanted is not None and refusal.directory.name in wanted:
+        return f"SELECTED by --tasks as {refusal.directory.name!r}"
+    if wanted is None:
+        return "no --tasks selection was given, so the whole set is required"
+    return (
+        f"committed, and NOT the task you selected "
+        f"({', '.join(sorted(wanted))}): this manifest is not work in "
+        "progress, so the task set's own revision does not load and no "
+        "selection can skip it"
+    )
+
+
+def _refusal_report(root: Path, fatal: list[RefusedManifest],
+                    wanted: set[str] | None, skippable: int) -> str:
+    """The refusal text. `skippable` is the count of refusals that were NOT
+    fatal, and it is stated when non-zero because the header claims every
+    listed manifest is required -- a reader who knows there were four
+    refusals and sees one listed would otherwise be reading a report that
+    silently dropped three."""
+    lines = [
+        f"{root}: {len(fatal)} manifest(s) in this task set did not load, "
+        "and every one of them is required here:"
+    ]
+    for refusal in fatal:
+        lines.append(f"  - [{_fatal_reason(refusal, wanted)}]")
+        lines.append(f"    {refusal.error}")
+    if skippable:
+        lines.append(
+            f"({skippable} further manifest(s) here also did not load and "
+            "would have been skippable under this selection; they are listed "
+            "only when the load is allowed to proceed.)"
+        )
+    lines.append(
+        "Every record stamps task_set_commit -- the revision of this whole "
+        "directory -- so a set that does not load whole is not a state to "
+        "record against, and grade.py, which has no --tasks and loads the set "
+        "whole, cannot tell that a manifest it cannot read is not the one a "
+        "record names. Fix the manifest, or move it out of this directory. "
+        "Only work in progress can be skipped -- a manifest not tracked in "
+        "this directory's revision, or in a directory that has none -- and "
+        "only by a --tasks selection that does not name it "
+        "(docs/BUILDING-A-TASK-SET.md section 1.5: commit the task set before "
+        "every collection)."
+    )
+    return "\n".join(lines)
+
+
+def refusal_warnings(refusals: list[RefusedManifest], *, root: Path,
+                     selected: set[str]) -> list[str]:
+    """The lines a driver prints for refusals it was allowed to skip.
+
+    A list of lines rather than a print, because `tasks.py` is a library and a
+    module that prints cannot be asserted against. Returned as text rather
+    than as the refusals themselves so that two drivers cannot word the same
+    finding differently -- the reason this is a function at all.
+
+    The middle clause claims only what was measured. "Uncommitted work in
+    progress" would be an overclaim about a directory in a tree that is not a
+    git repository at all, where nothing is known about work in progress; what
+    IS known is that no such refusal is committed in this task set's revision,
+    because there is none or because the directory is not tracked in it.
+
+    Empty whenever `refusals` is: `load_task_set_with_refusals` returns a
+    non-empty list only on the branch that was allowed to proceed.
+    """
+    if not refusals:
+        return []
+    lines = [
+        f"WARNING: {len(refusals)} manifest(s) under {root} did not load and "
+        f"were skipped. None of them is a selected task "
+        f"({', '.join(sorted(selected))}), and none is committed in this task "
+        "set's revision (it has none, or the directory is not tracked there):"
+    ]
+    lines += [f"  - {refusal.error}" for refusal in refusals]
+    lines.append(
+        "WARNING: these are refusals, not skips. A run without --tasks, and "
+        "any grade.py run over this directory, refuses until each one is "
+        "fixed or moved out. This warning is the only place the skip is "
+        "recorded -- no record field carries it."
+    )
+    return lines
+
+
+def load_task_set_with_refusals(
+    root: Path, only: list[str] | None = None
+) -> tuple[list[TaskManifest], list[RefusedManifest]]:
+    """Every task under `root`, validated, in a stable order -- and the
+    directories that would not load, when the caller is allowed to skip them.
 
     Duplicate task_ids raise. `run_id` is a hash of (task_id, model, sample,
     attempt), so two tasks sharing an id would collide in the event log and
     the second one's records would be refused as immutability violations --
     at the far end of a matrix, after the tokens were spent.
+
+    A refusal is NOT raised where it is found. Measured 2026-09-02 in a shared
+    drafting directory: one worker's in-progress `image.env` typo blocked a
+    different worker's `--tasks <unrelated>` gate, and the printed error named
+    only the sibling. Refusals are collected and judged once, against three
+    facts -- was a selection given, does it name this directory, is this
+    manifest tracked in the enclosing revision -- because each answers a
+    different question. The selection says what the operator asked for;
+    tracked-ness says whether the task set's own revision is broken or whether
+    this is work in progress in a tree that has no revision for a record to
+    name (`task_set_commit` is then `""`, never `"<sha>-dirty"` -- a scratch
+    task set is typically not a git repository at all).
+
+    A refused directory is matched against `only` by DIRECTORY NAME, because a
+    manifest that did not load has no readable task_id. `load_task` does not
+    require the two to agree, so a refused `foo/` could declare `task_id: bar`
+    and a `--tasks bar` selection would proceed past it. That cannot pass
+    quietly: `bar` is then missing from the loaded ids and the "no such task"
+    refusal below names every surviving refusal as a directory it could not
+    check.
+
+    `only` is read for truthiness, not for `is not None`, exactly as before:
+    an empty selection has always meant "no selection", and `run_matrix.py`
+    passes `None` for an absent `--tasks`.
     """
     root = Path(root)
     if not root.is_dir():
         raise TaskError(f"{root}: no such task set")
     commit = task_set_commit(root)
     tasks: list[TaskManifest] = []
+    refusals: list[RefusedManifest] = []
     for task_dir in sorted(p for p in root.iterdir() if p.is_dir()):
         if not (task_dir / MANIFEST_NAME).exists():
             continue
-        tasks.append(load_task(task_dir, set_commit=commit))
-    if only:
-        wanted = set(only)
+        try:
+            tasks.append(load_task(task_dir, set_commit=commit))
+        except Exception as exc:  # noqa: BLE001 - one manifest, not the set
+            # Broad on purpose. `load_task` raises TaskError for everything it
+            # checks, but `yaml.safe_load` raises `yaml.YAMLError` and an
+            # unreadable file raises OSError -- neither is a TaskError, so a
+            # sibling with malformed YAML used to reach the operator as a
+            # traceback straight through both drivers' `except TaskError`.
+            # Nothing gets quieter: every collected refusal is re-raised as a
+            # TaskError below unless it is provably skippable.
+            refusals.append(RefusedManifest(
+                directory=task_dir,
+                error=(str(exc) if isinstance(exc, TaskError) else
+                       f"{task_dir / MANIFEST_NAME}: "
+                       f"{type(exc).__module__}.{type(exc).__name__}: {exc}"),
+                # Only asked when the set has a revision at all -- see
+                # `_manifest_committed`'s docstring for why the empty-commit
+                # case must not reach it.
+                committed=(bool(commit)
+                           and _manifest_committed(root, task_dir)),
+            ))
+
+    wanted = set(only) if only else None
+    fatal = [r for r in refusals
+             if wanted is None or r.committed or r.directory.name in wanted]
+    if fatal:
+        raise TaskError(
+            _refusal_report(root, fatal, wanted, len(refusals) - len(fatal))
+        )
+
+    if wanted is not None:
         known = {task.task_id for task in tasks}
         missing = wanted - known
         if missing:
+            unchecked = ""
+            if refusals:
+                unchecked = (
+                    f"; {len(refusals)} manifest(s) here did not load and were "
+                    "matched against the selection by DIRECTORY NAME only, so "
+                    "one of them may be the task you asked for: "
+                    + ", ".join(str(r.directory) for r in refusals)
+                )
             raise TaskError(
-                f"no such task(s) in {root}: {', '.join(sorted(missing))}"
+                f"no such task(s) in {root}: "
+                f"{', '.join(sorted(missing))}{unchecked}"
             )
         tasks = [task for task in tasks if task.task_id in wanted]
+
     seen: set[str] = set()
     for task in tasks:
         if task.task_id in seen:
@@ -1542,6 +1808,20 @@ def load_task_set(root: Path, only: list[str] | None = None) -> list[TaskManifes
         seen.add(task.task_id)
     if not tasks:
         raise TaskError(f"{root}: no tasks")
+    return tasks, refusals
+
+
+def load_task_set(root: Path, only: list[str] | None = None
+                  ) -> list[TaskManifest]:
+    """`load_task_set_with_refusals` for a caller with nothing to skip.
+
+    Signature and return type are unchanged, so `scripts/grade.py` and
+    `scripts/judge.py` keep their call sites and inherit the refusal text
+    without an edit. Both pass no selection, which is the branch on which
+    `refusals` is empty by construction: a caller that named no subset is
+    asking for the whole set, and every manifest in it is required.
+    """
+    tasks, _ = load_task_set_with_refusals(root, only)
     return tasks
 
 
