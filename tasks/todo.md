@@ -4212,3 +4212,179 @@ after (`git status` showed only the intended diff). `scripts/verify_logger.py`:
 **GATE PASSED** — unit `1717 passed, 67 deselected` in 83.12s, integration
 `44 passed, 1740 deselected` in 112.30s, dry run OK, offline smoke GO.
 `graphify update .` run after the source edits.
+
+## Round 2 item 9 — a pure gitlink rename is refused, not applied and graded — 2026-09-03
+
+Plan: [docs/superpowers/plans/2026-09-03-round2-9-gitlink-rename.md](../docs/superpowers/plans/2026-09-03-round2-9-gitlink-rename.md).
+
+**What was found (measured by the plan, restated here).** `grader._chunk_is_gitlink`
+reads only a chunk's HEADER for a `160000` mode line, and `container.snapshot_diff`
+runs `git diff --cached <base_sha>` with no `-M` and no `--no-renames` in a run
+tree that sets no `diff.renames` — so rename detection is ON (git's default since
+2.9). A submission whose only change to a submodule is a rename therefore emits
+`similarity index 100%` / `rename from` / `rename to` and **nothing else**: no
+mode line, no `index <a>..<b> <mode>` line, no hunk body. `_chunk_is_gitlink`
+returns `False`, and `_gitlinks_touched` — which only inspects chunks that return
+`True` — never sees the path. The existing refusal's own docstring claimed this
+shape was "out of reach" because renaming a submodule means editing `.gitmodules`
+too; measured false in both halves: a plain `mv sub newsub` followed by
+`git add -A` (the ordinary way an agent moves a directory) produces **no**
+`.gitmodules` chunk at all, and `git mv`'s own `.gitmodules` chunk is mode
+`100644` and would not have matched the check anyway. `git apply --index` of the
+four-line chunk exits 0, moves the index entry to the new path, and leaves the
+submodule's fully-populated files at the **old** path with an empty directory at
+the new one — so the ladder would grade a tree the agent's move never reached and
+return `resolved: False`, an accusation over a limitation of the harness's own
+diff capture. No diff-only rule can close this: a 100%-similarity rename of an
+*ordinary* file is byte-identical in shape, differing only in the paths, and a
+path's mode is not in the diff.
+
+**What was built.** Three new functions in `grader.py`, between `_gitlinks_touched`
+and `_added_lines`:
+
+- `_rename_pairs(diff)` — the `(source, destination)` pairs a submission renames,
+  read off `_chunk_path`'s forward/reverse `git apply --numstat -z` (never the
+  `rename from`/`rename to` header text, for `tasks.py`'s standing reason: those
+  lines are not `-z`-framed, are C-quoted for non-ASCII, and a path containing
+  `" b/"` makes the `diff --git` line ambiguous).
+- `_start_state_gitlinks(repo, start_sha, paths)` — which of `paths` are `160000`
+  gitlinks in `start_sha`'s tree, via `git ls-tree -r -z <start_sha> --
+  :(literal)<path>...`, reusing `_ls_tree_gitlinks`'s existing parser. Raises
+  `TaskError` on a failed listing rather than reading it as "no gitlinks" (D4) —
+  the fallback for a silent failure here is grading a tree the submission's
+  content never reached. Pathspecs are `:(literal)`-prefixed (D8): measured, a
+  gitlink literally named `:weird` is returned **only** under the literal
+  spelling, and the bare one exits 0 with **empty output**, which would read as
+  "not a gitlink" and let it through.
+- `_renamed_gitlinks(diff, repo, start_sha)` — composes the two: no rename pairs
+  means no `git ls-tree` at all (measured, 115/115 stored records take this path),
+  and only the **source** side of each pair is asked about, since a rename's
+  destination cannot exist at `start_sha` by construction.
+
+`grade_run` gained a second refusal branch, **inside** the existing `try:` block
+(so the `finally: shutil.rmtree(tree, ...)` still removes the tree on this path —
+T3.9 pins the ordering), between `materialize` and `RunContainer`. This is D1/D3's
+central decision: the mode of the rename source is not in the diff, so the
+authority has to be `start_sha`'s tree, and that tree does not exist until
+`materialize` builds it — no rearrangement asks the question earlier, because the
+pruned mirror is at `base_sha` and `declared_start_sha` names a commit no
+repository holds. So the gitlink refusal is now **in two places**: every shape
+carrying a `160000` mode line is refused before the artifacts wipe and before
+`materialize` (free); a pure rename is refused after `materialize` and before the
+container (one hardlinked `--local` clone, D3); a submission with no rename chunk
+pays nothing extra beyond one additional `_parse_submission` call (D7, priced at
+~690 short-lived git processes across the 115-row stored corpus — declined to
+collapse into one parse because the saving is tens of milliseconds and the cost is
+architectural, per D7's rejected-alternative section).
+
+**D2, in its current framing.** The alternative — passing `--no-renames` to
+`container.snapshot_diff` so every gitlink change carries a mode line and the
+existing check is complete on its own — was measured to work. It is not rejected
+as the worse recording; it is **insufficient** as *the* fix, for one argument in
+two halves: it cannot reach a row already written to the append-only event log
+(all 115 stored rows were captured renames-on), and it would make the grader's
+soundness depend invisibly on a flag in another process (delete `--no-renames`
+from `container.py` a year from now and the check silently goes blind again, with
+nothing offline able to tell a renames-off diff from a renames-on diff that
+happens to contain no rename). The grader-side `ls-tree` is required whatever the
+harness later records, so the two are not alternatives — and whether the *record*
+itself should carry renames at all (measured: with renames on, `files_touched`
+reports only a rename's destination, dropping the source silently) is a separate
+question, filed as its own `TASKS.md` P2 entry (T5.2) rather than folded in here,
+because one commit must not change both what is measured and what is graded.
+
+**D5/D6.** No new `NotGradedReason`: this is the same absence
+`SUBMODULE_GITLINK_UNGRADABLE` already names (a gitlink moved in the index without
+its content following), distinguished from the mode-line case only in
+`not_graded_detail`'s prose (an arrow, `sub -> newsub`, where the existing message
+lists plain paths). `GRADER_VERSION` moved 11 -> 12 by reading the constant and
+adding one, per the standing rule — a submission the ladder used to accept and
+grade (`git apply --index` exits 0, measured) is now taken out of the denominator,
+which is a change to what the ladder means on an input it already accepted, so the
+version moves whether or not any stored row hits it. Measured: **0 of 115** stored
+records under `~/.cache/bakeoff` carry a rename chunk of any kind, so no stored
+verdict changes — the bump is for `scripts/grade.py`'s resume gate
+(`(run_id, GRADER_VERSION)` alone), not for a flip.
+
+**Tests.** Eight new in `tests/test_grader.py`, plus one edited
+(`test_the_grader_version_moved_with_what_check_5_means`, literal `"11"` ->
+`"12"` with a new `11 -> 12` paragraph): the two fixtures and the hermetic
+`_start_state_repo` helper (built with real `git update-index --add --cacheinfo
+160000,<sha>,<path>` — no submodule, no clone, no network); the pure-rename
+refusal and its ordinary-file control; `_rename_pairs` reading off git rather
+than the header; the zero-cost no-rename path (an `AssertionError`-raising fake
+proves `_start_state_gitlinks` is never called); the exact `git ls-tree` argv
+(source only, `start_sha`, `:(literal)`-prefixed); the `grade_run` branch itself
+(no container starts, `NotGradedReason.SUBMODULE_GITLINK_UNGRADABLE`, the arrow
+in `not_graded_detail`, `artifacts_dir is None`); the refused row leaving no
+materialized tree behind (explicitly **not** asserting the key-level
+`grade-tree/<run_id>` husk is gone — that survival is `fresh_tree`'s documented,
+deliberate cost since round-2 item 3, and asserting it away would fail against
+correct code); and a failed `git ls-tree` raising `TaskError` rather than falling
+through.
+
+**Deviation from the plan.** T3.10 (`test_a_start_state_listing_that_fails_stops_the_grade`)
+could not be transcribed as a bare "make `grader.subprocess.run` return
+`returncode=128`" fake: `subprocess` is one process-global module, and
+`_renamed_gitlinks` calls it **twice** on the way to the `git ls-tree` this test
+is about — once for real, inside `_rename_pairs` (`_parse_submission` ->
+`_chunk_path` -> `_numstat`, which must actually parse the fixture's rename chunk
+to produce a pair worth looking up). A fake that intercepts every call
+unconditionally makes `_numstat`'s own real `git apply --numstat` invocation see
+the broken reply too, so `_parse_submission` raises `TaskError`, `_rename_pairs`
+catches it and returns `()`, and `_renamed_gitlinks` returns `()` **without ever
+reaching** `_start_state_gitlinks` — the test would pass for the wrong reason (no
+exception at all, not the intended `TaskError`) or fail outright. Fixed by having
+the fake intercept only a `git ls-tree` argv and delegate everything else
+(including the real numstat call's `input=` kwarg, which the plan's literal
+three-parameter signature does not accept) to the real `subprocess.run`, captured
+before the patch. The assertions themselves (`pytest.raises(TaskError)`,
+`"not a tree object" in str(...)`) are exactly as the plan specifies.
+
+**Verification.**
+- `.venv/bin/python -m pytest tests/ -q` — **1725 passed, 67 deselected**,
+  exactly baseline `1717` + **8** (T3.3-T3.10; T3.11 edits an existing test and
+  adds none, matching the plan's corrected count from review 2).
+- `tests/test_grader.py -q -k "gitlink or rename"` — **13 passed** (the eight
+  new plus the four pre-existing gitlink tests plus one).
+- The two pre-materialize tests (`not_graded_rather_than_failed`,
+  `nested_repo_is_not_graded_either`) still pass with no Docker and no mirror.
+- `.venv/bin/python scripts/mutation_check.py` run solo (backgrounded past the
+  120 s tool timeout, waited out with `until ! pgrep -f mutation_check.py`):
+  **195/195 caught**, 0 stale (194 + the one new anchor), tree byte-clean
+  after.
+- Manual re-measurement of the load-bearing external fact, on the real
+  `tomlkit-514-inline-table-comment-separator` task materialized into a scratch
+  tree (`~/.cache/bakeoff-probe/taskset-w6-isolated`, `start_sha
+  e1d72b883d2e452ca14835047e2fa7db02cdc4d8`): `mv tests/toml-test tests/toml_test
+  && git add -A && git diff --cached <start_sha>` printed exactly
+  `similarity index 100%` / `rename from tests/toml-test` / `rename to
+  tests/toml_test`, no mode line, no `.gitmodules` chunk — confirming M8's
+  reachability claim on a real submodule task, not only on the synthetic
+  fixture.
+- Self-grade on that same task (`~/.cache/bakeoff-probe/self_grade.py` writing
+  reference/empty/extra records, `scripts/grade.py --taskset
+  ~/.cache/bakeoff-probe/taskset-w6-isolated`), with the extra diff being the
+  real rename captured above:
+  ```
+  reference: resolved=true, not_graded_reason=null, grade_failure=null
+  empty:     resolved=false, grade_failure=empty_patch
+  extra:     resolved=null, not_graded_reason=submodule_gitlink_ungradable,
+             not_graded_detail="the submission renames the gitlink(s)
+             tests/toml-test -> tests/toml_test; a 100%-similarity rename
+             carries no mode line and no content, so applying it moves the
+             index entry and leaves the submodule's files at the old path"
+  ```
+  `grader_version` on every line reads `"12"`. Exactly the plan's predicted
+  verdict, and the reference stays `resolved: true` beside it — the refusal is
+  specific to the rename, not a blanket NO-GO on the task. Evidence left at
+  `~/.cache/bakeoff-probe/eventlog-tomlkit-514-gitlink-rename`; the rename diff
+  itself at `.superpowers/broaden/round2/gitlink_rename_extra.diff`.
+
+Everything else in the plan (D1's authority choice, D3's cost accounting, D4's
+raise-don't-fall-through, D7's rejected refactor and its correction from review
+1, D8's `:(literal)` reasoning, the `GRADER_VERSION` comment block, the
+`_chunk_is_gitlink` docstring correction, the `grade_run` docstring rewrite) was
+transcribed as written; no other defect was found.
+
+`graphify update .` run after the source edits.

@@ -285,7 +285,28 @@ from bakeoff.tasks import (
 #: with the code that makes the divergence possible rather than with the
 #: first run that exercises it, because the resume gate in
 #: `scripts/grade.py` keys on `(run_id, GRADER_VERSION)` alone.
-GRADER_VERSION: str = "11"
+#:
+#: 11 -> 12: `_renamed_gitlinks`. A submission that RENAMES a gitlink without
+#: changing its content -- `mv sub newsub`, no new submodule commit -- carries
+#: no `160000` mode line at all (a pure rename is `similarity index` /
+#: `rename from` / `rename to` and nothing else), so `_gitlinks_touched` does
+#: not see it, and a pure rename of an ordinary file is byte-identical in
+#: shape (measured 2026-09-02, git 2.50.1) so nothing in the diff can tell
+#: them apart. Under 11 such a submission applied cleanly (`git apply
+#: --index` exits 0, `warning: unable to rmdir` only), moved only the index
+#: entry, and left the submodule's files at the OLD path with an empty
+#: directory at the new one -- so the ladder graded a tree the agent's move
+#: never reached and the verdict was `resolved: False`, an accusation over
+#: content the harness's own diff capture could not carry. That is a change
+#: to what the ladder MEANS on an input it already accepted, so the version
+#: moves whether or not any stored row hits it -- `scripts/grade.py`'s resume
+#: gate keys on `(run_id, GRADER_VERSION)` alone and never on the code that
+#: produced the verdict.
+#:
+#: It costs a full re-grade into a fresh `v12` artifacts directory per event
+#: log. No verdict on today's corpus changes: measured 2026-09-02, 0 of 115
+#: stored records carry a rename chunk of any kind.
+GRADER_VERSION: str = "12"
 
 #: Wall clock for the HOST-side gitleaks scan, and for nothing else.
 #: `_ContainerEnv.scan_secrets` shells out to `docker run` rather than through
@@ -722,13 +743,17 @@ def _chunk_is_gitlink(chunk: str) -> bool:
     Only the lines BEFORE the first hunk header are considered; see
     `_GITLINK_MODE` for why the body is not an authority.
 
-    Residual, recorded rather than papered over: a PURE RENAME of a gitlink
-    with no mode change emits `similarity index`/`rename from`/`rename to`
-    and neither a mode line nor a hunk body, so neither this authority nor the
-    `Subproject commit` one sees it. It is out of reach of an agent working in
-    a run tree -- renaming a submodule means editing `.gitmodules` too, which
-    IS a text chunk the submission carries -- and it is named here so nobody
-    re-derives the gap as a bug.
+    A PURE RENAME of a gitlink is deliberately outside this function. Such a
+    chunk carries `similarity index 100%` / `rename from` / `rename to` and
+    neither a mode line nor a hunk body, so neither this authority nor the
+    `Subproject commit` one can see it -- and a pure rename of an ordinary
+    FILE is byte-identical in shape, so nothing in the diff can separate
+    them. It is reachable: measured 2026-09-02 (git 2.50.1), a plain
+    `mv sub newsub` followed by `git add -A` emits exactly that one chunk and
+    NO `.gitmodules` chunk at all, and `git mv`'s `.gitmodules` chunk is mode
+    100644 and would not match here anyway. `_renamed_gitlinks` closes it by
+    asking `git ls-tree <start_sha>` for the source's mode, which needs a
+    tree and therefore runs after `materialize`.
     """
     for line in chunk.split("\n"):
         if line.startswith("@@"):
@@ -805,6 +830,120 @@ def _gitlinks_touched(diff: str) -> tuple[str, ...]:
         for path in (source, dest)
     }
     return tuple(sorted(touched))
+
+
+def _rename_pairs(diff: str) -> tuple[tuple[str, str], ...]:
+    """The `(source, destination)` pairs this submission renames.
+
+    A rename is `source != dest` OFF `_chunk_path`, which runs
+    `git apply --numstat -z` forward and with `-R` per chunk. The
+    `similarity index` / `rename from` / `rename to` lines are never matched:
+    they are not `-z`-framed, they are C-quoted for a non-ASCII path, and a
+    path containing " b/" makes the `diff --git` line ambiguous -- the five
+    silent-wrong-path bugs `tasks.py`'s module docstring records.
+
+    Measured 2026-09-02, git 2.50.1, on the four-line chunk a submodule
+    rename produces: forward `0\t0\tnewsub`, reverse `0\t0\tsub`.
+
+    A submission that cannot be parsed returns `()`, for the same reason
+    `_gitlinks_touched` does: `_apply_submission` owns that shape, and a
+    second authority for one refusal is the mistake `not_graded_gate`'s
+    docstring records.
+    """
+    try:
+        parsed = _parse_submission(diff)
+    except TaskError:
+        return ()
+    return tuple(
+        (source, dest) for _chunk, source, dest in parsed if source != dest
+    )
+
+
+def _start_state_gitlinks(repo: Path, start_sha: str,
+                          paths: tuple[str, ...]) -> tuple[str, ...]:
+    """Which of `paths` are `160000` gitlinks in `start_sha`'s tree.
+
+    On the HOST, in the materialized tree, because the answer comes out of
+    the object store and not out of the index -- so none of `_refresh_index`'s
+    stat-cache problem applies and no container is needed to ask.
+
+    Pathspecs are `:(literal)`-prefixed: a git pathspec is a PATTERN by
+    default and these paths come from the submission, which is data. Measured
+    2026-09-02 (git 2.50.1): a gitlink literally named `:weird` is returned
+    ONLY under `:(literal)` -- the bare spelling exits 0 with EMPTY OUTPUT,
+    which this function would read as "not a gitlink" and let through. A
+    silent false negative, which is the whole class of defect this check
+    exists to close. `_check_test_restore` passes its paths bare and is right
+    to: those come from the manifest, which a task author writes and preflight
+    checks.
+
+    RAISES rather than reporting nothing. A pathspec matching no entry is
+    exit 0 with empty output (measured), which is a real answer -- "not a
+    gitlink" -- and is left alone. A non-zero exit is not: the fallback for a
+    silent failure here is grading a tree the submission's content never
+    reached, which is `resolved: False` in an append-only file.
+    `scripts/grade.py` contains this per record into its `errors` bucket, so
+    the cost of being wrong is one named, re-runnable row.
+    """
+    argv = ["git", "ls-tree", "-r", "-z", start_sha, "--",
+            *(f":(literal){p}" for p in paths)]
+    try:
+        proc = subprocess.run(argv, cwd=repo, capture_output=True)
+    except OSError as exc:
+        raise TaskError(f"could not run {' '.join(argv)}: {exc}") from exc
+    if proc.returncode != 0:
+        raise TaskError(
+            "could not read the start state's file modes while checking a "
+            f"renamed path for a gitlink (exit {proc.returncode}): "
+            f"{proc.stderr.decode('utf-8', 'replace').strip()}"
+        )
+    return _ls_tree_gitlinks(proc.stdout.decode("utf-8", "surrogateescape"))
+
+
+def _renamed_gitlinks(diff: str, repo: Path,
+                      start_sha: str) -> tuple[tuple[str, str], ...]:
+    """The gitlinks this submission MOVES without changing, source -> dest.
+
+    The blind spot `_chunk_is_gitlink` cannot close. Measured 2026-09-02,
+    git 2.50.1: a 100%-similarity rename carries NO mode line -- not
+    `new file mode`, not `deleted file mode`, not `old mode`/`new mode`, and
+    not even an `index <a>..<b> <mode>` line -- and no hunk body, so neither
+    the mode authority nor the `Subproject commit` one it rejects sees it.
+    And a 100%-similarity rename of an ORDINARY file is byte-identical in
+    shape:
+
+        diff --git a/sub b/newsub          diff --git a/big.py b/moved_big.py
+        similarity index 100%              similarity index 100%
+        rename from sub                    rename from big.py
+        rename to newsub                   rename to moved_big.py
+
+    The two differ only in their paths, so no diff-only rule can separate
+    them: the mode has to come from the tree. Hence `start_sha`, and hence
+    this runs after `materialize` rather than beside the other refusal.
+
+    The SOURCE side is what is asked about. A rename's destination does not
+    exist at `start_sha`; its source always does, because `final_diff` is
+    `git diff --cached <base_sha>` taken in the run tree and the grader
+    materializes that same start state.
+
+    Why it matters: `git apply --index` of that four-line chunk exits 0 on a
+    freshly materialized tree (`warning: unable to rmdir` only), moves the
+    index entry to the new path, and leaves the submodule's files at the OLD
+    one with an EMPTY DIRECTORY at the new one -- measured. The ladder then
+    grades a tree the agent's move never reached and returns
+    `resolved: False`, an accusation over a limitation of the harness's own
+    diff capture.
+
+    No rename means no `git ls-tree` at all: measured across the 115 stored
+    records under `~/.cache/bakeoff` (2026-09-02), that is every one of them.
+    """
+    pairs = _rename_pairs(diff)
+    if not pairs:
+        return ()
+    gitlinks = set(_start_state_gitlinks(
+        repo, start_sha, tuple(source for source, _dest in pairs)
+    ))
+    return tuple((s, d) for s, d in pairs if s in gitlinks)
 
 
 def _added_lines(chunk: str) -> str:
@@ -2059,10 +2198,18 @@ def grade_run(record: RunRecord, task, image: str, oracle: Oracle | None,
     The gitlink refusal sits beside it and for the same reason, but it is a
     SEPARATE function rather than a branch of `not_graded_gate`: that gate is
     also called by `run_ladder` and asks only whether a submission EXISTS,
-    while this one reads the submission's contents. It runs before the
-    artifacts wipe and before `materialize`, so a refused row costs no tree
-    and no container -- and, since the authority is the diff rather than the
-    task, no mirror clone either.
+    while this one reads the submission's contents.
+
+    It is in TWO PLACES, and the split is a measurement rather than a
+    preference. Every shape that carries a `160000` mode line is refused
+    before the artifacts wipe and before `materialize`, so those rows cost no
+    tree, no container and no mirror clone. A PURE RENAME carries no mode
+    line, and a pure rename of an ordinary file is byte-identical to one of a
+    gitlink (measured 2026-09-02, git 2.50.1) -- so the mode has to come from
+    `start_sha`'s tree, and that branch runs after `materialize` and before
+    the container. A refused rename therefore costs one hardlinked `--local`
+    clone from the already-cached pruned mirror and nothing else. A
+    submission with no rename chunk asks git nothing.
 
     The tree is removed on the way out, including on the failure paths: it
     holds the submission applied on top of the start state, which is a trap
@@ -2119,6 +2266,20 @@ def grade_run(record: RunRecord, task, image: str, oracle: Oracle | None,
     tree = fresh_tree(Path(cache_root) / "grade-tree" / record.run_id)
     start_sha = materialize(task, tree / "repo", Path(cache_root))
     try:
+        renamed = _renamed_gitlinks(
+            record.artifacts.final_diff or "", tree / "repo", start_sha
+        )
+        if renamed:
+            return build_grade_record(
+                record, task, image, oracle, _gated_result((
+                    NotGradedReason.SUBMODULE_GITLINK_UNGRADABLE,
+                    "the submission renames the gitlink(s) "
+                    + ", ".join(f"{s} -> {d}" for s, d in renamed)
+                    + "; a 100%-similarity rename carries no mode line and no "
+                    "content, so applying it moves the index entry and leaves "
+                    "the submodule's files at the old path",
+                )),
+            )
         with RunContainer(image=image, repo_path=str(tree / "repo"),
                           base_sha=start_sha) as container:
             env = _ContainerEnv(

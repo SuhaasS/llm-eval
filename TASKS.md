@@ -1406,6 +1406,20 @@ judge runs after one — which is why they sit here rather than above.
   plus a `PREFLIGHT_VERSION` bump, which invalidates every cached preflight
   verdict — hence its own item.
 
+- [ ] **`files_touched` reports only a rename's destination.** `container.
+  snapshot_diff` runs `git diff --cached --name-only <base_sha>` with rename
+  detection on (git's default since 2.9; the run tree sets no
+  `diff.renames`), so a submission that moves `big.py` to `moved_big.py`
+  records `moved_big.py` and NOT `big.py` — measured 2026-09-02, 3 names
+  where `--no-renames` reports 5. A reader asking which files the model
+  touched is told about the destinations only, and the source's disappearance
+  is invisible. This is a change to what the harness RECORDS — `final_diff`
+  bytes and `files_touched` both move, and diff-size views with them — so it
+  needs its own plan and a `SCHEMA_VERSION` bump. Found while closing the
+  gitlink-rename item (round 2, item 9); deliberately not folded into it,
+  because one commit must not change both what is measured and what is
+  graded.
+
 ---
 
 ## P3 — Decisions to settle before numbers are published
@@ -1495,16 +1509,25 @@ These need a call, not code. Most are cheap to make and expensive to make late.
   state at checkpoint time — a change to what a run RECORDS, not to how one is
   graded — so it needs its own plan. Measured 2026-09-01 (broadening 6, M8).
 
-- [ ] **A pure gitlink rename is invisible to the grader's gitlink refusal.**
+- [x] **A pure gitlink rename is invisible to the grader's gitlink refusal.**
   `grader._chunk_is_gitlink` reads the chunk header for a `160000` mode line
   (`new file mode`, `deleted file mode`, `old mode`/`new mode`, `index …
   160000`); a rename chunk with 100% similarity carries none of those, so a
   submission that only moves a submodule directory applies `--index` green and
-  is graded against the old content. Not measured on a real submission —
-  recorded here so the gap is in the backlog and not only in the docstring.
-  Closing it means reading the `similarity index`/`rename from` header and
-  checking the destination's mode in the index. Measured 2026-09-02
-  (broadening 6 fix wave).
+  is graded against the old content. Measured 2026-09-02 (round 2 item 9, git
+  2.50.1): the harness's own `git diff --cached <base>` — `container.
+  snapshot_diff`, no `-M`, no `--no-renames` — emits exactly this shape,
+  because rename detection has defaulted to on since git 2.9 and the run tree
+  sets no `diff.renames`. A plain `mv sub newsub` followed by `git add -A`
+  produces it with **no** `.gitmodules` chunk beside it, which is what the
+  entry's own former mitigation ("renaming means editing `.gitmodules` too")
+  assumed away. `git apply --index` of the four-line chunk exits 0, moves the
+  index entry, and leaves the submodule's files at the old path with an
+  empty directory at the new one. Fixed by `grader._renamed_gitlinks`: it
+  reads the rename pairs off `_chunk_path` (never the header text) and asks
+  `git ls-tree <start_sha>` for the source's mode — a question that needs a
+  tree, so it runs after `materialize` and before the container, unlike the
+  mode-line refusal it sits beside. `GRADER_VERSION` 11 → 12.
 
 - [ ] **The submodule's `remote remove` is `check=False` and the `reflog
   expire` beside it is `check=True`; nothing measured the asymmetry.** Both

@@ -1875,6 +1875,21 @@ MUTATIONS = [
         "not integration",
     ),
     (
+        # A 100%-similarity rename carries NO mode line, and a pure rename of
+        # an ordinary file is byte-identical to one of a gitlink -- so the
+        # mode can only come from `start_sha`'s tree. Skipping the lookup puts
+        # the submission back on the path measured 2026-09-02: `git apply
+        # --index` exits 0, the index entry moves, the submodule's files stay
+        # at the OLD path, and the ladder grades `resolved: False` -- an
+        # accusation over content the harness could not capture.
+        "grader: grade a submission that moved a gitlink and nothing else",
+        "src/bakeoff/grader.py",
+        "        renamed = _renamed_gitlinks(",
+        "        renamed = (lambda *a, **kw: ())(",
+        "tests/test_grader.py -k gitlink_rename_is_not_graded",
+        "not integration",
+    ),
+    (
         # The residual ambiguity once the match is boundary-anchored:
         # `vendor/lib` and `vendor/lib dep` both match ONE status line,
         # because the separator the boundary rule looks for is itself part of

@@ -33,6 +33,7 @@ from bakeoff.grader import (
     run_ladder,
 )
 from bakeoff.oracle import Oracle
+from bakeoff.tasks import TaskError
 from bakeoff.schema import (
     Artifacts,
     Checkpoint,
@@ -483,7 +484,8 @@ def test_an_ungraded_record_does_not_claim_an_empty_quarantine(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# 1b. the gitlink refusal, which runs beside the gates and before the ladder
+# 1b. the gitlink refusals: the mode-line one before materialize, the rename
+#     one after
 # --------------------------------------------------------------------------
 
 #: Shape 1: a DECLARED submodule whose gitlink the agent moved by committing
@@ -521,6 +523,59 @@ _NESTED_REPO_SUBMISSION = (
     "@@ -0,0 +1 @@\n"
     "+Subproject commit 4f5328fcf96da17d142cfc082764652008343211\n"
 )
+
+#: Shape 3: a PURE RENAME of a gitlink, which carries no mode line at all.
+#: Produced verbatim 2026-09-02 with git 2.50.1, by `mv sub newsub` followed
+#: by `git add -A` in a superproject with a submodule at `sub` -- a plain
+#: `mv`, so there is no `.gitmodules` chunk beside it. `git diff --cached
+#: <base>` and `git diff --cached -M <base>` returned identical bytes, and
+#: `container.snapshot_diff` runs the former.
+_GITLINK_RENAME_SUBMISSION = (
+    "diff --git a/sub b/newsub\n"
+    "similarity index 100%\n"
+    "rename from sub\n"
+    "rename to newsub\n"
+)
+
+#: The control, and the reason the tree has to be asked: a 100%-similarity
+#: rename of an ORDINARY file is the same four lines with different paths.
+#: Produced the same way, by `git mv big.py moved_big.py`.
+_FILE_RENAME_SUBMISSION = (
+    "diff --git a/big.py b/moved_big.py\n"
+    "similarity index 100%\n"
+    "rename from big.py\n"
+    "rename to moved_big.py\n"
+)
+
+
+def _start_state_repo(root: Path) -> str:
+    """A real repository whose tree carries a `160000` gitlink at `sub` and a
+    blob at `big.py`, and the SHA of the commit holding both.
+
+    `git update-index --add --cacheinfo 160000,<sha>,<path>` writes a gitlink
+    entry directly -- no submodule, no clone, no `.gitmodules`, no network --
+    so `_start_state_gitlinks` runs against REAL git output rather than a
+    string somebody typed. Measured 2026-09-02 (git 2.50.1): the resulting
+    `git ls-tree -r -z <sha> -- sub big.py` reply is
+    `160000 commit <sha>\\tsub\\0100644 blob <sha>\\tbig.py\\0`.
+    """
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=root, check=True)
+    (root / "big.py").write_text("x = 1\n")
+    subprocess.run(["git", "add", "big.py"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "update-index", "--add", "--cacheinfo",
+         "160000,8d8cfe7b9864c69193d190b7e3c3df9bbddd911a,sub"],
+        cwd=root, check=True,
+    )
+    subprocess.run(
+        ["git", "-c", "user.email=test@example.com",
+         "-c", "user.name=test", "commit", "-q", "-m", "start"],
+        cwd=root, check=True,
+    )
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=root, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
 
 
 def test_a_gitlink_submission_is_not_graded_rather_than_failed(tmp_path):
@@ -616,6 +671,198 @@ def test_an_unparseable_submission_is_left_to_the_existing_refusal():
     `LOSSY_DIFF_UNAPPLIABLE` off every lossy row.
     """
     assert grader._gitlinks_touched("not a diff at all\n") == ()
+
+
+def test_a_pure_gitlink_rename_is_refused_though_it_carries_no_mode_line(
+    tmp_path
+):
+    """The blind spot `_chunk_is_gitlink` cannot close on its own: a
+    100%-similarity rename carries no `160000` mode line at all, so the
+    diff-only authority says "not a gitlink" -- stated as an assertion here so
+    the two authorities stay honestly separate -- and `_renamed_gitlinks`
+    closes the gap by asking `start_sha`'s tree for the rename source's mode.
+    """
+    sha = _start_state_repo(tmp_path)
+
+    assert grader._chunk_is_gitlink(_GITLINK_RENAME_SUBMISSION) is False
+    assert grader._renamed_gitlinks(
+        _GITLINK_RENAME_SUBMISSION, tmp_path, sha
+    ) == (("sub", "newsub"),)
+
+
+def test_a_pure_regular_file_rename_is_not_refused(tmp_path):
+    """The control: `_FILE_RENAME_SUBMISSION` is the same four lines as
+    `_GITLINK_RENAME_SUBMISSION` with different paths. A rule that refused on
+    the diff shape alone would take every honest file rename out of the
+    denominator; asking the tree is what tells the two apart.
+    """
+    sha = _start_state_repo(tmp_path)
+
+    assert grader._renamed_gitlinks(
+        _FILE_RENAME_SUBMISSION, tmp_path, sha
+    ) == ()
+
+
+def test_rename_pairs_come_from_git_rather_than_the_rename_header():
+    """`_rename_pairs` is `_chunk_path`'s forward/reverse `--numstat`, never a
+    match over `similarity index` / `rename from` / `rename to`."""
+    assert grader._rename_pairs(_GITLINK_RENAME_SUBMISSION) == \
+        (("sub", "newsub"),)
+    # A modification has `source == dest`, so it is not a rename.
+    assert grader._rename_pairs(TEXT_DIFF) == ()
+    assert grader._rename_pairs("not a diff at all\n") == ()
+
+
+def test_a_submission_with_no_rename_asks_git_nothing(monkeypatch):
+    """Pins the zero-cost common path: measured 2026-09-02, 115 of 115 stored
+    records carry no rename chunk, and none of them should pay a
+    `git ls-tree`."""
+    def _raiser(*a, **kw):
+        raise AssertionError(
+            "a submission with no rename must not ask git anything"
+        )
+
+    monkeypatch.setattr(grader, "_start_state_gitlinks", _raiser)
+
+    assert grader._renamed_gitlinks(
+        TEXT_DIFF, Path("/nonexistent"), START_SHA
+    ) == ()
+
+
+def test_the_renamed_source_mode_is_read_from_the_start_state(monkeypatch):
+    """Pins three things at once: the tree asked is `start_sha`'s and not
+    `base_sha`'s, only the SOURCE side of a rename is asked about, and the
+    pathspec is `:(literal)`-prefixed."""
+    calls = []
+
+    def _recorder(argv, cwd=None, capture_output=None):
+        calls.append((argv, cwd))
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(grader.subprocess, "run", _recorder)
+
+    repo = Path("/some/repo")
+    grader._start_state_gitlinks(repo, START_SHA, ("sub",))
+
+    assert len(calls) == 1
+    argv, cwd = calls[0]
+    assert argv == [
+        "git", "ls-tree", "-r", "-z", START_SHA, "--", ":(literal)sub",
+    ]
+    assert cwd == repo
+
+
+def test_a_gitlink_rename_is_not_graded_and_starts_no_container(
+    monkeypatch, tmp_path
+):
+    """Through `grade_run`, in the style of
+    `test_the_stat_cache_is_refreshed_before_the_ladder_applies`. `_record`'s
+    `diff` defaults to `TEXT_DIFF`, so naming `_GITLINK_RENAME_SUBMISSION`
+    explicitly is what makes the detail assertion hold."""
+    monkeypatch.setattr(grader, "materialize", lambda *a, **kw: START_SHA)
+    monkeypatch.setattr(
+        grader, "_start_state_gitlinks", lambda *a, **kw: ("sub",)
+    )
+
+    class _RefusingContainer:
+        def __init__(self, **kw):
+            raise AssertionError(
+                "a refused row must not start a container"
+            )
+
+    monkeypatch.setattr(grader, "RunContainer", _RefusingContainer)
+
+    graded = grade_run(_record(diff=_GITLINK_RENAME_SUBMISSION), _task(),
+                       "sha256:image", _oracle(),
+                       tmp_path / "cache", tmp_path / "art")
+
+    assert graded.resolved is None
+    assert graded.not_graded_reason == \
+        NotGradedReason.SUBMODULE_GITLINK_UNGRADABLE.value
+    assert graded.grade_failure is None
+    assert "sub -> newsub" in graded.not_graded_detail
+    assert graded.artifacts_dir is None
+
+
+def test_a_refused_rename_leaves_no_materialized_tree_behind(
+    monkeypatch, tmp_path
+):
+    """The order in `grade_run` matters: the refusal sits INSIDE the `try`
+    block so the existing `finally: shutil.rmtree(tree, ...)` removes the
+    tree on this path too -- above the `try`, a refused row would leave a
+    materialized tree holding somebody's submission on disk.
+
+    Do NOT assert the KEY-level `grade-tree/<run_id>` directory is gone.
+    Since round-2 item 3, `fresh_tree` allocates a `uuid4().hex` LEAF under
+    that key, the `finally` removes only the leaf, and the key-level
+    directory surviving as an empty husk is `fresh_tree`'s documented and
+    deliberate cost -- `_sweep_stale_trees` is explicitly documented as not
+    collecting it. Asserting the husk is gone would fail against correct,
+    unrelated code.
+    """
+    leaves: list[Path] = []
+
+    def _fake_materialize(task, dest, cache_root):
+        # `dest` is `<leaf>/repo`, so the leaf `fresh_tree` allocated is its
+        # parent. There is no other way to learn the name: it is a uuid4.
+        Path(dest).mkdir(parents=True)
+        leaves.append(Path(dest).parent)
+        return START_SHA
+
+    monkeypatch.setattr(grader, "materialize", _fake_materialize)
+    monkeypatch.setattr(
+        grader, "_start_state_gitlinks", lambda *a, **kw: ("sub",)
+    )
+
+    class _RefusingContainer:
+        def __init__(self, **kw):
+            raise AssertionError(
+                "a refused row must not start a container"
+            )
+
+    monkeypatch.setattr(grader, "RunContainer", _RefusingContainer)
+
+    grade_run(_record(diff=_GITLINK_RENAME_SUBMISSION), _task(),
+             "sha256:image", _oracle(),
+             tmp_path / "cache", tmp_path / "art")
+
+    assert leaves and not leaves[0].exists()
+
+
+def test_a_start_state_listing_that_fails_stops_the_grade(monkeypatch):
+    """A non-zero `git ls-tree` RAISES rather than being read as "no
+    gitlinks". The fallback for a silent failure here is grading a tree the
+    submission's content never reached, which is `resolved: False` in an
+    append-only file -- `scripts/grade.py` contains this per record into its
+    `errors` bucket, so the cost of being wrong is one named, re-runnable
+    row.
+
+    `grader.subprocess.run` is one process-global function, and
+    `_renamed_gitlinks` calls it twice on the way here: once, for real,
+    inside `_rename_pairs` (`_parse_submission` -> `_chunk_path` ->
+    `_numstat`, which must actually parse the fixture's real rename chunk to
+    produce a pair worth looking up), and once for the `git ls-tree` this
+    test is about. The fake therefore only intercepts the `ls-tree` argv and
+    delegates everything else -- including the real numstat call's `input=`
+    kwarg -- to the real `subprocess.run`, captured before the patch.
+    """
+    real_run = grader.subprocess.run
+
+    def _broken(argv, cwd=None, capture_output=None, **kw):
+        if argv[:2] == ["git", "ls-tree"]:
+            return SimpleNamespace(
+                returncode=128, stdout=b"",
+                stderr=b"fatal: not a tree object\n",
+            )
+        return real_run(argv, cwd=cwd, capture_output=capture_output, **kw)
+
+    monkeypatch.setattr(grader.subprocess, "run", _broken)
+
+    with pytest.raises(TaskError) as excinfo:
+        grader._renamed_gitlinks(
+            _GITLINK_RENAME_SUBMISSION, Path("/some/repo"), START_SHA
+        )
+    assert "not a tree object" in str(excinfo.value)
 
 
 # --------------------------------------------------------------------------
@@ -1262,10 +1509,20 @@ def test_the_grader_version_moved_with_what_check_5_means():
     reads `environment_error` where it read `scope_collected_nothing`, and a
     run where one declared id failed while another went stale now reads
     `environment_error` where it read `p2p_regression` -- the second is the
-    only one that changes a `resolved` value (`False` -> `None`)."""
+    only one that changes a `resolved` value (`False` -> `None`).
+
+    `11 -> 12` is `_renamed_gitlinks` (round 2 item 9, 2026-09-03). A pure
+    RENAME of a gitlink -- `mv sub newsub`, no new submodule commit -- carries
+    no `160000` mode line at all, so `_gitlinks_touched` never sees it, and a
+    pure rename of an ordinary file is byte-identical in shape. Under 11 such
+    a submission applied cleanly, moved only the index entry, and left the
+    submodule's files at the old path with an empty directory at the new one
+    -- so the ladder graded a tree the agent's move never reached and the
+    verdict was `resolved: False`, an accusation over content the harness's
+    own diff capture could not carry."""
     from bakeoff.grader import GRADER_VERSION
 
-    assert GRADER_VERSION == "11"
+    assert GRADER_VERSION == "12"
 
 
 def test_the_grade_says_which_runner_produced_its_numbers():
