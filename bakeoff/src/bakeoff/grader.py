@@ -1103,7 +1103,9 @@ def _check_test_restore(state: _State, task, env, start_sha: str,
     any submission whose diff touches a `160000` mode line before this check
     ever runs (`_gitlinks_touched` -> `SUBMODULE_GITLINK_UNGRADABLE`), so the
     gitlink at every declared path still equals the start state's by the time
-    control reaches here -- there is nothing for the restore to put back
+    control reaches here, and `_renamed_gitlinks` refuses the pure-rename
+    shape that carries no mode line at all (after `materialize`, still
+    before this check) -- there is nothing for the restore to put back
     there, only a working tree for `git rm -r` to destroy. Left unguarded,
     `git rm` removes the submodule's checkout and the following `git checkout
     <start_sha> -- tests/` restores only the gitlink to the index, never the
@@ -2209,7 +2211,9 @@ def grade_run(record: RunRecord, task, image: str, oracle: Oracle | None,
     `start_sha`'s tree, and that branch runs after `materialize` and before
     the container. A refused rename therefore costs one hardlinked `--local`
     clone from the already-cached pruned mirror and nothing else. A
-    submission with no rename chunk asks git nothing.
+    submission with no rename chunk asks git no `ls-tree`; it still pays one
+    `_parse_submission` -- two `git apply --numstat` per chunk -- to learn
+    there is no rename.
 
     The tree is removed on the way out, including on the failure paths: it
     holds the submission applied on top of the start state, which is a trap

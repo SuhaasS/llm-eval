@@ -33,7 +33,6 @@ from bakeoff.grader import (
     run_ladder,
 )
 from bakeoff.oracle import Oracle
-from bakeoff.tasks import TaskError
 from bakeoff.schema import (
     Artifacts,
     Checkpoint,
@@ -47,6 +46,7 @@ from bakeoff.schema import (
     TerminationReason,
     Versions,
 )
+from bakeoff.tasks import TaskError
 
 # --------------------------------------------------------------------------
 # diffs -- real ones, because _chunk_path runs real git over them
@@ -713,7 +713,7 @@ def test_rename_pairs_come_from_git_rather_than_the_rename_header():
     assert grader._rename_pairs("not a diff at all\n") == ()
 
 
-def test_a_submission_with_no_rename_asks_git_nothing(monkeypatch):
+def test_a_submission_with_no_rename_asks_the_start_state_nothing(monkeypatch):
     """Pins the zero-cost common path: measured 2026-09-02, 115 of 115 stored
     records carry no rename chunk, and none of them should pay a
     `git ls-tree`."""
