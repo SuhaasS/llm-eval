@@ -275,7 +275,33 @@ _PYTEST_ADAPTER = for_framework("pytest")
 #: `same_file_duplicate_ids` is `{}` on every verdict this version writes for
 #: a task at least one of whose node runs reported, and `None` where nothing
 #: counted.
-PREFLIGHT_VERSION: str = "19"
+#:
+#: 19 -> 20: a property-based determinism check for the node frameworks
+#: (round 2 item 12, 2026-09-03). Measured 2026-09-02 against fast-check
+#: 3.23.2 and 2.25.0: `QualifiedParameters.readSeed` falls back to
+#: `Date.now() ^ (Math.random() * 0x100000000)` when no seed is configured,
+#: the package reads NO environment variable anywhere, and ten fresh vitest
+#: runs of one property over unchanged code gave `0 0 0 1 1 0 0 0 0 0` -- so a
+#: node task whose p2p-before sweep runs an unpinned fast-check/jest-fuzz/
+#: jsverify suite was certified on whichever draw the gate happened to get.
+#: Since 20, the gate scans the p2p-before run's `Outcome.files_run` -- what
+#: the certified sweep actually loaded, not the declared `tests.paths` -- and
+#: refuses a task where a swept file imports one of those frameworks and
+#: nothing swept pins a seed with `configureGlobal(... seed: ...)`. There is
+#: no `image.env` lever for this one (unlike hypothesis's `CI=1`): the one
+#: external seed lever that works, `NODE_OPTIONS` preloading a module that
+#: calls `fc.configureGlobal`, is defeated by jest's module registry. A
+#: cached PASS under 19 on a NODE task whose sweep runs a property-based
+#: suite is stale: it was taken by a gate that could not see the shape. A
+#: cached NO-GO is unaffected -- nothing this version adds turns a NO-GO into
+#: a GO -- and no PYTEST verdict moves at all, since `PytestAdapter.
+#: property_scan` returns `None` and the block never runs. The three new
+#: evidence keys (`property_framework_imported_by_suite`,
+#: `property_framework_seed_pinned`, `property_scan_files`) are `None` on
+#: every verdict this version writes where the node scan did not run --
+#: the pre-container early return, a pytest task, or a node run whose
+#: p2p-before sweep wrote no report.
+PREFLIGHT_VERSION: str = "20"
 
 
 def preflight_cache_key(task, image: str, start_sha: str) -> str:
@@ -453,6 +479,8 @@ EVIDENCE_KEYS: tuple[str, ...] = (
     "scope_prefixes", "scope_prefixes_absent", "p2p_scoped_after_exit",
     "duplicate_full_names", "scope_files_run", "scope_files_outside",
     "ambiguous_file_filters", "same_file_duplicate_ids",
+    "property_framework_imported_by_suite", "property_framework_seed_pinned",
+    "property_scan_files",
 )
 
 
@@ -671,6 +699,58 @@ def _present(container, names, *, dangling_counts: bool = False) -> list[str]:
         if any(container.exec(["test", probe, name]).exit_code == 0
                for probe in probes)
     ]
+
+
+def _rg_probe(container, pattern: str, scanned: list[str], problems: list[str],
+              what: str, consequence: str, *,
+              multiline: bool = False) -> bool | None:
+    """Three-valued `rg -q` over `scanned`. `None` is "could not answer".
+
+    0 is a match, 1 is no match, and anything else -- an unreadable path, a bad
+    pattern, no rg -- is UNKNOWN. A quiet boolean there silently disarms the
+    caller, which is the whole reason this is not a `bool`.
+
+    UNKNOWN is not silent either: `scanned` is non-empty at every call site, so
+    the probe RAN and did not answer, and that is a controller-ruling ambiguity
+    rather than the "never ran" shape an empty `scanned` gives. The two would
+    render identically as `None` in `evidence`, so this appends a problem
+    naming the argv and the exit code.
+
+    `consequence` is the caller's own closing sentence rather than one sentence
+    shared by all three. The hypothesis probe's misreading disarms a check; the
+    seed-pin probe's misreading REFUSES a task that was already fine. One
+    sentence covering both would be wrong for one of them, and the hypothesis
+    caller's text is passed verbatim so that message stays byte-identical --
+    `test_the_hypothesis_rg_message_is_byte_identical_after_the_extraction`
+    pins it.
+
+    `--` before the paths: an entry starting with `-` would otherwise parse as
+    an rg flag, turning a scan target into a silent argv change.
+
+    INHERITED DEFAULTS, stated once here rather than rediscovered per caller:
+    `rg` without `--no-ignore` honours `.gitignore`/`.ignore` and skips hidden
+    files, so a gitignored test file is not scanned -- the SILENT direction for
+    an import probe. Left as-is because it is the behaviour the hypothesis
+    probe has always had, and changing it here would change that probe too;
+    a change must move both, deliberately.
+    """
+    argv = ["rg", "-q"] + (["-U"] if multiline else []) + [pattern, "--",
+                                                           *scanned]
+    probe = container.exec(argv)
+    if probe.exit_code == 0:
+        return True
+    if probe.exit_code == 1:
+        return False
+    problems.append(
+        f"the {what} could not answer: `" + " ".join(argv)
+        + f"` exited {probe.exit_code}, "
+        "not 0 (match) or 1 (no match). rg exits 2 on an "
+        "unreadable path or a bad pattern and it is asserted "
+        "present above, so this names an environment problem "
+        "preflight cannot see through -- "
+        + consequence
+    )
+    return None
 
 
 def _observed_env(container, keys: tuple[str, ...]) -> dict[str, str | None]:
@@ -2114,44 +2194,14 @@ def preflight(
             scanned = _present(container, tests.paths)
             used: bool | None = None
             if scanned:
-                # `--` before the paths: a `tests.paths` entry starting
-                # with `-` (e.g. a directory named `-tests/`) would otherwise
-                # parse as an rg flag rather than a path, turning a scan
-                # target into a silent argv change.
-                probe_argv = ["rg", "-q", r"^\s*(from|import)\s+hypothesis\b",
-                              "--", *scanned]
-                probe = container.exec(probe_argv)
-                # Three-valued on purpose. 0 is a match, 1 is no match, and
-                # anything else (an unreadable path, a bad pattern, no rg) is
-                # UNKNOWN -- a quiet False there would silently disarm the only
-                # check that catches an undeclared property-based suite.
-                #
-                # UNKNOWN is not silent either. `scanned` is non-empty
-                # here, so the probe RAN and did not answer -- a
-                # controller-ruling ambiguity, not the "never ran" shape
-                # below where `scanned` is empty and no exec happens at all.
-                # The two render identically as `None` in `evidence`, which
-                # is exactly the pair this repo's "a null says which kind of
-                # null it is" rule exists for, so the exit-code case gets a
-                # problem naming what was run and what came back, and the
-                # never-ran case stays a quiet `None`.
-                if probe.exit_code == 0:
-                    used = True
-                elif probe.exit_code == 1:
-                    used = False
-                else:
-                    problems.append(
-                        "the hypothesis-import scan (rg over tests.paths) "
-                        "could not answer: `"
-                        + " ".join(probe_argv)
-                        + f"` exited {probe.exit_code}, "
-                        "not 0 (match) or 1 (no match). rg exits 2 on an "
-                        "unreadable path or a bad pattern and it is asserted "
-                        "present above, so this names an environment problem "
-                        "preflight cannot see through -- silently reading it "
-                        "as 'not imported' would disarm the one check that "
-                        "catches an undeclared property-based suite."
-                    )
+                used = _rg_probe(
+                    container, r"^\s*(from|import)\s+hypothesis\b", scanned,
+                    problems,
+                    "hypothesis-import scan (rg over tests.paths)",
+                    "silently reading it as 'not imported' would disarm the "
+                    "one check that catches an undeclared property-based "
+                    "suite.",
+                )
             evidence["hypothesis_imported_by_suite"] = used
 
             if used and "CI" not in declared:
@@ -2298,7 +2348,116 @@ def preflight(
         evidence["bounded_run_durations_s"]["p2p_before"] = _elapsed_s(green)
         # Classified IMMEDIATELY after its own invocation: `classify` reads
         # `_Runner.last_report`, which the next `run` overwrites.
-        p2p_green = _note(runner.classify(green), runner.last_report).kind == KIND_PASSED
+        p2p_before_outcome = _note(runner.classify(green), runner.last_report)
+        p2p_green = p2p_before_outcome.kind == KIND_PASSED
+
+        # The node half of the same question, and it is a REFUSAL rather than a
+        # probe-plus-remedy because there is nothing to declare.
+        #
+        # Measured 2026-09-02 in bakeoff-eval-agent:base-node-22 against
+        # fast-check 3.23.2 and 2.25.0: `QualifiedParameters.readSeed` falls
+        # back to `Date.now() ^ (Math.random() * 0x100000000)`, the package
+        # reads NO environment variable anywhere (`grep -rl process.env` over
+        # the installed tree exits 1), and ten fresh vitest runs of one
+        # property over unchanged code gave `0 0 0 1 1 0 0 0 0 0`. So a node
+        # property suite gates on whichever draw preflight happened to run.
+        #
+        # NODE_OPTIONS preloading `fc.configureGlobal({seed})` was measured and
+        # rejected: it works on vitest (10/10 stable, both polarities) and is
+        # DEFEATED by jest's module registry (the test's own
+        # `fc.readConfigureGlobal()` reads `{}`, `--runInBand` included). A
+        # lever that silently does nothing on one of two peer frameworks is the
+        # failure the image.env read-back above exists to catch -- and this one
+        # could not be read back at all, since fast-check prints its seed only
+        # on a FAILING run.
+        #
+        # SCOPED TO THE P2P-BEFORE RUN'S `files_run`, which is the whole design
+        # decision. `tests.paths` would scan something other than what this
+        # gate certifies: with `tests.p2p: []` the sweep above is rootdir-wide,
+        # and measured on yaml-474 it loads 25 suites and 3,497 tests while
+        # `tests.paths` is one file. A rootdir `rg` would scan the right
+        # question and produce a refusal NO AUTHOR ACTION CLEARS -- excluding
+        # the file from the sweep leaves it on disk. `files_run` is the scope
+        # where the remedy and the fix are the same action: exclude the file
+        # from the sweep, it leaves `files_run`, the refusal clears, and the
+        # certified verdict stops depending on a draw.
+        #
+        # `None` for pytest (`Outcome.files_run`'s contract), so this stays
+        # node-only with no framework branch here. `None` also on a node run
+        # that wrote no report -- KIND_ENVIRONMENT -- and that case adds no
+        # problem of its own, because the missing report is already a NO-GO
+        # said better one branch below.
+        #
+        # `_present` even though the runner just loaded these files: `_relpath`
+        # never raises, so a mangled or absolute report `name` would make rg
+        # exit 2, which must read as "could not answer" and not as "no match".
+        #
+        # TWO probes, for the pytest block's reason: the first asks whether the
+        # sweep ran a property suite, the second whether it is pinned, and only
+        # the second answering no after the first answering yes is refused.
+        scan = adapter.property_scan()
+        swept = p2p_before_outcome.files_run
+        if scan is not None and swept:
+            scan_files = _present(container, swept)
+            evidence["property_scan_files"] = scan_files
+            if scan_files:
+                imported = _rg_probe(
+                    container, scan.import_pattern, scan_files, problems,
+                    "property-framework-import scan (rg over the p2p-before "
+                    "run's files_run)",
+                    "silently reading it as 'no property framework' would "
+                    "disarm the one check that catches an unpinned "
+                    "property-based suite.",
+                )
+                evidence["property_framework_imported_by_suite"] = imported
+
+                pinned: bool | None = None
+                if imported:
+                    # Only asked when the first probe said yes, so `None` here
+                    # is "not asked" and is read beside `imported` above. `-U`,
+                    # because a real `configureGlobal({\n seed: 1234,\n})`
+                    # spans lines and rg is line-based without it.
+                    pinned = _rg_probe(
+                        container, scan.pin_pattern, scan_files, problems,
+                        "property-seed-pin scan (rg over the p2p-before run's "
+                        "files_run)",
+                        "silently reading it as 'no seed pin' would refuse a "
+                        "task whose suite is already deterministic.",
+                        multiline=True,
+                    )
+                evidence["property_framework_seed_pinned"] = pinned
+
+                if imported and not pinned:
+                    problems.append(
+                        "the p2p-before sweep ran a file importing a "
+                        "JavaScript property-based framework ("
+                        + ", ".join(scan.frameworks)
+                        + ") and nothing it ran pins a seed. Measured "
+                        "2026-09-02 against fast-check 3.23.2 and 2.25.0, the "
+                        "seed defaults to `Date.now() ^ (Math.random() * "
+                        "0x100000000)` and ten fresh runs of one property over "
+                        "unchanged code gave `0 0 0 1 1 0 0 0 0 0` -- so the "
+                        "p2p verdict this gate publishes, and the grader's "
+                        "checks 5 and 6 after it, are a draw. THERE IS NO "
+                        "image.env LEVER TO ADD: fast-check reads no "
+                        "environment variable at all, and the one external "
+                        "lever that works for vitest (NODE_OPTIONS preloading "
+                        "a module that calls fc.configureGlobal) is defeated "
+                        "by jest's module registry. TWO remedies, and the "
+                        "first is the one that actually changes the verdict: "
+                        "(1) take the file out of the SWEEP by adding the "
+                        "framework's ignore flag to tests.runner -- and "
+                        "re-emit the entries it replaces, because a CLI "
+                        "--testPathIgnorePatterns REPLACES both the config's "
+                        "list and jest's built-in /node_modules/ rule "
+                        "(measured: the naive one-flag form killed yaml-474's "
+                        "sweep outright, no report written); (2) pick a repo "
+                        "whose own suite calls `fc.configureGlobal({seed: "
+                        "...})` in a file the sweep runs. Read "
+                        "taskset/HARVESTING.md's 'Screening a JavaScript or "
+                        "TypeScript repository' first -- a pinned seed makes "
+                        "this oracle reproducible, not correct."
+                    )
 
         if red_outcome.kind == KIND_PASSED:
             problems.append(

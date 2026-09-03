@@ -110,12 +110,30 @@ Runs inside the pinned image, before the proxy starts.
   (`image.env: {CI: "1", HYPOTHESIS_STORAGE_DIRECTORY:
   "/tmp/bakeoff-hypothesis"}`) makes the suite reproducible, not correct — see
   the property-based-suite bullet under Layer 2.
+- **A node p2p-BEFORE sweep that ran a file importing `fast-check`,
+  `@fast-check/*`, `jest-fuzz` or `jsverify` is a NO-GO unless something the
+  sweep ran pins a seed with `configureGlobal(... seed: ...)`.** The scope is
+  the p2p-before run's `Outcome.files_run`, **not** `tests.paths` — with
+  `tests.p2p: []` the sweep is rootdir-wide (measured on
+  `yaml-474-single-newline-empty-value`: 25 suites, 3,497 tests, against a
+  one-file `tests.paths`), so scanning the declared paths would answer a
+  question about a file the certified verdict barely depends on. There is
+  **no** `image.env` remedy here, unlike hypothesis's `CI=1`: measured
+  2026-09-02, fast-check reads no environment variable at all in either 3.23.2
+  or 2.25.0. The remedies are excluding the file from the sweep (see "Screening
+  a JavaScript or TypeScript repository" below for the exact form) or picking a
+  different repo.
 - **An `rg` exit code that is neither 0 (match) nor 1 (no match) is a NO-GO
   naming the argv and the exit code, never a silent "not imported".** rg is
   asserted present earlier in this list, so an unreadable path or a bad
   pattern is an environment problem preflight can see and must not read as a
   quiet `False` — that would disarm the one check that catches an undeclared
-  property-based suite.
+  property-based suite. THREE probes share this trichotomy now — the
+  hypothesis-import scan, the node property-import scan and the node
+  seed-pin scan — and they are not interchangeable in what a misreading costs:
+  misreading either import probe DISARMS a check, while misreading the
+  seed-pin probe REFUSES a task that was already fine. That asymmetry is why
+  each probe supplies its own closing sentence rather than sharing one.
 - f2p is **red** at the start state, in one of two ways, and never `0` (already
   solved). Either it exits **1** with every declared f2p id in pytest's
   FAILED/ERROR lines, or it exits **4** (or **2**) because the modules holding
@@ -261,6 +279,12 @@ that passes Layer 1 and measures the wrong thing.
   are satisfied that *any* correct fix passes it and *no* wrong one does,
   which is the same judgment call as the "tests assert behaviour, not internal
   names" bullet above and is harder here, not easier.
+
+  **This whole rule is hypothesis's.** Node has no `image.env` lever for the
+  same problem -- fast-check reads no environment variable at all, measured
+  2026-09-02 against 3.23.2 and 2.25.0 -- so the node equivalent is a Layer 1
+  REFUSAL rather than a Layer 2 acceptance rule: see "A node p2p-BEFORE sweep
+  that ran a file importing `fast-check`..." under Preflight above.
 - **A suite that pins `TZ` is allowed, and it is a §6.4 confound to record.**
   `image.env: {TZ: "America/New_York"}` (or any IANA name / `UTC` /
   `Etc/GMT+N`) is the fix for a suite whose assertions are written against a
@@ -432,10 +456,103 @@ rules, not instead of them.
   not a path: `tests/` matches `jtests/` too (measured). Preflight refuses a
   scoped run that leaves the declared paths, and the remedy is a narrower
   prefix.
-- **The suite must be deterministic, and nothing checks it here.** Preflight's
-  hypothesis probe is a Python-ecosystem check and answers nothing for
-  `fast-check` or `jest-fuzz`. If the suite is property-based, pin its seed in
-  the repo's own config and say so under `provenance`.
+- **A property-based suite (fast-check, `@fast-check/*`, jest-fuzz, jsverify)
+  gates on whichever draw preflight happened to get, unless the repo's own
+  config pins a seed.** Measured 2026-09-02 against fast-check 3.23.2 and
+  2.25.0: `readSeed` falls back to
+  `Date.now() ^ (Math.random() * 0x100000000)` when nothing configures one, and
+  ten fresh runs of one property over unchanged code gave:
+
+  | what | ten fresh runs of unchanged code (exit codes) |
+  |---|---|
+  | vitest 3.2.7 + fast-check 3.23.2, no lever | `0 0 0 1 1 0 0 0 0 0` |
+  | vitest 3.2.7 + fast-check 2.25.0, no lever | `1 1 0 0 1 0 0 0 0 1` |
+  | jest 30.5.0 + fast-check 3.23.2, no lever | `0 1 1 0 1 0 0 0 1 0` |
+
+  **There is no environment lever, and the one external lever that works
+  covers only one of the two frameworks.** fast-check reads no environment
+  variable anywhere (`grep -rl process.env` over the installed package exits
+  1 in both majors), and neither framework's CLI plumbs a seed flag into
+  fast-check's own `Parameters.seed`. `NODE_OPTIONS` preloading a module that
+  calls `fc.configureGlobal({seed})` is stable 10/10 on vitest, both
+  polarities, but is **defeated by jest's module registry** — jest hands the
+  test its own instance of `fast-check`, so the preload configures a
+  different one (`fc.readConfigureGlobal()` reads `{}` from inside the test,
+  `--runInBand` included). Adding `NODE_OPTIONS` to the image.env allowlist
+  would not fix this: it is a lever that silently does nothing on one of two
+  peer frameworks, and it would also reach the agent's own `claude` process.
+
+  **Preflight's check is scoped to the p2p-BEFORE run's `Outcome.files_run`,
+  not `tests.paths`.** With `tests.p2p: []` the p2p-before sweep is
+  rootdir-wide, so a task's certified verdict can depend on a property file
+  `tests.paths` never names — measured on `yaml-474-single-newline-empty-value`,
+  the sweep loads 25 suites and 3,497 tests against a one-file `tests.paths`.
+
+  **The remedy is excluding the property file from the sweep, and it is NOT
+  one CLI flag.** A lone `--testPathIgnorePatterns=<file>` **REPLACES** the
+  repository's own `testPathIgnorePatterns` list *and* jest's built-in
+  `/node_modules/` rule. Measured 2026-09-02 against
+  `yaml-474-single-newline-empty-value`'s own runner (`jest --config
+  config/jest.config.js`, whose config declares
+  `testPathIgnorePatterns: ['tests/_utils', 'tests/json-test-suite/']`): the
+  naive one-flag form un-ignores the vendored JSON-test-suite fixtures, jest
+  collects a plain script that calls `process.exit(1)` from inside a `catch`
+  (`tests/json-test-suite/parsers/test_json.js:10` — under jest
+  `process.argv[2]` is undefined, so `readFileSync` throws), and the runner
+  writes **no report at all**. Write out every entry the flag would otherwise
+  drop, alongside the new one:
+
+  ```yaml
+    runner:
+      - "/node_modules/.bin/jest"
+      - "--config"
+      - "config/jest.config.js"
+      - "--testPathIgnorePatterns=/node_modules/"
+      - "--testPathIgnorePatterns=tests/_utils"
+      - "--testPathIgnorePatterns=tests/json-test-suite/"
+      - "--testPathIgnorePatterns=tests/properties\\.ts"
+  ```
+
+  Measured cost of the working remedy on this task: 1 test of 3,497 **for the
+  p2p-before sweep itself** — that specific check is what this remedy is
+  named for, and it clears the property-scan refusal exactly as claimed:
+  `property_framework_imported_by_suite` goes to `false`, `tests/properties.ts`
+  drops out of `property_scan_files`.
+
+  **But re-measured end-to-end against the full preflight gate (round-2 item
+  12, 2026-09-03), this exact `tests.runner` also breaks OTHER checks that
+  append their own positional after it.** With these four flags declared as
+  part of `tests.runner`, the f2p SELECT check gets `-t` matching nothing
+  (exit 0, "did not RUN") and the SCOPED p2p check runs 23 files outside
+  `tests.paths` — jest's `--testPathIgnorePatterns` is documented above as a
+  greedy yargs array that swallows a bare token immediately following it, and
+  `_Runner.run` builds every check's argv as `tests.runner + <the adapter's
+  own suffix>`, so a manifest-declared ignore flag at the tail of
+  `tests.runner` sits directly in front of whatever THAT check appends. The
+  p2p-before sweep's own suffix is unaffected (confirmed: `property_scan_files`
+  still comes back with the expected 24 entries) — only the checks whose
+  suffix opens with a bare file positional break. So this exact remedy, as
+  written above, does **not** clear the whole gate to GO on
+  `yaml-474-single-newline-empty-value`; it clears only the property-scan
+  problem, and introduces new ones. Filed in `TASKS.md`; not fixed here, and
+  the code under test (the property scan itself) is unaffected — its own
+  evidence is correct on this exact run.
+
+  vitest's analogue is `--exclude`, and it is **unmeasured** — no vitest
+  property task has been cut yet — so a harvester cutting the first one must
+  measure it against a real task before relying on the parallel; vitest's own
+  docs say `--exclude` replaces its defaults too.
+
+  **Two known false refusals, both loud, both cleared by the exclusion
+  remedy.** A suite-wide `fc.configureGlobal({seed})` living in a framework
+  setup file (vitest `setupFiles`, jest `setupFilesAfterEnv`) is invisible to
+  this check — it appears in neither `files_run` nor `tests.paths` — so the
+  best-behaved repository this check can meet is falsely refused; adding the
+  setup file to `tests.paths` is NOT the fix (measured: jest then fails it,
+  "Your test suite must contain at least one test", `2 failed, 2 total` where
+  only one failure is real). And a quoted `'fast-check'` inside a comment or a
+  string literal trips the import probe even though nothing is actually
+  imported.
 
 The `npm install` vs `npm ci` rule and the duplicate-full-name exclusion above
 are both screening decisions a harvester makes before writing a manifest, not
@@ -589,7 +706,11 @@ host-side simulation scoped to `tests/doc/` never exercised. A task author
 narrowing `tests.paths` to dodge a submodule still has to make the **entire**
 suite's dependencies installable,
 not just the scoped file's — narrowing `tests.p2p` itself (leaf ids only, per
-the rule above) is the only lever that actually shrinks what gets swept.
+the rule above) is the only lever that actually shrinks what gets swept. The
+node property scan (round 2 item 12) is scoped to that same p2p-before sweep's
+`Outcome.files_run` for exactly this reason, so it is the one gate that
+narrowing `tests.paths` does not silence — that `tests/properties.ts` sighting
+above is the file the property scan refuses this task over.
 
 Three ways a task image fails at build time, silently, all found by screening
 rather than by reasoning:

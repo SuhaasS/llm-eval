@@ -1833,6 +1833,18 @@ MUTATIONS = [
         "not integration",
     ),
     (
+        # The node half of the same defect. Reverting the refusal leaves every
+        # piece of EVIDENCE in place -- imported: true, pinned: false -- and
+        # flips the verdict from NO-GO to PASS with nothing else visible, which
+        # is exactly how a property suite gets certified on a lucky draw.
+        "preflight: record the unpinned node property suite and stop refusing it",
+        "src/bakeoff/preflight.py",
+        "                if imported and not pinned:\n                    problems.append(",
+        "                if False:\n                    problems.append(",
+        "tests/test_preflight.py -k fast_check_with_no_seed_pin",
+        "not integration",
+    ),
+    (
         # Fix 2's whole point: bidict-389's GATED runner passes by bypassing
         # its own pyproject.toml addopts (--override-ini=addopts=) while the
         # bare command an agent types exits 4 from turn one. Reverting this

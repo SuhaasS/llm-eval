@@ -1284,17 +1284,6 @@ judge runs after one — which is why they sit here rather than above.
   identical green) on 3.11, 3.12 and 3.13; see
   `~/.cache/bakeoff-probe/reports/r2-19-rescreen.md` and `HARVESTING.md`.
 
-- [ ] **No property-based determinism check exists for the node frameworks.**
-  Broadening 3 refuses a pytest task whose declared tests import `hypothesis`
-  with no `image.env: {CI: ...}` declared beside it, closing a gate a lucky
-  draw could otherwise pass through. Nothing equivalent exists for `fast-check`
-  or `jest-fuzz`: `node_adapter.py`'s `hypothesis_interpreter` returns `None`
-  for both node frameworks, and the docstring beside it — and
-  `test_runners.py`'s beside that — both cite this file as where the follow-up
-  is tracked. A node task with a seeded-by-clock property suite gates on
-  whichever draw preflight happens to run, exactly as a pytest one did before
-  broadening 3 closed it there.
-
 - [x] **Two node ids with the same `fullName` in the SAME file are unguarded,
   and it is a different gap from the cross-file one — whose refusal round 2
   item 1 REMOVED rather than kept.** Closed 2026-09-03 (round 2 item 11).
@@ -1320,6 +1309,60 @@ judge runs after one — which is why they sit here rather than above.
   `GradeRecord`, and nothing joins them); see the P2 bullet below.
   `PREFLIGHT_VERSION` 19. `GRADER_VERSION` and `ORACLE_VERSION` do not move —
   no argv changes, gated-equals-graded is unaffected.
+
+- [ ] **The node property-scan's escape hatch cannot see a seed pin that
+  lives in a framework setup file.** Round 2 item 12 scopes the scan to the
+  p2p-before run's `Outcome.files_run`, and a suite-wide
+  `fc.configureGlobal({seed})` idiomatically lives in vitest's `setupFiles`
+  or jest's `setupFilesAfterEnv` — neither of which appears in `files_run` or
+  in `tests.paths`. So the best-behaved repository this check can meet — one
+  that already pins its seed, in the framework's own recommended place — is
+  falsely refused. The obvious remedy was measured and does NOT work: adding
+  the setup file to `tests.paths` makes it a positional the framework
+  collects as its own suite, and jest fails it (`Your test suite must
+  contain at least one test`, measured `2 failed, 2 total` where only one
+  failure is real). The exclusion remedy (take the property file itself out
+  of the sweep) still clears the refusal, so this is a false refusal and not
+  a dead end — but it costs an author a file they cannot narrow. Candidate
+  fix, deliberately not built here: a manifest key nominating extra files for
+  the pin scan to read regardless of what the sweep loaded.
+
+- [ ] **The property-scan's own worked remedy (round 2 item 12, §1.6/§6.5)
+  clears the property-scan refusal and breaks two OTHER preflight checks on
+  the same task.** Re-measured 2026-09-03 end-to-end (the plan's own §1.6
+  measured only the isolated p2p-before sweep invocation, not the full
+  gate): declaring `tests.runner` as `["/node_modules/.bin/jest", "--config",
+  "config/jest.config.js", "--testPathIgnorePatterns=/node_modules/",
+  "--testPathIgnorePatterns=tests/_utils",
+  "--testPathIgnorePatterns=tests/json-test-suite/",
+  "--testPathIgnorePatterns=tests/properties\\.ts"]` on
+  `yaml-474-single-newline-empty-value` does clear the property-scan problem
+  exactly as the plan claims (`property_framework_imported_by_suite: false`,
+  `tests/properties.ts` absent from `property_scan_files`, confirmed via
+  `run_matrix.py --preflight-only --force-preflight`) — but the gate still
+  NO-GOes, on two NEW reasons: the f2p SELECT check reports "these declared
+  f2p tests did not RUN at the start state" (exit 0, "Test Suites: 23
+  skipped, 0 of 23 total"), and the SCOPED p2p check reports 23 files outside
+  `tests.paths`. `_Runner.run` builds every check's argv as `tests.runner +
+  <that check's own suffix>`, and jest's `--testPathIgnorePatterns` is a
+  documented greedy yargs array that swallows a bare token immediately
+  following it (HARVESTING.md's rg-exit bullet and the runner comment in
+  `node_adapter.p2p_argvs` both already name this for the adapter's OWN
+  internally-built groups, which order scope before flags for exactly this
+  reason) — a manifest-declared ignore flag at the tail of `tests.runner` has
+  no such protection, and select_argvs'/the scoped run's suffix both open
+  with a bare file positional. The p2p-before sweep's own suffix is
+  unaffected by the same tests.runner (confirmed: `property_scan_files` comes
+  back with the expected 24 entries), so this is not a uniform "any trailing
+  array flag breaks everything" defect — only checks whose suffix opens with
+  a bare positional are hit, and the exact boundary was not fully
+  characterized before filing this. `HARVESTING.md`'s remedy section carries
+  a caveat pointing here. Candidate fix: change `node_adapter.select_argvs`
+  and the scoped-run call site to put a `--` separator or reorder so a
+  manifest-declared trailing flag cannot swallow the adapter's own suffix --
+  unmeasured whether `--` preserves `-t`'s meaning (a quick check during this
+  filing showed `--` also disables `-t` as a flag, turning it into another
+  OR'd testPathPattern, so the fix is not that one line either).
 
 - [ ] **A node check is several commands and the record does not say how
   many.** Since round 2 item 1 a node p2p deselect run is 1 + K invocations
@@ -1477,6 +1520,16 @@ judge runs after one — which is why they sit here rather than above.
 ---
 
 ## P3 — Decisions to settle before numbers are published
+
+- **`rg` inherits `.gitignore`/`.ignore` and skips hidden files, in all
+  three preflight probes.** The hypothesis-import scan, the node
+  property-import scan and the node seed-pin scan (round 2 item 12) all run
+  plain `rg -q` with no `--no-ignore`, so a gitignored test file is not
+  scanned — the SILENT direction for an import probe (a suite that imports a
+  property framework from a gitignored file reads as "no property
+  framework"). Pre-existing on the hypothesis probe and not a regression
+  introduced by item 12; a fix would have to move both probe families
+  together, deliberately, since `_rg_probe` is now shared by all three.
 
 - **Grade summary can double-count across grader versions.** `grade.py`'s
   end-of-batch summary audits the last line per `(run_id, grader_version)`,

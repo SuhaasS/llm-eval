@@ -11,6 +11,7 @@ This file pins the adapter contract. `test_preflight.py`, `test_oracle.py` and
 """
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -1375,11 +1376,141 @@ def test_node_module_of_is_the_file_half_of_an_id_whose_name_carries_colons():
 
 def test_the_node_adapters_ask_for_no_hypothesis_probe():
     """A recorded absence, never a claim that the suite is deterministic. The
-    hypothesis block is a Python-ecosystem check; fast-check and jest-fuzz have
-    their own seed mechanisms and no such check exists yet (TASKS.md)."""
+    hypothesis block is a Python-ecosystem check; the node determinism question
+    is answered by `property_scan` instead, over the p2p-before sweep's
+    `files_run` rather than over `tests.paths`, and as a refusal rather than a
+    probe-plus-remedy -- fast-check reads no environment variable, so there is
+    no node analogue of CI=1 to declare."""
     for framework in ("vitest", "jest"):
         assert for_framework(framework).hypothesis_interpreter(
             ("/node_modules/.bin/vitest", "run")) is None
+
+
+def test_pytest_asks_for_no_property_scan():
+    """Not because pytest has no property-based suites -- `hypothesis_interpreter`
+    answers it with a lever preflight can read back out of the container
+    (`image.env: {CI: "1"}`, verified against the running container), and
+    because `Outcome.files_run` is `None` for pytest, so there would be no
+    scope to scan even if this returned one."""
+    assert for_framework("pytest").property_scan() is None
+
+
+def test_the_node_adapters_ask_for_a_property_scan():
+    """One fact, one place: vitest and jest disagree about nothing here, so
+    both adapters answer with the SAME object rather than two copies of it."""
+    vitest_scan = for_framework("vitest").property_scan()
+    jest_scan = for_framework("jest").property_scan()
+
+    assert vitest_scan is not None
+    assert vitest_scan is jest_scan
+    assert "fast-check" in vitest_scan.frameworks
+    assert "jest-fuzz" in vitest_scan.frameworks
+    assert "jsverify" in vitest_scan.frameworks
+
+
+#: The nineteen fixture strings measured 2026-09-02 against ripgrep 13.0.0 in
+#: bakeoff-eval-agent:base-node-22 (plan §1.5). Python's `re` is not ripgrep's
+#: Rust engine, so this pins the pattern's INTENT offline; the authority for
+#: the pattern is the container measurement, and a change to either pattern
+#: must be re-measured there rather than only here.
+_PROPERTY_FIXTURES = {
+    "a_esm_ns": "import * as fc from 'fast-check'\n",
+    "b_esm_default": 'import fc from "fast-check";\n',
+    "c_named_integration": "import { test, fc } from '@fast-check/vitest';\n",
+    "d_cjs": "const fc = require('fast-check');\n",
+    "e_dynamic": "const fc = await import('fast-check');\n",
+    "f_jestfuzz": "const Fuzz = require('jest-fuzz');\n",
+    "g_jsverify": "import jsc from 'jsverify';\n",
+    "h_none": "import { parse } from 'yaml';\n",
+    "i_pin_oneline": "fc.configureGlobal({ seed: 42, numRuns: 100 });\n",
+    "j_pin_multiline": "configureGlobal({\n  numRuns: 100,\n  seed: 1234,\n});\n",
+    "k_perassert": (
+        "fc.assert(fc.property(fc.nat(), (n) => n >= 0), { seed: 7 });\n"
+    ),
+    "l_decoy_configureGlobal_noseed": (
+        "configureGlobal({ numRuns: 500 })\nconst seed = 3;\n"
+    ),
+    "m_decoy_noseed_plus_perassert": (
+        "configureGlobal({ numRuns: 500 })\n"
+        "fc.assert(fc.property(fc.nat(), (n) => n >= 0), { seed: 7 });\n"
+    ),
+    "n_pin_with_paren_in_call": (
+        "configureGlobal({ randomType: prand.xorshift128plus(), seed: 42 })\n"
+    ),
+    "o_comment_mention": (
+        "// we used to use 'fast-check' here but removed it\n"
+        "import { parse } from 'yaml';\n"
+    ),
+    "p_setupfile_pin_elsewhere": (
+        "import fc from 'fast-check';\n"
+        "fc.assert(fc.property(fc.nat(), (n) => n >= 0));\n"
+    ),
+    "q_pin_nested_object": (
+        "configureGlobal({ examples: [{ a: 1 }], seed: 42 })\n"
+    ),
+    "r_pin_paren_and_nested": (
+        "configureGlobal({ randomType: prand.xorshift128plus(), "
+        "examples: [{ a: 1 }], seed: 42 })\n"
+    ),
+    "s_decoy_close_brace_split": (
+        "configureGlobal({\n  numRuns: 500\n}\n);\n"
+        "fc.assert(fc.property(fc.nat(), (n) => n >= 0), { seed: 7 });\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("name", [
+    "a_esm_ns", "b_esm_default", "c_named_integration", "d_cjs", "e_dynamic",
+    "f_jestfuzz", "g_jsverify",
+    # The over-match is deliberate and pinned, not tolerated silently --
+    # `'fast-check'` inside a comment or string literal is still a quoted
+    # module specifier and the pattern cannot tell it from a real import.
+    "o_comment_mention",
+])
+def test_the_import_pattern_matches_the_measured_spellings(name):
+    scan = for_framework("vitest").property_scan()
+    assert re.search(scan.import_pattern, _PROPERTY_FIXTURES[name])
+
+
+def test_the_import_pattern_does_not_match_a_file_with_no_property_import():
+    scan = for_framework("vitest").property_scan()
+    assert not re.search(scan.import_pattern, _PROPERTY_FIXTURES["h_none"])
+
+
+@pytest.mark.parametrize("name", [
+    "i_pin_oneline", "j_pin_multiline", "n_pin_with_paren_in_call",
+])
+def test_the_pin_pattern_matches_a_real_suite_wide_seed_pin(name):
+    scan = for_framework("vitest").property_scan()
+    assert re.search(scan.pin_pattern, _PROPERTY_FIXTURES[name])
+
+
+@pytest.mark.parametrize("name", [
+    "k_perassert", "l_decoy_configureGlobal_noseed",
+    "m_decoy_noseed_plus_perassert", "p_setupfile_pin_elsewhere",
+    "s_decoy_close_brace_split",
+])
+def test_the_pin_pattern_does_not_match_a_per_assert_seed_or_a_decoy(name):
+    scan = for_framework("vitest").property_scan()
+    assert not re.search(scan.pin_pattern, _PROPERTY_FIXTURES[name])
+
+
+@pytest.mark.parametrize("name", [
+    "q_pin_nested_object",  # accepted false refusal (§1.5)
+    "r_pin_paren_and_nested",  # accepted false refusal (§1.5)
+])
+def test_a_pin_whose_options_nest_an_object_literal_is_an_accepted_false_refusal(
+    name,
+):
+    """`[^{}]*?` cannot cross a `{`, so a real pin whose options object
+    contains a nested OBJECT literal is missed -- a false refusal, the loud
+    direction, cleared by the exclusion remedy. Pinned here rather than left
+    to be silently traded away: the one measured bound that catches both
+    (`(?:[^}]|\\}[^)])*?`) produces a FALSE ACCEPT on
+    `s_decoy_close_brace_split`, which is the defect this whole item exists
+    to close."""
+    scan = for_framework("vitest").property_scan()
+    assert not re.search(scan.pin_pattern, _PROPERTY_FIXTURES[name])
 
 
 def test_node_explain_never_claims_an_exit_code_means_anything():

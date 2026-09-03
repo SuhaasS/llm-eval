@@ -421,6 +421,16 @@ class PytestAdapter:
     def hypothesis_interpreter(self, runner):
         return _runner_python(tuple(runner))
 
+    def property_scan(self):
+        # `None`, and NOT because pytest has no property-based suites -- it is
+        # the ecosystem this whole check was built for. `hypothesis_interpreter`
+        # above already answers it, with a stronger instrument: its remedy is
+        # `image.env: {CI: "1"}`, which preflight reads back OUT of the
+        # container (`image_env_observed`). The node scan has no lever to read
+        # back, so the two are different checks and folding them would weaken
+        # the one that works.
+        return None
+
     def explain(self, code):
         return _EXIT_MEANING.get(code, f"exit code {code}")
 

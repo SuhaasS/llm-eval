@@ -93,6 +93,26 @@ class Outcome:
     explain: str = ""
 
 
+@dataclass(frozen=True)
+class PropertyScan:
+    """How to recognise a property-based suite, and a pinned seed in it.
+
+    Consumed by preflight's node determinism check (round-2 item 12). A match
+    on `import_pattern` proves a scanned file imports a property-based
+    framework; a match on `pin_pattern` proves a scanned file calls
+    `configureGlobal` with a `seed`. Neither proves the pin EXECUTES, runs
+    before every property, or is not overridden by a `describe`-local
+    `fc.assert` -- unlike pytest's `image.env: {CI: "1"}` lever, which
+    preflight reads back OUT of the container, a `configureGlobal` match is
+    only a grep over source. It is a signal the repository has thought about
+    the problem, and no more than that.
+    """
+
+    import_pattern: str
+    pin_pattern: str
+    frameworks: tuple[str, ...]
+
+
 @runtime_checkable
 class RunnerAdapter(Protocol):
     """The seam. One implementation per `tests.framework`.
@@ -261,6 +281,23 @@ class RunnerAdapter(Protocol):
         non-Python adapter makes preflight skip it and leave both evidence keys
         `None` -- a recorded absence, never a claim that the suite is
         deterministic.
+        """
+
+    def property_scan(self) -> PropertyScan | None:
+        """How to recognise a property-based suite in this ecosystem.
+
+        Consumed by preflight over the p2p-BEFORE run's `Outcome.files_run`
+        -- what the certified sweep actually loaded -- rather than over
+        `tests.paths`, which with an empty `tests.p2p` is a small subset of it.
+
+        `None` from an adapter whose determinism question is answered
+        elsewhere -- pytest's is `hypothesis_interpreter` above, whose remedy
+        (`image.env: {CI: "1"}`) is a lever this one has no analogue for. It
+        would also have no scope: `files_run` is `None` for pytest.
+        Measured 2026-09-02 against fast-check 3.23.2 and 2.25.0: the package
+        reads no environment variable at all and `readSeed` falls back to
+        `Date.now() ^ (Math.random() * 0x100000000)`, so there is nothing to
+        declare and the node check is a refusal rather than a lever.
         """
 
     def explain(self, code: int) -> str:

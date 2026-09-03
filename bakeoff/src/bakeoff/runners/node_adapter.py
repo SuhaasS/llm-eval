@@ -95,6 +95,7 @@ from bakeoff.runners import (
     KIND_NOTHING_RAN,
     KIND_PASSED,
     Outcome,
+    PropertyScan,
 )
 
 #: Where `RunContainer` binds the run tree, and therefore the prefix the
@@ -193,6 +194,55 @@ def verify_selected(report: dict | None, requested: tuple[str, ...],
     # exist to be right about it.
     seen = {f"{path}::{name}" for path, name in adapter.executed_names(report)}
     return frozenset(node_id for node_id in requested if node_id not in seen)
+
+
+#: The npm specifiers that mean "this file drives a property-based suite".
+#: Matched as a QUOTED MODULE SPECIFIER rather than anchored to an import
+#: statement the way pytest's `^\s*(from|import)\s+hypothesis\b` is: JavaScript
+#: has four spellings that all reach the same package -- `import fc from`,
+#: `import * as fc from`, `import { fc } from`, `const fc = require(...)` and
+#: `await import(...)` -- and `require` is an expression that can appear
+#: anywhere on a line, so an anchored pattern would miss the two commonest
+#: forms. The quoted specifier is the one shape all of them share.
+#:
+#: Measured 2026-09-02 against ripgrep 13.0.0 in bakeoff-eval-agent:base-node-22
+#: over twelve fixtures: all seven import spellings match, a file importing
+#: only `yaml` does not. `@fast-check/<pkg>` covers the official vitest and
+#: jest integrations, which re-export fast-check and share its seed.
+_PROPERTY_IMPORT_PATTERN = (
+    r"""['"](@fast-check/[A-Za-z0-9._-]+|fast-check|jest-fuzz|jsverify)['"]"""
+)
+
+#: A SUITE-WIDE seed pin. `[^{}]*?` rather than `.*?`: a negated class matches
+#: newlines, so this spans a multi-line `configureGlobal({\n seed: 1234,\n})`
+#: under `rg -U` while the brace bound keeps it inside the one options object --
+#: a `.*?` would happily pair a `configureGlobal(` here with a `seed:` two
+#: hundred lines away.
+#:
+#: BRACES, NOT PARENTHESES, and it was measured both ways. `[^)]*?` misses a
+#: genuine pin whose options carry a nested CALL --
+#: `configureGlobal({ randomType: prand.xorshift128plus(), seed: 42 })`, a
+#: supported fast-check shape -- and refusing a task whose suite is already
+#: deterministic is the cost. `[^{}]` matches that one and still refuses the
+#: case the bound exists for: an unseeded `configureGlobal({ numRuns: 500 })`
+#: in the same file as a per-assert `fc.assert(..., { seed: 7 })`, because the
+#: text between them contains a `{`. Measured 2026-09-02 over sixteen fixtures:
+#: 16/16 for `[^{}]`, 15/16 for `[^)]`.
+#:
+#: A per-call seed is deliberately not a pin: seeding one assertion is not a
+#: claim about the file. The residual miss is a pin whose options object
+#: contains a nested OBJECT literal, which the brace bound cannot cross -- a
+#: false refusal, which is the loud direction.
+_PROPERTY_PIN_PATTERN = r"configureGlobal\s*\(\s*\{[^{}]*?\bseed\s*:"
+
+#: Shared by both flavours because they disagree about nothing here: vitest and
+#: jest resolve the same npm packages by the same specifier strings, and a
+#: per-flavour copy would be two places for one fact to drift.
+_NODE_PROPERTY_SCAN = PropertyScan(
+    import_pattern=_PROPERTY_IMPORT_PATTERN,
+    pin_pattern=_PROPERTY_PIN_PATTERN,
+    frameworks=("fast-check", "@fast-check/*", "jest-fuzz", "jsverify"),
+)
 
 
 @dataclass(frozen=True)
@@ -724,11 +774,15 @@ class _NodeFlavour:
     def hypothesis_interpreter(self, runner):
         # `None`, so preflight skips the whole block and leaves both evidence
         # keys `None` -- a recorded ABSENCE, never a claim that the suite is
-        # deterministic. The JavaScript property-based libraries (fast-check,
-        # jest-fuzz) have their own seed mechanisms and no such check exists
-        # yet; that is named follow-up work in TASKS.md, not an assumption
-        # made here.
+        # deterministic. The JavaScript determinism question is answered by
+        # `property_scan` below instead, and it is a REFUSAL rather than a
+        # probe-plus-remedy: measured 2026-09-02, fast-check reads no
+        # environment variable, so there is no node analogue of CI=1 to
+        # declare.
         return None
+
+    def property_scan(self):
+        return _NODE_PROPERTY_SCAN
 
     def explain(self, code):
         # Deliberately says what the number does NOT tell anyone. Every

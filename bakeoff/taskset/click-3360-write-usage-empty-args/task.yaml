@@ -302,6 +302,18 @@ image:
   # `0 0 0 0 1 1 1 1 0 0`, and six under CI=1 gave `1 1 1 1 1 1`. There is no
   # HYPOTHESIS_PROFILE environment variable to use instead.
   #
+  # CI is a hypothesis lever with NO NODE ANALOGUE. Measured 2026-09-02:
+  # fast-check reads no environment variable at all in either 3.23.2 or
+  # 2.25.0, so a node property suite (fast-check, @fast-check/*, jest-fuzz,
+  # jsverify) is refused by preflight's own scan rather than levered by this
+  # key -- see round-2 item 12 and HARVESTING.md's "A node p2p-BEFORE sweep"
+  # bullet. Adding NODE_OPTIONS to the image.env allowlist would not fix it
+  # either: measured, the one lever that would work (a NODE_OPTIONS preload
+  # calling fc.configureGlobal) is defeated by jest's module registry, and it
+  # would also reach the agent's own `claude` process. This manifest is the
+  # documentation for the key, so a reader arriving here must not conclude it
+  # covers node.
+  #
   # HYPOTHESIS_STORAGE_DIRECTORY must be absolute and outside /repo -- refused
   # at load otherwise. Hypothesis's storage root is fixed to the cwd at import
   # time, so without it the `constants/` cache lands in the tree the section

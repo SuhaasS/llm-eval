@@ -914,6 +914,8 @@ class _ScriptedContainer:
                  f2p_before=None, f2p_after=None, p2p_before=None,
                  env=None, hypothesis_importable=False,
                  hypothesis_in_suite=False, rg_exit=None,
+                 property_imported=False, property_pinned=False,
+                 property_import_rg_exit=None, property_pin_rg_exit=None,
                  python="Python 3.12.13",
                  submodule_status="", submodule_status_exit=0,
                  gitlinks=(), gitmodules_declared=None, gitmodules_exit=None,
@@ -951,6 +953,18 @@ class _ScriptedContainer:
         #: above cannot express the third answer -- "the probe could not
         #: answer" -- which is the one a quiet False would swallow.
         self.rg_exit = rg_exit
+        #: The node property-scan probes (round-2 item 12): whether a swept
+        #: file imports a property-based framework, and whether one pins a
+        #: seed. Told apart from `hypothesis_in_suite`/`rg_exit` above by the
+        #: PATTERN the `rg` invocation carries, since three probes share the
+        #: same `exec` branch now.
+        self.property_imported = property_imported
+        self.property_pinned = property_pinned
+        #: The same "could not answer" overrides `rg_exit` gives the
+        #: hypothesis probe, one per property probe since a single shared
+        #: `rg_exit` cannot express "only the pin scan failed to answer".
+        self.property_import_rg_exit = property_import_rg_exit
+        self.property_pin_rg_exit = property_pin_rg_exit
         #: What `python --version` answers, verbatim; `None` for an image with
         #: no interpreter on PATH at all.
         self.python = python
@@ -1154,6 +1168,19 @@ class _ScriptedContainer:
             # scripts a venv runner must still be answered here.
             return _Exec(exit_code=0 if self.hypothesis_importable else 1)
         if cmd[:1] == ["rg"]:
+            # Three probes run rg now, told apart by their PATTERN rather than
+            # by position -- the hypothesis one, the property-import one and
+            # the seed-pin one. `-U` is on the pin probe's argv only, which is
+            # what a test asserting "the pin scan was never asked" reads.
+            pattern = " ".join(cmd)
+            if "configureGlobal" in pattern:
+                if self.property_pin_rg_exit is not None:
+                    return _Exec(exit_code=self.property_pin_rg_exit)
+                return _Exec(exit_code=0 if self.property_pinned else 1)
+            if "fast-check" in pattern:
+                if self.property_import_rg_exit is not None:
+                    return _Exec(exit_code=self.property_import_rg_exit)
+                return _Exec(exit_code=0 if self.property_imported else 1)
             # rg's three exit codes are the point (0 match, 1 no match,
             # anything else could-not-answer), so `rg_exit` overrides the
             # boolean when a test is about the third one.
@@ -2528,10 +2555,33 @@ def test_the_preflight_version_moved_with_the_new_assertion():
     `pytest_adapter.duplicate_ids` is `{}` as a claim its node ids back. The
     new evidence key `same_file_duplicate_ids` is `{}` on every verdict this
     version writes for a task at least one of whose node runs reported, and
-    `None` where nothing counted."""
+    `None` where nothing counted.
+
+    19 -> 20 is a property-based determinism check for the node frameworks
+    (round 2 item 12, 2026-09-03). Measured 2026-09-02 against fast-check
+    3.23.2 and 2.25.0, the seed defaults to
+    `Date.now() ^ (Math.random() * 0x100000000)` when nothing configures one,
+    the package reads no environment variable anywhere, and ten fresh vitest
+    runs of one property over unchanged code gave `0 0 0 1 1 0 0 0 0 0` -- so
+    a node task whose p2p-before sweep runs an unpinned fast-check/jest-fuzz/
+    jsverify suite was certified on whichever draw the gate happened to get.
+    Since 20 the gate scans the p2p-before run's `Outcome.files_run` and
+    refuses a task where a swept file imports one of those frameworks and
+    nothing swept pins a seed with `configureGlobal(... seed: ...)`. There is
+    no `image.env` lever for this one, unlike hypothesis's `CI=1`: the one
+    external seed lever that works, `NODE_OPTIONS` preloading a module that
+    calls `fc.configureGlobal`, is defeated by jest's module registry. A
+    cached PASS under 19 on a NODE task whose sweep runs a property-based
+    suite is stale: it was taken by a gate that could not see the shape. A
+    cached NO-GO is unaffected -- nothing this version adds turns a NO-GO
+    into a GO -- and no PYTEST verdict moves at all, since
+    `PytestAdapter.property_scan` returns `None`. The three new evidence
+    keys (`property_framework_imported_by_suite`,
+    `property_framework_seed_pinned`, `property_scan_files`) are `None` on
+    every verdict this version writes where the node scan did not run."""
     from bakeoff.preflight import PREFLIGHT_VERSION
 
-    assert PREFLIGHT_VERSION == "19"
+    assert PREFLIGHT_VERSION == "20"
 
 
 # --- fix 2: the bare-runner probe ---------------------------------------------
@@ -3669,7 +3719,8 @@ _NODE_F2P = "tests/a.test.js::does a thing"
 
 def _node_container(*, f2p_ran=True, f2p_twice=False, p2p_twice=False,
                     missing=(), scope_names=None, scope_files=None,
-                    p2p=(), framework="vitest", runner=None):
+                    p2p=(), framework="vitest", runner=None,
+                    p2p_before_files=(), **container_kwargs):
     """A node task and the container that answers its five suite CHECKS.
 
     Each check is one or more commands now -- a node selection is one per
@@ -3696,6 +3747,18 @@ def _node_container(*, f2p_ran=True, f2p_twice=False, p2p_twice=False,
     `(file, fullName)` pairs directly, and `scope_files` names files and gives
     each a distinct title so the duplicate-name rule stays quiet and the scope
     rule is the only thing under test.
+
+    `p2p_before_files` appends extra file entries (each with one passing
+    test) to the P2P-BEFORE REPORT ONLY -- what puts a file such as
+    `tests/properties.ts` into that run's `files_run` without touching
+    `tests.paths`, the f2p report, or the scoped report. This is the property
+    scan's scope (round-2 item 12): the scan reads `Outcome.files_run` off
+    the p2p-before run, not the declared paths.
+
+    `**container_kwargs` is forwarded verbatim into the `_ScriptedContainer`
+    call below, which is how the property-scan parameters
+    (`property_imported`, `property_pinned`, `property_import_rg_exit`,
+    `property_pin_rg_exit`) and a `present=()` override reach it.
     """
     if runner is None:
         runner = (("/node_modules/.bin/vitest", "run", "--no-cache")
@@ -3718,11 +3781,20 @@ def _node_container(*, f2p_ran=True, f2p_twice=False, p2p_twice=False,
         by_file.setdefault(path, []).append(("passed", name))
 
     p2p_ids = tuple(p2p) or ("tests/b.test.js::keeps working",)
-    p2p_report = _node_report([
+    p2p_entries = [
         (node_id.partition("::")[0],
          [("passed", node_id.partition("::")[2])] * (2 if p2p_twice else 1))
         for node_id in p2p_ids
-    ])
+    ]
+    p2p_report = _node_report(p2p_entries)
+    # `p2p_before_files` is appended to the BEFORE report only, each with one
+    # passing assertion -- extra files the p2p-before sweep "loaded" without
+    # widening `tests.paths` or the after report.
+    p2p_before_report = _node_report(
+        p2p_entries
+        + [(path, [("passed", "a property holds")])
+           for path in p2p_before_files]
+    )
     reports = {
         "f2p_before": _node_report(
             [("tests/a.test.js",
@@ -3733,14 +3805,34 @@ def _node_container(*, f2p_ran=True, f2p_twice=False, p2p_twice=False,
         "f2p_after": _node_report(
             [("tests/a.test.js",
               [("passed", "does a thing")] * (2 if f2p_twice else 1))]),
-        "p2p_before": p2p_report,
+        "p2p_before": p2p_before_report,
         "p2p_after": p2p_report,
         "scoped": _node_report(list(by_file.items())),
     }
     for key in missing:
         reports[key] = None
+    # DEVIATION from the plan's literal `present=tests.paths`: the property
+    # scan (round-2 item 12) is the first node check to filter REPORT-derived
+    # paths (`files_run`) through `_present`, rather than manifest-declared
+    # ones -- every prior `_present` caller in a node context only ever asked
+    # about `tests.paths` itself. `test -e` in the scripted double is exact
+    # SET membership, so a swept file such as `tests/properties.ts` needs its
+    # own entry or the scan reads it as absent and every property-scan test
+    # would see an empty `property_scan_files` regardless of what the report
+    # says ran. The default is broadened to every path this container's own
+    # reports claim to have executed -- what a real tree would answer `test
+    # -e` for, since these are exactly the files whose reports this container
+    # is scripting -- so a test need not separately declare "the file the
+    # report says ran also exists". An explicit `present=` in
+    # `container_kwargs` still overrides it entirely (`setdefault`).
+    default_present = (
+        set(tests.paths) | {"tests/a.test.js"} | set(by_file)
+        | {node_id.partition("::")[0] for node_id in p2p_ids}
+        | set(p2p_before_files)
+    )
+    container_kwargs.setdefault("present", tuple(sorted(default_present)))
     container = _ScriptedContainer(start_sha="s" * 40, tests=tests,
-                                   present=tests.paths, reports=reports)
+                                   reports=reports, **container_kwargs)
     return container, task
 
 
@@ -4188,6 +4280,229 @@ def test_same_file_duplicate_ids_is_None_on_the_runner_gate_early_return():
 
     assert not result.ok
     assert result.evidence["same_file_duplicate_ids"] is None
+
+
+# --- node property-based determinism (round 2 item 12) -----------------------
+
+
+def test_a_swept_file_that_imports_fast_check_with_no_seed_pin_is_refused():
+    """A real, already-gated node task does this today: `yaml-474`'s
+    `tests/properties.ts` imports fast-check and nothing the p2p-before
+    sweep runs pins a seed. Measured 2026-09-02 against fast-check 3.23.2
+    and 2.25.0, `readSeed` falls back to `Date.now() ^ (Math.random() *
+    0x100000000)` and ten fresh runs of one property over unchanged code
+    gave `0 0 0 1 1 0 0 0 0 0` -- so the p2p verdict this gate publishes,
+    and the grader's checks 5 and 6 after it, are a draw. There is no
+    `image.env` lever to add for this one: fast-check reads no environment
+    variable at all, and the one external lever that works for vitest
+    (`NODE_OPTIONS` preloading a `configureGlobal` call) is defeated by
+    jest's module registry."""
+    result = _preflight_over(_node_container(
+        p2p_before_files=("tests/properties.ts",),
+        property_imported=True, property_pinned=False))
+
+    assert not result.ok
+    assert result.evidence["property_framework_imported_by_suite"] is True
+    assert result.evidence["property_framework_seed_pinned"] is False
+    assert "tests/properties.ts" in result.evidence["property_scan_files"]
+    assert any("fast-check" in p and "pins a seed" in p
+               for p in result.problems)
+
+
+def test_the_scan_reads_the_p2p_before_runs_files_run_not_tests_paths():
+    """The load-bearing scope decision (review 1). Measured on yaml-474: the
+    p2p-before sweep loads 25 suites and 3,497 tests while `tests.paths` is
+    the single file `tests/doc/stringify.ts` -- scanning the declared paths
+    answers a question about a file the certified verdict barely depends on
+    and says nothing about the 24 others it does. So the scan reads
+    `Outcome.files_run` off the p2p-BEFORE run, not `tests.paths`."""
+    container, task = _node_container(
+        p2p_before_files=("tests/properties.ts",),
+        property_imported=True, property_pinned=False)
+
+    _preflight_over((container, task))
+
+    import_scan = next(
+        cmd for cmd in container.commands
+        if any("fast-check" in part for part in cmd))
+    assert "tests/properties.ts" in import_scan
+    assert "tests/" not in import_scan
+
+
+def test_the_scan_runs_after_the_p2p_before_sweep_that_gives_it_its_scope():
+    """Not the environment-defect ordering rule (preflight collects problems
+    rather than raising, so order carries no verdict) -- it is that
+    `classify` reads `_Runner.last_report`, which ANY subsequent
+    `_Runner.run` overwrites, so the scope must be taken from the Outcome
+    bound at the p2p-before run and used before the next suite invocation,
+    whichever one that is. Bounding on the p2p-AFTER run instead would
+    permit a placement the rationale forbids (review 2, C3): the f2p-after
+    run sits between the two p2p runs."""
+    container, task = _node_container(
+        p2p_before_files=("tests/properties.ts",),
+        property_imported=True, property_pinned=False)
+
+    _preflight_over((container, task))
+
+    scan_index = next(
+        i for i, cmd in enumerate(container.commands)
+        if any("fast-check" in part for part in cmd))
+    suite_indices = [i for i, cmd in enumerate(container.commands)
+                     if cmd[:1] == ["timeout"] and "--co" not in cmd]
+    before = max(i for i in suite_indices if i < scan_index)
+    after = min(i for i in suite_indices if i > scan_index)
+
+    assert before < scan_index < after
+
+
+def test_a_swept_file_whose_scope_pins_the_seed_is_accepted():
+    """Deliberately weaker than `image.env`, which preflight reads back OUT
+    of the container: a `configureGlobal` match proves the repository has
+    thought about the problem, not that it executes, that it runs before
+    every property, or that a `describe`-local `fc.assert` overrides it."""
+    result = _preflight_over(_node_container(
+        p2p_before_files=("tests/properties.ts",),
+        property_imported=True, property_pinned=True))
+
+    assert result.evidence["property_framework_imported_by_suite"] is True
+    assert result.evidence["property_framework_seed_pinned"] is True
+    assert not any("pins a seed" in p for p in result.problems)
+
+
+def test_a_sweep_with_no_property_import_is_not_asked_about_a_pin():
+    """The second probe is not run when the first says no: `imported: false`
+    means the pin was never asked about, which is a different fact from
+    `pinned: false` -- "asked, and no pin found"."""
+    container, task = _node_container(property_imported=False)
+
+    result = _preflight_over((container, task))
+
+    assert result.evidence["property_framework_imported_by_suite"] is False
+    assert result.evidence["property_framework_seed_pinned"] is None
+    assert result.evidence["property_scan_files"]
+    assert not any("-U" in cmd for cmd in container.commands)
+
+
+def test_the_property_import_scan_that_could_not_answer_is_None_and_a_NO_GO():
+    """A quiet `False` here reads as "no property framework" and disarms the
+    one check that catches an unpinned property-based suite on an
+    environment defect preflight CAN see through."""
+    container, task = _node_container(property_import_rg_exit=2)
+
+    result = _preflight_over((container, task))
+
+    assert not result.ok
+    assert result.evidence["property_framework_imported_by_suite"] is None
+    assert result.evidence["property_framework_seed_pinned"] is None
+    assert any("property-framework-import scan" in p and "exited 2" in p
+               for p in result.problems)
+    assert not any("-U" in cmd for cmd in container.commands)
+
+
+def test_the_seed_pin_scan_that_could_not_answer_is_None_and_a_NO_GO():
+    """The asymmetry `_rg_probe`'s `consequence` parameter exists for:
+    misreading THIS probe REFUSES a task that was already fine, which is not
+    what misreading the other two probes does -- so a single shared rg_exit
+    cannot express this case, and the fake dispatches on the pattern
+    instead."""
+    result = _preflight_over(_node_container(
+        property_imported=True, property_pin_rg_exit=2))
+
+    assert not result.ok
+    assert result.evidence["property_framework_seed_pinned"] is None
+    assert any("property-seed-pin scan" in p and "exited 2" in p
+               for p in result.problems)
+
+
+def test_the_pin_scan_is_the_only_probe_that_asks_rg_for_multiline():
+    """A real `configureGlobal({\\n seed: 1234\\n})` spans lines and rg is
+    line-based without `-U`, so dropping it turns a pinned suite into a
+    refused one; putting `-U` on the IMPORT probe would change what that
+    pattern can match across file boundaries."""
+    container, task = _node_container(
+        property_imported=True, property_pinned=True)
+
+    _preflight_over((container, task))
+
+    multiline = [cmd for cmd in container.commands if "-U" in cmd]
+    assert len(multiline) == 1
+    assert any("configureGlobal" in part for part in multiline[0])
+
+
+def test_a_pytest_task_records_all_three_property_keys_as_absent():
+    """`files_run` is `None` for pytest by the adapter's own contract, so the
+    check is node-only by CONSTRUCTION rather than by a framework branch --
+    and the null is a recorded absence, never a claim that a Python suite
+    has no property framework, which the hypothesis probe answers with a
+    stronger instrument."""
+    container, task = _pytest_container()
+
+    result = _preflight_over((container, task))
+
+    assert result.evidence["property_framework_imported_by_suite"] is None
+    assert result.evidence["property_framework_seed_pinned"] is None
+    assert result.evidence["property_scan_files"] is None
+    assert not any("fast-check" in part for cmd in container.commands
+                  for part in cmd)
+
+
+def test_a_sweep_that_wrote_no_report_leaves_the_property_keys_absent():
+    """A broken config exits 1 and writes NO file on both frameworks
+    (measured), which is `KIND_ENVIRONMENT` -- and that shape already NO-GOes
+    for the missing-report reason, so the scan adds no problem of its own
+    here. A second message for one cause is how a reader learns to skim
+    both."""
+    container, task = _node_container(missing=("p2p_before",))
+
+    result = _preflight_over((container, task))
+
+    assert not result.ok
+    assert result.evidence["property_framework_imported_by_suite"] is None
+    assert result.evidence["property_framework_seed_pinned"] is None
+    assert result.evidence["property_scan_files"] is None
+    assert not any("fast-check" in part for cmd in container.commands
+                  for part in cmd)
+
+
+def test_the_property_scan_keys_say_which_absence_on_the_early_return():
+    """The keys are written on every path, because a key present on one
+    branch and absent on another is the same defect one layer down. A NEW
+    test, not an edit to the existing runner-gate one: round-2 item 5 is
+    about that function's early-return evidence and the two must not
+    collide."""
+    result = _preflight_over(_node_container(runner=("python", "-m", "pytest")))
+
+    assert not result.ok
+    assert result.evidence["property_framework_imported_by_suite"] is None
+    assert result.evidence["property_framework_seed_pinned"] is None
+    assert result.evidence["property_scan_files"] is None
+
+
+def test_the_hypothesis_rg_message_is_byte_identical_after_the_extraction(
+    monkeypatch, tmp_path
+):
+    """The plan behind this extraction is on record wanting the hypothesis
+    probe's message stable through the `_rg_probe` refactor, and nothing
+    pinned it before -- the two existing tests
+    (`test_an_rg_probe_that_could_not_answer_is_None_and_not_False`,
+    `test_the_hypothesis_import_probe_runs_before_the_suite`) assert only
+    substrings, which survive any rewording."""
+    task = _FakeTask()
+    container = _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                                   present=("tests/",), rg_exit=2)
+
+    result = _run_preflight(monkeypatch, tmp_path, task, container)
+
+    expected = (
+        "the hypothesis-import scan (rg over tests.paths) could not answer: "
+        "`rg -q ^\\s*(from|import)\\s+hypothesis\\b -- tests/` exited 2, "
+        "not 0 (match) or 1 (no match). rg exits 2 on an unreadable path or "
+        "a bad pattern and it is asserted present above, so this names an "
+        "environment problem preflight cannot see through -- silently "
+        "reading it as 'not imported' would disarm the one check that "
+        "catches an undeclared property-based suite."
+    )
+    assert expected in result.problems
 
 
 # --- one check, several commands ---------------------------------------------
