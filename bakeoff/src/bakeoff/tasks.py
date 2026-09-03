@@ -254,6 +254,9 @@ class TaskBudget:
     # until the section 3.5 calibration pilot sets them from the
     # slowest-converging model's p95 -- tuning them to the incumbent is
     # exactly what that section forbids.
+    # All three are positive integers, refused at load by name if not --
+    # see `_positive_int`. No upper bound on max_turns: wall_clock_timeout_s
+    # is the outer stop and section 3.5's pilot owns the number.
     max_turns: int = 40
     wall_clock_timeout_s: int = 900
     #: The coreutils `timeout` bound on every command preflight, the oracle
@@ -1173,8 +1176,10 @@ def _positive_int(value: Any, where: str, default: int) -> int:
     this exists at all:
 
     * `int("forty")` raises a bare `ValueError` out of `load_task`, with no
-      manifest path in the traceback -- which is how `max_turns` and
-      `wall_clock_timeout_s` behave today.
+      manifest path in the traceback -- and `int(None)` a bare `TypeError`,
+      which is how `max_turns` and `wall_clock_timeout_s` behaved before
+      2026-09-02. An author is handed a stack trace naming this module
+      instead of a message naming their file and their key.
     * `int("600")` and `int(600.0)` SUCCEED, so a quoted or floated value is
       accepted silently and the manifest stops being a faithful record.
     * `bool` IS an `int` in Python: `int(True)` is 1. `suite_timeout_s: true`
@@ -1184,10 +1189,27 @@ def _positive_int(value: Any, where: str, default: int) -> int:
       FIRST; folded into the int test it is dead code a mutation cannot catch.
 
     `_ABSENT` rather than `None` for "not declared", so an explicit `key: null`
-    falls through to the refusal. Applied to `suite_timeout_s` only:
-    `max_turns` and `wall_clock_timeout_s` keep their bare `int(...)` because
-    tightening them could refuse a manifest that loads today, which belongs in
-    its own change (`TASKS.md`).
+    falls through to the refusal.
+
+    Applied to all three `budget:` keys. `max_turns` and `wall_clock_timeout_s`
+    kept a bare `int(...)` until 2026-09-02, and the cost was not the shapes
+    that raised -- it was the shapes that did NOT. `wall_clock_timeout_s: true`
+    loaded as 1 second, and the `>` refusal below then reported the manifest's
+    defect as a `suite_timeout_s` the author had never declared, ending in
+    "lower suite_timeout_s", which is advice about the wrong key. `: 0.5`
+    loaded as 0 the same way. Measured across the nine manifests that existed
+    that day, extending this validator refused none of them.
+
+    No UPPER bound on `max_turns`, deliberately: `wall_clock_timeout_s` is the
+    outer stop whatever this says, section 5.4 leaves the number to the
+    section 3.5 calibration pilot, and there is no downstream limit to mirror
+    AT THE VERSION MEASURED -- verified against claude 2.1.258 on the host,
+    where `--max-turns` is absent from `--help` entirely and `--max-turns 0`
+    starts a session and calls the API rather than being refused. The eval
+    image pins 2.1.220 and was not measured; a stricter check there would
+    only move the failure earlier, never make this refusal wrong. The bottom
+    is what the container cannot survive, and `value <= 0` is what refuses
+    it.
     """
     if value is _ABSENT:
         return default
@@ -1321,7 +1343,18 @@ def load_task(task_dir: Path, set_commit: str = "") -> TaskManifest:
         adapter.validate_node_id(node_id, test_paths, where)
     adapter.validate_id_set((*f2p, *p2p), where)
 
-    image_raw = data.get("image") or {}
+    # `is None`, NOT `or {}`, for the reason given at `budget_raw` above and
+    # at `grading_raw` below -- and this section is the one where a silently
+    # discarded body costs the most. Measured 2026-09-02: `image: []`, `: 0`
+    # and `: ""` all loaded as the default python with EMPTY apt, pip and
+    # build, so one stray bracket throws away `build: ["pip install -e ."]`
+    # (imports then resolve to site-packages and nothing the agent writes
+    # takes effect) and `apt: ["less"]` (189 tests error on a closed stdout
+    # in the pager test). Preflight catches both, which is the only reason
+    # this was ever a hygiene defect rather than a P0.
+    image_raw = data.get("image")
+    if image_raw is None:
+        image_raw = {}
     if not isinstance(image_raw, dict):
         raise TaskError(f"{where}: image must be a mapping")
     # The same guard `grading:` has below, needed here for a sharper reason: a
@@ -1360,7 +1393,18 @@ def load_task(task_dir: Path, set_commit: str = "") -> TaskManifest:
             "comes from the framework; declaring both is two sources for one "
             "fact."
         )
-    budget_raw = data.get("budget") or {}
+    # `is None`, NOT `or {}` -- for the reason the `grading:` block below
+    # gives in the same words: `budget: []` is what an author who started a
+    # list and never wrote the keys leaves behind, and `or {}` reads it as a
+    # section they never wrote, applying all three defaults to a manifest
+    # that visibly asked for something else. Measured 2026-09-02: `[]`, `0`
+    # and `""` all loaded as 40/900/600. An explicit `budget: null` still
+    # takes the defaults, which is a commented-out block and is what the
+    # defaults are for -- unlike a null KEY, which is an author reaching for
+    # one number and writing none, and is refused by `_positive_int`.
+    budget_raw = data.get("budget")
+    if budget_raw is None:
+        budget_raw = {}
     if not isinstance(budget_raw, dict):
         raise TaskError(f"{where}: budget must be a mapping")
     # Optional: absent is `not_configured`, not an error. Whether the declared
@@ -1429,10 +1473,27 @@ def load_task(task_dir: Path, set_commit: str = "") -> TaskManifest:
         )
     _refuse_stripped_halves(test_files, solution_files, strip_paths, where)
 
+    # All three through one validator, and the two below the comparison
+    # matter most: a bare `int(...)` accepted `wall_clock_timeout_s: true`
+    # as 1 and `: 0.5` as 0, and the `>` refusal further down then reported
+    # the manifest's problem as a `suite_timeout_s` the author never
+    # declared -- advising them to lower the one number that was correct.
+    # `_ABSENT` rather than the dataclass default, so `key: null` is refused
+    # instead of read as a key nobody wrote.
+    #
+    # Keyword arguments evaluate left to right, so a manifest with two bad
+    # keys is refused by the FIRST in this order. Deterministic, and it is
+    # the order the keys appear in the dataclass and in every manifest.
     budget = TaskBudget(
-        max_turns=int(budget_raw.get("max_turns", TaskBudget.max_turns)),
-        wall_clock_timeout_s=int(
-            budget_raw.get("wall_clock_timeout_s", TaskBudget.wall_clock_timeout_s)
+        max_turns=_positive_int(
+            budget_raw.get("max_turns", _ABSENT),
+            f"{where}:budget.max_turns",
+            TaskBudget.max_turns,
+        ),
+        wall_clock_timeout_s=_positive_int(
+            budget_raw.get("wall_clock_timeout_s", _ABSENT),
+            f"{where}:budget.wall_clock_timeout_s",
+            TaskBudget.wall_clock_timeout_s,
         ),
         suite_timeout_s=_positive_int(
             budget_raw.get("suite_timeout_s", _ABSENT),
@@ -1450,6 +1511,9 @@ def load_task(task_dir: Path, set_commit: str = "") -> TaskManifest:
     # price for a contradiction visible in the YAML. Strictly `>`: equality is
     # degenerate but is a judgement about slack, not something arithmetic
     # settles.
+    # Runs after all three keys are validated above, which is what lets this
+    # message be trusted: on a bare `int(...)` it fired for a boolean
+    # `wall_clock_timeout_s` and blamed `suite_timeout_s`.
     if budget.suite_timeout_s > budget.wall_clock_timeout_s:
         raise TaskError(
             f"{where}: budget.suite_timeout_s ({budget.suite_timeout_s}) "

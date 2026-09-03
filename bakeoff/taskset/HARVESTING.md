@@ -737,6 +737,10 @@ rather than by reasoning:
   a run terminated mid-suite is that loop truncated with an unchecked diff.
   Raising `wall_clock_timeout_s` is the other escape and is not a §5.4
   divergence: the budget is per task, identical across arms.
+  All three `budget:` keys are positive integers, refused at load with the
+  file and the key named — a quoted, floated, boolean, null, zero or negative
+  value is a load error, not a coercion — and that check runs before this
+  comparison, so a bad `wall_clock_timeout_s` is reported as itself.
 
 One consequence of the run tree being pruned to `base_sha`'s history, since it
 shows up in exactly the repos the second bullet is about: **tags that are

@@ -1357,6 +1357,69 @@ MUTATIONS = [
         "tests/test_tasks.py -k world_readable",
         "not integration",
     ),
+    # --- round 2 item 6: every budget: number goes through one validator ----
+    (
+        # Reverting this makes `max_turns: true` load as 1 and
+        # `max_turns: false` as 0, and the CLI refuses neither -- measured
+        # 2026-09-02, `--max-turns 0` starts a session and calls the API.
+        "budget: parse max_turns with a bare int again, accepting `true` as one turn",
+        "src/bakeoff/tasks.py",
+        "        max_turns=_positive_int(\n"
+        '            budget_raw.get("max_turns", _ABSENT),\n'
+        '            f"{where}:budget.max_turns",\n'
+        "            TaskBudget.max_turns,\n"
+        "        ),\n",
+        '        max_turns=int(budget_raw.get("max_turns", TaskBudget.max_turns)),\n',
+        "tests/test_tasks.py -k budget_key_refuses_a_boolean or max_turns",
+        "not integration",
+    ),
+    (
+        # This is the 2026-09-02 defect verbatim -- `wall_clock_timeout_s:
+        # true` becomes 1 and the `>` refusal below reports it as a
+        # `suite_timeout_s` the manifest never declared.
+        "budget: parse wall_clock_timeout_s with a bare int, blaming suite_timeout_s for a boolean",
+        "src/bakeoff/tasks.py",
+        "        wall_clock_timeout_s=_positive_int(\n"
+        '            budget_raw.get("wall_clock_timeout_s", _ABSENT),\n'
+        '            f"{where}:budget.wall_clock_timeout_s",\n'
+        "            TaskBudget.wall_clock_timeout_s,\n"
+        "        ),\n",
+        "        wall_clock_timeout_s=int(\n"
+        '            budget_raw.get("wall_clock_timeout_s", TaskBudget.wall_clock_timeout_s)\n'
+        "        ),\n",
+        "tests/test_tasks.py -k names_its_own_key",
+        "not integration",
+    ),
+    (
+        # `budget: []` then applies all three defaults to a manifest that
+        # visibly asked for something else. The selector is deliberately the
+        # long form: `-k not_a_mapping_is_refused` is a substring match that
+        # also collects the four `grading:` cases and
+        # `test_an_image_env_that_is_not_a_mapping_is_refused` (measured,
+        # 5/185), which still catches the mutation but re-runs four
+        # irrelevant tests.
+        "budget: read a written-but-empty budget section as an unwritten one",
+        "src/bakeoff/tasks.py",
+        '    budget_raw = data.get("budget")\n'
+        "    if budget_raw is None:\n"
+        "        budget_raw = {}\n",
+        '    budget_raw = data.get("budget") or {}\n',
+        "tests/test_tasks.py -k budget_section_that_is_not_a_mapping",
+        "not integration",
+    ),
+    (
+        # `image: []` then builds the default base with no `apt`, no `pip`
+        # and no `build` -- a non-editable install every arm fails
+        # identically on, and click's missing `less`.
+        "image: read a written-but-empty image section as an unwritten one",
+        "src/bakeoff/tasks.py",
+        '    image_raw = data.get("image")\n'
+        "    if image_raw is None:\n"
+        "        image_raw = {}\n",
+        '    image_raw = data.get("image") or {}\n',
+        "tests/test_tasks.py -k image_section_that_is_not_a_mapping",
+        "not integration",
+    ),
     (
         # Schema 3.8.0. Every one of the next six used to destroy the record
         # outright or, worse, publish something false in its place.

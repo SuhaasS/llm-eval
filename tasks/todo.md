@@ -3990,3 +3990,90 @@ zero stale, up from the round's opening 183. `scripts/verify_logger.py` run
 (unchanged code path, run anyway per the plan's Verification list): **GATE
 PASSED**, `GO (offline criteria): every arm completed a loop on all 1 of 1
 run(s).` Real gate: see numbers above.
+
+## Round 2 item 6 — every `budget:` number goes through one validator — 2026-09-03
+
+Closed `docs/superpowers/plans/2026-09-03-round2-6-budget-ints.md`. `max_turns`
+and `wall_clock_timeout_s` now go through `tasks._positive_int`, the same
+validator `suite_timeout_s` already used — a quoted, floated, boolean, null,
+zero or negative value is a `TaskError` naming the manifest path and the key,
+where before a bare `int(...)` either accepted the value silently (`"40"` →
+40, `40.0` → 40, `true` → 1, `false` → 0) or raised with no manifest path in
+it (`None`, a non-numeric string). The worst measured case:
+`wall_clock_timeout_s: true` used to load as 1 and the `suite_timeout_s >
+wall_clock_timeout_s` refusal below then blamed a `suite_timeout_s` the
+manifest never declared (600 is the dataclass default), ending in "lower
+suite_timeout_s" — advice about the one number that was correct. That
+comparison still runs exactly where it did, but its correctness now rests on
+validation that happens first; T1.3's added comment says so at the call site.
+
+Rode along per D4: `budget: []` / `: 0` / `: ""` and the identical `image:`
+shapes stopped reading a written-but-falsy section as an unwritten one
+(`data.get(...) or {}` → an explicit `is None` check), matching the existing
+`grading:` precedent nine lines below in the same function. `image: []` was
+the sharper case — it silently discarded `build: ["pip install -e ."]` and
+`apt: ["less"]`, both caught by preflight today but invisible at load.
+
+**Deliberately NOT done** (all filed or already tracked): no upper bound on
+`max_turns` (D5 — `wall_clock_timeout_s` is the outer stop, section 5.4
+leaves the number to section 3.5's pilot, and claude 2.1.258 on the host
+enforces nothing on `--max-turns`, including `0`); `0x28` still resolves to
+the int 40 and is accepted (D6, YAML does the coercion, not this loader);
+unknown keys under `budget:` still load silently with every default (D7 —
+filed as a new `TASKS.md` entry, the `_BUDGET_KEYS` fix is future work);
+`provenance:` keeps its `or {}` (D4's last paragraph — `dict(0)` raises a
+bare `TypeError`, so switching it would introduce an unhandled path for
+exactly the case D4 exists to catch). No version constant moved:
+`SCHEMA_VERSION`, `GRADE_SCHEMA_VERSION`, `GRADER_VERSION`, `ORACLE_VERSION`
+and `PREFLIGHT_VERSION` are all untouched — nothing a verdict asserts
+changed, only which manifests fail to load before any of those versions is
+ever stamped on anything. `manifest_digest` for the click task moved because
+T5 edited its `budget:` comments (hashed as raw bytes), which is the cache
+key doing its job, not a version bump.
+
+One recorded caveat: `--max-turns 0`/`false`/`-1` not being refused downstream
+is measured against **claude 2.1.258 on the host**; the eval image pins
+**2.1.220**, which was deliberately not re-measured for this commit (D5's
+caveat) — a stricter check at 2.1.220 would only move the failure earlier,
+never make the load-time refusal wrong.
+
+**Deviation from the plan.** T2.11 offered two shapes for pinning that
+`image: null` still defaults ("in the same test or a one-line sibling").
+Written as a separate sibling test the total would have landed at 33 new
+cases against the plan's own stated arithmetic of 32 (`2.1`'s 9 + `2.2`'s 2 +
+`2.3`'s 7 + `2.4`'s 2 + `2.5`'s 3 + `2.6`'s 1 + `2.7`'s 3 + `2.8`'s 1 + `2.9`'s
+1 + `2.11`'s 3 = 32) — so the null check was folded into the same
+parametrized test instead, running once per parametrize case rather than as
+its own node. Both options were explicitly offered by the plan; this is the
+one that keeps the arithmetic exact.
+
+Verified: `.venv/bin/python -m pytest tests/ -q` — `1706 passed, 67
+deselected`, exactly baseline `1674` + the plan's stated `32`.
+`.venv/bin/python -m pytest tests/test_tasks.py -k budget -v` — 9 passed.
+`.venv/bin/python scripts/mutation_check.py` run solo: **191/191 caught**, 0
+stale (187 + the 4 new anchors in Task 3; each selector re-verified with
+`--collect-only` to match only its intended parametrized cases, per T3.5).
+Source tree confirmed byte-clean after the mutation run (`git status` shows
+only the intended diff). V2's compatibility walk re-run before and after Task
+1: `taskset` 1/1, `~/.cache/bakeoff-probe/taskset` now **10 directories, 9
+with a manifest** (grown by one, `sqlglot-8225-mysql-key-constraint`, since
+the plan's 9/8 measurement) — every one of the nine manifests loaded
+identically before and after, no new refusal, `image.build` unchanged on
+every task. V4 — `scripts/run_matrix.py --preflight-only` — **PASS** for
+`click-3360-write-usage-empty-args`, and the gate visibly re-ran rather than
+reporting a cached verdict (no ", N from cached verdicts" suffix on the gate
+total line), confirming T5's comment edit moved `manifest_digest` as
+intended. V7 — the end-to-end defect reproduction on a scratch copy of the
+click manifest — all four mutated bodies now raise `TaskError` naming
+`budget.<key>` and `must be a positive integer`; the `wall_clock_timeout_s:
+true` case no longer mentions `suite_timeout_s`.
+`scripts/verify_logger.py` (offline logger gate, unchanged code path):
+**GATE PASSED** on a clean re-run (`1706 passed, 67 deselected` in the unit
+phase, `44 passed` integration, dry run OK, offline smoke GO). One earlier
+invocation reported `GATE FAILED: unit suite` while a background job whose
+tail output was truncated to 30 lines was being inspected; re-run
+immediately after with full output captured showed a clean pass across all
+four phases with no code changes in between, which reads as a transient
+flake rather than a regression — flagged here rather than silently
+discarded, since this repository already tracks at least one other flaky
+fixture (`git log`, "record the flaky fixture in the wave's review log").

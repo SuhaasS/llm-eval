@@ -470,6 +470,10 @@ image:
 # saying why — see §4.
 
 budget:
+  # All three are POSITIVE INTEGERS, refused at load by name otherwise:
+  # a quoted "40", a floated 40.0, true/false, null, 0 and negatives are
+  # each a TaskError naming this file and the key. Unquoted and unfloated,
+  # or the manifest stops being a record of what the arms were asked to do.
   max_turns: 40
   wall_clock_timeout_s: 900
   # suite_timeout_s: 600   # the timeout on every command preflight, the

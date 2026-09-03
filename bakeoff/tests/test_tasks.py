@@ -10,6 +10,7 @@ of a matrix, after the tokens are spent.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import shutil
@@ -423,9 +424,10 @@ def test_a_declared_suite_timeout_is_read(tmp_path, upstream):
 def test_a_suite_timeout_that_is_not_a_positive_int_is_a_load_error(
     tmp_path, upstream, yaml_value
 ):
-    """`int("600")` and `int(600.0)` both SUCCEED, so the bare `int(...)` the
-    other two budget keys use accepts a quoted or floated value silently and
-    the manifest stops being a faithful record. An explicit `null` is refused
+    """`int("600")` and `int(600.0)` both SUCCEED, so a bare `int(...)` accepts
+    a quoted or floated value silently, which is how the other two budget keys
+    behaved until 2026-09-02 -- and the manifest stops being a faithful
+    record. An explicit `null` is refused
     rather than defaulted: the author WROTE the key, so reading it as "never
     written" is the wrong repair -- which is why `_positive_int` takes an
     `_ABSENT` sentinel and not a `None` default.
@@ -491,6 +493,173 @@ def test_a_suite_timeout_equal_to_the_wall_clock_loads(tmp_path, upstream):
 def test_the_default_budget_pair_is_self_consistent():
     """The defaults must not be a pair the loader would refuse: 600 <= 900."""
     assert TaskBudget().suite_timeout_s <= TaskBudget().wall_clock_timeout_s
+
+
+@pytest.mark.parametrize(
+    "yaml_value",
+    ['"40"', "40.0", "3.7", "null", "0", "-1", "forty", "1e3", "[40]"],
+)
+def test_a_max_turns_that_is_not_a_positive_int_is_a_load_error(
+    tmp_path, upstream, yaml_value
+):
+    """Until 2026-09-02 `max_turns` was parsed with a bare `int(...)`, which
+    accepted three of these shapes silently: `"40"` -> 40, `40.0` -> 40, and
+    `3.7` -> 3 (truncated, not rounded) -- a manifest that stops being a
+    faithful record of what an arm was asked to do. `forty` and `null` raised
+    a bare `ValueError`/`TypeError` with no manifest path in it. `1e3` is a
+    `str` to PyYAML 6.0.3, not a float: YAML 1.1's float resolver requires a
+    decimal point in the mantissa and a signed exponent (`1.0e+3`), so the
+    shorthand an author reaches for to raise a bound by an order of magnitude
+    is one of the cases that must now raise a named `TaskError`."""
+    with pytest.raises(TaskError, match="budget.max_turns"):
+        load_task(_budget_task(tmp_path, upstream, f"  max_turns: {yaml_value}\n"))
+
+
+@pytest.mark.parametrize("yaml_value", ["true", "false"])
+def test_a_boolean_max_turns_is_refused_rather_than_read_as_one_turn(
+    tmp_path, upstream, yaml_value
+):
+    """`bool` IS an `int`, so `int(True)` is 1 and `int(False)` is 0 -- the
+    failure mode differs from every value in the previous test because these
+    were ACCEPTED. `max_turns: true` gave every arm of that task one API call
+    and a record that reads as a model that stopped after one turn;
+    `max_turns: false` gave it zero. Measured 2026-09-02 that the CLI does not
+    save this: against claude 2.1.258 (the host binary; the eval image pins
+    2.1.220) with `ANTHROPIC_BASE_URL` pointed at an unreachable port,
+    `claude -p --output-format stream-json --verbose --max-turns 0 "say hi"`
+    emits the `system/init` event and then `api_retry` events -- it starts a
+    session and calls the API. `--max-turns -1` and `--max-turns 0.5` behave
+    the same. Only a non-numeric argument is refused, by commander, before any
+    network: `error: option '--max-turns <turns>' argument 'abc' is invalid.
+    must be a number` -- and `--max-turns` is not listed in `claude --help` at
+    all, so there is no downstream backstop."""
+    with pytest.raises(TaskError, match="budget.max_turns"):
+        load_task(_budget_task(tmp_path, upstream, f"  max_turns: {yaml_value}\n"))
+
+
+@pytest.mark.parametrize(
+    "yaml_value", ['"900"', "900.0", "null", "0", "-1", "forty", "[900]"]
+)
+def test_a_wall_clock_timeout_that_is_not_a_positive_int_is_a_load_error(
+    tmp_path, upstream, yaml_value
+):
+    """`"900"` was accepted silently by the bare `int(...)` this replaced.
+    This key is also read by `run_matrix`'s per-cell credential margin
+    (`wall_clock_timeout_s + CELL_OVERHEAD_S`, handed to
+    `proxy.credential_stop`), so a value nobody wrote used to propagate into
+    a refusal-to-start decision about the SSO window."""
+    with pytest.raises(TaskError, match="budget.wall_clock_timeout_s"):
+        load_task(_budget_task(
+            tmp_path, upstream, f"  wall_clock_timeout_s: {yaml_value}\n"))
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "  wall_clock_timeout_s: true\n",
+        "  wall_clock_timeout_s: 0\n  suite_timeout_s: 1800\n",
+    ],
+)
+def test_a_bad_wall_clock_names_its_own_key_not_the_suite_comparison(
+    tmp_path, upstream, body
+):
+    """The item's measured defect, and the ordering pin. Before 2026-09-02,
+    with no `suite_timeout_s` declared (the click shape), this manifest
+    raised:
+
+        budget.suite_timeout_s (600) exceeds budget.wall_clock_timeout_s (1)
+        by 599s ... Raise wall_clock_timeout_s, or lower suite_timeout_s to
+        what the suite actually needs.
+
+    600 is the dataclass default for a key the manifest never mentions, so
+    the refusal named a key the author never wrote, did arithmetic over a
+    boolean (`int(True)` is 1), and advised lowering the one number that was
+    correct. The `not in` assertions below are the load-bearing half: with
+    the validation removed the comparison still fires and still raises a
+    `TaskError`, so a bare `pytest.raises(TaskError)` would pass on the bug."""
+    with pytest.raises(TaskError) as exc:
+        load_task(_budget_task(tmp_path, upstream, body))
+    message = str(exc.value)
+    assert "budget.wall_clock_timeout_s" in message
+    assert "must be a positive integer" in message
+    assert "suite_timeout_s" not in message
+    assert "exceeds" not in message
+
+
+@pytest.mark.parametrize(
+    "name", [f.name for f in dataclasses.fields(TaskBudget)]
+)
+def test_every_budget_key_refuses_a_boolean(tmp_path, upstream, name):
+    """Derived from the dataclass rather than listing three names, so a
+    fourth budget key added later and wired up with a bare `int(...)` fails
+    here instead of shipping.
+
+    `match=` on the key name alone is NOT enough, and this is measured:
+    against a package with only `wall_clock_timeout_s` reverted to the bare
+    `int(...)`, `pytest.raises(TaskError, match="budget.wall_clock_timeout_s")`
+    PASSES on the bug -- the comparison's own message contains that key name
+    (`"... budget.suite_timeout_s (600) exceeds budget.wall_clock_timeout_s
+    (1) by 599s..."`). So the test advertised as the drift pin would have
+    gone green for the one key this whole item exists to fix. Asserting
+    `"must be a positive integer"` as well flips that case to a failure; a
+    reader who trims this back to `match=` alone re-opens the hole silently."""
+    with pytest.raises(TaskError) as exc:
+        load_task(_budget_task(tmp_path, upstream, f"  {name}: true\n"))
+    message = str(exc.value)
+    assert f"budget.{name}" in message
+    assert "must be a positive integer" in message
+    assert "exceeds" not in message
+
+
+def test_max_turns_has_no_upper_bound(tmp_path, upstream):
+    """A ceiling is a judgement about how much is too much, section 5.4
+    leaves the number to section 3.5's pilot, `wall_clock_timeout_s` is the
+    outer stop whatever `max_turns` says, and the CLI enforces nothing
+    (measured in the boolean test above). Pinned so a later cap is a
+    deliberate change rather than an unnoticed one."""
+    task = load_task(_budget_task(tmp_path, upstream, "  max_turns: 100000\n"))
+    assert task.budget.max_turns == 100000
+
+
+@pytest.mark.parametrize("block", ["budget: []", "budget: 0", 'budget: ""'])
+def test_a_budget_section_that_is_not_a_mapping_is_refused_rather_than_defaulted(
+    tmp_path, upstream, block
+):
+    """`budget_raw = data.get("budget") or {}` read every falsy value as an
+    unwritten section and applied all three defaults, measured 2026-09-02.
+    The precedent is `test_a_grading_section_that_is_not_a_mapping_is_refused_at_load`,
+    nine lines below `budget:` in the same function and already parametrized
+    over exactly `['grading: ruff', 'grading: []', "grading: ''", 'grading:
+    0']` -- this test is that one, for the section that predates it."""
+    task_dir = _write_task(tmp_path / "set", upstream, extra_yaml=block)
+
+    with pytest.raises(TaskError, match="budget must be a mapping"):
+        load_task(task_dir)
+
+
+def test_a_null_budget_section_reads_as_absent(tmp_path, upstream):
+    """The deliberate asymmetry against `max_turns: null`, which is refused:
+    a null SECTION is a commented-out block whose keys all have defaults that
+    are exactly the prior behaviour; a null KEY is an author reaching for one
+    number and writing none. Pins that the previous test did not tighten this
+    by accident."""
+    task_dir = _write_task(tmp_path / "set", upstream, extra_yaml="budget: null")
+    task = load_task(task_dir)
+    defaults = TaskBudget()
+    assert task.budget.max_turns == defaults.max_turns
+    assert task.budget.wall_clock_timeout_s == defaults.wall_clock_timeout_s
+    assert task.budget.suite_timeout_s == defaults.suite_timeout_s
+
+
+def test_an_absent_budget_block_takes_every_default(tmp_path, upstream):
+    """The click manifest and every probe manifest rely on the defaults for
+    at least one key, so the no-`budget:` path is the one every task
+    actually takes."""
+    task = load_task(_write_task(tmp_path / "set", upstream))
+    defaults = TaskBudget()
+    assert task.budget.max_turns == defaults.max_turns
+    assert task.budget.wall_clock_timeout_s == defaults.wall_clock_timeout_s
+    assert task.budget.suite_timeout_s == defaults.suite_timeout_s
 
 
 # --- the split ---------------------------------------------------------------
@@ -2327,6 +2496,44 @@ def test_an_image_env_that_is_not_a_mapping_is_refused(tmp_path, upstream):
 
     with pytest.raises(TaskError, match="expected a mapping"):
         load_task(task_dir)
+
+
+@pytest.mark.parametrize("block", ["image: []", "image: 0", 'image: ""'])
+def test_an_image_section_that_is_not_a_mapping_is_refused_rather_than_defaulted(
+    tmp_path, upstream, block
+):
+    """Measured 2026-09-02: each of these loaded as the default python with
+    EMPTY `apt`, `pip` and `build`, so one stray bracket throws away
+    `build: ["pip install -e ."]` -- imports resolve to site-packages,
+    nothing the agent writes takes effect, and every arm fails identically --
+    and `apt: ["less"]`, whose absence errors 189 unrelated tests in click's
+    pager test. Preflight catches both, so this is hygiene rather than a live
+    hole; the point is that `image:` must not be the one section left
+    reading a written value as an unwritten one.
+
+    Keep the substring `image_section_that_is_not_a_mapping` in this test's
+    name: mutation anchor 3.4 selects on it, and the neighbourhood already
+    holds `test_an_image_env_that_is_not_a_mapping_is_refused`, so a
+    plausible shortening would both over-collect (`-k
+    not_a_mapping_is_refused` takes 5/185) and be selected for the wrong
+    reason -- the long form takes 0/185 today.
+
+    Also pins T1.7 as a NARROWING and not a tightening of the null path, in
+    the same test rather than a separate one: `image: null` is a
+    commented-out block and must keep taking the default base, exactly like
+    an absent `image:` block."""
+    task_dir = _write_task(tmp_path / "set", upstream, extra_yaml=block)
+
+    with pytest.raises(TaskError, match="image must be a mapping"):
+        load_task(task_dir)
+
+    null_task_dir = _write_task(
+        tmp_path / "set-null", upstream, extra_yaml="image: null"
+    )
+    null_task = load_task(null_task_dir)
+    assert null_task.image.build == ()
+    assert null_task.image.apt == ()
+    assert null_task.image.pip == ()
 
 
 def test_the_allowlist_and_the_harness_pinned_keys_are_disjoint():

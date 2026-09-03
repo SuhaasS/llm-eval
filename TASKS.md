@@ -1549,12 +1549,16 @@ These need a call, not code. Most are cheap to make and expensive to make late.
 - [ ] **`Checkpoint.tests_pass` stays `None`** by design — §5.5 requires offline
   grading. Lands with the scoring plan.
 
-- [ ] **`max_turns` and `wall_clock_timeout_s` still parse with a bare
-  `int(...)`.** `int("forty")` raises a `ValueError` out of `load_task` with no
-  manifest path in it, and `wall_clock_timeout_s: true` becomes 1 (`bool` is an
-  `int` in Python). `tasks._positive_int`, added for broadening 4, exists and is
-  applied to `suite_timeout_s` only; extending it to the other two could refuse
-  a manifest that loads today, so it is its own change.
+- [ ] **An unknown key under `budget:` loads silently with every default.**
+  `budget:\n  max_turn: 5` and `budget:\n  suite_timeout_ms: 5` both load as
+  40/900/600 (measured 2026-09-02) — the same invisible typo `_IMAGE_KEYS`
+  exists to catch for `image:`, where a misspelled `pyhton:` builds the
+  default base and every read-back agrees with the field it was compared to.
+  The fix is `_BUDGET_KEYS = tuple(f.name for f in dataclass_fields(
+  TaskBudget))` beside `_IMAGE_KEYS` plus a refusal naming the unknown key
+  and the accepted set. Its own change: unlike the value validation (round 2
+  item 6), this one CAN refuse a manifest an author has written locally.
+  (Round 2 item 6, 2026-09-02.)
 
 - [x] **Preflight's observed suite duration is not recorded, and it is the
   figure two separate readings need.** Closed 2026-09-03 (round 2 item 7). The

@@ -341,6 +341,12 @@ image:
 budget:
   # Section 5.4 placeholders. Real caps come from the section 3.5 calibration
   # pilot's slowest-converging model, not from the incumbent.
+  # All three keys are positive integers and are refused at load by name
+  # otherwise -- a quoted "40", a floated 40.0, `true`, `false`, `null`, 0
+  # or a negative each raise a TaskError naming this file and the key.
+  # QUOTE nothing here: unlike image.python, which must be quoted because
+  # YAML reads an unquoted 3.10 as the float 3.1, a quoted number in this
+  # block is refused rather than coerced.
   max_turns: 40
   wall_clock_timeout_s: 900
   # suite_timeout_s: NOT USED by this task -- click's suite runs in 1.4 s, so
@@ -356,7 +362,10 @@ budget:
   #
   # A positive integer, and it may not exceed wall_clock_timeout_s -- the
   # agent re-runs this suite inside that budget, so a longer one describes a
-  # task no arm could verify even once. Raising it multiplies the gate's wall
+  # task no arm could verify even once. That comparison runs only after all
+  # three keys above have been validated, so a bad wall_clock_timeout_s is
+  # refused as itself rather than surfacing here as this key exceeding it.
+  # Raising it multiplies the gate's wall
   # cost: preflight runs the suite five times (four when tests.p2p is
   # declared) plus once per declared grading.* argv plus the bare pytest
   # collection the gate makes on every pytest task -- 9x worst case on a
