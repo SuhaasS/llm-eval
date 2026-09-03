@@ -1585,6 +1585,41 @@ These need a call, not code. Most are cheap to make and expensive to make late.
   Left in place when found (broadening 7, Task 5) to keep that diff to its
   subject.
 
+- [ ] **A stored record graded before `SCHEMA_VERSION` 3.9.0 carries the
+  tracked-but-ignored phantom, and its verdict was computed over it.**
+  Measured 2026-09-02 (code review of round-2 item 2, `df699a8`, finding 1):
+  `~/.cache/bakeoff/trucking-dry3/runs/71212309ce6538ea.json`
+  (`trucking-2-stale-job-reaper`, schema 3.8.0, `turns_used 1`,
+  `destructive_events []`) has 2,902 `deleted file mode` chunks in
+  `artifacts.final_diff` (19.8 MB) and in checkpoint 1's `diff_vs_base`,
+  matching exactly the 2,902 files tracked under
+  `lib/python3.12/site-packages/` at its `base_sha` `66609e41` while
+  `.gitignore` names `lib/` (the two sibling shas track 0 such files). It was
+  graded: `trucking-dry3/grades/grades.jsonl` carries `resolved: False`,
+  `GRADER_VERSION 2` — the ladder applied those 2,902 fabricated deletions to
+  the grading tree before running the suite, so the `False` verdict is not
+  trustworthy evidence about the agent's actual submission. Re-grading this
+  one record (and auditing the other 97 `trucking-*` records under
+  `~/.cache/bakeoff` for the same shape, since only this one was checked in
+  full) is unstarted.
+
+- [ ] **`mutation_check.py` has two pre-existing anchors whose `old` string is
+  not unique in its file, so a mutation lands on whichever match comes first
+  rather than the one the entry's comment names.** Measured 2026-09-02 (code
+  review of round-2 item 2): `mutation_check.py:1024` ("collection: stop the
+  record naming which collection produced it") has its `old` occurring **2×**
+  in `src/bakeoff/runner.py`, and `mutation_check.py:1833` ("runners: read a
+  report that was never written as a clean run") occurs **3×** in
+  `src/bakeoff/runners/node_adapter.py`. Both are CAUGHT today, so this is
+  latent rather than broken, but it is silent: `mutation_check.py` applies
+  `original.replace(find, replace, 1)` with no uniqueness check. `tasks.py`'s
+  `    if unknown:` is now at 3 occurrences too, so the next anchor reaching
+  for a short `old` string there has a 1-in-3 chance of being silently
+  misplaced. Close the class with one guard —
+  `assert original.count(find) == 1` before the replace, reported as a
+  distinct failure kind from MISSED — and retarget the two named anchors with
+  longer, unique `old` strings.
+
 ---
 
 ## Out of scope here — each needs its own plan

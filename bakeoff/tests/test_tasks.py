@@ -3296,7 +3296,7 @@ def test_materialize_leaves_a_declared_unneeded_submodule_empty(
 
 
 def test_no_pruned_mirror_is_built_for_a_declared_unneeded_submodule(
-        tmp_path, upstream_submodule):
+        tmp_path, upstream_submodule, monkeypatch):
     """The `if not needed: return` above the mirror comprehension is what makes
     this a property of the code rather than of an empty comprehension.
 
@@ -3313,12 +3313,8 @@ def test_no_pruned_mirror_is_built_for_a_declared_unneeded_submodule(
 
     task = _sub_task(tmp_path, up,
                      extra_yaml='submodules_unneeded: ["vendor/libdep"]')
-    original = tasks.ensure_pruned_mirror
-    tasks.ensure_pruned_mirror = recording
-    try:
-        materialize(task, tmp_path / "run", tmp_path / "cache")
-    finally:
-        tasks.ensure_pruned_mirror = original
+    monkeypatch.setattr(tasks, "ensure_pruned_mirror", recording)
+    materialize(task, tmp_path / "run", tmp_path / "cache")
 
     assert "git@example.invalid:x/y.git" not in [url for url, _sha in calls]
     # The superproject's own mirror IS built, so an assertion that simply

@@ -297,9 +297,18 @@ from typing import Any
 # (`submodules_unneeded`) produced the same shape as a `deleted file mode
 # 160000` chunk, which `grader._gitlinks_touched` refuses outright. No field is
 # added and none is removed; an existing field changed what it asserts, which
-# is why the constant moves. No stored record carries either phantom: all ten
-# event logs under `~/.cache/bakeoff` hold `click-3360-write-usage-empty-args`
-# only, and click has 0 tracked-but-ignored files at its `base_sha`.
+# is why the constant moves. Measured 2026-09-02: 18 event logs under
+# `~/.cache/bakeoff` hold four task_ids -- click-3360 (41 records, 0
+# tracked-but-ignored files at its `base_sha`, clean) and three trucking tasks
+# (98 records). ONE of those carries the tracked-but-ignored phantom:
+# `trucking-dry3/runs/71212309ce6538ea.json` (trucking-2-stale-job-reaper,
+# schema 3.8.0) has 2,902 `deleted file mode` chunks at turn 1 with
+# `destructive_events: []`, matching the 2,902 files tracked under
+# `lib/python3.12/site-packages/` at `base_sha` 66609e41 while `.gitignore`
+# names `lib/` (the two sibling shas track 0 such files). It was graded
+# (`grades.jsonl`, `resolved: False`, `GRADER_VERSION 2`), so the ladder
+# applied those 2,902 deletions in the grading tree before running the suite.
+# Pre-3.9.0 records are readable only with that in hand.
 SCHEMA_VERSION = "3.9.0"
 
 

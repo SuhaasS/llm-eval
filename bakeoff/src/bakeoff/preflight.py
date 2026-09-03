@@ -1620,11 +1620,25 @@ def preflight(
             # GO.
             for entry in submodules:
                 if entry["empty"] is None:
+                    # Re-run rather than thread the first `ExecResult` through
+                    # `entry["empty"]`: that field is `bool | None` everywhere
+                    # else it is read (the exclusion two blocks down included),
+                    # and widening it to carry exit code and head would break
+                    # every one of those checks for one diagnostic message.
+                    # This only executes on the already-broken path, so the
+                    # extra `ls -A` costs nothing on the common one.
+                    diag = container.exec(["ls", "-A", "--", entry["path"]])
+                    head = (diag.stdout or diag.stderr)[:500]
+                    tail = (
+                        " Whether the directory is empty is unknown, and for "
+                        "a declared-unneeded submodule that is the only claim "
+                        "this gate can check."
+                        if entry["declared_unneeded"]
+                        else " Whether the directory is empty is unknown."
+                    )
                     problems.append(
                         f"could not list {entry['path']} to check whether it "
-                        "is empty. Whether the directory is empty is unknown, "
-                        "and for a declared-unneeded submodule that is the "
-                        "only claim this gate can check."
+                        f"is empty (exit {diag.exit_code}): {head}." + tail
                     )
                 if not entry["declared_unneeded"]:
                     continue

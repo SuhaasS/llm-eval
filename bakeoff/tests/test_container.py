@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -667,7 +668,14 @@ def test_a_moved_gitlink_still_reaches_the_submission(git_container_factory):
     diff, files = container.snapshot_diff(start)
 
     assert "vendor/libdep" in files
-    assert "160000" in diff
+    # A bare "160000" substring is satisfied by `deleted file mode 160000` --
+    # the phantom this seed removes -- as much as by a genuine move, so it
+    # cannot tell the two apart. `grader._GITLINK_MODE` matches on the mode
+    # line's exact shape; assert that shape, and rule the phantom out
+    # explicitly rather than relying on the positive match alone.
+    assert re.search(r"^index [0-9a-f]+\.\.[0-9a-f]+ 160000$", diff,
+                      re.MULTILINE)
+    assert "deleted file mode 160000" not in diff
 
 
 def test_a_first_stream_frame_yields_no_percentage():

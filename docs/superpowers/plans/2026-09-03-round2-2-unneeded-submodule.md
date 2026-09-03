@@ -2107,12 +2107,21 @@ exercise the phantom-deletion fix against a real git.
   `ls -A` reads (D6), which refuse the task rather than scoring it. **If item
   17 does not land**, Task 6 Step 5 files a `TASKS.md` line naming the gap;
   if it does, the line is redundant and is not written.
-- **It does not need to re-grade anything.** Whether a stored record carries
-  either phantom is now **answered, not filed**: all ten event logs under
-  `~/.cache/bakeoff` hold `click-3360-write-usage-empty-args` records only,
-  and click has 0 tracked-but-ignored files at its `base_sha` and no gitlink.
-  `SCHEMA_VERSION` moves to keep *future* records readable across the change,
-  not to annotate past ones.
+- **Whether a stored record carries either phantom was checked, not assumed
+  — and one does.** Re-measured 2026-09-02 (code review of `df699a8`,
+  finding 1): 18 event logs under `~/.cache/bakeoff` hold four task_ids, not
+  one. `click-3360-write-usage-empty-args` (41 records) is clean, but
+  `trucking-dry3/runs/71212309ce6538ea.json` (`trucking-2-stale-job-reaper`,
+  schema 3.8.0) carries 2,902 `deleted file mode` chunks matching the 2,902
+  files tracked under `lib/python3.12/site-packages/` at its `base_sha` while
+  `.gitignore` names `lib/` — exactly the tracked-but-ignored phantom this
+  item removes, on a task whose `destructive_events` field says `[]`. It was
+  already graded (`grades.jsonl`, `resolved: False`, `GRADER_VERSION 2`), so
+  the ladder applied those deletions in the grading tree. `SCHEMA_VERSION`
+  moves to keep *future* records readable across the change; it does not by
+  itself fix that one stored verdict. Re-grading `71212309ce6538ea` (or
+  auditing the other 97 trucking records for the same shape) is separate work
+  and is filed in `TASKS.md`, not done here.
 
 ---
 

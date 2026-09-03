@@ -3067,7 +3067,12 @@ def test_an_unlistable_submodule_directory_records_None_and_a_problem(
         monkeypatch, tmp_path):
     """`None`, never `False`. An unlistable directory is the "not measured"
     absence, and rendering it as the measured claim `False` would let a
-    permission error read as "the gate checked and the directory is empty"."""
+    permission error read as "the gate checked and the directory is empty".
+
+    The message names the exit code and the read's own output (re-read
+    rather than threaded through `entry["empty"]`, which stays `bool | None`
+    everywhere else it is checked), and its tail claims the declaration
+    because this path IS declared unneeded."""
     container = _ScriptedContainer(
         start_sha="s" * 40, tests=_FakeTests(), present=("tests/",),
         gitlinks=("vendor/libdep",),
@@ -3080,7 +3085,36 @@ def test_an_unlistable_submodule_directory_records_None_and_a_problem(
 
     assert not result.ok
     assert result.evidence["submodules"][0]["empty"] is None
-    assert any("could not list vendor/libdep" in p for p in result.problems)
+    problem = next(p for p in result.problems
+                   if "could not list vendor/libdep" in p)
+    assert "(exit 2)" in problem
+    assert "cannot access 'vendor/libdep'" in problem
+    assert "declared-unneeded submodule" in problem
+
+
+def test_an_unlistable_needed_submodule_directory_does_not_claim_a_declaration(
+        monkeypatch, tmp_path):
+    """`empty` is measured for every submodule, needed ones included -- but
+    the "only claim this gate can check" sentence is about a DECLARATION the
+    manifest does not carry for a needed path, so it must not appear here."""
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=_FakeTests(), present=("tests/",),
+        gitlinks=("vendor/libdep",),
+        submodule_status=(
+            " 942c381d88cecca36be86b2e902f554ad145ec44 vendor/libdep"
+            " (heads/main)\n"
+        ),
+        ls_exits={"vendor/libdep": 2},
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, _FakeTask(), container)
+
+    assert not result.ok
+    assert result.evidence["submodules"][0]["empty"] is None
+    problem = next(p for p in result.problems
+                   if "could not list vendor/libdep" in p)
+    assert "(exit 2)" in problem
+    assert "declared-unneeded submodule" not in problem
 
 
 def test_an_unneeded_declaration_the_index_has_no_gitlink_for_is_a_problem(

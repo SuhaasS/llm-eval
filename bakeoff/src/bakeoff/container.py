@@ -487,6 +487,16 @@ class RunContainer:
         the fallback for a silent failure here is the phantom deletion, which
         is the accusation this paragraph exists to prevent. Containment
         already lives one layer up in `checkpoints.maybe_capture`.
+
+        The seed is not free: `read-tree` discards the scratch index's stat
+        cache, so the `add -A` that follows re-hashes every tracked file
+        rather than trusting an unchanged mtime. Measured 2026-09-02 on a
+        358-file, 70 MB `sqlglot` worktree, three reps each: unseeded 0.01 s,
+        seeded 0.04 s -- a 4x multiplier, ~30 ms absolute. The cost scales
+        with the tracked bytes in the worktree, not with the size of the
+        change (`trucking-2`'s `base_sha` tracks 2,902 site-packages files on
+        top of its source tree); if that ever binds, the remedy is a narrower
+        base for the read-tree, never a conditional seed.
         """
         env = {"GIT_INDEX_FILE": SNAPSHOT_INDEX}
         self.checked_exec(["git", "read-tree", base_sha], env=env)

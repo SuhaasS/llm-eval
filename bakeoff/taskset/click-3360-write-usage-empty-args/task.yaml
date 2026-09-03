@@ -214,7 +214,9 @@ tests:
 # first. Without that seed an uninitialised gitlink reads as a DELETION
 # against an index `git add -A` built from a worktree scan, and the offline
 # grader refuses every such submission as submodule_gitlink_ungradable
-# (measured 2026-09-02: 239 bytes on this repository, clean tree).
+# (measured 2026-09-02: 237 bytes on `tobymao/sqlglot` at start_sha
+# 4b61ee5603e7..., clean tree -- this repository, pallets/click, has no
+# submodule at its base_sha, so the figure cannot be reproduced here).
 #
 # Section 6.4 confound, to be recorded here by any task that uses it: the
 # humans who wrote the PR had the submodule.
