@@ -259,7 +259,23 @@ _PYTEST_ADAPTER = for_framework("pytest")
 #: cached PASS was a PASS for the same reasons and a NO-GO is still a NO-GO.
 #: What is re-run is the MEASUREMENT, not the judgement, and re-running it is
 #: the point.
-PREFLIGHT_VERSION: str = "18"
+#:
+#: 18 -> 19: adds a refusal a node manifest can trip and a pytest one cannot:
+#: a declared f2p or p2p id that names MORE THAN ONE test in its own file. A
+#: node id is `<file>::<fullName>` with no positional index, so two
+#: identically titled tests in one file are the same id -- measured
+#: 2026-09-02, an exact anchored `-t` runs both (one passed and one failed in
+#: the same run) and the deselection skips both, so the red-before check was
+#: satisfied by whichever one fails, the green-after check by both passing,
+#: and no count downstream disagreed. A cached PASS under 18 on a NODE task
+#: is stale: it was taken by a gate that could not see the shape. A cached
+#: NO-GO is unaffected -- nothing this version adds turns a NO-GO into a GO
+#: -- and no PYTEST verdict moves at all, since `pytest_adapter.duplicate_ids`
+#: is `{}` as a claim its node ids back. The new evidence key
+#: `same_file_duplicate_ids` is `{}` on every verdict this version writes for
+#: a task at least one of whose node runs reported, and `None` where nothing
+#: counted.
+PREFLIGHT_VERSION: str = "19"
 
 
 def preflight_cache_key(task, image: str, start_sha: str) -> str:
@@ -436,7 +452,7 @@ EVIDENCE_KEYS: tuple[str, ...] = (
     *(f"grading_{key}_exit" for key in _GRADING_KEYS),
     "scope_prefixes", "scope_prefixes_absent", "p2p_scoped_after_exit",
     "duplicate_full_names", "scope_files_run", "scope_files_outside",
-    "ambiguous_file_filters",
+    "ambiguous_file_filters", "same_file_duplicate_ids",
 )
 
 
@@ -1335,12 +1351,35 @@ def preflight(
     #: positional) and an explicit-`tests.p2p` task makes no scoped run at all.
     seen_files: set[str] = set()
     files_measured = False
+    #: Every `<file>::<fullName>` that MORE THAN ONE assertion in a single
+    #: `testResults` entry reached a verdict for, with the largest count any
+    #: run reported. Accumulated by MAX and never by SUM: the same test
+    #: executes in the before-run and again in the after-run, so a sum reads
+    #: every ordinary test as a duplicate.
+    #:
+    #: Over EVERY node run rather than the scoped one, and that is measured:
+    #: the scoped p2p run DESELECTS the f2p ids, and a deselected test is
+    #: `skipped` on vitest and `pending` on jest -- neither is terminal, so it
+    #: never reaches `executed_names`. A declared f2p duplicate is visible only
+    #: in the f2p runs, and a declared p2p one only in the p2p runs, which is
+    #: also the task shape (explicit `tests.p2p`) that makes no scoped run.
+    same_file_dupes: dict[str, int] = {}
+    dupes_measured = False
 
-    def _note(outcome):
-        nonlocal files_measured
+    def _note(outcome, report):
+        nonlocal files_measured, dupes_measured
         if outcome.files_run is not None:
             files_measured = True
             seen_files.update(outcome.files_run)
+        # `report_path() is None` is pytest, whose `duplicate_ids` is `{}` as a
+        # CLAIM its node ids back -- not an absence. A node run that wrote no
+        # report is the absence, and it leaves this flag alone: the flag says
+        # "at least one run was counted", never "every run was".
+        if adapter.report_path() is None or report is not None:
+            dupes_measured = True
+            for node_id, count in adapter.duplicate_ids(report).items():
+                same_file_dupes[node_id] = max(
+                    same_file_dupes.get(node_id, 0), count)
         return outcome
 
     tests = task.tests
@@ -2179,7 +2218,7 @@ def preflight(
         evidence["suite_timeout_s"] = runner.last_timeout_s
         evidence["f2p_before_exit"] = red.exit_code
         evidence["bounded_run_durations_s"]["f2p_before"] = _elapsed_s(red)
-        red_outcome = _note(runner.classify(red))
+        red_outcome = _note(runner.classify(red), runner.last_report)
 
         # Every declared f2p id must have RUN, not merely not-passed. Node
         # only in effect -- `not_run` is empty for pytest, which answers a
@@ -2259,7 +2298,7 @@ def preflight(
         evidence["bounded_run_durations_s"]["p2p_before"] = _elapsed_s(green)
         # Classified IMMEDIATELY after its own invocation: `classify` reads
         # `_Runner.last_report`, which the next `run` overwrites.
-        p2p_green = _note(runner.classify(green)).kind == KIND_PASSED
+        p2p_green = _note(runner.classify(green), runner.last_report).kind == KIND_PASSED
 
         if red_outcome.kind == KIND_PASSED:
             problems.append(
@@ -2425,7 +2464,7 @@ def preflight(
             after_f2p = runner.select(tests.f2p)
             evidence["f2p_after_exit"] = after_f2p.exit_code
             evidence["bounded_run_durations_s"]["f2p_after"] = _elapsed_s(after_f2p)
-            if _note(runner.classify(after_f2p)).kind != KIND_PASSED:
+            if _note(runner.classify(after_f2p), runner.last_report).kind != KIND_PASSED:
                 problems.append(
                     f"the f2p tests do NOT pass after the reference fix -- "
                     f"{adapter.explain(after_f2p.exit_code)}. A solved run "
@@ -2439,7 +2478,7 @@ def preflight(
             after_p2p = runner.pass_to_pass(tests)
             evidence["p2p_after_exit"] = after_p2p.exit_code
             evidence["bounded_run_durations_s"]["p2p_after"] = _elapsed_s(after_p2p)
-            if _note(runner.classify(after_p2p)).kind != KIND_PASSED:
+            if _note(runner.classify(after_p2p), runner.last_report).kind != KIND_PASSED:
                 problems.append(
                     "the reference fix regresses the rest of the suite -- "
                     f"{adapter.explain(after_p2p.exit_code)}. The reference "
@@ -2513,7 +2552,7 @@ def preflight(
                     # bound to a name: three assertions read this one run, and
                     # `classify` reads `_Runner.last_report`, which the next
                     # `run` overwrites.
-                    scoped_outcome = _note(runner.classify(scoped))
+                    scoped_outcome = _note(runner.classify(scoped), runner.last_report)
 
                     # Which EXECUTED tests under the scope share a full name
                     # across files. EVIDENCE, not a problem: a node selection
@@ -2677,6 +2716,51 @@ def preflight(
             "and cannot hit this. Rename or move one of the files in the task "
             "repo, or declare an explicit tests.p2p that does not reach either "
             "file; see taskset/HARVESTING.md."
+        )
+
+    evidence["same_file_duplicate_ids"] = (
+        dict(sorted(same_file_dupes.items())) if dupes_measured else None)
+    # DECLARED ids only, and the boundary is about what THIS component can
+    # prove. For a declared id the gate proves the ambiguity from its own runs:
+    # the f2p-before run shows two terminal assertions under the one id at
+    # `passed` and `failed` (measured), the f2p-after run shows two at
+    # `passed`, so red-before and green-after are satisfied by different tests
+    # and nothing downstream can say which -- `failed_ids` collapses them and
+    # `verify_selected` reports nothing missing. For an UNDECLARED duplicate
+    # the gate proves only that both twins ran and both passed; the harm needs
+    # the id to reach the quarantine, which `oracle._derive` computes at GRADE
+    # time from two reference runs this gate never makes.
+    #
+    # The accepted residual, stated because a residual nobody records is
+    # silence: a flaky undeclared twin CAN be quarantined, `_derive`
+    # deselects by node id, and that removes BOTH twins from check 6 -- so a
+    # submission that broke the healthy one can still be `resolved: True`. The
+    # two halves of the audit are the map above, in this task's cached
+    # preflight verdict, and `GradeRecord`'s quarantine; NOTHING joins them,
+    # and the intersection is the offline reader's to make.
+    declared = frozenset(tests.f2p) | frozenset(tests.p2p)
+    declared_dupes = {node_id: count
+                      for node_id, count in sorted(same_file_dupes.items())
+                      if node_id in declared}
+    if declared_dupes:
+        problems.append(
+            "these declared test ids each name MORE THAN ONE test in their "
+            "own file: "
+            + "; ".join(f"{node_id!r} names {count} tests"
+                        for node_id, count in declared_dupes.items())
+            + f". A {adapter.name} id is `<file>::<fullName>` with no "
+            "positional index, so two identically titled tests in one file "
+            "collapse to the SAME id and there is no way to declare, select "
+            "or deselect one of them. Measured 2026-09-02 (vitest 3.2.7, jest "
+            "30.5.0) on a file holding two tests titled `outer adds`: `-t "
+            "'^(?:outer adds)$'` ran BOTH on both frameworks -- one passed and "
+            "one failed in the same run -- so the red-before check is "
+            "satisfied by whichever of them fails and the green-after check by "
+            "both passing, with nothing saying they are the same test; and a "
+            "quarantine of the id deselects both, with p2p_deselected "
+            "AGREEING, because two tests really were skipped. Declare a "
+            "different test id, or cut the task from a PR whose tests are "
+            "uniquely titled; see taskset/HARVESTING.md."
         )
 
     # ONE null-aware maximum, here, rather than at each reader. `max(())`

@@ -83,6 +83,7 @@ def test_no_adapter_method_is_a_stub_any_more():
         assert adapter.explain(1)
         assert adapter.validate_id_set((), "tests.f2p") is None
         assert adapter.parse_deselected(stdout="", report=None) is None
+        assert adapter.duplicate_ids({"testResults": []}) == {}, name
 
     for name in ("vitest", "jest"):
         # No report is the config-error signal on these two, and it is the one
@@ -626,14 +627,16 @@ _REPORTS = Path(__file__).resolve().parent / "fixtures" / "node_reports"
 
 
 def _report(shape: str, framework: str) -> dict:
-    """One of the eight measured report shapes, replayed from disk.
+    """One of the nine measured report shapes, replayed from disk.
 
     Captured once in `node:22-bookworm-slim` against vitest 3.2.7 and jest
     30.5.0; see the README beside them for the argv each came from and for the
     exit code each run produced. They are replayed rather than re-measured
     because regenerating one needs a Docker daemon, a network and 73 MB of npm
     -- and because the whole point of these tests is that the exit code is not
-    what the classification rests on.
+    what the classification rests on. The ninth (`same_file_dup`) in
+    `bakeoff-eval-agent:base-node-22`, whose runners are the same pinned
+    versions -- see the README beside them.
     """
     return json.loads((_REPORTS / f"{shape}.{framework}.json").read_text())
 
@@ -1521,3 +1524,170 @@ def test_verify_selected_and_executed_names_read_ONE_rule():
     from bakeoff.runners import node_adapter
 
     assert "executed_names" in inspect.getsource(node_adapter.verify_selected)
+
+
+# --- duplicate_ids: two tests in one file answering to the same id ------------
+
+
+@pytest.mark.parametrize("framework", ["vitest", "jest"])
+def test_the_same_file_dup_fixture_holds_two_assertions_under_one_name(framework):
+    """M11.1: one testResults entry holding three assertionResults, two of
+    them with the identical fullName, title and ancestorTitles at statuses
+    passed and failed. On the runs this harness makes, nothing in the report
+    separates the pair: vitest emits no `location` key at all on a default
+    run (it appears only when a file:line positional turns task-location
+    capture on), and jest's `location` is present and `null` without
+    `--testLocationInResults`."""
+    report = _report("same_file_dup", framework)
+
+    assert len(report["testResults"]) == 1
+    suite = report["testResults"][0]
+    assertions = suite["assertionResults"]
+    assert len(assertions) == 3
+    dups = [a for a in assertions if a["fullName"] == "outer adds"]
+    assert len(dups) == 2
+    assert {a["status"] for a in dups} == {"passed", "failed"}
+    assert all(a["ancestorTitles"] == ["outer"] for a in dups)
+    assert all(a["title"] == "adds" for a in dups)
+    if framework == "vitest":
+        assert all("location" not in a for a in dups)
+    else:
+        assert all(a["location"] is None for a in dups)
+
+
+@pytest.mark.parametrize("framework", ["vitest", "jest"])
+def test_two_tests_with_the_same_name_in_one_file_are_ONE_failed_id(framework):
+    """M11.5: `classify` collapses the pair to one failed_id for two
+    assertions, which is what the record would carry -- one id, and no field
+    saying which of the two tests actually failed."""
+    outcome = for_framework(framework).classify(
+        exit_code=1, stdout="", stderr="",
+        report=_report("same_file_dup", framework))
+
+    assert outcome.kind == KIND_FAILED
+    assert outcome.failed_ids == {"tests/dup.test.js::outer adds"}
+    assert outcome.files_run == ("tests/dup.test.js",)
+
+
+@pytest.mark.parametrize("framework", ["vitest", "jest"])
+def test_verify_selected_reports_nothing_missing_for_a_duplicated_id(framework):
+    """The existing channels read this run clean -- which is why a new one
+    (`duplicate_ids`) is needed."""
+    from bakeoff.runners.node_adapter import verify_selected
+
+    report = _report("same_file_dup", framework)
+    adapter = for_framework(framework)
+
+    assert verify_selected(
+        report, ("tests/dup.test.js::outer adds",), adapter) == frozenset()
+
+
+@pytest.mark.parametrize("framework", ["vitest", "jest"])
+def test_duplicate_ids_counts_a_name_that_appears_more_than_once_in_one_file(
+        framework):
+    """Mutation selector `more_than_once_in_one_file`."""
+    adapter = for_framework(framework)
+
+    assert adapter.duplicate_ids(_report("same_file_dup", framework)) == {
+        "tests/dup.test.js::outer adds": 2}
+
+
+@pytest.mark.parametrize("framework", ["vitest", "jest"])
+def test_duplicate_ids_of_a_clean_report_is_empty_and_that_is_a_measurement(
+        framework):
+    """The `pass` fixture's three fullNames are distinct."""
+    adapter = for_framework(framework)
+
+    assert adapter.duplicate_ids(_report("pass", framework)) == {}
+
+
+@pytest.mark.parametrize("framework", ["vitest", "jest"])
+def test_duplicate_ids_of_a_report_that_does_not_exist_is_empty(framework):
+    """Deliberately not `None`: the absence is preflight's to record, with
+    the same guard `duplicate_full_names` carries, because a report-less run
+    measured nothing."""
+    assert for_framework(framework).duplicate_ids(None) == {}
+
+
+@pytest.mark.parametrize("framework", ["vitest", "jest"])
+def test_duplicate_ids_counts_only_tests_that_reached_a_verdict(framework):
+    """M11.4: the scoped p2p run DESELECTS the f2p ids, and a deselected
+    duplicate is `skipped` on vitest and `pending` on jest -- neither
+    terminal, so it cannot make a verdict ambiguous. This is why the scoped
+    p2p run cannot see an f2p duplicate at all, and preflight's accumulator
+    has to span every node run rather than the scoped one."""
+    status = "skipped" if framework == "vitest" else "pending"
+    report = {"testResults": [
+        {"name": "/repo/tests/dup.test.js", "status": "passed",
+         "assertionResults": [
+             {"status": "passed", "fullName": "outer adds"},
+             {"status": status, "fullName": "outer adds"},
+         ]},
+    ]}
+
+    assert for_framework(framework).duplicate_ids(report) == {}
+
+
+@pytest.mark.parametrize("framework", ["vitest", "jest"])
+def test_duplicate_ids_does_not_count_one_test_seen_in_two_suite_entries(
+        framework):
+    """Counting per `testResults` entry can only UNDER-report a duplicate,
+    never invent one -- and item 1's `ambiguous_file_filters` is what makes
+    the overlapping-groups shape (`merge_reports` concatenating two entries
+    for the same file) unreachable in the first place."""
+    report = {"testResults": [
+        {"name": "/repo/tests/a.test.js", "status": "passed",
+         "assertionResults": [{"status": "passed", "fullName": "works"}]},
+        {"name": "/repo/tests/a.test.js", "status": "passed",
+         "assertionResults": [{"status": "passed", "fullName": "works"}]},
+    ]}
+
+    assert for_framework(framework).duplicate_ids(report) == {}
+
+
+def test_pytest_duplicate_ids_is_empty_and_that_is_a_claim():
+    """A pytest node id names exactly one test by construction: two
+    functions with the same name in one module shadow each other, a class
+    scope is part of the id, and pytest appends an index for a colliding
+    parametrized case -- so `--deselect a.py::test_x` reaches one test and
+    one test only. See `pytest_adapter.duplicate_ids`' own docstring."""
+    adapter = for_framework("pytest")
+
+    assert adapter.duplicate_ids({"testResults": []}) == {}
+    assert adapter.duplicate_ids(None) == {}
+
+
+def test_executed_names_and_duplicate_ids_read_ONE_rule():
+    """Mirrors `test_verify_selected_and_executed_names_read_ONE_rule`:
+    both `executed_names` and `duplicate_ids` delegate to `_executed` rather
+    than each re-implementing the terminal-status test."""
+    import inspect
+
+    from bakeoff.runners import node_adapter
+
+    assert "_executed" in inspect.getsource(
+        node_adapter._NodeFlavour.executed_names)
+    assert "_executed" in inspect.getsource(
+        node_adapter._NodeFlavour.duplicate_ids)
+
+
+def test_the_first_eight_space_report_guard_in_this_module_is_the_classifiers():
+    """`mutation_check.py` replaces the FIRST eight-space `if report is
+    None:` in this module, and it must be `classify`'s: indentation is what
+    excludes `verify_selected`'s four-space guard, position is what picks
+    `classify` out among the method bodies, and nothing in the language
+    enforces either. A NEW method added above `classify` carrying that guard
+    defeats the anchor exactly as a moved `_executed` would, and
+    `mutation_check` would report CAUGHT for the wrong reason."""
+    import inspect
+
+    from bakeoff.runners import node_adapter
+
+    lines = inspect.getsource(node_adapter).splitlines()
+    guards = [index + 1 for index, line in enumerate(lines)
+              if line == "        if report is None:"]
+    body, start = inspect.getsourcelines(node_adapter._NodeFlavour.classify)
+    assert guards, "the anchor mutation_check.py replaces no longer exists"
+    assert start <= guards[0] < start + len(body), (
+        f"the first eight-space `if report is None:` is at line {guards[0]}, "
+        f"outside classify (lines {start}-{start + len(body) - 1})")

@@ -101,7 +101,7 @@ diff --git a/src/calc.js b/src/calc.js
 _RUNNER = '["/node_modules/.bin/vitest", "run", "--no-cache"]'
 
 
-def _manifest(upstream: Path, base: str) -> str:
+def _manifest(upstream: Path, base: str, task_id: str = "node-smoke") -> str:
     """The task.yaml text.
 
     NO `start_sha`. A real task pins it, so that a re-cut patch or a different
@@ -118,9 +118,14 @@ def _manifest(upstream: Path, base: str) -> str:
     `image.node`, never `image.python` -- `load_task` refuses the latter
     beside a node framework, because two keys that each imply a runtime is two
     sources for one fact.
+
+    `task_id` defaults to the original fixture's, and a SECOND task cut from
+    this same template must pass its own: `build_task_image` caches by task
+    id among other things, and two fixtures sharing one would risk one's
+    image being served for the other's task.
     """
     return (
-        "task_id: node-smoke\n"
+        f"task_id: {task_id}\n"
         "task_version: 1\n"
         "repo:\n"
         f"  url: {upstream}\n"
@@ -313,6 +318,90 @@ def test_a_cross_file_duplicate_full_name_gates_and_selects_only_its_own_file(
         shutil.rmtree(tree, ignore_errors=True)
 
 
+@pytest.fixture(scope="module")
+def dup_task_dir(tmp_path_factory):
+    """The same fixture, but `tests/calc.test.js` carries a DECOY that shares
+    the f2p test's `fullName`.
+
+    A same-file duplicate, not the cross-file one `duplicate_task_dir` above
+    is. `_REFERENCE`'s hunk is `@@ -1,2 +1,4 @@`, whose pre-image is exactly
+    the base file's first two lines and whose last context line is `it('keeps
+    subtracting elsewhere' …)`, so a third line beyond the hunk -- the decoy
+    below -- changes nothing about whether the patch applies. The start state
+    therefore holds TWO tests titled `adds two numbers` in one file: the
+    reference test half's, which fails until the reference fix lands, and the
+    decoy, which always passes -- M11.2's shape, measured here in a real
+    image rather than a scripted report.
+    """
+    root = tmp_path_factory.mktemp("node-task-same-dup")
+    upstream = root / "upstream"
+    shutil.copytree(FIXTURE, upstream)
+    (upstream / "src" / "calc.js").write_text(
+        "export function add(a, b) { return a - b; }\n")
+    (upstream / "tests" / "calc.test.js").write_text(
+        "import { it, expect } from 'vitest';\n"
+        "it('keeps subtracting elsewhere', () => { expect(3 - 1).toBe(2); });\n"
+        "it('adds two numbers', () => { expect(1 + 1).toBe(2); });\n"
+    )
+    for args in (["init", "-q"], ["config", "user.email", "t@t.test"],
+                 ["config", "user.name", "t"], ["add", "-A"],
+                 ["commit", "-q", "-m", "base"]):
+        subprocess.run(["git", *args], cwd=upstream, check=True,
+                       capture_output=True)
+    base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=upstream,
+                          check=True, capture_output=True,
+                          text=True).stdout.strip()
+
+    task_dir = root / "task"
+    task_dir.mkdir()
+    (task_dir / "reference.diff").write_text(_REFERENCE)
+    (task_dir / "task.yaml").write_text(
+        _manifest(upstream, base, task_id="node-smoke-dup"))
+    return task_dir
+
+
+@pytest.fixture(scope="module")
+def dup_node_image(dup_task_dir):
+    """This fixture's own image, under its own task id -- `node_image` and
+    this one must never be served for each other's task."""
+    base = build_base_image(REPO_ROOT, "node", "22")
+    image = build_task_image(load_task(dup_task_dir), base,
+                             CACHE_ROOT / "build-same-dup", CACHE_ROOT)
+    assert image.startswith("sha256:")
+    assert not image_entrypoint(image)
+    return image
+
+
+@pytest.fixture
+def dup_node_tree(dup_task_dir):
+    """A fresh run tree for the same-file-duplicate fixture, at a path no
+    other test uses. See `node_tree`'s docstring for why this is a UUID path
+    and not a reused one."""
+    tree = fresh_tree(CACHE_ROOT / "tree")
+    task = load_task(dup_task_dir)
+    start_sha = materialize(task, tree / "repo", CACHE_ROOT)
+    yield task, tree / "repo", start_sha
+    shutil.rmtree(tree, ignore_errors=True)
+
+
+def test_a_same_file_duplicate_of_the_f2p_title_is_refused(
+    dup_node_tree, dup_node_image
+):
+    """M11.2 end to end, in a real image: the declared f2p id resolves to
+    TWO assertions in `tests/calc.test.js` -- the reference test, red until
+    the fix lands, and the always-passing decoy -- and preflight refuses the
+    manifest rather than reporting a clean gate over an ambiguous verdict."""
+    task, repo, start_sha = dup_node_tree
+
+    result = preflight(task, image=dup_node_image, repo_path=repo,
+                       start_sha=start_sha)
+
+    assert not result.ok
+    assert any("names 2 tests" in p for p in result.problems)
+    assert result.evidence["same_file_duplicate_ids"] == {
+        "tests/calc.test.js::adds two numbers": 2}
+
+
 @contextlib.contextmanager
 def _mounted(image: str, repo: Path, start_sha: str):
     """A `RunContainer` whose bind mount is PROVEN to have landed.
@@ -382,6 +471,7 @@ def test_the_node_fixture_gates_green(node_tree, node_image):
     # config gives on both node frameworks -- so a real green gate is the one
     # place the `[]` side of that distinction can be measured end to end.
     assert result.evidence["duplicate_full_names"] == []
+    assert result.evidence["same_file_duplicate_ids"] == {}
     assert result.evidence["scope_files_outside"] == []
     assert result.evidence["runner_cache_flags_missing"] == []
     assert result.evidence["dirty_after_tests"] == ""

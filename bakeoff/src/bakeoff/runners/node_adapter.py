@@ -45,6 +45,22 @@ positional with a pattern over only that file's titles, and a deselection is
 excluded and no `-t` at all, then one group per such file carrying only its own
 deselected titles. Measured, one positional plus one `-t` pairs exactly.
 
+TWO TESTS WITH THE SAME NAME IN ONE FILE ARE ONE ID, and that is unfixable
+here rather than merely unguarded. Item 1 gave each file its own argv, which
+closes the *cross*-file collision; a same-file pair has nothing left to
+separate it. Measured 2026-09-02 (vitest 3.2.7, jest 30.5.0) on a file
+holding two `it('adds')` under one `describe('outer')`: the report carries
+two `assertionResults` with the identical `fullName`, `title` and
+`ancestorTitles`, and on the runs this harness makes neither framework
+reports a `location` beside them -- vitest emits the key only when a
+`file:line` positional turns task-location capture on, and jest's is `null`
+without `--testLocationInResults`. `-t '^(?:outer adds)$'` runs BOTH -- one
+passed and one failed in the same run -- and the deselection skips both with
+`numPendingTests: 2` for one requested id. `classify` then reports ONE
+`failed_id` for the pair and `verify_selected` reports nothing missing, so
+every channel reads clean. `duplicate_ids` is what says so instead, and
+preflight refuses a task whose DECLARED ids are in it.
+
 TWO FRAMEWORK ASYMMETRIES DECIDE THE ARGV, and both were measured rather than
 assumed. First, the per-file positional: jest's is a JavaScript `RegExp` tested
 against BOTH the repo-relative path and the absolute one, so a mount-anchored,
@@ -522,33 +538,90 @@ class _NodeFlavour:
             return None
         return report.get("numPendingTests")
 
+    def _executed(self, report):
+        """`(suite ordinal, relpath, fullName)` for every assertion that
+        reached a verdict.
+
+        ONE rule with three readers -- `executed_names` (which
+        `verify_selected` and preflight's cross-file duplicate evidence go
+        through) and `duplicate_ids` (preflight's same-file refusal). A second
+        copy of the terminal-status test is a second thing that can be wrong
+        about what ran, inside the checks that exist to be right about it.
+
+        `passed` OR `failed`, never `skipped`/`pending`/`todo`: a deselected
+        test and a test that was never selected are the same shape in the
+        report (measured -- a `-t` matching nothing exits 0 with every test
+        skipped), and both of this generator's readers are claims about what
+        actually RAN.
+
+        THE SUITE ORDINAL is carried because `duplicate_ids` counts within one
+        `testResults` entry and not across the report. Since item 1 a report
+        can be the merge of several argv groups, so one file could appear as
+        two entries; counting per entry can only UNDER-report a duplicate,
+        never invent one, and inventing one refuses a healthy task.
+
+        DEFINED BELOW `classify`, and that is not stylistic:
+        `scripts/mutation_check.py` anchors `classify`'s own `if report is
+        None:` by its exact eight-space text and replaces the FIRST
+        occurrence. This method now carries that guard (`executed_names` used
+        to), so an eight-space `if report is None:` added ANYWHERE above
+        `classify` -- this one moved, or a new method -- silently moves the
+        mutation to a different guard, and `mutation_check` reports CAUGHT for
+        the wrong reason. Pinned over the whole module by
+        `test_the_first_eight_space_report_guard_in_this_module_is_the_classifiers`.
+        """
+        if report is None:
+            return
+        for ordinal, suite in enumerate(report.get("testResults") or []):
+            path = self._relpath(suite.get("name") or "")
+            for item in suite.get("assertionResults") or []:
+                if item.get("status") in _TERMINAL_STATUSES:
+                    yield ordinal, path, item.get("fullName", "")
+
     def executed_names(self, report):
         """Every assertion that reached a verdict, as `(relpath, fullName)`.
-
-        `scripts/mutation_check.py` anchors `classify`'s own `if report is
-        None:` by its exact text and replaces the FIRST occurrence, and what
-        keeps that anchor on the right guard is INDENTATION, not position: the
-        anchor carries eight leading spaces, so every method body here matches
-        it and `verify_selected`'s module-level four-space guard -- which sits
-        EARLIER in this file than `classify` does -- cannot. Position only
-        orders the method-body ones among themselves. So a new four-space
-        `if report is None:` anywhere is harmless; an eight-space one added
-        above `classify` would silently move the mutation to a different
-        guard, and `mutation_check` would report CAUGHT for the wrong reason.
 
         `passed` OR `failed`, the same rule `verify_selected` reads through
         this method: a test that was skipped and a test that was never
         selected are the same shape in the report, and preflight's
         duplicate-name assertion is a claim about what actually RAN under
         `tests.paths`.
+
+        A two-line wrapper over `_executed`, which owns that rule and the
+        `report is None` guard for all three readers -- this one,
+        `verify_selected` through it, and `duplicate_ids`. The mutation-anchor
+        argument that used to live in this docstring moved there with the
+        guard.
         """
-        if report is None:
-            return
-        for suite in report.get("testResults") or []:
-            path = self._relpath(suite.get("name") or "")
-            for item in suite.get("assertionResults") or []:
-                if item.get("status") in _TERMINAL_STATUSES:
-                    yield path, item.get("fullName", "")
+        for _, path, name in self._executed(report):
+            yield path, name
+
+    def duplicate_ids(self, report):
+        """`<file>::<fullName>` -> the tests in that file answering to it,
+        for the ids where that is more than one.
+
+        The half NEITHER a loader NOR a cross-file rule can see: both
+        duplicates are the identical id string, so `validate_id_set` compares
+        it with itself and `duplicate_full_names`' `first != path` is False by
+        construction. Measured 2026-09-02 (vitest 3.2.7, jest 30.5.0): an
+        exact anchored `-t` runs both -- one passed and one failed in the same
+        run -- and the deselection skips both with `numPendingTests: 2` for
+        one requested id, so no count downstream disagrees with anything.
+
+        `{}` for a report that does not exist, which is NOT the same fact as
+        "a report was read and holds no collision": preflight records that
+        absence with the flag that guards this call, exactly as it does for
+        `duplicate_full_names` and `f2p_before_not_run`.
+        """
+        counts: dict[tuple[int, str], int] = {}
+        for ordinal, path, name in self._executed(report):
+            key = (ordinal, f"{path}::{name}")
+            counts[key] = counts.get(key, 0) + 1
+        out: dict[str, int] = {}
+        for (_, node_id), count in counts.items():
+            if count > 1:
+                out[node_id] = max(out.get(node_id, 0), count)
+        return dict(sorted(out.items()))
 
     def module_of(self, node_id):
         # Split once, from the LEFT. A JavaScript test title may itself

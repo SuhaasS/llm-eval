@@ -1954,7 +1954,7 @@ MUTATIONS = [
         # would stand in as this run's evidence.
         #
         # The anchor text also occurs in `parse_deselected` and in
-        # `executed_names`; `run` replaces the FIRST occurrence, which is the
+        # `_executed`; `run` replaces the FIRST occurrence, which is the
         # classifier's, and both of those are defined below it for that reason.
         "runners: read a report that was never written as a clean run",
         "src/bakeoff/runners/node_adapter.py",
@@ -2489,6 +2489,33 @@ MUTATIONS = [
         "            )",
         "            self._selected = tuple(tests.p2p)",
         "tests/test_grader.py -k quarantined_p2p_id_is_not_reported",
+        "not integration",
+    ),
+    (
+        # M11.2/M11.3, measured 2026-09-02 (vitest 3.2.7, jest 30.5.0): an
+        # exact anchored `-t` against a file holding two identically titled
+        # tests runs BOTH, one passing and one failing in the same run, and
+        # the negated form skips BOTH with `numPendingTests: 2` for one
+        # requested id. So a node id is one name for two tests and nothing
+        # downstream counts the collision unless this branch does.
+        "runners: count two same-named tests in one file as one",
+        "src/bakeoff/runners/node_adapter.py",
+        "            if count > 1:",
+        "            if False:",
+        "tests/test_runners.py -k more_than_once_in_one_file",
+        "not integration",
+    ),
+    (
+        # The consequence of the branch above going uncaught: red-before is
+        # satisfied by whichever of the pair fails, green-after by both
+        # passing, and `F2P_FAILED`/`resolved: True` is stamped on a pair the
+        # record cannot name -- `failed_ids` collapses them to one id and
+        # `verify_selected` reports nothing missing.
+        "preflight: accept a declared id that names two tests",
+        "src/bakeoff/preflight.py",
+        "    if declared_dupes:",
+        "    if False:",
+        "tests/test_preflight.py -k names_more_than_one_test",
         "not integration",
     ),
 ]

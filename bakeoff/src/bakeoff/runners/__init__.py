@@ -100,10 +100,12 @@ class RunnerAdapter(Protocol):
     Everything here is a pure function of its arguments except that nothing
     here touches a container: the adapter builds argv and reads output, and the
     caller runs the command. That is what keeps `classify` testable against a
-    captured report with no Docker daemon -- which matters, because the eight
-    node report shapes this package branches on were captured once and can be
-    replayed forever, while re-measuring them needs a network and 73 MB of
-    npm.
+    captured report with no Docker daemon -- which matters, because the nine
+    captured node report shapes were measured once and can be replayed
+    forever, while re-measuring them needs a network and 73 MB of npm. (Eight
+    of the nine are `classify` branches; the ninth is the two-tests-one-name
+    shape `duplicate_ids` reads, which `classify` sees as an ordinary
+    failure.)
     """
 
     #: The manifest's `tests.framework` value.
@@ -223,6 +225,17 @@ class RunnerAdapter(Protocol):
         `b.py::test_x` and the hazard does not exist there. preflight writes
         the evidence key either way, as `[]`, which is "measured, nothing
         found" and not "not measured".
+        """
+
+    def duplicate_ids(self, report: dict | None) -> dict[str, int]:
+        """`<file>::<fullName>` -> how many tests in that file answer to it.
+
+        Only ids that MORE THAN ONE assertion in a single `testResults` entry
+        reached a verdict for; an id that names exactly one test is absent.
+        `{}` for a framework whose ids are unique by construction, and `{}`
+        for a report that does not exist -- preflight records THAT absence
+        with its own flag, because a report-less run measured nothing and an
+        empty map here would say it looked and found nothing.
         """
 
     def module_of(self, node_id: str) -> str:

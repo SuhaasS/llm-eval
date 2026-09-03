@@ -4518,3 +4518,135 @@ non-empty one, and the OQ1/OQ4 rulings) was transcribed as written; no other
 defect was found.
 
 `graphify update .` run after the source edits.
+
+## Round 2 item 11 — a declared node id that names two tests in its own file — 2026-09-03
+
+Plan: `docs/superpowers/plans/2026-09-03-round2-11-same-file-duplicates.md`
+(reviewed twice, APPROVED, 0 open findings after review 2). Transcribed as
+written, plus one carried-forward fix (below).
+
+**What was measured (M11.1-M11.6).** A node id is `<file>::<fullName>` with no
+positional index. On a file holding two tests titled `outer adds`, measured
+2026-09-02 (vitest 3.2.7, jest 30.5.0): the report carries two
+`assertionResults` with the identical `fullName`, `title` and
+`ancestorTitles`, and on the runs this harness makes neither framework reports
+a `location` that separates them — vitest emits the key only when a `file:line`
+positional turns task-location capture on, jest's is `null` without
+`--testLocationInResults`. An exact anchored `-t '^(?:outer adds)$'` ran BOTH
+on both frameworks — one passed and one failed in the same run — and the
+negated form skipped BOTH at `numPendingTests: 2` for one requested id. So
+`classify` reports ONE `failed_id` for the pair, `verify_selected` reports
+nothing missing, and a deselected duplicate is not in `_TERMINAL_STATUSES` (so
+the scoped p2p run — which deselects the f2p ids — cannot see an f2p
+duplicate at all). A positional index would not help either: vitest's
+`file:line` positional selects one of the pair but jest reads it as a path
+regex and collects zero tests, and neither framework can *deselect* by line,
+which the quarantine needs.
+
+**The boundary (D1).** Preflight refuses a task whose **declared** f2p or p2p
+id resolves to more than one terminal assertion in its own file
+(`same_file_duplicate_ids` intersected with `tests.f2p ∪ tests.p2p`), and
+records — without refusing — every same-file collision, declared or not, in
+that same evidence key. The line is drawn at what the gate can *prove*: for a
+declared id, the f2p-before run shows two terminal assertions at `passed` and
+`failed` and the f2p-after run shows two at `passed`, so the two claims the
+gate exists to make ("these tests were red", "these tests are green") are
+demonstrably satisfied by *different tests*, and nothing downstream can say
+which. For an undeclared duplicate the gate proves only that both twins ran
+and both passed; the harm needs the id to reach `oracle._derive`'s
+grade-time quarantine, which this gate never computes, so refusing on it would
+refuse repositories over a condition the refusing component cannot evaluate —
+re-erecting the corpus-wide exclusion item 1 dismantled, in the round convened
+to raise yield. The accepted residual is real and named rather than closed: a
+flaky undeclared twin CAN be quarantined, `_derive` deselects by node id, and
+that removes BOTH twins from check 6 — so a submission that broke the healthy
+twin can still grade `resolved: true`. Filed as a P2 bullet in `TASKS.md`
+rather than left only in this plan, since a residual nobody records is
+silence.
+
+**The accumulator (D2) and the refactor (D3).** `same_file_duplicate_ids` is
+accumulated over EVERY node run this gate makes (not the scoped one alone,
+for the reason above), per `testResults` entry (never across entries, so a
+`merge_reports`-concatenated report can only under-report a duplicate, never
+invent one), combined by MAX across runs (never SUM — the same test executes
+in the before-run and the after-run, and test 14's `f2p_twice=True` shape
+pins that a summing implementation reads 4 where the answer is 2), over
+terminal statuses only. `node_adapter.executed_names` is refactored onto a
+private `_executed(report)` generator that both it and the new
+`duplicate_ids(report)` delegate to, carrying the `report is None` guard for
+all three readers; `_executed` is defined immediately above `executed_names`
+and below `classify`, because `mutation_check.py`'s existing
+`if report is None:` anchor replaces the FIRST eight-space occurrence in the
+module and that must stay `classify`'s. `pytest_adapter.duplicate_ids` is
+`{}` unconditionally — a CLAIM pytest's node ids back (file + class + a
+parametrize index makes a pytest id unique by construction), not an absence.
+
+**Deviation from the plan: a pre-existing test-harness gap, fixed.**
+`_ScriptedContainer._node_timeout`'s p2p branch recognises the deselect-branch
+shape by `"-t" not in rest`("opening" a check). An EXPLICIT `tests.p2p` takes
+`p2p_argvs`' SELECTED branch instead, whose every group carries a `-t` for the
+identical reason `_f2p_open`'s own comment already gives for f2p's selection
+groups — so the heuristic misread the very first (and only) group of an
+explicit p2p check as a continuation and served it `{"testResults": []}`,
+regardless of what a test scripted into `container.reports`. Measured: this
+predates round 2 item 11 entirely (reproduced against `50464d4`, before any of
+this item's edits, with a plain single-id `p2p=(...)`), and no existing test
+had ever asserted content-correctness of an explicit-p2p run, so it went
+uncaught. Plan test 15 (`test_a_declared_p2p_id_that_names_more_than_one_test_
+is_a_problem`) is the first test that needed it. Fixed the same way `_f2p_open`
+and `_scoped_groups` already are: a memoized `_p2p_select_groups` (the
+adapter's own selected-branch argv for `tests.p2p`) matched against the
+invocation, with a `_p2p_open` flag mirroring `_f2p_open`'s. `None`/empty
+when `tests.p2p` is empty, so it cannot affect the deselect-branch path any
+existing test exercises. This is a test-only fix (`tests/test_preflight.py`),
+touches no production code, and every test that passed before still does.
+
+**Real-corpus finding, not a defect.** The plan's own §6.5 verification step
+(re-gate `yaml-474-single-newline-empty-value` with `--force-preflight`)
+predicted either `same_file_duplicate_ids: {}` or a genuine finding to record.
+Measured here: **non-empty on both real node tasks in the probe corpus** —
+`yaml-474` reports three undeclared same-file collisions in
+`tests/doc/stringify.ts`, and `ufo-214-without-trailing-slash-query` reports
+two in `test/query.test.ts` and `test/utilities.test.ts` — and both still gate
+`preflight PASS`, because none of the six ids are declared. This is the D1
+boundary working as designed on real repositories: recorded, not refused. Not
+a HARVESTING.md screened-corpus entry, because that instruction is for a
+DECLARED duplicate producing a NO-GO, which did not happen on either task.
+
+**Verification.**
+- `.venv/bin/python -m pytest tests/ -q` — **1762 passed, 69 deselected**
+  (baseline 1734/69 + 28: 19 in `test_runners.py` — eight new tests ×2
+  frameworks plus three unparametrized — and 9 in `test_preflight.py`).
+- `.venv/bin/python scripts/mutation_check.py`, solo — **200/200 caught**
+  (198 baseline + 2: `runners: count two same-named tests in one file as one`
+  and `preflight: accept a declared id that names two tests`). Tree byte-clean
+  afterward.
+- `.venv/bin/python scripts/verify_logger.py` — **GATE PASSED**.
+- `.venv/bin/python -m pytest -v -m integration --basetemp="$HOME/.cache/
+  bakeoff-pytest"` — **67 passed, 3 skipped** (the pre-existing live
+  codex/judge skips), including the new
+  `test_a_same_file_duplicate_of_the_f2p_title_is_refused` against a real
+  container: `not result.ok`, a problem containing `"names 2 tests"`, and
+  `same_file_duplicate_ids == {"tests/calc.test.js::adds two numbers": 2}`.
+- `.venv/bin/python scripts/run_matrix.py --preflight-only --force-preflight
+  --task-set ~/.cache/bakeoff-probe/taskset --tasks
+  yaml-474-single-newline-empty-value` and `--tasks
+  ufo-214-without-trailing-slash-query` — both `preflight PASS`,
+  `preflight_version: 19`, `same_file_duplicate_ids` non-empty on both (see
+  above finding) and `ok: True` on both — no false refusal on either real
+  node task in the probe corpus.
+- `--tasks sqlglot-6927-dremio-trycast` against
+  `~/.cache/bakeoff-probe/ts-sqlglot-6927-dremio-trycast` — `preflight PASS`,
+  `same_file_duplicate_ids: {}`. The stored comparison blob predates several
+  round-2 evidence-schema items (`preflight_version` 15), so more than just
+  `preflight_version` and `same_file_duplicate_ids` differ against it; the
+  pytest-relevant claim — no pytest verdict moves, `duplicate_ids` is `{}` as
+  pytest's own claim — holds.
+
+Everything else in the plan (the module docstring rewrites, the fixture pair
+and its README/`_report` provenance updates, the `HARVESTING.md`/
+`BUILDING-A-TASK-SET.md`/`click-3360` doc edits, §4's grader-does-not-need-this
+argument, the §8 non-goals) was transcribed as written; no other defect was
+found.
+
+`graphify update .` run after the source edits.

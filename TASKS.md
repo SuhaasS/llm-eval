@@ -1295,22 +1295,31 @@ judge runs after one — which is why they sit here rather than above.
   whichever draw preflight happens to run, exactly as a pytest one did before
   broadening 3 closed it there.
 
-- [ ] **Two node ids with the same `fullName` in the SAME file are unguarded,
+- [x] **Two node ids with the same `fullName` in the SAME file are unguarded,
   and it is a different gap from the cross-file one — whose refusal round 2
-  item 1 REMOVED rather than kept.** `-t` matches `fullName` alone, so a
-  JS/TS suite that genuinely has two
-  identically-titled tests in one file is indistinguishable to a selection or
-  a deselection targeting either one — but there is no way to *represent* that
-  as two different declared ids in the first place, since a node id is exactly
-  `<file>::<fullName>` with no positional index: both same-file duplicates
-  collapse to the identical string. `node_adapter.validate_id_set` (the
-  loader, now a no-op) and preflight's `duplicate_full_names` check (the real
-  report, now evidence) both compare `(fullName, path)` pairs and only flag a
-  collision when the `path` differs — a same-file pair, where `path` agrees,
-  passes both by construction. The per-file grouping does not help here
-  either: both tests live in the one file that one argv names. A repo with
-  this shape reads as clean at every gate and silently over-selects or
-  over-deselects whichever test the manifest names.
+  item 1 REMOVED rather than kept.** Closed 2026-09-03 (round 2 item 11).
+  `-t` matches `fullName` alone, and a node id is exactly `<file>::<fullName>`
+  with no positional index, so two identically titled tests in one file are
+  the SAME id — measured 2026-09-02 (vitest 3.2.7, jest 30.5.0), an exact
+  anchored `-t` runs both (one passed and one failed in the same run) and the
+  negated form skips both at `numPendingTests: 2` for one requested id, so
+  `failed_ids` reports one id for two tests and no count downstream
+  disagrees. Preflight now refuses a task whose **declared** f2p or p2p ids
+  are in that shape, over evidence accumulated from every node run rather
+  than the scoped one alone (the scoped run deselects the f2p ids, and a
+  deselected duplicate is `skipped`/`pending`, not terminal). An
+  **undeclared** same-file duplicate is deliberately **recorded and not
+  refused**, as `same_file_duplicate_ids`: the gate can prove a declared id's
+  verdict is ambiguous from its own runs, and cannot prove an undeclared
+  twin's hazard, since the quarantine is `oracle._derive`'s, computed at
+  grade time from two reference runs the gate never makes. The accepted
+  residual — a flaky undeclared twin can be quarantined and take its healthy
+  sibling out of check 6, so a submission that broke the sibling can still
+  grade `resolved: true` — is real, named, and auditable only by hand (the
+  map is in the task's cached preflight verdict, the quarantine is in
+  `GradeRecord`, and nothing joins them); see the P2 bullet below.
+  `PREFLIGHT_VERSION` 19. `GRADER_VERSION` and `ORACLE_VERSION` do not move —
+  no argv changes, gated-equals-graded is unaffected.
 
 - [ ] **A node check is several commands and the record does not say how
   many.** Since round 2 item 1 a node p2p deselect run is 1 + K invocations
@@ -1446,6 +1455,24 @@ judge runs after one — which is why they sit here rather than above.
   assert about remotes", a fourth term in a post-condition `HANDOFF.md`
   spends three rounds warning against adding terms to casually — whoever
   picks this up needs that measurement first.
+
+- [ ] **Nothing joins `same_file_duplicate_ids` to a `GradeRecord` quarantine,
+  and the residual round-2 item 11 accepted lives in exactly that gap.**
+  Preflight records every `<file>::<fullName>` that more than one test in one
+  file answers to, declared or not; `oracle._derive` quarantines by node
+  **id**, so a quarantined *undeclared* twin deselects **both** twins from
+  check 6 — measured 2026-09-02 (vitest 3.2.7, jest 30.5.0), an exact
+  anchored `-t` runs both and the negated form skips both at
+  `numPendingTests: 2` for one requested id — and a submission that broke the
+  healthy twin can still grade `resolved: true`. A flaky twin reaches this
+  even on a task preflight measured green, because `_derive` runs the
+  reference suite twice where preflight runs it once. Both halves are stored
+  — the map in the task's cached preflight verdict, the quarantine in
+  `GradeRecord` — and **nothing intersects them**, so the audit exists only if
+  a reader thinks to make it by hand. The close is an offline view, or a
+  line in `grade.py`'s end-of-batch summary, that flags any graded run whose
+  quarantine names an id in that task's `same_file_duplicate_ids`. No
+  `SCHEMA_VERSION` move: both fields already exist.
 
 ---
 

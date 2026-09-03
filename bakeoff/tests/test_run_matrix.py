@@ -622,7 +622,7 @@ def test_a_cached_verdict_from_another_gate_is_not_printed(tmp_path):
 
     blob = {
         "manifest_digest": "d", "image": "sha256:img", "start_sha": "s" * 40,
-        "preflight_version": "18", "ok": True,
+        "preflight_version": PREFLIGHT_VERSION, "ok": True,
     }
     path = tmp_path / "preflight" / "t.json"
     path.parent.mkdir(parents=True)

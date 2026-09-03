@@ -84,6 +84,11 @@ tests:
   #   runner: ["/node_modules/.bin/vitest", "run", "--no-cache"]
   #   f2p: ["tests/formatting.test.ts::HelpFormatter writes usage with no args"]
   #
+  #   # The fullName must be unique inside its own file: a node id carries no
+  #   # positional index, so two identically titled tests in one file are one
+  #   # id -- `-t` runs both and deselects both -- and preflight refuses a
+  #   # manifest that declares it.
+  #
   # and, under `image:`, the node base's major instead of image.python:
   #
   #   node: "22"

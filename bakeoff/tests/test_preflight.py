@@ -1003,6 +1003,18 @@ class _ScriptedContainer:
         #: scripting emits one command per check and never reads them.
         self._f2p_open = False
         self._open = None
+        #: An EXPLICIT `tests.p2p` takes `p2p_argvs`' SELECTED branch, whose
+        #: groups all carry a `-t` for the same reason `_f2p_open`'s comment
+        #: gives for f2p's own selection -- so the deselect-branch's
+        #: `-t`-absent-means-opening heuristic below would read every one of
+        #: them as a continuation and serve `{"testResults": []}` for the
+        #: whole check. Recognised by MATCHING against the adapter's own
+        #: selected-branch groups, exactly as the f2p check and the scoped
+        #: check already are; `None` when `tests.p2p` is empty, since the
+        #: deselect branch is what runs then and this check must stay out of
+        #: its way.
+        self._p2p_select_groups = None
+        self._p2p_open = False
         #: The scoped check's own expected argv groups, memoized on first use
         #: (needs `tests.framework`'s adapter, not available yet at
         #: construction). Recognised by MATCHING against this list -- the
@@ -1292,16 +1304,39 @@ class _ScriptedContainer:
         scoped_index = next(
             (i for i, group in enumerate(self._scoped_groups)
              if group and rest[:len(group)] == group), None)
+        if self._p2p_select_groups is None and self.tests.p2p:
+            self._p2p_select_groups = adapter.p2p_argvs(
+                selected=tuple(self.tests.p2p), scope=(),
+                deselected=(), ignored=())
+        p2p_select_index = next(
+            (i for i, group in enumerate(self._p2p_select_groups or ())
+             if group and rest[:len(group)] == group), None)
         if any(group and rest[:len(group)] == group for group in select):
             # Every group of one selection belongs to the same check; the
             # check opens on the FIRST of them.
+            self._p2p_open = False
             opening = not self._f2p_open
             if opening:
                 self.f2p_runs += 1
                 self._f2p_open = True
             key = "f2p_before" if self.f2p_runs == 1 else "f2p_after"
+        elif p2p_select_index is not None:
+            # An EXPLICIT `tests.p2p` takes `p2p_argvs`' SELECTED branch,
+            # whose groups all carry a `-t` for the same reason `_f2p_open`'s
+            # own comment gives -- so the deselect-branch heuristic below
+            # would read every one of them as a continuation. Matched
+            # against the adapter's own groups instead, exactly as the f2p
+            # check is.
+            self._f2p_open = False
+            opening = not self._p2p_open
+            if opening:
+                self.p2p_runs += 1
+                self._p2p_open = True
+            self.p2p_argvs.append(list(rest))
+            key = "p2p_before" if self.p2p_runs == 1 else "p2p_after"
         else:
             self._f2p_open = False
+            self._p2p_open = False
             if scoped_index is not None:
                 opening = scoped_index == 0
                 if opening:
@@ -2466,10 +2501,26 @@ def test_the_preflight_version_moved_with_the_new_assertion():
     `bounded_run_durations_s` -- one entry per bounded invocation, `null` for
     a run that did not happen -- and `bounded_run_duration_max_s` beside it.
     No verdict moves: a cached 17 PASS was a PASS for the same reasons, so
-    what the bump re-runs is the MEASUREMENT and not the judgement."""
+    what the bump re-runs is the MEASUREMENT and not the judgement.
+
+    18 -> 19 is a refusal a node manifest can trip and a pytest one cannot
+    (round 2 item 11, 2026-09-03): a declared f2p or p2p id that names MORE
+    THAN ONE test in its own file. A node id is `<file>::<fullName>` with no
+    positional index, so two identically titled tests in one file are the
+    same id -- measured 2026-09-02, an exact anchored `-t` runs both (one
+    passed and one failed in the same run) and the deselection skips both, so
+    the red-before check was satisfied by whichever one fails, the
+    green-after check by both passing, and no count downstream disagreed. A
+    cached 18 PASS on a NODE task is stale: it was taken by a gate that could
+    not see the shape. A cached NO-GO is unaffected -- nothing this version
+    adds turns a NO-GO into a GO -- and no PYTEST verdict moves at all, since
+    `pytest_adapter.duplicate_ids` is `{}` as a claim its node ids back. The
+    new evidence key `same_file_duplicate_ids` is `{}` on every verdict this
+    version writes for a task at least one of whose node runs reported, and
+    `None` where nothing counted."""
     from bakeoff.preflight import PREFLIGHT_VERSION
 
-    assert PREFLIGHT_VERSION == "18"
+    assert PREFLIGHT_VERSION == "19"
 
 
 # --- fix 2: the bare-runner probe ---------------------------------------------
@@ -3605,7 +3656,8 @@ def _node_exit(report):
 _NODE_F2P = "tests/a.test.js::does a thing"
 
 
-def _node_container(*, f2p_ran=True, scope_names=None, scope_files=None,
+def _node_container(*, f2p_ran=True, f2p_twice=False, p2p_twice=False,
+                    missing=(), scope_names=None, scope_files=None,
                     p2p=(), framework="vitest", runner=None):
     """A node task and the container that answers its five suite CHECKS.
 
@@ -3621,6 +3673,12 @@ def _node_container(*, f2p_ran=True, scope_names=None, scope_files=None,
     `f2p_ran=False` is M1's shape verbatim: the declared f2p test is reported
     SKIPPED at exit 0, which is what both frameworks do with a `-t` pattern
     that matches nothing -- a renamed test, most often.
+
+    `f2p_twice` / `p2p_twice` put the declared id at TWO assertions inside
+    the SAME `testResults` entry -- M11.2's measured shape, since one file is
+    one entry. `missing` blanks a run's report entirely (the measured
+    broken-config shape: exit 1, no file), which `_ScriptedContainer` already
+    answers the way the real container does (`cat` exit 1).
 
     `scope_names` and `scope_files` both describe the scoped p2p run's report,
     from the two directions the two assertions read it: `scope_names` names
@@ -3651,20 +3709,25 @@ def _node_container(*, f2p_ran=True, scope_names=None, scope_files=None,
     p2p_ids = tuple(p2p) or ("tests/b.test.js::keeps working",)
     p2p_report = _node_report([
         (node_id.partition("::")[0],
-         [("passed", node_id.partition("::")[2])]) for node_id in p2p_ids
+         [("passed", node_id.partition("::")[2])] * (2 if p2p_twice else 1))
+        for node_id in p2p_ids
     ])
     reports = {
         "f2p_before": _node_report(
             [("tests/a.test.js",
-              [("failed" if f2p_ran else "skipped", "does a thing")])],
+              [("failed" if f2p_ran else "skipped", "does a thing")]
+              + ([("passed", "does a thing")] if f2p_twice else []))],
             status="failed" if f2p_ran else "passed",
         ),
         "f2p_after": _node_report(
-            [("tests/a.test.js", [("passed", "does a thing")])]),
+            [("tests/a.test.js",
+              [("passed", "does a thing")] * (2 if f2p_twice else 1))]),
         "p2p_before": p2p_report,
         "p2p_after": p2p_report,
         "scoped": _node_report(list(by_file.items())),
     }
+    for key in missing:
+        reports[key] = None
     container = _ScriptedContainer(start_sha="s" * 40, tests=tests,
                                    present=tests.paths, reports=reports)
     return container, task
@@ -4008,6 +4071,112 @@ def test_ambiguous_file_filters_is_None_when_no_node_run_reported_files():
     node_result = _preflight_over((container, task))
 
     assert node_result.evidence["ambiguous_file_filters"] is None
+
+
+# --- same-file duplicate ids (round 2 item 11) --------------------------------
+
+
+def test_a_declared_f2p_id_that_names_more_than_one_test_is_a_problem():
+    """M11.2: the red-before check is satisfied by whichever of the pair
+    fails and the green-after check by both passing, so the gate's two
+    conjuncts stop meaning "this test went red, then green". The `== 2` is
+    also what fails a summing accumulator, since this shape puts the id at
+    count 2 in BOTH f2p reports."""
+    result = _preflight_over(_node_container(f2p_twice=True))
+
+    assert not result.ok
+    assert any("names 2 tests" in p for p in result.problems)
+    assert result.evidence["same_file_duplicate_ids"] == {
+        "tests/a.test.js::does a thing": 2}
+
+
+def test_a_declared_p2p_id_that_names_more_than_one_test_is_a_problem():
+    """This is also the task shape that makes NO scoped run at all (an
+    explicit `tests.p2p`), pinning that the check does not depend on one."""
+    result = _preflight_over(_node_container(
+        p2p=("tests/b.test.js::keeps working",), p2p_twice=True))
+
+    assert not result.ok
+    assert any("names 2 tests" in p for p in result.problems)
+    assert result.evidence["same_file_duplicate_ids"] == {
+        "tests/b.test.js::keeps working": 2}
+
+
+def test_an_undeclared_same_file_duplicate_is_recorded_and_not_refused():
+    """D1's boundary: the gate can prove a DECLARED id's verdict is
+    ambiguous and cannot prove an UNDECLARED twin's hazard, because the
+    quarantine is `oracle._derive`'s, computed at GRADE time from two
+    reference runs this gate never makes. The accepted residual -- a flaky
+    undeclared twin CAN be quarantined and take its healthy sibling out of
+    check 6 -- is recorded in this same key and audited by hand against
+    `GradeRecord`; nothing here joins the two."""
+    result = _preflight_over(_node_container(scope_names=[
+        ("tests/b.test.js", "works"), ("tests/b.test.js", "works")]))
+
+    assert result.ok, result.problems
+    assert result.evidence["same_file_duplicate_ids"] == {
+        "tests/b.test.js::works": 2}
+    assert not any("names" in p for p in result.problems)
+
+
+def test_the_declared_duplicate_refusal_reads_the_f2p_run_not_the_scoped_one():
+    """M11.4: the scoped run DESELECTS the f2p ids, and a deselected test is
+    `skipped` on vitest and `pending` on jest -- neither terminal, so a check
+    written over the scoped report alone would see nothing. The scoped
+    report here is the default, clean one, and the refusal must still fire
+    off the f2p runs."""
+    result = _preflight_over(_node_container(f2p_twice=True))
+
+    assert not result.ok
+    assert result.evidence["same_file_duplicate_ids"] == {
+        "tests/a.test.js::does a thing": 2}
+
+
+def test_same_file_duplicate_ids_is_recorded_when_there_are_none():
+    result = _preflight_over(_node_container())
+
+    assert result.evidence["same_file_duplicate_ids"] == {}
+    assert result.evidence["duplicate_full_names"] == []
+
+
+def test_same_file_duplicate_ids_is_None_when_no_node_run_wrote_a_report():
+    """The verdict is a NO-GO for other reasons and control still reaches
+    the end of `preflight` (there are exactly two `return PreflightResult(`
+    sites, and only the runner-gate one returns early), so this asserts the
+    ACCUMULATOR's absence and not the seed's."""
+    result = _preflight_over(_node_container(missing=(
+        "f2p_before", "f2p_after", "p2p_before", "p2p_after", "scoped")))
+
+    assert not result.ok
+    assert result.evidence["same_file_duplicate_ids"] is None
+
+
+def test_a_run_that_wrote_no_report_contributes_nothing_and_does_not_erase_what_did():
+    """The flag's exact semantics: `{}` is "at least one node run was read
+    and no id in the runs that were read names two tests", never "every run
+    was counted" -- a run that wrote no report contributes nothing and is
+    named by its own exit and kind evidence rather than by this key."""
+    result = _preflight_over(_node_container(f2p_twice=True, missing=("scoped",)))
+
+    assert not result.ok
+    assert result.evidence["same_file_duplicate_ids"] == {
+        "tests/a.test.js::does a thing": 2}
+
+
+def test_a_pytest_task_records_an_empty_same_file_duplicate_map():
+    """`{}`, a claim pytest's ids back, never `None`."""
+    result = _preflight_over(_pytest_container())
+
+    assert result.evidence["same_file_duplicate_ids"] == {}
+
+
+def test_same_file_duplicate_ids_is_None_on_the_runner_gate_early_return():
+    """The `tests.runner`/`tests.framework` mismatch return, which starts no
+    container: `None`, straight from the seed."""
+    result = _preflight_over(_node_container(runner=("python", "-m", "pytest")))
+
+    assert not result.ok
+    assert result.evidence["same_file_duplicate_ids"] is None
 
 
 # --- one check, several commands ---------------------------------------------

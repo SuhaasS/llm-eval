@@ -384,8 +384,7 @@ rules, not instead of them.
 - **Two tests with the same full name in the *same* file cannot be named as two
   ids at all.** A node id is `<file>::<fullName>` with no positional index, so
   the two collapse to one identical string — invisible to the loader and to
-  `duplicate_full_names` alike. Open work, tracked in `TASKS.md`; such a
-  repository is still **excluded**. Check both before you cut:
+  `duplicate_full_names` alike. Check both before you cut:
 
       vitest run --reporter=json --outputFile=/tmp/r.json tests/
       node -e 'const r=require("/tmp/r.json"),f=r.testResults.map(x=>x.name);
@@ -396,6 +395,23 @@ rules, not instead of them.
               s.add(a.fullName); } }
         for (const a of f) for (const b of f)
           if (a!==b && b.includes(a)) console.log("CONTAINED PATH:", a, "<", b);'
+- **A declared id's `fullName` must be unique inside its own file.** A node id
+  is `<file>::<fullName>` with no positional index, so two identically titled
+  tests in one file are the *same id* — measured 2026-09-02 (vitest 3.2.7,
+  jest 30.5.0), an exact anchored `-t` runs both (one passed and one failed in
+  the same run) and the negated form skips both at `numPendingTests: 2` for
+  one requested id. Preflight refuses a task whose declared f2p or p2p ids are
+  in that shape (`same_file_duplicate_ids`); there is no remedy but declaring a
+  different test, since the id cannot be narrowed and neither framework can
+  deselect by anything but the name. A same-file duplicate the manifest never
+  names is **recorded and allowed**: every check still runs both, and the harm
+  needs the id to reach the grade-time quarantine, which the gate cannot
+  compute. That residual is real — a quarantined twin takes its healthy
+  sibling out of the regression check, so a submission that broke the sibling
+  can still grade `resolved: true` — and it is **auditable, but only by
+  hand**: the ids are in the task's cached preflight verdict
+  (`same_file_duplicate_ids`) and the quarantine is in `GradeRecord`, and
+  nothing joins them.
 - **A jest task's own `testPathIgnorePatterns` is honoured.** Under
   `GRADER_VERSION` 10 the harness emits that flag nowhere, so the repository's
   configuration decides what jest collects. This is a change from 9, where the

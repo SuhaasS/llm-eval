@@ -1,9 +1,12 @@
-# The eight node report shapes, captured
+# The nine captured node report shapes
 
-`node_adapter.classify` branches on these and on nothing else, so they are
-replayed from disk rather than re-measured: regenerating one needs a Docker
-daemon, a network and a 73 MB `npm install`, and a fixture whose provenance is
-not written down is a fixture nobody dares regenerate.
+`node_adapter.classify` branches on eight of them and on nothing else; the
+ninth (`same_file_dup`) is not a new branch — it is what two identically
+titled tests in one file produce, which `classify` reads as an ordinary
+failure and which `duplicate_ids` is what sees. They are replayed from disk
+rather than re-measured: regenerating one needs a Docker daemon, a network
+and a 73 MB `npm install`, and a fixture whose provenance is not written down
+is a fixture nobody dares regenerate.
 
 Captured **2026-09-02** in `node:22-bookworm-slim` (node v22.23.2, npm 10.9.8),
 `vitest 3.2.7` and `jest 30.5.0` — the versions `docker/eval-agent-node.Dockerfile`
@@ -11,6 +14,17 @@ pins. Note that `jest --version` prints **30.4.2** for the 30.5.0 package
 (`node_modules/jest/package.json` and `node_modules/jest-cli/package.json` both
 say `30.5.0`); the CLI's own banner lags its package, which matters to anything
 asserting a runner pin by parsing `--version`.
+
+The ninth pair (`same_file_dup`) was captured **2026-09-02** in
+`bakeoff-eval-agent:base-node-22` — node v22.23.2 with the same pinned
+`vitest 3.2.7` / `jest 30.5.0` the base installs at `/node_modules` — with the
+tree mounted at `/repo` rather than `/work`. Its rewrite is therefore
+`"/repo/projv" → "/repo"` and `"/repo/projj" → "/repo"` with **no**
+`node_modules` step, because that image already resolves the runners at
+`/node_modules`. Everything else is the recipe below: `rm -f` before each
+invocation, record whether the file came back, then pretty-print with
+`indent=2, sort_keys=True`. Its source is two `it('adds')` under one
+`describe('outer')`, one passing and one failing, plus an `it('subs')`.
 
 ## What each file is
 
@@ -28,6 +42,7 @@ code to classify on**, which is the whole reason this adapter exists.
 | `t_nomatch` | `tests/pass.test.js -t '^(?:no such test)$'` | **0** | **0** | yes |
 | `t_match` | `tests/pass.test.js -t '^(?:outer adds)$'` | 0 | 0 | yes |
 | `mixed` | `tests/pass.test.js tests/broken.test.js` | 1 | 1 | yes |
+| `same_file_dup` | `tests/dup.test.js` (a file with two tests titled `outer adds`) | 1 | 1 | yes |
 | *(no fixture)* a broken config file | — | 1 | 1 | **NO FILE AT ALL** |
 
 The last row is why there is no `config_error.*.json` to commit: the signal is
@@ -116,9 +131,30 @@ Neither produces a fixture; both are pinned by tests in `test_runners.py`.
    `p2p_argvs` emits the scope before the flags for exactly this reason; the
    trailing `-t` is safe because it starts with `-`, which ends the array.
 3. **vitest's ignore flag is `--exclude=<path>`, the equals form, not a
-   space-separated pair.** Measured 2026-09-02 alongside jest's
-   `--testPathIgnorePatterns=<path>`: both frameworks are called with `=`,
-   and `p2p_argvs` emits it that way for both. Pinned in `test_runners.py`
-   (`test_node_ignore_flags_are_per_framework_and_jest_keeps_its_default`) as
-   the exact argv `["tests/", "--exclude=tests/x.js"]`, not a two-element
-   `["--exclude", "tests/x.js"]`.
+   space-separated pair -- and the bare spelling, not a glob.** Measured
+   2026-09-02: the SAME string is a substring filter as a positional and a
+   GLOB as `--exclude`, so `--exclude=tests/doc/a.test.js` still ran
+   `pkg/tests/doc/a.test.js` while `--exclude='**/tests/doc/a.test.js'`
+   excluded it -- the bare spelling is what this design wants, since group 0
+   must lose exactly the deselected file and never a second file whose path
+   ends the same way. jest has no equivalent flag at all (item 1 above):
+   `--testPathIgnorePatterns` REPLACES the repository's own value rather than
+   adding to it, so jest excludes through the positional's lookaheads instead
+   and `p2p_argvs` emits `--exclude=` for vitest only. Pinned in
+   `test_runners.py`
+   (`test_vitest_excludes_through_the_bare_exclude_flag_not_a_glob`) as the
+   exact argv `["tests/", "--exclude=tests/a.test.js"]`, not a two-element
+   `["--exclude", "tests/a.test.js"]` and not a glob.
+4. **A `-t` cannot address one of two identically titled tests in one file.**
+   Measured 2026-09-02: `-t '^(?:outer adds)$'` against `dup.test.js` ran
+   **both**, one passing and one failing, on vitest and jest alike; the
+   negated form skipped **both**, at `numPendingTests: 2` for one requested
+   id. Nothing in either default report separates the pair: vitest emits a
+   `location` only when a `file:line` positional turns task-location capture
+   on, and jest's is `null` without `--testLocationInResults`. vitest's
+   `file:line` positional *does* select one (`dup.test.js:3` ran the passer,
+   `dup.test.js:4` the failer) while jest reads `dup.test.js:3` as a path
+   regex and collects **0 tests** at exit 1 — and neither framework has a
+   line-scoped *de*selection, which is what the quarantine needs. Hence a
+   refusal rather than an id spelling; see preflight's
+   `same_file_duplicate_ids`.

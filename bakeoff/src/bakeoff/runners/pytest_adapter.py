@@ -384,6 +384,21 @@ class PytestAdapter:
         # different fact from the `None` an explicit-p2p task leaves.
         return ()
 
+    def duplicate_ids(self, report):
+        """`{}`, a CLAIM and not a gap.
+
+        A pytest node id names exactly one test by construction: two
+        functions with the same name in one module shadow each other, a class
+        scope is part of the id, and pytest appends an index when two
+        parametrized cases would otherwise collide -- so `--deselect
+        a.py::test_x` reaches one test and one test only. The node
+        frameworks' ids do not: `-t` matches `fullName`, and two
+        `it('works')` in one file collapse to the identical `<file>::works`
+        (measured 2026-09-02, vitest 3.2.7 and jest 30.5.0 -- an exact
+        anchored `-t` ran both, one passing and one failing in the same run).
+        """
+        return {}
+
     def module_of(self, node_id):
         return node_id.split("::", 1)[0]
 

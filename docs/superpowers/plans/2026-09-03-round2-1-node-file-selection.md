@@ -1170,7 +1170,7 @@ what else landed rather than as a failure of this change.
 
 * **Same-file duplicate `fullName`s** (round-2 item 11). `duplicate_full_names` keeps
   its exact shape and its cross-file meaning; item 11 adds
-  `same_file_full_name_collisions` beside it. The reason the split is here: a same-file
+  `same_file_duplicate_ids` beside it. The reason the split is here: a same-file
   pair collapses to the *identical* node id string, so it is a **manifest
   representation** problem while this item is a **selection argv** problem — and
   `validate_id_set` becoming a no-op is the evidence, since a loader comparing
