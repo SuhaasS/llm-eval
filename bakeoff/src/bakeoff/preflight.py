@@ -298,8 +298,8 @@ SCOPE_COLLECTS_NOTHING = "scope_collects_nothing"
 #: `problem_codes` was added to stop.
 EARLY_RETURN_RUNNER_MISMATCH = "runner_does_not_match_framework"
 
-#: Every key `preflight` can write, in the order it writes them. ONE list,
-#: filled from by the early return and by the full path alike, because the
+#: Every key `preflight` can write. ONE list, filled from by the early
+#: return and by the full path alike, because the
 #: alternative has already failed twice inside this file: `PREFLIGHT_VERSION`
 #: 11 moved three keys from `[]` to `None`, and the `bare_runner_skipped` note
 #: in the early-return block records a fourth "left out of this seed once" --
@@ -320,15 +320,19 @@ EARLY_RETURN_RUNNER_MISMATCH = "runner_does_not_match_framework"
 #: first time a check is added to `TaskGrading`, and that failure is the
 #: silent one.
 #:
-#: A tuple in the order the gate LOOKS, not a frozenset: `dict.fromkeys`
-#: preserves it, so `to_dict()` hands a reader the keys in the order a reader
-#: would walk the gate, and this constant reads as that walk. It does NOT
-#: survive to the stored artifact: `matrix.write_json`, which writes the blob,
+#: A tuple, not a frozenset, GROUPED the way the gate's narrative runs --
+#: what is knowable before a container starts, then what each stage
+#: measures as it runs. This is membership, not write order: the tuple
+#: carries forward the old hand-written seed block's grouping, and 113
+#: pairwise inversions against each key's actual first-write line (measured
+#: 2026-09-03) confirm it is not a write order. It does NOT survive to the
+#: stored artifact either: `matrix.write_json`, which writes the blob,
 #: dumps with `sort_keys=True` (verified 2026-09-03 against the click-3360
 #: blob, which is alphabetical from `ambiguous_file_filters`), so the file a
-#: task author diffs is sorted whatever this order is. Every comparison against this tuple
-#: is on sets, so the order is presentation at both ends and nothing depends
-#: on it.
+#: task author diffs is sorted whatever this order is. Every comparison
+#: against this tuple is on sets, so order is presentation at both ends and
+#: nothing depends on it. A new key is APPENDED to its group -- the AST
+#: test above proves membership, not position.
 EVIDENCE_KEYS: tuple[str, ...] = (
     "early_return", "framework",
     "image_env_declared", "image_env_observed", "image_env_mismatch",

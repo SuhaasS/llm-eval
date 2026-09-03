@@ -3812,7 +3812,7 @@ sentence was moved to its write for the same reason.
 | unit | `1652 passed, 67 deselected` (from `1637 passed, 67 deselected`) |
 | `mutation_check.py` | **183/183** (from 181), run solo |
 | V1, post-Task-2 | 42 keys derived, `set(EVIDENCE_KEYS) == written`, no `early_return` union needed |
-| route null-sets | nine routes, nine distinct null counts, each reaching its claimed verdict |
+| route null-sets | nine routes, nine distinct null sets (counts 35/9/11/16/14/8/11/8/11), each reaching its claimed verdict |
 | `tests/test_grade_script.py` | passes with **no edit** — the proof `default_factory=_evidence_seed` absorbed the assertion |
 | GATE | `click-3360-write-usage-empty-args` **PASS** at `preflight_version 17`, `len(evidence) == 42`, `early_return: null`, all three `grading_*_exit: null` where the v16 blob carried no such key at all |
 
@@ -3828,3 +3828,49 @@ not re-resolve them.
 the remaining keys for the OTHER shape of the defect — a key whose *value* means
 two things. That was `PREFLIGHT_VERSION` 11's round and is done for the four keys
 it found.
+
+**Review fix wave (`.superpowers/broaden/round2/impl-5-review.md`).** One
+blocking finding: `EVIDENCE_KEYS`' docstring claimed twice, at `:301` and
+`:323-325`, that the tuple is written "in the order it writes them" and that
+`to_dict()` hands a reader "the order a reader would walk the gate" — measured
+against the AST, 113 pairwise inversions between the tuple's order and each
+key's actual first-write line. The tuple GROUPS keys the way the gate's
+narrative runs (what is knowable before a container starts, then what each
+stage measures), carrying forward the old hand-written seed block's grouping;
+membership is the invariant `__post_init__` and T3.2 enforce, not order, and
+the stored artifact is alphabetical regardless of this tuple's order
+(`matrix.write_json`'s `sort_keys=True`). Reflowed both sentences to say that
+— no code, test, or `PREFLIGHT_VERSION` change; a new key joins by appending
+to the group it belongs in.
+
+Six non-blocking findings. This section's own "nine distinct null counts" is
+corrected above to "nine distinct null sets (counts 35/9/11/16/14/8/11/8/11)"
+— two of the nine counts repeat (8 and 11, each twice), so "distinct counts"
+was a stronger claim than the measurement supports; "distinct sets" is the one
+that is actually true. `test_evidence_keys_lists_exactly_what_preflight_writes`'s
+AST walk now filters on `isinstance(n.ctx, ast.Store)`, so a future *read* of
+an evidence key cannot be miscounted as a write by a test whose own name says
+"writes" — equivalent today (zero `ast.Load` evidence subscripts exist), but
+no longer merely equivalent by accident. The over-length docstring line
+(`:329`, 90 columns) folded into the finding-1 reflow.
+
+The three findings that ask a *queued* plan (items 7, 11, 12, 13, 14) to be
+amended were not applied here: those plans are not edited mid-round, per this
+round's own process (implementation is strictly sequential; a plan is revised
+by its own reviewer before its own implementer, not by a later item's fix
+wave). Recorded instead as a standing note in
+`.superpowers/broaden/round2/CONTEXT.md` (git-ignored scratch, not part of
+this commit): every new evidence key must be appended to `EVIDENCE_KEYS` (it
+is seeded automatically from there) and `PREFLIGHT_VERSION` bumped, or
+`PreflightResult.__post_init__` raises on every path of every task — the
+failure mode items 11 and 12 would hit verbatim, and item 7's `_SCHEMA_ROUTES`
+reuse and item 14's now-stale seed-site line reference are each item's own
+implementer's problem to catch against the tree as it stands when that item is
+picked up.
+
+Verified: `.venv/bin/python -m pytest tests/ -q` — `1652 passed, 67
+deselected`, unchanged (docstring and a test-comprehension guard only, no new
+test). Both mutation anchors for this section (`evidence: dict =
+_evidence_seed()` and `if set(self.evidence) != set(EVIDENCE_KEYS):`)
+re-checked present and unique in `preflight.py` by `grep -c`; neither line
+moved, so `mutation_check.py` was not re-run.

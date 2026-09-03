@@ -4345,7 +4345,8 @@ def test_evidence_keys_lists_exactly_what_preflight_writes():
     written = {n.slice.value for n in ast.walk(fn)
                if isinstance(n, ast.Subscript)
                and isinstance(n.value, ast.Name) and n.value.id == "evidence"
-               and isinstance(n.slice, ast.Constant)}
+               and isinstance(n.slice, ast.Constant)
+               and isinstance(n.ctx, ast.Store)}
     written |= {f"grading_{key}_exit" for key in _GRADING_KEYS}
 
     assert set(pf.EVIDENCE_KEYS) == written
