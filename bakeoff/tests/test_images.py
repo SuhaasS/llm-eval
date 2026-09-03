@@ -334,6 +334,106 @@ def _submodule_fixture(tmp_path):
     return {"sup": sup, "lib": lib, "base": base, "pinned": pinned}
 
 
+def _nested_submodule_fixture(tmp_path):
+    """`sup` -> `vendor/libdep` -> `vendor/libdep/vendor/deep`, three real
+    repositories, for the same reason `_submodule_fixture` is real: the thing
+    under test is that N levels take N+1 archives and each lands inside the
+    empty directory the level above left.
+    """
+    def sh(*args, cwd):
+        subprocess.run(args, cwd=cwd, check=True, capture_output=True)
+
+    def head(cwd):
+        return subprocess.run(["git", "rev-parse", "HEAD"], cwd=cwd,
+                              check=True, capture_output=True,
+                              text=True).stdout.strip()
+
+    deep = tmp_path / "deep"
+    (deep / "deepdep").mkdir(parents=True)
+    (deep / "deepdep" / "__init__.py").write_text("DEEP = 1\n")
+    sh("git", "init", "-q", cwd=deep)
+    sh("git", "config", "user.email", "t@t.test", cwd=deep)
+    sh("git", "config", "user.name", "t", cwd=deep)
+    sh("git", "add", "-A", cwd=deep)
+    sh("git", "commit", "-q", "-m", "deep", cwd=deep)
+    deep_pinned = head(deep)
+
+    lib = tmp_path / "nlib"
+    (lib / "libdep").mkdir(parents=True)
+    (lib / "libdep" / "__init__.py").write_text("VALUE = 1\n")
+    sh("git", "init", "-q", cwd=lib)
+    sh("git", "config", "user.email", "t@t.test", cwd=lib)
+    sh("git", "config", "user.name", "t", cwd=lib)
+    sh("git", "add", "-A", cwd=lib)
+    sh("git", "commit", "-q", "-m", "lib", cwd=lib)
+    sh("git", "-c", "protocol.file.allow=always", "submodule", "add", "-q",
+       str(deep), "vendor/deep", cwd=lib)
+    sh("git", "add", "-A", cwd=lib)
+    sh("git", "commit", "-q", "-m", "nest", cwd=lib)
+    lib_pinned = head(lib)
+
+    sup = tmp_path / "nsup"
+    sup.mkdir()
+    (sup / "calc.py").write_text("x = 1\n")
+    sh("git", "init", "-q", cwd=sup)
+    sh("git", "config", "user.email", "t@t.test", cwd=sup)
+    sh("git", "config", "user.name", "t", cwd=sup)
+    sh("git", "add", "-A", cwd=sup)
+    sh("git", "commit", "-q", "-m", "base", cwd=sup)
+    sh("git", "-c", "protocol.file.allow=always", "submodule", "add", "-q",
+       str(lib), "vendor/libdep", cwd=sup)
+    sh("git", "add", "-A", cwd=sup)
+    sh("git", "commit", "-q", "-m", "sub", cwd=sup)
+    return {"sup": sup, "lib": lib, "deep": deep, "base": head(sup),
+            "pinned": lib_pinned, "deep_pinned": deep_pinned}
+
+
+def test_the_build_context_carries_every_submodule_level(tmp_path, monkeypatch):
+    """N levels, N+1 archives. Measured 2026-09-02 (M15): `git archive` at
+    level N emits level N+1's gitlink as an EMPTY directory exactly as
+    `base_sha`'s archive emits level 1's, so an image built from two archives
+    for a two-level tree ships a directory the run tree will have content in.
+    """
+    fixture = _nested_submodule_fixture(tmp_path)
+    monkeypatch.setattr("bakeoff.images._run", lambda *a, **k: "sha256:fake")
+    monkeypatch.setattr(tasks, "_SUBMODULE_URL_PREFIX", "")
+
+    build_task_image(_sub_task_stub(fixture), "sha256:base",
+                     tmp_path / "build", tmp_path / "cache")
+
+    repo = tmp_path / "build" / "image-t" / "repo"
+    assert (repo / "vendor" / "libdep" / "libdep" / "__init__.py").read_text() \
+        == "VALUE = 1\n"
+    assert (repo / "vendor" / "libdep" / "vendor" / "deep" / "deepdep"
+            / "__init__.py").read_text() == "DEEP = 1\n"
+
+
+def test_the_second_archive_runs_parents_before_children(tmp_path, monkeypatch):
+    """The order is pinned rather than left to `derive_submodules`' pre-order,
+    because `mkdir(parents=True)` would HIDE the mistake: a child unpacked
+    first creates its parent's directory, the parent's archive then unpacks
+    over it, and the only residue is a directory mode nobody looks at.
+    """
+    fixture = _nested_submodule_fixture(tmp_path)
+    monkeypatch.setattr("bakeoff.images._run", lambda *a, **k: "sha256:fake")
+    monkeypatch.setattr(tasks, "_SUBMODULE_URL_PREFIX", "")
+    archived: list[str] = []
+    real_run = subprocess.run
+
+    def recording_run(argv, *a, **k):
+        if list(argv[:3]) == ["git", "archive", "--format=tar"]:
+            archived.append(argv[3])
+        return real_run(argv, *a, **k)
+
+    monkeypatch.setattr("bakeoff.images.subprocess.run", recording_run)
+
+    build_task_image(_sub_task_stub(fixture), "sha256:base",
+                     tmp_path / "build", tmp_path / "cache")
+
+    assert archived == [fixture["base"], fixture["pinned"],
+                        fixture["deep_pinned"]]
+
+
 def _sub_task_stub(fixture, strip_paths=(), submodules_unneeded=()):
     class _Image:
         apt = ()

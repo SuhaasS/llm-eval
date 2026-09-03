@@ -535,6 +535,19 @@ pass-to-pass, 1.4 s suite. **What remains for Gate 1 is the dataset itself**
   `submodules_dirty` and refused by the grader. Filed here because item 17 had
   not landed when item 2 shipped; delete this entry when it does.
 
+  Measured 2026-09-02 at two levels, with item 17's own argv: the
+  superproject's `git status --porcelain=v2 --ignore-submodules=none` reads
+  `1 .M S.M. … vendor/lib` for a level-1 uncommitted edit, a level-2
+  uncommitted edit **and** a level-2 commit alike — so the refusal fires at any
+  depth (soundness is complete) but the record and the message name
+  `vendor/lib` for work done two levels down. Running the same argv per
+  initialised level (`git -C vendor/lib …`) separates them: `N... mid.txt`,
+  `S.M. vendor/deep`, `SC.. vendor/deep`. `git submodule status --recursive`
+  is **not** the fix — it reads a leading space on both lines for both
+  uncommitted cases. One correction to item 17's own D8 prose: `SC..` is the
+  staged, diff-carried gitlink move at depth 1 only; at depth 2 a commit reads
+  `S.M.` at the superproject and stages zero bytes.
+
 - [ ] **The test half is applied at setup, and that is a methodology choice.**
   A real bug-fix PR carries the test that proves the fix, so at `base_sha` the
   oracle does not exist and §3.3's "runs tests, sees failures, self-corrects"
@@ -1460,6 +1473,15 @@ judge runs after one — which is why they sit here rather than above.
   spends three rounds warning against adding terms to casually — whoever
   picks this up needs that measurement first.
 
+  Measured 2026-09-02 at two levels (round 2 item 18): both module directories
+  leak the host cache path in four files each (`config`, `logs/HEAD`,
+  `logs/refs/heads/main`, `logs/refs/remotes/origin/HEAD`); the guard pair
+  removes all four at the level it runs at and reaches no other level; and the
+  nested module directory is `.git/modules/<outer NAME>/modules/<inner NAME>`,
+  named by the submodule name and never its path. `_refuse_host_mirror_path`'s
+  `os.walk` over `dest/.git` covers this by construction, which is why item 18
+  added no leak scan of its own.
+
 - [ ] **Nothing joins `same_file_duplicate_ids` to a `GradeRecord` quarantine,
   and the residual round-2 item 11 accepted lives in exactly that gap.**
   Preflight records every `<file>::<fullName>` that more than one test in one
@@ -1576,12 +1598,6 @@ These need a call, not code. Most are cheap to make and expensive to make late.
   scored as a capability difference (§5.4) — and cost-per-task is not directly
   comparable at equal text. Caps derive from the Phase 3 calibration pilot;
   decide the policy there.
-
-- [ ] **Nested submodules.** `submodule update --init --recursive` plus one
-  pruned mirror per `(inner url, inner gitlink)`, and preflight's
-  `git submodule status --recursive`. Refused today because the untested path
-  leaves the inner directory empty, which reads as clean. A deferral, not a
-  defect (broadening 6).
 
 - [x] **A pure gitlink rename is invisible to the grader's gitlink refusal.**
   `grader._chunk_is_gitlink` reads the chunk header for a `160000` mode line

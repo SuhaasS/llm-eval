@@ -5248,3 +5248,135 @@ proposed text is quoted verbatim in
 `.superpowers/broaden/round2/impl-17-report.md` for a human to apply.
 
 `graphify update .` run after the source edits.
+
+---
+
+## Round 2, item 18 — nested submodules (2026-09-03)
+
+Plan: `docs/superpowers/plans/2026-09-03-round2-18-nested-submodules.md`
+(revision 2; review 1 REVISE with 16 findings folded in, review 2 APPROVE).
+The last item of round 2.
+
+**What it lifts.** A task could not be cut from a repository whose `base_sha`
+carries a submodule that has a submodule of its own. The refusal was right for
+the reason it gave — `git submodule update --init` does not recurse, the inner
+directory arrives empty, and measured 2026-09-02 at two levels the
+superproject's `git status --porcelain`, the inner's own, `git diff HEAD` and
+non-recursive `git submodule status` are ALL clean, so nothing downstream would
+say so. `git submodule status --recursive` is the only reader that speaks.
+
+**What replaced it.** `derive_submodules` is a pre-order recursion over
+`(mirror, sha)` pairs (`_derive_from` drives, `_read_level` is the level body
+— the two readers were already generic over that pair, so this is a parameter
+change and not a second parser). `Submodule` gains `depth`, `parent` and a
+`local_path` property; `path` is the FULL superproject-relative path at every
+depth, because six consumers compare it against superproject-relative paths and
+a level-local one makes all six silently wrong at depth 2. `_init_submodules`
+walks the flat tuple with `cwd` at the parent's working tree and
+`sub.local_path` as the argument — never `--recursive`, which measured
+populates the deeper tree and leaves its marker at `-`, and never a
+process-wide `-c submodule.<name>.url=`, which measured collides across levels
+because names are per-repository. `images._extract_submodules` takes one
+archive per level, parents first. `preflight` runs `git submodule status
+--recursive`, recurses `git ls-files -s -z` per level behind a
+`rev-parse --show-prefix` guard, stamps `depth` on every entry, names a tree
+deeper than the cap before the `unmatched` problem fires, and reads
+`submodules_orphaned` at every initialised level all-or-`None`.
+
+**The depth cap is 2** (`tasks._MAX_SUBMODULE_DEPTH`), and it is policy: git
+imposes none. Three reasons, in the constant's own comment — termination
+becomes a property of the code, every level multiplies the surfaces where an
+empty directory reads as clean, and every gitlink in the screened corpus the
+harness can reach is measured FLAT (four at their pinned shas carry no
+`.gitmodules` and zero `160000` entries; the fifth is private and is the one
+item 2 declares unneeded). A broadening built on a prediction moves the floor
+by one level.
+
+**The guard that is not tidiness.** `preflight._is_own_repository`. Measured
+2026-09-02 at both levels: `git -C <empty submodule dir> ls-files -s -z` exits
+0 and returns the PARENT's gitlink as `./`, because git walks up to the
+enclosing repository and filters its index by the cwd prefix. Descending
+unguarded files `vendor/lib/.` — a fabricated observation, worse than the
+empty directory it was looking for. `--show-prefix` rather than
+`--show-toplevel` compared against a composed path, because that form would
+compare a host-composed string against one produced inside the container over
+a bind mount, and a false compare there NO-GOes every healthy nested tree.
+
+**One refusal NARROWS.** The cap's predicate is `_has_gitlinks`, a `160000`
+scan, not `_has_gitmodules`. Measured: a submodule `git rm --cached`'d with its
+stanza left behind has a readable `.gitmodules` and zero gitlinks — the inert
+shape this module's own comments say must be recorded rather than refused. It
+now derives, materializes, and is filed as `submodules_orphaned`.
+
+**Versions.** `PREFLIGHT_VERSION` 24 → **25**, read off disk and incremented,
+with the ledger paragraph naming what a 24 verdict could not say. Nothing else
+moves: no `SCHEMA_VERSION`, `GRADER_VERSION`, `GRADE_SCHEMA_VERSION`,
+`ORACLE_VERSION`, no `EVIDENCE_KEYS` entry (`depth` is per-entry), no
+`_pack_fingerprint` term, no `check=` value, and `start_sha` is unmoved —
+pinned by `test_a_nested_submodule_does_not_move_start_sha` and by the two
+real-task re-gates below.
+
+**Verification.**
+
+- Unit: **1938 passed, 78 deselected** (+30 over `c9faf12`'s 1908/77: 18 in
+  `test_tasks.py`, 2 in `test_images.py`, 9 in `test_preflight.py`, and the
+  31st is the new `test_integration_submodules.py` case, which is the extra
+  deselection here).
+- `scripts/mutation_check.py`: **229/229**, including the six new anchors.
+  Four pre-existing anchors went stale against the edited lines and were
+  re-transcribed rather than deleted — item 2's typo check (now guarded to
+  depth 1 and carrying the `deferred` term), item 16's persisted-url write
+  (now `cwd=parent_tree`), item 16's `url_resolved` construction (now
+  `full_path`), and the two `ensure_pruned_mirror` comprehensions, which the
+  recursion made ambiguous: the one-line find now matched `_derive_from` and
+  left `_init_submodules` unmutated, so both anchors gained the
+  `for sub in needed` line.
+- `scripts/verify_logger.py`: **GATE PASSED**.
+- `-m "integration and task_image" tests/test_integration_submodules.py`:
+  **7 passed**, including the new two-level leg — gate PASS, evidence carrying
+  `depth` 1 and 2, the level-2 blob byte-identical in the run tree and the
+  build context, both mirrors pruned, and no host cache path anywhere under
+  `.git` (asserted rather than inferred: measured, both module directories
+  leak it in four files each before the guards run).
+- The flat path, on real tasks:
+  `tomlkit-514-inline-table-comment-separator` re-gates **PASS** with
+  `start_sha e1d72b883d2e452ca14835047e2fa7db02cdc4d8` unchanged and evidence
+  `[{"path": "tests/toml-test", …, "depth": 1}]` under `preflight_version` 25;
+  `click-3360-write-usage-empty-args` re-gates **PASS** with
+  `start_sha 33575cc0b75608fa5cbcb1d3ae3347b81eac437f` unchanged.
+
+**Verification ceiling, stated rather than papered over:** no real nested task
+exists to gate. Every gitlink in the screened corpus the harness can reach is
+flat, so the two-level evidence is the integration leg's synthetic
+superproject plus the M-series measurements. That is weaker than every other
+round-2 item's, and it is the reason the cap is 2.
+
+**Also in this wave, as a separate commit** (`docs: prose fixes from item 17's
+review`): the five non-blocking findings on `424edfa` that touch tracked files
+— the probe's `.git`-test comment corrected to the measured owner
+(`S..U` in the v2 stream, 0 bytes in the diff, so the first reader owns it,
+not `_gitlinks_touched`), a `TASKS.md` bullet proposing
+`git --no-optional-locks add -A` in `snapshot_diff` with the three measured
+rows, `SNAPSHOT_INDEX`'s comment qualified to the superproject's index,
+`grader._submodule_edits`' `#:` block moved into a real docstring, a JSON-
+boundary test pinning that `{}` and `None` stay apart for both
+`submodules_dirty` fields, `tasks/todo.md`'s deselected count corrected to 77,
+and plan 17's §8 disjointness claim corrected to the directory-test form. The
+sixth finding concerns only the report under `.superpowers/`.
+
+**Deviations from the plan, all recorded in
+`.superpowers/broaden/round2/impl-18-report.md`.** The largest three: the
+too-deep problem cannot use "slash depth" as the plan's placeholder wrote it
+(`vendor/lib` is depth 1 with one slash and `vendor/lib/vendor/deep` is depth 2
+with three), so it tests whether an unmatched status line's path sits under a
+path already known to be AT the cap; `test_strip_paths_covering_a_nested_
+submodule_is_refused` asserts the message names `vendor/lib` rather than the
+deep path, because a strip covering level 2 necessarily covers level 1 from
+below and the loop refuses on the first match — the full-path decision is
+pinned by its second half, that the level-local `vendor/deep` matches nothing;
+and the per-level `.gitmodules`/`--local` reads are keyed by `(prefix, name)`
+pairs rather than names, which the plan did not ask for and correctness
+requires, since submodule names are per-repository (M19/M14) and a flat map
+would overwrite one level's url with another's.
+
+`graphify update .` run after the source edits.

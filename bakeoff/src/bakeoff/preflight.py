@@ -33,7 +33,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from bakeoff.container import RunContainer
 from bakeoff.images import base_tag, image_labels, scaffold_only_paths
@@ -49,6 +49,7 @@ from bakeoff.runners.node_adapter import verify_selected
 from bakeoff.tasks import (
     _DEFAULT_PYTHON,
     _GRADING_KEYS,
+    _MAX_SUBMODULE_DEPTH,
     _under,
     task_runtime,
 )
@@ -360,7 +361,24 @@ _PYTEST_ADAPTER = for_framework("pytest")
 #: absent field read as a positive negative claim. GO/NO-GO is unchanged for
 #: every task in the corpus (none declares a relative url); what moved is
 #: what a stored verdict's evidence can be read to say.
-PREFLIGHT_VERSION: str = "24"
+#:
+#: 24 -> 25: the submodule readers recurse (round 2 item 18). A verdict cached
+#: under 24 was written by a gate that ran `git submodule status` WITHOUT
+#: `--recursive` and built its authoritative path set from one `git ls-files
+#: -s -z` at the repository root, so on a task carrying a nested submodule it
+#: could not name the deeper entry at all. Measured 2026-09-02 (git 2.50.1)
+#: with level 1 populated and level 2 empty: the superproject's `git status
+#: --porcelain`, the inner's own `git status --porcelain`, `git diff HEAD` and
+#: non-recursive `git submodule status` are ALL clean, and `git submodule
+#: status --recursive` is the only reader that says anything. So a 24 PASS on
+#: any task with a submodule is a verdict about a tree this gate could not
+#: interrogate. The evidence shape also changes for every task, nested or not
+#: -- each `submodules` entry gains `depth`, and `submodules_orphaned` now
+#: means "every initialised level was read" where it used to mean "the root
+#: was read" -- so a warm blob and a fresh blob would otherwise sit in one
+#: cache describing two shapes, and a reader who cannot tell them apart reads
+#: an absent field as a positive negative claim.
+PREFLIGHT_VERSION: str = "25"
 
 #: Bounds the VERDICT, not the transfer: `docker cp` has no names-only mode,
 #: so `scaffold_only_paths` streams the whole image `/repo` regardless of this
@@ -1003,8 +1021,26 @@ def _parse_submodule_status(
     return parsed, unmatched
 
 
-def _gitlink_paths(container) -> tuple[str, ...] | None:
+def _gitlink_paths(container, prefix: str = "") -> tuple[str, ...] | None:
     """Every 160000 entry in the container's index. `None` if it could not be read.
+
+    `prefix` is a superproject-relative submodule path, and a non-empty one
+    makes this read THAT repository's index through `git -C` -- `container.exec`
+    takes no workdir argument (it is hard-wired to the repo mount), so every
+    deeper read is a `-C`. The paths it returns are joined back onto `prefix`
+    with `PurePosixPath`, never string concatenation, because every consumer --
+    the status matcher, `submodules_orphaned`, the entry evidence -- compares
+    them against the superproject-relative paths `git submodule status
+    --recursive` prints.
+
+    THE CALLER MUST PROVE `prefix` IS ITS OWN REPOSITORY FIRST
+    (`_is_own_repository`). Measured 2026-09-02 (M11), at level 1 and level 2
+    alike: `git -C <empty submodule dir> ls-files -s -z` exits 0 and returns
+    the PARENT's gitlink entry as `./`, because git walked up to the enclosing
+    repository and filtered its index by the cwd prefix. Joined onto the
+    prefix that is `vendor/lib/.`, a gitlink that does not exist -- a
+    fabricated observation, which is worse than the empty directory the
+    recursion was looking for.
 
     `container.exec` and an explicit `exit_code` branch, NOT `_checked_exec` --
     and the reason is the gate's contract, not a style preference.
@@ -1031,7 +1067,8 @@ def _gitlink_paths(container) -> tuple[str, ...] | None:
     two readers disagreeing -- which is what a record neither reader can name
     IS.
     """
-    result = container.exec(["git", "ls-files", "-s", "-z"])
+    argv = ["git"] + (["-C", prefix] if prefix else []) + ["ls-files", "-s", "-z"]
+    result = container.exec(argv)
     if result.exit_code != 0:
         return None
     paths = []
@@ -1039,8 +1076,97 @@ def _gitlink_paths(container) -> tuple[str, ...] | None:
         if record.startswith("160000 "):
             _meta, _tab, path = record.partition("\t")
             if path:
-                paths.append(path)
+                paths.append(str(PurePosixPath(prefix) / path) if prefix
+                             else path)
     return tuple(paths)
+
+
+def _is_own_repository(container, path: str) -> bool | None:
+    """Whether `path` in the container is a repository of its own -- an
+    INITIALISED submodule -- rather than a directory inside its parent's.
+
+    `None` if the probe could not be run, never `False`: the caller turns that
+    into `None` evidence plus a problem, the same shape `_gitlink_paths`' own
+    unreadable branch uses.
+
+    THE GUARD, and it is not defensive tidiness. `_gitlink_paths`' docstring
+    carries the measurement (M11): an unguarded descent into an uninitialised
+    submodule directory files a gitlink that does not exist. This is the test
+    that stops it.
+
+    `rev-parse --show-prefix`, NOT `--show-toplevel` compared against a
+    composed path. Measured 2026-09-02 at both levels: the prefix is EMPTY for
+    a directory that is its own repository and non-empty otherwise
+    (`vendor/lib/` for an uninitialised level-1 directory, `vendor/deep/` for
+    an uninitialised level-2 one, `tests/` for an ordinary subdirectory). The
+    toplevel form would have this code compose `/repo/<path>` on the HOST and
+    compare it against a string produced INSIDE the container, over a bind
+    mount -- the class of host/container path disagreement `CLAUDE.md` records
+    under "an index written on the host is a lie to the container". A false
+    compare there NO-GOes every healthy nested tree on an environment
+    difference, which is the worst shape a gate defect takes. `--show-prefix`
+    needs no path from the caller at all.
+
+    `--show-superproject-working-tree` discriminates too (empty vs the parent's
+    path) and is not used: it answers a question about the parent rather than
+    about this directory, and it is empty in BOTH the "uninitialised" and the
+    "not a submodule at all" cases.
+    """
+    result = container.exec(["git", "-C", path, "rev-parse", "--show-prefix"])
+    if result.exit_code != 0:
+        return None
+    return result.stdout.strip() == ""
+
+
+def _read_gitmodules_level(out: str, prefix: str,
+                           path_by_name: dict[tuple[str, str], str],
+                           url_by_name: dict[tuple[str, str], str]) -> None:
+    """One level's `.gitmodules` records, folded into the two `(prefix, name)`
+    maps. `path` values are joined onto `prefix`, so both maps speak the
+    superproject-relative paths every other reader in this file does.
+
+    `-z`, and it is the same rule as `_gitlink_paths`' and `_chunk_path`'s:
+    take the value from git's own delimiter, never from a split over a display
+    line. Measured 2026-09-01 (git 2.50.1): without `-z` the output is `<key>
+    <value>` on one line, and a submodule NAME may contain a space --
+    `[submodule "my sub"]` gives the key `submodule.my sub.path`, so
+    `split(" ", 1)[1]` returns `sub.path <value>` rather than the value. That
+    string is then never in `gitlinks`, so a submodule that is perfectly
+    healthy is reported as an orphan, under a path that is not a path. `-z`
+    emits `<key>\n<value>\0` per record (NEWLINE between the two, NUL between
+    records), which is unambiguous for both -- a key cannot contain a newline
+    and the trailing NUL leaves one empty final record.
+
+    `partition`, never `split("\n", 1)[1]`: a valueless key (`path` with no
+    `=`) is a record with no newline in it, and the indexed form would raise
+    `IndexError` out of a gate whose caller does not wrap it -- a traceback
+    instead of a NO-GO, the same failure `_gitlink_paths` documents.
+
+    `rpartition`, not a fixed suffix strip: the regex matches BOTH `.path` and
+    `.url`, and a submodule NAME may itself contain a dot, so the split has to
+    happen at the LAST one -- exactly `derive_submodules`' own parse of this
+    same blob.
+
+    Last-wins on a repeated key, which is git's own reading and what
+    `derive_submodules`' `declared.setdefault(name, {})[field]` has always
+    done. Measured 2026-09-03 (git 2.50.1): `--get-regexp` returns BOTH records
+    for a stanza that repeats its own `path`, so the pre-item-16 union filed
+    both values as declared paths while this files only the second -- the
+    consequence being that a repeated first `path` with no gitlink stops being
+    reported as an orphan.
+    """
+    for record in out.split("\0"):
+        if not record:
+            continue
+        key, sep, value = record.partition("\n")
+        if not sep:
+            continue
+        name, _, field = key[len("submodule."):].rpartition(".")
+        if field == "path":
+            path_by_name[(prefix, name)] = (
+                str(PurePosixPath(prefix) / value) if prefix else value)
+        elif field == "url":
+            url_by_name[(prefix, name)] = value
 
 
 def _directory_is_empty(container, path: str) -> bool | None:
@@ -2111,7 +2237,14 @@ def preflight(
         # dataset instead of through the image, and it is scored as capability
         # on every arm.
         submodules: list[dict] = []
-        status = container.exec(["git", "submodule", "status"])
+        # `--recursive`, and it is the only reader in this file that can see a
+        # nested level at all. Measured 2026-09-02 (M16) with level 1
+        # populated and level 2 empty: the superproject's `git status
+        # --porcelain`, the same with `--ignore-submodules=none`, the inner's
+        # OWN `git status --porcelain`, `git diff HEAD` and non-recursive `git
+        # submodule status` are ALL clean. `--recursive` is the one command
+        # that prints the `-` marker for the empty level.
+        status = container.exec(["git", "submodule", "status", "--recursive"])
         if status.exit_code != 0:
             # `None`, not `[]`. A non-zero exit returns empty stdout, which
             # parses to `[]` -- a positive observation of "there are none"
@@ -2120,13 +2253,71 @@ def preflight(
             evidence["submodules"] = None
             evidence["submodules_orphaned"] = None
             problems.append(
-                "`git submodule status` failed (exit "
+                "`git submodule status --recursive` failed (exit "
                 f"{status.exit_code}): {(status.stdout or status.stderr)[:500]}. "
                 "Whether this tree's submodules are initialised is unknown, and "
                 "an uninitialised one is invisible in `git status`."
             )
         gitlinks = None if status.exit_code != 0 else _gitlink_paths(container)
-        if status.exit_code == 0 and gitlinks is None:
+        # THE SECOND READER RECURSES TOO, and it has to: `git ls-tree -r` and
+        # `git ls-files` both stop at a gitlink (measured 2026-09-02, M1), so
+        # the root index names level 1 and nothing below it. Every descent is
+        # guarded by `_is_own_repository`, because `git -C <empty submodule
+        # dir> ls-files` walks UP and returns the parent's own gitlink as
+        # `./` -- see that function and `_gitlink_paths`.
+        #
+        # `git ls-files --recurse-submodules` is deliberately NOT used.
+        # Measured 2026-09-02 (M10): with level 1 initialised its listing
+        # contains the level-2 gitlink and OMITS the level-1 one, and with
+        # level 1 uninitialised it contains the level-1 one and nothing
+        # deeper. An authoritative set whose meaning changes with the state
+        # being checked cannot be the authority on that state -- on a healthy
+        # tree `vendor/lib` would fall out, its status line would land in
+        # `unmatched`, and the gate would NO-GO a correct tree.
+        depth_by_path: dict[str, int] = {}
+        not_own: list[str] = []
+        probe_failed: str | None = None
+        if gitlinks is not None:
+            depth_by_path = {path: 1 for path in gitlinks}
+            frontier = list(gitlinks)
+            for level in range(2, _MAX_SUBMODULE_DEPTH + 1):
+                deeper: list[str] = []
+                for path in frontier:
+                    own = _is_own_repository(container, path)
+                    if own is None:
+                        probe_failed = path
+                        break
+                    if not own:
+                        # An UNINITIALISED directory. Recorded rather than
+                        # descended into; whether it is also a disagreement
+                        # depends on the status marker, which is parsed below.
+                        not_own.append(path)
+                        continue
+                    inner = _gitlink_paths(container, path)
+                    if inner is None:
+                        probe_failed = path
+                        break
+                    for inner_path in inner:
+                        depth_by_path[inner_path] = level
+                        deeper.append(inner_path)
+                if probe_failed is not None:
+                    break
+                frontier = deeper
+            gitlinks = None if probe_failed else tuple(depth_by_path)
+        if status.exit_code == 0 and gitlinks is None and probe_failed:
+            # A level was reached and could not be interrogated. Same shape as
+            # the two branches around it: `None` evidence and a problem, never
+            # a shorter positive list.
+            evidence["submodules"] = None
+            evidence["submodules_orphaned"] = None
+            problems.append(
+                f"reading inside the submodule {probe_failed} failed (`git -C "
+                f"{probe_failed} rev-parse --show-prefix` or `git -C "
+                f"{probe_failed} ls-files -s -z`), so this tree's gitlinks "
+                "below that path could not be read and no submodule claim can "
+                "be made about it."
+            )
+        elif status.exit_code == 0 and gitlinks is None:
             # Same shape as the branch above, different cause: the index could
             # not be read, so there is no authoritative path set and nothing
             # below can be trusted to name a submodule.
@@ -2154,7 +2345,52 @@ def preflight(
             for entry in submodules:
                 entry["declared_unneeded"] = entry["path"] in unneeded
                 entry["empty"] = _directory_is_empty(container, entry["path"])
+                # From THE RECURSION'S OWN BOOKKEEPING -- which `ls-files`
+                # produced the path -- never from counting slashes in it and
+                # never from the manifest. `vendor/lib` is depth 1 with one
+                # slash and `vendor/lib/vendor/deep` is depth 2 with three, so
+                # the text of a path does not carry its depth. Written for
+                # EVERY entry, depth 1 included: a reader who cannot see the
+                # field on the others cannot tell "this tree is flat" from
+                # "this gate did not know about nesting".
+                entry["depth"] = depth_by_path[entry["path"]]
             evidence["submodules"] = submodules
+            # A tree DEEPER than the cap is NAMED, and before `unmatched` is,
+            # because otherwise it is reported as the wrong thing. The
+            # recursion by construction produces no path deeper than the cap,
+            # so a depth-3 status line matches no authoritative path, lands in
+            # `unmatched`, and is reported as "the two readers disagree about
+            # this tree" -- true, and about the wrong cause.
+            #
+            # THIS IS THE ONE PLACE a path's depth is taken from its own
+            # display text rather than from the recursion, and it is
+            # deliberate: the status reader's line is the only evidence of a
+            # level this gate did not walk. The text is used to decide whether
+            # it sits under a path already known to be AT the cap -- anchored
+            # on a "/" so a sibling (`vendor/lib/vendor/deepx`) cannot match --
+            # and is then QUOTED, never turned into an evidence path.
+            capped = {path for path, level in depth_by_path.items()
+                      if level >= _MAX_SUBMODULE_DEPTH}
+            # `line[1:]` first: the MARKER is character zero and the sha
+            # follows it with no separator, exactly as `_parse_submodule_status`
+            # reads them, so partitioning the raw line splits at the marker and
+            # yields the sha instead of the path.
+            too_deep = sorted(
+                tail for tail in (line[1:].partition(" ")[2]
+                                  for line in unmatched)
+                if any(tail.startswith(known + "/") for known in capped)
+            )
+            if too_deep:
+                problems.append(
+                    "`git submodule status --recursive` names submodules "
+                    "deeper than this eval populates (at most "
+                    f"{_MAX_SUBMODULE_DEPTH} levels): "
+                    + ", ".join(too_deep[:5])
+                    + ". The loader refuses a manifest whose tree is that "
+                    "deep, so this container's tree is not the one that was "
+                    "derived. Reported rather than refused: the gate reads a "
+                    "tree, the loader refuses a manifest."
+                )
             if unmatched:
                 # NOT resolved by falling back to the display line's own text:
                 # that would put a display-derived path into the evidence,
@@ -2191,6 +2427,26 @@ def preflight(
                     "positive list with the path simply missing from it and "
                     "the initialisation check never sees it."
                 )
+            # THE THIRD DISAGREEMENT, and the one only the recursion can see:
+            # `git submodule status --recursive` reports a leading space --
+            # initialised, HEAD at the gitlink -- for a path `git -C <path>
+            # rev-parse --show-prefix` says is not a repository of its own.
+            # One of the two readers is wrong about the tree the suite will
+            # run in, and the descent stopped there, so nothing below that
+            # path was read at all.
+            disagreed = sorted(set(not_own)
+                               & {entry["path"] for entry in submodules
+                                  if entry["marker"] == " "})
+            if disagreed:
+                problems.append(
+                    "`git submodule status --recursive` reports these "
+                    "submodules as initialised, but `git -C <path> rev-parse "
+                    "--show-prefix` says the directory is not a repository of "
+                    "its own: " + ", ".join(disagreed[:5])
+                    + ". The two readers disagree about this tree, and the "
+                    "recursion did not descend past them -- so any submodule "
+                    "of theirs is unread."
+                )
             # Inert, therefore recorded rather than refused (measured: git
             # drives submodules off the index, so a stanza with no gitlink is
             # never listed, never fetched and creates no directory). Recorded
@@ -2209,71 +2465,54 @@ def preflight(
             # record (NEWLINE between the two, NUL between records), which is
             # unambiguous for both -- a key cannot contain a newline and the
             # trailing NUL leaves one empty final record.
-            declared_subs = container.exec(
-                ["git", "config", "-f", ".gitmodules", "--get-regexp", "-z",
-                 r"^submodule\..*\.(path|url)$"]
+            # ONE READ PER INITIALISED LEVEL, and `git -C` scopes `-f`
+            # (measured 2026-09-02, M20: `git -C vendor/lib config -f
+            # .gitmodules` and `git config -f vendor/lib/.gitmodules` return
+            # the same records). An UNINITIALISED level is skipped: its
+            # `.gitmodules` does not exist, so reading it would exit 128 and
+            # the all-or-`None` rule below would erase the whole key over a
+            # state the gate already reports elsewhere.
+            #
+            # Keys are `(prefix, name)` PAIRS, not names. Measured 2026-09-02
+            # (M19/M14): submodule names are per-repository and need not be
+            # unique, and a module directory is named by the NAME, so two
+            # levels can both declare `[submodule "dep"]` -- a flat name map
+            # would silently overwrite one level's url with the other's.
+            levels = [""] + [entry["path"] for entry in submodules
+                             if entry["marker"] != "-"]
+            path_by_name: dict[tuple[str, str], str] = {}
+            url_by_name: dict[tuple[str, str], str] = {}
+            orphans_readable = True
+            for prefix in levels:
+                declared_subs = container.exec(
+                    ["git"] + (["-C", prefix] if prefix else [])
+                    + ["config", "-f", ".gitmodules", "--get-regexp", "-z",
+                       r"^submodule\..*\.(path|url)$"]
+                )
+                if declared_subs.exit_code not in (0, 1):
+                    # ALL-OR-`None`, and the alternative is the rule this file
+                    # states everywhere else being broken in the block whose
+                    # comments argue for it: returning the levels that DID
+                    # answer renders a partial answer as a complete positive
+                    # list. After this, `[]` means "every initialised level was
+                    # read and none has an orphan stanza" and `None` means "at
+                    # least one level could not be read, or no submodule read
+                    # was made at all".
+                    orphans_readable = False
+                    problems.append(
+                        "reading .gitmodules "
+                        + (f"inside the submodule {prefix} " if prefix
+                           else "at the repository root ")
+                        + f"failed (exit {declared_subs.exit_code}): "
+                        f"{(declared_subs.stdout or declared_subs.stderr)[:500]}"
+                    )
+                    continue
+                _read_gitmodules_level(declared_subs.stdout, prefix,
+                                       path_by_name, url_by_name)
+            evidence["submodules_orphaned"] = (
+                sorted(set(path_by_name.values()) - set(gitlinks))
+                if orphans_readable else None
             )
-            # HOISTED above the exit-code branch, not inside its `if`: the
-            # url-key loop below (round 2 item 16) runs unconditionally in
-            # this same enclosing block, and an UnboundLocalError out of a
-            # gate whose caller does not wrap it is a traceback instead of a
-            # NO-GO -- exactly the failure the comment two screens up already
-            # documents for `split("\n", 1)[1]`. On the else path both dicts
-            # stay empty, every entry's two new url keys read `None`, and the
-            # only problem filed is the existing orphan-read one below.
-            path_by_name: dict[str, str] = {}
-            url_by_name: dict[str, str] = {}
-            if declared_subs.exit_code in (0, 1):
-                # 1 is git config's ORDINARY "no key matched" -- a repository
-                # with no .gitmodules at all, or one whose stanzas all have
-                # gitlinks. Collapsing it with >1 would report a genuine
-                # failure (an unreadable or malformed .gitmodules) as the
-                # measured claim "there are no orphans".
-                #
-                # `partition`, never `split("\n", 1)[1]`: a valueless key
-                # (`path` with no `=`) is a record with no newline in it, and
-                # the indexed form would raise `IndexError` out of a gate
-                # whose caller does not wrap it -- a traceback instead of a
-                # NO-GO, the same failure `_gitlink_paths` documents.
-                #
-                # `rpartition`, not a fixed suffix strip: the regex now
-                # matches BOTH `.path` and `.url`, and a submodule NAME may
-                # itself contain a dot, so the split has to happen at the
-                # LAST one -- exactly `derive_submodules`' own parse of this
-                # same blob.
-                #
-                # The orphan set this produces is byte-identical to the
-                # pre-item-16 `declared_paths.add(value)` union EXCEPT on one
-                # shape: a stanza that repeats its own `path` key. Measured
-                # 2026-09-03 (git 2.50.1) -- `--get-regexp` returns BOTH
-                # records, so the union filed both values as declared paths
-                # while `path_by_name[name] = value` is last-wins and files
-                # only the second. Last-wins is git's own reading and is what
-                # `derive_submodules`' `declared.setdefault(name, {})[field]`
-                # has always done, so the two now agree where before they
-                # could not; the consequence is that a repeated first `path`
-                # with no gitlink stops being reported as an orphan.
-                for record in declared_subs.stdout.split("\0"):
-                    if not record:
-                        continue
-                    key, sep, value = record.partition("\n")
-                    if sep:
-                        name, _, field = key[len("submodule."):].rpartition(".")
-                        if field == "path":
-                            path_by_name[name] = value
-                        elif field == "url":
-                            url_by_name[name] = value
-                declared_paths = set(path_by_name.values())
-                evidence["submodules_orphaned"] = sorted(
-                    declared_paths - set(gitlinks)
-                )
-            else:
-                evidence["submodules_orphaned"] = None
-                problems.append(
-                    "reading .gitmodules failed (exit "
-                    f"{declared_subs.exit_code}): "
-                    f"{(declared_subs.stdout or declared_subs.stderr)[:500]}"
-                )
             # The RESOLVED url, observed rather than restated (round 2 item
             # 16). `--local` is deliberate: this asks what `_init_submodules`
             # wrote into THIS tree, not what an operator's global config says.
@@ -2293,50 +2532,69 @@ def preflight(
             # in that task. With it, `persisted_by_name` stays `{}` and the
             # entry loop below reads `None` out of an empty dict exactly as
             # it would have, so no evidence value changes.
-            persisted_by_name: dict[str, str] | None = {}
+            #
+            # ONE READ PER INITIALISED LEVEL, on the same `levels` list and
+            # keyed the same `(prefix, name)` way as the `.gitmodules` read:
+            # a depth-2 registration lives in the INNER repository's config
+            # (`.git/modules/<outer NAME>/config`, reached through the `.git`
+            # file), which `git -C <path> config --local` is what reads.
+            # Without it every nested entry's `url_persisted` would be `None`
+            # -- "not measured" -- for a value that is right there.
+            persisted_by_name: dict[tuple[str, str], str] | None = {}
             if submodules:
-                persisted = container.exec(
-                    ["git", "config", "--local", "--get-regexp", "-z",
-                     r"^submodule\..*\.url$"]
-                )
-                if persisted.exit_code in (0, 1):
+                for prefix in levels:
+                    persisted = container.exec(
+                        ["git"] + (["-C", prefix] if prefix else [])
+                        + ["config", "--local", "--get-regexp", "-z",
+                           r"^submodule\..*\.url$"]
+                    )
+                    if persisted.exit_code not in (0, 1):
+                        persisted_by_name = None
+                        problems.append(
+                            "reading the run tree's submodule urls "
+                            + (f"inside the submodule {prefix} " if prefix
+                               else "at the repository root ")
+                            + f"failed (exit {persisted.exit_code}): "
+                            f"{(persisted.stdout or persisted.stderr)[:500]}"
+                        )
+                        continue
+                    if persisted_by_name is None:
+                        continue
                     for record in persisted.stdout.split("\0"):
                         if not record:
                             continue
                         key, sep, value = record.partition("\n")
                         if sep:
                             # A FIXED suffix slice here, unlike the
-                            # `rpartition` above, and it is exact rather than
-                            # a shortcut: this regex matches only `.url`, so
-                            # the last four characters of every key it
-                            # returns are that suffix -- a name that itself
-                            # ends in `.url` gives `submodule.a.url.url` and
-                            # comes back as `a.url`, which is the name. The
-                            # read above matches `.path` OR `.url` and has no
-                            # such fixed suffix to strip.
+                            # `rpartition` in `_read_gitmodules_level`, and it
+                            # is exact rather than a shortcut: this regex
+                            # matches only `.url`, so the last four characters
+                            # of every key it returns are that suffix -- a
+                            # name that itself ends in `.url` gives
+                            # `submodule.a.url.url` and comes back as `a.url`,
+                            # which is the name. The other read matches
+                            # `.path` OR `.url` and has no such fixed suffix
+                            # to strip.
                             persisted_by_name[
-                                key[len("submodule."):-len(".url")]] = value
-                else:
-                    persisted_by_name = None
-                    problems.append(
-                        "reading the run tree's submodule urls failed (exit "
-                        f"{persisted.exit_code}): "
-                        f"{(persisted.stdout or persisted.stderr)[:500]}"
-                    )
+                                (prefix,
+                                 key[len("submodule."):-len(".url")])] = value
             # `url_declared`/`url_persisted` on every entry, and the one
             # assertion this pair of reads exists for (round 2 item 16). The
-            # join key is the submodule NAME (both files key on it); the
-            # entry key is the PATH, so `path_by_name` bridges them, and an
-            # entry whose path no name maps to gets `None` on both -- honest,
-            # since neither file has anything to say about it.
-            name_by_path = {path: name for name, path in path_by_name.items()}
+            # join key is the `(level prefix, submodule NAME)` pair -- both
+            # files key on the name, and the name alone is ambiguous across
+            # levels (M19/M14: names are per-repository and two levels can
+            # both declare `[submodule "dep"]`). The entry key is the PATH, so
+            # `path_by_name` bridges them, and an entry whose path no pair maps
+            # to gets `None` on both -- honest, since neither file has anything
+            # to say about it.
+            name_by_path = {path: pair for pair, path in path_by_name.items()}
             for entry in submodules:
-                name = name_by_path.get(entry["path"])
+                join_key = name_by_path.get(entry["path"])
                 entry["url_declared"] = (
-                    None if name is None else url_by_name.get(name))
+                    None if join_key is None else url_by_name.get(join_key))
                 entry["url_persisted"] = (
-                    None if name is None or persisted_by_name is None
-                    else persisted_by_name.get(name))
+                    None if join_key is None or persisted_by_name is None
+                    else persisted_by_name.get(join_key))
                 # `is not None` on url_persisted, and never the `or ""` idiom
                 # that is right on url_declared two lines up: the two are not
                 # symmetric. `None` on url_persisted means NOT MEASURED, in

@@ -19,7 +19,7 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from unittest import mock
 
 import pytest
@@ -935,6 +935,8 @@ class _ScriptedContainer:
                  gitlinks=(), gitmodules_declared=None, gitmodules_exit=None,
                  gitmodules_urls=None, persisted_urls=None,
                  persisted_exit=None,
+                 inner_gitlinks=None, own_repo=None,
+                 inner_gitmodules=None, inner_gitmodules_exits=None,
                  ls_entries=None, ls_exits=None,
                  reports=None, bare_runner=None, apply_exit=0,
                  durations_ms=None):
@@ -1024,6 +1026,34 @@ class _ScriptedContainer:
         #: every test but the failure ones is in. An explicit value is how a
         #: test reaches the >1 branch.
         self.persisted_exit = persisted_exit
+        #: round 2 item 18. What `git -C <prefix> ls-files -s -z` answers,
+        #: keyed by the submodule path the recursion descended into. Values
+        #: are the LEVEL-LOCAL paths that repository's index carries (the gate
+        #: joins them onto the prefix itself); a value of `None` is an
+        #: `ls-files` that could not be read at all. An ABSENT key is a
+        #: repository with no gitlinks of its own -- the flat shape every
+        #: existing test in this module is in, and the reason the default
+        #: cannot be "the root's own gitlinks", which would file
+        #: `vendor/libdep/vendor/libdep` on every one of them.
+        self.inner_gitlinks = dict(inner_gitlinks or {})
+        #: round 2 item 18. What `git -C <path> rev-parse --show-prefix`
+        #: answers, as a verdict: `True` is its own repository (empty prefix),
+        #: `False` is a directory inside its parent's (a non-empty prefix,
+        #: which is what an UNINITIALISED submodule directory gives), and
+        #: `None` is a probe that exited non-zero. `None` for the whole dict
+        #: DERIVES the verdict from `submodule_status`' markers -- a `-` line
+        #: is uninitialised -- which is what git actually does and what keeps
+        #: every existing test in this module scripting nothing new.
+        self.own_repo = own_repo
+        #: round 2 item 18. A deeper level's `.gitmodules`, keyed by prefix:
+        #: a tuple of `(level-local path, url)` pairs. An absent key is a
+        #: submodule with no `.gitmodules` of its own (exit 1, git's ordinary
+        #: "no key matched"), which is every flat fixture in this module.
+        self.inner_gitmodules = dict(inner_gitmodules or {})
+        #: round 2 item 18. A deeper level's `.gitmodules` read EXIT, keyed by
+        #: prefix, for the >1 branch that must null the whole orphan key
+        #: rather than report the levels that did answer.
+        self.inner_gitmodules_exits = dict(inner_gitmodules_exits or {})
         #: What `ls -A -- <path>` reports, keyed by path. An ABSENT key is an
         #: empty directory at exit 0, which is the state every existing test
         #: in this module is in. A value may be a tuple of tuples, in which
@@ -1132,6 +1162,19 @@ class _ScriptedContainer:
         result.duration_ms = self.durations_ms.get(key, 0)
         return result
 
+    def _uninitialised_paths(self):
+        """The paths `submodule_status` marks `-`, which is what makes the
+        default `rev-parse --show-prefix` answer git's own rather than a
+        second thing a test has to remember to script."""
+        out = set()
+        for line in self.submodule_status.splitlines():
+            if not line.strip():
+                continue
+            _sha, _, tail = line[1:].partition(" ")
+            if line[0] == "-":
+                out.add(tail.split(" ")[0])
+        return out
+
     def exec(self, cmd, env=None):
         self.commands.append(list(cmd))
         if cmd[:2] == ["rm", "-f"]:
@@ -1230,22 +1273,59 @@ class _ScriptedContainer:
             if self.rg_exit is not None:
                 return _Exec(exit_code=self.rg_exit)
             return _Exec(exit_code=0 if self.hypothesis_in_suite else 1)
+        # round 2 item 18: every read below the root is a `git -C <path>`,
+        # because `container.exec` has no workdir argument. The prefix is
+        # split off HERE so each branch answers one question and the level it
+        # was asked about is a parameter rather than a fourth argv shape.
+        prefix = ""
+        if cmd[:2] == ["git", "-C"]:
+            prefix, cmd = cmd[2], ["git"] + list(cmd[3:])
+        if cmd[:3] == ["git", "rev-parse", "--show-prefix"]:
+            own = (self.own_repo.get(prefix)
+                   if self.own_repo is not None
+                   else prefix not in self._uninitialised_paths())
+            if own is None:
+                return _Exec(exit_code=128,
+                             stderr="fatal: not a git repository\n")
+            # EMPTY iff the directory is its own repository. The non-empty
+            # answer is the path git filtered the enclosing repository's index
+            # by, which is the last component of an uninitialised submodule's
+            # own path -- measured 2026-09-02, `vendor/deep/` for
+            # `vendor/lib/vendor/deep`.
+            return _Exec(stdout="" if own
+                         else PurePosixPath(prefix).name + "/\n")
         # The three submodule probes come BEFORE every other `git` branch:
         # the catch-all `cmd[0] == "git"` below would swallow all three and
         # answer each of them exit 0 with empty stdout -- which is the
         # healthy-and-empty answer, so nothing would fail.
         if cmd[:2] == ["git", "submodule"]:
-            return _Exec(exit_code=self.submodule_status_exit,
-                         stdout=self.submodule_status)
+            # `--recursive` is ANSWERED, not tolerated (round 2 item 18).
+            # Without it git lists only the SUPERPROJECT's own gitlinks --
+            # measured 2026-09-02, a level-2 line appears only under
+            # `--recursive` -- so a container that returned the same text for
+            # both argvs would let the gate drop the flag with every test
+            # still green, which is the one reader that can see an empty
+            # nested submodule at all.
+            lines = self.submodule_status
+            if "--recursive" not in cmd:
+                lines = "".join(
+                    line + "\n" for line in lines.splitlines()
+                    if line.strip()
+                    and line[1:].partition(" ")[2].split(" ")[0]
+                    in (self.gitlinks or ())
+                )
+            return _Exec(exit_code=self.submodule_status_exit, stdout=lines)
         if cmd[:3] == ["git", "ls-files", "-s"]:
-            if self.gitlinks is None:
+            entries = (self.gitlinks if not prefix
+                       else self.inner_gitlinks.get(prefix, ()))
+            if entries is None:
                 return _Exec(exit_code=128,
                              stderr="fatal: not a git repository\n")
             # `-z` emits `<mode> <sha> <stage>\t<path>` NUL-TERMINATED, so the
             # last record is empty. Written out rather than joined, because
             # that trailing empty is what the parser has to survive.
             return _Exec(stdout="".join(
-                f"160000 {'a' * 40} 0\t{path}\0" for path in self.gitlinks
+                f"160000 {'a' * 40} 0\t{path}\0" for path in entries
             ))
         if cmd[:4] == ["git", "config", "-f", ".gitmodules"]:
             # The `-z` is asserted, not tolerated. Without it git emits
@@ -1254,6 +1334,26 @@ class _ScriptedContainer:
             # answered either argv the same way would let the parser regress
             # to the space split with every test still green.
             assert "-z" in cmd, cmd
+            if prefix:
+                # A DEEPER level's `.gitmodules`, scripted per prefix. Absent
+                # means the submodule has none of its own, which is git's
+                # ordinary exit-1 "no key matched" and the state every flat
+                # fixture in this module is in.
+                exit_code = self.inner_gitmodules_exits.get(prefix)
+                if exit_code is not None and exit_code > 1:
+                    return _Exec(exit_code=exit_code,
+                                 stderr="fatal: bad config line 1\n")
+                pairs = self.inner_gitmodules.get(prefix, ())
+                records = "".join(
+                    f"submodule.{path}.path\n{path}\0"
+                    f"submodule.{path}.url\n{url}\0"
+                    for path, url in pairs
+                )
+                return _Exec(
+                    exit_code=(exit_code if exit_code is not None
+                               else (0 if records else 1)),
+                    stdout=records,
+                )
             declared = (self.gitlinks or ()
                         if self.gitmodules_declared is None
                         else self.gitmodules_declared)
@@ -1290,6 +1390,12 @@ class _ScriptedContainer:
             # initialised submodule, which is the state every existing test
             # in this module is in.
             assert "-z" in cmd, cmd
+            if prefix:
+                # A deeper level's OWN config. Nothing in this module scripts
+                # one, so it answers git's ordinary "no key matched" -- which
+                # leaves every nested entry's `url_persisted` `None`, honestly,
+                # rather than repeating the root's answer one level down.
+                return _Exec(exit_code=1)
             urls = self.persisted_urls or {}
             if self.persisted_exit is not None and self.persisted_exit > 1:
                 return _Exec(exit_code=self.persisted_exit,
@@ -2879,10 +2985,24 @@ def test_the_preflight_version_moved_with_the_new_assertion():
     a stored blob cannot tell "this task's submodule url is absolute" from
     "this gate did not look." GO/NO-GO is unchanged for every task in the
     corpus, since none declares a relative submodule url; what moved is what
-    a stored verdict's evidence can be read to say."""
+    a stored verdict's evidence can be read to say.
+
+    24 -> 25 is round 2, item 18 (nested submodules). Both submodule readers
+    recurse: `git submodule status` gained `--recursive`, and the
+    authoritative path set is now one `git ls-files -s -z` per initialised
+    level rather than one at the repository root. A verdict cached under 24
+    was written by a gate that could not NAME a level-2 submodule at all --
+    measured 2026-09-02 with level 1 populated and level 2 empty, the
+    superproject's `git status --porcelain`, the inner's own, `git diff HEAD`
+    and non-recursive `git submodule status` are ALL clean, and only
+    `--recursive` says anything. The evidence shape moves for every task,
+    nested or not: each `submodules` entry gains `depth`, and
+    `submodules_orphaned` now means "every initialised level was read" where
+    it meant "the root was read". `EVIDENCE_KEYS` does not move -- `depth` is
+    per-entry -- and no flat task's GO/NO-GO changes."""
     from bakeoff.preflight import PREFLIGHT_VERSION
 
-    assert PREFLIGHT_VERSION == "24"
+    assert PREFLIGHT_VERSION == "25"
 
 
 # --- round 2, item 14: what an image.build step wrote into the scaffold ------
@@ -3406,7 +3526,7 @@ def test_an_initialised_submodule_at_its_gitlink_is_a_GO(monkeypatch, tmp_path):
         {"path": "vendor/libdep",
          "sha": "942c381d88cecca36be86b2e902f554ad145ec44",
          "initialised": True, "marker": " ",
-         "declared_unneeded": False, "empty": False,
+         "declared_unneeded": False, "empty": False, "depth": 1,
          # round 2 item 16: neither url is scripted by this fixture, so both
          # are the "not measured" None -- not an empty string, which would
          # claim a stanza that declares no url.
@@ -3439,6 +3559,7 @@ def test_an_uninitialised_submodule_is_a_preflight_problem(monkeypatch,
     assert result.evidence["submodules"] == [
         {"path": "vendor/libdep", "sha": "0" * 40, "initialised": False,
          "marker": "-", "declared_unneeded": False, "empty": True,
+         "depth": 1,
          "url_declared": None, "url_persisted": None}
     ]
 
@@ -3462,6 +3583,7 @@ def test_a_submodule_at_the_wrong_commit_is_a_preflight_problem(monkeypatch,
     assert result.evidence["submodules"] == [
         {"path": "vendor/libdep", "sha": "1" * 40, "initialised": False,
          "marker": "+", "declared_unneeded": False, "empty": True,
+         "depth": 1,
          "url_declared": None, "url_persisted": None}
     ]
 
@@ -3662,7 +3784,7 @@ def test_an_unreadable_gitmodules_is_not_reported_as_no_orphans(monkeypatch,
         {"path": "vendor/libdep",
          "sha": "942c381d88cecca36be86b2e902f554ad145ec44",
          "initialised": True, "marker": " ",
-         "declared_unneeded": False, "empty": True,
+         "declared_unneeded": False, "empty": True, "depth": 1,
          # round 2 item 16: the failed .gitmodules read leaves BOTH
          # `path_by_name` and `url_by_name` empty (hoisted above the
          # exit-code branch precisely so this stays `None` rather than
@@ -3716,6 +3838,7 @@ def test_a_declared_unneeded_submodule_is_a_GO_while_uninitialised(
     assert result.evidence["submodules"] == [
         {"path": "vendor/libdep", "sha": "0" * 40, "initialised": False,
          "marker": "-", "declared_unneeded": True, "empty": True,
+         "depth": 1,
          "url_declared": None, "url_persisted": None}
     ]
     assert result.evidence["submodules_empty_after_suite"] == \
@@ -4026,7 +4149,8 @@ def test_an_unreadable_run_tree_config_nulls_the_persisted_url_and_files_a_probl
     entry = result.evidence["submodules"][0]
     assert entry["url_persisted"] is None
     assert any(
-        "reading the run tree's submodule urls failed" in p
+        "reading the run tree's submodule urls at the repository root failed"
+        in p
         for p in result.problems
     )
 
@@ -4202,7 +4326,8 @@ def test_an_unreadable_run_tree_config_does_not_also_claim_the_url_was_unresolve
     url_problems = [p for p in result.problems if "submodule urls" in p
                     or "was never resolved" in p]
     assert len(url_problems) == 1
-    assert "reading the run tree's submodule urls failed" in url_problems[0]
+    assert ("reading the run tree's submodule urls at the repository root "
+            "failed") in url_problems[0]
 
 
 def test_a_declared_unneeded_submodule_with_a_relative_url_is_a_go(
@@ -6003,3 +6128,223 @@ def test_the_schema_moves_no_verdict():
     assert not refused.ok
     assert refused.problem_codes == ()
     assert len(refused.problems) == 1
+
+
+# --- round 2, item 18: nested submodules --------------------------------------
+
+
+_NESTED_STATUS = (
+    " 1111111111111111111111111111111111111111 vendor/lib (heads/main)\n"
+    " 2222222222222222222222222222222222222222 vendor/lib/vendor/deep"
+    " (heads/main)\n"
+)
+
+
+def _nested_container(**overrides):
+    """The healthy two-level tree every test in this section starts from."""
+    kwargs = dict(
+        start_sha="s" * 40, tests=_FakeTests(), present=("tests/",),
+        gitlinks=("vendor/lib",),
+        inner_gitlinks={"vendor/lib": ("vendor/deep",)},
+        submodule_status=_NESTED_STATUS,
+        ls_entries={"vendor/lib": ("libdep",),
+                    "vendor/lib/vendor/deep": ("deepdep",)},
+    )
+    kwargs.update(overrides)
+    return _ScriptedContainer(**kwargs)
+
+
+def test_a_nested_submodule_status_line_matches_only_its_own_path():
+    """Pure, over `_parse_submodule_status`, which item 18 does NOT modify --
+    and that is worth pinning because it looks like it should need work.
+    `tail == "vendor/lib"` is false for the deeper line and
+    `tail.startswith("vendor/lib" + " ")` is false too (the next byte is `/`),
+    so only the long path matches and `max(key=len)` is never asked."""
+    parsed, unmatched = _parse_submodule_status(
+        _NESTED_STATUS, ("vendor/lib", "vendor/lib/vendor/deep"))
+
+    assert unmatched == []
+    assert [entry["path"] for entry in parsed] == [
+        "vendor/lib", "vendor/lib/vendor/deep"]
+    assert [entry["sha"] for entry in parsed] == ["1" * 40, "2" * 40]
+    assert all(entry["initialised"] for entry in parsed)
+
+
+def test_an_uninitialised_parent_is_not_descended_into(monkeypatch, tmp_path):
+    """THE M11 PIN. Measured 2026-09-02: `git -C <empty submodule dir> ls-files
+    -s -z` exits 0 and returns the PARENT's own gitlink as `./`, because git
+    walked up to the enclosing repository and filtered its index by the cwd
+    prefix. Joined onto the prefix that is `vendor/lib/.` -- a gitlink that
+    does not exist, which is a FABRICATED observation and worse than the empty
+    directory the recursion was looking for. `rev-parse --show-prefix` is what
+    stops it, and this container answers `ls-files` the way git really does so
+    that removing the guard produces the fabrication rather than nothing."""
+    container = _nested_container(
+        submodule_status=(
+            "-1111111111111111111111111111111111111111 vendor/lib\n"
+        ),
+        inner_gitlinks={"vendor/lib": ("./",)},
+        ls_entries={},
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, _FakeTask(), container)
+
+    paths = [entry["path"] for entry in result.evidence["submodules"]]
+    assert paths == ["vendor/lib"]
+    assert not any("." in path.split("/") for path in paths)
+    assert result.evidence["submodules"][0]["depth"] == 1
+    # Not a GO -- the parent really is uninitialised -- but for the RIGHT
+    # reason, and with no fabricated path in the problems either.
+    assert not result.ok
+    assert any("not initialised at their gitlink" in p for p in result.problems)
+    assert not any("vendor/lib/." in p for p in result.problems)
+
+
+def test_an_uninitialised_inner_is_not_descended_into(monkeypatch, tmp_path):
+    """The same guard one level down, which needs a cap of 3 to be reachable at
+    all: at the shipped cap of 2 the recursion never probes a depth-2 path,
+    because it has nowhere left to descend to. Measured 2026-09-02, the walk-up
+    happens at EVERY level -- `git -C vendor/lib/vendor/deep ls-files` returns
+    `./` for an empty inner exactly as it does for an empty outer."""
+    monkeypatch.setattr("bakeoff.preflight._MAX_SUBMODULE_DEPTH", 3)
+    container = _nested_container(
+        submodule_status=(
+            " 1111111111111111111111111111111111111111 vendor/lib"
+            " (heads/main)\n"
+            "-2222222222222222222222222222222222222222 vendor/lib/vendor/deep\n"
+        ),
+        inner_gitlinks={"vendor/lib": ("vendor/deep",),
+                        "vendor/lib/vendor/deep": ("./",)},
+        ls_entries={"vendor/lib": ("libdep",)},
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, _FakeTask(), container)
+
+    paths = [entry["path"] for entry in result.evidence["submodules"]]
+    assert paths == ["vendor/lib", "vendor/lib/vendor/deep"]
+    assert not any(path.endswith("/.") for path in paths)
+
+
+def test_a_failed_prefix_probe_makes_the_submodule_evidence_none(
+        monkeypatch, tmp_path):
+    """`None`, never a shorter positive list: a level was reached and could not
+    be interrogated, so nothing below it was read and no submodule claim can be
+    made about the tree."""
+    container = _nested_container(own_repo={"vendor/lib": None})
+
+    result = _run_preflight(monkeypatch, tmp_path, _FakeTask(), container)
+
+    assert not result.ok
+    assert result.evidence["submodules"] is None
+    assert result.evidence["submodules_orphaned"] is None
+    assert any("reading inside the submodule vendor/lib failed" in p
+               for p in result.problems)
+    assert any("rev-parse --show-prefix" in p for p in result.problems)
+
+
+def test_every_submodule_entry_carries_its_depth(monkeypatch, tmp_path):
+    """On EVERY entry, depth 1 included: a reader who cannot see the field on
+    the flat entries cannot tell "this tree is flat" from "this gate did not
+    know about nesting"."""
+    flat = _ScriptedContainer(
+        start_sha="s" * 40, tests=_FakeTests(), present=("tests/",),
+        gitlinks=("vendor/libdep",),
+        submodule_status=(
+            " 942c381d88cecca36be86b2e902f554ad145ec44 vendor/libdep"
+            " (heads/main)\n"
+        ),
+        ls_entries={"vendor/libdep": ("libdep",)},
+    )
+    flat_result = _run_preflight(monkeypatch, tmp_path, _FakeTask(), flat)
+    assert [e["depth"] for e in flat_result.evidence["submodules"]] == [1]
+
+    nested_result = _run_preflight(monkeypatch, tmp_path, _FakeTask(),
+                                   _nested_container())
+    assert nested_result.ok, nested_result.problems
+    assert [(e["path"], e["depth"])
+            for e in nested_result.evidence["submodules"]] == [
+        ("vendor/lib", 1), ("vendor/lib/vendor/deep", 2)]
+    assert nested_result.evidence["submodules_orphaned"] == []
+
+
+def test_an_empty_inner_submodule_is_a_no_go(monkeypatch, tmp_path):
+    """The whole point of the recursion. Measured 2026-09-02 (M16): with level
+    1 populated and level 2 empty, `git status --porcelain`, the inner's own,
+    `git diff HEAD` and NON-recursive `git submodule status` are all clean --
+    `--recursive` is the only reader that says anything, and what it says is
+    this `-`."""
+    container = _nested_container(
+        submodule_status=(
+            " 1111111111111111111111111111111111111111 vendor/lib"
+            " (heads/main)\n"
+            "-2222222222222222222222222222222222222222 vendor/lib/vendor/deep\n"
+        ),
+        ls_entries={"vendor/lib": ("libdep",)},
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, _FakeTask(), container)
+
+    assert not result.ok
+    stale = [p for p in result.problems
+             if "not initialised at their gitlink" in p]
+    assert len(stale) == 1
+    assert "vendor/lib/vendor/deep" in stale[0]
+
+
+def test_a_tree_deeper_than_the_cap_is_named_before_the_unmatched_problem(
+        monkeypatch, tmp_path):
+    """Ruled: the gate READS a tree, the loader REFUSES a manifest. Without the
+    explicit problem the depth-3 line falls into `unmatched` and is reported as
+    the two readers disagreeing -- true, and about the wrong cause."""
+    container = _nested_container(
+        submodule_status=_NESTED_STATUS + (
+            " 3333333333333333333333333333333333333333"
+            " vendor/lib/vendor/deep/vendor/bottom (heads/main)\n"
+        ),
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, _FakeTask(), container)
+
+    assert not result.ok
+    deeper = [i for i, p in enumerate(result.problems)
+              if "deeper than this eval populates" in p]
+    disagree = [i for i, p in enumerate(result.problems)
+                if "the index has no gitlink for" in p]
+    assert len(deeper) == 1 and len(disagree) == 1
+    assert deeper[0] < disagree[0]
+    assert "vendor/lib/vendor/deep/vendor/bottom" in result.problems[deeper[0]]
+    assert "at most 2 levels" in result.problems[deeper[0]]
+
+
+def test_submodules_orphaned_is_read_at_every_level(monkeypatch, tmp_path):
+    """A stanza with no gitlink is inert and is RECORDED, at every initialised
+    level -- and the value is joined onto the level's prefix, because every
+    other reader in this file speaks superproject-relative paths."""
+    container = _nested_container(
+        inner_gitmodules={"vendor/lib": (("vendor/deep", "https://x/deep.git"),
+                                         ("gone", "https://x/gone.git"))},
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, _FakeTask(), container)
+
+    assert result.evidence["submodules_orphaned"] == ["vendor/lib/gone"]
+    entries = {e["path"]: e for e in result.evidence["submodules"]}
+    assert entries["vendor/lib/vendor/deep"]["url_declared"] \
+        == "https://x/deep.git"
+
+
+def test_one_unreadable_level_makes_submodules_orphaned_none(
+        monkeypatch, tmp_path):
+    """ALL-OR-`None`. Returning the levels that DID answer would render a
+    partial answer as a complete positive list -- "absence is recorded, never
+    implied", broken in the block whose comments argue for it."""
+    container = _nested_container(
+        inner_gitmodules_exits={"vendor/lib": 128},
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, _FakeTask(), container)
+
+    assert not result.ok
+    assert result.evidence["submodules_orphaned"] is None
+    assert any("reading .gitmodules inside the submodule vendor/lib failed "
+               "(exit 128)" in p for p in result.problems)

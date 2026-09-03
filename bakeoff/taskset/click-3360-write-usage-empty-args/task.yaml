@@ -193,6 +193,14 @@ tests:
 # nothing here takes part in the setup commit, and submodules are initialised
 # after start_sha is settled.
 #
+# Each entry is a submodule path AT ANY DEPTH -- a level-2 submodule
+# (`vendor/lib/vendor/deep`) can be declared unneeded while its parent is
+# populated, and the path is always superproject-relative, never the
+# level-local one the inner .gitmodules declares. DECLARING A PARENT
+# IMPLICITLY DECLINES ITS CHILDREN, because the harness does not descend into
+# a submodule it was told not to populate; so declaring both a parent and one
+# of its children is refused, and the refusal names the child.
+#
 # What it does NOT relax: a strip_paths entry covering the submodule is
 # still refused (the strip removes the gitlink and moves start_sha), and a
 # reference diff touching the submodule path -- either half -- is still

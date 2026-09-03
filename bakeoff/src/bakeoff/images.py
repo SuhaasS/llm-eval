@@ -721,10 +721,20 @@ def _extract_submodules(task, repo_dir: Path, cache_root: Path) -> None:
     make the image's tree an artifact of this function rather than of
     `base_sha`'s, which is not the same claim the moment anything reorders
     around the strip.
+
+    ONE ARCHIVE PER LEVEL, PARENTS FIRST. Measured 2026-09-02 (M15): `git
+    archive` at level N emits level N+1's gitlink as an EMPTY directory,
+    exactly as `base_sha`'s archive emits level 1's -- so N levels need N+1
+    archives, one per `(mirror, sha)` pair, and each unpacks into the empty
+    directory the level above left. The `sort` is redundant with
+    `derive_submodules`' pre-order and is kept because `mkdir(parents=True)`
+    would hide the mistake rather than raise it: a child unpacked first
+    CREATES its parent's directory, so the parent's archive would then unpack
+    over it and the only residue is a directory mode nobody looks at.
     """
     from bakeoff.tasks import ensure_pruned_mirror, task_submodules
 
-    for sub in task_submodules(task, cache_root):
+    for sub in sorted(task_submodules(task, cache_root), key=lambda s: s.depth):
         if sub.declared_unneeded:
             continue
         mirror = ensure_pruned_mirror(sub.url_resolved, sub.sha, cache_root)

@@ -1886,8 +1886,10 @@ MUTATIONS = [
         # since only an arm that looks collects it.
         "tasks: populate a submodule from the unpruned mirror",
         "src/bakeoff/tasks.py",
-        "        sub.path: ensure_pruned_mirror(sub.url_resolved, sub.sha, cache_root)",
-        "        sub.path: ensure_mirror(sub.url_resolved, sub.sha, cache_root)",
+        "        sub.path: ensure_pruned_mirror(sub.url_resolved, sub.sha, cache_root)\n"
+        "        for sub in needed",
+        "        sub.path: ensure_mirror(sub.url_resolved, sub.sha, cache_root)\n"
+        "        for sub in needed",
         "tests/test_tasks.py -k cannot_reach_the_future",
         "not integration",
     ),
@@ -2237,10 +2239,10 @@ MUTATIONS = [
         # report MISSED -- loud, but not a caught mutation.
         "tasks: accept an unneeded declaration naming no gitlink",
         "src/bakeoff/tasks.py",
-        "    unknown = sorted(set(task.submodules_unneeded) - set(gitlinks))\n"
-        "    if unknown:",
-        "    unknown = sorted(set(task.submodules_unneeded) - set(gitlinks))\n"
-        "    if False:",
+        "        unknown = sorted(set(task.submodules_unneeded) - set(gitlinks) - deferred)\n"
+        "        if unknown:",
+        "        unknown = sorted(set(task.submodules_unneeded) - set(gitlinks) - deferred)\n"
+        "        if False:",
         "tests/test_tasks.py -k naming_no_gitlink_is_refused",
         "not integration",
     ),
@@ -2661,8 +2663,10 @@ MUTATIONS = [
         # own design notes argue against.
         "tasks: the mirror is keyed on the resolved url",
         "src/bakeoff/tasks.py",
-        "        sub.path: ensure_pruned_mirror(sub.url_resolved, sub.sha, cache_root)",
-        "        sub.path: ensure_pruned_mirror(sub.url_declared, sub.sha, cache_root)",
+        "        sub.path: ensure_pruned_mirror(sub.url_resolved, sub.sha, cache_root)\n"
+        "        for sub in needed",
+        "        sub.path: ensure_pruned_mirror(sub.url_declared, sub.sha, cache_root)\n"
+        "        for sub in needed",
         "tests/test_tasks.py -k no_mirror_is_keyed_on_the_raw",
         "not integration",
     ),
@@ -2672,8 +2676,8 @@ MUTATIONS = [
         # unconditional at materialization time instead.
         "tasks: the run tree persists the resolved url",
         "src/bakeoff/tasks.py",
-        "        _git(\"config\", key, sub.url_resolved, cwd=dest)",
-        "        _git(\"config\", key, sub.url_declared, cwd=dest)",
+        "        _git(\"config\", key, sub.url_resolved, cwd=parent_tree)",
+        "        _git(\"config\", key, sub.url_declared, cwd=parent_tree)",
         "tests/test_tasks.py -k run_tree_persists_the_resolved_url",
         "not integration",
     ),
@@ -2695,7 +2699,7 @@ MUTATIONS = [
         # exist behind the stanza.
         "tasks: a declared-unneeded submodule is never resolved",
         "src/bakeoff/tasks.py",
-        "            url_resolved=None if path in unneeded else _resolve_submodule_url(",
+        "            url_resolved=None if full_path in unneeded else _resolve_submodule_url(",
         "            url_resolved=_resolve_submodule_url(",
         "tests/test_tasks.py -k declared_unneeded_submodule_is_never_resolved",
         "not integration",
@@ -2823,6 +2827,93 @@ MUTATIONS = [
         "        if state == SUBMODULE_UNINITIALISED_CONTENT",
         "        if False",
         "tests/test_grader.py -k uninitialised_submodule_is_refused",
+        "not integration",
+    ),
+    # --- round 2 item 18: nested submodules ----------------------------------
+    (
+        # The cap raised by one, which makes a three-level chain LEGAL. The
+        # measured reason it is not: `submodule update --init` runs per level,
+        # so a level below the cap arrives empty, and an empty submodule
+        # directory leaves `git status --porcelain` clean -- the Phase 0c
+        # shape arriving through the dataset, one level further down.
+        "tasks: recurse one level past the depth cap",
+        "src/bakeoff/tasks.py",
+        "_MAX_SUBMODULE_DEPTH = 2",
+        "_MAX_SUBMODULE_DEPTH = 3",
+        "tests/test_tasks.py -k three_levels_deep",
+        "not integration",
+    ),
+    (
+        # The update must run at the PARENT's working tree. Measured
+        # 2026-09-02 (M13): from the superproject root, `submodule update
+        # --init -- vendor/deep` has no such submodule to update, so the inner
+        # directory stays empty -- and `git status --porcelain` reports that
+        # tree as clean. The find is the TWO-LINE call, because `cwd=
+        # parent_tree` appears three times in this loop and
+        # `mutation_check` replaces the first occurrence only.
+        "tasks: initialise a nested submodule from the superproject root",
+        "src/bakeoff/tasks.py",
+        '        _git("-c", "protocol.file.allow=always",\n'
+        '             "submodule", "update", "--init", "--", sub.local_path,\n'
+        "             cwd=parent_tree)",
+        '        _git("-c", "protocol.file.allow=always",\n'
+        '             "submodule", "update", "--init", "--", sub.local_path,\n'
+        "             cwd=Path(dest))",
+        "tests/test_tasks.py -k populated_at_its_gitlink",
+        "not integration",
+    ),
+    (
+        # `path` is the FULL superproject-relative path at every depth, and
+        # this join is what makes it one. Level-local, the five path-shaped
+        # consumers compare unlike things: a `strip_paths: ["vendor/deep"]`
+        # matches a submodule really at `vendor/lib/vendor/deep`, a reference
+        # diff touching `vendor/lib/vendor/deep/x.py` slips past the refusal
+        # built to catch it, and item 2's declared-unneeded join never
+        # matches at all.
+        "tasks: join a nested submodule path onto nothing",
+        "src/bakeoff/tasks.py",
+        "        full = str(PurePosixPath(parent.path) / local) if parent else local",
+        "        full = local",
+        "tests/test_tasks.py -k full_paths_and_depths",
+        "not integration",
+    ),
+    (
+        # The descent must SKIP a submodule the manifest declared unneeded:
+        # nothing is populated for it, so its own `.gitmodules` is never read
+        # and its children never exist. Anchored on the `continue` rather than
+        # left to `mirrors.get(...)` returning None, which is a coincidence of
+        # the comprehension above and cannot be mutation-tested.
+        "tasks: descend into a submodule item 2 declared unneeded",
+        "src/bakeoff/tasks.py",
+        "        if sub.declared_unneeded:",
+        "        if False:",
+        "tests/test_tasks.py -k level_two_submodule_can_be_declared_unneeded",
+        "not integration",
+    ),
+    (
+        # `--recursive` is the ONLY reader that can see an empty nested
+        # submodule. Measured 2026-09-02 (M16) with level 1 populated and
+        # level 2 empty: the superproject's `git status --porcelain`, the
+        # inner's own, `git diff HEAD` and non-recursive `git submodule
+        # status` are all clean.
+        "preflight: read submodule status without --recursive",
+        "src/bakeoff/preflight.py",
+        '["git", "submodule", "status", "--recursive"]',
+        '["git", "submodule", "status"]',
+        "tests/test_preflight.py -k empty_inner_submodule",
+        "not integration",
+    ),
+    (
+        # THE DESCENT GUARD. Measured 2026-09-02 (M11): `git -C <empty
+        # submodule dir> ls-files -s -z` exits 0 and returns the PARENT's own
+        # gitlink as `./`, so an unguarded descent files `vendor/lib/.` -- a
+        # gitlink that does not exist, which is a fabricated observation and
+        # worse than the empty directory it was looking for.
+        "preflight: descend into a directory that is not its own repository",
+        "src/bakeoff/preflight.py",
+        '    return result.stdout.strip() == ""',
+        "    return True",
+        "tests/test_preflight.py -k uninitialised_parent_is_not_descended_into",
         "not integration",
     ),
 ]

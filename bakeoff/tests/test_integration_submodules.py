@@ -258,6 +258,10 @@ def test_the_image_and_the_run_tree_carry_the_same_submodule_blob(
         {"path": SUB_PATH, "sha": superproject["pinned"],
          "initialised": True, "marker": " ",
          "declared_unneeded": False, "empty": False,
+         # round 2 item 18: written on every entry, depth 1 included, so a
+         # reader can tell a flat tree from a gate that did not know about
+         # nesting.
+         "depth": 1,
          # round 2 item 16: an already-absolute url resolves to itself, so
          # both the declared and the persisted value are the submodule's
          # real local path.
@@ -846,3 +850,239 @@ def test_a_relative_url_superproject_materializes_and_the_image_matches(
     )
     assert in_run.read_bytes() == in_image.read_bytes()
     assert in_run.read_bytes() == SUB_LIB.encode()
+
+
+# ---------------------------------------------------------------------------
+# round-2 item 18: a submodule of a submodule
+# ---------------------------------------------------------------------------
+
+DEEP_PATH = "vendor/libdep/vendor/deep"
+SUB_DEEP = "DEEP = 1\n"
+SUB_DEEP_FUTURE = "DEEP = 999\n"
+
+#: The suite imports from BOTH levels, for the reason this file's own header
+#: gives: an assertion that cannot fail for the reason it is written for
+#: proves nothing. With `vendor/libdep/vendor/deep` empty this is a collection
+#: error in the red-before AND the green-after run, so `result.ok` is a claim
+#: about level 2 and not only about level 1.
+OLD_TEST_NESTED = """\
+import sys
+from pathlib import Path
+
+_repo = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_repo / "vendor" / "libdep"))
+sys.path.insert(0, str(_repo / "vendor" / "libdep" / "vendor" / "deep"))
+
+from calc import add
+from libdep import VALUE
+from deepdep import DEEP
+
+
+def test_both_submodule_levels_are_populated():
+    assert VALUE == 1
+    assert DEEP == 1
+
+
+def test_add():
+    assert add(1, 1) == 0
+"""
+
+NEW_TEST_NESTED = OLD_TEST_NESTED.replace(
+    "assert add(1, 1) == 0", "assert add(1, 2) == 3")
+
+MANIFEST_NESTED = """\
+task_id: sub-int-004
+task_version: 1
+repo:
+  url: {url}
+  base_sha: {base_sha}
+prompt: |
+  fix add()
+tests:
+  paths: ["tests/"]
+  runner: ["python", "-m", "pytest", "-q"]
+  f2p: ["tests/test_calc.py::test_add"]
+"""
+
+
+@pytest.fixture(scope="module")
+def nested_superproject(workspace) -> dict:
+    """`super4` -> `vendor/libdep` -> `vendor/libdep/vendor/deep`.
+
+    Fresh repositories throughout, never another fixture's: module-scoped
+    fixtures in this file run in an unspecified order, and a shared submodule
+    mirror would make one test's clone the reason another's prune assertion
+    holds.
+
+    THE BUILD ORDER IS FORCED BY THE NESTING and is written out because it has
+    to be re-derived otherwise: the innermost repository is committed first
+    because the inner's pinned commit has to name it, and the inner's pinned
+    commit has to exist before the superproject can pin THAT. Each level
+    carries a commit PAST its own gitlink, so the two prune assertions below
+    have something to fail to remove.
+
+    Offline: every repository is a local `git init` and every
+    submodule-touching command carries `-c protocol.file.allow=always`.
+    """
+    innermost = workspace / "deepdep4"
+    (innermost / "deepdep").mkdir(parents=True)
+    (innermost / "deepdep" / "__init__.py").write_text(SUB_DEEP)
+    _sh("git", "init", "-q", cwd=innermost)
+    _sh("git", "config", "user.email", "t@t.test", cwd=innermost)
+    _sh("git", "config", "user.name", "t", cwd=innermost)
+    _sh("git", "add", "-A", cwd=innermost)
+    _sh("git", "commit", "-q", "-m", "deepdep v1", cwd=innermost)
+    deep_pinned = _sh("git", "rev-parse", "HEAD", cwd=innermost)
+    (innermost / "deepdep" / "__init__.py").write_text(SUB_DEEP_FUTURE)
+    _sh("git", "commit", "-q", "-am", "deepdep FUTURE", cwd=innermost)
+    deep_future = _sh("git", "rev-parse", "HEAD", cwd=innermost)
+
+    inner = workspace / "libdep4"
+    (inner / "libdep").mkdir(parents=True)
+    (inner / "libdep" / "__init__.py").write_text(SUB_LIB)
+    _sh("git", "init", "-q", cwd=inner)
+    _sh("git", "config", "user.email", "t@t.test", cwd=inner)
+    _sh("git", "config", "user.name", "t", cwd=inner)
+    _sh("git", "add", "-A", cwd=inner)
+    _sh("git", "commit", "-q", "-m", "libdep v1", cwd=inner)
+    _sh("git", "-c", "protocol.file.allow=always", "submodule", "add", "-q",
+        str(innermost), "vendor/deep", cwd=inner)
+    _sh("git", "-c", "protocol.file.allow=always", "-C", "vendor/deep",
+        "checkout", "-q", deep_pinned, cwd=inner)
+    _sh("git", "add", "-A", cwd=inner)
+    _sh("git", "commit", "-q", "-m", "pin the inner submodule", cwd=inner)
+    inner_pinned = _sh("git", "rev-parse", "HEAD", cwd=inner)
+    (inner / "libdep" / "__init__.py").write_text(SUB_LIB_FUTURE)
+    _sh("git", "commit", "-q", "-am", "libdep FUTURE", cwd=inner)
+    inner_future = _sh("git", "rev-parse", "HEAD", cwd=inner)
+
+    repo = workspace / "super4"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "calc.py").write_text(BUGGY)
+    (repo / "tests" / "test_calc.py").write_text(OLD_TEST_NESTED)
+    (repo / ".gitignore").write_text("__pycache__/\n")
+    _sh("git", "init", "-q", cwd=repo)
+    _sh("git", "config", "user.email", "t@t.test", cwd=repo)
+    _sh("git", "config", "user.name", "t", cwd=repo)
+    _sh("git", "add", "-A", cwd=repo)
+    _sh("git", "commit", "-q", "-m", "base", cwd=repo)
+    _sh("git", "-c", "protocol.file.allow=always", "submodule", "add", "-q",
+        str(inner), SUB_PATH, cwd=repo)
+    _sh("git", "-c", "protocol.file.allow=always", "-C", SUB_PATH,
+        "checkout", "-q", inner_pinned, cwd=repo)
+    _sh("git", "add", "-A", cwd=repo)
+    _sh("git", "commit", "-q", "-m", "pin the outer submodule", cwd=repo)
+    base = _sh("git", "rev-parse", "HEAD", cwd=repo)
+
+    (repo / "calc.py").write_text(FIXED)
+    (repo / "tests" / "test_calc.py").write_text(NEW_TEST_NESTED)
+    _sh("git", "add", "-A", cwd=repo)
+    _sh("git", "commit", "-q", "-m", "fix", cwd=repo)
+    head = _sh("git", "rev-parse", "HEAD", cwd=repo)
+    reference = subprocess.run(
+        ["git", "diff", base, head], cwd=repo, check=True,
+        capture_output=True, text=True,
+    ).stdout
+
+    task_dir = workspace / "taskset" / "sub-int-004"
+    task_dir.mkdir(parents=True)
+    (task_dir / "task.yaml").write_text(
+        MANIFEST_NESTED.format(url=str(repo), base_sha=base))
+    (task_dir / "reference.diff").write_text(reference)
+    return {"task_dir": task_dir, "inner": inner, "innermost": innermost,
+            "inner_pinned": inner_pinned, "inner_future": inner_future,
+            "deep_pinned": deep_pinned, "deep_future": deep_future}
+
+
+def test_the_image_and_the_run_tree_carry_the_same_nested_submodule_blob(
+        workspace, nested_superproject, local_urls):
+    """The two-level end of everything this file compares, and the only place
+    a nested tree is materialized, built, gated and diffed against itself."""
+    task = load_task(nested_superproject["task_dir"])
+    cache = workspace / "cache4"
+
+    run_tree = workspace / "run4"
+    start_sha = materialize(task, run_tree, cache)
+
+    base = build_base_images(
+        REPO_ROOT, [task_runtime(task)])[task_runtime(task)].image_id
+    image = build_task_image(task, base, workspace / "build4", cache)
+    assert image.startswith("sha256:"), (
+        f"{image!r} is not a content pin; RunContainer refuses a tag"
+    )
+
+    result = preflight(task, image=image, repo_path=run_tree,
+                       start_sha=start_sha)
+
+    # 1. The gate passes. The suite imports from BOTH levels, so an empty
+    #    `vendor/libdep/vendor/deep` is a collection error in the red-before
+    #    and the green-after run alike.
+    assert result.ok, result.problems
+
+    # 2. The gate SAW both levels, at their gitlinks, initialised -- which no
+    #    reader in this file could do before item 18: measured 2026-09-02, a
+    #    tree with level 1 populated and level 2 empty is CLEAN to `git status
+    #    --porcelain`, to the inner's own, and to non-recursive `git submodule
+    #    status`.
+    assert result.evidence["submodules"] == [
+        {"path": SUB_PATH, "sha": nested_superproject["inner_pinned"],
+         "initialised": True, "marker": " ",
+         "declared_unneeded": False, "empty": False, "depth": 1,
+         "url_declared": str(nested_superproject["inner"]),
+         "url_persisted": str(nested_superproject["inner"])},
+        {"path": DEEP_PATH, "sha": nested_superproject["deep_pinned"],
+         "initialised": True, "marker": " ",
+         "declared_unneeded": False, "empty": False, "depth": 2,
+         "url_declared": str(nested_superproject["innermost"]),
+         "url_persisted": str(nested_superproject["innermost"])},
+    ]
+    assert result.evidence["submodules_orphaned"] == []
+
+    # 3. THE COMPARISON, at level 2. Existence first, on both sides: two
+    #    absent files would raise, but an emptiness that made both sides equal
+    #    would have PASSED -- the `/var/folders` bind-mount failure this
+    #    module's docstring records.
+    in_run = run_tree / DEEP_PATH / "deepdep" / "__init__.py"
+    in_image = (workspace / "build4" / f"image-{task.task_id}" / "repo"
+                / DEEP_PATH / "deepdep" / "__init__.py")
+    assert in_run.is_file(), f"{in_run} is missing: the run tree has no level 2"
+    assert in_image.is_file(), f"{in_image} is missing: the context has no level 2"
+    assert in_run.read_bytes() == in_image.read_bytes()
+    assert in_run.read_bytes() == SUB_DEEP.encode()
+
+    # 4. BOTH mirrors pruned, in the artifact the agent gets. One pruned
+    #    mirror per `(url, sha)` at every level, so each level's own upstream
+    #    commit past its gitlink has to be unreachable -- and the level-1 one
+    #    is asserted too, because a recursion that built the inner mirror from
+    #    an unpruned outer clone would still pass assertion 5 alone.
+    for label, cwd, future in (
+        ("level 2", run_tree / DEEP_PATH, nested_superproject["deep_future"]),
+        ("level 1", run_tree / SUB_PATH, nested_superproject["inner_future"]),
+    ):
+        reachable = subprocess.run(
+            ["git", "cat-file", "-e", future], cwd=cwd,
+            capture_output=True, text=True)
+        assert reachable.returncode != 0, (
+            f"the run tree's {label} submodule can reach {future}, which is "
+            "one commit PAST its gitlink -- that mirror did not prune, or the "
+            "clone came from somewhere else"
+        )
+
+    # 5. NO HOST CACHE PATH ANYWHERE UNDER `.git`, at either level. Item 10's
+    #    `_refuse_host_mirror_path` walks `dest/.git` with `os.walk` and so
+    #    covers `.git/modules/<outer NAME>/modules/<inner NAME>` by
+    #    construction -- which is asserted here rather than inferred, because
+    #    measured 2026-09-02 BOTH module directories leak the path in four
+    #    files each (`config`, `logs/HEAD`, `logs/refs/heads/main`,
+    #    `logs/refs/remotes/origin/HEAD`) before the guards run, and the
+    #    guard pair reaches only the level it runs at.
+    needle = str(cache / "repos").encode()
+    assert [path for path in (run_tree / ".git").rglob("*")
+            if path.is_file() and not path.is_symlink()
+            and needle in path.read_bytes()] == []
+    # Non-vacuity, per file: the INNER module directory exists and its
+    # `logs/HEAD` -- whose expire is the last write to it -- is present at
+    # 0 bytes.
+    inner_head = (run_tree / ".git" / "modules" / SUB_PATH / "modules"
+                  / "vendor/deep" / "logs" / "HEAD")
+    assert inner_head.is_file() and inner_head.stat().st_size == 0

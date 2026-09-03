@@ -779,7 +779,18 @@ rather than by reasoning:
     an ssh `repo.url` is out for the same reason its parent is. A submodule
     declared unneeded (the bullet below) is never resolved and no url of any
     kind is judged for it.
-  - Nested submodules are refused.
+  - **Submodules may be nested two levels deep; a third is refused.** A
+    submodule of the superproject is depth 1 and a submodule of one of those is
+    depth 2; a submodule at depth 2 whose own tree carries a gitlink is refused
+    at load. Every level gets its own pruned mirror, its own `git submodule
+    update --init` run from its parent's working tree, its own leak guards and
+    its own `git archive` into the build context. The cap is a policy:
+    measured 2026-09-02, git recurses to any depth, and every gitlink in the
+    screened corpus that the harness can reach is flat (four measured at their
+    pinned shas; the fifth is a private repository the harness never fetches).
+    Raising it is a one-line change to `tasks._MAX_SUBMODULE_DEPTH` plus the
+    tests that name it. A `.gitmodules` stanza with no gitlink is **not**
+    nesting and is not refused at any depth.
   - **`strip_paths` may not touch a submodule, from above or below.** Both
     `vendor/libdep` and `vendor` (with the gitlink at `vendor/libdep`) are
     refused at load. The strip runs against a start state where the submodule

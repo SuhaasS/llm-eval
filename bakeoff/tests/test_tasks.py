@@ -255,6 +255,146 @@ def upstream_two_submodules(tmp_path):
     return _build
 
 
+SUB_DEEP = "DEEP = 1\n"
+SUB_DEEP_FUTURE = "DEEP = 999\n"
+
+
+def _init_repo(path: Path) -> None:
+    _sh("git", "init", "-q", cwd=path)
+    _sh("git", "config", "user.email", "t@t.test", cwd=path)
+    _sh("git", "config", "user.name", "t", cwd=path)
+
+
+@pytest.fixture
+def nested_submodule(tmp_path):
+    """A superproject -> `vendor/lib` -> `vendor/lib/vendor/deep`.
+
+    Yields a builder taking one keyword, `levels: int = 2`, so the same three
+    repositories can be extended to a fourth for the depth-cap refusal without
+    a second fixture whose two halves could drift apart.
+
+    EVERY level carries a commit PAST its gitlink, for the reason
+    `upstream_submodule`'s docstring gives one level up: `git submodule update
+    --init` against the real url clones the submodule's whole history, so a
+    fixture whose inner repository has nothing after the pin cannot tell a
+    pruned mirror from an unpruned one. Two pins here, two futures, and the
+    materialization tests assert both are unreachable.
+
+    The build ORDER is forced by the nesting and is worth stating: the
+    innermost is committed first because `inner`'s pinned commit has to name
+    it, and `inner`'s pinned commit has to exist before the superproject can
+    pin THAT. Writing it the other way round pins each level at a commit whose
+    gitlink is empty.
+
+    `-c protocol.file.allow=always` on every submodule-touching command, for
+    the reason `upstream_submodule`'s docstring gives.
+    """
+    def _build(levels: int = 2, deep_url: str | None = None,
+               deep_stanza: bool = True, orphan_in_innermost: bool = False):
+        """`levels=3` adds a fourth repository under `innermost`, so the
+        innermost tree carries a gitlink and the depth cap fires. `deep_url`
+        rewrites the INNER's `.gitmodules` url before its pinned commit, which
+        is how a level-2 url is made unfetchable without touching level 1.
+        `deep_stanza=False` drops that stanza entirely, leaving the level-2
+        gitlink with no url. `orphan_in_innermost` gives the innermost tree a
+        `.gitmodules` and ZERO gitlinks -- the `git rm --cached` shape, which
+        must NOT be refused at the cap."""
+        deepest = None
+        if levels >= 3:
+            # A FOURTH repository, one level below `innermost`, which is what
+            # makes the innermost tree carry a gitlink of its own and the
+            # depth cap fire.
+            deepest = tmp_path / "deepest"
+            (deepest / "deepestdep").mkdir(parents=True)
+            (deepest / "deepestdep" / "__init__.py").write_text("BOTTOM = 1\n")
+            _init_repo(deepest)
+            _sh("git", "add", "-A", cwd=deepest)
+            _sh("git", "commit", "-q", "-m", "deepest v1", cwd=deepest)
+
+        innermost = tmp_path / "innermost"
+        (innermost / "deepdep").mkdir(parents=True)
+        (innermost / "deepdep" / "__init__.py").write_text(SUB_DEEP)
+        _init_repo(innermost)
+        _sh("git", "add", "-A", cwd=innermost)
+        _sh("git", "commit", "-q", "-m", "deepdep v1", cwd=innermost)
+        if deepest is not None:
+            _sh("git", "-c", "protocol.file.allow=always", "submodule", "add",
+                "-q", str(deepest), "vendor/bottom", cwd=innermost)
+            _sh("git", "commit", "-q", "-m", "nest the bottom", cwd=innermost)
+        if orphan_in_innermost:
+            # A stanza with NO gitlink, which is what a `git rm --cached`
+            # leaves behind. `_has_gitmodules` is true for this tree and
+            # `_has_gitlinks` is false, and only the second may drive the cap.
+            (innermost / ".gitmodules").write_text(
+                '[submodule "gone"]\n\tpath = gone\n\turl = https://x/y.git\n'
+            )
+            _sh("git", "add", ".gitmodules", cwd=innermost)
+            _sh("git", "commit", "-q", "-m", "an orphan stanza", cwd=innermost)
+        deep_pinned = _sh("git", "rev-parse", "HEAD", cwd=innermost)
+        (innermost / "deepdep" / "__init__.py").write_text(SUB_DEEP_FUTURE)
+        _sh("git", "commit", "-q", "-am", "deepdep FUTURE", cwd=innermost)
+        deep_future = _sh("git", "rev-parse", "HEAD", cwd=innermost)
+
+        inner = tmp_path / "inner"
+        (inner / "libdep").mkdir(parents=True)
+        (inner / "libdep" / "__init__.py").write_text(SUB_LIB)
+        _init_repo(inner)
+        _sh("git", "add", "-A", cwd=inner)
+        _sh("git", "commit", "-q", "-m", "libdep v1", cwd=inner)
+        _sh("git", "-c", "protocol.file.allow=always", "submodule", "add", "-q",
+            str(innermost), "vendor/deep", cwd=inner)
+        _sh("git", "-c", "protocol.file.allow=always", "-C", "vendor/deep",
+            "checkout", "-q", deep_pinned, cwd=inner)
+        if not deep_stanza:
+            (inner / ".gitmodules").write_text("")
+        elif deep_url is not None:
+            (inner / ".gitmodules").write_text(
+                '[submodule "vendor/deep"]\n\tpath = vendor/deep\n'
+                f"\turl = {deep_url}\n"
+            )
+        _sh("git", "add", "-A", cwd=inner)
+        _sh("git", "commit", "-q", "-m", "pin the inner submodule", cwd=inner)
+        inner_pinned = _sh("git", "rev-parse", "HEAD", cwd=inner)
+        (inner / "libdep" / "__init__.py").write_text(SUB_LIB_FUTURE)
+        _sh("git", "commit", "-q", "-am", "libdep FUTURE", cwd=inner)
+        inner_future = _sh("git", "rev-parse", "HEAD", cwd=inner)
+
+        repo = tmp_path / "super-nested"
+        (repo / "tests").mkdir(parents=True)
+        (repo / "calc.py").write_text(BUGGY)
+        (repo / "tests" / "test_calc.py").write_text(OLD_TEST)
+        _init_repo(repo)
+        _sh("git", "add", "-A", cwd=repo)
+        _sh("git", "commit", "-q", "-m", "base", cwd=repo)
+        _sh("git", "-c", "protocol.file.allow=always", "submodule", "add", "-q",
+            str(inner), "vendor/lib", cwd=repo)
+        _sh("git", "-c", "protocol.file.allow=always", "-C", "vendor/lib",
+            "checkout", "-q", inner_pinned, cwd=repo)
+        _sh("git", "add", "-A", cwd=repo)
+        _sh("git", "commit", "-q", "-m", "pin the outer submodule", cwd=repo)
+        base = _sh("git", "rev-parse", "HEAD", cwd=repo)
+
+        (repo / "calc.py").write_text(FIXED)
+        (repo / "tests" / "test_calc.py").write_text(NEW_TEST)
+        _sh("git", "add", "-A", cwd=repo)
+        _sh("git", "commit", "-q", "-m", "fix", cwd=repo)
+        head = _sh("git", "rev-parse", "HEAD", cwd=repo)
+        reference = subprocess.run(
+            ["git", "diff", base, head], cwd=repo, check=True,
+            capture_output=True, text=True,
+        ).stdout
+        return {
+            "path": repo, "base": base, "head": head, "reference": reference,
+            "inner": inner, "innermost": innermost, "deepest": deepest,
+            "inner_pinned": inner_pinned, "inner_future": inner_future,
+            "deep_pinned": deep_pinned, "deep_future": deep_future,
+            "sub_path": "vendor/lib",
+            "sub_path_deep": "vendor/lib/vendor/deep",
+        }
+
+    return _build
+
+
 @pytest.fixture
 def local_urls(monkeypatch):
     """Accept the fixtures' local-path submodule urls.
@@ -3117,7 +3257,7 @@ def test_a_repository_with_no_submodules_derives_an_empty_tuple(tmp_path, upstre
     mirror = tasks.ensure_mirror(str(upstream["path"]), upstream["base"],
                                  tmp_path / "cache")
 
-    assert tasks.derive_submodules(task, mirror) == ()
+    assert tasks.derive_submodules(task, mirror, tmp_path / "cache") == ()
 
 
 def test_the_gitlink_and_the_gitmodules_blob_are_both_read(tmp_path,
@@ -3130,7 +3270,7 @@ def test_the_gitlink_and_the_gitmodules_blob_are_both_read(tmp_path,
     task = _sub_task(tmp_path, up)
     mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
 
-    (sub,) = tasks.derive_submodules(task, mirror)
+    (sub,) = tasks.derive_submodules(task, mirror, tmp_path / "cache")
 
     assert sub.path == "vendor/libdep"
     assert sub.name == "vendor/libdep"
@@ -3164,7 +3304,7 @@ def test_a_gitlink_with_no_gitmodules_url_is_refused(tmp_path,
     mirror = tasks.ensure_mirror(str(up["path"]), base, tmp_path / "cache")
 
     with pytest.raises(TaskError, match="vendor/libdep"):
-        tasks.derive_submodules(task, mirror)
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
 
 
 def test_a_gitmodules_stanza_with_a_path_and_no_url_is_refused(
@@ -3193,7 +3333,7 @@ def test_a_gitmodules_stanza_with_a_path_and_no_url_is_refused(
     mirror = tasks.ensure_mirror(str(up["path"]), base, tmp_path / "cache")
 
     with pytest.raises(TaskError, match="declares no url") as excinfo:
-        tasks.derive_submodules(task, mirror)
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
 
     # `no url`, never `url ''`: an empty value reads as a url that is present
     # and strange rather than one that was never written.
@@ -3225,7 +3365,7 @@ def test_a_gitmodules_entry_with_no_gitlink_is_NOT_refused(tmp_path,
     task = _sub_task(tmp_path, {**up, "base": base})
     mirror = tasks.ensure_mirror(str(up["path"]), base, tmp_path / "cache")
 
-    assert [s.path for s in tasks.derive_submodules(task, mirror)] \
+    assert [s.path for s in tasks.derive_submodules(task, mirror, tmp_path / "cache")] \
         == ["vendor/libdep"]
 
 
@@ -3239,7 +3379,7 @@ def test_a_non_https_submodule_url_is_refused(tmp_path, upstream_submodule):
     mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
 
     with pytest.raises(TaskError, match="https://"):
-        tasks.derive_submodules(task, mirror)
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
 
 
 def test_a_strip_path_covering_a_submodule_is_refused(tmp_path,
@@ -3250,7 +3390,7 @@ def test_a_strip_path_covering_a_submodule_is_refused(tmp_path,
     mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
 
     with pytest.raises(TaskError, match="strip_paths"):
-        tasks.derive_submodules(task, mirror)
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
 
 
 def test_a_strip_path_covering_a_submodule_from_above_is_refused(
@@ -3272,7 +3412,7 @@ def test_a_strip_path_covering_a_submodule_from_above_is_refused(
     mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
 
     with pytest.raises(TaskError, match="above or below") as excinfo:
-        tasks.derive_submodules(task, mirror)
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
 
     assert "vendor/libdep" in str(excinfo.value)
 
@@ -3297,7 +3437,7 @@ def test_a_reference_diff_touching_a_submodule_path_is_refused(
     mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
 
     with pytest.raises(TaskError, match="reference diff"):
-        tasks.derive_submodules(task, mirror)
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
 
 
 def test_a_gitlink_whose_only_gitmodules_stanza_names_another_path_is_refused(
@@ -3324,7 +3464,7 @@ def test_a_gitlink_whose_only_gitmodules_stanza_names_another_path_is_refused(
     mirror = tasks.ensure_mirror(str(up["path"]), base, tmp_path / "cache")
 
     with pytest.raises(TaskError, match="no .gitmodules url") as excinfo:
-        tasks.derive_submodules(task, mirror)
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
     assert "vendor/libdep" in str(excinfo.value)
     assert "vendor/gone" not in str(excinfo.value)
 
@@ -3663,10 +3803,21 @@ def test_an_unreachable_submodule_mirror_is_a_task_error(
         _materialize_sub(tmp_path, up)
 
 
-def test_a_nested_submodule_is_refused(tmp_path, upstream_submodule,
-                                       local_urls):
-    """`submodule update --init` without `--recursive` leaves the inner one
-    empty, which is the same silence one level further down.
+def test_a_nested_submodule_is_no_longer_refused_and_both_levels_populate(
+        tmp_path, upstream_submodule, local_urls):
+    """The refusal round-2 item 18 LIFTED, on the tree that pinned it.
+
+    Until item 18 this shape raised *"declares submodules of its own"*, because
+    `submodule update --init` does not recurse and the inner directory arrived
+    empty -- and an empty submodule directory leaves `git status --porcelain`
+    clean. It is now populated one level at a time, with `cwd` at the parent's
+    working tree, so both levels arrive. Depth 3 is still refused, by
+    `test_a_submodule_three_levels_deep_is_refused_by_the_depth_cap`.
+
+    Kept beside the `nested_submodule` fixture's own tests rather than folded
+    into them: this tree is built by REPINNING an existing submodule at a
+    commit that already carries a gitlink, which is the shape a real task
+    author meets, and its two traps below are measured.
 
     Two details this test got wrong once and is now pinned against. The
     superproject is detached back to `up["base"]` before the gitlink moves, so
@@ -3679,7 +3830,7 @@ def test_a_nested_submodule_is_refused(tmp_path, upstream_submodule,
     refusal in it at all.
     """
     up = upstream_submodule
-    inner = tmp_path / "inner"
+    inner = tmp_path / "inner-repinned"
     inner.mkdir()
     (inner / "x.py").write_text("X = 1\n")
     _sh("git", "init", "-q", cwd=inner)
@@ -3700,8 +3851,12 @@ def test_a_nested_submodule_is_refused(tmp_path, upstream_submodule,
         "commit", "-q", "-m", "repin at the nested commit", cwd=up["path"])
     base = _sh("git", "rev-parse", "HEAD", cwd=up["path"])
 
-    with pytest.raises(TaskError, match="submodules of its own"):
-        _materialize_sub(tmp_path, {**up, "base": base})
+    _, run, _ = _materialize_sub(tmp_path, {**up, "base": base})
+
+    assert (run / "vendor" / "libdep" / "inner" / "x.py").read_text() == "X = 1\n"
+    assert _sh("git", "-C", "vendor/libdep/inner", "rev-parse", "HEAD",
+               cwd=run) == _sh("git", "rev-parse", "HEAD", cwd=inner)
+    assert _sh("git", "status", "--porcelain", cwd=run) == ""
 
 
 def test_a_submodule_the_update_left_unpopulated_is_refused(
@@ -3837,7 +3992,7 @@ def test_a_declared_unneeded_submodule_is_not_refused_for_its_url(
     mirror = tasks.ensure_mirror(str(up["path"]), up["base"],
                                  tmp_path / "cache")
 
-    (sub,) = tasks.derive_submodules(task, mirror)
+    (sub,) = tasks.derive_submodules(task, mirror, tmp_path / "cache")
 
     assert sub.declared_unneeded is True
     assert sub.url_declared == "git@example.invalid:x/y.git"
@@ -3858,7 +4013,7 @@ def test_an_unneeded_declaration_naming_no_gitlink_is_refused(
                                  tmp_path / "cache")
 
     with pytest.raises(TaskError, match="vendor/typo") as excinfo:
-        tasks.derive_submodules(task, mirror)
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
 
     assert "no gitlink" in str(excinfo.value)
 
@@ -3875,7 +4030,7 @@ def test_the_typo_refusal_beats_the_url_refusal(tmp_path, upstream_submodule):
                                  tmp_path / "cache")
 
     with pytest.raises(TaskError) as excinfo:
-        tasks.derive_submodules(task, mirror)
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
 
     assert "submodules_unneeded" in str(excinfo.value)
     assert "git@example.invalid" not in str(excinfo.value)
@@ -3896,7 +4051,7 @@ def test_the_typo_refusal_beats_the_unreadable_gitmodules_refusal(
     mirror = tasks.ensure_mirror(str(up["path"]), base, tmp_path / "cache")
 
     with pytest.raises(TaskError) as excinfo:
-        tasks.derive_submodules(task, mirror)
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
 
     assert "submodules_unneeded" in str(excinfo.value)
     assert "no readable .gitmodules" not in str(excinfo.value)
@@ -3918,7 +4073,7 @@ def test_a_declared_unneeded_gitlink_survives_an_unreadable_gitmodules(
                      extra_yaml='submodules_unneeded: ["vendor/libdep"]')
     mirror = tasks.ensure_mirror(str(up["path"]), base, tmp_path / "cache")
 
-    (sub,) = tasks.derive_submodules(task, mirror)
+    (sub,) = tasks.derive_submodules(task, mirror, tmp_path / "cache")
 
     assert sub.declared_unneeded is True
     assert sub.url_declared == ""
@@ -3938,7 +4093,7 @@ def test_a_declared_unneeded_gitlink_with_no_stanza_in_a_readable_gitmodules(
     mirror = tasks.ensure_mirror(str(up["path"]), up["base"],
                                  tmp_path / "cache")
 
-    subs = tasks.derive_submodules(task, mirror)
+    subs = tasks.derive_submodules(task, mirror, tmp_path / "cache")
 
     assert [s.path for s in subs] == ["vendor/libdep", "vendor/other"]
     other = subs[1]
@@ -3964,7 +4119,7 @@ def test_a_strip_path_covering_a_declared_unneeded_submodule_is_still_refused(
                                  tmp_path / "cache")
 
     with pytest.raises(TaskError, match="strip_paths"):
-        tasks.derive_submodules(task, mirror)
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
 
 
 def test_a_reference_diff_touching_a_declared_unneeded_submodule_is_still_refused(
@@ -3989,7 +4144,7 @@ def test_a_reference_diff_touching_a_declared_unneeded_submodule_is_still_refuse
                                  tmp_path / "cache")
 
     with pytest.raises(TaskError, match="ungradable"):
-        tasks.derive_submodules(task, mirror)
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
 
 
 @pytest.mark.parametrize("bad", [
@@ -4169,7 +4324,7 @@ def test_both_urls_are_recorded_on_the_submodule_record(
     mirror = tasks.ensure_mirror(str(up["path"]), up["base"],
                                  tmp_path / "cache")
 
-    (sub,) = tasks.derive_submodules(task, mirror)
+    (sub,) = tasks.derive_submodules(task, mirror, tmp_path / "cache")
 
     assert sub.url_declared == "../libdep"
     assert sub.url_resolved == str(up["lib"])
@@ -4182,7 +4337,7 @@ def test_an_absolute_url_records_the_same_value_twice(
     mirror = tasks.ensure_mirror(str(up["path"]), up["base"],
                                  tmp_path / "cache")
 
-    (sub,) = tasks.derive_submodules(task, mirror)
+    (sub,) = tasks.derive_submodules(task, mirror, tmp_path / "cache")
 
     assert sub.url_declared == sub.url_resolved
 
@@ -4215,7 +4370,7 @@ def test_a_gitlink_with_no_url_is_refused_before_the_resolver_runs(
     mirror = tasks.ensure_mirror(str(up["path"]), base, tmp_path / "cache")
 
     with pytest.raises(TaskError, match="no url") as excinfo:
-        tasks.derive_submodules(task, mirror)
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
 
     assert "does not resolve" not in str(excinfo.value)
 
@@ -4238,7 +4393,7 @@ def test_an_unresolvable_relative_url_is_refused_at_derivation(
     mirror = tasks.ensure_mirror(str(up["path"]), base, tmp_path / "cache")
 
     with pytest.raises(TaskError, match="climbs above"):
-        tasks.derive_submodules(task, mirror)
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
 
 
 def test_a_declared_unneeded_submodule_is_never_resolved(
@@ -4260,7 +4415,7 @@ def test_a_declared_unneeded_submodule_is_never_resolved(
                      extra_yaml='submodules_unneeded: ["vendor/libdep"]')
     mirror = tasks.ensure_mirror(str(up["path"]), base, tmp_path / "cache")
 
-    (sub,) = tasks.derive_submodules(task, mirror)
+    (sub,) = tasks.derive_submodules(task, mirror, tmp_path / "cache")
 
     assert sub.declared_unneeded is True
     assert sub.url_resolved is None
@@ -4276,7 +4431,7 @@ def test_no_mirror_is_keyed_on_the_raw_relative_url(
     materialize(task, tmp_path / "run", cache)
 
     (sub,) = tasks.derive_submodules(
-        task, tasks.ensure_mirror(str(up["path"]), up["base"], cache))
+        task, tasks.ensure_mirror(str(up["path"]), up["base"], cache), cache)
     assert tasks.pruned_mirror_path(sub.url_resolved, sub.sha, cache).exists()
     # The raw url would slug to a DIFFERENT path (`pruned_mirror_path` keys
     # on the string it is given) -- no directory exists under that key,
@@ -4295,7 +4450,7 @@ def test_the_run_tree_persists_the_resolved_url(
     materialize(task, dest, cache)
 
     (sub,) = tasks.derive_submodules(
-        task, tasks.ensure_mirror(str(up["path"]), up["base"], cache))
+        task, tasks.ensure_mirror(str(up["path"]), up["base"], cache), cache)
     persisted = _sh("git", "config", "--get", "submodule.vendor/libdep.url",
                     cwd=dest)
     assert persisted == sub.url_resolved
@@ -4902,3 +5057,402 @@ def test_a_selected_id_no_directory_supplies_names_the_refused_manifests(
     assert "t-999" in message
     assert "DIRECTORY NAME only" in message
     assert str(root / "t-002") in message
+
+
+# --- round 2, item 18: nested submodules --------------------------------------
+
+
+def test_local_path_is_relative_to_the_parent():
+    """Pure. `local_path` inverts a join this class performed, so a `path` that
+    is not under its `parent` RAISES rather than returning a plausible wrong
+    path -- which is what `path[len(parent) + 1:]` would do, and what
+    `submodule update --init --` would then be handed."""
+    flat = tasks.Submodule(name="n", path="vendor/lib", url_declared="u",
+                           url_resolved="u", sha="a" * 40)
+    nested = tasks.Submodule(name="n", path="vendor/lib/vendor/deep",
+                             url_declared="u", url_resolved="u", sha="b" * 40,
+                             depth=2, parent="vendor/lib")
+
+    assert flat.local_path == "vendor/lib"
+    assert flat.depth == 1 and flat.parent == ""
+    assert nested.local_path == "vendor/deep"
+
+    lying = tasks.Submodule(name="n", path="elsewhere/deep", url_declared="u",
+                            url_resolved="u", sha="c" * 40, depth=2,
+                            parent="vendor/lib")
+    with pytest.raises(ValueError):
+        lying.local_path
+
+
+def test_a_two_level_submodule_is_derived_with_full_paths_and_depths(
+        tmp_path, nested_submodule, local_urls):
+    """`path` is superproject-relative at BOTH levels, which is what keeps the
+    five path-shaped refusals comparing like with like at depth 2."""
+    up = nested_submodule()
+    task = _sub_task(tmp_path, up)
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
+
+    outer, inner = tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+    assert (outer.path, outer.depth, outer.parent, outer.local_path) == (
+        "vendor/lib", 1, "", "vendor/lib")
+    assert (inner.path, inner.depth, inner.parent, inner.local_path) == (
+        "vendor/lib/vendor/deep", 2, "vendor/lib", "vendor/deep")
+    assert outer.sha == up["inner_pinned"]
+    assert inner.sha == up["deep_pinned"]
+    assert inner.url_resolved == str(up["innermost"])
+
+
+def test_the_derived_order_is_parents_before_children(
+        tmp_path, nested_submodule, local_urls):
+    """PRE-ORDER, pinned rather than left as a property of the recursion's
+    shape: `_init_submodules` walks this flat tuple and runs each update with
+    `cwd` at the parent's working tree, which does not exist until the parent's
+    own update has run."""
+    up = nested_submodule()
+    task = _sub_task(tmp_path, up)
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
+
+    subs = tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+    assert [s.path for s in subs] == ["vendor/lib", "vendor/lib/vendor/deep"]
+
+
+def test_a_submodule_three_levels_deep_is_refused_by_the_depth_cap(
+        tmp_path, nested_submodule, local_urls):
+    """A four-repository chain. The cap is policy -- measured, git recurses to
+    any depth -- so the refusal names the cap rather than describing a limit of
+    git's."""
+    up = nested_submodule(levels=3)
+    task = _sub_task(tmp_path, up)
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
+
+    with pytest.raises(TaskError, match="at most 2"):
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+
+def test_the_depth_refusal_names_the_full_path_and_the_cap(
+        tmp_path, nested_submodule, local_urls):
+    """The message has to name a path the task author can find, and keep the
+    measured sentence: the level below the cap arrives empty and `git status
+    --porcelain` reports a tree in that state as CLEAN."""
+    up = nested_submodule(levels=3)
+    task = _sub_task(tmp_path, up)
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
+
+    with pytest.raises(TaskError) as excinfo:
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+    message = str(excinfo.value)
+    assert "vendor/lib/vendor/deep" in message
+    assert "most 2" in message
+    assert "3 levels below the superproject" in message
+    assert ("an empty submodule directory leaves `git status --porcelain` "
+            "clean") in message
+
+
+def test_an_orphan_gitmodules_stanza_at_the_cap_is_not_refused(
+        tmp_path, nested_submodule, local_urls):
+    """The predicate is a GITLINK scan, not `.gitmodules`' existence. A
+    submodule `git rm --cached`'d with its stanza left behind gives a readable
+    `.gitmodules` and zero `160000` entries -- the inert shape this module's
+    own comments say must be recorded rather than refused, and which the old
+    `_has_gitmodules` condition refused at the cap."""
+    up = nested_submodule(orphan_in_innermost=True)
+    task = _sub_task(tmp_path, up)
+    cache = tmp_path / "cache"
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], cache)
+
+    subs = tasks.derive_submodules(task, mirror, cache)
+
+    assert [s.path for s in subs] == ["vendor/lib", "vendor/lib/vendor/deep"]
+    innermost_mirror = tasks.ensure_pruned_mirror(
+        str(up["innermost"]), up["deep_pinned"], cache)
+    assert tasks._has_gitmodules(innermost_mirror, up["deep_pinned"]) is True
+    assert tasks._has_gitlinks(innermost_mirror, up["deep_pinned"]) is False
+    _materialize_sub(tmp_path, up, name="t-002")
+
+
+def test_a_nested_submodule_url_that_is_not_https_is_refused(
+        tmp_path, nested_submodule, monkeypatch):
+    """The url rule applies at EVERY level, and the message names the FULL
+    path.
+
+    `_SUBMODULE_URL_PREFIX` is set to the fixtures' own tmp_path rather than
+    emptied (`local_urls`) or left at production `https://`: emptied, no url
+    can be refused at all; at production, the level-1 local path is refused
+    first and the level-2 url is never read. Under this prefix the fixtures'
+    local paths pass and `ssh://` does not, which is the only arrangement in
+    which the assertion is about level 2.
+    """
+    monkeypatch.setattr(tasks, "_SUBMODULE_URL_PREFIX", str(tmp_path))
+    up = nested_submodule(deep_url="ssh://git@example.invalid/deep.git")
+    task = _sub_task(tmp_path, up)
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
+
+    with pytest.raises(TaskError) as excinfo:
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+    message = str(excinfo.value)
+    assert "vendor/lib/vendor/deep" in message
+    assert "ssh://git@example.invalid/deep.git" in message
+    assert "That tree is the submodule vendor/lib at depth 1" not in message
+
+
+def test_the_inner_url_is_refused_before_its_mirror_is_built(
+        tmp_path, nested_submodule, monkeypatch):
+    """Ordering, and it is why each level refuses BEFORE it clones: a url the
+    eval cannot fetch reaching `ensure_pruned_mirror` is git's own error, or a
+    credential prompt, instead of the loader's message naming the task.
+
+    Only the INNERMOST mirror is forbidden. A blanket patch would raise at
+    level 1, before any level-2 url exists to refuse -- the level-1 mirror is
+    the repository whose `.gitmodules` declares the inner url.
+    """
+    monkeypatch.setattr(tasks, "_SUBMODULE_URL_PREFIX", str(tmp_path))
+    up = nested_submodule(deep_url="ssh://git@example.invalid/deep.git")
+    task = _sub_task(tmp_path, up)
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
+    real = tasks.ensure_pruned_mirror
+
+    def only_the_innermost_is_forbidden(repo_url, sha, cache_root):
+        if repo_url in (str(up["innermost"]),
+                        "ssh://git@example.invalid/deep.git"):
+            raise AssertionError(
+                "the innermost mirror was built before its url was refused"
+            )
+        return real(repo_url, sha, cache_root)
+
+    monkeypatch.setattr(tasks, "ensure_pruned_mirror",
+                        only_the_innermost_is_forbidden)
+
+    with pytest.raises(TaskError, match="urls can be fetched by this"):
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+
+def test_a_gitlink_with_no_url_at_the_inner_level_is_refused(
+        tmp_path, nested_submodule, local_urls):
+    """The gitlink-with-no-url refusal at depth 2, and its message names both
+    the level-2 path and the parent submodule at its depth -- otherwise the
+    author is told a sha they cannot look up."""
+    up = nested_submodule(deep_stanza=False)
+    task = _sub_task(tmp_path, up)
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
+
+    with pytest.raises(TaskError) as excinfo:
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+    message = str(excinfo.value)
+    assert "vendor/lib/vendor/deep" in message
+    assert "That tree is the submodule vendor/lib at depth 1." in message
+
+
+def test_strip_paths_covering_a_nested_submodule_is_refused(
+        tmp_path, nested_submodule, local_urls):
+    """The full-path decision, from the consumer's side, and it takes BOTH
+    halves to state.
+
+    A strip covering the level-2 submodule necessarily covers the level-1 one
+    from below, and the loop refuses on the first submodule it matches -- so
+    the message names `vendor/lib`, which is accurate and is the strip that
+    would actually run. What the full path buys is the second half: the
+    LEVEL-LOCAL name `vendor/deep` matches no submodule in this tree, and a
+    level-local `sub.path` would have made it match one that is really at
+    `vendor/lib/vendor/deep`.
+    """
+    up = nested_submodule()
+    cache = tmp_path / "cache"
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], cache)
+
+    task = _sub_task(tmp_path, up,
+                     extra_yaml='strip_paths: ["vendor/lib/vendor/deep"]')
+    with pytest.raises(TaskError) as excinfo:
+        tasks.derive_submodules(task, mirror, cache)
+    assert "strip_paths names vendor/lib/vendor/deep" in str(excinfo.value)
+    assert "covers the submodule vendor/lib " in str(excinfo.value)
+
+    local_only = _sub_task(tmp_path, up, name="t-002",
+                           extra_yaml='strip_paths: ["vendor/deep"]')
+    assert [s.path for s in
+            tasks.derive_submodules(local_only, mirror, cache)] \
+        == ["vendor/lib", "vendor/lib/vendor/deep"]
+
+
+def test_a_reference_diff_touching_a_nested_submodule_is_refused(
+        tmp_path, nested_submodule, local_urls):
+    """`git add -A` stages nothing for content inside a submodule at any
+    depth, so a task whose fix lives two levels down is ungradable by
+    construction -- and the refusal only fires if `sub.path` is full."""
+    up = nested_submodule()
+    reference = up["reference"] + (
+        "diff --git a/vendor/lib/vendor/deep/deep.py"
+        " b/vendor/lib/vendor/deep/deep.py\n"
+        "--- a/vendor/lib/vendor/deep/deep.py\n"
+        "+++ b/vendor/lib/vendor/deep/deep.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+X = 1\n"
+    )
+    task = _sub_task(tmp_path, {**up, "reference": reference})
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
+
+    with pytest.raises(TaskError) as excinfo:
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+    assert "vendor/lib/vendor/deep" in str(excinfo.value)
+
+
+def test_a_level_two_submodule_can_be_declared_unneeded(
+        tmp_path, nested_submodule, local_urls):
+    """Item 2's key takes a path at ANY depth, so a level-2 submodule can be
+    left unpopulated while its parent is populated. No mirror is built for it,
+    and its directory is present and empty afterwards."""
+    up = nested_submodule()
+    cache = tmp_path / "cache"
+    task = _sub_task(
+        tmp_path, up,
+        extra_yaml='submodules_unneeded: ["vendor/lib/vendor/deep"]')
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], cache)
+
+    outer, inner = tasks.derive_submodules(task, mirror, cache)
+
+    assert outer.declared_unneeded is False
+    assert inner.declared_unneeded is True
+    assert inner.url_resolved is None
+    assert not tasks.pruned_mirror_path(
+        str(up["innermost"]), up["deep_pinned"], cache).exists()
+
+    _, run, _ = _materialize_sub(
+        tmp_path, up, name="t-002",
+        extra_yaml='submodules_unneeded: ["vendor/lib/vendor/deep"]')
+    deep = run / "vendor" / "lib" / "vendor" / "deep"
+    assert deep.is_dir() and not any(deep.iterdir())
+    assert (run / "vendor" / "lib" / "libdep" / "__init__.py").read_text() \
+        == SUB_LIB
+
+
+def test_a_level_two_typo_in_submodules_unneeded_is_refused_after_the_recursion(
+        tmp_path, nested_submodule, local_urls):
+    """A declared path under a level-1 gitlink is DEFERRED at item 2's own
+    position, because only the recursion can say whether it exists. When no
+    level explains it, the second check refuses it."""
+    up = nested_submodule()
+    task = _sub_task(
+        tmp_path, up,
+        extra_yaml='submodules_unneeded: ["vendor/lib/vendor/deeep"]')
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
+
+    with pytest.raises(TaskError) as excinfo:
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+    message = str(excinfo.value)
+    assert "vendor/lib/vendor/deeep" in message
+    assert "is not a gitlink at any level the derivation reached" in message
+
+
+def test_declaring_a_parent_and_its_child_is_refused(
+        tmp_path, nested_submodule, local_urls):
+    """DECLARING A PARENT IMPLICITLY DECLINES ITS CHILDREN, because the
+    recursion does not descend into a submodule it was told not to populate --
+    so the child is in no `sub.path` and the second typo check refuses the
+    pair. The message is accurate and does not say why; the why lives in the
+    key's documentation block, and this test is what forces that block to move
+    if the pair is ever made legal."""
+    up = nested_submodule()
+    task = _sub_task(
+        tmp_path, up,
+        extra_yaml=('submodules_unneeded: ["vendor/lib", '
+                    '"vendor/lib/vendor/deep"]'))
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
+
+    with pytest.raises(TaskError) as excinfo:
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+    message = str(excinfo.value)
+    assert "vendor/lib/vendor/deep" in message
+    assert "is not a gitlink at any level the derivation reached" in message
+
+
+def test_a_level_one_typo_still_beats_the_url_refusal(
+        tmp_path, nested_submodule, monkeypatch):
+    """Item 2's ordering, re-run ON THE NESTED FIXTURE, because that is where
+    the new `deferred` term could wrongly swallow it. `_under` is
+    component-wise, so `vendor/libdeps` is not under `vendor/lib` and is
+    refused as the typo it is rather than deferred to a level that will never
+    explain it."""
+    monkeypatch.setattr(tasks, "_SUBMODULE_URL_PREFIX", "https://")
+    up = nested_submodule()
+    task = _sub_task(tmp_path, up,
+                     extra_yaml='submodules_unneeded: ["vendor/libdeps"]')
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
+
+    with pytest.raises(TaskError) as excinfo:
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+    message = str(excinfo.value)
+    assert "submodules_unneeded names vendor/libdeps" in message
+    assert "has no gitlink at" in message
+
+
+def test_a_nested_submodule_is_populated_at_its_gitlink(
+        tmp_path, nested_submodule, local_urls):
+    """M13 against M5. Both directories exist and are non-empty, both HEADs
+    equal their gitlinks, and both `git submodule status --recursive` markers
+    are a LEADING SPACE -- which is what the one-shot `--recursive` update does
+    NOT produce: it populates the deeper tree and leaves its marker at `-`,
+    because the inner `submodule init` skips a registration whose value is
+    already visible."""
+    up = nested_submodule()
+    _, run, _ = _materialize_sub(tmp_path, up)
+
+    outer = run / "vendor" / "lib"
+    inner = outer / "vendor" / "deep"
+    assert (outer / "libdep" / "__init__.py").read_text() == SUB_LIB
+    assert (inner / "deepdep" / "__init__.py").read_text() == SUB_DEEP
+    assert _sh("git", "rev-parse", "HEAD", cwd=outer) == up["inner_pinned"]
+    assert _sh("git", "rev-parse", "HEAD", cwd=inner) == up["deep_pinned"]
+
+    # RAW stdout, never `_sh`: that helper strips, and the whole assertion
+    # here is about the FIRST CHARACTER of the first line.
+    status = subprocess.run(
+        ["git", "submodule", "status", "--recursive"], cwd=run,
+        check=True, capture_output=True, text=True).stdout
+    lines = [line for line in status.splitlines() if line.strip()]
+    assert len(lines) == 2
+    assert all(line[0] == " " for line in lines), status
+    assert _sh("git", "status", "--porcelain", cwd=run) == ""
+
+
+def test_a_nested_submodule_cannot_reach_the_future(
+        tmp_path, nested_submodule, local_urls):
+    """Every level gets its own PRUNED mirror. Without one the run tree carries
+    submodule content newer than the gitlink -- the founding leak, one and two
+    levels down, and differential in the same way since only an arm that looks
+    inside `.git` collects it."""
+    up = nested_submodule()
+    _, run, _ = _materialize_sub(tmp_path, up)
+
+    outer = run / "vendor" / "lib"
+    inner = outer / "vendor" / "deep"
+    assert subprocess.run(["git", "cat-file", "-e", up["inner_future"]],
+                          cwd=outer, capture_output=True).returncode != 0
+    assert subprocess.run(["git", "cat-file", "-e", up["deep_future"]],
+                          cwd=inner, capture_output=True).returncode != 0
+
+
+def test_a_nested_submodule_does_not_move_start_sha(
+        tmp_path, nested_submodule, local_urls):
+    """`_init_submodules` runs AFTER `start_sha` is computed and compared, so
+    nothing the recursion does can reach the setup commit. Materialized twice
+    into two destinations, because a start sha that is a pure function of the
+    manifest is the property the pin rests on."""
+    up = nested_submodule()
+    task = _sub_task(tmp_path, up)
+    cache = tmp_path / "cache"
+    first = materialize(task, tmp_path / "run-a", cache)
+    second = materialize(task, tmp_path / "run-b", cache)
+
+    assert first == second
+    for run in (tmp_path / "run-a", tmp_path / "run-b"):
+        assert (run / "vendor" / "lib" / "vendor" / "deep"
+                / "deepdep" / "__init__.py").read_text() == SUB_DEEP
+        assert _sh("git", "status", "--porcelain", cwd=run) == ""
