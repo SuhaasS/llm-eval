@@ -520,20 +520,15 @@ pass-to-pass, 1.4 s suite. **What remains for Gate 1 is the dataset itself**
   is a bound on external validity, not a correctness gap: every arm sees the
   identical tree.
 
-- [ ] **What an agent writes inside an uninitialised submodule directory is
-  invisible at run time.** Measured 2026-09-02 after the snapshot-index seed:
-  a file the agent creates under a `submodules_unneeded` path diffs to **0
-  bytes** and names nothing, while `ls -A` sees it — git does not descend into
-  a gitlink path in any state, and the seeded index does not either. So the
-  §5.6 submission and every §5.5 checkpoint are silent about it. Within item 2
-  the only enforcement is preflight's two `ls -A` reads, which refuse the
-  *task* rather than scoring a *run*: a task that gates clean and an agent
-  that writes in there mid-run are two different moments. Capturing it at run
-  time is round-2 item 17's job
-  (`docs/superpowers/plans/2026-09-03-round2-17-submodule-dirty-capture.md`):
-  an `ls -A` over uninitialised gitlink directories, recorded in
-  `submodules_dirty` and refused by the grader. Filed here because item 17 had
-  not landed when item 2 shipped; delete this entry when it does.
+- [ ] **A submodule edit is refused at any depth, but the record and the
+  message name the depth-1 path.** The capture itself landed with round 2 item
+  17: `container.submodule_states` records `submodules_dirty`,
+  `RunRecord.submodules_dirty_at_exit` carries it, and the grader refuses such
+  a run as `SUBMODULE_EDIT_UNGRADABLE` rather than letting `git add -A`'s
+  silence land as `EMPTY_PATCH` → `resolved: False`. What is still open is
+  LOCALISATION, and only for an INITIALISED chain — a declared-unneeded
+  submodule is depth-1 only since the round-2 final review, precisely because
+  the run-time reader cannot see under an initialised parent.
 
   Measured 2026-09-02 at two levels, with item 17's own argv: the
   superproject's `git status --porcelain=v2 --ignore-submodules=none` reads

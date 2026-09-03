@@ -193,13 +193,24 @@ tests:
 # nothing here takes part in the setup commit, and submodules are initialised
 # after start_sha is settled.
 #
-# Each entry is a submodule path AT ANY DEPTH -- a level-2 submodule
-# (`vendor/lib/vendor/deep`) can be declared unneeded while its parent is
-# populated, and the path is always superproject-relative, never the
-# level-local one the inner .gitmodules declares. DECLARING A PARENT
-# IMPLICITLY DECLINES ITS CHILDREN, because the harness does not descend into
-# a submodule it was told not to populate; so declaring both a parent and one
-# of its children is refused, and the refusal names the child.
+# Each entry is a submodule path AT DEPTH 1 ONLY -- a submodule of the
+# superproject. A level-2 path (`vendor/lib/vendor/deep`) is refused at load,
+# and the reason is the run-time reader rather than the gate:
+# container.submodule_states enumerates gitlinks with `git ls-files -s -z` at
+# the superproject root, and git does not descend through a gitlink, so a
+# level-2 gitlink inside a POPULATED level-1 submodule is never enumerated and
+# never probed (the level-1 path that IS enumerated carries a .git and is
+# skipped by design, and --porcelain=v2 is silent too). What an agent wrote
+# into that empty directory would be recorded nowhere while submodules_dirty
+# read `{}` -- the positive claim that the tree was read and is clean -- and
+# the offline grader would stamp EMPTY_PATCH, `resolved: False`, on a
+# submission that really edited files.
+#
+# Paths are always superproject-relative, never the level-local one an inner
+# .gitmodules declares. DECLARING A PARENT IMPLICITLY DECLINES ITS CHILDREN,
+# because the harness does not descend into a submodule it was told not to
+# populate; so declaring both a parent and one of its children is refused, and
+# the refusal names the child.
 #
 # What it does NOT relax: a strip_paths entry covering the submodule is
 # still refused (the strip removes the gitlink and moves start_sha), and a
@@ -210,7 +221,10 @@ tests:
 #
 # Refused at load: an absolute path, "..", ".", ".git", a glob, a repeat.
 # Refused when the mirror exists: a path the tree at base_sha has no gitlink
-# at -- a typo must not silently declare nothing.
+# at -- a typo must not silently declare nothing -- and a path that IS a
+# gitlink but at depth 2 or below, which is refused by the level that finds
+# it, so the message names the depth and the parent rather than calling a
+# real path a typo.
 #
 # What the gate CHECKS, and it is narrower than the key's name: the
 # directory exists, is EMPTY and `git submodule status` reads `-`; the

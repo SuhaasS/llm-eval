@@ -2,6 +2,8 @@
 
 CLAUDE.md was not edited on branch `broaden-taskset` because `main` carries an uncommitted edit to it. Each plan's deferred section is collected here verbatim so the paragraphs can be applied to CLAUDE.md in one pass after the merge.
 
+One entry broke that rule and was put back: item 14's bullet was written into `CLAUDE.md` by `38e735c`, and the round-2 final fix wave reverted it so that `git diff d053c6e -- CLAUDE.md` is empty at HEAD. The paragraph therefore belongs in this list like every other, and it is applied **once**, post-merge — its entry says so, because a reader who knows only that it was committed on the branch would skip it, and one who knows only that it is listed here would add it twice.
+
 
 ## 2026-09-01-broaden-1-strip-paths.md
 
@@ -147,7 +149,7 @@ And one line for the **Config gotchas** section:
 
 ## Round 2 (2026-09-03)
 
-Round 2 deferred nine of seventeen entries a sentence (item 13 covers items 13 and 15; item 19, the re-screen, is tracked separately below and contributes nothing). Items 8, 12, 13+15 and 18 close with no `CLAUDE.md` text — noted under each.
+Round 2 deferred thirteen of seventeen entries a sentence (item 13 covers items 13 and 15; item 19, the re-screen, is tracked separately below and contributes nothing). Items 8, 12, 13+15 and 18 close with no `CLAUDE.md` text — noted under each.
 
 ### Item 3 — `2026-09-03-round2-3-unique-run-trees.md` (`8ab0b08`, `cfa155a`)
 
@@ -163,7 +165,7 @@ Round 2 deferred nine of seventeen entries a sentence (item 13 covers items 13 a
 ### Item 2 — `2026-09-03-round2-2-unneeded-submodule.md` (`df699a8`, `a317b0a`)
 
 * Under the submodule material: *"A submodule the task's suite never reads can be declared `submodules_unneeded` in the manifest — the gitlink stays in the index and the tree, the directory is never populated, its url scheme is never checked, a readable `.gitmodules` is not required for it, and no mirror is built. It relaxes four of the six submodule refusals and neither of the two that protect grading: a strip covering the path, and a reference diff touching it, are refused with the key exactly as without it."*
-* Beside the "Silence is the enemy" bullet: *"git does not descend into a gitlink path in any state. Measured 2026-09-02: a file inside an uninitialised submodule directory is invisible to `git status --porcelain` (with or without `-uall`) and to `git ls-files -o`. So the clean-tree check cannot see a suite that writes in there, and preflight's `ls -A` is the only reader that can."*
+* Beside the "Silence is the enemy" bullet: *"git does not descend into a gitlink path in any state. Measured 2026-09-02: a file inside an uninitialised submodule directory is invisible to `git status --porcelain` (with or without `-uall`) and to `git ls-files -o`. So the clean-tree check cannot see a suite that writes in there, and preflight's `ls -A` at gate time and `container.submodule_states`' `find` probe at run time are the only readers that can."*
 * A third, and it is the one that cost a whole review round: *"`snapshot_diff` stages into a SCRATCH index, and a scratch index starts empty — so `git add -A` builds it from a worktree scan that cannot see a gitlink, and an UNINITIALISED submodule reads as `deleted file mode 160000` against `base_sha`. Measured 2026-09-02: 239 bytes on `tobymao/sqlglot`, clean tree, agent did nothing; `grader._GITLINK_MODE` matches it, so every run of a `submodules_unneeded` task would grade SUBMODULE_GITLINK_UNGRADABLE. The same empty index reported a tracked-but-gitignored file as deleted. `git read-tree <base_sha>` into that index before staging is the fix, and a measurement of `git add -A` against the repository's own index is not a measurement of this path."*
 
 ### Item 4 — `2026-09-03-round2-4-task-selection-load.md` (`a653d32`, `ac97018`)
@@ -216,6 +218,8 @@ No `CLAUDE.md` paragraph. Every remedy in this item is a `HARVESTING.md` and `TA
 No `CLAUDE.md` paragraph. The plan states plainly that the existing "Configuration is never reported as observation" bullet already covers the rule this change applies, and directs "no edit unless a later reviewer asks" — no reviewer asked.
 
 ### Item 14 — `2026-09-03-round2-14-build-outputs.md` (`38e735c`, `dde9bcf`)
+
+**APPLIED ON THE BRANCH IN `38e735c`, THEN REVERTED — apply it here, exactly once.** This is the one entry whose paragraph was written into `CLAUDE.md` rather than deferred; the round-2 final fix wave took it back out, so the branch carries no `CLAUDE.md` change at HEAD and this list is again the complete set. Do not read `38e735c` in the history as "already done". `main`'s uncommitted `CLAUDE.md` edit is the cache-pricing bullet at a different hunk, so the two do not overlap.
 
 Under **Invariants**, new bullet:
 

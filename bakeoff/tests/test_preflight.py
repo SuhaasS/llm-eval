@@ -5857,9 +5857,15 @@ def test_evidence_keys_lists_exactly_what_preflight_writes():
     import bakeoff.preflight as pf
 
     tree = ast.parse(pathlib.Path(pf.__file__).read_text())
-    fn = next(n for n in ast.walk(tree)
-              if isinstance(n, ast.FunctionDef) and n.name == "preflight")
-    written = {n.slice.value for n in ast.walk(fn)
+    # MODULE-WIDE, not scoped to `preflight`. Every write is inside that
+    # function today, but a helper taking the evidence dict and writing a key
+    # into it would be invisible to a scoped walk while
+    # `PreflightResult.__post_init__` accepted the result -- the one shape
+    # this test exists to catch, missed by the test itself. Re-measured
+    # 2026-09-03 over the whole module in both subscript shapes, plus a scan
+    # for `evidence.update` and `|=` (there are none): exact agreement with
+    # the scoped extraction, no extras either way.
+    written = {n.slice.value for n in ast.walk(tree)
                if isinstance(n, ast.Subscript)
                and isinstance(n.value, ast.Name) and n.value.id == "evidence"
                and isinstance(n.slice, ast.Constant)
@@ -5869,7 +5875,7 @@ def test_evidence_keys_lists_exactly_what_preflight_writes():
     # `.value`. Read it from there rather than requiring `ctx=Store` on the
     # inner node, which it never carries.
     written |= {
-        n.value.slice.value for n in ast.walk(fn)
+        n.value.slice.value for n in ast.walk(tree)
         if isinstance(n, ast.Subscript) and isinstance(n.ctx, ast.Store)
         and isinstance(n.value, ast.Subscript)
         and isinstance(n.value.value, ast.Name) and n.value.value.id == "evidence"

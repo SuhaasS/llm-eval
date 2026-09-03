@@ -5301,11 +5301,29 @@ def test_a_reference_diff_touching_a_nested_submodule_is_refused(
     assert "vendor/lib/vendor/deep" in str(excinfo.value)
 
 
-def test_a_level_two_submodule_can_be_declared_unneeded(
+def test_a_level_two_submodule_cannot_be_declared_unneeded(
         tmp_path, nested_submodule, local_urls):
-    """Item 2's key takes a path at ANY depth, so a level-2 submodule can be
-    left unpopulated while its parent is populated. No mirror is built for it,
-    and its directory is present and empty afterwards."""
+    """DEPTH 1 ONLY, and the reason is a RUN-TIME reader, not a gate one.
+
+    The gate can see an uninitialised submodule at any depth -- item 18 gave
+    preflight a per-level walk with an `ls -A` read at each. The capture cannot:
+    `container.submodule_states` enumerates gitlinks with `git ls-files -s -z`
+    at the superproject root, and measured 2026-09-03 (git 2.50.1) that does
+    not descend through a gitlink -- so a level-2 gitlink inside a POPULATED
+    level-1 submodule is never enumerated and never probed, while the level-1
+    path that IS enumerated carries a `.git` and is skipped by
+    `_uninitialised_with_content` by design. `--porcelain=v2` is silent for it
+    too. An agent's writes into that empty directory would therefore be
+    recorded nowhere while `submodules_dirty` came back `{}` -- the positive
+    claim "read, nothing dirty" -- `grader._submodule_edits` would collapse it
+    to `()` and the ladder would stamp EMPTY_PATCH: `resolved: False`, the
+    accusation item 17 exists to prevent, one level down and permanent. The
+    state is made unrepresentable at load instead.
+
+    The refusal fires at the level that FINDS the gitlink, which is what keeps
+    the two messages apart: a real level-2 path is told its depth and its
+    parent, and only a path no level explains is called a typo.
+    """
     up = nested_submodule()
     cache = tmp_path / "cache"
     task = _sub_task(
@@ -5313,21 +5331,17 @@ def test_a_level_two_submodule_can_be_declared_unneeded(
         extra_yaml='submodules_unneeded: ["vendor/lib/vendor/deep"]')
     mirror = tasks.ensure_mirror(str(up["path"]), up["base"], cache)
 
-    outer, inner = tasks.derive_submodules(task, mirror, cache)
+    with pytest.raises(TaskError) as excinfo:
+        tasks.derive_submodules(task, mirror, cache)
 
-    assert outer.declared_unneeded is False
-    assert inner.declared_unneeded is True
-    assert inner.url_resolved is None
+    message = str(excinfo.value)
+    assert "submodules_unneeded names vendor/lib/vendor/deep" in message
+    assert "a gitlink at depth 2 inside the submodule vendor/lib" in message
+    assert "DEPTH 1 ONLY" in message
+    # The refusal runs in `_read_level`, before the level's mirrors are built,
+    # so nothing was fetched for the path it refused.
     assert not tasks.pruned_mirror_path(
         str(up["innermost"]), up["deep_pinned"], cache).exists()
-
-    _, run, _ = _materialize_sub(
-        tmp_path, up, name="t-002",
-        extra_yaml='submodules_unneeded: ["vendor/lib/vendor/deep"]')
-    deep = run / "vendor" / "lib" / "vendor" / "deep"
-    assert deep.is_dir() and not any(deep.iterdir())
-    assert (run / "vendor" / "lib" / "libdep" / "__init__.py").read_text() \
-        == SUB_LIB
 
 
 def test_a_level_two_typo_in_submodules_unneeded_is_refused_after_the_recursion(

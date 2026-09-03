@@ -80,8 +80,15 @@ def test_the_oracle_version_moved_with_what_derivation_means():
     sequence, so a quarantine cached under 4 for a NODE task was derived from
     runs in which one file's deselection removed another file's
     identically-titled test -- it can name an id that never needed
-    quarantining and miss one that did."""
-    assert ORACLE_VERSION == "5"
+    quarantining and miss one that did. 5 -> 6 is the same `_Runner`'s argv
+    once more (item 12's fix wave, `d75ceba`, 2026-09-03): `report_args` moved
+    to the front of every group, `ORACLE_VERSION` did not move with it, and a
+    node manifest whose `tests.runner` ends in an array-valued flag was
+    derived under an argv whose scope positional the flag had swallowed --
+    so the XOR was taken over a different file set than the same manifest
+    gives today. No pytest quarantine moves; `PytestAdapter.report_args` is
+    `[]`."""
+    assert ORACLE_VERSION == "6"
 
 
 def test_both_runs_green_yields_empty_quarantine():

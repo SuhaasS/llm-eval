@@ -116,7 +116,28 @@ from bakeoff.tasks import materialize
 #: another file's deselection. No pytest quarantine changes: that adapter
 #: emits one group whose argv is the v4 argv. A cached node verdict must be
 #: re-derived rather than re-read.
-ORACLE_VERSION: str = "5"
+#:
+#: 5 -> 6: the reference runs' argv again, and this bump lands LATE -- item
+#: 12's fix wave (`d75ceba`, 2026-09-03) moved `adapter.report_args` to the
+#: FRONT of every group's argv and moved `PREFLIGHT_VERSION` only.
+#: `_derive` constructs a `preflight._Runner` and `derive_quarantine` drives
+#: it through `pass_to_pass` twice, so the two reference runs ARE the runs
+#: that changed: quarantines derived before and after the reorder sat under
+#: one fingerprint (`manifest|image|5`) and one was served for the other.
+#: The blast radius is NODE tasks whose `tests.runner` ends in an
+#: array-valued flag. Before the reorder that greedy flag swallowed the
+#: run's own scope positional, so the p2p reference run left `tests.paths`
+#: and executed files outside it (the measurement `PREFLIGHT_VERSION`'s
+#: `20 -> 21` entry records) -- and the XOR of the two reference runs was
+#: therefore taken over a different file set than the same manifest yields
+#: today. That is not a hypothetical shape: `HARVESTING.md`'s own worked
+#: remedy tells an author to write four trailing `--testPathIgnorePatterns=`
+#: entries. No PYTEST quarantine moves: `PytestAdapter.report_args` is `[]`,
+#: so the reorder is behaviourally inert there, and every task in the stored
+#: corpus is a pytest one. A cached node verdict must be re-derived rather
+#: than re-read; the two entries on disk under `"5"` are pytest-shaped and
+#: are re-derived only because the fingerprint moves.
+ORACLE_VERSION: str = "6"
 
 #: preflight's pytest exit meanings plus the codes the `timeout` wrapper and
 #: the shell contribute. Non-{0,1} is refused whatever the code, but the

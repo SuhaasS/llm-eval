@@ -311,7 +311,12 @@ class Submodule:
     reader of a `Submodule` -- the initialiser, the image builder, the gate's
     evidence -- sees one answer instead of three lookups that can disagree. The
     entry is kept in the tuple rather than filtered out: a filtered submodule
-    renders as a tree with no gitlink there, which is a different tree.
+    renders as a tree with no gitlink there, which is a different tree. It is
+    settable at DEPTH 1 ONLY -- `_read_level` refuses a declaration naming a
+    gitlink at depth >= 2, because `container.submodule_states`' `git ls-files`
+    read is taken at the superproject root and cannot see under an INITIALISED
+    parent, so an agent's writes into a level-2 empty directory would be
+    recorded nowhere while `submodules_dirty` claimed the tree was read.
 
     `path` is the FULL superproject-relative path at every depth, because every
     consumer compares it against superproject-relative paths: the `strip_paths`
@@ -2147,11 +2152,12 @@ def derive_submodules(task: TaskManifest, mirror: Path,
     # THE SECOND HALF of item 2's typo refusal. The first half is in
     # `_read_level`, at item 2's own position and guarded to depth 1, and it
     # DEFERS any declared path that sits under a gitlink at that level --
-    # `vendor/lib/vendor/deep` under `vendor/lib` is a legal level-2
-    # declaration that no level-1 reader can explain. This is where a deferral
-    # that no level explained is refused, and it is also what refuses declaring
-    # BOTH a parent and its child: the recursion does not descend into a
-    # declared-unneeded submodule, so the child is in no `sub.path`.
+    # `vendor/lib/vendor/deep` under `vendor/lib` is a shape no level-1 reader
+    # can explain, and the level that CAN explain it refuses it as too deep.
+    # This is where a deferral that no level explained at all is refused, and
+    # it is also what refuses declaring BOTH a parent and its child: the
+    # recursion does not descend into a declared-unneeded submodule, so the
+    # child is in no `sub.path`.
     unexplained = sorted(set(task.submodules_unneeded)
                          - {sub.path for sub in subs})
     if unexplained:
@@ -2246,9 +2252,12 @@ def _read_level(task: TaskManifest, mirror: Path, sha: str,
         # than about a url or an unreadable blob. The position is the message.
         #
         # A declared path that sits UNDER a gitlink at this level may still be
-        # explained one level down (`vendor/lib/vendor/deep` under
+        # a real gitlink one level down (`vendor/lib/vendor/deep` under
         # `vendor/lib`), so it is DEFERRED to `derive_submodules`' second check
-        # rather than called a typo here. `_under` is component-wise
+        # rather than called a typo here. Deferred, not accepted: the level
+        # that finds it refuses it as too deep (the `else` branch below) and a
+        # level that never finds it refuses it as a typo, so the two refusals
+        # split the cases and each names the one it actually caught. `_under` is component-wise
         # (`PurePosixPath.is_relative_to`), so a near-miss is not deferred:
         # measured 2026-09-02, `vendor/libdeps` is not under `vendor/libdep`
         # and `vendor/typo` is not under it either, which is what keeps item
@@ -2265,6 +2274,52 @@ def _read_level(task: TaskManifest, mirror: Path, sha: str,
                 "gitlink at. A typo declares nothing: the submodule it was meant "
                 "to name is still populated (or still refused for its url), and "
                 "nothing downstream would say the key did not apply."
+            )
+    else:
+        # ITEM 2'S LEVER IS DEPTH-1 ONLY, and this is where that is enforced.
+        # `parent` is never None on this branch: depth > 1 is reached only
+        # through `_derive_from`'s recursion, which always passes the level's
+        # own submodule.
+        #
+        # The GATE can see an uninitialised submodule at any depth -- item 18
+        # gave preflight a per-level walk and an `ls -A` read at each one --
+        # but the RUN-TIME reader cannot. `container.submodule_states`
+        # enumerates gitlinks with `git ls-files -s -z` at the SUPERPROJECT
+        # ROOT, and measured 2026-09-03 (git 2.50.1) `ls-files` does not
+        # descend through a gitlink: a level-2 gitlink inside a POPULATED
+        # level-1 submodule is never enumerated and so never probed, while the
+        # level-1 path that IS enumerated carries a `.git` and is skipped by
+        # `_uninitialised_with_content` by design. The `--porcelain=v2` stream
+        # is silent for it as well. So content an agent writes into that empty
+        # level-2 directory is recorded NOWHERE and `submodules_dirty` comes
+        # back `{}` -- which `container.submodule_states` documents as the
+        # positive measurement "read, nothing dirty", not as an absence.
+        # `grader._submodule_edits` collapses it to `()`, the ladder stamps
+        # EMPTY_PATCH, and that is a `GradeFailure`: `resolved: False`, an
+        # accusation that the model changed nothing, permanently, in an
+        # append-only file. Exactly the accusation item 17 exists to prevent,
+        # reproduced one level down.
+        #
+        # Refused at LOAD rather than closed by a deeper reader, because that
+        # makes the state unrepresentable and costs nothing today -- no corpus
+        # task nests at all. The alternative, running `_GITLINK_ARGV` per
+        # initialised level with paths joined onto the level prefix, is a new
+        # measured surface at run time and wants its own anchors. Nothing
+        # about a gate verdict changes, so `PREFLIGHT_VERSION` does not move.
+        too_deep = sorted(set(task.submodules_unneeded) & set(gitlinks))
+        if too_deep:
+            raise TaskError(
+                f"{task.task_id}: submodules_unneeded names "
+                f"{', '.join(too_deep)}, a gitlink at depth {depth} inside the "
+                f"submodule {parent.path}. A submodule can be declared "
+                "unneeded at DEPTH 1 ONLY: the run-time reader enumerates "
+                "gitlinks with `git ls-files` at the superproject root, which "
+                "does not descend through an initialised parent, so anything "
+                "an agent writes into that uninitialised directory is "
+                "recorded nowhere and the run's submodules_dirty reads `{}` "
+                "-- the positive claim that the tree was read and is clean. "
+                "Populate it, or declare its depth-1 parent instead, which "
+                "declines its children."
             )
     # ONE derived set for BOTH `.gitmodules` refusals, not two subtractions,
     # because they are the same claim: nothing is fetched for a declared path,
@@ -2598,8 +2653,17 @@ def _refuse_submodule_conflicts(task: TaskManifest, subs: tuple[Submodule, ...],
             elif sub.url_resolved == sub.url_declared:
                 stated = f"url {sub.url_declared!r}"
             else:
+                # The BASE the resolution actually used, not `task.repo_url`
+                # unconditionally: `_read_level` resolves against
+                # `parent.url_resolved` at depth >= 2, so naming `repo.url`
+                # there reports configuration where the message means to
+                # report what happened. `sub.parent` is the parent's PATH,
+                # which is what an author can find in `.gitmodules`; the url
+                # behind it is not carried on the child.
+                base = (f"the resolved url of submodule {sub.parent}"
+                        if sub.parent else repr(task.repo_url))
                 stated = (f"url {sub.url_declared!r}, which resolves against "
-                          f"{task.repo_url!r} to {sub.url_resolved!r}")
+                          f"{base} to {sub.url_resolved!r}")
             # `(sub.url_resolved or "")`, never a bare `.startswith`: both ""
             # (the stanza declared no url) and None (declared unneeded, never
             # resolved) must fall through to this raise, and `sub.url_resolved
@@ -2609,9 +2673,10 @@ def _refuse_submodule_conflicts(task: TaskManifest, subs: tuple[Submodule, ...],
                 raise TaskError(
                     f"{task.task_id}: submodule {sub.path} declares {stated}; "
                     f"only {_SUBMODULE_URL_PREFIX} urls can be fetched by this "
-                    "eval. A relative url is resolved against repo.url first, "
-                    "and it is the RESULT that is judged; ssh, http and file "
-                    "urls cannot be fetched at all."
+                    "eval. A relative url is resolved first -- against "
+                    "repo.url at depth 1 and against the parent submodule's "
+                    "resolved url below it -- and it is the RESULT that is "
+                    "judged; ssh, http and file urls cannot be fetched at all."
                 )
             # FIRST after the url check, and the only refusal that needs an
             # artifact rather than a comparison -- hence `mirrors`, and hence

@@ -2879,15 +2879,46 @@ MUTATIONS = [
     ),
     (
         # The descent must SKIP a submodule the manifest declared unneeded:
-        # nothing is populated for it, so its own `.gitmodules` is never read
-        # and its children never exist. Anchored on the `continue` rather than
-        # left to `mirrors.get(...)` returning None, which is a coincidence of
-        # the comprehension above and cannot be mutation-tested.
+        # nothing is populated for it, so no mirror exists to descend through,
+        # its own `.gitmodules` is never read and its children never exist.
+        # Anchored on the `continue` rather than left to `mirrors.get(...)`
+        # returning None, which is a coincidence of the comprehension above
+        # and cannot be mutation-tested.
+        #
+        # The selector is a DEPTH-1 declaration, and it has to be since the
+        # final-review fix: a depth-2 declaration is refused at load, so the
+        # only shape that reaches this loop with `declared_unneeded` set is a
+        # submodule of the superproject, and `_no_pruned_mirror_is_built`
+        # drives exactly that through `materialize`.
         "tasks: descend into a submodule item 2 declared unneeded",
         "src/bakeoff/tasks.py",
         "        if sub.declared_unneeded:",
         "        if False:",
-        "tests/test_tasks.py -k level_two_submodule_can_be_declared_unneeded",
+        "tests/test_tasks.py -k no_pruned_mirror_is_built_for_a_declared_unneeded",
+        "not integration",
+    ),
+    (
+        # ITEM 2'S LEVER IS DEPTH-1 ONLY. `container.submodule_states` reads
+        # `git ls-files -s -z` at the SUPERPROJECT ROOT, which does not
+        # descend through a gitlink -- so a level-2 gitlink inside a populated
+        # level-1 submodule is never enumerated and never probed, and the
+        # level-1 path that is enumerated carries a `.git` and is skipped by
+        # design. Without this refusal an agent's writes into that empty
+        # directory are recorded nowhere, `submodules_dirty` reads `{}` (the
+        # positive claim "read, nothing dirty"), and the ladder stamps
+        # EMPTY_PATCH -- `resolved: False` on a submission that edited files.
+        #
+        # TWO LINES, for the reason the typo anchor above gives: `    if
+        # too_deep:` is unique today, but pinning the subtraction beside it is
+        # what keeps a future `if unknown:`-shaped neighbour from being the
+        # line that gets mutated.
+        "tasks: accept an unneeded declaration naming a depth-2 gitlink",
+        "src/bakeoff/tasks.py",
+        "        too_deep = sorted(set(task.submodules_unneeded) & set(gitlinks))\n"
+        "        if too_deep:",
+        "        too_deep = sorted(set(task.submodules_unneeded) & set(gitlinks))\n"
+        "        if False:",
+        "tests/test_tasks.py -k level_two_submodule_cannot_be_declared_unneeded",
         "not integration",
     ),
     (

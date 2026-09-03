@@ -326,7 +326,16 @@ from bakeoff.tasks import (
 #:
 #: No verdict on today's corpus changes: no stored record carries that field,
 #: so `_submodule_edits` returns `()` for all of them and the ladder runs
-#: exactly as under 12. The version moves anyway, on the same argument the
+#: exactly as under 12. "As under 12" is a claim about today's corpus and not
+#: about `12` as a code state: item 12's fix wave (`d75ceba`) moved
+#: `_Runner.run`'s `report_args` to the front of every group's argv INSIDE
+#: this window, and checks 4, 5 and 6 each build a `_Runner` -- so two ladder
+#: argvs shipped under one grader version. It is behaviourally inert on
+#: pytest (`PytestAdapter.report_args` is `[]`), which is every stored task,
+#: and unlike `ORACLE_VERSION` it self-heals: 13 supersedes 12 and
+#: `scripts/grade.py`'s resume gate re-grades every row.
+#:
+#: The version moves anyway, on the same argument the
 #: `4 -> 5` entry makes in full -- the bump has to land with the code that
 #: makes the divergence possible, not with the run that first exercises it,
 #: because `scripts/grade.py`'s resume gate keys on `(run_id,

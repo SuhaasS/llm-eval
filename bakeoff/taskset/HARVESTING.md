@@ -811,12 +811,24 @@ rather than by reasoning:
     `resolved: False`, an accusation that the model changed nothing. The rule
     stands anyway: a refused row is still a lost observation, and what an
     agent chooses to edit is not something a manifest can constrain.
-  - **A submodule the task's suite never reads can be declared unneeded.**
-    `submodules_unneeded: ["<path>"]`, top-level. The gitlink stays in the
-    index and the tree exactly as at `base_sha`, the directory is never
-    populated, **its url is never checked** — which is what reopens an
+  - **A submodule the task's suite never reads can be declared unneeded, at
+    depth 1 only.** `submodules_unneeded: ["<path>"]`, top-level. The gitlink
+    stays in the index and the tree exactly as at `base_sha`, the directory is
+    never populated, **its url is never checked** — which is what reopens an
     ssh-url repository — and a readable `.gitmodules` is not required for it
-    either. No mirror is built and no network read is made for it, and
+    either. A path naming a gitlink at depth 2 or below is **refused at
+    load**, and the reason is the run-time reader rather than the gate:
+    `container.submodule_states` enumerates gitlinks with `git ls-files -s -z`
+    at the superproject root, and git does not descend through a gitlink — so
+    a level-2 gitlink inside a *populated* level-1 submodule is never
+    enumerated and never probed, while the level-1 path that is enumerated
+    carries a `.git` and is skipped by design, and `--porcelain=v2` is silent
+    as well. What an agent wrote into that empty directory would be recorded
+    nowhere while `submodules_dirty` read `{}` — the positive claim that the
+    tree was read and is clean — and the grader would stamp `EMPTY_PATCH`,
+    `resolved: False`, on a submission that really edited files. Declare the
+    depth-1 parent instead (which declines its children), or populate the
+    chain. No mirror is built and no network read is made for it, and
     `start_sha` does not move. It relaxes four of the six refusals above and
     **neither of the two that protect grading**: a `strip_paths` entry
     covering the path and a reference diff touching it are refused with the

@@ -181,6 +181,7 @@ _PYTEST_ADAPTER = for_framework("pytest")
 #: failure mode this file's module docstring names. A cached v12 PASS on a
 #: pytest task must be re-run under 13 to be believed; a v12 NO-GO is
 #: unaffected (nothing this version adds can turn a NO-GO into a GO).
+#:
 #: 13 -> 14 is not a new assertion. It retires cached PASS verdicts observed
 #: through a container this code can no longer interrogate:
 #: `preflight-tree/<task_id>` was one path per task, reused across
@@ -194,6 +195,7 @@ _PYTEST_ADAPTER = for_framework("pytest")
 #: `preflight.json` (run_matrix) and `preflight-grade.json` (grade.py)
 #: invalidate together -- one offline re-gate per task per driver, no
 #: credentials and no spend.
+#:
 #: 14 -> 15: node selection and deselection became per-file (round 2 item 1,
 #: 2026-09-03), and four things about a cached v14 verdict follow from it.
 #: (1) A v14 NO-GO for a cross-file duplicate `fullName` is STALE: that
@@ -215,6 +217,7 @@ _PYTEST_ADAPTER = for_framework("pytest")
 #: verdicts across this bump must not read that growth as a regression.
 #: No pytest verdict moves: `pytest_adapter` emits one group whose argv is the
 #: v14 argv, and `file_filter_matches` cannot fire there.
+#:
 #: 15 -> 16: `submodules_unneeded` (round 2 item 2, 2026-09-02), and the
 #: EVIDENCE SHAPE is the reason, not the new assertion. Every `submodules`
 #: entry now carries `declared_unneeded` and `empty`, on every task whether or
@@ -231,6 +234,7 @@ _PYTEST_ADAPTER = for_framework("pytest")
 #: refusal: a manifest could have carried `submodules_unneeded` before this
 #: code shipped, been gated at 15 (which ignored it and NO-GOed on `stale`),
 #: and that stale NO-GO would otherwise be served forever.
+#:
 #: 16 -> 17: one evidence schema (round 2 item 5, 2026-09-03). A 16 verdict is
 #: missing every key measured inside the container -- from `uid` and `head`
 #: through `suite_timeout_s`, the strip's two keys and the three

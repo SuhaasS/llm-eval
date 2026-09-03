@@ -1549,6 +1549,33 @@ cd bakeoff && .venv/bin/python -m pytest -v -m integration \
   > populate; so declaring both a parent and one of its children is refused, and
   > the refusal names the child.
 
+  **SUPERSEDED by the round-2 final review (finding 1), and the shipped text
+  says the opposite of the first clause.** `submodules_unneeded` is **depth 1
+  only**: `_read_level` refuses an entry naming a gitlink at depth >= 2, with
+  `test_a_level_two_submodule_cannot_be_declared_unneeded` and the anchor
+  *"tasks: accept an unneeded declaration naming a depth-2 gitlink"* pinning it.
+  The reason is a run-time reader this plan's D7 did not reach, because item 2's
+  lever was reviewed before nesting existed. D7 measured the **initialised**
+  depth-2 chain — a level-2 tracked edit gives `1 .M S.M. … vendor/mid` and an
+  untracked file `1 .M S..U … vendor/mid`, both refused — and that finding
+  stands. The **uninitialised** depth-2 case is the gap: item 17's second reader
+  enumerates gitlinks with `git ls-files -s -z` at the **superproject root**, and
+  `ls-files` does not descend through a gitlink, so a level-2 gitlink inside a
+  *populated* level-1 submodule is never enumerated and never probed, while the
+  level-1 path that *is* enumerated carries a `.git` and is skipped by
+  `_uninitialised_with_content` by design; `--porcelain=v2` is silent too
+  (measured 2026-09-03, git 2.50.1, on the `top → vendor/mid →
+  vendor/mid/vendor/deep` fixture). `submodule_states()` therefore returns `{}`
+  — which `container.py` documents as the positive measurement *"read, nothing
+  dirty"*, not as an absence — `grader._submodule_edits` collapses it to `()`,
+  and the ladder stamps `EMPTY_PATCH`: `resolved: False`, an accusation that the
+  model changed nothing, permanent in an append-only file. The state is made
+  unrepresentable at load rather than closed by a deeper reader, because that
+  costs nothing today (no corpus task nests) while a per-level `_GITLINK_ARGV`
+  walk is a new measured surface at run time. `PREFLIGHT_VERSION` does not move:
+  a load-time refusal is not a gate verdict. The second clause — declaring a
+  parent declines its children — is unchanged and still shipped.
+
 - [ ] **`docs/BUILDING-A-TASK-SET.md`** §2, the *"needs a git submodule"* row:
   *"the submodule has no submodules of its own"* becomes *"the submodule chain is
   at most two levels deep — a submodule of a submodule is fine, a third level is
