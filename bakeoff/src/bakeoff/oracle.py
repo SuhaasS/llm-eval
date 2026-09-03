@@ -135,8 +135,10 @@ from bakeoff.tasks import materialize
 #: entries. No PYTEST quarantine moves: `PytestAdapter.report_args` is `[]`,
 #: so the reorder is behaviourally inert there, and every task in the stored
 #: corpus is a pytest one. A cached node verdict must be re-derived rather
-#: than re-read; the two entries on disk under `"5"` are pytest-shaped and
-#: are re-derived only because the fingerprint moves.
+#: than re-read; the two entries on disk under `"5"` are node ones (yaml-474
+#: under jest, ufo-214 under vitest) whose `tests.runner` carries no trailing
+#: array-valued flag, so the reorder changed nothing they measured -- they are
+#: re-derived only because the fingerprint moves.
 ORACLE_VERSION: str = "6"
 
 #: preflight's pytest exit meanings plus the codes the `timeout` wrapper and
