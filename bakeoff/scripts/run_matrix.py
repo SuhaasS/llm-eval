@@ -270,13 +270,18 @@ def suite_time_line(verdict: dict) -> str:
 def _measured_total(verdict: dict) -> float:
     """The bounded seconds a verdict recorded, 0.0 when it recorded none.
 
-    Reads the same two keys `suite_time_line` reads, the same tolerant way
-    -- `.get` at both levels -- so neither helper can raise out of
-    `resolve_tasks` on a truncated, hand-edited or future-shaped blob. A
-    reporting affordance may not be the thing that stops a matrix.
+    Reads the same key `suite_time_line` reads, with the same guard --
+    `isinstance(durations, dict)`, not a bare `.get` fallback, because
+    `... or {}` only rescues a FALSY non-dict and a hand-edited blob whose
+    `bounded_run_durations_s` is a list or string would otherwise raise out
+    of `resolve_tasks` on the very line after `suite_time_line` printed its
+    "not recorded" sentence for the same blob. A reporting affordance may
+    not be the thing that stops a matrix.
     """
     evidence = verdict.get("evidence") or {}
-    durations = evidence.get("bounded_run_durations_s") or {}
+    durations = evidence.get("bounded_run_durations_s")
+    if not isinstance(durations, dict):
+        return 0.0
     return sum(v for v in durations.values() if v is not None)
 
 

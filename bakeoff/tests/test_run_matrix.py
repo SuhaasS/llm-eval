@@ -15,6 +15,7 @@ there -- `resolve_tasks` is still the caller they describe.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -625,7 +626,7 @@ def test_a_cached_verdict_from_another_gate_is_not_printed(tmp_path):
     }
     path = tmp_path / "preflight" / "t.json"
     path.parent.mkdir(parents=True)
-    path.write_text(__import__("json").dumps(blob))
+    path.write_text(json.dumps(blob))
 
     key = preflight_cache_key(
         type("T", (), {"manifest_digest": "d"})(), "sha256:img", "s" * 40)
@@ -647,7 +648,7 @@ def test_a_cached_verdict_from_another_gate_is_not_printed(tmp_path):
                             "sha256:img", "s" * 40) + "x",
     ) is None
     not_pass_path = tmp_path / "preflight" / "u.json"
-    not_pass_path.write_text(__import__("json").dumps(blob | {"ok": False}))
+    not_pass_path.write_text(json.dumps(blob | {"ok": False}))
     assert rm.cached_verdict(tmp_path, "u", key) is None
     assert rm.cached_verdict(tmp_path, "nonexistent", key) is None
 
@@ -667,6 +668,7 @@ def test_the_gate_totals_the_bounded_time_it_spent(monkeypatch, tmp_path, capsys
     monkeypatch.setattr(rm, "materialize", lambda task, repo, cache: "s" * 40)
 
     def _canned(task_id, ok, suite_timeout_s, durations, problems=()):
+        assert ok == (not problems), "ok and problems disagree on the same fixture"
         evidence = _evidence_seed() | {
             "suite_timeout_s": suite_timeout_s,
             "bounded_run_durations_s": dict.fromkeys(BOUNDED_RUN_KEYS) | durations,

@@ -242,7 +242,7 @@ What you are looking for, and what each answer disqualifies:
 
 | observation | verdict |
 |---|---|
-| suite green, under ~40 s | usable. Preflight runs it five times per task (four with an explicit `tests.p2p`) plus once per declared `grading.*` argv, the oracle twice more, and the agent re-runs it inside its own timeout |
+| suite green, under ~40 s | usable. Preflight runs it five times per task (four with an explicit `tests.p2p`) plus once per declared `grading.*` argv plus the bare pytest collection the gate makes on every pytest task, the oracle twice more, and the agent re-runs it inside its own timeout |
 | suite green but slow | usable only with `budget.suite_timeout_s` raised — and it must stay ≤ `budget.wall_clock_timeout_s`, or `load_task` refuses the manifest. Costs up to 9× the value per task at the gate (8× on a node task), before the proxy starts and inside the one-hour SSO window — and the gate records what it actually cost in `bounded_run_durations_s` |
 | collection errors | usually one missing test dependency. Fixable by declaring it in `image.pip` — note which |
 | `git status` dirty after the suite | the suite writes into the tree. Every submission diff then carries the droppings and diff size measures the interpreter rather than the agent. Fixable with `gitignore_extra` |

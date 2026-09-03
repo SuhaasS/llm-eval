@@ -352,6 +352,33 @@ SCOPE_COLLECTS_NOTHING = "scope_collects_nothing"
 #: `problem_codes` was added to stop.
 EARLY_RETURN_RUNNER_MISMATCH = "runner_does_not_match_framework"
 
+#: Every bounded invocation `preflight` can make, in the order the gate makes
+#: them. The grading entries come off `tasks._GRADING_KEYS` for the reason
+#: `_declared_grading` and `EVIDENCE_KEYS` both give: a hand-listed copy goes
+#: stale the first time a check is added to `TaskGrading`, and that failure is
+#: the silent one.
+#:
+#: The order is the order the gate MAKES them, which is not the order the
+#: manifest declares: the bare-runner probe runs before the f2p selection, and
+#: the scoped p2p runs last, after the grading commands, because the grader's
+#: ladder runs build and typecheck before p2p and a grading command can write
+#: into the tree.
+#:
+#: `bare_runner` is a COLLECTION (`--co -q`), not a suite run, and it is in
+#: here anyway -- which is why these are "bounded runs" and not "suite runs".
+#: It carries the same `timeout <suite_timeout_s>` prefix, it has its own exit
+#: 124 branch, and a count of the gate's bounded commands that leaves one out
+#: is wrong about the number the one-hour SSO window is spent on. That is the
+#: same off-by-one this commit corrects in three documents.
+BOUNDED_RUN_KEYS: tuple[str, ...] = (
+    "bare_runner",
+    "f2p_before", "p2p_before",
+    "f2p_after", "p2p_after",
+    *(f"grading_{key}" for key in _GRADING_KEYS),
+    "p2p_scoped_after",
+)
+
+
 #: Every key `preflight` can write. ONE list, filled from by the early
 #: return and by the full path alike, because the
 #: alternative has already failed twice inside this file: `PREFLIGHT_VERSION`
@@ -387,34 +414,6 @@ EARLY_RETURN_RUNNER_MISMATCH = "runner_does_not_match_framework"
 #: against this tuple is on sets, so order is presentation at both ends and
 #: nothing depends on it. A new key is APPENDED to its group -- the AST
 #: test above proves membership, not position.
-#:
-#: Every bounded invocation `preflight` can make, in the order the gate makes
-#: them. The grading entries come off `tasks._GRADING_KEYS` for the reason
-#: `_declared_grading` and `EVIDENCE_KEYS` both give: a hand-listed copy goes
-#: stale the first time a check is added to `TaskGrading`, and that failure is
-#: the silent one.
-#:
-#: The order is the order the gate MAKES them, which is not the order the
-#: manifest declares: the bare-runner probe runs before the f2p selection, and
-#: the scoped p2p runs last, after the grading commands, because the grader's
-#: ladder runs build and typecheck before p2p and a grading command can write
-#: into the tree.
-#:
-#: `bare_runner` is a COLLECTION (`--co -q`), not a suite run, and it is in
-#: here anyway -- which is why these are "bounded runs" and not "suite runs".
-#: It carries the same `timeout <suite_timeout_s>` prefix, it has its own exit
-#: 124 branch, and a count of the gate's bounded commands that leaves one out
-#: is wrong about the number the one-hour SSO window is spent on. That is the
-#: same off-by-one this commit corrects in three documents.
-BOUNDED_RUN_KEYS: tuple[str, ...] = (
-    "bare_runner",
-    "f2p_before", "p2p_before",
-    "f2p_after", "p2p_after",
-    *(f"grading_{key}" for key in _GRADING_KEYS),
-    "p2p_scoped_after",
-)
-
-
 EVIDENCE_KEYS: tuple[str, ...] = (
     "early_return", "framework",
     "image_env_declared", "image_env_observed", "image_env_mismatch",
