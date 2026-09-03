@@ -933,6 +933,8 @@ class _ScriptedContainer:
                  python="Python 3.12.13",
                  submodule_status="", submodule_status_exit=0,
                  gitlinks=(), gitmodules_declared=None, gitmodules_exit=None,
+                 gitmodules_urls=None, persisted_urls=None,
+                 persisted_exit=None,
                  ls_entries=None, ls_exits=None,
                  reports=None, bare_runner=None, apply_exit=0,
                  durations_ms=None):
@@ -1004,6 +1006,24 @@ class _ScriptedContainer:
         #: how a test reaches the >1 branch, where the file exists and could
         #: not be read -- the answer that must not be reported as "no orphans".
         self.gitmodules_exit = gitmodules_exit
+        #: round 2 item 16: `.gitmodules`' declared urls, keyed by the same
+        #: name `gitmodules_declared`'s paths use (the submodule NAME, which
+        #: this stub sets equal to the path -- what `git submodule add`
+        #: writes). `None` is "no test scripted a url", the state every
+        #: existing test in this module is in, and produces no `.url` record
+        #: at all -- not an empty string, which would be a stanza that
+        #: DECLARES no url, a different absence.
+        self.gitmodules_urls = gitmodules_urls
+        #: round 2 item 16: what `_init_submodules` wrote into the run tree's
+        #: OWN config, keyed by name. `None` is the same "not scripted"
+        #: default, and produces no matching record either.
+        self.persisted_urls = persisted_urls
+        #: round 2 item 16: `git config --local --get-regexp`'s exit code.
+        #: `None` picks git's own: 0 when `persisted_urls` names something, 1
+        #: when it does not -- the ordinary "no submodule initialised" case
+        #: every test but the failure ones is in. An explicit value is how a
+        #: test reaches the >1 branch.
+        self.persisted_exit = persisted_exit
         #: What `ls -A -- <path>` reports, keyed by path. An ABSENT key is an
         #: empty directory at exit 0, which is the state every existing test
         #: in this module is in. A value may be a tuple of tuples, in which
@@ -1240,17 +1260,46 @@ class _ScriptedContainer:
             if self.gitmodules_exit is not None and self.gitmodules_exit > 1:
                 return _Exec(exit_code=self.gitmodules_exit,
                              stderr="fatal: bad config line 1\n")
+            # round 2 item 16: `.url` records, keyed by the same NAME the
+            # `.path` records use (this stub sets name == path). `None` --
+            # the default -- adds nothing, so every existing test's stdout is
+            # byte-identical to what it was before this key existed.
+            urls = self.gitmodules_urls or {}
+            records = "".join(
+                f"submodule.{path}.path\n{path}\0" for path in declared
+            ) + "".join(
+                f"submodule.{name}.url\n{url}\0" for name, url in urls.items()
+            )
             return _Exec(
                 # 1 is git config's ORDINARY "no key matched": no .gitmodules
                 # at all, or one whose stanzas all have gitlinks.
                 exit_code=(self.gitmodules_exit if self.gitmodules_exit
-                           is not None else (0 if declared else 1)),
+                           is not None else (0 if records else 1)),
                 # `<key>\n<value>\0` per record, measured against git 2.50.1.
                 # The submodule NAME is the path here (what `git submodule
                 # add` writes), so a path carrying a space produces a key
                 # carrying one -- which is the shape `-z` exists for.
+                stdout=records,
+            )
+        if cmd[:3] == ["git", "config", "--local"]:
+            # round 2 item 16: what `_init_submodules` actually wrote into
+            # THIS tree's own config -- told apart from the tracked
+            # `.gitmodules` blob above by `--local` rather than `-f
+            # .gitmodules`. `None` -- the default -- produces no record and
+            # exit 1, git's own "no key matched" for a tree with no
+            # initialised submodule, which is the state every existing test
+            # in this module is in.
+            assert "-z" in cmd, cmd
+            urls = self.persisted_urls or {}
+            if self.persisted_exit is not None and self.persisted_exit > 1:
+                return _Exec(exit_code=self.persisted_exit,
+                             stderr="fatal: unable to read config file\n")
+            return _Exec(
+                exit_code=(self.persisted_exit if self.persisted_exit
+                           is not None else (0 if urls else 1)),
                 stdout="".join(
-                    f"submodule.{path}.path\n{path}\0" for path in declared
+                    f"submodule.{name}.url\n{url}\0"
+                    for name, url in urls.items()
                 ),
             )
         if cmd[:2] == ["git", "rev-parse"]:
@@ -2818,10 +2867,22 @@ def test_the_preflight_version_moved_with_the_new_assertion():
     the one whose suite imports a module the image build generated answers
     1. A verdict cached under 22 may describe a task this gate now refuses,
     so a cached PASS is stale and must be re-gated; a cached NO-GO is
-    unaffected, since nothing here turns a NO-GO into a GO."""
+    unaffected, since nothing here turns a NO-GO into a GO.
+
+    23 -> 24 is round 2, item 16 (relative `.gitmodules` urls). Adds
+    `url_declared` and `url_persisted` to every `submodules` entry -- the
+    first read from the tree's `.gitmodules`, the second from the run tree's
+    own `--local` config -- and one problem for a relative url that reached
+    the run tree unresolved. Both are PER-ENTRY fields inside the existing
+    `submodules` key, so `EVIDENCE_KEYS` does not move. A verdict cached
+    under 23 was written by a gate that recorded neither key, so a reader of
+    a stored blob cannot tell "this task's submodule url is absolute" from
+    "this gate did not look." GO/NO-GO is unchanged for every task in the
+    corpus, since none declares a relative submodule url; what moved is what
+    a stored verdict's evidence can be read to say."""
     from bakeoff.preflight import PREFLIGHT_VERSION
 
-    assert PREFLIGHT_VERSION == "23"
+    assert PREFLIGHT_VERSION == "24"
 
 
 # --- round 2, item 14: what an image.build step wrote into the scaffold ------
@@ -3345,7 +3406,11 @@ def test_an_initialised_submodule_at_its_gitlink_is_a_GO(monkeypatch, tmp_path):
         {"path": "vendor/libdep",
          "sha": "942c381d88cecca36be86b2e902f554ad145ec44",
          "initialised": True, "marker": " ",
-         "declared_unneeded": False, "empty": False}
+         "declared_unneeded": False, "empty": False,
+         # round 2 item 16: neither url is scripted by this fixture, so both
+         # are the "not measured" None -- not an empty string, which would
+         # claim a stanza that declares no url.
+         "url_declared": None, "url_persisted": None}
     ]
     assert result.evidence["submodules_orphaned"] == []
     # `{}` is "measured, this task declares no unneeded submodules"; `None` is
@@ -3373,7 +3438,8 @@ def test_an_uninitialised_submodule_is_a_preflight_problem(monkeypatch,
     assert any("vendor/libdep" in p for p in result.problems)
     assert result.evidence["submodules"] == [
         {"path": "vendor/libdep", "sha": "0" * 40, "initialised": False,
-         "marker": "-", "declared_unneeded": False, "empty": True}
+         "marker": "-", "declared_unneeded": False, "empty": True,
+         "url_declared": None, "url_persisted": None}
     ]
 
 
@@ -3395,7 +3461,8 @@ def test_a_submodule_at_the_wrong_commit_is_a_preflight_problem(monkeypatch,
     assert any("not initialised at their gitlink" in p for p in result.problems)
     assert result.evidence["submodules"] == [
         {"path": "vendor/libdep", "sha": "1" * 40, "initialised": False,
-         "marker": "+", "declared_unneeded": False, "empty": True}
+         "marker": "+", "declared_unneeded": False, "empty": True,
+         "url_declared": None, "url_persisted": None}
     ]
 
 
@@ -3595,7 +3662,14 @@ def test_an_unreadable_gitmodules_is_not_reported_as_no_orphans(monkeypatch,
         {"path": "vendor/libdep",
          "sha": "942c381d88cecca36be86b2e902f554ad145ec44",
          "initialised": True, "marker": " ",
-         "declared_unneeded": False, "empty": True}
+         "declared_unneeded": False, "empty": True,
+         # round 2 item 16: the failed .gitmodules read leaves BOTH
+         # `path_by_name` and `url_by_name` empty (hoisted above the
+         # exit-code branch precisely so this stays `None` rather than
+         # raising `UnboundLocalError`), so this entry's url cannot be
+         # joined to a name and reads as "not measured", not "declares no
+         # url".
+         "url_declared": None, "url_persisted": None}
     ]
     assert any(".gitmodules" in p for p in result.problems)
 
@@ -3641,7 +3715,8 @@ def test_a_declared_unneeded_submodule_is_a_GO_while_uninitialised(
     assert result.ok, result.problems
     assert result.evidence["submodules"] == [
         {"path": "vendor/libdep", "sha": "0" * 40, "initialised": False,
-         "marker": "-", "declared_unneeded": True, "empty": True}
+         "marker": "-", "declared_unneeded": True, "empty": True,
+         "url_declared": None, "url_persisted": None}
     ]
     assert result.evidence["submodules_empty_after_suite"] == \
         {"vendor/libdep": True}
@@ -3881,6 +3956,270 @@ def test_a_strip_that_did_not_happen_is_refused_by_the_real_gate(
     assert not result.ok
     assert any("strip_paths" in problem for problem in result.problems)
     assert result.evidence["stripped_paths_present"] == ["vendor"]
+
+
+# --- round 2 item 16: submodule url evidence ----------------------------------
+
+
+def test_every_submodule_entry_carries_both_url_keys(monkeypatch, tmp_path):
+    """The pass direction: an absolute url, declared and persisted alike."""
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=_FakeTests(), present=("tests/",),
+        gitlinks=("vendor/libdep",),
+        submodule_status=(
+            " 942c381d88cecca36be86b2e902f554ad145ec44 vendor/libdep"
+            " (heads/main)\n"
+        ),
+        ls_entries={"vendor/libdep": ("libdep",)},
+        gitmodules_urls={"vendor/libdep": "https://github.com/org/libdep.git"},
+        persisted_urls={"vendor/libdep": "https://github.com/org/libdep.git"},
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, _FakeTask(), container)
+
+    assert result.ok, result.problems
+    entry = result.evidence["submodules"][0]
+    assert entry["url_declared"] == "https://github.com/org/libdep.git"
+    assert entry["url_persisted"] == "https://github.com/org/libdep.git"
+
+
+def test_the_url_keys_are_present_even_when_the_name_cannot_be_joined(
+        monkeypatch, tmp_path):
+    """A gitlink `.gitmodules` names no stanza for at all: both url keys read
+    `None`, honestly, since neither file has anything to say about it --
+    `name_by_path.get` returning `None` is what this pins. Not an orphan (the
+    reverse direction: a stanza with no gitlink) and not refused: preflight
+    only OBSERVES this pairing, it never judges it."""
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=_FakeTests(), present=("tests/",),
+        gitlinks=("vendor/libdep",), gitmodules_declared=(),
+        submodule_status=(
+            " 942c381d88cecca36be86b2e902f554ad145ec44 vendor/libdep"
+            " (heads/main)\n"
+        ),
+        ls_entries={"vendor/libdep": ("libdep",)},
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, _FakeTask(), container)
+
+    entry = result.evidence["submodules"][0]
+    assert entry["url_declared"] is None
+    assert entry["url_persisted"] is None
+
+
+def test_an_unreadable_run_tree_config_nulls_the_persisted_url_and_files_a_problem(
+        monkeypatch, tmp_path):
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=_FakeTests(), present=("tests/",),
+        gitlinks=("vendor/libdep",),
+        submodule_status=(
+            " 942c381d88cecca36be86b2e902f554ad145ec44 vendor/libdep"
+            " (heads/main)\n"
+        ),
+        ls_entries={"vendor/libdep": ("libdep",)},
+        persisted_exit=2,
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, _FakeTask(), container)
+
+    assert not result.ok
+    entry = result.evidence["submodules"][0]
+    assert entry["url_persisted"] is None
+    assert any(
+        "reading the run tree's submodule urls failed" in p
+        for p in result.problems
+    )
+
+
+def test_an_absent_run_tree_config_is_not_a_problem(monkeypatch, tmp_path):
+    """N4: exit 1 is git config's ORDINARY "no key matched" for a tree with
+    no initialised submodule -- the state every other test in this section
+    is already in."""
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=_FakeTests(), present=("tests/",),
+        gitlinks=("vendor/libdep",),
+        submodule_status=(
+            " 942c381d88cecca36be86b2e902f554ad145ec44 vendor/libdep"
+            " (heads/main)\n"
+        ),
+        ls_entries={"vendor/libdep": ("libdep",)},
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, _FakeTask(), container)
+
+    assert result.ok, result.problems
+    entry = result.evidence["submodules"][0]
+    assert entry["url_persisted"] is None
+    assert not any("submodule urls failed" in p for p in result.problems)
+
+
+def test_an_unresolved_relative_url_in_the_run_tree_is_a_problem(
+        monkeypatch, tmp_path):
+    """The new assertion (D8), and the one that would have caught this
+    item's own defect: a relative url that reached the run tree unresolved."""
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=_FakeTests(), present=("tests/",),
+        gitlinks=("vendor/libdep",),
+        submodule_status=(
+            " 942c381d88cecca36be86b2e902f554ad145ec44 vendor/libdep"
+            " (heads/main)\n"
+        ),
+        ls_entries={"vendor/libdep": ("libdep",)},
+        gitmodules_urls={"vendor/libdep": "../libdep"},
+        persisted_urls={"vendor/libdep": "../libdep"},
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, _FakeTask(), container)
+
+    assert not result.ok
+    assert any("was never resolved" in p for p in result.problems)
+
+
+def test_a_resolved_relative_url_in_the_run_tree_is_not_a_problem(
+        monkeypatch, tmp_path):
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=_FakeTests(), present=("tests/",),
+        gitlinks=("vendor/libdep",),
+        submodule_status=(
+            " 942c381d88cecca36be86b2e902f554ad145ec44 vendor/libdep"
+            " (heads/main)\n"
+        ),
+        ls_entries={"vendor/libdep": ("libdep",)},
+        gitmodules_urls={"vendor/libdep": "../libdep"},
+        persisted_urls={
+            "vendor/libdep": "https://github.com/org/libdep.git"},
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, _FakeTask(), container)
+
+    assert result.ok, result.problems
+    assert not any("was never resolved" in p for p in result.problems)
+
+
+def test_a_relative_url_resolved_to_a_local_path_is_not_a_problem(
+        monkeypatch, tmp_path):
+    """The fixture branch of the predicate: a persisted url starting with
+    `/` (a local path, exactly what a test fixture's url looks like under
+    `_SUBMODULE_URL_PREFIX`'s relaxation) must not be reported as
+    unresolved."""
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=_FakeTests(), present=("tests/",),
+        gitlinks=("vendor/libdep",),
+        submodule_status=(
+            " 942c381d88cecca36be86b2e902f554ad145ec44 vendor/libdep"
+            " (heads/main)\n"
+        ),
+        ls_entries={"vendor/libdep": ("libdep",)},
+        gitmodules_urls={"vendor/libdep": "../libdep"},
+        persisted_urls={"vendor/libdep": "/cache/lib.git"},
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, _FakeTask(), container)
+
+    assert result.ok, result.problems
+    assert not any("was never resolved" in p for p in result.problems)
+
+
+def test_the_orphan_set_is_unchanged_by_the_widened_regex(
+        monkeypatch, tmp_path):
+    """The `.gitmodules` regex now matches `.path` AND `.url`; `declared_paths`
+    is still built from exactly the `path` half, so the orphan set this
+    section's other tests already pin is byte-identical."""
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=_FakeTests(), present=("tests/",),
+        gitlinks=("vendor/libdep",),
+        gitmodules_declared=("vendor/libdep", "vendor/gone"),
+        gitmodules_urls={
+            "vendor/libdep": "https://github.com/org/libdep.git",
+            "vendor/gone": "https://github.com/org/gone.git",
+        },
+        submodule_status=(
+            " 942c381d88cecca36be86b2e902f554ad145ec44 vendor/libdep"
+            " (heads/main)\n"
+        ),
+        ls_entries={"vendor/libdep": ("libdep",)},
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, _FakeTask(), container)
+
+    assert result.ok, result.problems
+    assert result.evidence["submodules_orphaned"] == ["vendor/gone"]
+
+
+def test_an_unreadable_gitmodules_nulls_both_url_keys_without_crashing(
+        monkeypatch, tmp_path):
+    """The `UnboundLocalError` finding, pinned directly: `path_by_name` and
+    `url_by_name` are hoisted ABOVE the exit-code branch precisely so the
+    else path -- an unreadable `.gitmodules` -- leaves both dicts empty
+    instead of undefined. No traceback; both keys read `None` on every
+    entry, `submodules_orphaned` is `None`, and the only problem filed is
+    the existing orphan-read one."""
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=_FakeTests(), gitlinks=("vendor/libdep",),
+        gitmodules_exit=3,
+        submodule_status=(
+            " 942c381d88cecca36be86b2e902f554ad145ec44 vendor/libdep"
+            " (heads/main)\n"
+        ),
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, _FakeTask(), container)
+
+    assert not result.ok
+    entry = result.evidence["submodules"][0]
+    assert entry["url_declared"] is None
+    assert entry["url_persisted"] is None
+    assert result.evidence["submodules_orphaned"] is None
+    assert sum(1 for p in result.problems if ".gitmodules" in p) == 1
+
+
+def test_an_unreadable_run_tree_config_does_not_also_claim_the_url_was_unresolved(
+        monkeypatch, tmp_path):
+    """The `is not None` half of the predicate, isolated: a `.gitmodules`
+    relative url PLUS a failed `--local` read must file exactly the read
+    failure, never ALSO the "never resolved" problem -- that would be a
+    positive claim about something this gate did not look at."""
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=_FakeTests(), present=("tests/",),
+        gitlinks=("vendor/libdep",),
+        submodule_status=(
+            " 942c381d88cecca36be86b2e902f554ad145ec44 vendor/libdep"
+            " (heads/main)\n"
+        ),
+        ls_entries={"vendor/libdep": ("libdep",)},
+        gitmodules_urls={"vendor/libdep": "../libdep"},
+        persisted_exit=2,
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path, _FakeTask(), container)
+
+    assert not result.ok
+    url_problems = [p for p in result.problems if "submodule urls" in p
+                    or "was never resolved" in p]
+    assert len(url_problems) == 1
+    assert "reading the run tree's submodule urls failed" in url_problems[0]
+
+
+def test_a_declared_unneeded_submodule_with_a_relative_url_is_a_go(
+        monkeypatch, tmp_path):
+    """The repository class items 2 and 16 exist together to reopen: a
+    declared-unneeded submodule's relative url is never registered by
+    `_init_submodules`, so `url_persisted` reads `None` -- not measured --
+    and that must not be reported as "never resolved"."""
+    container = _ScriptedContainer(
+        start_sha="s" * 40, tests=_FakeTests(), present=("tests/",),
+        gitlinks=("vendor/libdep",),
+        submodule_status=("-" + "0" * 40 + " vendor/libdep\n"),
+        gitmodules_urls={"vendor/libdep": "../libdep"},
+    )
+
+    result = _run_preflight(monkeypatch, tmp_path,
+                            _unneeded_task("vendor/libdep"), container)
+
+    assert result.ok, result.problems
+    entry = result.evidence["submodules"][0]
+    assert entry["url_persisted"] is None
+    assert not any("was never resolved" in p for p in result.problems)
 
 
 # --- the runner adapter seam -------------------------------------------------

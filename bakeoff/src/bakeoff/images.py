@@ -727,7 +727,7 @@ def _extract_submodules(task, repo_dir: Path, cache_root: Path) -> None:
     for sub in task_submodules(task, cache_root):
         if sub.declared_unneeded:
             continue
-        mirror = ensure_pruned_mirror(sub.url, sub.sha, cache_root)
+        mirror = ensure_pruned_mirror(sub.url_resolved, sub.sha, cache_root)
         target = Path(repo_dir) / sub.path
         target.mkdir(parents=True, exist_ok=True)
         archive = subprocess.run(

@@ -1886,8 +1886,8 @@ MUTATIONS = [
         # since only an arm that looks collects it.
         "tasks: populate a submodule from the unpruned mirror",
         "src/bakeoff/tasks.py",
-        "        sub.path: ensure_pruned_mirror(sub.url, sub.sha, cache_root)",
-        "        sub.path: ensure_mirror(sub.url, sub.sha, cache_root)",
+        "        sub.path: ensure_pruned_mirror(sub.url_resolved, sub.sha, cache_root)",
+        "        sub.path: ensure_mirror(sub.url_resolved, sub.sha, cache_root)",
         "tests/test_tasks.py -k cannot_reach_the_future",
         "not integration",
     ),
@@ -2611,6 +2611,105 @@ MUTATIONS = [
         "            elif bare.exit_code == EXIT_TESTS_FAILED:",
         "            elif False:",
         "tests/test_preflight.py -k cannot_start",
+        "not integration",
+    ),
+
+    # --- round 2 item 16: relative .gitmodules urls ---------------------------
+
+    (
+        # The resolver's own trigger, mutated to fire on everything: `if
+        # True:` makes it return `declared` unchanged no matter what --
+        # "no resolution happens", the truest statement of the mutation a
+        # SyntaxError-free edit can make here. (A first draft targeted the
+        # call site instead -- `url_resolved=None if path in unneeded else
+        # (` -- which heads a continuation line carrying keyword arguments
+        # inside a parenthesized display and does not parse at all.)
+        "tasks: a relative submodule url is resolved",
+        "src/bakeoff/tasks.py",
+        "    if not declared.startswith(_RELATIVE_URL_PREFIXES):",
+        "    if True:",
+        "tests/test_tasks.py -k both_urls_are_recorded",
+        "not integration",
+    ),
+    (
+        # The pre-pop guard, disabled. `segments.pop()` then runs on an
+        # empty list, so the named test's `pytest.raises(TaskError)` sees an
+        # `IndexError` and ERRORS rather than failing -- still red, just not
+        # by the assertion it was written for.
+        "tasks: the climb guard runs before the pop",
+        "src/bakeoff/tasks.py",
+        "            if not segments:",
+        "            if False:",
+        "tests/test_tasks.py -k climb_past_the_host",
+        "not integration",
+    ),
+    (
+        # `./` popping a segment it should only append to. Reproduces row
+        # C/Y's shape wrong -- the base's own last segment would be eaten
+        # rather than kept.
+        "tasks: a dot-slash url does not pop a segment",
+        "src/bakeoff/tasks.py",
+        "            remainder = remainder[2:]",
+        "            remainder = remainder[2:]; segments and segments.pop()",
+        "tests/test_tasks.py -k dot_slash_url_appends",
+        "not integration",
+    ),
+    (
+        # The mirror keyed on the RAW url instead of the resolved one --
+        # `--sub.git` for a relative declaration, the "loader refusing a
+        # manifest wearing the costume of a harness crash" shape the item's
+        # own design notes argue against.
+        "tasks: the mirror is keyed on the resolved url",
+        "src/bakeoff/tasks.py",
+        "        sub.path: ensure_pruned_mirror(sub.url_resolved, sub.sha, cache_root)",
+        "        sub.path: ensure_pruned_mirror(sub.url_declared, sub.sha, cache_root)",
+        "tests/test_tasks.py -k no_mirror_is_keyed_on_the_raw",
+        "not integration",
+    ),
+    (
+        # The persisted value reverted to the raw declaration -- exactly
+        # what N2 measures `git submodule sync` does on its own, made
+        # unconditional at materialization time instead.
+        "tasks: the run tree persists the resolved url",
+        "src/bakeoff/tasks.py",
+        "        _git(\"config\", key, sub.url_resolved, cwd=dest)",
+        "        _git(\"config\", key, sub.url_declared, cwd=dest)",
+        "tests/test_tasks.py -k run_tree_persists_the_resolved_url",
+        "not integration",
+    ),
+    (
+        # The SECOND, independent consumer: the image context's own mirror
+        # key. Anchored separately from the tasks.py entry above on purpose
+        # -- two independent consumers, so one regressing must not hide
+        # behind the other's anchor.
+        "images: the image context uses the resolved url",
+        "src/bakeoff/images.py",
+        "        mirror = ensure_pruned_mirror(sub.url_resolved, sub.sha, cache_root)",
+        "        mirror = ensure_pruned_mirror(sub.url_declared, sub.sha, cache_root)",
+        "tests/test_tasks.py -k image_context_uses_the_resolved_url",
+        "not integration",
+    ),
+    (
+        # The declared-unneeded guard, dropped -- the resolver now runs
+        # against a path nothing fetches, over a url that may not even
+        # exist behind the stanza.
+        "tasks: a declared-unneeded submodule is never resolved",
+        "src/bakeoff/tasks.py",
+        "            url_resolved=None if path in unneeded else _resolve_submodule_url(",
+        "            url_resolved=_resolve_submodule_url(",
+        "tests/test_tasks.py -k declared_unneeded_submodule_is_never_resolved",
+        "not integration",
+    ),
+    (
+        # The resolved/unresolved test inverted: the "never resolved"
+        # problem now fires exactly when the url WAS resolved, so the named
+        # test's positive assertion goes red on a clean failure rather than
+        # an exception.
+        "preflight: an unresolved relative url is a problem",
+        "src/bakeoff/preflight.py",
+        "                        and not entry[\"url_persisted\"].startswith(",
+        "                        and entry[\"url_persisted\"].startswith(",
+        "tests/test_preflight.py -k unresolved_relative_url",
         "not integration",
     ),
 ]

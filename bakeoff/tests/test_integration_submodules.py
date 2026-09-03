@@ -257,7 +257,12 @@ def test_the_image_and_the_run_tree_carry_the_same_submodule_blob(
     assert result.evidence["submodules"] == [
         {"path": SUB_PATH, "sha": superproject["pinned"],
          "initialised": True, "marker": " ",
-         "declared_unneeded": False, "empty": False}
+         "declared_unneeded": False, "empty": False,
+         # round 2 item 16: an already-absolute url resolves to itself, so
+         # both the declared and the persisted value are the submodule's
+         # real local path.
+         "url_declared": str(superproject["lib"]),
+         "url_persisted": str(superproject["lib"])}
     ]
     assert result.evidence["submodules_orphaned"] == []
     # `{}` is "measured, this task declares no unneeded submodules".
@@ -574,3 +579,154 @@ def test_a_skipped_reflog_expire_is_refused_on_a_real_run_tree(
         tasks.subprocess.run = real_run
 
     assert task.task_id in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# round-2 item 16: a relative .gitmodules url, resolved against repo.url
+# ---------------------------------------------------------------------------
+
+MANIFEST_RELATIVE_URL = """\
+task_id: sub-int-003
+task_version: 1
+repo:
+  url: {url}
+  base_sha: {base_sha}
+prompt: |
+  fix add()
+tests:
+  paths: ["tests/"]
+  runner: ["python", "-m", "pytest", "-q"]
+  f2p: ["tests/test_calc.py::test_add"]
+"""
+
+
+@pytest.fixture(scope="module")
+def superproject_relative_url(workspace) -> dict:
+    """`superproject`'s shape, with the committed `.gitmodules` url rewritten
+    to the RELATIVE form `../libdep3` before `base_sha` is cut.
+
+    A fresh submodule (`libdep3`) and a fresh superproject (`super3`) --
+    never `superproject`'s or `superproject_under_test_prefix`'s. This
+    file's own established rule, stated in that fixture's docstring and
+    quoted here because it is the reason: module-scoped fixtures in this
+    file run in an unspecified order, and a shared submodule mirror would
+    make one test's clone the reason another's prune assertion holds.
+
+    Offline throughout, exactly as `superproject` is: every repository is a
+    local `git init` and every submodule-touching command carries
+    `-c protocol.file.allow=always`. The resolution this fixture exercises is
+    `<workspace>/super3` + `../libdep3` -> `<workspace>/libdep3`, the
+    directory it just built.
+    """
+    lib = workspace / "libdep3"
+    (lib / "libdep").mkdir(parents=True)
+    (lib / "libdep" / "__init__.py").write_text(SUB_LIB)
+    _sh("git", "init", "-q", cwd=lib)
+    _sh("git", "config", "user.email", "t@t.test", cwd=lib)
+    _sh("git", "config", "user.name", "t", cwd=lib)
+    _sh("git", "add", "-A", cwd=lib)
+    _sh("git", "commit", "-q", "-m", "libdep v1", cwd=lib)
+    pinned = _sh("git", "rev-parse", "HEAD", cwd=lib)
+
+    repo = workspace / "super3"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "calc.py").write_text(BUGGY)
+    (repo / "tests" / "test_calc.py").write_text(OLD_TEST)
+    (repo / ".gitignore").write_text("__pycache__/\n")
+    _sh("git", "init", "-q", cwd=repo)
+    _sh("git", "config", "user.email", "t@t.test", cwd=repo)
+    _sh("git", "config", "user.name", "t", cwd=repo)
+    _sh("git", "add", "-A", cwd=repo)
+    _sh("git", "commit", "-q", "-m", "base", cwd=repo)
+    _sh("git", "-c", "protocol.file.allow=always", "submodule", "add", "-q",
+        str(lib), SUB_PATH, cwd=repo)
+    _sh("git", "-c", "protocol.file.allow=always", "-C", SUB_PATH,
+        "checkout", "-q", pinned, cwd=repo)
+    # THE REWRITE. The committed `.gitmodules` url is now relative --
+    # `base_sha` carries it, which is what makes derivation see the RAW fact
+    # (M3) rather than a git-supplied resolution.
+    _sh("git", "config", "-f", ".gitmodules", "submodule.vendor/libdep.url",
+        "../libdep3", cwd=repo)
+    _sh("git", "add", "-A", cwd=repo)
+    _sh("git", "commit", "-q", "-m", "pin the submodule (relative url)",
+        cwd=repo)
+    base = _sh("git", "rev-parse", "HEAD", cwd=repo)
+
+    (repo / "calc.py").write_text(FIXED)
+    (repo / "tests" / "test_calc.py").write_text(NEW_TEST)
+    _sh("git", "add", "-A", cwd=repo)
+    _sh("git", "commit", "-q", "-m", "fix", cwd=repo)
+    head = _sh("git", "rev-parse", "HEAD", cwd=repo)
+    reference = subprocess.run(
+        ["git", "diff", base, head], cwd=repo, check=True,
+        capture_output=True, text=True,
+    ).stdout
+
+    task_dir = workspace / "taskset" / "sub-int-003"
+    task_dir.mkdir(parents=True)
+    (task_dir / "task.yaml").write_text(
+        MANIFEST_RELATIVE_URL.format(url=str(repo), base_sha=base))
+    (task_dir / "reference.diff").write_text(reference)
+    return {"task_dir": task_dir, "lib": lib, "pinned": pinned}
+
+
+def test_a_relative_url_superproject_materializes_and_the_image_matches(
+        workspace, superproject_relative_url, local_urls):
+    """The one test that proves the whole path end to end: the resolver, the
+    mirror key, `_init_submodules`'s preset-and-rewrite, and
+    `_extract_submodules`. Same assertion
+    `test_the_image_and_the_run_tree_carry_the_same_submodule_blob` makes for
+    an absolute url, over a task whose `.gitmodules` declares a relative
+    one."""
+    task = load_task(superproject_relative_url["task_dir"])
+    cache = workspace / "cache3"
+
+    run_tree = workspace / "run3"
+    start_sha = materialize(task, run_tree, cache)
+
+    # 1. Populated at its gitlink. `git submodule status` reads a leading
+    #    space (M1b) -- initialised, not `-` or `+`.
+    status = subprocess.run(
+        ["git", "submodule", "status"], cwd=run_tree,
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert status.startswith(" ")
+
+    # 2. THE RUN TREE PERSISTS THE RESOLVED URL, never the raw relative one
+    #    (D7, M5). `str(superproject_relative_url["lib"])` is exactly what
+    #    a clone with a reachable remote has git itself write into
+    #    `.git/config`.
+    persisted = _sh(
+        "git", "config", "--get", f"submodule.{SUB_PATH}.url", cwd=run_tree,
+    )
+    assert persisted == str(superproject_relative_url["lib"])
+
+    base = build_base_images(
+        REPO_ROOT, [task_runtime(task)])[task_runtime(task)].image_id
+    image = build_task_image(task, base, workspace / "build3", cache)
+    assert image.startswith("sha256:"), (
+        f"{image!r} is not a content pin; RunContainer refuses a tag"
+    )
+    assert not image_entrypoint(image), (
+        "the task image declares an ENTRYPOINT; RunContainer's `sleep "
+        "infinity` would become an argument to it and the container would "
+        "exit immediately"
+    )
+
+    result = preflight(task, image=image, repo_path=run_tree,
+                       start_sha=start_sha)
+    assert result.ok, result.problems
+
+    # 3. THE SAME BLOB COMPARISON `test_the_image_and_the_run_tree_carry_
+    #    the_same_submodule_blob` makes for an absolute url -- the image
+    #    context's mirror is keyed on the RESOLVED url too (`_extract_
+    #    submodules`), so both archives come from the same object set.
+    in_run = run_tree / SUB_PATH / "libdep" / "__init__.py"
+    in_image = (workspace / "build3" / f"image-{task.task_id}" / "repo"
+                / SUB_PATH / "libdep" / "__init__.py")
+    assert in_run.is_file(), f"{in_run} is missing: the run tree has no submodule"
+    assert in_image.is_file(), (
+        f"{in_image} is missing: the context has no submodule"
+    )
+    assert in_run.read_bytes() == in_image.read_bytes()
+    assert in_run.read_bytes() == SUB_LIB.encode()

@@ -348,7 +348,19 @@ _PYTEST_ADAPTER = for_framework("pytest")
 #: may describe a task this gate now refuses -- a cached PASS is therefore
 #: stale and must be re-gated; a cached NO-GO is unaffected, since nothing
 #: here turns a NO-GO into a GO.
-PREFLIGHT_VERSION: str = "23"
+#:
+#: 23 -> 24: round 2, item 16. Adds `url_declared` and `url_persisted` to
+#: every `submodules` entry (the first from the tree's `.gitmodules`, the
+#: second from the run tree's own `--local` config) and one problem for a
+#: relative url the run tree never resolved. Both are PER-ENTRY fields inside
+#: the existing `submodules` key, not new top-level evidence keys -- no
+#: `EVIDENCE_KEYS` change. A verdict cached under 23 was written by a gate
+#: that recorded neither, so a reader of a stored blob cannot tell "this
+#: task's submodule url is absolute" from "this gate did not look" -- an
+#: absent field read as a positive negative claim. GO/NO-GO is unchanged for
+#: every task in the corpus (none declares a relative url); what moved is
+#: what a stored verdict's evidence can be read to say.
+PREFLIGHT_VERSION: str = "24"
 
 #: Bounds the VERDICT, not the transfer: `docker cp` has no names-only mode,
 #: so `scaffold_only_paths` streams the whole image `/repo` regardless of this
@@ -2199,8 +2211,18 @@ def preflight(
             # trailing NUL leaves one empty final record.
             declared_subs = container.exec(
                 ["git", "config", "-f", ".gitmodules", "--get-regexp", "-z",
-                 r"^submodule\..*\.path$"]
+                 r"^submodule\..*\.(path|url)$"]
             )
+            # HOISTED above the exit-code branch, not inside its `if`: the
+            # url-key loop below (round 2 item 16) runs unconditionally in
+            # this same enclosing block, and an UnboundLocalError out of a
+            # gate whose caller does not wrap it is a traceback instead of a
+            # NO-GO -- exactly the failure the comment two screens up already
+            # documents for `split("\n", 1)[1]`. On the else path both dicts
+            # stay empty, every entry's two new url keys read `None`, and the
+            # only problem filed is the existing orphan-read one below.
+            path_by_name: dict[str, str] = {}
+            url_by_name: dict[str, str] = {}
             if declared_subs.exit_code in (0, 1):
                 # 1 is git config's ORDINARY "no key matched" -- a repository
                 # with no .gitmodules at all, or one whose stanzas all have
@@ -2213,13 +2235,23 @@ def preflight(
                 # the indexed form would raise `IndexError` out of a gate
                 # whose caller does not wrap it -- a traceback instead of a
                 # NO-GO, the same failure `_gitlink_paths` documents.
-                declared_paths = set()
+                #
+                # `rpartition`, not a fixed suffix strip: the regex now
+                # matches BOTH `.path` and `.url`, and a submodule NAME may
+                # itself contain a dot, so the split has to happen at the
+                # LAST one -- exactly `derive_submodules`' own parse of this
+                # same blob.
                 for record in declared_subs.stdout.split("\0"):
                     if not record:
                         continue
-                    _key, sep, value = record.partition("\n")
+                    key, sep, value = record.partition("\n")
                     if sep:
-                        declared_paths.add(value)
+                        name, _, field = key[len("submodule."):].rpartition(".")
+                        if field == "path":
+                            path_by_name[name] = value
+                        elif field == "url":
+                            url_by_name[name] = value
+                declared_paths = set(path_by_name.values())
                 evidence["submodules_orphaned"] = sorted(
                     declared_paths - set(gitlinks)
                 )
@@ -2230,6 +2262,77 @@ def preflight(
                     f"{declared_subs.exit_code}): "
                     f"{(declared_subs.stdout or declared_subs.stderr)[:500]}"
                 )
+            # The RESOLVED url, observed rather than restated (round 2 item
+            # 16). `--local` is deliberate: this asks what `_init_submodules`
+            # wrote into THIS tree, not what an operator's global config says.
+            # Measured 2026-09-02 (git 2.50.1): `-z` gives `<key>\n<value>\0`
+            # records, the same shape the .gitmodules read above parses, and
+            # exit 1 is the ordinary "no key matched" for a tree with no
+            # initialised submodule -- collapsing it with >1 would report an
+            # unreadable config as the measured claim "no submodule has a
+            # url".
+            persisted = container.exec(
+                ["git", "config", "--local", "--get-regexp", "-z",
+                 r"^submodule\..*\.url$"]
+            )
+            persisted_by_name: dict[str, str] | None = {}
+            if persisted.exit_code in (0, 1):
+                for record in persisted.stdout.split("\0"):
+                    if not record:
+                        continue
+                    key, sep, value = record.partition("\n")
+                    if sep:
+                        persisted_by_name[
+                            key[len("submodule."):-len(".url")]] = value
+            else:
+                persisted_by_name = None
+                problems.append(
+                    "reading the run tree's submodule urls failed (exit "
+                    f"{persisted.exit_code}): "
+                    f"{(persisted.stdout or persisted.stderr)[:500]}"
+                )
+            # `url_declared`/`url_persisted` on every entry, and the one
+            # assertion this pair of reads exists for (round 2 item 16). The
+            # join key is the submodule NAME (both files key on it); the
+            # entry key is the PATH, so `path_by_name` bridges them, and an
+            # entry whose path no name maps to gets `None` on both -- honest,
+            # since neither file has anything to say about it.
+            name_by_path = {path: name for name, path in path_by_name.items()}
+            for entry in submodules:
+                name = name_by_path.get(entry["path"])
+                entry["url_declared"] = (
+                    None if name is None else url_by_name.get(name))
+                entry["url_persisted"] = (
+                    None if name is None or persisted_by_name is None
+                    else persisted_by_name.get(name))
+                # `is not None` on url_persisted, and never the `or ""` idiom
+                # that is right on url_declared two lines up: the two are not
+                # symmetric. `None` on url_persisted means NOT MEASURED, in
+                # two distinct ways -- the `--local` read failed above, or the
+                # name was never registered at all, which is exactly what a
+                # DECLARED-UNNEEDED submodule looks like (item 2 never
+                # registers one). Under `or ""` both would satisfy this
+                # predicate and file a problem asserting "never resolved" --
+                # a positive claim about something this gate did not look at,
+                # and its concrete cost would be that every task using
+                # `submodules_unneeded` on a relative-url gitlink becomes a
+                # spurious NO-GO. A failed read is already reported by the
+                # problem above; this one stays silent about what it did not
+                # see.
+                if (entry["url_declared"] or "").startswith(("./", "../")) \
+                        and entry["url_persisted"] is not None \
+                        and not entry["url_persisted"].startswith(
+                            ("http://", "https://", "/")):
+                    problems.append(
+                        f"submodule {entry['path']} declares the relative url "
+                        f"{entry['url_declared']!r} and the run tree persists "
+                        f"{entry['url_persisted']!r}. The relative url was "
+                        "never resolved, so any command that re-reads it "
+                        "resolves against a remote this tree does not have "
+                        "and falls back to the superproject's own path, "
+                        "which inside the container is a path that does not "
+                        "exist."
+                    )
             # The declared state, asserted rather than assumed. Every one of
             # these replaces something `stale` used to say about these paths,
             # and the exclusion two blocks down is what turns the NO-GO into a

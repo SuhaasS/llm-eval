@@ -288,13 +288,22 @@ class Submodule:
     module docstring's third load-bearing item, and spec section 3.7).
 
     Every field is inside the tree `base_sha` already pins: `path` and `sha`
-    are a `160000` entry in `git ls-tree`, `name` and `url` are the section
-    header and value in the `.gitmodules` blob. A manifest key restating them
-    would be configuration reported as observation, and it could drift from
-    the tree while every other check passed.
+    are a `160000` entry in `git ls-tree`, `name` and `url_declared` are the
+    section header and value in the `.gitmodules` blob. A manifest key
+    restating them would be configuration reported as observation, and it
+    could drift from the tree while every other check passed.
 
     `name` is not `path`: the `[submodule "NAME"]` header is what
     `submodule.<name>.url` keys on, and git does not require the two to match.
+
+    `url_declared` is the `.gitmodules` value VERBATIM -- measured 2026-09-02,
+    nothing the harness does rewrites that blob, so it stays the
+    manifest-adjacent fact. `url_resolved` is what the mirror was built from
+    and what the run tree persists: equal to `url_declared` whenever the
+    declared url was already absolute, resolved by `_resolve_submodule_url`
+    when it was relative, and `None` -- a third value, not `""` -- when this
+    submodule is declared unneeded and was therefore never resolved at all.
+    `""` remains "the stanza declared no url", which is a different absence.
 
     `declared_unneeded` is the one field that is NOT derived. It is the
     manifest's `submodules_unneeded` list, joined onto the derived entry by
@@ -307,16 +316,26 @@ class Submodule:
 
     name: str
     path: str
-    url: str
+    url_declared: str
+    url_resolved: str | None
     sha: str
     declared_unneeded: bool = False
 
 
-#: The only submodule url shape the eval can fetch. A relative url ("../x.git")
-#: resolves against the superproject's remote, which `materialize` deletes and
-#: the container cannot reach; ssh needs keys the eval does not carry; file://
-#: points at the task author's laptop. Refused at derivation so the failure
-#: names the manifest, not `git submodule update`'s clone error.
+#: gitmodules(5)'s two relative forms, and git's own trigger: a bare `..`
+#: matches neither and is stored verbatim (measured 2026-09-02, git 2.50.1,
+#: table R row T), which is why the tuple carries the slashes.
+_RELATIVE_URL_PREFIXES = ("./", "../")
+
+#: The only submodule url shape the eval can fetch, judged against the
+#: RESOLVED url. A relative url ("../x.git") is resolved against
+#: `task.repo_url` by `_resolve_submodule_url` -- git resolves it against
+#: `remote.origin.url`, which `materialize` deletes, and git then falls back to
+#: the superproject's own host path (measured 2026-09-02, git 2.50.1: a warning
+#: and a clone of `<run tree>/../x.git` that does not exist). ssh needs keys the
+#: eval does not carry; file:// points at the task author's laptop. Refused at
+#: derivation so the failure names the manifest, not `git submodule update`'s
+#: clone error.
 _SUBMODULE_URL_PREFIX = "https://"
 
 
@@ -2045,6 +2064,11 @@ def derive_submodules(task: TaskManifest, mirror: Path) -> tuple[Submodule, ...]
     local repositories, so the whole materialization path runs offline -- relax
     it by monkeypatching one name, and no shipping signature carries a flag
     that only tests ever set.
+
+    A RELATIVE url is resolved here, against `task.repo_url`, and the
+    resolution runs LAST -- after the unreadable-.gitmodules raise and after
+    the `unfetchable` raise -- so a gitlink with no url is told that rather
+    than told that "" does not resolve.
     """
     entries = _git("ls-tree", "-r", "-z", task.base_sha, cwd=mirror).stdout
     gitlinks: dict[str, str] = {}
@@ -2122,14 +2146,32 @@ def derive_submodules(task: TaskManifest, mirror: Path) -> tuple[Submodule, ...]
     # construct an entry with no stanza at all, and even with no readable
     # `.gitmodules`: `name` falls back to the path and `url` to `""`. That
     # combination is unreachable for a needed submodule, because the two
-    # refusals above rule it out.
+    # refusals above rule it out. Bound ONCE per gitlink here (a comprehension
+    # would evaluate it twice), and used for both `declared_unneeded` and
+    # `url_resolved` below.
     unneeded = set(task.submodules_unneeded)
-    subs = tuple(
-        Submodule(name=by_path.get(path, (path, {}))[0], path=path,
-                  url=by_path.get(path, (path, {}))[1].get("url", ""), sha=sha,
-                  declared_unneeded=path in unneeded)
-        for path, sha in sorted(gitlinks.items())
-    )
+    subs_list: list[Submodule] = []
+    for path, sha in sorted(gitlinks.items()):
+        name, entry = by_path.get(path, (path, {}))
+        declared = entry.get("url", "")
+        subs_list.append(Submodule(
+            name=name, path=path, sha=sha,
+            url_declared=declared,
+            # Written explicitly. Its default is `False`, so omitting this
+            # keyword compiles, constructs, and silently reverts the whole of
+            # the declared-unneeded exemption -- the url-refusal guard,
+            # `_init_submodules`' filter, `_extract_submodules`' skip and
+            # preflight's GO.
+            declared_unneeded=path in unneeded,
+            # NEVER resolved for a declared-unneeded path: nothing fetches
+            # it, so no url has to exist for it at all (a declared-unneeded
+            # gitlink may have no stanza behind it, in which case `declared`
+            # is already ""). `None` is "not resolved", a different absence
+            # from `""` ("declared no url").
+            url_resolved=None if path in unneeded else _resolve_submodule_url(
+                task.repo_url, declared, task_id=task.task_id, path=path),
+        ))
+    subs = tuple(subs_list)
     _refuse_submodule_conflicts(task, subs, mirrors={})
     return subs
 
@@ -2137,6 +2179,138 @@ def derive_submodules(task: TaskManifest, mirror: Path) -> tuple[Submodule, ...]
 def _has_gitmodules(mirror: Path, sha: str) -> bool:
     return _git("cat-file", "-e", f"{sha}:.gitmodules", cwd=mirror,
                 check=False).returncode == 0
+
+
+def _resolve_submodule_url(repo_url: str, declared: str, *,
+                           task_id: str, path: str) -> str:
+    """git's resolution of a relative `.gitmodules` url, offline.
+
+    gitmodules(5) resolves `./` and `../` against the superproject's default
+    remote, `remote.origin.url`, or -- with no remote -- against the
+    superproject's own path. `materialize` removes `origin` on purpose, so
+    measured 2026-09-02 (git 2.50.1) git takes the third branch, warns
+    *"Assuming this repository is its own authoritative upstream"*, and tries
+    to clone `<run tree>/../x.git`, which does not exist. `task.repo_url` is
+    the same fact the deleted remote carried, it is in the manifest, and it is
+    offline -- so the resolution is done here instead.
+
+    THIS IS A SUPERSET OF REFUSALS OVER GIT, not a port of `relative_url()`.
+    git is defined to produce something for every input, at exit 0, which is
+    why `../../../sub.git` under `https://github.com/org/super.git` measures as
+    `https://sub.git` (a host named `sub.git`) and one more `../` measures as
+    `https:/sub.git` (not a url at all). Everything accepted here git accepts
+    identically; everything refused here git accepts and hands back a url the
+    eval would fail to clone in the middle of a matrix. The 33 measured rows
+    are in `docs/superpowers/plans/2026-09-03-round2-16-relative-submodule-urls.md`.
+
+    No scheme check: the resolver returns a url and
+    `_refuse_submodule_conflicts` judges it against `_SUBMODULE_URL_PREFIX`,
+    which is the one place that decides what is fetchable -- and is the one
+    name the test fixtures relax so a local path can stand in for a url.
+    """
+    if not declared.startswith(_RELATIVE_URL_PREFIXES):
+        # git's own trigger, and it is a two-string prefix set rather than a
+        # `..` check: measured, a bare `..` matches neither and git stores it
+        # verbatim. Falling through leaves it for the url refusal to name.
+        return declared
+
+    where = f"{task_id}: submodule {path} declares the relative url " \
+            f"{declared!r}"
+    for char, what in (("?", "a query"), ("#", "a fragment")):
+        if char in repo_url:
+            raise TaskError(
+                f"{where}, and repo.url {repo_url!r} carries {what}. Measured "
+                "2026-09-02: git silently discards it when the `../` chain "
+                "pops the segment holding it and embeds it mid-path for a "
+                "`./`, so the resolved url is not a url anyone wrote down."
+            )
+    scheme, sep, rest = repo_url.partition("://")
+    if sep:
+        authority, slash, tail = rest.partition("/")
+        if not slash:
+            raise TaskError(
+                f"{where}, and repo.url {repo_url!r} has no path to resolve "
+                "against. Measured 2026-09-02: git pops the HOST in that "
+                "case, giving `https://sub.git` -- a url naming a host that "
+                "does not exist, at exit 0."
+            )
+        prefix = f"{scheme}://{authority}"
+    elif repo_url.startswith("/"):
+        # Reachable only from the test fixtures, where a local path stands in
+        # for a url and `_SUBMODULE_URL_PREFIX` is relaxed to "". The prefix is
+        # empty and the join below restores the leading slash, so the segment
+        # arithmetic is the same one git does.
+        prefix, tail = "", repo_url[1:]
+    else:
+        raise TaskError(
+            f"{where}, and repo.url {repo_url!r} is neither a `scheme://` url "
+            "nor an absolute path, so there is nothing to resolve against. An "
+            "scp-style url (`git@host:org/repo.git`) resolves in git to "
+            "another scp-style url, which this eval cannot fetch either."
+        )
+    tail = tail.rstrip("/")
+    if not tail:
+        raise TaskError(
+            f"{where}, and repo.url {repo_url!r} has no path to resolve "
+            "against."
+        )
+    segments = tail.split("/")
+    if any(not segment for segment in segments):
+        raise TaskError(
+            f"{where}, and repo.url {repo_url!r} carries an empty path "
+            "segment, so which segment a `../` pops is not well defined."
+        )
+
+    remainder = declared
+    while True:
+        if remainder.startswith("./"):
+            # Measured: `./` appends to the WHOLE base, `super.git` included.
+            remainder = remainder[2:]
+        elif remainder.startswith("../"):
+            remainder = remainder[3:]
+            if not segments:
+                # BEFORE the pop, not after, and that is the whole boundary:
+                # two pops from two segments is `https://github.com/other/
+                # sub.git`, exactly what git gives; a third pop is where git
+                # starts eating the host and this stops.
+                raise TaskError(
+                    f"{where}, which climbs above the path of repo.url "
+                    f"{repo_url!r}. Measured 2026-09-02: git pops the host "
+                    "and then the scheme's second slash rather than failing, "
+                    "so the clone target is a url naming a host that does not "
+                    "exist."
+                )
+            segments.pop()
+        else:
+            break
+
+    if not remainder:
+        raise TaskError(
+            f"{where}, which resolves to a directory rather than to a "
+            "repository."
+        )
+    if remainder.endswith("/"):
+        raise TaskError(
+            f"{where}, which ends in a slash. Measured 2026-09-02: git "
+            "consumes exactly one trailing slash, so `../x.git/` and "
+            "`../x.git//` resolve to two different urls."
+        )
+    parts = remainder.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise TaskError(
+            f"{where}, which carries an empty or dot path component after its "
+            "leading `./`/`../` chain. Measured 2026-09-02: git copies those "
+            "through verbatim, so the clone target holds a literal `..` or an "
+            "empty segment."
+        )
+    if any(char in remainder for char in "?#\\:") or \
+            any(char.isspace() for char in remainder):
+        raise TaskError(
+            f"{where}, which carries a query, fragment, backslash, colon or "
+            "whitespace. A relative submodule url is a path, and git appends "
+            "it to the resolved base without escaping it."
+        )
+    return "/".join([prefix, *segments, remainder])
 
 
 def _refuse_submodule_conflicts(task: TaskManifest, subs: tuple[Submodule, ...],
@@ -2199,15 +2373,33 @@ def _refuse_submodule_conflicts(task: TaskManifest, subs: tuple[Submodule, ...],
             # `no url` rather than `url ''`: an empty value is what a
             # `.gitmodules` stanza carrying a `path` and nothing else yields,
             # and quoting the empty string reads as a url that is present and
-            # strange rather than as a field the author never wrote.
-            stated = f"url {sub.url!r}" if sub.url else "no url"
-            if not sub.url.startswith(_SUBMODULE_URL_PREFIX):
+            # strange rather than as a field the author never wrote. Three-way
+            # rather than two-way, because `url_resolved` can now differ from
+            # `url_declared`: `is None` is unreachable here (item 2's guard
+            # skips this whole check for a declared-unneeded submodule) and is
+            # written anyway so a future editor who moves that guard gets the
+            # sentence rather than an `AttributeError`.
+            if sub.url_resolved is None:
+                stated = "no url (declared unneeded)"
+            elif not sub.url_declared:
+                stated = "no url"
+            elif sub.url_resolved == sub.url_declared:
+                stated = f"url {sub.url_declared!r}"
+            else:
+                stated = (f"url {sub.url_declared!r}, which resolves against "
+                          f"{task.repo_url!r} to {sub.url_resolved!r}")
+            # `(sub.url_resolved or "")`, never a bare `.startswith`: both ""
+            # (the stanza declared no url) and None (declared unneeded, never
+            # resolved) must fall through to this raise, and `sub.url_resolved
+            # .startswith(...)` would throw `AttributeError` on `None` one
+            # line after `stated` was built to describe it.
+            if not (sub.url_resolved or "").startswith(_SUBMODULE_URL_PREFIX):
                 raise TaskError(
                     f"{task.task_id}: submodule {sub.path} declares {stated}; "
                     f"only {_SUBMODULE_URL_PREFIX} urls can be fetched by this "
-                    "eval. A relative url resolves against a remote the run "
-                    "tree does not have, and ssh/file urls cannot be fetched "
-                    "at all."
+                    "eval. A relative url is resolved against repo.url first, "
+                    "and it is the RESULT that is judged; ssh, http and file "
+                    "urls cannot be fetched at all."
                 )
             # FIRST after the url check, and the only refusal that needs an
             # artifact rather than a comparison -- hence `mirrors`, and hence
@@ -2887,6 +3079,18 @@ def _init_submodules(task: TaskManifest, dest: Path,
     the url git clones from and the url the run tree carries in one place, in
     that order; it is a legibility choice here, not a behavioural one.
 
+    The value persisted is `url_resolved`, which for a relative `.gitmodules`
+    url is NOT what the blob says. That is fidelity, not invention: measured
+    2026-09-02, a clone with a reachable remote has git itself write the
+    resolved url into `.git/config`. Persisting the raw value instead would
+    leave a tree in which any command that re-derives from `.gitmodules`
+    resolves against the `origin` `materialize` removed and falls back to the
+    superproject's own path fallback -- on the host that is a host path, and
+    inside the container, where the tree is mounted at `/repo`, it is
+    `/sub.git` (measured: a warning, then a clone of a path that does not
+    exist, in both cases). `git submodule sync` re-derives that way and is
+    deliberately not covered; what this removes is the passive path.
+
     `protocol.file.allow=always` stays TRANSIENT and is REQUIRED in production,
     not only in tests: git has refused the file transport for submodules since
     the CVE-2022-39253 hardening, and a local pruned mirror is a file
@@ -2924,7 +3128,7 @@ def _init_submodules(task: TaskManifest, dest: Path,
     # acquisitions here are never nested inside it -- which flock would punish
     # with a same-process deadlock on the same slug.
     mirrors = {
-        sub.path: ensure_pruned_mirror(sub.url, sub.sha, cache_root)
+        sub.path: ensure_pruned_mirror(sub.url_resolved, sub.sha, cache_root)
         for sub in needed
     }
     _refuse_submodule_conflicts(task, subs, mirrors=mirrors)
@@ -2933,7 +3137,7 @@ def _init_submodules(task: TaskManifest, dest: Path,
         _git("config", key, str(mirrors[sub.path]), cwd=dest)
         _git("-c", "protocol.file.allow=always",
              "submodule", "update", "--init", "--", sub.path, cwd=dest)
-        _git("config", key, sub.url, cwd=dest)
+        _git("config", key, sub.url_resolved, cwd=dest)
 
         # BEFORE the two commands that run with `cwd=dest/sub.path`, and that
         # order is the whole point. Everything below this guard -- `remote

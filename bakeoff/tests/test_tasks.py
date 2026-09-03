@@ -2823,6 +2823,288 @@ def test_declaring_a_python_version_moves_the_digest_but_not_the_start_state(
         materialize(plain, tmp_path / "ta" / "repo", tmp_path / "ca")
 
 
+# --- relative submodule urls -------------------------------------------------
+#
+# Every test here calls `tasks._resolve_submodule_url` with plain strings --
+# no fixture, no repository. The 33-row measurement table (table R) these
+# tests transcribe lives in
+# docs/superpowers/plans/2026-09-03-round2-16-relative-submodule-urls.md.
+
+
+def test_a_parent_relative_url_resolves_against_repo_url():
+    """row A."""
+    assert tasks._resolve_submodule_url(
+        "https://github.com/org/super.git", "../sub.git",
+        task_id="t", path="vendor/sub",
+    ) == "https://github.com/org/sub.git"
+
+
+def test_the_superprojects_last_segment_is_popped_whole_and_no_git_suffix_is_stripped():
+    """rows A + B: git does not "strip a trailing .git" -- it pops a whole
+    `/`-separated segment per `../`, and `.git` is simply part of the segment
+    that goes. Nothing is appended either: `../sub` keeps `sub` with no
+    `.git`."""
+    assert tasks._resolve_submodule_url(
+        "https://github.com/org/super.git", "../sub.git",
+        task_id="t", path="p",
+    ) == "https://github.com/org/sub.git"
+    assert tasks._resolve_submodule_url(
+        "https://github.com/org/super.git", "../sub",
+        task_id="t", path="p",
+    ) == "https://github.com/org/sub"
+
+
+def test_a_repo_url_with_no_git_suffix_resolves_identically():
+    """row D."""
+    assert tasks._resolve_submodule_url(
+        "https://github.com/org/super", "../sub.git",
+        task_id="t", path="p",
+    ) == "https://github.com/org/sub.git"
+
+
+def test_a_trailing_slash_on_repo_url_is_absorbed():
+    """rows E and X give the same answer as A, with or without `.git`."""
+    assert tasks._resolve_submodule_url(
+        "https://github.com/org/super/", "../sub.git", task_id="t", path="p",
+    ) == "https://github.com/org/sub.git"
+    assert tasks._resolve_submodule_url(
+        "https://github.com/org/super.git/", "../sub.git",
+        task_id="t", path="p",
+    ) == "https://github.com/org/sub.git"
+
+
+def test_a_dot_slash_url_appends_to_the_whole_base():
+    """row C: `./` appends to the WHOLE base, `super.git` included, and pops
+    nothing. Row Y is the same shape with a trailing slash on the relative
+    url and is refused by test 24, not accepted here."""
+    assert tasks._resolve_submodule_url(
+        "https://github.com/org/super.git", "./sub.git",
+        task_id="t", path="p",
+    ) == "https://github.com/org/super.git/sub.git"
+
+
+def test_a_two_level_climb_empties_the_path_without_refusing():
+    """row F: the boundary case for the pre-pop guard -- two pops from two
+    segments is legal."""
+    assert tasks._resolve_submodule_url(
+        "https://github.com/org/super.git", "../../other/sub.git",
+        task_id="t", path="p",
+    ) == "https://github.com/other/sub.git"
+
+
+def test_each_climb_pops_exactly_one_segment():
+    """row P."""
+    assert tasks._resolve_submodule_url(
+        "https://github.com/org/super.git", "../../org2/sub.git",
+        task_id="t", path="p",
+    ) == "https://github.com/org2/sub.git"
+
+
+def test_userinfo_in_repo_url_survives():
+    """row N: a port and a userinfo live in the authority and are carried
+    through -- the resolver's colon refusal is on the REMAINDER only."""
+    assert tasks._resolve_submodule_url(
+        "https://user@github.com/org/super.git", "../sub.git",
+        task_id="t", path="p",
+    ) == "https://user@github.com/org/sub.git"
+
+
+def test_the_resolution_is_case_preserving():
+    """row U."""
+    assert tasks._resolve_submodule_url(
+        "https://github.com/org/super.git", "../SUB.git",
+        task_id="t", path="p",
+    ) == "https://github.com/org/SUB.git"
+
+
+def test_an_absolute_url_is_returned_unchanged():
+    assert tasks._resolve_submodule_url(
+        "https://github.com/org/super.git", "https://github.com/x/y.git",
+        task_id="t", path="p",
+    ) == "https://github.com/x/y.git"
+    assert tasks._resolve_submodule_url(
+        "https://github.com/org/super.git", "",
+        task_id="t", path="p",
+    ) == ""
+
+
+def test_a_bare_dot_dot_is_not_a_relative_url():
+    """row T: git's trigger is the two-string prefix set `("./", "../")`, and
+    a bare `..` matches neither, so it is stored verbatim -- no raise."""
+    assert tasks._resolve_submodule_url(
+        "https://github.com/org/super.git", "..",
+        task_id="t", path="p",
+    ) == ".."
+
+
+def test_an_absolute_local_path_base_resolves_by_the_same_arithmetic():
+    """The fixture branch: an absolute local path stands in for a url under
+    the test fixtures' `_SUBMODULE_URL_PREFIX` relaxation, and resolves by
+    the same segment arithmetic git uses against a real url."""
+    assert tasks._resolve_submodule_url(
+        "/tmp/a/super", "../lib", task_id="t", path="p",
+    ) == "/tmp/a/lib"
+
+
+def test_a_climb_past_the_host_is_refused():
+    """row G: three pops from two segments is where git starts eating the
+    host and hands back `https://sub.git` -- a url naming a host that does
+    not exist, at exit 0. This resolver refuses instead."""
+    with pytest.raises(TaskError, match="climbs above the path of repo.url"):
+        tasks._resolve_submodule_url(
+            "https://github.com/org/super.git", "../../../sub.git",
+            task_id="t", path="p",
+        )
+
+
+def test_a_climb_past_the_scheme_is_refused():
+    """row H: one more `../` than G, refused at the same guard."""
+    with pytest.raises(TaskError, match="climbs above the path of repo.url"):
+        tasks._resolve_submodule_url(
+            "https://github.com/org/super.git", "../../../../sub.git",
+            task_id="t", path="p",
+        )
+
+
+def test_a_repo_url_with_no_path_is_refused():
+    """row N1's shape, and its trailing-slash sibling: git pops the HOST in
+    that case, at exit 0. Both are refused with the same message."""
+    for repo_url in ("https://github.com", "https://github.com/"):
+        with pytest.raises(TaskError, match="no path to resolve against"):
+            tasks._resolve_submodule_url(
+                repo_url, "../sub.git", task_id="t", path="p",
+            )
+
+
+def test_a_repo_url_with_a_query_is_refused():
+    """row K: git silently discards the query when the `../` chain pops the
+    segment holding it."""
+    with pytest.raises(TaskError, match="carries a query"):
+        tasks._resolve_submodule_url(
+            "https://github.com/org/super.git?x=1", "../sub.git",
+            task_id="t", path="p",
+        )
+
+
+def test_a_repo_url_with_a_fragment_is_refused():
+    """row L."""
+    with pytest.raises(TaskError, match="carries a fragment"):
+        tasks._resolve_submodule_url(
+            "https://github.com/org/super.git#frag", "../sub.git",
+            task_id="t", path="p",
+        )
+
+
+def test_an_scp_style_repo_url_is_refused():
+    """row M: an scp-style repo.url has no `://` and is not absolute, so the
+    resolver refuses it itself -- one measured deviation from the plan's
+    first draft, which filed this as "refused one check later" for its
+    scheme; it never reaches that check."""
+    with pytest.raises(
+        TaskError,
+        match=r"neither a `scheme://` url nor an absolute path",
+    ):
+        tasks._resolve_submodule_url(
+            "git@example.invalid:org/super.git", "../sub.git",
+            task_id="t", path="p",
+        )
+
+
+def test_a_relative_repo_url_is_refused():
+    """The same refusal for a bare relative repo.url."""
+    with pytest.raises(
+        TaskError,
+        match=r"neither a `scheme://` url nor an absolute path",
+    ):
+        tasks._resolve_submodule_url(
+            "org/super.git", "../sub.git", task_id="t", path="p",
+        )
+
+
+def test_a_repo_url_with_an_empty_path_segment_is_refused():
+    with pytest.raises(TaskError, match="empty path segment"):
+        tasks._resolve_submodule_url(
+            "https://github.com/org//super.git", "../sub.git",
+            task_id="t", path="p",
+        )
+
+
+def test_an_interior_dot_or_dot_dot_component_is_refused():
+    """row I (`../a/../b.git`) and row DOTA (`../a/./b.git`, measured to pass
+    through git verbatim as `.../org/a/./b.git`): normalising either would
+    make the eval clone something git does not, which is the opposite of the
+    design's claim."""
+    with pytest.raises(TaskError, match="empty or dot path component"):
+        tasks._resolve_submodule_url(
+            "https://github.com/org/super.git", "../a/../b.git",
+            task_id="t", path="p",
+        )
+    with pytest.raises(TaskError, match="empty or dot path component"):
+        tasks._resolve_submodule_url(
+            "https://github.com/org/super.git", "../a/./b.git",
+            task_id="t", path="p",
+        )
+
+
+def test_an_empty_component_in_the_relative_url_is_refused():
+    """row R."""
+    with pytest.raises(TaskError, match="empty or dot path component"):
+        tasks._resolve_submodule_url(
+            "https://github.com/org/super.git", "..//sub.git",
+            task_id="t", path="p",
+        )
+
+
+def test_a_relative_url_that_resolves_to_a_directory_is_refused():
+    """rows S and V: those shapes name a directory, not a repository."""
+    with pytest.raises(TaskError, match="resolves to a directory"):
+        tasks._resolve_submodule_url(
+            "https://github.com/org/super.git", "../",
+            task_id="t", path="p",
+        )
+    with pytest.raises(TaskError, match="resolves to a directory"):
+        tasks._resolve_submodule_url(
+            "https://github.com/org/sub.git", "./",
+            task_id="t", path="p",
+        )
+
+
+def test_a_trailing_slash_on_the_relative_url_is_refused():
+    """rows O, O2 and Y: empty and trailing-slash remainders are
+    inconsistent even in git (O consumes one trailing slash, O2 keeps the
+    second) -- those shapes name a directory, not a repository, either
+    way."""
+    for declared in ("../sub.git/", "../sub.git//", "./sub.git/"):
+        with pytest.raises(TaskError, match="ends in a slash"):
+            tasks._resolve_submodule_url(
+                "https://github.com/org/super.git", declared,
+                task_id="t", path="p",
+            )
+
+
+def test_a_relative_url_carrying_a_query_or_whitespace_is_refused():
+    for declared in ("../sub.git?x=1", "../sub .git"):
+        with pytest.raises(
+            TaskError,
+            match="query, fragment, backslash, colon or whitespace",
+        ):
+            tasks._resolve_submodule_url(
+                "https://github.com/org/super.git", declared,
+                task_id="t", path="p",
+            )
+
+
+def test_the_refusal_names_the_task_and_the_submodule_path():
+    with pytest.raises(TaskError) as excinfo:
+        tasks._resolve_submodule_url(
+            "https://github.com/org/super.git", "../../../sub.git",
+            task_id="my-task-007", path="vendor/deep/sub",
+        )
+
+    assert "my-task-007" in str(excinfo.value)
+    assert "vendor/deep/sub" in str(excinfo.value)
+
+
 # --- submodules --------------------------------------------------------------
 
 
@@ -2853,7 +3135,9 @@ def test_the_gitlink_and_the_gitmodules_blob_are_both_read(tmp_path,
     assert sub.path == "vendor/libdep"
     assert sub.name == "vendor/libdep"
     assert sub.sha == up["pinned"]
-    assert sub.url == str(up["lib"])
+    assert sub.url_declared == str(up["lib"])
+    # The corpus shape: an already-absolute url resolves to itself.
+    assert sub.url_resolved == sub.url_declared
 
 
 def test_a_gitlink_with_no_gitmodules_url_is_refused(tmp_path,
@@ -2888,9 +3172,9 @@ def test_a_gitmodules_stanza_with_a_path_and_no_url_is_refused(
     """A THIRD shape, between the two neighbouring tests: `.gitmodules` is
     readable and the stanza names this exact path, so both the set difference
     and the "no readable .gitmodules" refusal are satisfied and neither fires.
-    What is missing is the url alone, which leaves `Submodule.url` an empty
-    string -- and an empty string is not a url, it is a stanza someone
-    hand-edited or a `git submodule add` that never finished.
+    What is missing is the url alone, which leaves `Submodule.url_declared`
+    an empty string -- and an empty string is not a url, it is a stanza
+    someone hand-edited or a `git submodule add` that never finished.
 
     Deliberately WITHOUT the `local_urls` fixture. That fixture empties
     `_SUBMODULE_URL_PREFIX` so `startswith` is vacuously true, and `""` starts
@@ -3556,7 +3840,10 @@ def test_a_declared_unneeded_submodule_is_not_refused_for_its_url(
     (sub,) = tasks.derive_submodules(task, mirror)
 
     assert sub.declared_unneeded is True
-    assert sub.url == "git@example.invalid:x/y.git"
+    assert sub.url_declared == "git@example.invalid:x/y.git"
+    # Never resolved: nothing fetches this submodule, so no url has to
+    # exist for it -- a different absence from "" ("declares no url").
+    assert sub.url_resolved is None
 
 
 def test_an_unneeded_declaration_naming_no_gitlink_is_refused(
@@ -3634,7 +3921,8 @@ def test_a_declared_unneeded_gitlink_survives_an_unreadable_gitmodules(
     (sub,) = tasks.derive_submodules(task, mirror)
 
     assert sub.declared_unneeded is True
-    assert sub.url == ""
+    assert sub.url_declared == ""
+    assert sub.url_resolved is None
     assert sub.name == "vendor/libdep"
 
 
@@ -3655,7 +3943,8 @@ def test_a_declared_unneeded_gitlink_with_no_stanza_in_a_readable_gitmodules(
     assert [s.path for s in subs] == ["vendor/libdep", "vendor/other"]
     other = subs[1]
     assert other.declared_unneeded is True
-    assert other.url == ""
+    assert other.url_declared == ""
+    assert other.url_resolved is None
     assert subs[0].declared_unneeded is False
 
 
@@ -3826,6 +4115,245 @@ def test_a_mixed_task_populates_the_needed_submodule_and_not_the_other(
                for line in status.splitlines() if line}
     assert markers["vendor/other"] == "-"
     assert markers["vendor/libdep"] == " "
+
+
+# --- round 2 item 16: relative-url derivation and wiring ----------------------
+
+
+def _relative_url_fixture(up):
+    """`upstream_submodule` with the committed `.gitmodules` url rewritten to
+    the RELATIVE form `../libdep`.
+
+    `../libdep`, not `../lib`: `upstream_submodule` builds the submodule
+    source at `tmp_path / "libdep"` (returned under the dict key `"lib"`) and
+    the superproject at `tmp_path / "super"`, with the gitlink at
+    `vendor/libdep`. From base `<tmp_path>/super`, one `../` pops `super` and
+    the remainder appends, giving `<tmp_path>/libdep` -- `str(up["lib"])`.
+    `../lib` would resolve to `<tmp_path>/lib`, which does not exist, and
+    `ensure_pruned_mirror` would fail on `git clone --mirror` of a missing
+    path with a bare `CalledProcessError` instead of the assertion a test
+    below was written for.
+
+    Same shape as `_ssh_url_fixture`: the rewrite lands on top of the
+    fixture's own fix commit, so a new base and a new head are both cut, or
+    the reference diff the manifest ships no longer applies at the base it
+    names.
+    """
+    repo = up["path"]
+
+    def commit(message):
+        _sh("git", "add", "-A", cwd=repo)
+        _sh("git", "-c", "user.email=t@t.test", "-c", "user.name=t",
+            "commit", "-q", "-m", message, cwd=repo)
+        return _sh("git", "rev-parse", "HEAD", cwd=repo)
+
+    _sh("git", "config", "-f", ".gitmodules",
+        "submodule.vendor/libdep.url", "../libdep", cwd=repo)
+    (repo / "calc.py").write_text(BUGGY)
+    (repo / "tests" / "test_calc.py").write_text(OLD_TEST)
+    base = commit("a relative url, back at the buggy state")
+    (repo / "calc.py").write_text(FIXED)
+    (repo / "tests" / "test_calc.py").write_text(NEW_TEST)
+    head = commit("fix")
+    reference = subprocess.run(
+        ["git", "diff", base, head], cwd=repo, check=True,
+        capture_output=True, text=True,
+    ).stdout
+    return {**up, "base": base, "head": head, "reference": reference}
+
+
+def test_both_urls_are_recorded_on_the_submodule_record(
+        tmp_path, upstream_submodule, local_urls):
+    up = _relative_url_fixture(upstream_submodule)
+    task = _sub_task(tmp_path, up)
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"],
+                                 tmp_path / "cache")
+
+    (sub,) = tasks.derive_submodules(task, mirror)
+
+    assert sub.url_declared == "../libdep"
+    assert sub.url_resolved == str(up["lib"])
+
+
+def test_an_absolute_url_records_the_same_value_twice(
+        tmp_path, upstream_submodule, local_urls):
+    up = upstream_submodule
+    task = _sub_task(tmp_path, up)
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"],
+                                 tmp_path / "cache")
+
+    (sub,) = tasks.derive_submodules(task, mirror)
+
+    assert sub.url_declared == sub.url_resolved
+
+
+def test_a_gitlink_with_no_url_is_refused_before_the_resolver_runs(
+        tmp_path, upstream_submodule):
+    """The ordering the D6 comment states: an author whose gitlink has NO url
+    at all must be told that, not told that "" does not resolve -- which it
+    would in fact do, unchanged, since `_resolve_submodule_url` returns any
+    non-relative string verbatim.
+
+    Deliberately WITHOUT `local_urls`: that fixture empties
+    `_SUBMODULE_URL_PREFIX`, under which `"".startswith("")` is True and the
+    "no url" refusal cannot fire at all -- this test would pass with the
+    refusal deleted. The resolver itself never inspects `repo.url`'s shape
+    for a non-relative (here, empty) declared value, so a local-path
+    `repo.url` costs nothing here either way.
+    """
+    up = upstream_submodule
+    _sh("git", "rm", "-q", "--cached", ".gitmodules", cwd=up["path"])
+    (up["path"] / ".gitmodules").write_text(
+        '[submodule "vendor/libdep"]\n'
+        "\tpath = vendor/libdep\n"
+    )
+    _sh("git", "add", "-A", cwd=up["path"])
+    _sh("git", "-c", "user.email=t@t.test", "-c", "user.name=t",
+        "commit", "-q", "-m", "no url in the stanza", cwd=up["path"])
+    base = _sh("git", "rev-parse", "HEAD", cwd=up["path"])
+    task = _sub_task(tmp_path, {**up, "base": base})
+    mirror = tasks.ensure_mirror(str(up["path"]), base, tmp_path / "cache")
+
+    with pytest.raises(TaskError, match="no url") as excinfo:
+        tasks.derive_submodules(task, mirror)
+
+    assert "does not resolve" not in str(excinfo.value)
+
+
+def test_an_unresolvable_relative_url_is_refused_at_derivation(
+        tmp_path, upstream_submodule, local_urls):
+    up = _relative_url_fixture(upstream_submodule)
+    _sh("git", "config", "-f", ".gitmodules",
+        # 50 pops -- comfortably more than any pytest tmp_path is deep --
+        # rather than the table's 3: `repo_url` here is `str(up["path"])`,
+        # an ABSOLUTE LOCAL PATH under `local_urls`' relaxation, and a real
+        # tmp_path has far more than two segments to pop through before the
+        # climb runs out.
+        "submodule.vendor/libdep.url", "../" * 50 + "x.git", cwd=up["path"])
+    _sh("git", "add", "-A", cwd=up["path"])
+    _sh("git", "-c", "user.email=t@t.test", "-c", "user.name=t",
+        "commit", "-q", "-m", "climbs past the host", cwd=up["path"])
+    base = _sh("git", "rev-parse", "HEAD", cwd=up["path"])
+    task = _sub_task(tmp_path, {**up, "base": base})
+    mirror = tasks.ensure_mirror(str(up["path"]), base, tmp_path / "cache")
+
+    with pytest.raises(TaskError, match="climbs above"):
+        tasks.derive_submodules(task, mirror)
+
+
+def test_a_declared_unneeded_submodule_is_never_resolved(
+        tmp_path, upstream_submodule, local_urls):
+    up = _relative_url_fixture(upstream_submodule)
+    _sh("git", "config", "-f", ".gitmodules",
+        # 50 pops -- comfortably more than any pytest tmp_path is deep --
+        # rather than the table's 3: `repo_url` here is `str(up["path"])`,
+        # an ABSOLUTE LOCAL PATH under `local_urls`' relaxation, and a real
+        # tmp_path has far more than two segments to pop through before the
+        # climb runs out.
+        "submodule.vendor/libdep.url", "../" * 50 + "x.git", cwd=up["path"])
+    _sh("git", "add", "-A", cwd=up["path"])
+    _sh("git", "-c", "user.email=t@t.test", "-c", "user.name=t",
+        "commit", "-q", "-m", "unresolvable, but declared unneeded",
+        cwd=up["path"])
+    base = _sh("git", "rev-parse", "HEAD", cwd=up["path"])
+    task = _sub_task(tmp_path, {**up, "base": base},
+                     extra_yaml='submodules_unneeded: ["vendor/libdep"]')
+    mirror = tasks.ensure_mirror(str(up["path"]), base, tmp_path / "cache")
+
+    (sub,) = tasks.derive_submodules(task, mirror)
+
+    assert sub.declared_unneeded is True
+    assert sub.url_resolved is None
+    assert sub.url_declared == "../" * 50 + "x.git"
+
+
+def test_no_mirror_is_keyed_on_the_raw_relative_url(
+        tmp_path, upstream_submodule, local_urls):
+    up = _relative_url_fixture(upstream_submodule)
+    task = _sub_task(tmp_path, up)
+    cache = tmp_path / "cache"
+
+    materialize(task, tmp_path / "run", cache)
+
+    (sub,) = tasks.derive_submodules(
+        task, tasks.ensure_mirror(str(up["path"]), up["base"], cache))
+    assert tasks.pruned_mirror_path(sub.url_resolved, sub.sha, cache).exists()
+    # The raw url would slug to a DIFFERENT path (`pruned_mirror_path` keys
+    # on the string it is given) -- no directory exists under that key,
+    # because nothing was ever built or fetched against it.
+    assert not tasks.pruned_mirror_path(
+        sub.url_declared, sub.sha, cache).exists()
+
+
+def test_the_run_tree_persists_the_resolved_url(
+        tmp_path, upstream_submodule, local_urls):
+    up = _relative_url_fixture(upstream_submodule)
+    task = _sub_task(tmp_path, up)
+    dest = tmp_path / "run"
+    cache = tmp_path / "cache"
+
+    materialize(task, dest, cache)
+
+    (sub,) = tasks.derive_submodules(
+        task, tasks.ensure_mirror(str(up["path"]), up["base"], cache))
+    persisted = _sh("git", "config", "--get", "submodule.vendor/libdep.url",
+                    cwd=dest)
+    assert persisted == sub.url_resolved
+    # N5's property: the tracked blob is never rewritten.
+    blob = _sh("git", "show", "HEAD:.gitmodules", cwd=dest)
+    assert "../libdep" in blob
+
+
+def test_the_submodule_is_at_its_gitlink_after_a_relative_url_materialization(
+        tmp_path, upstream_submodule, local_urls):
+    up = _relative_url_fixture(upstream_submodule)
+    task = _sub_task(tmp_path, up)
+    dest = tmp_path / "run"
+
+    materialize(task, dest, tmp_path / "cache")
+
+    head = _sh("git", "rev-parse", "HEAD", cwd=dest / "vendor" / "libdep")
+    assert head == up["pinned"]
+    # NOT `_sh`, which strips: the leading character is the whole assertion
+    # (M1b) -- a leading space means initialised, `-` uninitialised.
+    status = subprocess.run(["git", "submodule", "status"], cwd=dest,
+                            check=True, capture_output=True, text=True).stdout
+    assert status.startswith(" ")
+
+
+def test_start_sha_does_not_move_when_a_relative_url_is_resolved(
+        tmp_path, upstream_submodule, local_urls):
+    """D9: `_init_submodules` -- where the resolved url is built and
+    persisted -- runs AFTER `start_sha` is computed and pinned, so nothing
+    about resolving a relative url can feed back into it. Pinned by
+    determinism rather than by a cross-fixture comparison (the two fixtures'
+    `.gitmodules` blobs differ in content, so their commit shas differ too,
+    which any such comparison would conflate with a real regression here):
+    two independent materializations of the SAME relative-url task, into
+    fresh trees and caches, return the identical `start_sha` -- the "pure
+    function of the manifest" property CLAUDE.md states for it."""
+    up = _relative_url_fixture(upstream_submodule)
+    task = _sub_task(tmp_path, up)
+
+    first = materialize(task, tmp_path / "ra", tmp_path / "ca")
+    second = materialize(task, tmp_path / "rb", tmp_path / "cb")
+
+    assert first == second
+
+
+def test_the_image_context_uses_the_resolved_url(
+        tmp_path, upstream_submodule, local_urls):
+    from bakeoff import images
+
+    up = _relative_url_fixture(upstream_submodule)
+    task = _sub_task(tmp_path, up)
+    repo_dir = tmp_path / "context" / "repo"
+    (repo_dir / "vendor" / "libdep").mkdir(parents=True)
+
+    images._extract_submodules(task, repo_dir, tmp_path / "cache")
+
+    assert (repo_dir / "vendor" / "libdep" / "libdep"
+            / "__init__.py").read_text() == SUB_LIB
 
 
 # --- tests.framework ----------------------------------------------------------

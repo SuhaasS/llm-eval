@@ -765,10 +765,20 @@ rather than by reasoning:
     --porcelain` reports the tree as clean throughout. The reverse — a stanza
     naming no gitlink — is inert and is recorded rather than refused (last
     bullet).
-  - The url must be `https://`. Relative (`../x.git`), `ssh://`, `git@…` and
-    `file://` are refused; a repository whose `.gitmodules` uses a relative
-    url is currently out, and that is a deferral rather than a judgement
-    (`TASKS.md`).
+  - **The url must resolve to `https://`.** A relative url (`../x.git`,
+    `./x.git`) is resolved against `repo.url` by the same segment arithmetic
+    git uses against `remote.origin.url` — `../` pops one path segment,
+    `./` pops none, a trailing `.git` on `repo.url` is simply part of the
+    segment that gets popped, and a trailing slash on `repo.url` is absorbed.
+    What is refused is a chain that climbs above `repo.url`'s path (git would
+    eat the host and hand back `https://sub.git` at exit 0), a `repo.url` with
+    no path, a query or fragment on either url, an scp-style or relative
+    `repo.url`, and a remainder that names a directory rather than a
+    repository. `ssh://`, `git@…`, `http://` and `file://` are refused as
+    before, and they are refused on the RESOLVED url, so a relative url under
+    an ssh `repo.url` is out for the same reason its parent is. A submodule
+    declared unneeded (the bullet below) is never resolved and no url of any
+    kind is judged for it.
   - Nested submodules are refused.
   - **`strip_paths` may not touch a submodule, from above or below.** Both
     `vendor/libdep` and `vendor` (with the gitlink at `vendor/libdep`) are
