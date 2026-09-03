@@ -2989,7 +2989,7 @@ def _init_submodules(task: TaskManifest, dest: Path,
         # ran: it is the one file the removal exists for, which is why a
         # config-only check placed after both sees nothing, and why the
         # removal is no longer allowed to fail quietly.
-        _git("reflog", "expire", "--expire=now", "--all", cwd=dest / sub.path)
+        _git("reflog", "expire", "--expire=now", "--all", cwd=checked)
 
         head = _git("rev-parse", "HEAD", cwd=checked, check=False)
         if head.returncode != 0 or head.stdout.strip() != sub.sha:
@@ -3081,8 +3081,14 @@ def _refuse_host_mirror_path(dest: Path, cache_root: Path, task_id: str) -> None
     the superproject's own copy by name, NOTHING checks
     `.git/modules/<name>/objects/info/alternates`. Measured cost: 0.005-0.013 s
     across the probe corpus against a `materialize` of 0.29-0.35 s.
+
+    The needle is `os.fsencode`d, not UTF-8-encoded: the bytes git itself
+    wrote into `.git/config` and the reflogs are the filesystem encoding, and
+    on a host where that is not UTF-8 a `.encode()` needle would disagree
+    with the file's bytes and report clean over a real leak -- the exact
+    silent false negative this function exists to remove.
     """
-    needle = str(Path(cache_root) / "repos").encode()
+    needle = os.fsencode(Path(cache_root) / "repos")
     base = Path(dest) / ".git"
 
     def _refuse_walk_error(exc: OSError) -> None:

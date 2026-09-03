@@ -3151,6 +3151,8 @@ def test_a_submodule_remote_git_did_not_name_origin_is_still_removed(
     monkeypatch.setenv("GIT_CONFIG_VALUE_0", "upstream")
     up = upstream_submodule
 
+    assert _sh("git", "config", "--get", "clone.defaultRemoteName",
+               cwd=tmp_path) == "upstream"
     _, run, _ = _materialize_sub(tmp_path, up)
 
     assert _sh("git", "-C", "vendor/libdep", "remote", cwd=run) == ""
@@ -4364,4 +4366,3 @@ def test_a_selected_id_no_directory_supplies_names_the_refused_manifests(
     assert "t-999" in message
     assert "DIRECTORY NAME only" in message
     assert str(root / "t-002") in message
-

@@ -4491,6 +4491,24 @@ and the superproject's own two guards ran before it was ever called.
   metadata.
 - The `clone.defaultRemoteName=upstream` real-task check (V10), detailed in
   deviation 3 above: clean materialize, zero leaks, `start_sha` unchanged.
+- `.venv/bin/python scripts/verify_logger.py` (V6) — **GATE PASSED**.
+- `.venv/bin/python -m pytest -v -m "integration and task_image"
+  tests/test_integration_submodules.py -k
+  "no_host_mirror_path_under_dot_git or skipped_reflog_expire_is_refused"
+  --basetemp="$HOME/.cache/bakeoff-pytest"` (V7) — **2 passed, 2 deselected**,
+  both new integration tests collected and green under both markers, closing
+  the gap the item's own report left (two new tests had shipped without ever
+  having been run).
+- `.venv/bin/python scripts/run_matrix.py --preflight-only` over
+  `bakeoff/taskset/` (V9) — `preflight PASS` on the one task in the taskset,
+  6.6s of bounded-run time; `PREFLIGHT_VERSION` does not move in this item, so
+  this is confirmation the cached verdict is genuinely undisturbed rather than
+  merely argued to be.
+- The chunked-read memory bound (V11), re-measured against a synthetic 60 MB
+  packfile: peak RSS delta ~2 MB, confirming `_refuse_host_mirror_path` does
+  not materialize the file whole (the code review's own measurement against
+  `pytest-10210`'s real 40.3 MB pack found chunked 28 MB peak RSS against
+  154 MB for the `read_bytes()` version it replaced).
 
 Everything else in the plan (D2's superproject symmetry, D3's chunked-read and
 `os.walk(onerror=)` reasoning, D5's naming, D6's widened test, D7's
