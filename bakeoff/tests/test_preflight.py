@@ -1008,11 +1008,13 @@ class _ScriptedContainer:
         #: gives for f2p's own selection -- so the deselect-branch's
         #: `-t`-absent-means-opening heuristic below would read every one of
         #: them as a continuation and serve `{"testResults": []}` for the
-        #: whole check. Recognised by MATCHING against the adapter's own
-        #: selected-branch groups, exactly as the f2p check and the scoped
-        #: check already are; `None` when `tests.p2p` is empty, since the
-        #: deselect branch is what runs then and this check must stay out of
-        #: its way.
+        #: whole check. Measured at 8912fb0: the first group also left
+        #: `p2p_runs` at 1, so the p2p-AFTER check resolved to the
+        #: `p2p_before` key -- a second mis-keying the same match closes.
+        #: Recognised by MATCHING against the adapter's own selected-branch
+        #: groups, exactly as the f2p check and the scoped check already
+        #: are; `None` when `tests.p2p` is empty, since the deselect branch
+        #: is what runs then and this check must stay out of its way.
         self._p2p_select_groups = None
         self._p2p_open = False
         #: The scoped check's own expected argv groups, memoized on first use
@@ -1034,6 +1036,14 @@ class _ScriptedContainer:
         self.f2p_after = f2p_after
         self.p2p_before = p2p_before
         self.p2p_runs = 0
+        #: Indexes a RUN on three shapes (pytest; the node deselect branch,
+        #: which appends only on its opening group) and a GROUP on the
+        #: fourth: the node selected branch (an explicit `tests.p2p`) appends
+        #: on every group of the check, since `_p2p_select_groups` matching
+        #: fires per group rather than per opening. The two existing
+        #: consumers index it as runs, and both are pytest tasks, so nothing
+        #: reads it wrong today -- stated here because the meaning is now
+        #: shape-dependent with nothing else saying so.
         self.p2p_argvs = []
         #: Fix 2's bare-runner probe. `None` -- the default -- answers the
         #: healthy exit 0, since the probe's argv (`--co` present) never
@@ -1288,10 +1298,11 @@ class _ScriptedContainer:
         continuation of whatever check happened to be open last (or, on a
         framework whose bare file filter happens to equal that same `paths`
         entry, as an unopened "scoped" check served an empty report instead
-        of its scripted one). The p2p checks are the one place the `-t`
-        heuristic still applies -- they always call `p2p_argvs` with
-        `scope=()`, which never omits group 0, so the heuristic's premise
-        holds there.
+        of its scripted one). The DESELECT-branch p2p checks are the one
+        place the `-t` heuristic still applies -- that branch's group 0
+        carries no `-t`, and `scope=()` never omits it. The SELECTED branch
+        (an explicit `tests.p2p`) has no such group, so it is matched
+        against `_p2p_select_groups` above.
         """
         from bakeoff.runners import for_framework
 

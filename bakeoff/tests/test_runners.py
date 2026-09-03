@@ -1015,7 +1015,9 @@ def test_the_explicit_branch_does_not_drop_every_group_when_every_selected_file_
     `_Runner.run` refuses, and `run_matrix.py` has no `except` around
     `preflight(...)` -- so an unconditional drop turns a per-task NO-GO into a
     `ValueError` that kills every remaining task's gate. The group is emitted,
-    and the run is left loud (KIND_NOTHING_RAN), instead."""
+    and the run is left loud (KIND_LOAD_ERROR -- a file in `ignored` is one
+    that failed to import, so re-collecting it yields a `testResults` entry
+    with an empty `assertionResults`), instead."""
     for framework in ("vitest", "jest"):
         groups = for_framework(framework).p2p_argvs(
             selected=("tests/f.test.js::red",), scope=(),

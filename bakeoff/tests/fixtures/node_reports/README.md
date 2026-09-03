@@ -113,9 +113,9 @@ text = text.replace("/work/node_modules", "/node_modules")
 json.dump(json.loads(text), out, indent=2, sort_keys=True)
 ```
 
-## Two argv facts measured beside these, which the adapter is built around
+## Four argv facts measured beside these, which the adapter is built around
 
-Neither produces a fixture; both are pinned by tests in `test_runners.py`.
+None produces a fixture; all four are pinned by tests in `test_runners.py`.
 
 1. **A second `-t` is not "last one wins".** `vitest run -t a -t b tests/pass.test.js`
    → `Error: Expected a single value for option "-t, --testNamePattern <pattern>",

@@ -4614,9 +4614,11 @@ a HARVESTING.md screened-corpus entry, because that instruction is for a
 DECLARED duplicate producing a NO-GO, which did not happen on either task.
 
 **Verification.**
-- `.venv/bin/python -m pytest tests/ -q` — **1762 passed, 69 deselected**
-  (baseline 1734/69 + 28: 19 in `test_runners.py` — eight new tests ×2
-  frameworks plus three unparametrized — and 9 in `test_preflight.py`).
+- `.venv/bin/python -m pytest tests/ -q` — **1762 passed, 70 deselected**
+  (baseline 1734/69 + 28 passed, +1 deselected: 19 in `test_runners.py` —
+  eight new tests ×2 frameworks plus three unparametrized — and 9 in
+  `test_preflight.py`, the +1 deselected coming from the new `integration`+
+  `task_image` test in `test_integration_node_task.py`).
 - `.venv/bin/python scripts/mutation_check.py`, solo — **200/200 caught**
   (198 baseline + 2: `runners: count two same-named tests in one file as one`
   and `preflight: accept a declared id that names two tests`). Tree byte-clean

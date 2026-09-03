@@ -369,7 +369,10 @@ class _NodeFlavour:
             # turning what used to be a per-task NO-GO into a `ValueError`
             # that `run_matrix.py` has no `except` around, killing every
             # remaining task's gate. Emit the groups anyway and let the run
-            # be loud (KIND_NOTHING_RAN) instead of the driver going quiet.
+            # be loud (KIND_LOAD_ERROR -- a file in `ignored` is one that
+            # failed to import, so re-collecting it yields a `testResults`
+            # entry with an empty `assertionResults`) instead of the driver
+            # going quiet.
             keep_any = any(path not in ignored for path, _ in pairs)
             groups = []
             for path, titles in pairs:
