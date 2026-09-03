@@ -1172,7 +1172,16 @@ class _ScriptedContainer:
             # by position -- the hypothesis one, the property-import one and
             # the seed-pin one. `-U` is on the pin probe's argv only, which is
             # what a test asserting "the pin scan was never asked" reads.
-            pattern = " ".join(cmd)
+            #
+            # Dispatched on the PATTERN ELEMENT alone (`cmd[cmd.index("--") -
+            # 1]`, `_rg_probe`'s own argv shape: `["rg", "-q", ["-U"]?,
+            # pattern, "--", *scanned]`), not on the whole joined argv (round
+            # 2 item 12's fix wave, non-blocking finding 7,
+            # impl-12-review.md, 2026-09-03): a joined string also matches
+            # against the SCANNED PATHS after `--`, so a swept file named
+            # e.g. `tests/configureGlobal.spec.ts` would have routed the
+            # import probe to the pin branch.
+            pattern = cmd[cmd.index("--") - 1]
             if "configureGlobal" in pattern:
                 if self.property_pin_rg_exit is not None:
                     return _Exec(exit_code=self.property_pin_rg_exit)
@@ -1334,6 +1343,18 @@ class _ScriptedContainer:
         from bakeoff.runners import for_framework
 
         adapter = for_framework(self.tests.framework)
+        # Round 2 item 12's fix wave (`_Runner.run` now emits
+        # `report_args` FIRST rather than last, 2026-09-03): every group's
+        # `rest` opens with the fixed 2-element report-args prefix, and the
+        # matching below is front-anchored against the adapter's OWN
+        # argv-building calls, which build no report args at all. Strip the
+        # known prefix once, here, rather than teaching every match below
+        # to skip it -- a mismatch is a real defect (report args changed
+        # shape, or a group somehow carries none), so this asserts loudly
+        # instead of silently matching the wrong check.
+        report_args = adapter.report_args(adapter.report_path())
+        assert rest[:len(report_args)] == report_args, (rest, report_args)
+        rest = rest[len(report_args):]
         select = adapter.select_argvs(tuple(self.tests.f2p))
         if self._scoped_groups is None:
             self._scoped_groups = adapter.p2p_argvs(
@@ -2578,10 +2599,27 @@ def test_the_preflight_version_moved_with_the_new_assertion():
     `PytestAdapter.property_scan` returns `None`. The three new evidence
     keys (`property_framework_imported_by_suite`,
     `property_framework_seed_pinned`, `property_scan_files`) are `None` on
-    every verdict this version writes where the node scan did not run."""
+    every verdict this version writes where the node scan did not run.
+
+    20 -> 21 is the round-2 item 12 fix wave's blocking finding 1
+    (impl-12-review.md, 2026-09-03): the 19->20 refusal's own worked remedy
+    -- add the framework's ignore flag to `tests.runner` -- did not clear
+    the gate. `_Runner.run` built every check's argv as `tests.runner +
+    <that check's own suffix>`, and a manifest-declared array-valued flag
+    (jest's `--testPathIgnorePatterns`) at the tail of `tests.runner`
+    swallowed the next bare token -- the f2p SELECT check's own file
+    positional and the scoped p2p run's own scope positional, both
+    measured turning into more ignore patterns instead of a selection.
+    Since 21 `_Runner.run` emits `adapter.report_args` FIRST rather than
+    last: both spellings open with a token starting with `-`, which ends a
+    yargs array, so a trailing manifest flag can now only ever swallow
+    report args this code does not read back. A cached PASS under 20 on a
+    node task whose `tests.runner` carries a trailing array-valued flag is
+    stale. No PYTEST verdict moves, since `PytestAdapter.report_args` is
+    `[]` and the reorder is inert on an empty list."""
     from bakeoff.preflight import PREFLIGHT_VERSION
 
-    assert PREFLIGHT_VERSION == "20"
+    assert PREFLIGHT_VERSION == "21"
 
 
 # --- fix 2: the bare-runner probe ---------------------------------------------
@@ -4309,6 +4347,23 @@ def test_a_swept_file_that_imports_fast_check_with_no_seed_pin_is_refused():
                for p in result.problems)
 
 
+def test_a_swept_path_the_tree_does_not_have_is_not_handed_to_rg():
+    """`_present(container, swept)` is what a mangled or absolute report
+    `name` reads as, since `_relpath` never raises. Round 2 item 12's fix
+    wave, non-blocking finding 4 (impl-12-review.md, 2026-09-03): before this
+    test, no property-scan test overrode `present=`, so every swept file was
+    always present by construction and a mutation to `_present(container,
+    swept)` returning `list(swept)` unfiltered went uncaught."""
+    container, task = _node_container(
+        p2p_before_files=("/repo/tests/properties.ts",),
+        property_imported=True,
+        present=("tests/", "tests/a.test.js", "tests/b.test.js"))
+
+    result = _preflight_over((container, task))
+
+    assert "/repo/tests/properties.ts" not in result.evidence["property_scan_files"]
+
+
 def test_the_scan_reads_the_p2p_before_runs_files_run_not_tests_paths():
     """The load-bearing scope decision (review 1). Measured on yaml-474: the
     p2p-before sweep loads 25 suites and 3,497 tests while `tests.paths` is
@@ -4538,6 +4593,34 @@ def test_a_problem_message_names_every_argv_group_that_ran():
 
     problem = next(p for p in result.problems if "the p2p run the GRADER" in p)
     assert problem.count("\n  timeout 600 ") == 2
+
+
+def test_no_suite_argv_lets_tests_runner_swallow_the_checks_own_positional():
+    """Measured 2026-09-03 in bakeoff-task-yaml-474-…:v1 (jest 30.5.0):
+    `--testPathIgnorePatterns=<p>` at the tail of tests.runner swallows the
+    next bare token -- 23 files listed against 1 -- and the `=` form is no
+    less greedy than the space form. HARVESTING.md's own worked remedy puts
+    that flag there, so the f2p SELECT check ran 23 suites with 3279 skipped
+    ("did not RUN"), the scoped run left tests.paths, and the p2p-before
+    sweep INVERTED to run only the f2p file. `--` is not the fix: after it
+    yargs stops parsing and `-t` becomes another OR'd path pattern (measured:
+    "Ran all test suites matching <path>|-t|<pattern>"). The report flag is
+    emitted FIRST so every group opens with a token starting with `-`, which
+    is what ends a yargs array -- the rule node_adapter.p2p_argvs already
+    applies to its own internally-built groups."""
+    container, task = _node_container(
+        framework="jest",
+        runner=("/node_modules/.bin/jest", "--config", "config/jest.config.js",
+                "--testPathIgnorePatterns=tests/properties\\.ts"))
+
+    _preflight_over((container, task))
+
+    suites = [cmd for cmd in container.commands
+              if cmd[:1] == ["timeout"] and "--co" not in cmd]
+    assert suites
+    for cmd in suites:
+        tail = cmd[2 + len(task.tests.runner):]
+        assert tail and tail[0].startswith("-"), cmd
 
 
 def test_running_no_argv_groups_raises_rather_than_running_the_bare_runner():

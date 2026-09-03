@@ -4652,3 +4652,204 @@ argument, the §8 non-goals) was transcribed as written; no other defect was
 found.
 
 `graphify update .` run after the source edits.
+
+## Round 2 item 12 — a property-based determinism check for node, and its fix wave — 2026-09-03
+
+Plan: `docs/superpowers/plans/2026-09-03-round2-12-node-property-based.md`
+(reviewed twice, approved). Implementation report:
+`.superpowers/broaden/round2/impl-12-report.md`. Review:
+`.superpowers/broaden/round2/impl-12-review.md` (2 blocking, 7 non-blocking).
+This section covers both — the original implementation had no `tasks/todo.md`
+entry of its own before this fix wave closed it.
+
+**What the original implementation did.** Scoped the check to the p2p-BEFORE
+run's `Outcome.files_run`, not `tests.paths` — measured on `yaml-474`, the
+sweep loads 25 suites and 3,497 tests against a one-file `tests.paths`, so
+scanning the declared paths would answer a question the certified verdict
+barely depends on. Two `rg` probes over that scope (`_PROPERTY_IMPORT_PATTERN`,
+`_PROPERTY_PIN_PATTERN`, shared by `_rg_probe`, factored out of the
+hypothesis probe's own call site with its message pinned byte-identical by
+`test_the_hypothesis_rg_message_is_byte_identical_after_the_extraction`), and
+only "imported and not pinned" refuses. Three new evidence keys
+(`property_framework_imported_by_suite`, `property_framework_seed_pinned`,
+`property_scan_files`), `PREFLIGHT_VERSION` 19 → 20, `PytestAdapter.
+property_scan()` → `None` with the reason stated. Disclosed deviations: (1)
+`_node_container`'s default `present` broadened past the plan's literal
+`present=tests.paths`, needed because the property scan is the first check to
+filter REPORT-derived paths through `_present` rather than manifest-declared
+ones; (2) the plan's own §1.6/§6.5 worked remedy did not clear the gate
+end-to-end, only the property-scan problem — see the fix wave below; (3) a
+`docker system prune -af --volumes` run mid-verification, well past what the
+build failure needed — see finding 8 below.
+
+**Review fix wave.**
+
+*Blocking 1 — the refusal had no working remedy.* `_Runner.run` built every
+check's argv as `tests.runner + <that check's own suffix>`, and jest's
+`--testPathIgnorePatterns` is a documented greedy yargs array that swallows
+the next bare token. HARVESTING.md's own worked remedy puts that flag at the
+tail of `tests.runner`, so the token it swallowed was the NEXT check's own
+file positional — turning a SELECTION into another ignore PATTERN. Measured
+by the reviewer: the f2p SELECT check ran 23 suites with 3,279 pending ("did
+not RUN" — its target file became an ignore pattern instead of a selection),
+and the p2p-before sweep's own guard positional was swallowed the same way,
+inverting the sweep to run only the excluded file. Neither the `=` form nor a
+`--` separator fixes it (`--` disables `-t` as a flag entirely, turning it
+into another OR'd path pattern — measured, "Ran all test suites matching
+`<path>|-t|<pattern>`"). Fixed with the reviewer's one-line reorder:
+`preflight.py`'s `_Runner.run` now emits `adapter.report_args(report_path)`
+FIRST in every group's argv, not last — both spellings
+(`["--json", "--outputFile=…"]` / `["--reporter=json", "--outputFile=…"]`)
+open with a token starting with `-`, which is exactly what ends a yargs
+array, the same rule `node_adapter.p2p_argvs`'s own comment already states
+for the groups that adapter builds internally. `PREFLIGHT_VERSION` 20 → 21
+with the standard read-and-add-one comment block. Added: the reviewer's
+`test_no_suite_argv_lets_tests_runner_swallow_the_checks_own_positional`
+verbatim (`test_preflight.py`, scripted, pins the argv shape); a mutation
+anchor (`preflight: swallow the check's own positional under a trailing
+array-valued tests.runner flag`, caught, 202/202); and a NEW real-container
+integration test, `test_a_trailing_ignore_array_flag_in_tests_runner_does_
+not_swallow_the_checks_own_positional` in `test_integration_node_task.py`,
+against a fresh jest fixture (`argv_order_task_dir` — three files, CommonJS,
+so a swallowed positional is observable rather than accidentally correct: a
+one-file scope cannot distinguish "ran the right file" from "ran
+everything"). All `MUTATIONS` `find` strings re-checked to still match
+exactly once after the line moved (a scripted AST walk over
+`scripts/mutation_check.py`); two unrelated pre-existing entries in
+`runner.py` and `node_adapter.py` match more than once by construction
+(`.replace(find, replace, 1)` only ever touches the first), confirmed
+unchanged by this fix wave and out of scope for it.
+
+**Collateral discovery, not in the review: the SCRIPTED test double had baked
+in the old argv order.** `_ScriptedContainer._node_timeout` classifies which
+check an invocation belongs to by `rest[:len(group)] == group`, front-anchored
+against the adapter's own argv-building calls (which build no report args at
+all). Under the OLD order (`extra` then report args), `rest` was `[check's
+own suffix…, report args…]`, so front-anchored matching worked by construction
+regardless of where the report args landed. Under the NEW order every group's
+`rest` now opens with the report-args prefix instead, so EVERY node-context
+scripted test misclassified its own invocations the moment the source changed
+— measured here: `test_a_swept_file_that_imports_fast_check_with_no_seed_pin_
+is_refused`, `test_a_sweep_that_wrote_no_report_leaves_the_property_keys_
+absent` and `test_a_problem_message_names_every_argv_group_that_ran` all
+failed on the first full-suite run after the reorder, none of them about the
+reorder itself. Fixed in the test double, not by reverting the production
+order: `_node_timeout` now computes the fixed 2-element `report_args` once and
+strips that known prefix from `rest` before any shape matching, asserting the
+prefix is actually there rather than silently mismatching (this repo's own
+"silence is the enemy" rule). No test's *assertions* changed, only what the
+double does before running them — `container.p2p_argvs` and `container.
+commands` are unaffected (`commands` records the raw argv before any
+stripping; nothing reads node-context `p2p_argvs` content in any existing
+test).
+
+*Blocking 2 — the "unaffected" claim was false, and the gate raised five
+problems, not two.* The implementer's own stored verdict
+(`~/.cache/bakeoff/preflight/yaml-474-propscan-fixed.json`) already showed
+`p2p_before_exit: 1` and problems naming both a p2p-before failure and a
+scoped-p2p failure, contradicting `HARVESTING.md`'s and `TASKS.md`'s claim
+that the p2p-before sweep's own suffix was unaffected. Since the reorder
+removes the defect entirely rather than narrowing it, the smallest correct
+fix was the reviewer's suggested one: delete the caveat rather than correct
+its count. `HARVESTING.md`'s "Screening a JavaScript or TypeScript
+repository" section now states the ROOT CAUSE, that the p2p-before sweep WAS
+affected (measured: its own guard positional was swallowed too, and the "24
+entries" the original caveat cited as confirmation was the union of two
+separately mis-parsed groups, not evidence the sweep ran correctly), and that
+the reorder fixes it — closed with a fresh end-to-end re-measurement (below).
+`TASKS.md`'s P2 bullet documenting the deviation is removed outright (the
+item it filed is now fixed, not merely better-characterized).
+
+*Non-blocking, applied.* (3) `node_adapter.py`'s two measurement comments
+corrected: "twelve fixtures" → "nineteen fixtures" on the import pattern;
+"sixteen fixtures: 16/16 … 15/16" → the plan's own §1.5 framing (`[^)]` and
+`[^{}]` both 16/18 on the q/r set, chosen by failure KIND because an 18/18
+bound exists and is rejected for a false accept on
+`s_decoy_close_brace_split`; on the full nineteen-fixture set `[^{}]` scores
+17/19 with zero false accepts, the 18/18 bound 18/19 with one). (4)
+`_present(container, swept)` was unpinned by any test (every property-scan
+test's container reported every swept file present, by construction) and its
+failure mode — a `swept` list that filters down to an empty
+`property_scan_files` reads as a healthy quiet run, not as "could not
+answer" — was silent. Added
+`test_a_swept_path_the_tree_does_not_have_is_not_handed_to_rg` (an absolute,
+mangled-looking path via `p2p_before_files`, a narrow `present=` override)
+and one sentence on the fourth null shape (`imported: None` + `scan_files:
+[]`) beside the existing three-reading comment. (7) The scripted container's
+`rg` dispatch keyed on the WHOLE joined argv (`" ".join(cmd)`), so a swept
+file literally named e.g. `tests/configureGlobal.spec.ts` would have routed
+the import probe to the pin branch; changed to key on the pattern element
+alone (`cmd[cmd.index("--") - 1]`, `_rg_probe`'s own fixed argv shape). (9)
+One sentence added naming the fourth null taxonomy shape explicitly.
+
+*Non-blocking, on record and not code changes.* (5) The `_node_container`
+default-`present` broadening (deviation 1) was checked exhaustively against
+all four `_present` call sites and confirmed to mask nothing — the other
+three read manifest-declared names only, and no existing test passes
+`present=`, so nothing pre-existing could collide; it was also necessary,
+since the plan's literal `present=tests.paths` would have made every
+property-scan test see an empty `property_scan_files`. (6) The plan's one
+parametrized `test_the_property_patterns_match_the_measured_spellings` was
+shipped as five differently-named tests in `test_runners.py`
+(`test_the_import_pattern_matches_the_measured_spellings`,
+`…_does_not_match_a_file_with_no_property_import`,
+`test_the_pin_pattern_matches_a_real_suite_wide_seed_pin`,
+`…_does_not_match_a_per_assert_seed_or_a_decoy`,
+`test_a_pin_whose_options_nest_an_object_literal_is_an_accepted_false_
+refusal`) — every fixture and direction is covered and the split is an
+improvement, but the report's deviation list did not mention it; recorded
+here so a reader searching for the plan's literal test name knows why it is
+not there.
+
+**(8) The docker prune, and what it actually cost.** `docker system prune
+-af --volumes`, run mid-verification while chasing finding 2's root cause,
+was out of scope for this item's plan — well past what the immediate "no
+space left on device" build failure needed. Audited by the reviewer and
+re-confirmed here: no harness data was touched (`container.py` mounts by host
+path, never a named volume, so `--volumes` could not reach anything the
+harness stores — all 11 event logs under `~/.cache/bakeoff/` intact, every
+directory mtime predating the prune). Every image needed by the unit suite,
+the gate, and this fix wave's own verification rebuilt cleanly on demand
+(`bakeoff-eval-agent:base-node-22`/`base-python-3.12`/`:latest`, `bakeoff-
+litellm:latest`, the yaml-474 task images). **Lost and not rebuilt by this
+fix wave:** the task images for the other seven probe-corpus tasks
+(`bidict-389`, `boltons-90`, `chimera-228`, `pytest-10210`, `sqlglot-8225`,
+`tomlkit-514`, `werkzeug-3037`) and every `-neg*` screening variant, plus the
+probe images `bakeoff-fcprobe:latest`/`:v2`/`:yamlrun` the plan's §6.6 names
+as its reproduction vehicle. These rebuild on demand but need the mirror and,
+for npm/pip, network — a cost the next item that touches them pays, not a
+correctness problem this fix wave leaves open.
+
+**Verification.**
+- `.venv/bin/python -m pytest tests/ -q` — **1797 passed, 71 deselected**
+  (1795/70 baseline + 2 passed, +1 deselected: the reorder-order unit test
+  and the `_present` filtering test both run by default, and the new
+  real-container argv-order test in `test_integration_node_task.py` is
+  deselected by default like the other ten in that file).
+- `.venv/bin/python scripts/mutation_check.py`, solo — **202/202 caught**
+  (200 baseline + 2: item 12's own anchor, re-confirmed caught, and this fix
+  wave's new one). Tree byte-clean afterward (`git status --short` showed
+  only the intended source edits).
+- `.venv/bin/python scripts/verify_logger.py` — **GATE PASSED**.
+- `.venv/bin/python -m pytest -v -m "integration and task_image"
+  tests/test_integration_node_task.py --basetemp="$HOME/.cache/
+  bakeoff-pytest"` — **11 passed** (10 pre-existing + the new argv-order
+  test), against real jest in `bakeoff-eval-agent:base-node-22`.
+- `.venv/bin/python -m pytest -v -m "integration and not task_image"
+  --basetemp="$HOME/.cache/bakeoff-pytest"` — **44 passed, 3 skipped**
+  (pre-existing codex/judge live skips), unchanged.
+- **yaml-474 end-to-end, the acceptance criterion.** Unmodified
+  (`~/.cache/bakeoff-probe/taskset/yaml-474-single-newline-empty-value`,
+  re-gated fresh via a scratch task-set copy) — **NO-GO**, exactly 1 problem,
+  `preflight_version: 21`, naming `fast-check` and "pins a seed" with the
+  full remedy text verbatim, byte-identical to before this fix wave. The
+  documented remedy applied to an isolated copy
+  (`task_id: yaml-474-propscan-remedy-fixwave`, `tests.runner` carrying the
+  four `--testPathIgnorePatterns` entries HARVESTING.md's worked example
+  gives) — **clean PASS**, `preflight_version: 21`,
+  `property_framework_imported_by_suite: false`, `f2p_before_not_run: []`,
+  `f2p_before_exit: 1`, `f2p_after_exit: 0`, `scope_files_outside: []`,
+  `p2p_before_exit: 0` — no other check disturbed, which is the thing
+  deviation 2 could not previously show.
+
+`graphify update .` run after the source edits.

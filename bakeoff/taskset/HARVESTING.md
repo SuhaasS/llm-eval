@@ -519,24 +519,28 @@ rules, not instead of them.
   `property_framework_imported_by_suite` goes to `false`, `tests/properties.ts`
   drops out of `property_scan_files`.
 
-  **But re-measured end-to-end against the full preflight gate (round-2 item
-  12, 2026-09-03), this exact `tests.runner` also breaks OTHER checks that
-  append their own positional after it.** With these four flags declared as
-  part of `tests.runner`, the f2p SELECT check gets `-t` matching nothing
-  (exit 0, "did not RUN") and the SCOPED p2p check runs 23 files outside
-  `tests.paths` — jest's `--testPathIgnorePatterns` is documented above as a
-  greedy yargs array that swallows a bare token immediately following it, and
-  `_Runner.run` builds every check's argv as `tests.runner + <the adapter's
-  own suffix>`, so a manifest-declared ignore flag at the tail of
-  `tests.runner` sits directly in front of whatever THAT check appends. The
-  p2p-before sweep's own suffix is unaffected (confirmed: `property_scan_files`
-  still comes back with the expected 24 entries) — only the checks whose
-  suffix opens with a bare file positional break. So this exact remedy, as
-  written above, does **not** clear the whole gate to GO on
-  `yaml-474-single-newline-empty-value`; it clears only the property-scan
-  problem, and introduces new ones. Filed in `TASKS.md`; not fixed here, and
-  the code under test (the property scan itself) is unaffected — its own
-  evidence is correct on this exact run.
+  **A trailing array-valued flag in `tests.runner` is safe.** It was not,
+  briefly: re-measured end-to-end against the full preflight gate on
+  2026-09-03, this exact `tests.runner` cleared the property-scan refusal but
+  broke FOUR other checks (f2p-before SELECT, the p2p-BEFORE sweep itself,
+  f2p-after SELECT, and the SCOPED p2p run), producing five problems total —
+  not the two originally filed here. Root cause: `_Runner.run` built every
+  check's argv as `tests.runner + <that check's own suffix>`, and jest's
+  `--testPathIgnorePatterns` is a greedy yargs array that swallows the next
+  bare token — which is a check's own file positional when that positional
+  comes right after `tests.runner`'s trailing flag. The p2p-before sweep's
+  own suffix was NOT unaffected, contrary to what this section first claimed:
+  under the broken order its guard positional was swallowed too, inverting
+  the sweep to run only the excluded file — `property_scan_files` still came
+  back with 24 entries because that number is the union of two separately
+  mis-parsed groups, not evidence the sweep ran correctly. Fixed in round-2
+  item 12's fix wave (`PREFLIGHT_VERSION` 20 → 21): `_Runner.run` now emits
+  the report flags FIRST in every group's argv, which always open with a
+  token starting with `-` and so always end a yargs array — the same
+  correctness rule `node_adapter.p2p_argvs`'s own comment states for the
+  groups that adapter builds internally. Re-verified end-to-end after the fix
+  against an isolated copy of `yaml-474-single-newline-empty-value` with
+  exactly this `tests.runner`: clean **PASS**, no other check disturbed.
 
   vitest's analogue is `--exclude`, and it is **unmeasured** — no vitest
   property task has been cut yet — so a harvester cutting the first one must

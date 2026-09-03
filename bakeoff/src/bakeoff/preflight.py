@@ -301,7 +301,34 @@ _PYTEST_ADAPTER = for_framework("pytest")
 #: every verdict this version writes where the node scan did not run --
 #: the pre-container early return, a pytest task, or a node run whose
 #: p2p-before sweep wrote no report.
-PREFLIGHT_VERSION: str = "20"
+#:
+#: 20 -> 21: `_Runner.run`'s round-2 item 12 fix wave (impl-12-review.md
+#: finding 1, 2026-09-03). The refusal 19->20 added tells an author to add
+#: the framework's ignore flag to `tests.runner` -- and that remedy did not
+#: work: `_Runner.run` built every check's argv as `tests.runner + <that
+#: check's own suffix>`, so a manifest-declared array-valued flag (jest's
+#: `--testPathIgnorePatterns`, a greedy yargs array) at the tail of
+#: `tests.runner` swallowed the very next bare token -- which is the f2p
+#: SELECT check's own file positional and the scoped p2p run's own scope
+#: positional. Measured against `yaml-474-single-newline-empty-value` with
+#: HARVESTING.md's own worked remedy applied: the f2p SELECT check reported
+#: "did not RUN" (its target file became an ignore pattern instead of a
+#: selection) and the scoped p2p run left `tests.paths` and ran 23 files
+#: outside it. Since 21, `_Runner.run` emits `adapter.report_args` FIRST in
+#: every group's argv rather than last -- both spellings
+#: (`["--json", "--outputFile=…"]` / `["--reporter=json",
+#: "--outputFile=…"]`) open with a token starting with `-`, which is what
+#: ends a yargs array, so a trailing manifest flag can now only ever
+#: swallow report args this code does not read back. A cached PASS under 20
+#: on a node task whose `tests.runner` carries a trailing array-valued flag
+#: is stale: it was taken by a gate whose SELECT and scoped-p2p checks
+#: silently ran the wrong files. A cached NO-GO is unaffected -- nothing
+#: this version adds turns a NO-GO into a GO -- and no PYTEST verdict moves
+#: at all, since `PytestAdapter.report_args` is `[]` and this reorder is
+#: behaviourally inert on an empty list. No evidence key is added or
+#: removed; what moves is which argv every existing key was measured
+#: against.
+PREFLIGHT_VERSION: str = "21"
 
 
 def preflight_cache_key(task, image: str, start_sha: str) -> str:
@@ -1201,7 +1228,31 @@ class _Runner:
                 # fixed name safe. Per GROUP, not per check: group 1 must not
                 # inherit group 0's report either.
                 self.container.exec(["rm", "-f", report_path])
-                extra = [*extra, *self.adapter.report_args(report_path)]
+                # FIRST, not last (round 2 item 12's fix wave, 2026-09-03,
+                # impl-12-review.md finding 1). `self.runner` is
+                # manifest-declared and may end in a trailing array-valued
+                # flag -- jest's `--testPathIgnorePatterns` is a documented
+                # greedy yargs array that swallows the next bare token, and
+                # HARVESTING.md's own worked remedy puts one there. Measured:
+                # with the report args LAST, that bare token was `extra`'s own
+                # leading file positional, so the check's own selection became
+                # another ignore pattern instead -- the f2p SELECT check ran
+                # 23 files with the target excluded ("did not RUN", 3279
+                # pending) and the scoped p2p run left `tests.paths` outright.
+                # `report_args` -- `["--json", "--outputFile=…"]` (jest) /
+                # `["--reporter=json", "--outputFile=…"]` (vitest) -- always
+                # opens with a token starting with `-`, which is exactly what
+                # ends a yargs array; that is the same correctness rule
+                # `node_adapter.p2p_argvs`'s own comment already states for
+                # the groups THAT adapter builds internally. Emitting it first
+                # means every group's argv opens with `-`, so a manifest's
+                # trailing array flag can only ever swallow report args this
+                # code does not need back -- never the check's own suffix.
+                # `--` was measured and rejected: after it yargs stops
+                # parsing, so a group's own `-t` becomes another OR'd path
+                # pattern instead of a name filter (measured: "Ran all test
+                # suites matching <path>|-t|<pattern>").
+                extra = [*self.adapter.report_args(report_path), *extra]
             argv = ["timeout", str(self.timeout_s), *self.runner, *extra]
             self.last_argvs.append(argv)
             results.append(self.container.exec(argv))
@@ -2391,6 +2442,13 @@ def preflight(
         # `_present` even though the runner just loaded these files: `_relpath`
         # never raises, so a mangled or absolute report `name` would make rg
         # exit 2, which must read as "could not answer" and not as "no match".
+        # A FOURTH null shape lives here too, beside the two above:
+        # `property_framework_imported_by_suite: None` with
+        # `property_scan_files: []` is "the sweep ran and reported files, but
+        # every one of them was filtered out here as not present on disk" --
+        # distinguishable from the other two `None`s by the empty list rather
+        # than `null`, so the taxonomy is satisfied; it is easy to miss
+        # because nothing else about this run reads as unhealthy.
         #
         # TWO probes, for the pytest block's reason: the first asks whether the
         # sweep ran a property suite, the second whether it is pinned, and only

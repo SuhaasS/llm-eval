@@ -1327,43 +1327,6 @@ judge runs after one — which is why they sit here rather than above.
   fix, deliberately not built here: a manifest key nominating extra files for
   the pin scan to read regardless of what the sweep loaded.
 
-- [ ] **The property-scan's own worked remedy (round 2 item 12, §1.6/§6.5)
-  clears the property-scan refusal and breaks two OTHER preflight checks on
-  the same task.** Re-measured 2026-09-03 end-to-end (the plan's own §1.6
-  measured only the isolated p2p-before sweep invocation, not the full
-  gate): declaring `tests.runner` as `["/node_modules/.bin/jest", "--config",
-  "config/jest.config.js", "--testPathIgnorePatterns=/node_modules/",
-  "--testPathIgnorePatterns=tests/_utils",
-  "--testPathIgnorePatterns=tests/json-test-suite/",
-  "--testPathIgnorePatterns=tests/properties\\.ts"]` on
-  `yaml-474-single-newline-empty-value` does clear the property-scan problem
-  exactly as the plan claims (`property_framework_imported_by_suite: false`,
-  `tests/properties.ts` absent from `property_scan_files`, confirmed via
-  `run_matrix.py --preflight-only --force-preflight`) — but the gate still
-  NO-GOes, on two NEW reasons: the f2p SELECT check reports "these declared
-  f2p tests did not RUN at the start state" (exit 0, "Test Suites: 23
-  skipped, 0 of 23 total"), and the SCOPED p2p check reports 23 files outside
-  `tests.paths`. `_Runner.run` builds every check's argv as `tests.runner +
-  <that check's own suffix>`, and jest's `--testPathIgnorePatterns` is a
-  documented greedy yargs array that swallows a bare token immediately
-  following it (HARVESTING.md's rg-exit bullet and the runner comment in
-  `node_adapter.p2p_argvs` both already name this for the adapter's OWN
-  internally-built groups, which order scope before flags for exactly this
-  reason) — a manifest-declared ignore flag at the tail of `tests.runner` has
-  no such protection, and select_argvs'/the scoped run's suffix both open
-  with a bare file positional. The p2p-before sweep's own suffix is
-  unaffected by the same tests.runner (confirmed: `property_scan_files` comes
-  back with the expected 24 entries), so this is not a uniform "any trailing
-  array flag breaks everything" defect — only checks whose suffix opens with
-  a bare positional are hit, and the exact boundary was not fully
-  characterized before filing this. `HARVESTING.md`'s remedy section carries
-  a caveat pointing here. Candidate fix: change `node_adapter.select_argvs`
-  and the scoped-run call site to put a `--` separator or reorder so a
-  manifest-declared trailing flag cannot swallow the adapter's own suffix --
-  unmeasured whether `--` preserves `-t`'s meaning (a quick check during this
-  filing showed `--` also disables `-t` as a flag, turning it into another
-  OR'd testPathPattern, so the fix is not that one line either).
-
 - [ ] **A node check is several commands and the record does not say how
   many.** Since round 2 item 1 a node p2p deselect run is 1 + K invocations
   (K = files holding a deselection) and a node selection is one per file, each

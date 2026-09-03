@@ -206,7 +206,7 @@ def verify_selected(report: dict | None, requested: tuple[str, ...],
 #: forms. The quoted specifier is the one shape all of them share.
 #:
 #: Measured 2026-09-02 against ripgrep 13.0.0 in bakeoff-eval-agent:base-node-22
-#: over twelve fixtures: all seven import spellings match, a file importing
+#: over nineteen fixtures: all seven import spellings match, a file importing
 #: only `yaml` does not. `@fast-check/<pkg>` covers the official vitest and
 #: jest integrations, which re-export fast-check and share its seed.
 _PROPERTY_IMPORT_PATTERN = (
@@ -226,8 +226,16 @@ _PROPERTY_IMPORT_PATTERN = (
 #: deterministic is the cost. `[^{}]` matches that one and still refuses the
 #: case the bound exists for: an unseeded `configureGlobal({ numRuns: 500 })`
 #: in the same file as a per-assert `fc.assert(..., { seed: 7 })`, because the
-#: text between them contains a `{`. Measured 2026-09-02 over sixteen fixtures:
-#: 16/16 for `[^{}]`, 15/16 for `[^)]`.
+#: text between them contains a `{`. Measured 2026-09-02: `[^)]` and `[^{}]`
+#: both score 16/18 on the q/r fixture set, each missing a different real
+#: pin -- which is why the bound is chosen by failure KIND rather than by
+#: score. An 18/18 bound (`(?:[^}]|\}[^)])*?`) was found and rejected: it
+#: silently false-accepts `s_decoy_close_brace_split` (a `configureGlobal({
+#: numRuns: 500 }\n);` whose closing brace and paren sit across a newline),
+#: which is a certified coin-flip -- the defect this item exists to close --
+#: while every miss `[^{}]` has is a false refusal the exclusion remedy
+#: clears. On the full nineteen-fixture set `[^{}]` scores 17/19 with ZERO
+#: false accepts; the 18/18 bound scores 18/19 with one.
 #:
 #: A per-call seed is deliberately not a pin: seeding one assertion is not a
 #: claim about the file. The residual miss is a pin whose options object

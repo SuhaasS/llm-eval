@@ -1845,6 +1845,25 @@ MUTATIONS = [
         "not integration",
     ),
     (
+        # Round 2 item 12's fix wave, blocking finding 1 (impl-12-review.md,
+        # 2026-09-03): with the report args LAST, a manifest-declared
+        # array-valued flag at the tail of `tests.runner` (jest's
+        # `--testPathIgnorePatterns`) swallows the next bare token -- the
+        # check's own file positional -- turning a SELECTION into another
+        # ignore PATTERN. Measured: the f2p SELECT check ran 23 suites with
+        # 3279 pending ("did not RUN") and the scoped p2p run left
+        # `tests.paths` outright. Reverting to `extra` first restores exactly
+        # that; every gated and every graded node argv moves with this line,
+        # since `grader.py` builds the same `_Runner`.
+        "preflight: swallow the check's own positional under a trailing "
+        "array-valued tests.runner flag",
+        "src/bakeoff/preflight.py",
+        "                extra = [*self.adapter.report_args(report_path), *extra]",
+        "                extra = [*extra, *self.adapter.report_args(report_path)]",
+        "tests/test_preflight.py -k swallow_the_checks_own_positional",
+        "not integration",
+    ),
+    (
         # Fix 2's whole point: bidict-389's GATED runner passes by bypassing
         # its own pyproject.toml addopts (--override-ini=addopts=) while the
         # bare command an agent types exits 4 from turn one. Reverting this

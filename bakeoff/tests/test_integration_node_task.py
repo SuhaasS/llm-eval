@@ -402,6 +402,144 @@ def test_a_same_file_duplicate_of_the_f2p_title_is_refused(
         "tests/calc.test.js::adds two numbers": 2}
 
 
+#: Round 2 item 12's fix wave (impl-12-review.md, 2026-09-03): jest rather
+#: than vitest -- the defect is jest's `--testPathIgnorePatterns`, a
+#: documented greedy yargs array, and vitest's `--exclude` (cac) never had
+#: it. A trailing entry that matches nothing real, so the manifest is
+#: otherwise ordinary; what is under test is the ARGV ORDER, not the flag's
+#: own effect.
+_ARGV_ORDER_RUNNER = (
+    '["/node_modules/.bin/jest", '
+    '"--testPathIgnorePatterns=nothing-matches-this-pattern-at-all"]'
+)
+
+#: CommonJS, not ESM: `require`/`module.exports`, resolved the ordinary way
+#: once this fixture's own `package.json` carries no `"type": "module"` --
+#: unlike `fixtures/node_task/package.json`, which is vitest's and ESM. jest
+#: reads ESM `import`/`export` under this base image only through a
+#: transform this fixture declares no `image.build` for, so CommonJS is what
+#: keeps the manifest dependency-free like the vitest fixture above.
+_ARGV_ORDER_REFERENCE = """diff --git a/tests/calc.test.js b/tests/calc.test.js
+--- a/tests/calc.test.js
++++ b/tests/calc.test.js
+@@ -1,2 +1,3 @@
+ const { add } = require('../src/calc.js');
++test('adds two numbers', () => { expect(add(2, 3)).toBe(5); });
+ test('keeps subtracting elsewhere', () => { expect(3 - 1).toBe(2); });
+diff --git a/src/calc.js b/src/calc.js
+--- a/src/calc.js
++++ b/src/calc.js
+@@ -1,2 +1,2 @@
+-function add(a, b) { return a - b; }
++function add(a, b) { return a + b; }
+ module.exports = { add };
+"""
+
+
+def _argv_order_manifest(upstream: Path, base: str) -> str:
+    """Same shape as `_manifest` above, with `tests.runner` carrying a
+    trailing array-valued ignore flag -- the manifest lever
+    `preflight.py`'s refusal message tells an author to add. No
+    `image.build`: jest resolves from `/node_modules` the same way vitest
+    does."""
+    return (
+        "task_id: node-smoke-argv-order\n"
+        "task_version: 1\n"
+        "repo:\n"
+        f"  url: {upstream}\n"
+        f"  base_sha: {base}\n"
+        "prompt: |\n"
+        "  fix add()\n"
+        "tests:\n"
+        "  framework: jest\n"
+        '  paths: ["tests/"]\n'
+        f"  runner: {_ARGV_ORDER_RUNNER}\n"
+        '  f2p: ["tests/calc.test.js::adds two numbers"]\n'
+        "image:\n"
+        '  node: "22"\n'
+    )
+
+
+@pytest.fixture(scope="module")
+def argv_order_task_dir(tmp_path_factory):
+    """A THIRD node fixture, jest rather than vitest, three test files rather
+    than one.
+
+    Three files -- `calc.test.js`, `other1.test.js`, `other2.test.js` -- so a
+    swallowed positional is observable rather than accidentally correct: a
+    scope of one file cannot distinguish "ran the right file" from "ran
+    everything", which is exactly the gap deviation 2 of the original
+    implementation report left (its own re-measurement used the real
+    `yaml-474` task and never built a fixture that isolates this from that
+    task's other 24 files).
+    """
+    root = tmp_path_factory.mktemp("node-task-argv-order")
+    upstream = root / "upstream"
+    (upstream / "src").mkdir(parents=True)
+    (upstream / "tests").mkdir()
+    (upstream / "package.json").write_text(
+        '{"name":"bakeoff-node-fixture-argv-order","private":true}\n')
+    (upstream / ".gitignore").write_text("node_modules/\n")
+    (upstream / "src" / "calc.js").write_text(
+        "function add(a, b) { return a - b; }\n"
+        "module.exports = { add };\n")
+    (upstream / "tests" / "calc.test.js").write_text(
+        "const { add } = require('../src/calc.js');\n"
+        "test('keeps subtracting elsewhere', () => { expect(3 - 1).toBe(2); });\n")
+    (upstream / "tests" / "other1.test.js").write_text(
+        "test('other one passes', () => { expect(1).toBe(1); });\n")
+    (upstream / "tests" / "other2.test.js").write_text(
+        "test('other two passes', () => { expect(2).toBe(2); });\n")
+    for args in (["init", "-q"], ["config", "user.email", "t@t.test"],
+                 ["config", "user.name", "t"], ["add", "-A"],
+                 ["commit", "-q", "-m", "base"]):
+        subprocess.run(["git", *args], cwd=upstream, check=True,
+                       capture_output=True)
+    base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=upstream,
+                          check=True, capture_output=True,
+                          text=True).stdout.strip()
+
+    task_dir = root / "task"
+    task_dir.mkdir()
+    (task_dir / "reference.diff").write_text(_ARGV_ORDER_REFERENCE)
+    (task_dir / "task.yaml").write_text(_argv_order_manifest(upstream, base))
+    return task_dir
+
+
+def test_a_trailing_ignore_array_flag_in_tests_runner_does_not_swallow_the_checks_own_positional(
+    argv_order_task_dir
+):
+    """The remedy `preflight.py`'s refusal message tells an author to apply
+    -- add the framework's ignore flag to `tests.runner` -- reproduced end to
+    end in the real image, real jest. Before round 2 item 12's fix wave,
+    `--testPathIgnorePatterns=...` at the tail of `tests.runner` ate the f2p
+    SELECT check's own file positional: the token meant to SELECT
+    `tests/calc.test.js` became another ignore PATTERN instead, so the file
+    was excluded from its own check and the f2p test never ran anywhere
+    (impl-12-review.md finding 1, "did not RUN", measured as 23 skipped on
+    the real `yaml-474` task this fixture scales down from). Emitting the
+    report flags before `extra` (`_Runner.run`) fixes it: every group's argv
+    opens with a token starting with `-`, which is what ends jest's yargs
+    array, so the check's own positional survives -- and the gate GOes.
+    """
+    base = build_base_image(REPO_ROOT, "node", "22")
+    task = load_task(argv_order_task_dir)
+    image = build_task_image(task, base, CACHE_ROOT / "build-argv-order",
+                             CACHE_ROOT)
+    tree = fresh_tree(CACHE_ROOT / "tree")
+    try:
+        start_sha = materialize(task, tree / "repo", CACHE_ROOT)
+
+        result = preflight(task, image=image, repo_path=tree / "repo",
+                           start_sha=start_sha)
+
+        assert result.ok, result.problems
+        assert result.evidence["f2p_before_not_run"] == []
+        assert result.evidence["f2p_after_exit"] == 0
+    finally:
+        shutil.rmtree(tree, ignore_errors=True)
+
+
 @contextlib.contextmanager
 def _mounted(image: str, repo: Path, start_sha: str):
     """A `RunContainer` whose bind mount is PROVEN to have landed.
