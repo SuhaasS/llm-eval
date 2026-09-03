@@ -45,7 +45,12 @@ from bakeoff.runners import (
     for_framework,
 )
 from bakeoff.runners.node_adapter import verify_selected
-from bakeoff.tasks import _DEFAULT_PYTHON, _under, task_runtime
+from bakeoff.tasks import (
+    _DEFAULT_PYTHON,
+    _GRADING_KEYS,
+    _under,
+    task_runtime,
+)
 
 # Re-exported, not re-defined. These moved to `bakeoff.runners.pytest_adapter`
 # when the exit-code judgement became per-framework (broadening 7), and they
@@ -224,7 +229,23 @@ _PYTEST_ADAPTER = for_framework("pytest")
 #: refusal: a manifest could have carried `submodules_unneeded` before this
 #: code shipped, been gated at 15 (which ignored it and NO-GOed on `stale`),
 #: and that stale NO-GO would otherwise be served forever.
-PREFLIGHT_VERSION: str = "16"
+#: 16 -> 17: one evidence schema (round 2 item 5, 2026-09-03). A 16 verdict is
+#: missing every key measured inside the container -- from `uid` and `head`
+#: through `suite_timeout_s`, the strip's two keys and the three
+#: `grading_*_exit` -- because they were written where they were measured and
+#: are simply absent from any path that did not measure them. Twenty of the
+#: forty-two keys were in that family, and four of them (`grading_build_exit`,
+#: `grading_typecheck_exit`, `grading_lint_exit`, `scope_prefixes_absent`) are
+#: absent from the ordinary healthy GO verdict, which is the blob a task
+#: author reads most. Absent renders identically to "written by a gate too old
+#: to have this key", which is the one thing this version string exists to let
+#: a reader rule out. Since 17 every verdict carries every key, `None` where
+#: the gate did not look, and `early_return` names the pre-container refusal
+#: rather than leaving a reader to infer it from which nulls are present.
+#: NO VERDICT MOVES across this boundary: a cached 16 PASS was a PASS for the
+#: same reasons and a 16 NO-GO is still a NO-GO. What is re-run is the
+#: READING, not the judgement.
+PREFLIGHT_VERSION: str = "17"
 
 
 def preflight_cache_key(task, image: str, start_sha: str) -> str:
@@ -260,6 +281,100 @@ SCOPE_PREFIX_MISSING = "scope_prefix_missing"
 #: branches on the code rather than on a prose prefix: closed sets, not
 #: composite strings, applies to this repo's own dataclass first.
 SCOPE_COLLECTS_NOTHING = "scope_collects_nothing"
+
+#: Why the gate returned before starting a container, or `None` because it did
+#: not. The set is {EARLY_RETURN_RUNNER_MISMATCH, None} and there is exactly
+#: one pre-container `return PreflightResult` to name; a second one adds a
+#: second constant HERE and extends `test_the_early_return_names_itself`. A
+#: closed code, like `problem_codes`' members and for the same reason:
+#: `problems` is prose for a human and nothing can machine-read it.
+#:
+#: It earns its place because under one schema "many nulls" stops being a
+#: proxy for "no container ran". A node task leaves `python_observed`, both
+#: `bare_runner_*` and both `hypothesis_*` null by design; an explicit-`p2p`
+#: task leaves the whole scoped block null; an ordinary GO leaves every
+#: `grading_*_exit` null. Four distinct null-sets, none of them this one, and
+#: reconstructing the route by intersecting them is exactly the inference
+#: `problem_codes` was added to stop.
+EARLY_RETURN_RUNNER_MISMATCH = "runner_does_not_match_framework"
+
+#: Every key `preflight` can write, in the order it writes them. ONE list,
+#: filled from by the early return and by the full path alike, because the
+#: alternative has already failed twice inside this file: `PREFLIGHT_VERSION`
+#: 11 moved three keys from `[]` to `None`, and the `bare_runner_skipped` note
+#: in the early-return block records a fourth "left out of this seed once" --
+#: each found by review rather than by a test. A key written where it is
+#: measured is ABSENT from every path that does not measure it, and absent
+#: renders identically to "written by a gate too old to have this key", which
+#: is the one thing `PREFLIGHT_VERSION` exists to let a reader rule out. Two
+#: absences that render identically are the same defect one layer down.
+#:
+#: `test_evidence_keys_lists_exactly_what_preflight_writes` derives this set
+#: from the source by an AST walk and is what keeps it from going stale the
+#: next time an item adds a key -- the plan that introduced this constant was
+#: itself two keys short against its own round's landing order, and only the
+#: derivation caught it.
+#:
+#: The grading keys come off `tasks._GRADING_KEYS` rather than being restated,
+#: for the reason `_declared_grading` gives: a hand-listed copy goes stale the
+#: first time a check is added to `TaskGrading`, and that failure is the
+#: silent one.
+#:
+#: A tuple in the order the gate LOOKS, not a frozenset: `dict.fromkeys`
+#: preserves it, so `to_dict()` hands a reader the keys in the order a reader
+#: would walk the gate, and this constant reads as that walk. It does NOT
+#: survive to the stored artifact: `matrix.write_json`, which writes the blob,
+#: dumps with `sort_keys=True` (verified 2026-09-03 against the click-3360
+#: blob, which is alphabetical from `ambiguous_file_filters`), so the file a
+#: task author diffs is sorted whatever this order is. Every comparison against this tuple
+#: is on sets, so the order is presentation at both ends and nothing depends
+#: on it.
+EVIDENCE_KEYS: tuple[str, ...] = (
+    "early_return", "framework",
+    "image_env_declared", "image_env_observed", "image_env_mismatch",
+    "hypothesis_importable", "hypothesis_imported_by_suite",
+    "python_declared", "python_observed",
+    "submodules", "submodules_orphaned", "submodules_empty_after_suite",
+    "runner_cache_flags", "runner_cache_flags_missing",
+    "bare_runner_argv", "bare_runner_exit", "bare_runner_skipped",
+    "uid", "claude_version", "head",
+    "stripped_paths", "stripped_paths_present",
+    "suite_timeout_s",
+    "f2p_before_exit", "f2p_before_not_run",
+    "f2p_collection_errors", "f2p_red_kind",
+    "p2p_before_ignored", "p2p_before_exit",
+    "dirty_after_tests",
+    "f2p_after_exit", "p2p_after_exit",
+    *(f"grading_{key}_exit" for key in _GRADING_KEYS),
+    "scope_prefixes", "scope_prefixes_absent", "p2p_scoped_after_exit",
+    "duplicate_full_names", "scope_files_run", "scope_files_outside",
+    "ambiguous_file_filters",
+)
+
+
+def _evidence_seed() -> dict:
+    """The schema, with every key at "the gate did not look".
+
+    One rule, stated once: `None` is "the gate did not look", and every key
+    that means anything else overwrites it where it is measured.
+
+    Every key starts `None`, INCLUDING the ones given a real value in the next
+    few statements of `preflight` (`framework`, `image_env_declared`,
+    `python_declared`, and the two cache-flag keys). Do not hand-seed those
+    here: a seed carrying real values for some keys and `None` for the rest is
+    the two-family split rebuilt by hand, which is the thing this constant
+    replaced.
+
+    Not a sentinel string. Four of these keys are string-typed
+    (`dirty_after_tests`, `claude_version`, `f2p_red_kind`,
+    `bare_runner_skipped`), so a sentinel would be indistinguishable from a
+    measurement on exactly them. Not a `collections.defaultdict` either: that
+    hides the drift instead of failing it, and a key nothing ever touches
+    still does not appear in `to_dict()` -- which leaves the reader this
+    schema exists for exactly where they started.
+    """
+    return dict.fromkeys(EVIDENCE_KEYS)
+
 
 # Files that would give one task a different agent context from another, and
 # would do it invisibly: section 5.2 pins the session config precisely because
@@ -312,7 +427,10 @@ class PreflightResult:
     image: str
     manifest_digest: str
     problems: tuple[str, ...] = ()
-    evidence: dict = field(default_factory=dict)
+    #: The schema, never a subset of it. Defaulted to the seed rather than to
+    #: `{}` so a hand construction -- `grade.py`'s three, and any future one --
+    #: satisfies `__post_init__` without knowing the key set exists.
+    evidence: dict = field(default_factory=_evidence_seed)
     #: Which gate produced this verdict. A stored verdict outlives the code
     #: that wrote it, and every grade copies this as
     #: `graded_under_preflight_version` -- discrimination is preflight's
@@ -323,6 +441,51 @@ class PreflightResult:
     #: would have been the first, through a string-prefix match no test can
     #: really guard. Not every code is a problem -- see SCOPE_PREFIX_MISSING.
     problem_codes: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Refuse an evidence dict that is not the schema, in both directions.
+
+        Here rather than at the two `return` sites because it then covers both
+        of them and every future one with no call-site discipline -- and
+        call-site discipline is precisely what has already failed twice inside
+        this file (`PREFLIGHT_VERSION` 11's three keys, and the
+        `bare_runner_skipped` note's "left out of this seed once"). In a
+        function where a third `return` is cheap to add, that is stronger than
+        it looks.
+
+        A RAISE, where `_gitlink_paths` argues the opposite for its own
+        failure, and the difference is what causes it. That one guards against
+        a defect in the DATA -- an unreadable index in some task's tree -- which
+        an operator can hit and which must therefore reach the driver as a
+        NO-GO rather than as a traceback. This one can only be caused by an
+        edit to `preflight` itself: with the seed in place every key in
+        `evidence` is either seeded or an overwrite of a seeded key, and the
+        one input-dependent write (`grading_<key>_exit`) takes its names from
+        `dataclass_fields(task.grading)`, which `load_task`'s unknown-key
+        refusal closes and which raises `TypeError` inside `_declared_grading`
+        first for anything that is not a dataclass at all. No task input
+        reaches the key set, so a traceback in a developer's own run is the
+        right answer and cannot turn a task NO-GO into a crash.
+
+        `ValueError` and not a named exception: `TaskError`, `ContainerError`
+        and `UnknownModelError` all exist because something CATCHES them, and
+        nothing may catch this one -- a caught schema error is the drift being
+        read past again.
+        """
+        if set(self.evidence) != set(EVIDENCE_KEYS):
+            # Both directions are named because the remedies differ: a MISSING
+            # key means a path that builds the result by hand, an UNLISTED one
+            # means a write that was never added to the tuple.
+            raise ValueError(
+                "preflight evidence is not the schema: missing "
+                f"{sorted(set(EVIDENCE_KEYS) - set(self.evidence))}, unlisted "
+                f"{sorted(set(self.evidence) - set(EVIDENCE_KEYS))}. Every key "
+                "the gate can write is seeded from EVIDENCE_KEYS so that 'the "
+                "gate did not look' is a null and never an absent key; a key "
+                "written on one path and not another cannot be read across a "
+                "set of cached verdicts, which outlive the code that wrote "
+                "them."
+            )
 
     @property
     def ok(self) -> bool:
@@ -987,7 +1150,7 @@ def preflight(
     """
     problems: list[str] = []
     problem_codes: list[str] = []
-    evidence: dict = {}
+    evidence: dict = _evidence_seed()
     #: Every rootdir-relative file ANY node run in this gate loaded or
     #: executed. Accumulated at each classification site rather than read at
     #: the end, because `_Runner.last_report` is overwritten by the next `run`
@@ -1032,16 +1195,15 @@ def preflight(
     # False`, on every arm, permanently, over a number the model never saw.
     timeout_s = task.budget.suite_timeout_s
 
-    # Written BEFORE the guard below, because `image.env` is a property of the
-    # manifest and is knowable with no daemon. The other three keys stay None
-    # on this path: `observed: {}` and `mismatch: []` would be a CLAIM that
-    # the gate looked and agreed, from a gate that never started a container.
-    # Two absences that render identically are the same defect one layer down.
+    # Written BEFORE the guard below, because these two are properties of
+    # the MANIFEST and are knowable with no daemon: a task refused for a
+    # bad runner still records what it declared. Every OTHER key is
+    # already at `_evidence_seed()`'s `None` -- "the gate did not look" --
+    # and is overwritten where it is measured, so nothing here needs a
+    # hand-written seed and nothing may get one: `image_env_observed: {}`
+    # or `image_env_mismatch: []` on this path would be a CLAIM that the
+    # gate looked and agreed, from a gate that never started a container.
     evidence["image_env_declared"] = declared = _declared_env(task)
-    evidence["image_env_observed"] = None
-    evidence["image_env_mismatch"] = None
-    evidence["hypothesis_importable"] = None
-    evidence["hypothesis_imported_by_suite"] = None
     #: `None` on a node task, and that is the null rule rather than a
     #: convenience: `_declared_python` falls back to `_DEFAULT_PYTHON` when the
     #: key is absent, so a node manifest -- which `load_task` FORBIDS from
@@ -1051,80 +1213,6 @@ def preflight(
     evidence["python_declared"] = declared_python = (
         _declared_python(task) if runtime == "python" else None
     )
-    #: `None`, not `""`. A gate that never started a container has not
-    #: observed an empty version -- it has not observed anything. Below,
-    #: a container that DID start but whose `python --version` exited
-    #: non-zero writes `""` instead: that is an observed empty answer, a
-    #: different absence than never having looked, and the two must not
-    #: render identically. A node task leaves it `None` for the third
-    #: reason: the probe was never run.
-    evidence["python_observed"] = None
-    #: `None`, not `[]`: nothing was measured. `[]` is the observation "this
-    #: tree has no submodules", which is what the check below writes for the
-    #: ordinary task -- and a key absent from this branch and present on that
-    #: one is the same defect one layer down, since a reader diffing two
-    #: evidence files could not tell the two apart.
-    evidence["submodules"] = None
-    evidence["submodules_orphaned"] = None
-    #: Beside the two above so the three submodule keys keep answering
-    #: together. At the top level `None` is "not measured" (this early return)
-    #: and `{}` is "measured, this task declares no unneeded submodules"; per
-    #: path the value is `True` (empty), `False` (has content) or `None` (the
-    #: read failed). A mapping rather than a list, so the stored evidence
-    #: itself tells `False` from `None` per path instead of leaving that to
-    #: the problem text.
-    evidence["submodules_empty_after_suite"] = None
-
-    # Written here, before any container starts, for the reason
-    # `image_env_observed` is: three of these are measured inside the scoped
-    # p2p branch, which an explicit `tests.p2p` skips entirely, and a key that
-    # is present on one task shape and missing on another cannot be read
-    # across a set of cached verdicts. `None` is "not measured on this path";
-    # `[]` is "measured, nothing found".
-    #
-    # `runner_cache_flags` starts as `[]` rather than `None` because it is
-    # measured on every path that reaches it: it is a function of the adapter
-    # and of `tests.runner`, so it is knowable with no container at all.
-    #
-    # `f2p_before_not_run` is NOT, and it used to claim otherwise. Two paths
-    # reach the end of this function without measuring it: the runner-gate
-    # early return below, which starts no container and runs no selection, and
-    # a node f2p run that wrote NO REPORT AT ALL -- measured 2026-09-01, what a
-    # broken config gives on both frameworks -- where `classify` guards on
-    # `last_report is not None`, `verify_selected` never runs, and
-    # `Outcome.not_run` stays empty. On both, `[]` said "measured, every
-    # declared id reached a verdict" for a gate that measured nothing. Same
-    # rule as `duplicate_full_names` and `scope_files_outside`, and the reason
-    # `PREFLIGHT_VERSION` moved to 11.
-    evidence["runner_cache_flags"] = []
-    evidence["runner_cache_flags_missing"] = []
-    evidence["f2p_before_not_run"] = None
-    evidence["duplicate_full_names"] = None
-    evidence["scope_files_run"] = None
-    evidence["scope_files_outside"] = None
-    #: `None` is "not measured on this path" here too: pytest reports no file
-    #: list at all, and a node gate whose every run wrote no report measured
-    #: nothing. `[]` is "measured, no declared file's filter reaches another
-    #: executed one".
-    evidence["ambiguous_file_filters"] = None
-    #: `None`, not `0`: the same rule as `f2p_before_not_run` applies here
-    #: identically. The runner-gate early return below starts no container at
-    #: all, and fix 2's own framework guard (beside the context-file probe)
-    #: skips a node task without ever calling `container.exec` -- neither
-    #: path has MEASURED "no usage error", and `0` would claim it had.
-    #: `bare_runner_argv` is `None` for the same two paths, and stays `None`
-    #: on the node one even once a container starts: the argv a reader would
-    #: see there is the one this probe never ran.
-    #:
-    #: `bare_runner_skipped` was left out of this seed once: it was written
-    #: only in the node `else` branch below, so the runner-gate early return
-    #: recorded `bare_runner_exit: None` with no key at all saying why --
-    #: the same "two absences that render identically" shape one layer down.
-    #: Seeded `None` here for the same two paths, and the runner-gate return
-    #: below sets a reason string of its own.
-    evidence["bare_runner_exit"] = None
-    evidence["bare_runner_argv"] = None
-    evidence["bare_runner_skipped"] = None
 
     # BEFORE the runner gate, so a manifest refused for a bad runner still
     # records what its declared framework wanted. Needs no container: both
@@ -1174,10 +1262,22 @@ def preflight(
             "test failure -- and without that distinction the gate is "
             "worthless"
         )
+        #: `bare_runner_skipped` was left out of the old hand-written seed
+        #: once: it was written only in the node `else` branch far below, so
+        #: this return recorded `bare_runner_exit: None` with no key at all
+        #: saying why -- the same "two absences that render identically" shape
+        #: one layer down, and the second occasion this file got it wrong
+        #: (`PREFLIGHT_VERSION` 11's three keys were the first). The schema
+        #: seeds it now; this writes the reason.
         evidence["bare_runner_skipped"] = (
             "tests.runner does not match tests.framework: no container "
             "started, so the bare-runner probe never ran"
         )
+        #: Beside it, and NOT a duplicate of it: `bare_runner_skipped` answers
+        #: why that one probe did not run (`HARVESTING.md` documents it by
+        #: name for the node task, where `early_return` is null), and
+        #: `early_return` answers why the whole gate returned.
+        evidence["early_return"] = EARLY_RETURN_RUNNER_MISMATCH
         return PreflightResult(
             task_id=task.task_id, task_version=task.task_version,
             start_sha=start_sha, image=image,
@@ -1442,9 +1542,9 @@ def preflight(
         # `getattr`, like `_declared_grading`'s: this function takes an
         # untyped `task` and a manifest object predating the key must not
         # crash the gate.
-        # Both keys are written unconditionally: "this task strips nothing"
-        # and "the gate did not look" render identically as a missing key, and
-        # absence is recorded rather than implied.
+        # Both keys are written with a REAL value rather than left at the
+        # schema's `None`, because the strip is knowable once a container
+        # exists: `[]` here is the measurement "this task strips nothing".
         stripped = tuple(getattr(task, "strip_paths", ()))
         still_there = (
             _present(container, stripped, dangling_counts=True)
@@ -1903,8 +2003,15 @@ def preflight(
         not_run = sorted(red_outcome.not_run)
         # `None` when this run produced no report on a framework that writes
         # one: `verify_selected` never ran, so `not_run` is empty because
-        # nothing was checked rather than because nothing was missing. The
-        # same guard `duplicate_full_names` carries, for the same reason, and
+        # nothing was checked rather than because nothing was missing.
+        #
+        # That is the SECOND of the two paths this key once claimed a
+        # measurement on. The first is the runner-gate early return above,
+        # which starts no container and runs no selection at all; it is
+        # answered by the schema's `None` now, where the `[]` it used to carry
+        # is what made `PREFLIGHT_VERSION` move to 11.
+        #
+        # The same guard `duplicate_full_names` carries, for the same reason, and
         # NOT a bare `last_report is not None` -- pytest writes no report by
         # design and answers a selection matching nothing with exit 4 and an
         # `ERROR: not found:` line, so `[]` there is a claim its framework
@@ -2354,6 +2461,11 @@ def preflight(
     # check reading the scoped run alone would be covered by nothing on those
     # tasks. At the function's own indentation because both branches have
     # rejoined here and it needs no container.
+    #
+    # `[]` is "measured, no declared file's filter reaches another executed
+    # one"; the schema's `None`, which `files_measured` leaves in place, is
+    # "not measured on this path" -- pytest reports no file list at all, and a
+    # node gate whose every run wrote no report measured nothing.
     ambiguous = (
         [f"{a!r} also selects {b}"
          for a in sorted(seen_files) for b in sorted(seen_files)

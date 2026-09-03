@@ -1235,10 +1235,12 @@ judge runs after one — which is why they sit here rather than above.
   (the image is pinned by `container_image_digest`) and it does mean the
   difference is invisible in a digest comparison.
 
-- **Two evidence families disagree about what an unreachable check writes.**
+- [x] **Two evidence families disagree about what an unreachable check writes.**
   Broadening 3's `image_env_*` / `hypothesis_*` keys are written on *every*
   path — `declared` with a value, the rest as explicit `null` — on the
-  pre-container early return at `preflight.py:507-523`. `stripped_paths` and
+  pre-container early return at ~~`preflight.py:507-523`~~ (that citation was
+  stale before this was written: it pointed inside `_gitlink_paths`' docstring,
+  not at the seed block). `stripped_paths` and
   `stripped_paths_present`, added by broadening 1, are simply **absent**
   there — and so is `suite_timeout_s`, added by broadening 4: no suite ran
   under any bound on this path, but that is indistinguishable from a gate too
@@ -1249,6 +1251,21 @@ judge runs after one — which is why they sit here rather than above.
   the new family is the shape to copy, not the other way round. Cheap, and it
   needs a
   `PREFLIGHT_VERSION` bump because it changes what a cached verdict contains.
+  **Resolved, and the item under-counted the defect by a factor of six.** The
+  inconsistent family is **twenty** keys, not three — taken by AST off every
+  `evidence[...] =` statement in `preflight()`. Four of them
+  (`grading_build_exit`, `grading_typecheck_exit`, `grading_lint_exit`,
+  `scope_prefixes_absent`) are absent from the *ordinary healthy GO* verdict,
+  which is the blob a task author reads most, so the three-key fix would not
+  have fixed the reader's problem on the two blobs a reader is most likely to
+  diff. Closed by a schema rather than by moving keys: `preflight.EVIDENCE_KEYS`
+  lists all 42, `_evidence_seed()` fills every path from it,
+  `PreflightResult.__post_init__` refuses a key set that is not it, and
+  `test_evidence_keys_lists_exactly_what_preflight_writes` derives the tuple
+  from the source by an AST walk so it cannot go stale the next time an item
+  adds a key. New key `early_return` names the pre-container refusal, because
+  under a uniform schema "many nulls" stops being a proxy for "no container
+  started". `PREFLIGHT_VERSION` 16 → 17; no verdict moves.
 
 - [x] **Re-screen the `HARVESTING.md` corpus at 3.11 and 3.13.** Broadening 5
   gave a manifest `image.python: "3.11" | "3.12" | "3.13"`, closed and

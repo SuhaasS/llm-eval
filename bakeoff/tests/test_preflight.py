@@ -25,12 +25,16 @@ from unittest import mock
 import pytest
 
 from bakeoff.preflight import (
+    EARLY_RETURN_RUNNER_MISMATCH,
+    EVIDENCE_KEYS,
     EXIT_ALL_PASSED,
     EXIT_COLLECTION_FAILURES,
     EXIT_COLLECTION_INTERRUPTED,
     EXIT_NOTHING_COLLECTED,
     EXIT_TESTS_FAILED,
     EXIT_USAGE_ERROR,
+    PreflightResult,
+    _evidence_seed,
     _gitlink_paths,
     _parse_python_version,
     _parse_submodule_status,
@@ -39,7 +43,12 @@ from bakeoff.preflight import (
     failed_node_ids,
     preflight,
 )
-from bakeoff.tasks import TaskGrading, load_task, materialize
+from bakeoff.tasks import (
+    TaskGrading,
+    _GRADING_KEYS,
+    load_task,
+    materialize,
+)
 
 FIXTURE = Path(__file__).resolve().parent.parent / "fixtures" / "smoke_task"
 
@@ -891,7 +900,7 @@ class _ScriptedContainer:
                  submodule_status="", submodule_status_exit=0,
                  gitlinks=(), gitmodules_declared=None, gitmodules_exit=None,
                  ls_entries=None, ls_exits=None,
-                 reports=None, bare_runner=None):
+                 reports=None, bare_runner=None, apply_exit=0):
         self.commands = []
         #: The JSON report each suite invocation writes, keyed by which run it
         #: is: `f2p_before`, `f2p_after`, `p2p_before`, `p2p_after`, `scoped`.
@@ -1005,6 +1014,12 @@ class _ScriptedContainer:
         self.bare_runner = bare_runner
         self.bare_runner_calls = 0
         self.bare_runner_argvs = []
+        #: What `git apply` of the reference patch answers. The reference fix
+        #: FAILING to apply is a real route through the gate -- it skips
+        #: `f2p_after_exit`, `p2p_after_exit`, every `grading_*_exit` and all
+        #: three scope keys -- and the catch-all `git` branch below answered it
+        #: a bare exit 0, so no test in this module could reach it.
+        self.apply_exit = apply_exit
 
     def __enter__(self):
         return self
@@ -1135,6 +1150,14 @@ class _ScriptedContainer:
             return _Exec(stdout=self.start_sha + "\n")
         if cmd[:2] == ["git", "status"]:
             return _Exec(stdout="")
+        if cmd[:2] == ["git", "apply"]:
+            # The stderr is conditional on the exit code, like the report
+            # `cat` branch above: a fixture that says "does not apply" while
+            # exiting 0 is one a later test can read the wrong way round.
+            # `preflight` reads this stderr only under `applied.exit_code != 0`.
+            return _Exec(exit_code=self.apply_exit,
+                         stderr="error: patch does not apply\n"
+                         if self.apply_exit else "")
         if cmd[0] == "git":
             return _Exec()
         # Recognised on `--co`, which appears in no OTHER argv this container
@@ -1629,7 +1652,7 @@ def test_the_scoped_assertion_is_skipped_on_an_explicit_p2p_list(monkeypatch, tm
 
     assert result.ok, result.problems
     assert container.scoped_runs == 0
-    assert "p2p_scoped_after_exit" not in result.evidence
+    assert result.evidence["p2p_scoped_after_exit"] is None
     assert result.problem_codes == ()
 
 
@@ -1744,11 +1767,16 @@ def test_the_evidence_records_the_bound_off_the_argv_not_off_the_manifest(
     assert result.evidence["suite_timeout_s"] == 1234
 
 
-def test_no_bound_is_recorded_when_no_command_ever_ran(monkeypatch, tmp_path):
+def test_the_bound_is_null_when_no_command_ever_ran(monkeypatch, tmp_path):
     """The non-pytest `tests.runner` refusal returns before the container is
-    even entered. An absent key is honest there -- no command ran under any
-    bound -- and a manifest value written anyway would be a claim about a run
-    that did not happen."""
+    even entered, so a manifest value written here would be a claim about a
+    run that did not happen.
+
+    `None`, not an absent key. Absence is NOT honest here, whatever an earlier
+    version of this docstring said: it renders identically to a verdict
+    written by a gate that predates `budget.suite_timeout_s` at all
+    (`PREFLIGHT_VERSION` 6), which is the one thing the version string exists
+    to let a reader rule out."""
     task = _FakeTask(tests=_FakeTests(runner=("go", "test", "./...")))
     container = _ScriptedContainer(
         start_sha="s" * 40, tests=task.tests, present=("tests/",))
@@ -1756,7 +1784,7 @@ def test_no_bound_is_recorded_when_no_command_ever_ran(monkeypatch, tmp_path):
     result = _run_preflight(monkeypatch, tmp_path, task, container)
 
     assert not result.ok
-    assert "suite_timeout_s" not in result.evidence
+    assert result.evidence["suite_timeout_s"] is None
 
 
 def test_last_timeout_s_is_none_before_any_invocation():
@@ -2369,10 +2397,23 @@ def test_the_preflight_version_moved_with_the_new_assertion():
     different shapes. The narrower residual comes second: a v15 NO-GO on a
     manifest that already declared the key -- reachable only because
     `load_task` has no top-level unknown-key refusal -- would otherwise be
-    served forever."""
+    served forever.
+
+    16 -> 17 is one evidence schema (round 2 item 5, 2026-09-03), and it moves
+    for the same reason 15 -> 16 did: the SHAPE, not the assertions. Twenty of
+    the forty-two keys were written where they were measured and are simply
+    absent from any path that did not measure them -- four of those
+    (`grading_build_exit`, `grading_typecheck_exit`, `grading_lint_exit`,
+    `scope_prefixes_absent`) from the ordinary healthy GO verdict. Absent
+    renders identically to "written by a gate too old to have this key", which
+    is the one thing this string exists to let a reader rule out. Since 17
+    every verdict carries every key of `EVIDENCE_KEYS`, `None` where the gate
+    did not look, and `early_return` names the pre-container refusal. No
+    verdict moves: a cached 16 PASS was a PASS for the same reasons, so what
+    the bump re-runs is the READING and not the judgement."""
     from bakeoff.preflight import PREFLIGHT_VERSION
 
-    assert PREFLIGHT_VERSION == "16"
+    assert PREFLIGHT_VERSION == "17"
 
 
 # --- fix 2: the bare-runner probe ---------------------------------------------
@@ -3890,7 +3931,7 @@ def test_ambiguous_file_filters_is_measured_off_the_f2p_run_too():
     result = _preflight_over((container, task))
 
     # No scoped run was made at all, which is the whole point of the shape.
-    assert "p2p_scoped_after_exit" not in result.evidence
+    assert result.evidence["p2p_scoped_after_exit"] is None
     assert result.evidence["duplicate_full_names"] is None
     assert result.evidence["ambiguous_file_filters"] == [
         "'tests/a.test.js' also selects pkg/tests/a.test.js"]
@@ -4136,3 +4177,216 @@ def test_a_scoped_run_that_wrote_no_report_measured_neither_node_rule():
     assert result.evidence["duplicate_full_names"] is None
     assert result.evidence["scope_files_run"] is None
     assert result.evidence["scope_files_outside"] is None
+
+
+# --- one evidence schema -----------------------------------------------------
+
+
+def test_a_preflight_result_whose_evidence_is_not_the_schema_is_refused():
+    """The enforcement lives in the gate and not only in the tests.
+
+    A test can only assert the routes it enumerates, and the route somebody
+    adds next is the one that has already gone wrong twice inside this file
+    (`PREFLIGHT_VERSION` 11's three keys, and `bare_runner_skipped`'s "left
+    out of this seed once"). Both were found by review rather than by a test,
+    which is what this raise replaces."""
+    with pytest.raises(ValueError) as caught:
+        PreflightResult(task_id="t", task_version=1, start_sha="s" * 40,
+                        image="i", manifest_digest="d",
+                        evidence={"framework": "pytest"})
+
+    assert "missing" in str(caught.value)
+    assert "'uid'" in str(caught.value)
+    assert "unlisted" in str(caught.value)
+
+
+def test_an_unlisted_evidence_key_is_refused_in_both_directions():
+    """The other direction, and the reason the message names both: a MISSING
+    key means a path that builds the result by hand, an UNLISTED one means a
+    write that was never added to `EVIDENCE_KEYS`. The remedies differ."""
+    with pytest.raises(ValueError) as caught:
+        PreflightResult(task_id="t", task_version=1, start_sha="s" * 40,
+                        image="i", manifest_digest="d",
+                        evidence=_evidence_seed() | {"invented": 1})
+
+    assert "invented" in str(caught.value)
+
+
+def test_the_grading_evidence_keys_read_the_grading_dataclass_and_not_a_copy():
+    """All three grading names are in the schema and correctly spelled.
+
+    It does NOT detect a transcribed copy -- `<=` holds for the star-unpack
+    and for three literal strings alike -- and neither does
+    `test_evidence_keys_lists_exactly_what_preflight_writes`' equality, both
+    of whose sides read `_GRADING_KEYS`. What a transcribed copy costs is one
+    round rather than silence: add a fourth check to `TaskGrading` and the
+    gate writes `grading_<new>_exit`, `__post_init__` raises, and that test
+    fails on the missing member. Its `ast.Starred` assertion is what closes
+    the gap at transcription time."""
+    assert {f"grading_{key}_exit" for key in _GRADING_KEYS} <= set(EVIDENCE_KEYS)
+
+
+def _apply_fails():
+    tests = _FakeTests()
+    task = _FakeTask(tests=tests)
+    return _ScriptedContainer(start_sha="s" * 40, tests=tests,
+                              present=("tests/",), apply_exit=1), task
+
+
+def _grading_declared():
+    task = _FakeTask(grading=TaskGrading(typecheck=("mypy", "src")))
+    return _ScriptedContainer(start_sha="s" * 40, tests=task.tests,
+                              present=("tests/",),
+                              grading_exits={("mypy", "src"): 0}), task
+
+
+def _no_prefix_exists():
+    tests = _FakeTests()
+    task = _FakeTask(tests=tests)
+    return _ScriptedContainer(start_sha="s" * 40, tests=tests,
+                              present=()), task
+
+
+def _one_prefix_missing():
+    tests = _FakeTests(paths=("tests/", "docs/tests/"))
+    task = _FakeTask(tests=tests)
+    return _ScriptedContainer(start_sha="s" * 40, tests=tests,
+                              present=("tests/",)), task
+
+
+def _submodule_status_failed():
+    tests = _FakeTests()
+    task = _FakeTask(tests=tests)
+    return _ScriptedContainer(start_sha="s" * 40, tests=tests,
+                              present=("tests/",),
+                              submodule_status_exit=1), task
+
+
+#: The routes through `preflight`, each skipping a different part of the key
+#: set. No route writes all of them, which is the whole finding.
+_SCHEMA_ROUTES = [
+    # id, build() -> (container, task)
+    ("runner_gate", lambda: _pytest_container(runner=("go", "test", "./..."))),
+    ("pytest_happy", lambda: _pytest_container()),
+    ("node_happy", lambda: _node_container()),
+    ("explicit_p2p", lambda: _node_container(p2p=("tests/a.test.js::other",))),
+    ("patch_does_not_apply", lambda: _apply_fails()),
+    ("grading_declared", lambda: _grading_declared()),
+    ("scope_collects_nothing", lambda: _no_prefix_exists()),
+    ("prefix_absent", lambda: _one_prefix_missing()),
+    ("submodule_status_failed", lambda: _submodule_status_failed()),
+]
+
+
+@pytest.mark.parametrize("build", [route[1] for route in _SCHEMA_ROUTES],
+                         ids=[route[0] for route in _SCHEMA_ROUTES])
+def test_every_evidence_key_is_present_on_every_route(build):
+    """`PreflightResult.__post_init__` already guarantees this equality for
+    every result that exists, so what this parametrization actually pins is
+    that each ENUMERATED route reaches a return at all. Remove the seed and
+    every one of them raises instead, which is how the mutation anchor goes
+    red.
+
+    It does not and cannot cover a route it does not enumerate; that coverage
+    is `__post_init__`'s, and the coverage of the tuple itself is
+    `test_evidence_keys_lists_exactly_what_preflight_writes`. The assertion is
+    kept in this readable form because it is the STATEMENT of the invariant,
+    not because it is the thing that can fail.
+
+    What each route skips, and why none of them is redundant: `runner_gate`
+    skips every container-measured key; `pytest_happy` skips the three
+    `grading_*_exit` (`_FakeTask`'s `TaskGrading()` is empty) and
+    `scope_prefixes_absent` (every declared prefix exists); `node_happy` skips
+    `python_observed` (the node branch is a bare `pass`; `python_declared` IS
+    written, as the `None` that says a node manifest may not declare
+    `image.python`), both `bare_runner_*` and both `hypothesis_*` (whose
+    writes sit inside `if interpreter is not None:` and the node adapter
+    answers `None`); `explicit_p2p` skips the whole scoped block;
+    `patch_does_not_apply` skips everything downstream of the fix, which is
+    the row set no "many nulls means no container" heuristic can see;
+    `grading_declared` writes one `grading_*_exit` and skips two;
+    `scope_collects_nothing` writes `scope_prefixes_absent` and then refuses
+    before the scoped run; `prefix_absent` is the only route that writes
+    `scope_prefixes_absent` AND still reaches the scoped run; and
+    `submodule_status_failed` leaves `submodules_orphaned` at its branch's own
+    explicit `None`."""
+    result = _preflight_over(build())
+
+    assert set(result.evidence) == set(EVIDENCE_KEYS)
+
+
+def test_evidence_keys_lists_exactly_what_preflight_writes():
+    """The one assertion here that fails on an `EVIDENCE_KEYS` edit rather
+    than following it.
+
+    `__post_init__` catches a key written on a path that RUNS; this catches a
+    key written on a path nothing exercises, at edit time -- and it is what
+    keeps the tuple from going stale the next time an item adds a key, which
+    is how this commit's own plan came to be written two keys short against
+    its round's landing order.
+
+    `early_return` needs no special case: it is a literal subscript in the
+    early-return block, so the walk finds it. Only the `f`-string grading
+    subscript is dynamic, and its names come off `_GRADING_KEYS`, which is the
+    same source `EVIDENCE_KEYS` reads -- so this asserts the two agree on a
+    set that is derived twice rather than transcribed twice -- and the
+    `ast.Starred` check reads the definition to prove the derivation is still
+    a derivation, which is the one thing neither this equality nor
+    `test_the_grading_evidence_keys_read_the_grading_dataclass_and_not_a_copy`
+    can see."""
+    import ast
+    import pathlib
+
+    import bakeoff.preflight as pf
+
+    tree = ast.parse(pathlib.Path(pf.__file__).read_text())
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "preflight")
+    written = {n.slice.value for n in ast.walk(fn)
+               if isinstance(n, ast.Subscript)
+               and isinstance(n.value, ast.Name) and n.value.id == "evidence"
+               and isinstance(n.slice, ast.Constant)}
+    written |= {f"grading_{key}_exit" for key in _GRADING_KEYS}
+
+    assert set(pf.EVIDENCE_KEYS) == written
+    assert len(pf.EVIDENCE_KEYS) == len(set(pf.EVIDENCE_KEYS))
+
+    # The grading names are DERIVED, not transcribed. The subset check in
+    # `test_the_grading_evidence_keys_read_the_grading_dataclass_and_not_a_copy`
+    # cannot see the difference -- `<=` holds for the star-unpack and for
+    # three literal strings alike -- and neither can the equality above, since
+    # both of its sides read `_GRADING_KEYS`. This reads the definition itself.
+    assign = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.AnnAssign)
+                  and getattr(n.target, "id", None) == "EVIDENCE_KEYS")
+    assert any(isinstance(e, ast.Starred) for e in assign.value.elts)
+
+
+def test_the_early_return_names_itself():
+    """With a uniform schema, "many nulls" stops being a proxy for "no
+    container started": a node task, an explicit-`p2p` task and an ordinary GO
+    each leave their own null-set, and none of them is this one. So the route
+    says which route it was rather than leaving a reader to intersect them.
+
+    A second pre-container return must add a second constant and extend this
+    test."""
+    refused = _preflight_over(_pytest_container(runner=("go", "test", "./...")))
+    healthy = _preflight_over(_pytest_container())
+
+    assert refused.evidence["early_return"] == EARLY_RETURN_RUNNER_MISMATCH
+    assert healthy.evidence["early_return"] is None
+
+
+def test_the_schema_moves_no_verdict():
+    """This commit changes what a stored verdict SAYS and never what it
+    DECIDES. That is what makes a cached PASS from `PREFLIGHT_VERSION` 16
+    still true and the bump a re-READING rather than a re-judgement."""
+    refused = _preflight_over(_pytest_container(runner=("go", "test", "./...")))
+    healthy = _preflight_over(_pytest_container())
+
+    assert healthy.ok, healthy.problems
+    assert healthy.problem_codes == ()
+    assert healthy.problems == ()
+    assert not refused.ok
+    assert refused.problem_codes == ()
+    assert len(refused.problems) == 1

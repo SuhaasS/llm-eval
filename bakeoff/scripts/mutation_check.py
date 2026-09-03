@@ -2232,6 +2232,34 @@ MUTATIONS = [
         "tests/test_tasks.py -k modified_broken_manifest",
         "not integration",
     ),
+    (
+        # A key written where it is measured is absent from every path that
+        # does not measure it, and absent renders identically to a verdict
+        # written by a gate too old to have the key. Twenty of preflight's
+        # forty-two keys were in that family. Under this mutation the seed is
+        # `{}`, so `__post_init__` raises out of `preflight` and the selected
+        # test fails as an ERROR rather than an assertion -- still red, which
+        # is what this harness requires.
+        "preflight: let an evidence key be absent on one path and present on another",
+        "src/bakeoff/preflight.py",
+        "    evidence: dict = _evidence_seed()",
+        "    evidence: dict = {}",
+        "tests/test_preflight.py -k every_evidence_key_is_present_on_every_route",
+        "not integration",
+    ),
+    (
+        # The enforcement, not the schema. A test covers the routes it
+        # enumerates; this covers the route somebody adds next -- which is the
+        # one that has already gone wrong twice inside this file
+        # (PREFLIGHT_VERSION 11's three keys, and bare_runner_skipped's "left
+        # out of this seed once").
+        "preflight: accept an evidence dict that is not the schema",
+        "src/bakeoff/preflight.py",
+        "        if set(self.evidence) != set(EVIDENCE_KEYS):",
+        "        if False:",
+        "tests/test_preflight.py -k not_the_schema_is_refused",
+        "not integration",
+    ),
 ]
 
 

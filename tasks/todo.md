@@ -3688,3 +3688,143 @@ declared-unneeded directory produces a 0-byte diff post-seed while `ls -A`
 sees the file — the submission cannot carry it and neither can a checkpoint.
 Preflight's two reads refuse the *task*; capturing it during a *run* is round
 2 item 17's job, and a `TASKS.md` entry names the gap until that lands.
+
+
+## Round 2 item 5 — one evidence schema for `preflight` — 2026-09-03
+
+Plan: [docs/superpowers/plans/2026-09-03-round2-5-evidence-schema.md](../docs/superpowers/plans/2026-09-03-round2-5-evidence-schema.md).
+
+**The defect, and the item under-counted it by a factor of six.** `TASKS.md`
+named three keys — `stripped_paths`, `stripped_paths_present`,
+`suite_timeout_s` — as written where they are measured and therefore absent
+from the pre-container early return. Taken by AST off every `evidence[...] =`
+statement in `preflight()`, the real family is **twenty** of the forty-two
+keys. Its own line citation (`preflight.py:507-523`) was stale too: it pointed
+inside `_gitlink_paths`' docstring, not at the seed block.
+
+Rows the three-key framing misses are the ones that matter most. `f2p_after_exit`,
+`p2p_after_exit`, the three `grading_*_exit` and all three scope keys are absent
+on paths that **do** start a container (the reference fix not applying is the
+plain one), so "many nulls" was never a usable proxy for "no container ran".
+And `grading_build_exit`, `grading_typecheck_exit`, `grading_lint_exit` and
+`scope_prefixes_absent` are absent from the **ordinary healthy GO** verdict —
+the blob in `<cache>/preflight/<task_id>.json` a task author reads most — so
+moving only the item's three keys would have left the schema unreadable across
+exactly the two blobs a reader is most likely to diff.
+
+**What the item actually closes is the absence of an enforcement.** The shape
+had already been got wrong twice inside this file, both times caught by review
+rather than by a test: `PREFLIGHT_VERSION` 11 moved `duplicate_full_names`,
+`scope_files_outside` and `f2p_before_not_run` from `[]` to `None` because `[]`
+claimed a measurement never made, and the `bare_runner_skipped` note records a
+fourth key "left out of this seed once". Nothing asserted that the two families
+agreed, so each drift survived until somebody read the diff.
+
+**The design.** One tuple, `preflight.EVIDENCE_KEYS`, listing all 42 keys in the
+order the gate writes them, with the three grading names DERIVED from
+`tasks._GRADING_KEYS` rather than restated. One helper, `_evidence_seed()`,
+returning `dict.fromkeys(EVIDENCE_KEYS)` — uniformly `None`, one rule stated
+once. `preflight()` starts from it; `PreflightResult.evidence`'s
+`default_factory` is it; `PreflightResult.__post_init__` raises `ValueError` on
+a key set that is not exactly it, naming both directions of the difference
+because the remedies differ (a *missing* key means a path building the result by
+hand, an *unlisted* key means a write never added to the tuple). One new key,
+`early_return`, carries `EARLY_RETURN_RUNNER_MISMATCH` on the one pre-container
+return and `None` everywhere else.
+
+The raise is safe here where `_gitlink_paths` argues for a NO-GO, and the
+difference is the cause: that one guards a defect in the DATA, which an operator
+can hit; this one can only be caused by an edit to `preflight()` itself, since
+with the seed in place every key is either seeded or an overwrite of a seeded
+key. The one input-dependent write (`grading_<key>_exit`) takes its names from
+`dataclass_fields(task.grading)`, which `load_task`'s unknown-key refusal closes
+and which raises `TypeError` inside `_declared_grading` first for anything that
+is not a dataclass at all.
+
+**Rejected.** A nested `evidence["grading"] = {...}` sub-dict — it closes the key
+set without an import and renames a key six tests and every stored blob already
+carry, for no gain; the flat name is what makes an old verdict and a new one
+comparable, which is the property under repair. A sentinel string — four of
+these keys are string-typed (`dirty_after_tests`, `claude_version`,
+`f2p_red_kind`, `bare_runner_skipped`) and a sentinel would be indistinguishable
+from a measurement on exactly them. A `defaultdict` — it hides the drift instead
+of failing it, and a key nothing touches still does not reach `to_dict()`.
+Tests-only enforcement — a test covers the routes it enumerates, and the route
+somebody adds next is the one that has failed twice.
+
+**The plan's own first draft shipped a tuple two keys short, and that is why
+T3.2 exists.** It was written against HEAD 8232032 and would have been
+implemented after items 1–4 landed; a transcribed tuple would have made
+`__post_init__` raise on **every path of every task**. Three defences now:
+Task 0 derives the tuple from the tree before any code is written, V1 is the
+command that does it, and
+`test_evidence_keys_lists_exactly_what_preflight_writes` is the standing AST
+walk that re-derives it on every run. The failure was *the plan being right
+about the wrong tree*, which no amount of care about the current tree would have
+caught — worth recording plainly.
+
+**Review 2's three LOW items**, recorded here at the reviewer's request rather
+than in another revision cycle. **N1**: the `node_happy` route skips
+`python_observed` alone, not `python_declared` — the latter IS written on that
+route, as the `None` that says a node manifest may not declare `image.python`.
+**N2**: `test_the_grading_evidence_keys_read_the_grading_dataclass_and_not_a_copy`'s
+`<=` cannot tell the star-unpack from three literal strings, and neither can
+T3.2's equality (both its sides read `_GRADING_KEYS`); the `ast.Starred`
+assertion added to T3.2 is the only thing that can, and the docstrings now claim
+only what they pin. **N3**: the new tests' imports were the one place an
+implementer would have had to invent, so the plan names them exactly.
+
+**Deviations from the plan, all forced by the tree.**
+
+| what the plan said | what the tree said |
+|---|---|
+| two additions to D2's tuple: `ambiguous_file_filters`, `submodules_populated_after_suite` | `ambiguous_file_filters` and **`submodules_empty_after_suite`** — item 2 landed the key under the other name. Same count, same position; the derivation is what said so |
+| `PREFLIGHT_VERSION` "16" → "17" (expected) | confirmed on disk, "16" → "17" |
+| "exactly two absence assertions in the tree" (review 1 grepped it) | **three** — item 1 landed a third `assert "p2p_scoped_after_exit" not in result.evidence` in `test_ambiguous_file_filters_is_measured_off_the_f2p_run_too`. Converted the same way |
+| the three hand constructions in `test_grade_script.py` | **five**, counting two in the same file's `fake_preflight` stubs and one in `test_run_matrix.py`. None passes `evidence=`, so the property the plan relied on holds and all five pass unedited |
+| no test named that pins `PREFLIGHT_VERSION` | `test_the_preflight_version_moved_with_the_new_assertion` asserts the literal and carries a running docstring of every bump. Updated to "17" with a 16 → 17 paragraph in the file's own style |
+| D2: a write-order tuple so `<cache>/preflight/<task_id>.json` "reads top to bottom in the order a reader would walk the gate" | **false for the artifact.** `matrix.write_json` dumps with `sort_keys=True`, so the stored blob is alphabetical from `ambiguous_file_filters` — verified against the click-3360 gate. The tuple stays in write order (that is the right shape for the constant and for `to_dict()`), and its docstring now says plainly that the order does not survive to the file, rather than transcribing a claim the artifact refutes |
+
+**Also gated, and it did not pass — for a reason that is not this commit's.**
+The plan named `bidict-389-putall-rollback-clean` as its vehicle. It gates
+**NO-GO** on that manifest today, and the refusal is fix 2's bare-runner probe:
+`bare_runner_exit: 4`, `unrecognized arguments: --numprocesses=auto`, `image.pip`
+needs `pytest-xdist`. That is a gap in the probe task set's manifest, not a
+verdict this commit moved — the schema assertion holds on it exactly as on the
+GO: `preflight_version 17`, `len(evidence) == 42`, `early_return: null`. Gating
+a GO and a NO-GO is the better evidence anyway, since the two blobs are what a
+reader diffs.
+
+**Where the deleted seed's prose went.** Three of the measurements it carried
+already existed at the sites that measure them, verbatim: `python_observed`'s
+three-absence paragraph is in the `python is None` branch, `submodules`' "`None`,
+not `[]`" is on both failure branches, and `submodules_empty_after_suite`'s
+mapping semantics are at its write. Two did not and were relocated:
+`f2p_before_not_run`'s two-paths note now sits at its write, and
+`bare_runner_skipped`'s "left out of this seed once" now sits in the early-return
+block that used to be its victim. `ambiguous_file_filters`' `[]`-vs-`None`
+sentence was moved to its write for the same reason.
+
+**Verification.**
+
+| step | result |
+|---|---|
+| unit | `1652 passed, 67 deselected` (from `1637 passed, 67 deselected`) |
+| `mutation_check.py` | **183/183** (from 181), run solo |
+| V1, post-Task-2 | 42 keys derived, `set(EVIDENCE_KEYS) == written`, no `early_return` union needed |
+| route null-sets | nine routes, nine distinct null counts, each reaching its claimed verdict |
+| `tests/test_grade_script.py` | passes with **no edit** — the proof `default_factory=_evidence_seed` absorbed the assertion |
+| GATE | `click-3360-write-usage-empty-args` **PASS** at `preflight_version 17`, `len(evidence) == 42`, `early_return: null`, all three `grading_*_exit: null` where the v16 blob carried no such key at all |
+
+**Docs checked, no edit required.** `bakeoff/taskset/HARVESTING.md:83` names the
+only two evidence keys any doc names — "`bare_runner_exit` stays `null` and
+`bare_runner_skipped` names why" on a node task — and both stay true verbatim.
+Its other `suite_timeout_s` hits (`:705`, `:712`, `:719`) and
+`docs/BUILDING-A-TASK-SET.md`'s (`:246`, `:475`) are all `budget.suite_timeout_s`,
+the manifest key, not the evidence key — resolved here so the next reader need
+not re-resolve them.
+
+**One thing this does NOT do**, beyond the plan's own list: it does not re-audit
+the remaining keys for the OTHER shape of the defect — a key whose *value* means
+two things. That was `PREFLIGHT_VERSION` 11's round and is done for the four keys
+it found.
