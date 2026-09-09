@@ -182,10 +182,14 @@ def test_the_router_does_not_cool_down_a_single_deployment_group():
 def test_no_deployment_targets_the_real_anthropic_api():
     """The assumption that makes the tool-id patch safe, written down.
 
-    `^[a-zA-Z0-9_-]+$` on tool_use ids is enforced by Anthropic's own API.
-    Disabling the sanitizer is only sound because nothing here calls it --
-    every arm goes to Bedrock. Point an arm at api.anthropic.com and the patch
-    stops being a bug fix and starts being a bug.
+    `^[a-zA-Z0-9_-]+$` on tool_use ids is enforced by Anthropic's own API, and
+    the patch hands ids through unsanitized. That is only sound because no
+    deployment here is Anthropic's API: the bedrock arms answer through
+    bedrock, and the openrouter arms through the `openai/` provider class,
+    which never constructs an Anthropic `tool_use` id for an upstream to
+    reject -- the id crosses as the model emitted it. Point an arm at
+    api.anthropic.com and the patch stops being a bug fix and starts being a
+    bug, on every arm at once, since the patch is global.
     """
     for path in sorted(CONFIG.parent.glob("litellm*.yaml")):
         for entry in yaml.safe_load(path.read_text())["model_list"]:

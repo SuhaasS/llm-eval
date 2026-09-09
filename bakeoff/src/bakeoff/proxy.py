@@ -19,8 +19,23 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-# The four arms of the eval. NOT one transport: Sonnet 5 runs on
-# bedrock-runtime and the three candidates on bedrock-mantle.
+# The two provider routes behind the proxy (spec 2026-09-08 §1). Selected by
+# `--provider` on the drivers, never inferred from which env var happens to be
+# set: an implicit choice is configuration reported as observation.
+PROVIDERS = ("openrouter", "bedrock")
+DEFAULT_PROVIDER = "openrouter"
+# How the PROXY learns which provider it serves. Read by litellm_patches to
+# decide whether the two mantle-only rewrites apply, and written into the
+# adapter manifest so the record can say which route answered.
+PROVIDER_ENV = "BAKEOFF_PROVIDER"
+OPENROUTER_KEY_ENV = "OPENROUTER_API_KEY"
+
+# The arms each provider's config serves. `run_matrix --models` defaults to the
+# list for the chosen provider; a bedrock arm name against an openrouter config
+# is an UnknownModelError after the tokens are spent.
+#
+# The bedrock four are NOT one transport: Sonnet 5 runs on bedrock-runtime and
+# the three candidates on bedrock-mantle.
 #
 # That split is not a preference. The mantle passthrough derives
 # `anthropic-beta` HTTP headers from Claude Code's context_management and
@@ -37,20 +52,6 @@ from pathlib import Path
 # Defined here rather than in either caller. The Phase 0c gate and the matrix
 # driver disagreeing about what "the four arms" are is the same class of
 # defect this module exists to prevent, one level down.
-# The two provider routes behind the proxy (spec 2026-09-08 §1). Selected by
-# `--provider` on the drivers, never inferred from which env var happens to be
-# set: an implicit choice is configuration reported as observation.
-PROVIDERS = ("openrouter", "bedrock")
-DEFAULT_PROVIDER = "openrouter"
-# How the PROXY learns which provider it serves. Read by litellm_patches to
-# decide whether the two mantle-only rewrites apply, and written into the
-# adapter manifest so the record can say which route answered.
-PROVIDER_ENV = "BAKEOFF_PROVIDER"
-OPENROUTER_KEY_ENV = "OPENROUTER_API_KEY"
-
-# The arms each provider's config serves. `run_matrix --models` defaults to the
-# list for the chosen provider; a bedrock arm name against an openrouter config
-# is an UnknownModelError after the tokens are spent.
 EVAL_ARMS_BY_PROVIDER: dict[str, list[str]] = {
     "bedrock": [
         "claude-sonnet-5-runtime",
@@ -60,10 +61,6 @@ EVAL_ARMS_BY_PROVIDER: dict[str, list[str]] = {
     ],
     "openrouter": ["kimi-k2-6", "kimi-k3"],
 }
-# Kept under its old name for the two scripts that import it; Task 2 of the
-# openrouter plan moves them to the dict.
-EVAL_ARMS = EVAL_ARMS_BY_PROVIDER["bedrock"]
-
 SSO_LOGIN_HINT = (
     "  AWS_CONFIG_FILE=bakeoff/.aws/config aws sso login --profile pindrop-bakeoff"
 )
@@ -335,7 +332,7 @@ class CredentialWindow:
 
 
 def credential_window(
-    region: str, now: datetime | None = None, provider: str = DEFAULT_PROVIDER
+    region: str, now: datetime | None = None, *, provider: str
 ) -> CredentialWindow:
     """When the credentials handed to the proxy stop working.
 
@@ -445,7 +442,7 @@ def credential_stop(window: CredentialWindow, now: datetime, needed_s: int) -> s
     )
 
 
-def proxy_environment(mode: str, provider: str = DEFAULT_PROVIDER) -> dict[str, str]:
+def proxy_environment(mode: str, provider: str) -> dict[str, str]:
     """Credentials for the proxy container. Live mode only.
 
     The agent is passed none of these and never sees them: it reaches the

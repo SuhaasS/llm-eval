@@ -55,7 +55,7 @@ class UnknownModelError(KeyError):
 
 # Bumped whenever a rate in PRICE_BOOK moves. Stamped into every record's
 # Versions so a stored cost says which book produced it.
-PRICING_BASIS = "sonnet-list-2026-08-11+bedrock-2026-08-05+candidate-nocache-2026-08-23+openrouter-2026-09-08"
+PRICING_BASIS = "sonnet-list-2026-08-11+bedrock-2026-08-05+openrouter-2026-09-08"
 
 
 @dataclass(frozen=True)
@@ -108,10 +108,10 @@ PRICE_BOOK.update(
 #
 # cache_read is a real discount here, unlike the bedrock candidates: both
 # endpoints publish an input_cache_read rate. cache_write is 1.0 because no
-# endpoint lists input_cache_write -- a written prefix bills as plain input,
-# so 1.0 is a PRICE, not a placeholder, and the same argument as the bedrock
-# candidates' 1.0 applies. There is no 1h tier on this route; 1.0 keeps a
-# run with no cache read at exactly prompt_tokens x input_per_1m.
+# endpoint lists input_cache_write. A written prefix therefore bills at the
+# plain input rate, so 1.0 is the PRICE and not a placeholder standing in for
+# a rate nobody looked up. There is no 1h tier on this route; 1.0 keeps a run
+# with no cache read at exactly prompt_tokens x input_per_1m.
 #
 # Added AFTER the -runtime aliasing above on purpose: an openrouter arm has no
 # second transport, and an alias would price a deployment that cannot exist.

@@ -61,6 +61,7 @@ from bakeoff.preflight import preflight, preflight_cache_key  # noqa: E402
 from bakeoff.proxy import (  # noqa: E402
     DEFAULT_PROVIDER,
     EVAL_ARMS_BY_PROVIDER,
+    OPENROUTER_KEY_HINT,
     PROVIDERS,
     SSO_LOGIN_HINT,
     CredentialWindow,
@@ -427,6 +428,12 @@ def main() -> int:
         return 0
 
     environment = proxy_environment(args.mode, args.provider)
+    # Which credential the operator has to go renew. Printed unconditionally as
+    # the SSO one until 2026-09-09, which told an OpenRouter operator to run an
+    # `aws sso login` that cannot touch the key the proxy actually refused on.
+    credential_hint = (
+        OPENROUTER_KEY_HINT if args.provider == "openrouter" else SSO_LOGIN_HINT
+    )
 
     # AFTER proxy_environment: that is what resolves the project-local AWS
     # config, so calling this first would read a different session from the one
@@ -464,7 +471,7 @@ def main() -> int:
         print(f"\nNOT STARTING: {blocked}")
         print(
             "Nothing was spent and no run_id was touched.\n"
-            f"{SSO_LOGIN_HINT}\n"
+            f"{credential_hint}\n"
             "then re-invoke this command."
         )
         return 2
@@ -505,7 +512,7 @@ def main() -> int:
                 print(f"\nSTOPPING BEFORE {cell.label}: {stop}")
                 print(
                     "Nothing was spent on this cell and its run_id is untouched.\n"
-                    f"{SSO_LOGIN_HINT}\n"
+                    f"{credential_hint}\n"
                     "then re-invoke this command: plan_resume skips every cell "
                     "already written."
                 )
