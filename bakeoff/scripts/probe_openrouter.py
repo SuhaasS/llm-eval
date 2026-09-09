@@ -258,20 +258,102 @@ def leg_a(arm: str, params: dict[str, Any], key: str, k3_order: str | None, chec
 # ------------------------------------------------------------------ Leg B
 
 
+def assemble_sse(lines: list[str]) -> dict[str, Any]:
+    """Replays an Anthropic Messages SSE stream into the same shape the
+    non-streaming endpoint returns (`content`, `usage`, `stop_reason`, ...).
+
+    Every real Claude Code call streams, and litellm 1.95.0 pushes streaming
+    and non-streaming `openai/` calls through different code paths -- a
+    non-streaming probe passes check 6 on a path no real run takes (finding
+    #2). This turns the raw `message_start` / `content_block_start` /
+    `content_block_delta` / `content_block_stop` / `message_delta` events
+    back into one message dict so `leg_b`'s downstream logic, written
+    against the non-streaming shape, does not have to know the difference.
+    """
+    message: dict[str, Any] = {"content": [], "usage": {}}
+    blocks: dict[int, dict[str, Any]] = {}
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:") :].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            event = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        etype = event.get("type")
+        if etype == "message_start":
+            msg = event.get("message") or {}
+            message.update({k: v for k, v in msg.items() if k != "content"})
+            message["usage"] = dict(msg.get("usage") or {})
+        elif etype == "content_block_start":
+            idx = event.get("index", len(blocks))
+            block = dict(event.get("content_block") or {})
+            if block.get("type") == "tool_use":
+                block["_partial_json"] = ""
+            blocks[idx] = block
+        elif etype == "content_block_delta":
+            block = blocks.get(event.get("index"))
+            if block is None:
+                continue
+            delta = event.get("delta") or {}
+            if delta.get("type") == "text_delta":
+                block["text"] = block.get("text", "") + delta.get("text", "")
+            elif delta.get("type") == "input_json_delta":
+                block["_partial_json"] = block.get("_partial_json", "") + delta.get("partial_json", "")
+            elif delta.get("type") == "thinking_delta":
+                block["thinking"] = block.get("thinking", "") + delta.get("thinking", "")
+        elif etype == "content_block_stop":
+            block = blocks.get(event.get("index"))
+            if block is not None and "_partial_json" in block:
+                raw_json = block.pop("_partial_json")
+                try:
+                    block["input"] = json.loads(raw_json) if raw_json else {}
+                except json.JSONDecodeError:
+                    block["input"] = {}
+        elif etype == "message_delta":
+            delta = event.get("delta") or {}
+            for key in ("stop_reason", "stop_sequence"):
+                if key in delta:
+                    message[key] = delta[key]
+            if event.get("usage"):
+                message["usage"].update(event["usage"])
+    message["content"] = [blocks[i] for i in sorted(blocks)]
+    return message
+
+
 def exec_post(proxy, path: str, body: dict[str, Any], run_id: str) -> dict[str, Any]:
-    """POST from inside the proxy container; the internal network has no host route."""
+    """POST from inside the proxy container; the internal network has no host route.
+
+    `body["stream"]` true (every real Claude Code call streams) reads the
+    raw SSE text in-container and reassembles it on the host with
+    `assemble_sse`, so the caller sees the same `{"status", "body"}` shape
+    either way -- see `assemble_sse` for why the shapes would otherwise
+    diverge.
+    """
+    streaming = bool(body.get("stream"))
     payload = base64.b64encode(json.dumps(body).encode()).decode()
+    read_response = (
+        "print(json.dumps({'status':r.status,'sse_text':r.read().decode('utf-8','replace')}))"
+        if streaming
+        else "print(json.dumps({'status':r.status,'body':json.loads(r.read())}))"
+    )
     code = (
         "import base64,json,urllib.request,sys\n"
         f"body=base64.b64decode('{payload}')\n"
         f"req=urllib.request.Request('http://127.0.0.1:4000{path}',data=body,method='POST',headers={{'Content-Type':'application/json','anthropic-version':'2023-06-01','X-Bakeoff-Run-Id':'{run_id}','Authorization':'Bearer probe'}})\n"
         "try:\n"
-        "  r=urllib.request.urlopen(req,timeout=180); print(json.dumps({'status':r.status,'body':json.loads(r.read())}))\n"
+        f"  r=urllib.request.urlopen(req,timeout=180); {read_response}\n"
         "except urllib.error.HTTPError as e:\n"
         "  print(json.dumps({'status':e.code,'body':e.read().decode('utf-8','replace')}))\n"
     )
     result = proxy.container.exec_run(["python", "-c", code])
-    return json.loads(result.output.decode("utf-8", "replace").strip().splitlines()[-1])
+    raw = json.loads(result.output.decode("utf-8", "replace").strip().splitlines()[-1])
+    if streaming and "sse_text" in raw:
+        return {"status": raw["status"], "body": assemble_sse(raw["sse_text"].splitlines())}
+    return raw
 
 
 def leg_b(arm: str, proxy, wire_dir: Path, checks: set[int]) -> list[dict[str, Any]]:
@@ -295,7 +377,10 @@ def leg_b(arm: str, proxy, wire_dir: Path, checks: set[int]) -> list[dict[str, A
     if checks & {4, 5, 6}:
         try:
             anthropic_tool = {"name": "Bash", "description": "Run a shell command", "input_schema": TOOL["function"]["parameters"]}
-            turn1 = {"model": arm, "max_tokens": 256, "stream": False, "tools": [anthropic_tool], "thinking": {"type": "adaptive"},
+            # stream: True -- every real Claude Code call streams, and a
+            # non-streaming probe would pass check 6 on a path no real run
+            # takes (finding #2). exec_post reassembles the SSE body.
+            turn1 = {"model": arm, "max_tokens": 256, "stream": True, "tools": [anthropic_tool], "thinking": {"type": "adaptive"},
                      "messages": [{"role": "user", "content": "Run `ls` with the Bash tool."}]}
             r1 = exec_post(proxy, "/v1/messages", turn1, run_id)
             blocks = r1["body"].get("content", []) if r1["status"] == 200 else []
