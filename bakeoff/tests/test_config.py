@@ -9,6 +9,8 @@ partway through a paid run.
 
 from pathlib import Path
 
+import pytest
+
 # Hard import, not importorskip: a skipped config check reads as green while
 # verifying nothing, which is the failure mode this suite keeps running into.
 import yaml
@@ -16,7 +18,12 @@ import yaml
 from bakeoff.costs import cost_usd
 from bakeoff.schema import TokenUsage
 
-CONFIG = Path(__file__).resolve().parents[1] / "config" / "litellm_config.yaml"
+CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
+BEDROCK = CONFIG_DIR / "litellm_config.yaml"
+OPENROUTER = CONFIG_DIR / "litellm_config_openrouter.yaml"
+CONFIG = BEDROCK  # the bedrock-only pins below read this name
+CONFIGS = {"bedrock": BEDROCK, "openrouter": OPENROUTER}
+OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 
 # bedrock/ models whose tool-call ids are MEASURED to satisfy Bedrock's
 # toolUseId pattern `[a-zA-Z0-9_-]{1,64}`. The comment beside each entry is the
@@ -32,19 +39,28 @@ CONVERSE_SAFE_TOOL_ID_MODELS = {
 }
 
 
-def _model_list():
-    return yaml.safe_load(CONFIG.read_text())["model_list"]
+def _model_list(path: Path = BEDROCK):
+    return yaml.safe_load(path.read_text())["model_list"]
 
 
-def test_config_parses_and_lists_every_arm():
-    names = {entry["model_name"] for entry in _model_list()}
-    assert {"claude-sonnet-5", "gemma-4-31b", "nemotron-3-super-120b", "kimi-k2-5"} <= names
+@pytest.mark.parametrize(
+    "config, expected",
+    [
+        (BEDROCK, {"claude-sonnet-5", "gemma-4-31b", "nemotron-3-super-120b", "kimi-k2-5"}),
+        (OPENROUTER, {"kimi-k2-6", "kimi-k3"}),
+    ],
+    ids=["bedrock", "openrouter"],
+)
+def test_config_parses_and_lists_every_arm(config, expected):
+    names = {entry["model_name"] for entry in _model_list(config)}
+    assert expected <= names
 
 
-def test_every_configured_model_name_can_be_priced():
+@pytest.mark.parametrize("config", CONFIGS.values(), ids=CONFIGS.keys())
+def test_every_configured_model_name_can_be_priced(config):
     """A name in the config that the price book does not know raises
     UnknownModelError mid-run, after the tokens are already spent."""
-    for entry in _model_list():
+    for entry in _model_list(config):
         cost_usd(entry["model_name"], TokenUsage(input=1))
 
 
@@ -105,7 +121,8 @@ def test_gemma_sends_no_top_p_because_its_route_refuses_one():
             assert "top_p" not in entry["litellm_params"], entry["model_name"]
 
 
-def test_the_production_config_registers_the_proxy_side_wire_callback():
+@pytest.mark.parametrize("config", CONFIGS.values(), ids=CONFIGS.keys())
+def test_the_production_config_registers_the_proxy_side_wire_callback(config):
     """Spec section 6.2 makes wire logging mandatory, and the proxy is the
     only process that makes the calls.
 
@@ -116,7 +133,7 @@ def test_the_production_config_registers_the_proxy_side_wire_callback():
     (Task 11, defect 15); the fault-injection config carries the callback
     and the production config did not.
     """
-    settings = yaml.safe_load(CONFIG.read_text())["litellm_settings"]
+    settings = yaml.safe_load(config.read_text())["litellm_settings"]
     assert "bakeoff.proxy_callback.instance" in settings.get("callbacks", [])
 
 
@@ -229,7 +246,8 @@ def test_no_bedrock_arm_reaches_converse_with_ids_it_would_reject():
             )
 
 
-def test_the_registered_callback_path_resolves_to_a_dispatchable_instance():
+@pytest.mark.parametrize("config", CONFIGS.values(), ids=CONFIGS.keys())
+def test_the_registered_callback_path_resolves_to_a_dispatchable_instance(config):
     """The trap this config comment has always warned about, asserted.
 
     get_instance_fn resolves a dotted path with getattr and returns it
@@ -243,7 +261,7 @@ def test_the_registered_callback_path_resolves_to_a_dispatchable_instance():
 
     from litellm.integrations.custom_logger import CustomLogger
 
-    paths = yaml.safe_load(CONFIG.read_text())["litellm_settings"]["callbacks"]
+    paths = yaml.safe_load(config.read_text())["litellm_settings"]["callbacks"]
     for path in paths:
         module_name, _, attribute = path.rpartition(".")
         resolved = getattr(importlib.import_module(module_name), attribute)
@@ -388,3 +406,54 @@ def test_pyyaml_is_a_runtime_dependency_not_a_dev_one():
     deps = tomllib.loads(pyproject.read_text())["project"]["dependencies"]
 
     assert any(d.startswith("pyyaml") for d in deps)
+
+
+def _openrouter_arms():
+    return _model_list(OPENROUTER)
+
+
+def test_every_openrouter_arm_targets_openrouter_on_the_openai_provider():
+    """Spec §2. `openai/`, not litellm's `openrouter/`: the resolved-params
+    capture and the two mantle rewrites hang off OpenAIConfig.map_openai_params,
+    which get_optional_params reaches only for custom_llm_provider == "openai".
+    A different provider class would leave the wrapper installed and never
+    called, and `resolved` would read null on every call."""
+    for entry in _openrouter_arms():
+        params = entry["litellm_params"]
+        assert params["model"].startswith("openai/"), entry["model_name"]
+        assert params["api_base"] == OPENROUTER_BASE, entry["model_name"]
+        assert params["api_key"] == "os.environ/OPENROUTER_API_KEY", entry["model_name"]
+
+
+def test_every_openrouter_arm_is_pinned_to_one_upstream_with_no_fallback():
+    """Spec §2. OpenRouter load-balances one model across upstreams with
+    different quantizations and tool-call parsers. Unpinned, an arm is not one
+    model across repeats; with fallbacks, `require_parameters` failing on the
+    pinned upstream silently routes to whoever is left."""
+    for entry in _openrouter_arms():
+        provider = entry["litellm_params"]["extra_body"]["provider"]
+        assert isinstance(provider.get("order"), list) and len(provider["order"]) == 1, entry["model_name"]
+        assert provider["allow_fallbacks"] is False, entry["model_name"]
+        assert provider["require_parameters"] is True, entry["model_name"]
+
+
+def test_every_openrouter_arm_asks_for_provider_cost_and_drops_the_derived_effort():
+    """`usage.include` is what makes `cost_usd_provider` exist. Dropping
+    reasoning_effort is what keeps require_parameters from rejecting K2.6,
+    whose endpoints list `reasoning` but not `reasoning_effort`; litellm
+    derives one from Claude Code's thinking:adaptive on every call."""
+    for entry in _openrouter_arms():
+        params = entry["litellm_params"]
+        assert params["extra_body"]["usage"] == {"include": True}, entry["model_name"]
+        assert "reasoning_effort" in params["additional_drop_params"], entry["model_name"]
+        assert "reasoning" in params["extra_body"], entry["model_name"]
+
+
+def test_the_openrouter_config_pins_quantization_where_the_endpoint_declares_one():
+    """CoreWeave declares fp4 for K2.6; Fireworks declares none for K3, so
+    pinning there would match nothing."""
+    by_name = {e["model_name"]: e["litellm_params"]["extra_body"]["provider"] for e in _openrouter_arms()}
+    assert by_name["kimi-k2-6"]["order"] == ["coreweave"]
+    assert by_name["kimi-k2-6"]["quantizations"] == ["fp4"]
+    assert by_name["kimi-k3"]["order"][0].startswith("fireworks")
+    assert "quantizations" not in by_name["kimi-k3"]

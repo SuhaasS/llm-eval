@@ -1,0 +1,160 @@
+# Self-hosted LiteLLM proxy calling OpenRouter (spec 2026-09-08 §2).
+# Selected by `--provider openrouter`, which is the default on run_matrix.py
+# and smoke_test.py. The bedrock route is config/litellm_config.yaml.
+#
+# Same topology as the bedrock route: Claude Code -> this proxy -> provider.
+# The candidates already reach bedrock-mantle through litellm's `openai/`
+# provider with a per-deployment api_base; OpenRouter is the same provider
+# class with a different host, so the wire callback fires on the same code
+# path with the same kwargs, and every wire-derived record field is produced
+# by the code that produces it today.
+#
+# `openai/`, NOT litellm's `openrouter/`. The resolved-params capture and the
+# two mantle rewrites (bakeoff.litellm_patches) wrap OpenAIConfig.map_openai_params,
+# which get_optional_params reaches only for custom_llm_provider == "openai".
+# A different provider class leaves the wrapper installed and never called,
+# and `resolved` reads null on every call.
+#
+# PROVIDER PINNING IS LOAD-BEARING. OpenRouter load-balances one model across
+# upstreams with different quantizations, context caps and tool-call parsers.
+# `order` + `allow_fallbacks: false` makes each arm one deployment across
+# repeats; `require_parameters: true` refuses any upstream that does not
+# accept every parameter sent, rather than dropping the parameter. The
+# response's `provider` field is captured per call so the pin is verified,
+# never assumed. Measured 2026-09-08 from /api/v1/models/<id>/endpoints:
+#   kimi-k2.6  coreweave/fp4  $0.65/$3.41  cache read $0.15   tools: yes
+#   kimi-k3    fireworks      $3.00/$15.00 cache read $0.30   tools: yes
+#   kimi-k3    fireworks/fast                                 tools: NO -- never let the router pick it
+#
+# reasoning_effort IS DROPPED HERE, NOT PINNED. litellm derives one from
+# Claude Code's thinking:{"type":"adaptive"} on every arm. K2.6's endpoints
+# list `reasoning` but not `reasoning_effort`, so under require_parameters a
+# derived effort is zero eligible providers. `extra_body.reasoning` is the
+# knob; `enabled: true` is the eval decision (thinking on -- both models ship
+# that way and off is the setting nobody would deploy). Flip per arm to
+# `{enabled: false}` for a thinking-off run; nothing else changes.
+#
+# usage.include asks OpenRouter to return `usage.cost`, which the record
+# carries as cost_usd_provider beside the price book's cost_usd.
+#
+# model_name doubles as the PRICE_BOOK key in bakeoff.costs.
+
+model_list:
+  - model_name: kimi-k2-6
+    litellm_params:
+      model: openai/moonshotai/kimi-k2.6
+      api_base: https://openrouter.ai/api/v1
+      api_key: os.environ/OPENROUTER_API_KEY
+      additional_drop_params: ["reasoning_effort"]
+      temperature: 1.0
+      top_p: 0.95
+      extra_body:
+        provider:
+          order: ["coreweave"]
+          allow_fallbacks: false
+          require_parameters: true
+          quantizations: ["fp4"]
+        usage: {include: true}
+        reasoning: {enabled: true}
+
+  - model_name: kimi-k3
+    litellm_params:
+      model: openai/moonshotai/kimi-k3
+      api_base: https://openrouter.ai/api/v1
+      api_key: os.environ/OPENROUTER_API_KEY
+      additional_drop_params: ["reasoning_effort"]
+      temperature: 1.0
+      top_p: 0.95
+      extra_body:
+        provider:
+          # "fireworks" or "fireworks/us": scripts/probe_openrouter.py check 1
+          # decides whether the router honours the variant slug. Edit here and
+          # in costs.PRICE_BOOK together, before the first paid run.
+          order: ["fireworks"]
+          allow_fallbacks: false
+          require_parameters: true
+        usage: {include: true}
+        reasoning: {enabled: true}
+
+litellm_settings:
+  # Wire capture, registered where the calls are actually made (spec
+  # section 6.2). The agent runs in its own container and this proxy is a
+  # third process, so a callback registered in the harness process observes
+  # nothing -- that was Task 11's defect 15, and it produced records with
+  # empty sampling, empty prompt and tool hashes and no error status while
+  # looking complete.
+  #
+  # The dotted path must resolve to a module-level INSTANCE, and this is
+  # the whole trap. Verified against litellm 1.95.0: get_instance_fn
+  # resolves the path with getattr and returns it as-is, then
+  # success_handler dispatches on isinstance(callback, CustomLogger). A
+  # class -- `bakeoff.wire.BakeoffCallback` -- fails that check and is
+  # skipped in SILENCE: no wire log, no error. `proxy_callback.instance`
+  # exists precisely so this line can point at an object rather than a type.
+  #
+  # bakeoff.wire.BakeoffCallback still cannot be named here for a second
+  # reason: it needs a per-run WireLogger and run_id, which no config
+  # string can supply. The proxy-side callback instead attributes each call
+  # by the X-Bakeoff-Run-Id header the harness stamps per run, and the
+  # harness replays those lines through WireLogger afterwards so there is
+  # still exactly one canonical artifact.
+  # Two entries, and the second is not optional in any config. The
+  # tool-id patch must be present wherever a proxy is started, or the
+  # offline gate and the fault-injection suite certify an UNPATCHED
+  # topology under the same name as the patched one.
+  #
+  # bakeoff.litellm_patches applies on construction and is imported by
+  # nothing in the harness -- that separation is what keeps the harness
+  # process's litellm unpatched. See that module for the defect.
+  callbacks:
+    - bakeoff.proxy_callback.instance
+    - bakeoff.litellm_patches.instance
+
+  # Route the OpenAI-compatible arms through /v1/chat/completions rather
+  # than /v1/responses. Without this LiteLLM sends any `openai/` deployment's
+  # Anthropic Messages traffic to the Responses API. Identical setting to
+  # the bedrock config -- a section 6.4 adapter setting, not a model finding.
+  use_chat_completions_url_for_anthropic_messages: true
+
+  # Named one at a time, never a blanket `drop_params: true`. A blanket drop
+  # would also silently discard temperature or max_tokens if a provider ever
+  # rejected one, and section 5.3 sampling would then be unapplied with
+  # nothing in the record saying so.
+  additional_drop_params:
+    - reasoning_effort
+    - context_management
+    - output_config
+
+  drop_params: false          # surface unsupported params instead of hiding them
+  set_verbose: false
+
+router_settings:
+  # Measured against litellm 1.95.0. `_should_cooldown_deployment` has four
+  # branches; three are guarded by `is_single_deployment_model_group` and the
+  # fourth -- `elif litellm._should_retry(status_code) is False` -- is not.
+  # _should_retry(401) and (403) are both False, so ONE auth failure cools the
+  # deployment down for DEFAULT_COOLDOWN_TIME_SECONDS (5).
+  #
+  # Every model group below is single-deployment: the model_names are distinct
+  # by design, so LiteLLM cannot load-balance and randomise transport per call.
+  # There is therefore nothing to fail over TO, and the cooldown buys nothing
+  # while costing the diagnosability of every auth failure -- `num_retries: 3`
+  # retries into it and gets RouterRateLimitError, a plain ValueError with NO
+  # status_code, so the wire log's last entry reads "No deployments available"
+  # at status None instead of naming the credential problem that caused it.
+  #
+  # The other unguarded branch needs 1000 requests in one minute
+  # (SINGLE_DEPLOYMENT_TRAFFIC_FAILURE_THRESHOLD) and is unreachable here. So in
+  # this configuration the cooldown mechanism fires on essentially nothing
+  # except an auth failure, and disabling it loses nothing.
+  #
+  # Applied to every deployment identically -- not a section 5.3 divergence.
+  disable_cooldowns: true
+
+
+general_settings:
+  # Retries are logged as infra events, never silently absorbed. Each retry
+  # is its own callback invocation, which is why the wire log counts calls
+  # rather than turns.
+  num_retries: 3
+  request_timeout: 900
