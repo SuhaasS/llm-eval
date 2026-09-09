@@ -667,3 +667,48 @@ def test_an_old_manifest_without_a_route_reads_as_no_claim(tmp_path):
     from bakeoff.proxy_callback import read_manifest
 
     assert read_manifest(tmp_path) == (["a"], "1.95.0", "")
+
+
+OPENROUTER_RAW = {
+    "id": "gen-123",
+    "provider": "CoreWeave",
+    "model": "moonshotai/kimi-k2.6",
+    "choices": [{"index": 0, "finish_reason": "tool_calls", "native_finish_reason": "tool_calls", "message": {"role": "assistant", "content": ""}}],
+    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.000123},
+}
+
+
+def test_the_upstream_provider_and_cost_are_read_from_the_raw_provider_body(wire_dir):
+    """Spec §4. litellm's ModelResponse is not guaranteed to keep OpenRouter's
+    top-level `provider`, so the callback reads kwargs["original_response"]
+    -- the raw JSON litellm hands every success callback -- before the dump."""
+    kwargs = kwargs_for("run-or")
+    kwargs["original_response"] = json.dumps(OPENROUTER_RAW)
+    BakeoffProxyCallback().log_success_event(kwargs, {"choices": [{"finish_reason": "tool_calls"}]}, None, None)
+    metadata = read_run_entries(wire_dir, "run-or")[0]["metadata"]
+    assert metadata["upstream_provider"] == "CoreWeave"
+    assert metadata["native_finish_reason"] == "tool_calls"
+    assert metadata["usage_cost"] == pytest.approx(0.000123)
+
+
+def test_the_upstream_fields_fall_back_to_the_response_dump_then_to_none(wire_dir):
+    kwargs = kwargs_for("run-dump")
+    BakeoffProxyCallback().log_success_event(kwargs, dict(OPENROUTER_RAW), None, None)
+    metadata = read_run_entries(wire_dir, "run-dump")[0]["metadata"]
+    assert metadata["upstream_provider"] == "CoreWeave"
+
+    kwargs = kwargs_for("run-none")
+    BakeoffProxyCallback().log_success_event(kwargs, {"choices": [{"finish_reason": "stop"}]}, None, None)
+    metadata = read_run_entries(wire_dir, "run-none")[0]["metadata"]
+    assert metadata["upstream_provider"] is None
+    assert metadata["native_finish_reason"] is None
+    assert metadata["usage_cost"] is None
+
+
+def test_the_upstream_fields_never_come_from_the_configured_order(wire_dir):
+    """The config's `order` is what was asked for. Only the response says
+    who answered; absent, the field is None, not the yaml value."""
+    kwargs = kwargs_for("run-cfg")
+    kwargs["litellm_params"]["extra_body"] = {"provider": {"order": ["coreweave"]}}
+    BakeoffProxyCallback().log_success_event(kwargs, {"choices": [{"finish_reason": "stop"}]}, None, None)
+    assert read_run_entries(wire_dir, "run-cfg")[0]["metadata"]["upstream_provider"] is None

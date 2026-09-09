@@ -392,6 +392,57 @@ def finish_reason(response: dict[str, Any]) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def upstream(kwargs: dict, response: dict[str, Any]) -> tuple[str | None, str | None, float | None]:
+    """(upstream provider, its native finish reason, its reported cost), or Nones.
+
+    OpenRouter returns top-level `provider`, `choices[].native_finish_reason`
+    and -- with `usage: {include: true}` -- `usage.cost` in every response body
+    (spec 2026-09-08 §4). litellm's ModelResponse dump is not guaranteed to
+    preserve unknown top-level keys, so `kwargs["original_response"]` -- the
+    raw provider JSON litellm passes every success callback, as a string --
+    is read first and the dump second.
+
+    None, never the config's `provider.order`: that is what was ASKED for,
+    and only the response says who answered. Verifying the pin per call is
+    the whole point of the field; a fallback to config would verify nothing.
+    """
+    raw = kwargs.get("original_response")
+    sources: list[dict[str, Any]] = []
+    if isinstance(raw, (str, bytes)):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                sources.append(parsed)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            pass
+    elif isinstance(raw, dict):
+        sources.append(raw)
+    if isinstance(response, dict):
+        sources.append(response)
+
+    provider: str | None = None
+    native: str | None = None
+    cost: float | None = None
+    for source in sources:
+        if provider is None:
+            value = source.get("provider")
+            if isinstance(value, str) and value:
+                provider = value
+        if native is None:
+            choices = source.get("choices")
+            if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                value = choices[0].get("native_finish_reason")
+                if isinstance(value, str) and value:
+                    native = value
+        if cost is None:
+            usage = source.get("usage")
+            if isinstance(usage, dict):
+                value = usage.get("cost")
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    cost = float(value)
+    return provider, native, cost
+
+
 def _iso(value: Any) -> str | None:
     """A callback timestamp as ISO-8601, or None if it was not one.
 
@@ -446,6 +497,8 @@ class BakeoffProxyCallback(CustomLogger):
         else:
             response = {"raw_completion": str(raw)}
 
+        upstream_provider, native_finish_reason, usage_cost = upstream(kwargs, response)
+
         with self._lock:
             self._call_index[run_id] = self._call_index.get(run_id, 0) + 1
             index = self._call_index[run_id]
@@ -463,6 +516,13 @@ class BakeoffProxyCallback(CustomLogger):
                     # than left inside `choices` so a reader does not have to
                     # know which shape this route logs.
                     "finish_reason": finish_reason(response),
+                    # Who actually answered, in the upstream's own words, and
+                    # what it says it charged. Read from the raw body, never
+                    # from the deployment's configured `order`; None when the
+                    # route did not say (every bedrock arm).
+                    "upstream_provider": upstream_provider,
+                    "native_finish_reason": native_finish_reason,
+                    "usage_cost": usage_cost,
                     "latency_ms": latency,
                     # The real call boundaries, not the moment this callback got
                     # around to writing. Nothing else in the artifact carries

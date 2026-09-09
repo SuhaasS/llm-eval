@@ -190,6 +190,13 @@ class BakeoffCallback(CustomLogger):
                 # Same key as proxy_callback._write. A field on one capture
                 # path only reads as "this arm did not report one".
                 "finish_reason": finish_reason(payload),
+                # Same keys as proxy_callback._write, None on this path: the
+                # harness is the caller, no upstream stands behind it, and a
+                # key present on one capture path only would read as "this
+                # arm did not report one".
+                "upstream_provider": None,
+                "native_finish_reason": None,
+                "usage_cost": None,
                 # Measured generation time, as opposed to the trajectory
                 # parser's estimate from transcript timestamps.
                 "latency_ms": self._latency_ms(start_time, end_time),

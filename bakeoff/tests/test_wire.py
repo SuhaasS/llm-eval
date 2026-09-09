@@ -276,3 +276,58 @@ def test_an_entry_captured_in_process_is_not_marked_as_replayed(tmp_path):
     entry = logger.entries()[0]
     assert entry["replayed_at"] is None
     assert entry["logged_at"]
+
+
+def _proxy_kwargs(run_id: str) -> dict:
+    """A callback kwargs dict shaped like `test_proxy_callback.kwargs_for`.
+
+    Built inline rather than imported: `tests/` has no `__init__.py`, and no
+    other test module imports across that boundary, so this module does not
+    start the pattern.
+    """
+    from bakeoff.proxy_callback import RUN_ID_HEADER
+
+    headers = {"content-type": "application/json", RUN_ID_HEADER: run_id}
+    return {
+        "model": "mock-ok",
+        "litellm_params": {
+            "model": "anthropic/claude-sonnet-5",
+            "metadata": {"headers": headers},
+            "proxy_server_request": {
+                "url": "http://litellm:4000/v1/messages",
+                "headers": headers,
+                "body": {
+                    "model": "mock-ok",
+                    "max_tokens": 4096,
+                    "temperature": 0.7,
+                    "system": "you are a coding agent",
+                    "tools": [{"name": "Bash"}],
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "litellm_metadata": {"headers": headers},
+                },
+            },
+        },
+        "optional_params": {},
+        "exception": None,
+    }
+
+
+def test_both_capture_paths_write_the_same_metadata_keys(tmp_path, monkeypatch):
+    """A key on one path only reads as 'this arm did not report one'."""
+    from bakeoff.proxy_callback import BakeoffProxyCallback, read_run_entries
+
+    monkeypatch.setenv("BAKEOFF_WIRE_DIR", str(tmp_path / "wire"))
+    BakeoffProxyCallback().log_success_event(
+        _proxy_kwargs("run-keys"), {"choices": [{"finish_reason": "stop"}]}, None, None
+    )
+    proxy_keys = set(read_run_entries(tmp_path / "wire", "run-keys")[0]["metadata"])
+
+    logger = WireLogger(tmp_path / "wire.jsonl.gz")
+    callback = BakeoffCallback(logger, run_id="run-keys")
+    callback.log_success_event(
+        _proxy_kwargs("run-keys"), {"choices": [{"finish_reason": "stop"}]}, None, None
+    )
+    inproc_keys = set(logger.entries()[0]["metadata"])
+
+    assert {"upstream_provider", "native_finish_reason", "usage_cost"} <= proxy_keys
+    assert proxy_keys - {"resolved_state"} == inproc_keys - {"bedrock_request_id"}
