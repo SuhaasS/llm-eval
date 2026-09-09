@@ -78,33 +78,7 @@ def resolve_aws_paths() -> None:
             print(f"aws         {key} points at a missing file: {path}")
 
 
-def load_env_file(path: Path) -> list[str]:
-    """Minimal .env loader. Avoids adding python-dotenv for one script.
-
-    Does not overwrite variables already set in the environment -- an exported
-    AWS_PROFILE or SSO session should win over a stale file.
-    """
-    loaded = []
-    if not path.exists():
-        return loaded
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        # Tolerate `export KEY=value` -- credentials get pasted straight out of
-        # the AWS SSO console, which hands them over in that form. Without this
-        # the key parses as "export AWS_ACCESS_KEY_ID" and the arm reports
-        # MISSING while the file plainly contains the value.
-        if line.startswith("export "):
-            line = line[len("export ") :].lstrip()
-        key, _, value = line.partition("=")
-        key, value = key.strip(), value.strip().strip('"').strip("'")
-        if not value or value.startswith("<"):  # unfilled placeholder
-            continue
-        if key not in os.environ:
-            os.environ[key] = value
-            loaded.append(key)
-    return loaded
+from bakeoff.envfile import load_env_file  # noqa: E402,F401 -- re-exported; callers import it from here
 
 
 # ---------------------------------------------------------------- credentials

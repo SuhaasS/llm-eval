@@ -37,16 +37,43 @@ from pathlib import Path
 # Defined here rather than in either caller. The Phase 0c gate and the matrix
 # driver disagreeing about what "the four arms" are is the same class of
 # defect this module exists to prevent, one level down.
-EVAL_ARMS = [
-    "claude-sonnet-5-runtime",
-    "gemma-4-31b",
-    "nemotron-3-super-120b",
-    "kimi-k2-5",
-]
+# The two provider routes behind the proxy (spec 2026-09-08 §1). Selected by
+# `--provider` on the drivers, never inferred from which env var happens to be
+# set: an implicit choice is configuration reported as observation.
+PROVIDERS = ("openrouter", "bedrock")
+DEFAULT_PROVIDER = "openrouter"
+# How the PROXY learns which provider it serves. Read by litellm_patches to
+# decide whether the two mantle-only rewrites apply, and written into the
+# adapter manifest so the record can say which route answered.
+PROVIDER_ENV = "BAKEOFF_PROVIDER"
+OPENROUTER_KEY_ENV = "OPENROUTER_API_KEY"
+
+# The arms each provider's config serves. `run_matrix --models` defaults to the
+# list for the chosen provider; a bedrock arm name against an openrouter config
+# is an UnknownModelError after the tokens are spent.
+EVAL_ARMS_BY_PROVIDER: dict[str, list[str]] = {
+    "bedrock": [
+        "claude-sonnet-5-runtime",
+        "gemma-4-31b",
+        "nemotron-3-super-120b",
+        "kimi-k2-5",
+    ],
+    "openrouter": ["kimi-k2-6", "kimi-k3"],
+}
+# Kept under its old name for the two scripts that import it; Task 2 of the
+# openrouter plan moves them to the dict.
+EVAL_ARMS = EVAL_ARMS_BY_PROVIDER["bedrock"]
 
 SSO_LOGIN_HINT = (
     "  AWS_CONFIG_FILE=bakeoff/.aws/config aws sso login --profile pindrop-bakeoff"
 )
+OPENROUTER_KEY_HINT = (
+    f"  put {OPENROUTER_KEY_ENV}=<key> in bakeoff/.env (see .env.example, section 0)"
+)
+
+# src/bakeoff/proxy.py -> bakeoff/.env. The same file scripts/smoke_bedrock.py
+# reads; resolved here so the openrouter branch needs nothing from that script.
+ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 
 
 class Proxy:
@@ -307,7 +334,9 @@ class CredentialWindow:
     error: str = ""
 
 
-def credential_window(region: str, now: datetime | None = None) -> CredentialWindow:
+def credential_window(
+    region: str, now: datetime | None = None, provider: str = DEFAULT_PROVIDER
+) -> CredentialWindow:
     """When the credentials handed to the proxy stop working.
 
     Both transports die at the same instant and that is not a coincidence:
@@ -331,10 +360,22 @@ def credential_window(region: str, now: datetime | None = None) -> CredentialWin
     project-local profile. Called before it, this reads the operator's ambient
     session -- a different credential from the one the proxy holds.
 
+    OPENROUTER. The key is static and the window is `None` with source
+    `openrouter-static` -- see the branch below. Everything under this line is
+    the bedrock provider.
+
     `_expiry_time` is botocore-private (botocore 1.x, RefreshableCredentials).
     Guarded with getattr and a fallback rather than trusted: an attribute that
     disappears must yield a weaker bound, not a crash on the path to a paid run.
     """
+    if provider == "openrouter":
+        # A static API key. There is no deadline to read, which is a
+        # different state from "could not read one": `source` says so, and
+        # credential_stop returns "" for it. The abort streak is the backstop
+        # for a revoked or exhausted key, as it already is for static AWS keys
+        # (CLAUDE.md, "That refusal cannot fire on static keys").
+        return CredentialWindow(None, "openrouter-static", "static API key; no expiry to read")
+
     now = now or datetime.now(timezone.utc)
     try:
         import boto3
@@ -404,28 +445,56 @@ def credential_stop(window: CredentialWindow, now: datetime, needed_s: int) -> s
     )
 
 
-def proxy_environment(mode: str) -> dict[str, str]:
+def proxy_environment(mode: str, provider: str = DEFAULT_PROVIDER) -> dict[str, str]:
     """Credentials for the proxy container. Live mode only.
 
-    The agent is passed none of these and never sees them: it reaches
-    Bedrock through the proxy over HTTP, which is what makes both credentials
-    single-hop secrets.
+    The agent is passed none of these and never sees them: it reaches the
+    provider through the proxy over HTTP, which is what makes every credential
+    here a single-hop secret.
 
-    Both transports are provisioned, because Sonnet 5 is served over
-    bedrock-runtime while the three candidates are served over
-    bedrock-mantle (see config/litellm_config.yaml). The mantle token is
-    passed as BAKEOFF_MANTLE_TOKEN and NOT as AWS_BEARER_TOKEN_BEDROCK:
-    LiteLLM's bedrock/ handler falls back to the AWS-named variable when a
-    deployment has no api_key, so setting it here would bearer-authenticate
-    every runtime arm and fail them with `bedrock:CallWithBearerToken`.
+    Two providers, two bodies, no shared code (spec 2026-09-08 §1). The
+    openrouter branch must not import the bedrock preflight or botocore: a
+    path that needs no AWS credential must not resolve one, and the test
+    asserts it on `sys.modules` in a fresh interpreter.
+
+    Every return carries PROVIDER_ENV. That is how the proxy process learns
+    which rewrites to apply (litellm_patches) and what to write into the
+    adapter manifest (`provider_route` on the record).
     """
     if mode != "live":
         return {}
+    if provider == "openrouter":
+        return _openrouter_environment()
+    if provider == "bedrock":
+        return {**_bedrock_environment(), PROVIDER_ENV: "bedrock"}
+    raise ValueError(f"unknown provider {provider!r}; expected one of {PROVIDERS}")
 
+
+def _openrouter_environment() -> dict[str, str]:
+    import os
+
+    from bakeoff.envfile import load_env_file
+
+    load_env_file(ENV_FILE)
+    key = os.environ.get(OPENROUTER_KEY_ENV, "")
+    if not key:
+        raise SystemExit(f"No {OPENROUTER_KEY_ENV}. Run:\n" + OPENROUTER_KEY_HINT)
+    return {OPENROUTER_KEY_ENV: key, PROVIDER_ENV: "openrouter"}
+
+
+def _bedrock_environment() -> dict[str, str]:
+    """Both bedrock transports are provisioned, because Sonnet 5 is served over
+    bedrock-runtime while the three candidates are served over bedrock-mantle
+    (see config/litellm_config.yaml). The mantle token is passed as
+    BAKEOFF_MANTLE_TOKEN and NOT as AWS_BEARER_TOKEN_BEDROCK: LiteLLM's
+    bedrock/ handler falls back to the AWS-named variable when a deployment
+    has no api_key, so setting it here would bearer-authenticate every runtime
+    arm and fail them with `bedrock:CallWithBearerToken`.
+    """
     import os
 
     from scripts.smoke_bedrock import (
-        ENV_FILE,
+        ENV_FILE as BEDROCK_ENV_FILE,
         LITELLM_BEARER_ENV,
         MANTLE_ENV,
         derive_mantle_token,
@@ -435,7 +504,7 @@ def proxy_environment(mode: str) -> dict[str, str]:
         scrub_placeholders,
     )
 
-    load_env_file(ENV_FILE)
+    load_env_file(BEDROCK_ENV_FILE)
     scrub_placeholders()
     resolve_aws_paths()
     normalize_mantle_token()

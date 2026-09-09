@@ -75,7 +75,7 @@ def test_the_window_comes_from_the_sts_expiry(monkeypatch):
     expiry = NOW + timedelta(hours=7)
     monkeypatch.setattr("boto3.Session", _session(_Creds(expiry=expiry)))
 
-    window = credential_window("us-east-1", now=NOW)
+    window = credential_window("us-east-1", now=NOW, provider="bedrock")
 
     assert window.expires_at == expiry
     assert window.source == "sts"
@@ -87,7 +87,7 @@ def test_a_naive_expiry_is_read_as_utc(monkeypatch):
     naive = (NOW + timedelta(hours=7)).replace(tzinfo=None)
     monkeypatch.setattr("boto3.Session", _session(_Creds(expiry=naive)))
 
-    window = credential_window("us-east-1", now=NOW)
+    window = credential_window("us-east-1", now=NOW, provider="bedrock")
 
     assert window.expires_at == NOW + timedelta(hours=7)
 
@@ -99,7 +99,7 @@ def test_the_window_is_capped_by_the_mantle_tokens_own_ttl(monkeypatch):
         "boto3.Session", _session(_Creds(expiry=NOW + timedelta(hours=30)))
     )
 
-    window = credential_window("us-east-1", now=NOW)
+    window = credential_window("us-east-1", now=NOW, provider="bedrock")
 
     assert window.expires_at == NOW + timedelta(hours=12)
     assert window.source == "mantle-ttl"
@@ -112,7 +112,7 @@ def test_no_sts_expiry_still_yields_the_mantle_bound(monkeypatch):
     four arms. `source` says it came from the weaker half."""
     monkeypatch.setattr("boto3.Session", _session(_Creds(expiry=None)))
 
-    window = credential_window("us-east-1", now=NOW)
+    window = credential_window("us-east-1", now=NOW, provider="bedrock")
 
     assert window.expires_at == NOW + timedelta(hours=12)
     assert window.source == "mantle-ttl"
@@ -124,7 +124,7 @@ def test_a_session_that_resolves_to_nothing_is_unknown(monkeypatch):
     "plenty of time" -- the abort streak is the backstop here."""
     monkeypatch.setattr("boto3.Session", _session(None))
 
-    window = credential_window("us-east-1", now=NOW)
+    window = credential_window("us-east-1", now=NOW, provider="bedrock")
 
     assert window.expires_at is None
     assert window.source == "unknown"
@@ -139,7 +139,7 @@ def test_an_already_dead_session_is_a_window_that_has_elapsed(monkeypatch):
         _Creds(raises=TokenRetrievalError(provider="sso", error_msg="expired"))
     ))
 
-    window = credential_window("us-east-1", now=NOW)
+    window = credential_window("us-east-1", now=NOW, provider="bedrock")
 
     assert window.source == "expired"
     assert credential_stop(window, now=NOW, needed_s=1)
@@ -192,3 +192,100 @@ def test_the_caller_is_what_adds_the_cell_overhead():
 
     assert credential_stop(window, now=NOW, needed_s=900) == ""
     assert credential_stop(window, now=NOW, needed_s=900 + CELL_OVERHEAD_S)
+
+
+# --------------------------------------------------------------- providers
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from bakeoff.proxy import (
+    DEFAULT_PROVIDER,
+    EVAL_ARMS_BY_PROVIDER,
+    OPENROUTER_KEY_ENV,
+    PROVIDER_ENV,
+    PROVIDERS,
+    proxy_environment,
+)
+
+BAKEOFF = Path(__file__).resolve().parents[1]
+
+
+def test_openrouter_is_the_default_provider():
+    assert DEFAULT_PROVIDER == "openrouter"
+    assert set(PROVIDERS) == {"openrouter", "bedrock"}
+    assert EVAL_ARMS_BY_PROVIDER["openrouter"] == ["kimi-k2-6", "kimi-k3"]
+    assert EVAL_ARMS_BY_PROVIDER["bedrock"][0] == "claude-sonnet-5-runtime"
+
+
+def test_the_openrouter_environment_is_exactly_the_key_and_the_provider_name(monkeypatch):
+    """Spec §1. Two keys, no AWS names: one proxy image serves both providers,
+    and an AWS variable leaking into an openrouter proxy is how a misrouted
+    deployment would authenticate against the wrong cloud."""
+    monkeypatch.setenv(OPENROUTER_KEY_ENV, "sk-or-test")
+    env = proxy_environment("live", "openrouter")
+    assert env == {OPENROUTER_KEY_ENV: "sk-or-test", PROVIDER_ENV: "openrouter"}
+
+
+def test_offline_mode_hands_the_proxy_nothing_for_either_provider():
+    assert proxy_environment("offline", "openrouter") == {}
+    assert proxy_environment("offline", "bedrock") == {}
+
+
+def test_a_missing_openrouter_key_refuses_before_the_proxy_is_built(monkeypatch):
+    monkeypatch.delenv(OPENROUTER_KEY_ENV, raising=False)
+    # Point the .env lookup at an empty directory so the operator's real
+    # key cannot make this test pass on one machine and fail on another.
+    monkeypatch.setattr("bakeoff.proxy.ENV_FILE", Path("/nonexistent/.env"))
+    with pytest.raises(SystemExit) as excinfo:
+        proxy_environment("live", "openrouter")
+    assert OPENROUTER_KEY_ENV in str(excinfo.value)
+
+
+def test_an_unknown_provider_is_a_programming_error_not_a_fallback():
+    with pytest.raises(ValueError):
+        proxy_environment("live", "azure")
+
+
+def test_the_openrouter_path_never_loads_botocore_or_the_bedrock_preflight():
+    """Spec §1, §8. Asserted in a fresh interpreter: the bedrock branch's
+    imports are module-level in scripts/smoke_bedrock.py, and a shared
+    import would drag botocore into a run that has no AWS credentials and no
+    reason to resolve any."""
+    code = (
+        "import sys\n"
+        "from bakeoff.proxy import proxy_environment\n"
+        "proxy_environment('live', 'openrouter')\n"
+        "leaked = [m for m in ('botocore', 'boto3', 'scripts.smoke_bedrock', 'smoke_bedrock') if m in sys.modules]\n"
+        "assert not leaked, leaked\n"
+    )
+    env = {**os.environ, OPENROUTER_KEY_ENV: "sk-or-test", "PYTHONPATH": str(BAKEOFF / "src")}
+    result = subprocess.run(
+        [sys.executable, "-c", code], env=env, capture_output=True, text=True, cwd=BAKEOFF
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_the_openrouter_window_has_no_expiry_and_never_stops_a_cell():
+    """A static key has no deadline to read. `None` here is 'nothing to
+    read', distinguished from botocore's 'could not read' by `source`, and
+    credential_stop must not refuse a cell over it -- the abort streak is the
+    backstop for a revoked key, as it already is for static AWS keys."""
+    window = credential_window("us-east-1", now=NOW, provider="openrouter")
+    assert window.expires_at is None
+    assert window.source == "openrouter-static"
+    assert credential_stop(window, NOW, 10_000) == ""
+
+
+def test_the_env_template_names_the_openrouter_key_first():
+    template = (BAKEOFF / ".env.example").read_text()
+    keys = [
+        line.split("=", 1)[0].strip()
+        for line in template.splitlines()
+        if "=" in line and not line.lstrip().startswith("#")
+    ]
+    assert keys[0] == OPENROUTER_KEY_ENV, keys
