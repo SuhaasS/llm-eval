@@ -27,7 +27,14 @@ from litellm.integrations.custom_logger import CustomLogger
 # whose docstring owns it. Importing it here is safe and importing
 # bakeoff.litellm_patches would not be -- that one applies its patches on
 # import. proxy_callback holds no patches, only the file-handoff contract.
-from bakeoff.proxy_callback import _error, _iso, finish_reason, project
+from bakeoff.proxy_callback import (
+    _error,
+    _iso,
+    finish_reason,
+    project,
+    upstream,
+    upstream_state,
+)
 from bakeoff.scanners import scan_secrets
 
 
@@ -169,6 +176,7 @@ class BakeoffCallback(CustomLogger):
             if error is not None
             else raw if isinstance(raw, dict) else {"raw_completion": str(raw)}
         )
+        upstream_provider, native_finish_reason, usage_cost = upstream(kwargs, payload)
         self.logger.log_call(
             # Projected through the shared allowlist, so this path and the proxy
             # one cannot drift: a run's canonical artifact is written from
@@ -190,13 +198,18 @@ class BakeoffCallback(CustomLogger):
                 # Same key as proxy_callback._write. A field on one capture
                 # path only reads as "this arm did not report one".
                 "finish_reason": finish_reason(payload),
-                # Same keys as proxy_callback._write, None on this path: the
-                # harness is the caller, no upstream stands behind it, and a
-                # key present on one capture path only would read as "this
-                # arm did not report one".
-                "upstream_provider": None,
-                "native_finish_reason": None,
-                "usage_cost": None,
+                # Same keys, and the same reader, as proxy_callback._write.
+                # NOT hardcoded None: unlike `resolved`, these are properties
+                # of the RESPONSE, so this path observes them exactly as well
+                # as the proxy path does whenever the route reports them --
+                # this callback receives the same kwargs and the same response
+                # object. Hardcoding None here would have filed "no upstream
+                # named itself" as a measurement on a run where one did.
+                # `upstream_state` says which kind of null a None is.
+                "upstream_provider": upstream_provider,
+                "native_finish_reason": native_finish_reason,
+                "usage_cost": usage_cost,
+                "upstream_state": upstream_state(upstream_provider),
                 # Measured generation time, as opposed to the trajectory
                 # parser's estimate from transcript timestamps.
                 "latency_ms": self._latency_ms(start_time, end_time),

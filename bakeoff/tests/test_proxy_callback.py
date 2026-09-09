@@ -689,6 +689,7 @@ def test_the_upstream_provider_and_cost_are_read_from_the_raw_provider_body(wire
     assert metadata["upstream_provider"] == "CoreWeave"
     assert metadata["native_finish_reason"] == "tool_calls"
     assert metadata["usage_cost"] == pytest.approx(0.000123)
+    assert metadata["upstream_state"] == "captured"
 
 
 def test_the_upstream_fields_fall_back_to_the_response_dump_then_to_none(wire_dir):
@@ -703,6 +704,81 @@ def test_the_upstream_fields_fall_back_to_the_response_dump_then_to_none(wire_di
     assert metadata["upstream_provider"] is None
     assert metadata["native_finish_reason"] is None
     assert metadata["usage_cost"] is None
+    assert metadata["upstream_state"] == "not_in_response"
+
+
+# What litellm 1.95.0 hands a STREAMING success callback: the output of
+# `stream_chunk_builder`, which rebuilds a ModelResponse from the chunks. It
+# carries `usage` (cost included) and drops OpenRouter's top-level `provider`
+# and `choices[].native_finish_reason`. `original_response` is unset too --
+# `llms/openai/openai.py::async_streaming` never calls `logging_obj.post_call`.
+ASSEMBLED_STREAM_DUMP = {
+    "id": "chatcmpl-abc",
+    "model": "moonshotai/kimi-k2.6",
+    "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "hi"}}],
+    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.000123},
+}
+
+
+def test_a_streaming_dump_with_no_provider_is_recorded_as_not_in_response(wire_dir):
+    """The shape every real OpenRouter call produces when the streaming hook
+    did not file anything. The cost survives the rebuild and the identity does
+    not, so `upstream_provider: null` here has to be distinguishable from a
+    bedrock entry's -- `upstream_state` is what distinguishes it, and
+    `upstream_providers` on the record reads None off it rather than []."""
+    kwargs = kwargs_for("run-stream")
+    assert "original_response" not in kwargs
+    BakeoffProxyCallback().log_success_event(kwargs, dict(ASSEMBLED_STREAM_DUMP), None, None)
+    metadata = read_run_entries(wire_dir, "run-stream")[0]["metadata"]
+    assert metadata["upstream_provider"] is None
+    assert metadata["native_finish_reason"] is None
+    assert metadata["upstream_state"] == "not_in_response"
+    # Cost still lands: stream_chunk_builder carries usage across, which is
+    # why the recovery channel does not need to carry it.
+    assert metadata["usage_cost"] == pytest.approx(0.000123)
+
+
+def test_the_streaming_hook_channel_supplies_what_the_rebuilt_dump_lost(wire_dir):
+    """Hop 2 for the upstream identity: a keyed dict joined on
+    litellm_call_id, because the value is produced in the streaming hook and
+    read in a callback that runs from a context copied before it."""
+    from bakeoff.proxy_callback import record_upstream
+
+    call_id = "call-hooked"
+    kwargs = {**kwargs_for("run-hooked"), "litellm_call_id": call_id}
+    # Two chunks, each carrying one half: OpenRouter names the provider on the
+    # first and the native finish reason on the last.
+    record_upstream(call_id, provider="CoreWeave")
+    record_upstream(call_id, native_finish_reason="tool_calls")
+    BakeoffProxyCallback().log_success_event(kwargs, dict(ASSEMBLED_STREAM_DUMP), None, None)
+    metadata = read_run_entries(wire_dir, "run-hooked")[0]["metadata"]
+    assert metadata["upstream_provider"] == "CoreWeave"
+    # Merged, not overwritten: the second chunk carried no provider and must
+    # not blank the first one's.
+    assert metadata["native_finish_reason"] == "tool_calls"
+    assert metadata["upstream_state"] == "captured"
+
+
+def test_an_unkeyed_upstream_capture_is_dropped_rather_than_guessed_at():
+    """Same rule as record_resolved_params: attributing a capture on
+    proximity puts one arm's upstream under another arm's entry."""
+    from bakeoff.proxy_callback import record_upstream, upstream_for
+
+    record_upstream(None, provider="CoreWeave")
+    record_upstream("", provider="CoreWeave")
+    assert upstream_for(None) is None
+    assert upstream_for("no-such-call") is None
+    record_upstream("call-empty", provider="", native_finish_reason=None)
+    assert upstream_for("call-empty") is None
+
+
+def test_the_upstream_channel_is_bounded():
+    """The proxy is long-lived; a capture nobody reads is a leak."""
+    from bakeoff import proxy_callback as pc
+
+    for index in range(pc._UPSTREAM_MAX + 40):
+        pc.record_upstream(f"bound-{index}", provider="CoreWeave")
+    assert len(pc._UPSTREAM_BY_CALL) <= pc._UPSTREAM_MAX
 
 
 def test_the_upstream_fields_never_come_from_the_configured_order(wire_dir):

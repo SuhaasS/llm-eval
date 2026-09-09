@@ -806,9 +806,14 @@ def test_no_successful_call_yields_none_not_an_empty_string():
 
 
 def _or_entry(provider, native="stop", cost=0.001, failed=False):
+    # upstream_state comes from the production function, not a literal, so the
+    # helper cannot drift from what the callbacks actually write.
+    from bakeoff.proxy_callback import upstream_state
+
     return {"metadata": {
         "failed": failed, "finish_reason": "stop",
         "upstream_provider": provider, "native_finish_reason": native, "usage_cost": cost,
+        "upstream_state": upstream_state(provider),
     }}
 
 
@@ -823,7 +828,17 @@ def test_upstream_providers_are_distinct_in_order_seen_and_skip_failures():
         _or_entry("Baseten", failed=True),
     ]
     assert upstream_providers(entries) == ["CoreWeave", "Fireworks"]
-    assert upstream_providers([]) == []
+
+
+def test_upstream_providers_is_none_when_no_entry_captured_one():
+    """None, not []. A bedrock run names no upstream because none exists; an
+    OpenRouter run whose capture broke names none because the capture broke.
+    [] renders those identically, which is the defect the state key closes."""
+    assert upstream_providers([]) is None
+    assert upstream_providers([_or_entry(None), _or_entry(None)]) is None
+    # A failed entry cannot license the list either: nothing answered.
+    assert upstream_providers([_or_entry("CoreWeave", failed=True)]) is None
+    assert upstream_providers([_or_entry(None), _or_entry("CoreWeave")]) == ["CoreWeave"]
 
 
 def test_the_terminal_native_finish_reason_is_the_last_returning_calls():

@@ -218,6 +218,78 @@ def resolved_params(call_id: str | None = None) -> dict[str, Any] | None:
     return dict(captured) if captured else None
 
 
+# The upstream's identity, filed by the streaming hook, read by the callback.
+#
+# Same shape as the resolved-params channel above and for the same measured
+# reason: a keyed dict in one process, joined on litellm's own
+# `litellm_call_id`, because a ContextVar set in a hook reads back unset in the
+# callback.
+#
+# Why a channel at all, when OpenRouter puts `provider` and
+# `native_finish_reason` in the response body: on a STREAMING call the callback
+# never sees that body. litellm 1.95.0's `openai/` streaming path
+# (`llms/openai/openai.py::async_streaming`) never calls `logging_obj.post_call`,
+# so `kwargs["original_response"]` is unset; and what reaches
+# `log_success_event` is `stream_chunk_builder(...)` output, which rebuilds a
+# ModelResponse from the chunks and carries neither the top-level `provider`
+# nor `choices[].native_finish_reason` across (it does carry `usage.cost`).
+# Every real call streams, so without this hop both fields are None on every
+# OpenRouter run -- which renders identically to a bedrock run, where no
+# upstream was ever named. `metadata.upstream_state` is the other half of that
+# fix and holds whether or not this channel is reachable.
+_UPSTREAM_BY_CALL: dict[str, dict[str, str]] = {}
+_UPSTREAM_LOCK = threading.Lock()
+_UPSTREAM_MAX = 512
+
+
+def record_upstream(
+    call_id: str | None,
+    provider: str | None = None,
+    native_finish_reason: str | None = None,
+) -> None:
+    """File what a raw chunk said about the upstream, under the call it is for.
+
+    MERGES rather than overwrites, and only over non-empty values: the two
+    facts arrive on different chunks -- OpenRouter names the provider on the
+    first and the native finish reason on the last -- so a later chunk carrying
+    only one of them must not blank out the other. Overwriting is what
+    `record_resolved_params` wants and is the wrong rule here.
+
+    A no-op without a call id: an unkeyed capture can only be attributed by
+    guessing, and one arm's upstream under another arm's entry is exactly the
+    failure the keying exists to prevent.
+    """
+    if not isinstance(call_id, str) or not call_id:
+        return
+    fields = {
+        "provider": provider,
+        "native_finish_reason": native_finish_reason,
+    }
+    present = {k: v for k, v in fields.items() if isinstance(v, str) and v}
+    if not present:
+        return
+    with _UPSTREAM_LOCK:
+        entry = _UPSTREAM_BY_CALL.setdefault(call_id, {})
+        entry.update(present)
+        while len(_UPSTREAM_BY_CALL) > _UPSTREAM_MAX:
+            _UPSTREAM_BY_CALL.pop(next(iter(_UPSTREAM_BY_CALL)))
+
+
+def upstream_for(call_id: str | None) -> dict[str, str] | None:
+    """What the streaming hook filed for THIS call, or None.
+
+    Read without consuming, for the same reason `resolved_params` is: a failed
+    call fires the failure callback twice under one call id, and a capture that
+    vanished on the first fire would make the duplicate look like a different
+    request.
+    """
+    if not isinstance(call_id, str) or not call_id:
+        return None
+    with _UPSTREAM_LOCK:
+        captured = _UPSTREAM_BY_CALL.get(call_id)
+    return dict(captured) if captured else None
+
+
 def _headers(kwargs: dict) -> dict[str, str]:
     """Request headers, wherever this LiteLLM version put them.
 
@@ -397,15 +469,36 @@ def upstream(kwargs: dict, response: dict[str, Any]) -> tuple[str | None, str | 
 
     OpenRouter returns top-level `provider`, `choices[].native_finish_reason`
     and -- with `usage: {include: true}` -- `usage.cost` in every response body
-    (spec 2026-09-08 §4). litellm's ModelResponse dump is not guaranteed to
-    preserve unknown top-level keys, so `kwargs["original_response"]` -- the
-    raw provider JSON litellm passes every success callback, as a string --
-    is read first and the dump second.
+    (spec 2026-09-08 §4). Three sources are consulted, in this order, because
+    each covers a case the next one does not:
+
+      1. the per-call channel above, filled by the streaming hook from the RAW
+         chunks. The only source that works on a streaming call, which is every
+         real call: litellm's `openai/` streaming path never calls
+         `logging_obj.post_call` and hands the callback a rebuilt
+         ModelResponse, so 2 is unset and 3 has already dropped both keys.
+      2. `kwargs["original_response"]`, the raw provider JSON litellm passes a
+         NON-streaming success callback, as a string.
+      3. the logged response dump, for a route that happens to preserve them.
+
+    `usage.cost` is not in the channel and does not need to be:
+    `stream_chunk_builder` carries usage across, so 3 answers for it.
 
     None, never the config's `provider.order`: that is what was ASKED for,
     and only the response says who answered. Verifying the pin per call is
     the whole point of the field; a fallback to config would verify nothing.
+    `metadata.upstream_state` beside the values says which of "no upstream was
+    named" and "no upstream stands behind this route" a None means.
     """
+    provider: str | None = None
+    native: str | None = None
+    cost: float | None = None
+
+    captured = upstream_for(kwargs.get("litellm_call_id"))
+    if captured:
+        provider = captured.get("provider") or None
+        native = captured.get("native_finish_reason") or None
+
     raw = kwargs.get("original_response")
     sources: list[dict[str, Any]] = []
     if isinstance(raw, (str, bytes)):
@@ -420,9 +513,6 @@ def upstream(kwargs: dict, response: dict[str, Any]) -> tuple[str | None, str | 
     if isinstance(response, dict):
         sources.append(response)
 
-    provider: str | None = None
-    native: str | None = None
-    cost: float | None = None
     for source in sources:
         if provider is None:
             value = source.get("provider")
@@ -441,6 +531,29 @@ def upstream(kwargs: dict, response: dict[str, Any]) -> tuple[str | None, str | 
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
                     cost = float(value)
     return provider, native, cost
+
+
+def upstream_state(upstream_provider: str | None) -> str:
+    """Why `upstream_provider` is null, when it is. One of:
+
+        captured        an upstream named itself on this call
+        not_in_response nothing in this call's chunks, raw body or logged dump
+                        named one
+
+    Without this, an OpenRouter run whose capture broke and a bedrock run,
+    where no upstream exists to name itself, write byte-identical entries --
+    two different absences rendering the same, which is the defect one layer
+    down from the null discipline this module is built on. `RunRecord.
+    upstream_providers` is `None` rather than `[]` on a run where no entry
+    says `captured`, for the same reason.
+
+    Deliberately shallow: it reports whether a value was obtained, never why
+    not. A finer verdict would have to name which of three sources was
+    supposed to answer, and on a streaming call that is the hook's business,
+    not this function's.
+    """
+    named = isinstance(upstream_provider, str) and bool(upstream_provider)
+    return "captured" if named else "not_in_response"
 
 
 def _iso(value: Any) -> str | None:
@@ -523,6 +636,10 @@ class BakeoffProxyCallback(CustomLogger):
                     "upstream_provider": upstream_provider,
                     "native_finish_reason": native_finish_reason,
                     "usage_cost": usage_cost,
+                    # Whether anybody named an upstream on this call, so a
+                    # broken capture on an OpenRouter run cannot read as a
+                    # bedrock run's honest silence. See upstream_state.
+                    "upstream_state": upstream_state(upstream_provider),
                     "latency_ms": latency,
                     # The real call boundaries, not the moment this callback got
                     # around to writing. Nothing else in the artifact carries

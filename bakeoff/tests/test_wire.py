@@ -312,6 +312,38 @@ def _proxy_kwargs(run_id: str) -> dict:
     }
 
 
+def test_the_in_process_path_reads_the_upstream_off_the_response_too(tmp_path):
+    """Not hardcoded None. These are properties of the RESPONSE, not of the
+    caller, so this path can observe them exactly as well as the proxy path --
+    and filing None where an upstream did name itself would be a measurement
+    the callback never made. (`resolved` stays None here for the opposite
+    reason: no second resolution exists on this path to observe.)"""
+    logger = WireLogger(tmp_path / "upstream.jsonl.gz")
+    callback = BakeoffCallback(logger, run_id="run-up")
+    callback.log_success_event(
+        _proxy_kwargs("run-up"),
+        {
+            "provider": "CoreWeave",
+            "choices": [{"finish_reason": "stop", "native_finish_reason": "stop"}],
+            "usage": {"cost": 0.5},
+        },
+        None,
+        None,
+    )
+    metadata = logger.entries()[0]["metadata"]
+    assert metadata["upstream_provider"] == "CoreWeave"
+    assert metadata["native_finish_reason"] == "stop"
+    assert metadata["usage_cost"] == 0.5
+    assert metadata["upstream_state"] == "captured"
+
+    callback.log_success_event(
+        _proxy_kwargs("run-up"), {"choices": [{"finish_reason": "stop"}]}, None, None
+    )
+    metadata = logger.entries()[1]["metadata"]
+    assert metadata["upstream_provider"] is None
+    assert metadata["upstream_state"] == "not_in_response"
+
+
 def test_both_capture_paths_write_the_same_metadata_keys(tmp_path, monkeypatch):
     """A key on one path only reads as 'this arm did not report one'."""
     from bakeoff.proxy_callback import BakeoffProxyCallback, read_run_entries
@@ -329,5 +361,7 @@ def test_both_capture_paths_write_the_same_metadata_keys(tmp_path, monkeypatch):
     )
     inproc_keys = set(logger.entries()[0]["metadata"])
 
-    assert {"upstream_provider", "native_finish_reason", "usage_cost"} <= proxy_keys
+    assert {
+        "upstream_provider", "native_finish_reason", "usage_cost", "upstream_state",
+    } <= proxy_keys
     assert proxy_keys - {"resolved_state"} == inproc_keys - {"bedrock_request_id"}

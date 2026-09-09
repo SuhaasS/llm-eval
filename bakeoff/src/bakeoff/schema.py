@@ -284,14 +284,21 @@ from typing import Any
 #
 # 3.9.0 adds `Versions.provider_route`, `upstream_providers`,
 # `terminal_native_finish_reason` and `cost_usd_provider` for the OpenRouter
-# route (spec 2026-09-08 §4). All four default to "not observed": "" / [] /
-# None. Every earlier record is a bedrock record, but the empty
-# `provider_route` on it is NOT to be read as "bedrock" -- the proxy never
-# said, and the record does not invent a route for it.
+# route (spec 2026-09-08 §4). All four default to "not observed": "" / None.
+# Every earlier record is a bedrock record, but the empty `provider_route` on
+# it is NOT to be read as "bedrock" -- the proxy never said, and the record
+# does not invent a route for it.
 #
 # `upstream_providers` is a list because OpenRouter can answer one run from
 # two upstreams, which is the fallback `allow_fallbacks: false` is configured
-# to forbid; a scalar would hide the one event the field exists to expose.
+# to forbid; a scalar would hide the one event the field exists to expose. It
+# is `list[str] | None` and not `list[str]` because the capture can fail: the
+# `openai/` streaming path drops the response's top-level `provider` before
+# any callback sees it, so an OpenRouter run whose hook did not fire would
+# write `[]` -- byte-identical to a bedrock run, where no upstream exists to
+# name itself. `None` is "nobody observed", carried by every wire entry as
+# `metadata.upstream_state`.
+#
 # `cost_usd_provider` is the provider's own figure summed over returning
 # calls, None if any returning call lacked it, beside the book's `cost_usd`;
 # the gap is reported, never reconciled.
@@ -790,10 +797,16 @@ class RunRecord:
     # stopped".
     terminal_finish_reason: str | None = None
     # Who answered, per OpenRouter's `provider` field, distinct and in the
-    # order seen across the run's returning wire entries. Empty on every
-    # bedrock run. More than one entry is a finding: the pinned upstream was
-    # not the only one that served this run.
-    upstream_providers: list[str] = field(default_factory=list)
+    # order seen across the run's returning wire entries. More than one entry
+    # is a finding: the pinned upstream was not the only one that served this
+    # run.
+    #
+    # None, NOT [], when no returning entry reports `upstream_state ==
+    # "captured"` -- nobody named an upstream, which is every bedrock run and
+    # also an OpenRouter run whose capture broke. [] would be a measurement
+    # ("we looked and the run was served by nobody"), and it is exactly the
+    # shape a bedrock run and a broken OpenRouter capture used to share.
+    upstream_providers: list[str] | None = None
     # The upstream's own word for how the last returning call stopped, beside
     # `terminal_finish_reason` (the route's word) -- one more mapping the
     # record would otherwise pass through unrecorded.

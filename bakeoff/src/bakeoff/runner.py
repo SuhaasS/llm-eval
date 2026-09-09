@@ -369,20 +369,32 @@ def terminal_finish_reason(entries: list[dict[str, Any]]) -> str | None:
     return None
 
 
-def upstream_providers(entries: list[dict[str, Any]]) -> list[str]:
+def upstream_providers(entries: list[dict[str, Any]]) -> list[str] | None:
     """Distinct `metadata.upstream_provider` values over RETURNING entries, in
     the order first seen. Failed entries are skipped: no upstream answered.
     Two values on a run pinned with allow_fallbacks:false is the finding the
-    field exists for (spec 2026-09-08 §4)."""
+    field exists for (spec 2026-09-08 §4).
+
+    None -- not [] -- when no returning entry says `upstream_state ==
+    "captured"`. Nobody named an upstream on this run, which is the ordinary
+    state of every bedrock run AND the state of an OpenRouter run whose
+    capture broke, and neither of those is the claim "this run was served by
+    no upstream" that an empty list makes. `[]` stays legal and means the
+    entries said `captured` and yet held no name, which is a contradiction
+    worth being able to see rather than one to fold into None.
+    """
     seen: list[str] = []
+    observed = False
     for entry in entries:
         metadata = entry.get("metadata") or {}
         if metadata.get("failed"):
             continue
+        if metadata.get("upstream_state") == "captured":
+            observed = True
         value = metadata.get("upstream_provider")
         if isinstance(value, str) and value and value not in seen:
             seen.append(value)
-    return seen
+    return seen if observed else None
 
 
 def terminal_native_finish_reason(entries: list[dict[str, Any]]) -> str | None:
