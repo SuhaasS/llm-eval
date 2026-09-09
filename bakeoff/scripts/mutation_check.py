@@ -74,10 +74,10 @@ MUTATIONS = [
         # route answers 400 to, on all three candidate arms.
         "adapter: stop renaming max_tokens, restoring Gemma's 0/3",
         "src/bakeoff/litellm_patches.py",
-        '                if "max_tokens" in mapped:\n'
-        '                    mapped["max_completion_tokens"] = mapped.pop("max_tokens")',
-        '                if False:\n'
-        '                    mapped["max_completion_tokens"] = mapped.pop("max_tokens")',
+        '                    if "max_tokens" in mapped:\n'
+        '                        mapped["max_completion_tokens"] = mapped.pop("max_tokens")',
+        '                    if False:\n'
+        '                        mapped["max_completion_tokens"] = mapped.pop("max_tokens")',
         "tests/test_litellm_patches.py -k max_completion",
         "not integration",
     ),
@@ -1690,6 +1690,51 @@ MUTATIONS = [
         '    with open(path, "a", encoding="utf-8") as handle:',
         '    with open(path, "w", encoding="utf-8") as handle:',
         "tests/test_grade_schema.py -k append_then_load",
+        "not integration",
+    ),
+    (
+        # Spec 2026-09-08 §3: the provider gate. Forcing the rewrites on
+        # under openrouter sends max_completion_tokens (no endpoint lists it;
+        # require_parameters -> zero providers) and pins reasoning_effort
+        # against extra_body.reasoning.
+        "openrouter: apply the mantle rewrites on every provider",
+        "src/bakeoff/litellm_patches.py",
+        '    return os.environ.get(_PROVIDER_ENV, "bedrock") != "openrouter"',
+        "    return True",
+        "tests/test_litellm_patches.py -k openrouter_the_two_mantle_rewrites",
+        "not integration",
+    ),
+    (
+        # The capture must run AFTER the rewrites, or `resolved` reports the
+        # pre-rename max_tokens with the provenance of an observation.
+        "openrouter: capture before the rewrites, reporting what did not go out",
+        "src/bakeoff/litellm_patches.py",
+        '                record_resolved_params({"model": model, **mapped})\n'
+        "            return mapped",
+        "            return mapped",
+        "tests/test_litellm_patches.py -k capture_records_the_rewritten",
+        "not integration",
+    ),
+    (
+        # Spec §6: a 402 falling through to `code = None` scores the
+        # operator's empty wallet as a model that did nothing.
+        "classify: drop the 402 branch",
+        "src/bakeoff/classify.py",
+        "        elif status == 402:\n"
+        "            # OpenRouter: the account balance is exhausted. The operator's\n"
+        "            # wallet, never the model.\n"
+        '            code = "api_credits"\n',
+        "",
+        "tests/test_classify.py -k exhausted_openrouter",
+        "not integration",
+    ),
+    (
+        # Spec §4: the field must never fall back to the configured order.
+        "callback: report the configured provider.order as the upstream",
+        "src/bakeoff/proxy_callback.py",
+        "    provider: str | None = None\n    native: str | None = None",
+        "    provider: str | None = (((kwargs.get('litellm_params') or {}).get('extra_body') or {}).get('provider') or {}).get('order', [None])[0]\n    native: str | None = None",
+        "tests/test_proxy_callback.py -k never_come_from_the_configured_order",
         "not integration",
     ),
 ]

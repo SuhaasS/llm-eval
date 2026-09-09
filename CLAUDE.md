@@ -37,13 +37,27 @@ cd bakeoff && .venv/bin/python scripts/verify_logger.py
 The **task** gate — separate from the logger gate, and deliberately not folded into it. Builds each task's image, materializes its start state, and proves inside the pinned image that the task is red before the reference fix and green after it. Needs a Docker daemon and, the first time a task is seen, network for the repo mirror; no credentials, no spend:
 
 ```bash
-cd bakeoff && .venv/bin/python scripts/run_matrix.py --preflight-only
+cd bakeoff && .venv/bin/python scripts/run_matrix.py --preflight-only            # openrouter (default)
+```
+
+```bash
+cd bakeoff && .venv/bin/python scripts/run_matrix.py --preflight-only --provider bedrock
 ```
 
 The collection driver. Runs task × model × sample, round-major with a recorded seed, resumable across invocations. It preflights every task before the proxy starts, so nothing is spent on a task that cannot be shown to discriminate:
 
 ```bash
-cd bakeoff && .venv/bin/python scripts/run_matrix.py --mode live --repeats 1
+cd bakeoff && .venv/bin/python scripts/run_matrix.py --mode live --repeats 1            # openrouter (default)
+```
+
+```bash
+cd bakeoff && .venv/bin/python scripts/run_matrix.py --mode live --repeats 1 --provider bedrock
+```
+
+The **OpenRouter gate** — run before the first paid matrix on the openrouter provider. Six checks (spec 2026-09-08 §7): provider pin, `require_parameters` viability, cache hit rate, thinking round trip through litellm's adapter, usage exclusivity, callback capture. Spends cents. Exits 1 with `GATE INCOMPLETE` on any failure; its JSON outputs are what `TASKS.md` cites:
+
+```bash
+cd bakeoff && .venv/bin/python scripts/probe_openrouter.py
 ```
 
 The offline grader. Runs *after* a collection, over the stored diffs, and writes one `GradeRecord` line per record to `<event-log>/grades/grades.jsonl`. The event log itself is never opened for writing. Resumable — a run already graded under this `GRADER_VERSION` is skipped unless `--re-grade`. Needs a Docker daemon and, per task, the repo mirror; no credentials, no spend:
@@ -77,7 +91,11 @@ cd bakeoff && .venv/bin/python scripts/smoke_test.py --mode offline
 ```
 
 ```bash
-cd bakeoff && .venv/bin/python scripts/smoke_bedrock.py && .venv/bin/python scripts/smoke_test.py --mode live
+cd bakeoff && .venv/bin/python scripts/smoke_test.py --mode live            # openrouter (default)
+```
+
+```bash
+cd bakeoff && .venv/bin/python scripts/smoke_bedrock.py && .venv/bin/python scripts/smoke_test.py --mode live --provider bedrock
 ```
 
 ## Architecture
@@ -153,6 +171,15 @@ These are enforced in code and asserted by tests. Breaking one is usually silent
 - **A pricing failure must not reach `parse_trajectory`'s caller.** `cost_usd` raises by design, but the call site catches per turn and records `pricing_error`. Letting it escape aborts the parse, and `assemble_record` then discards the whole trajectory — turns, tokens, tool calls and destructive events all zero for a run that worked. `cost_usd` is `float | None`: `None` is "price unknown", `0.0` is a genuine zero, and the two are not interchangeable.
 - **`mock_response` deployments short-circuit before the streaming wrapper**, so the success callback never fires and capture silently misses the call. Every real call is streaming — hence `fixtures/anthropic_stub.py`, a real streaming endpoint, for the offline smoke test.
 
+## OpenRouter gotchas
+
+- **`--provider openrouter` is the default; bedrock is `--provider bedrock`.** The config is `litellm_config_openrouter.yaml`, the credential is one static `OPENROUTER_API_KEY` in `.env`, and `credential_window` returns no expiry (`openrouter-static`). `StreakTracker` is the only backstop for a revoked or exhausted key.
+- **Provider pinning is load-bearing.** OpenRouter load-balances one model across upstreams with different quantizations and tool-call parsers. Every arm carries `provider.order` (one slug), `allow_fallbacks: false`, `require_parameters: true`. The record's `upstream_providers` is measured from the response's `provider` field, never the config; two values on one run is the finding. `fireworks/fast` serves K3 with **no `tools`**.
+- **`reasoning_effort` is dropped on every OpenRouter arm, not pinned.** litellm derives one from Claude Code's `thinking: adaptive`; K2.6's endpoints list `reasoning` but not `reasoning_effort`, so under `require_parameters` a derived effort is zero eligible providers. `extra_body.reasoning: {enabled: true}` is the knob and thinking-on is the policy. The two mantle rewrites in `litellm_patches` are off under `BAKEOFF_PROVIDER=openrouter`; the resolved-params capture is its own id (`openai_resolved_params_capture`) and stays on — it used to live inside the rewrite wrapper, and gating that off would have nulled `resolved` on every call.
+- **Cache-read has a price here.** CoreWeave K2.6 $0.15/M against $0.65 input; Fireworks K3 $0.30/M against $3.00. No write surcharge. Hit rate is unmeasured as of 2026-09-09; `scripts/probe_openrouter.py` check 3 settles it.
+- **Whether `output_tokens` is inclusive or exclusive of reasoning on this route is unmeasured as of 2026-09-09; `scripts/probe_openrouter.py` check 5 settles it.** If inclusive, `trajectory.py` needs a parse-time subtraction with its own `test_usage_accounting.py` pin — tracked in `TASKS.md` pending that result, the same reason Bedrock's cache-token subtraction is pinned there and not assumed here.
+- **OpenRouter's 402 is `api_credits`, its no-endpoint 404 is `router_no_endpoint`.** Both infra. A bare 404 is still nothing.
+
 ## Conventions
 
 - **Module and function docstrings carry the *why* and the failure mode**, cross-referenced to spec sections (`spec section 5.1`, `OPEN-10`). This is the dominant style — a change that alters an invariant should update the prose that explains it, and a comment that says what a line does rather than what breaks without it does not fit here.
@@ -172,6 +199,8 @@ These are enforced in code and asserted by tests. Breaking one is usually silent
 | [specs/2026-08-17-offline-grader-design.md](docs/superpowers/specs/2026-08-17-offline-grader-design.md) | The offline grader: the nine-check ladder, why the oracle is the manifest and only the quarantine is derived, and the `GradeRecord` field-by-field. Read before touching `grader.py` or `oracle.py`. |
 | [plans/2026-08-17-offline-grader.md](docs/superpowers/plans/2026-08-17-offline-grader.md) | The grader's implementation plan, Tasks 1–8, with the three revision rounds folded in. |
 | [specs/2026-08-18-judge-design.md](docs/superpowers/specs/2026-08-18-judge-design.md) | The judge: the second grading channel, unbuilt. Why it ranks and never gates, what the payload may not contain, and the κ dependency (OPEN-5) that blocks any number it produces. Read before writing `judge.py`. |
+| [specs/2026-09-08-openrouter-provider-design.md](docs/superpowers/specs/2026-09-08-openrouter-provider-design.md) | The OpenRouter provider route: the seam beside Bedrock, the mantle-rewrite gate, the classify codes, the wire metadata, and the six-check gate `probe_openrouter.py` runs before any paid matrix. |
+| [plans/2026-09-08-openrouter-provider.md](docs/superpowers/plans/2026-09-08-openrouter-provider.md) | The provider route's implementation plan, Tasks 1–10. |
 | [bakeoff/taskset/](bakeoff/taskset/) | The task set. One directory per task: `task.yaml` (§3.7) + `reference.diff`. `task_set_commit` on every record names this directory's git revision. |
 | [bakeoff/taskset/HARVESTING.md](bakeoff/taskset/HARVESTING.md) | What a candidate task has to satisfy, in three layers: refused by code, required-but-unchecked, and properties of the set. Carries the screened repository list and the measured reason each excluded repo is out. |
 | [docs/BUILDING-A-TASK-SET.md](docs/BUILDING-A-TASK-SET.md) | The procedural companion to `HARVESTING.md`: standing the harness up on a fresh machine, screening a corpus, cutting one task to a green preflight, then collecting and grading against a task set that lives outside this repo. Order of operations; `HARVESTING.md` remains the specification. |

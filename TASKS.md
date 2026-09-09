@@ -808,6 +808,42 @@ one ends a multi-day run outright.
   that the `bedrock/` Sonnet arm still reports `client_request` because no openai
   param mapping runs on its path.
 
+- [ ] **The bedrock corpus is not comparable with any openrouter record.**
+  25 records across 7 event logs under `~/.cache/bakeoff` were collected on new
+  models, a different provider, and Claude Code's `thinking: adaptive` mapped
+  through a different route — the openrouter arms also run with thinking on
+  (see the next item) where the bedrock corpus ran thinking-off throughout.
+  Never sum across `Versions.provider_route`; a reader who does is averaging
+  two different experiments and reporting one number.
+
+- [ ] **Thinking-on is now the policy on OpenRouter arms, and it has a cost.**
+  Bedrock's candidate arms ran thinking-off (`reasoning_effort` pinned to
+  `"none"`); OpenRouter's do not have that pin available (see the OpenRouter
+  gotchas in `CLAUDE.md` — a derived effort is zero eligible providers under
+  `require_parameters`), so `extra_body.reasoning: {enabled: true}` leaves
+  thinking on. Estimated **+20% to +60% per run** at 1k–3k reasoning
+  tokens/turn against the measured 163 output tokens/turn on kimi-k2-5's
+  bedrock corpus — an estimate, not a measurement; needs re-deriving once a
+  live openrouter matrix exists.
+
+- [ ] **Sonnet 5's reference arm on OpenRouter is deferred.**
+  `tests/test_config.py::test_no_deployment_targets_the_real_anthropic_api`
+  needs reconsidering before Sonnet can run through the openrouter provider —
+  today it enforces the opposite assumption (every deployment targets Bedrock)
+  and the openrouter arms are candidates only.
+
+- [ ] **Fireworks publishes no quantization for either Kimi model.**
+  Recorded here because the eval design calls out quantization as a §5.4
+  transport confound when it is known; Fireworks does not publish one for
+  `kimi-k2-6` or `kimi-k3`, so it stays an open gap rather than a pinned fact.
+
+- [ ] **Whether `trajectory.py` needs a parse-time subtraction for OpenRouter's
+  `output_tokens` is pending `scripts/probe_openrouter.py` check 5** (inclusive
+  vs. exclusive of reasoning tokens on this route) — unmeasured as of
+  2026-09-09. If check 5 reports inclusive, the subtraction and its
+  `test_usage_accounting.py` pin are their own item, tracked here until landed;
+  if exclusive, this item closes with no code change.
+
 ---
 
 ## P2 — Derivation gaps (Gate 3; safe to close after collection)
