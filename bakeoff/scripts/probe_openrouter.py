@@ -216,9 +216,13 @@ def leg_a(arm: str, params: dict[str, Any], key: str, k3_order: str | None, chec
     on one (a timeout, a non-JSON body, a connection drop) still lets the
     others run and still produces that check's JSON row."""
     results: list[dict[str, Any]] = []
-    order = params["extra_body"]["provider"]["order"]
-    if arm == "kimi-k3" and k3_order:
-        order = [k3_order]
+    try:
+        order = params["extra_body"]["provider"]["order"]
+        if arm == "kimi-k3" and k3_order:
+            order = [k3_order]
+    except Exception as exc:
+        results.append({"check": "leg_a_setup", "arm": arm, "pass": False, "error": f"{type(exc).__name__}: {exc}"})
+        return results
     with httpx.Client() as client:
         if 1 in checks:
             # 1 provider pin, 3 calls
@@ -355,6 +359,14 @@ def leg_b(arm: str, proxy, wire_dir: Path, checks: set[int]) -> list[dict[str, A
 # ------------------------------------------------------------------ driver
 
 
+def _write_check(r: dict[str, Any]) -> None:
+    """Writes one check's JSON immediately, not only in the final summary
+    loop -- a later arm's crash, or the proxy failing to start, must not cost
+    an earlier arm's already-paid-for rows their on-disk record."""
+    name = f"{r['arm']}-{r['check']}"
+    (OUT / f"{name}.json").write_text(json.dumps(r, indent=2, default=str))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--arm", action="append", help="kimi-k2-6 / kimi-k3 (default both)")
@@ -385,7 +397,19 @@ def main() -> int:
     results: list[dict[str, Any]] = []
     for arm in chosen:
         if checks & {1, 2, 3}:
-            results += leg_a(arm, arms[arm], key, args.k3_order, checks)
+            # leg_a contains its own per-check failures (see leg_a's own
+            # try/excepts) and its own config-shape failure (leg_a_setup).
+            # This wraps the call itself as a backstop, so a raise from
+            # anything else in leg_a still records one row for this arm and
+            # lets the remaining arms -- and Leg B -- run instead of losing
+            # every arm already processed to one raw traceback.
+            try:
+                arm_results = leg_a(arm, arms[arm], key, args.k3_order, checks)
+            except Exception as exc:
+                arm_results = [{"check": "leg_a", "arm": arm, "pass": False, "error": f"{type(exc).__name__}: {exc}"}]
+            for r in arm_results:
+                _write_check(r)
+            results += arm_results
 
     if not args.skip_proxy and checks & {4, 5, 6}:
         from bakeoff.images import build_proxy_image
@@ -398,17 +422,21 @@ def main() -> int:
             with Proxy("litellm_config_openrouter.yaml", wire_dir, proxy_environment("live", "openrouter"), f"probe-{stamp}",
                        image="bakeoff-litellm-proxy:matrix", repo_root=BAKEOFF) as proxy:
                 for arm in chosen:
-                    results += leg_b(arm, proxy, wire_dir, checks)
+                    arm_results = leg_b(arm, proxy, wire_dir, checks)
+                    for r in arm_results:
+                        _write_check(r)
+                    results += arm_results
         except Exception as exc:
-            results.append({"check": "proxy_start", "arm": "all", "pass": False, "error": f"{type(exc).__name__}: {exc}"})
+            row = {"check": "proxy_start", "arm": "all", "pass": False, "error": f"{type(exc).__name__}: {exc}"}
+            _write_check(row)
+            results.append(row)
 
     failed = 0
     for r in results:
-        name = f"{r['arm']}-{r['check']}"
-        (OUT / f"{name}.json").write_text(json.dumps(r, indent=2, default=str))
+        _write_check(r)  # idempotent: every row was already written as its arm/leg finished
         status = "PASS" if r.get("pass") else "FAIL"
         failed += not r.get("pass")
-        print(f"{status:4}  {name}")
+        print(f"{status:4}  {r['arm']}-{r['check']}")
     if failed:
         print(f"\nGATE INCOMPLETE: {failed} check(s) failed; see {OUT}")
         return 1
