@@ -224,6 +224,7 @@ def test_apply_is_idempotent():
         litellm_patches.TOOL_USE_ID_COLLISION_UNIQUIFY,
         litellm_patches.MAX_COMPLETION_TOKENS_RENAME,
         litellm_patches.REASONING_EFFORT_PINNED_NONE,
+        litellm_patches.OPENAI_RESOLVED_PARAMS_CAPTURE,
     ]
 
 
@@ -471,9 +472,10 @@ def test_the_manifest_records_what_the_proxy_did_to_itself(tmp_path):
     from bakeoff.proxy_callback import read_manifest, write_manifest
 
     write_manifest([litellm_patches.TOOL_USE_ID_PASSTHROUGH], "1.95.0", tmp_path)
-    patches, version = read_manifest(tmp_path)
+    patches, version, provider_route = read_manifest(tmp_path)
     assert patches == [litellm_patches.TOOL_USE_ID_PASSTHROUGH]
     assert version == "1.95.0"
+    assert provider_route == ""
 
 
 def test_an_absent_manifest_reports_nothing_rather_than_guessing(tmp_path):
@@ -481,7 +483,7 @@ def test_an_absent_manifest_reports_nothing_rather_than_guessing(tmp_path):
     that silence into a positive statement about the adapter."""
     from bakeoff.proxy_callback import read_manifest
 
-    assert read_manifest(tmp_path) == ([], "")
+    assert read_manifest(tmp_path) == ([], "", "")
 
 
 def test_importing_the_harness_does_not_patch_litellm():
@@ -778,3 +780,66 @@ def test_a_mapping_with_no_capture_open_is_a_no_op():
         drop_params=False,
     )
     assert resolved_params("some-other-call") is None
+
+
+# --- the provider seam (spec 2026-09-08 section 3) ---------------------------
+
+
+def _map(model="moonshotai/kimi-k2.6"):
+    import litellm
+
+    return litellm.OpenAIConfig().map_openai_params(
+        non_default_params={"max_tokens": 16, "reasoning_effort": "medium"},
+        optional_params={},
+        model=model,
+        drop_params=False,
+    )
+
+
+def test_under_openrouter_the_two_mantle_rewrites_are_off_and_capture_stays_on(monkeypatch):
+    """Spec §3. The rename sends a parameter no OpenRouter endpoint lists
+    (zero eligible providers under require_parameters) and the pin fights
+    extra_body.reasoning. But record_resolved_params lived inside the same
+    wrapper, so switching the wrapper off wholesale nulled `resolved` on
+    every call. The capture is its own id and is never gated."""
+    from bakeoff.proxy_callback import open_resolved_capture, resolved_params
+
+    monkeypatch.setenv("BAKEOFF_PROVIDER", "openrouter")
+    applied = litellm_patches.apply()
+    assert litellm_patches.OPENAI_RESOLVED_PARAMS_CAPTURE in applied
+    assert litellm_patches.MAX_COMPLETION_TOKENS_RENAME not in applied
+    assert litellm_patches.REASONING_EFFORT_PINNED_NONE not in applied
+
+    open_resolved_capture("call-openrouter")
+    mapped = _map()
+    assert mapped.get("max_tokens") == 16 and "max_completion_tokens" not in mapped
+    assert mapped.get("reasoning_effort") == "medium"
+    captured = resolved_params("call-openrouter")
+    assert captured is not None and captured["max_tokens"] == 16
+    open_resolved_capture(None)
+
+
+def test_under_bedrock_all_six_ids_apply_and_capture_records_the_rewritten_params(monkeypatch):
+    from bakeoff.proxy_callback import open_resolved_capture, resolved_params
+
+    monkeypatch.setenv("BAKEOFF_PROVIDER", "bedrock")
+    applied = litellm_patches.apply()
+    assert set(applied) >= {
+        litellm_patches.MAX_COMPLETION_TOKENS_RENAME,
+        litellm_patches.REASONING_EFFORT_PINNED_NONE,
+        litellm_patches.OPENAI_RESOLVED_PARAMS_CAPTURE,
+    }
+    open_resolved_capture("call-bedrock")
+    mapped = _map(model="google.gemma-4-31b")
+    assert mapped.get("max_completion_tokens") == 16 and "max_tokens" not in mapped
+    assert mapped.get("reasoning_effort") == "none"
+    # Capture runs AFTER the rewrites: `resolved` is what went out.
+    assert resolved_params("call-bedrock")["max_completion_tokens"] == 16
+    open_resolved_capture(None)
+
+
+def test_an_unset_provider_means_bedrock(monkeypatch):
+    """An invocation path that never sets BAKEOFF_PROVIDER behaves exactly as
+    it did before the seam existed."""
+    monkeypatch.delenv("BAKEOFF_PROVIDER", raising=False)
+    assert litellm_patches.MAX_COMPLETION_TOKENS_RENAME in litellm_patches.apply()

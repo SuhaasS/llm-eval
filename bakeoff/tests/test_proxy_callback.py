@@ -653,3 +653,17 @@ def test_a_null_resolved_says_which_kind_of_null_it_is(wire_dir):
     assert read_run_entries(wire_dir, "run-abc")[2]["metadata"][
         "resolved_state"
     ] == "captured"
+
+
+def test_the_manifest_round_trips_the_provider_route(tmp_path):
+    from bakeoff.proxy_callback import read_manifest, write_manifest
+
+    write_manifest(["a", "b"], "1.95.0", tmp_path, provider_route="openrouter")
+    assert read_manifest(tmp_path) == (["a", "b"], "1.95.0", "openrouter")
+
+
+def test_an_old_manifest_without_a_route_reads_as_no_claim(tmp_path):
+    (tmp_path / "adapter_patches.json").write_text('{"patches": ["a"], "litellm": "1.95.0"}')
+    from bakeoff.proxy_callback import read_manifest
+
+    assert read_manifest(tmp_path) == (["a"], "1.95.0", "")

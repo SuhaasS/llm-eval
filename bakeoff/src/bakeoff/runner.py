@@ -1388,8 +1388,9 @@ def execute_run(
     # says the proxy made no claim.
     adapter_patches: list[str] = []
     proxy_litellm = ""
+    provider_route = ""
     if proxy_wire_dir is not None:
-        adapter_patches, proxy_litellm = read_manifest(proxy_wire_dir)
+        adapter_patches, proxy_litellm, provider_route = read_manifest(proxy_wire_dir)
 
     unattributed_after = _unattributed(proxy_wire_dir)
     wire_unattributed = (

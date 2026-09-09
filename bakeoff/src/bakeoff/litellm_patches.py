@@ -187,6 +187,23 @@ TOOL_SCHEMA_PROPERTY_NAMES_STRIP = "anthropic_tool_schema_property_names_strip"
 TOOL_USE_ID_COLLISION_UNIQUIFY = "anthropic_tool_use_id_collision_uniquify"
 MAX_COMPLETION_TOKENS_RENAME = "openai_max_completion_tokens_rename"
 REASONING_EFFORT_PINNED_NONE = "openai_reasoning_effort_pinned_none"
+OPENAI_RESOLVED_PARAMS_CAPTURE = "openai_resolved_params_capture"
+
+# The env var the proxy is handed by proxy.proxy_environment. The literal is
+# repeated here rather than imported: this module must stay import-light
+# (importing it applies the patches), and bakeoff.proxy pulls in docker.
+_PROVIDER_ENV = "BAKEOFF_PROVIDER"
+
+
+def _rewrites_enabled() -> bool:
+    """Whether the two mantle-only rewrites apply. Read at call time so a
+    test can flip it in-process; in the proxy it never changes.
+
+    Absent means bedrock: an invocation path that never sets the variable
+    behaves exactly as it did before the provider seam existed.
+    """
+    return os.environ.get(_PROVIDER_ENV, "bedrock") != "openrouter"
+
 
 # The parameter, and the one value section 5.4 allows it to take. A constant
 # rather than a literal because the value IS the eval decision: every arm runs
@@ -507,8 +524,9 @@ def _apply_openai_param_pins() -> list[str]:
     of ``Versions.litellm_patches`` needs to know which one a record was
     written under.
 
-      MAX_COMPLETION_TOKENS_RENAME  the cap, under the spelling that still works
-      REASONING_EFFORT_PINNED_NONE  thinking off, uniformly and explicitly
+      MAX_COMPLETION_TOKENS_RENAME      the cap, under the spelling that still works   (bedrock only)
+      REASONING_EFFORT_PINNED_NONE      thinking off, uniformly and explicitly         (bedrock only)
+      OPENAI_RESOLVED_PARAMS_CAPTURE    what went out, filed under the call id         (every provider)
 
     POST-PROCESSING, not pre. Three separate things depend on it:
 
@@ -564,7 +582,8 @@ def _apply_openai_param_pins() -> list[str]:
         raise RuntimeError(
             "litellm.OpenAIConfig no longer defines map_openai_params: the "
             f"litellm pin moved and {MAX_COMPLETION_TOKENS_RENAME} / "
-            f"{REASONING_EFFORT_PINNED_NONE} would silently stop applying"
+            f"{REASONING_EFFORT_PINNED_NONE} / {OPENAI_RESOLVED_PARAMS_CAPTURE} "
+            "would silently stop applying"
         )
 
     original = litellm.OpenAIConfig.map_openai_params
@@ -591,48 +610,83 @@ def _apply_openai_param_pins() -> list[str]:
                 drop_params=drop_params,
             )
             if isinstance(mapped, dict):
-                if "max_tokens" in mapped:
-                    mapped["max_completion_tokens"] = mapped.pop("max_tokens")
-                # Assigned unconditionally, never set-if-absent: the value that
-                # would otherwise be here is the one derived from Claude Code's
-                # `thinking` block, and it is exactly what has to lose.
-                mapped[_REASONING_EFFORT] = _REASONING_EFFORT_VALUE
-                # Tell the wire log what the provider is actually getting.
-                # This is the ONLY place that knows: measured 2026-08-12, the
-                # success callback fires on the outer anthropic_messages call
-                # and the nested acompletion fires nothing, so every param this
-                # wrapper touches is invisible from where capture runs. Without
-                # this hand-off the log reports Claude Code's `max_tokens` for a
-                # call that carried `max_completion_tokens`, with the provenance
-                # of an observation.
-                #
-                # After the rewrites, never before: the whole point is what goes
-                # out, not what came in.
+                # THE TWO REWRITES, bedrock only (spec 2026-09-08 §3). On
+                # OpenRouter the rename names a parameter no endpoint lists,
+                # which under require_parameters is zero eligible providers,
+                # and the pin would fight the per-arm extra_body.reasoning.
+                if _rewrites_enabled():
+                    if "max_tokens" in mapped:
+                        mapped["max_completion_tokens"] = mapped.pop("max_tokens")
+                    # Assigned unconditionally, never set-if-absent: the value
+                    # that would otherwise be here is the one derived from
+                    # Claude Code's `thinking` block, and it is exactly what
+                    # has to lose.
+                    mapped[_REASONING_EFFORT] = _REASONING_EFFORT_VALUE
+                elif (
+                    _REASONING_EFFORT in non_default_params
+                    and _REASONING_EFFORT not in mapped
+                ):
+                    # "Off" has to mean untouched, not merely un-rewritten.
+                    # Verified against litellm 1.95.0:
+                    # OpenAIGPTConfig.get_supported_openai_params never lists
+                    # reasoning_effort for a non-o-series model, so `original`
+                    # above silently drops it before this wrapper ever runs --
+                    # independent of provider. OpenRouter's endpoints for these
+                    # models DO accept it (that is the whole reason the pin
+                    # fights extra_body.reasoning), so it is restored here
+                    # rather than left to litellm's own filter, which was
+                    # built for a different set of models.
+                    mapped[_REASONING_EFFORT] = non_default_params[_REASONING_EFFORT]
+                # THE CAPTURE, every provider, AFTER the rewrites. This is the
+                # ONLY place that knows what the provider is getting: measured
+                # 2026-08-12, the success callback fires on the outer
+                # anthropic_messages call and the nested acompletion fires
+                # nothing, so every param this wrapper touches is invisible
+                # from where capture runs. It used to sit inside the rewrite
+                # block; gating the block off for openrouter would have nulled
+                # `resolved` on every call, which is why it is its own id.
                 record_resolved_params({"model": model, **mapped})
             return mapped
 
         setattr(patched, _WRAPPED_MARKER, True)
         litellm.OpenAIConfig.map_openai_params = patched
 
-    # The observable behaviour, not the assignment: this is the check that
-    # would catch litellm moving either intervention somewhere this wrapper
-    # cannot see. A derived reasoning_effort goes in, so the probe also proves
-    # the pin BEATS one rather than merely filling a gap.
+    # The observable behaviour, not the assignment. A derived reasoning_effort
+    # goes in, so under bedrock the probe also proves the pin BEATS one rather
+    # than merely filling a gap, and under openrouter it proves the pin LEFT
+    # it alone.
     probe = litellm.OpenAIConfig().map_openai_params(
         non_default_params={"max_tokens": 16, _REASONING_EFFORT: "medium"},
         optional_params={},
         model="google.gemma-4-31b",
         drop_params=False,
     )
-    if probe.get("max_completion_tokens") != 16 or "max_tokens" in probe:
-        raise RuntimeError(
-            f"{MAX_COMPLETION_TOKENS_RENAME} did not take: got {probe!r}"
-        )
-    if probe.get(_REASONING_EFFORT) != _REASONING_EFFORT_VALUE:
-        raise RuntimeError(
-            f"{REASONING_EFFORT_PINNED_NONE} did not take: got {probe!r}"
-        )
-    return [MAX_COMPLETION_TOKENS_RENAME, REASONING_EFFORT_PINNED_NONE]
+    applied: list[str] = []
+    if _rewrites_enabled():
+        if probe.get("max_completion_tokens") != 16 or "max_tokens" in probe:
+            raise RuntimeError(
+                f"{MAX_COMPLETION_TOKENS_RENAME} did not take: got {probe!r}"
+            )
+        if probe.get(_REASONING_EFFORT) != _REASONING_EFFORT_VALUE:
+            raise RuntimeError(
+                f"{REASONING_EFFORT_PINNED_NONE} did not take: got {probe!r}"
+            )
+        applied += [MAX_COMPLETION_TOKENS_RENAME, REASONING_EFFORT_PINNED_NONE]
+    else:
+        if probe.get("max_tokens") != 16 or "max_completion_tokens" in probe:
+            raise RuntimeError(
+                f"openrouter: the max_tokens rename applied anyway: got {probe!r}"
+            )
+        if probe.get(_REASONING_EFFORT) != "medium":
+            raise RuntimeError(
+                f"openrouter: the reasoning_effort pin applied anyway: got {probe!r}"
+            )
+    # Capture is verified by the marker plus the in-process tests: exercising
+    # record_resolved_params here would need a call id in THIS context, and a
+    # ContextVar set at apply time leaks into every server task copied from
+    # it, attributing unkeyed captures to a probe id.
+    applied.append(OPENAI_RESOLVED_PARAMS_CAPTURE)
+    return applied
 
 
 def _report(patches: list[str]) -> Path | None:
@@ -650,7 +704,8 @@ def _report(patches: list[str]) -> Path | None:
     except Exception:  # noqa: BLE001 - a version lookup must not fail the proxy
         litellm_version = ""
     wire_dir = Path(os.environ.get("BAKEOFF_WIRE_DIR", "/eval/wire"))
-    return write_manifest(patches, litellm_version, wire_dir)
+    provider_route = os.environ.get(_PROVIDER_ENV, "")
+    return write_manifest(patches, litellm_version, wire_dir, provider_route=provider_route)
 
 
 class BakeoffAdapterPatches(CustomLogger):

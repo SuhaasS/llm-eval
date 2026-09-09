@@ -530,21 +530,28 @@ MANIFEST_NAME = "adapter_patches.json"
 
 
 def write_manifest(
-    patches: list[str], litellm_version: str, wire_dir: Path
+    patches: list[str], litellm_version: str, wire_dir: Path, provider_route: str = ""
 ) -> Path | None:
-    """Proxy side: record what this process did to its own litellm.
+    """Proxy side: record what this process did to its own litellm, and which
+    provider route it served.
 
     Written by the proxy about itself, deliberately. Section 6.1's rule is that
     configuration is never reported as observation -- a record must not claim a
     patch was active because a config file asked for one -- and the harness's
     own litellm version says nothing about the container, which pins its own.
+    `provider_route` is the proxy's reading of BAKEOFF_PROVIDER, not the
+    driver's flag; "" means the proxy made no claim.
     """
     try:
         wire_dir.mkdir(parents=True, exist_ok=True)
         path = wire_dir / MANIFEST_NAME
         path.write_text(
             json.dumps(
-                {"patches": sorted(patches), "litellm": litellm_version},
+                {
+                    "patches": sorted(patches),
+                    "litellm": litellm_version,
+                    "provider_route": provider_route,
+                },
                 sort_keys=True,
             )
         )
@@ -555,21 +562,26 @@ def write_manifest(
         return None
 
 
-def read_manifest(wire_dir: Path) -> tuple[list[str], str]:
-    """Harness side: what the proxy reported, or nothing if it reported nothing.
+def read_manifest(wire_dir: Path) -> tuple[list[str], str, str]:
+    """Harness side: (patches, litellm version, provider_route), or empties.
 
-    An absent manifest returns empty values. That is distinguishable from a
-    proxy reporting an empty patch set only by the litellm version also being
-    blank, and both readings are honest: neither invents a claim.
+    An absent manifest returns empty values. A manifest written before the
+    provider seam has no `provider_route` and reads "" -- no claim, not
+    "bedrock": the record must not invent a route for a proxy that never
+    said which one it served.
     """
     path = Path(wire_dir) / MANIFEST_NAME
     if not path.exists():
-        return [], ""
+        return [], "", ""
     try:
         data = json.loads(path.read_text())
     except (json.JSONDecodeError, OSError):
-        return [], ""
-    return [str(p) for p in (data.get("patches") or [])], str(data.get("litellm") or "")
+        return [], "", ""
+    return (
+        [str(p) for p in (data.get("patches") or [])],
+        str(data.get("litellm") or ""),
+        str(data.get("provider_route") or ""),
+    )
 
 
 def _parse_run_entries(wire_dir: Path, run_id: str) -> tuple[list[dict[str, Any]], int]:
