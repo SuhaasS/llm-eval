@@ -347,3 +347,41 @@ def test_harness_time_signals_leave_the_failure_class_undetermined():
     )
     assert classify_failure(clean) is None
     assert classify_exclusion(clean) is None
+
+
+def test_an_exhausted_openrouter_balance_is_an_infra_exclusion():
+    """Spec §6. OpenRouter's 402. Operator's wallet, not the model; a 4xx
+    with no branch fell through to `code = None` and the run scored as a
+    model that did nothing."""
+    exclusion = classify_exclusion(signals(
+        api_error_status=402,
+        terminal_error_messages=("OpenrouterException - Insufficient credits",),
+    ))
+    assert exclusion.reason_code == "api_credits"
+    assert exclusion.cls is ExclusionClass.INFRA_FAILURE
+
+
+def test_a_router_that_found_no_eligible_upstream_is_named_as_such():
+    """What require_parameters: true or a wrong `order` slug produces: a 404
+    whose body says no endpoint matched. Infra, and specifically the pin --
+    not the model, and not a generic 404."""
+    exclusion = classify_exclusion(signals(
+        api_error_status=404,
+        terminal_error_messages=("OpenrouterException - No endpoints found that support the requested parameters",),
+    ))
+    assert exclusion.reason_code == "router_no_endpoint"
+
+
+def test_a_bare_404_is_still_not_an_infra_failure():
+    assert classify_exclusion(signals(
+        api_error_status=404,
+        terminal_error_messages=("Not Found",),
+    )) is None
+
+
+def test_openrouters_missing_credentials_wording_is_an_auth_failure():
+    exclusion = classify_exclusion(signals(
+        api_error_status=None,
+        terminal_error_messages=("OpenrouterException - No auth credentials found",),
+    ))
+    assert exclusion.reason_code == "api_auth"

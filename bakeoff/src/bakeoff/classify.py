@@ -45,7 +45,9 @@ PRE_REGISTERED_REASONS: frozenset[str] = frozenset(
         "api_auth",
         "api_throttle",
         "api_timeout",
+        "api_credits",
         "router_no_deployment",
+        "router_no_endpoint",
         "tool_translation_failure",
         "task_defect_flaky_test",
         "task_defect_bad_base_sha",
@@ -90,6 +92,10 @@ AUTH_ERROR_SIGNATURES: tuple[str, ...] = (
     "invalid api key",
     "incorrect api key",
     "authenticationerror",
+    # OpenRouter's wording for a request with no Authorization header at all
+    # (a proxy started without OPENROUTER_API_KEY). Arrives as 401 too, but
+    # the router-refusal path can strip the status; see AUTH_ERROR_STATUSES.
+    "no auth credentials found",
 )
 
 # Statuses that mean auth wherever they appear in the terminal block.
@@ -114,6 +120,13 @@ AUTH_ERROR_STATUSES = (401, 403)
 # string is what the auth failure gets replaced by. Checked AFTER auth for
 # exactly that reason.
 NO_DEPLOYMENT_SIGNATURE = "no deployments available"
+
+# OpenRouter's 404 body when `provider.order` names an upstream that does not
+# serve the model, or when `require_parameters: true` finds no upstream that
+# accepts every parameter sent. Infra, and specifically the PIN -- the config's
+# fault, not the model's -- so it gets its own reason code rather than falling
+# into the generic-4xx `None` a bare 404 still yields.
+NO_ENDPOINT_SIGNATURE = "no endpoints found"
 
 
 @dataclass(frozen=True)
@@ -239,6 +252,12 @@ def classify_exclusion(signals: RunSignals) -> Exclusion | None:
             code = "api_throttle"
         elif status == 408:
             code = "api_timeout"
+        elif status == 402:
+            # OpenRouter: the account balance is exhausted. The operator's
+            # wallet, never the model.
+            code = "api_credits"
+        elif status == 404 and messages and NO_ENDPOINT_SIGNATURE in messages[-1]:
+            code = "router_no_endpoint"
         elif status >= 500:
             code = "api_5xx"
         else:
