@@ -4,7 +4,9 @@ Spec section 6.4 exists to tell an adapter failure apart from a model failure.
 This module removes five adapter failures that were being measured as model
 weakness. All were total, all were deterministic, and all had one-line causes
 -- which is the base rate to weigh before reading the next arm's failure as
-capability.
+capability. Two further interventions rewrite nothing and only observe; they
+are listed last, and each carries its own note on why observing needed a
+patch at all.
 
   anthropic_tool_use_id_passthrough        Kimi K2.5, below
   anthropic_tool_schema_property_names_strip   Gemma 4 31B, in the hook on
@@ -23,6 +25,13 @@ capability.
                                            unless reasoning_effort is
                                            explicitly "none", and absent is
                                            not "none"
+  openai_resolved_params_capture           observation: files what the
+                                           provider is actually sent, at the
+                                           one seam that knows
+  openai_upstream_stream_capture           observation: files which upstream
+                                           OpenRouter routed to, at the last
+                                           place the raw chunk still carries
+                                           it
 
 THE FIRST DEFECT. Kimi K2.5 emits tool-call ids of the form ``functions.Read:0``.
 LiteLLM's ``normalize_anthropic_tool_use_id`` rewrites every character outside
@@ -167,7 +176,9 @@ Verified against litellm 1.95.0.
 
 from __future__ import annotations
 
+import functools
 import os
+from collections.abc import Mapping
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
@@ -178,7 +189,12 @@ from litellm.integrations.custom_logger import CustomLogger
 # HARNESS has to read it and importing THIS module applies its patches -- the
 # same reason write_manifest lives over there. The dependency runs in this
 # direction only, and proxy_callback imports nothing from here.
-from bakeoff.proxy_callback import open_resolved_capture, record_resolved_params
+from bakeoff.proxy_callback import (
+    current_call_id,
+    open_resolved_capture,
+    record_resolved_params,
+    record_upstream,
+)
 
 # Stable identifiers recorded on every run record. Changing one changes what
 # the log claims was done to the adapter, so these are names, not descriptions.
@@ -188,6 +204,7 @@ TOOL_USE_ID_COLLISION_UNIQUIFY = "anthropic_tool_use_id_collision_uniquify"
 MAX_COMPLETION_TOKENS_RENAME = "openai_max_completion_tokens_rename"
 REASONING_EFFORT_PINNED_NONE = "openai_reasoning_effort_pinned_none"
 OPENAI_RESOLVED_PARAMS_CAPTURE = "openai_resolved_params_capture"
+OPENAI_UPSTREAM_STREAM_CAPTURE = "openai_upstream_stream_capture"
 
 # The env var the proxy is handed by proxy.proxy_environment. The literal is
 # repeated here rather than imported: this module must stay import-light
@@ -429,6 +446,7 @@ def apply() -> list[str]:
 
     applied.append(_apply_collision_uniquify())
     applied.extend(_apply_openai_param_pins())
+    applied.append(_apply_upstream_stream_capture())
     return applied
 
 
@@ -684,6 +702,188 @@ def _apply_openai_param_pins() -> list[str]:
     # it, attributing unkeyed captures to a probe id.
     applied.append(OPENAI_RESOLVED_PARAMS_CAPTURE)
     return applied
+
+
+# THE SIXTH INTERVENTION, and the only one that is pure observation: it
+# rewrites nothing and exists because a field the record needs is destroyed
+# before anything the harness can register gets to see it.
+#
+# WHAT IS LOST. OpenRouter answers with a top-level ``provider`` naming the
+# upstream that served the call, and ``choices[].native_finish_reason`` -- the
+# upstream's own word for why generation stopped. Verifying the ``order`` pin
+# per call is the whole reason `RunRecord.upstream_providers` exists, and
+# ``allow_fallbacks: false`` is a request, not a proof.
+#
+# WHY NO CALLBACK OR HOOK CAN SEE THEM, traced through litellm 1.95.0. Every
+# real call streams, and on the streaming path:
+#
+#   * ``llms/openai/openai.py::async_streaming`` never calls
+#     ``logging_obj.post_call``, so ``kwargs["original_response"]`` -- the raw
+#     provider JSON a NON-streaming success callback gets -- is never set.
+#   * what reaches ``log_success_event`` is ``stream_chunk_builder`` output,
+#     which rebuilds a ModelResponse and carries neither key across (it does
+#     carry ``usage.cost``, which is why the cost field needs no rescue).
+#   * ``async_post_call_streaming_hook`` IS dispatched on /v1/messages, but
+#     ``ProxyLogging.async_post_call_streaming_hook`` hands a CustomLogger
+#     ``response=complete_response`` -- the accumulated text STRING, not the
+#     chunk. There is nothing to read a provider off.
+#   * ``async_post_call_streaming_iterator_hook`` is dispatched too and does
+#     receive chunk objects, but by then they are AnthropicStreamWrapper
+#     output: Anthropic SSE events translated from the OpenAI chunks, several
+#     layers after the keys are gone.
+#
+# So the last place both keys still exist is the raw provider chunk, and the
+# last code to hold one is ``CustomStreamWrapper.chunk_creator``. The keys
+# survive that far only because the OpenAI SDK's models are ``extra="allow"``
+# -- verified in this venv: ChatCompletionChunk(**raw).model_extra is
+# {'provider': ...} and the choice's is {'native_finish_reason': ...}. Note
+# what happens one layer down: ``OpenAIChatCompletionStreamingHandler.
+# chunk_parser`` rebuilds ModelResponseStream from an explicit key whitelist
+# (id/object/created/model/choices/usage), so the top-level provider dies
+# there on the httpx path too. Either way, chunk_creator is upstream of the
+# loss.
+#
+# WHY THE CALL ID IS SNAPSHOTTED AT CONSTRUCTION. Same measured boundary as
+# the collision-uniquify patch above: a stream wrapper's ``__init__`` runs in
+# the handler coroutine, in the request's own context, and the per-chunk
+# translation runs in a task whose context was copied before the hook. So the
+# id is read once at __init__ and carried on the object.
+#
+# PROVIDER-NEUTRAL, applied on every route. A bedrock chunk carries neither
+# key, ``record_upstream`` files nothing, and the entry reads
+# ``upstream_state: not_in_response`` -- which is the truth there. Scoping it
+# to openrouter would make transport a per-arm difference (section 5.4) for
+# no gain.
+#
+# TOTAL, by construction. This runs inside the paid stream: a raise here does
+# not degrade an observation, it destroys the run the observation is about.
+_UPSTREAM_CAPTURE_MARKER = "_bakeoff_upstream_capture"
+_UPSTREAM_CALL_ID_ATTR = "_bakeoff_upstream_call_id"
+_UPSTREAM_SEEN_ATTR = "_bakeoff_upstream_seen"
+
+
+def _upstream_from_chunk(chunk: Any) -> tuple[str | None, str | None]:
+    """(provider, native_finish_reason) off ONE raw provider chunk.
+
+    A pure function so the extraction is testable without a proxy, a stream or
+    a network. Reads attributes first (the OpenAI SDK shape) and mapping keys
+    second (the httpx shape), because both reach chunk_creator depending on
+    which client litellm chose for the deployment.
+
+    Returns Nones for a chunk that carries neither, which is every chunk on
+    every bedrock arm and most chunks on an OpenRouter one -- the provider is
+    named on the first chunk and the native finish reason on the last.
+    """
+    def _read(source: Any, key: str) -> str | None:
+        value = None
+        if isinstance(source, Mapping):
+            value = source.get(key)
+        else:
+            value = getattr(source, key, None)
+            if value is None:
+                extra = getattr(source, "model_extra", None)
+                if isinstance(extra, Mapping):
+                    value = extra.get(key)
+        return value if isinstance(value, str) and value else None
+
+    provider = _read(chunk, "provider")
+
+    native = None
+    choices = chunk.get("choices") if isinstance(chunk, Mapping) else getattr(chunk, "choices", None)
+    if isinstance(choices, (list, tuple)) and choices:
+        native = _read(choices[0], "native_finish_reason")
+    return provider, native
+
+
+def _apply_upstream_stream_capture() -> str:
+    """Patch the streaming wrapper to file the upstream's identity. Idempotent."""
+    from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
+
+    for name in ("__init__", "chunk_creator"):
+        if name not in vars(CustomStreamWrapper):
+            raise RuntimeError(
+                f"CustomStreamWrapper no longer defines {name}: the litellm pin "
+                f"moved and {OPENAI_UPSTREAM_STREAM_CAPTURE} would silently stop "
+                "applying"
+            )
+
+    original_init = CustomStreamWrapper.__init__
+    if not getattr(original_init, _UPSTREAM_CAPTURE_MARKER, False):
+
+        @functools.wraps(original_init)
+        def patched_init(self, *args, **kwargs):
+            result = original_init(self, *args, **kwargs)
+            try:
+                # The hook's id first: it is the one the success callback
+                # joins on. The logging object's own id is the fallback for a
+                # route that never reached the hook -- filing under it is
+                # harmless (nobody reads that key) and filing under NOTHING
+                # would lose a capture on a route where the two agree.
+                call_id = current_call_id()
+                if call_id is None:
+                    details = getattr(
+                        getattr(self, "logging_obj", None), "model_call_details", None
+                    )
+                    if isinstance(details, Mapping):
+                        candidate = details.get("litellm_call_id")
+                        call_id = candidate if isinstance(candidate, str) else None
+                setattr(self, _UPSTREAM_CALL_ID_ATTR, call_id)
+                setattr(self, _UPSTREAM_SEEN_ATTR, set())
+            except Exception:  # noqa: BLE001 - observation may not cost the run
+                pass
+            return result
+
+        setattr(patched_init, _UPSTREAM_CAPTURE_MARKER, True)
+        CustomStreamWrapper.__init__ = patched_init
+
+    original_chunk_creator = CustomStreamWrapper.chunk_creator
+    if not getattr(original_chunk_creator, _UPSTREAM_CAPTURE_MARKER, False):
+
+        @functools.wraps(original_chunk_creator)
+        def patched_chunk_creator(self, chunk, *args, **kwargs):
+            try:
+                seen = getattr(self, _UPSTREAM_SEEN_ATTR, None)
+                if seen is not None and len(seen) < 2:
+                    provider, native = _upstream_from_chunk(chunk)
+                    # Only the FIRST sighting of each: a stream is hundreds of
+                    # chunks and the values do not change within one call, so
+                    # re-filing them would take the lock for nothing.
+                    if provider is not None and "provider" in seen:
+                        provider = None
+                    if native is not None and "native" in seen:
+                        native = None
+                    if provider is not None or native is not None:
+                        record_upstream(
+                            getattr(self, _UPSTREAM_CALL_ID_ATTR, None),
+                            provider=provider,
+                            native_finish_reason=native,
+                        )
+                        if provider is not None:
+                            seen.add("provider")
+                        if native is not None:
+                            seen.add("native")
+            except Exception:  # noqa: BLE001 - observation may not cost the run
+                pass
+            return original_chunk_creator(self, chunk, *args, **kwargs)
+
+        setattr(patched_chunk_creator, _UPSTREAM_CAPTURE_MARKER, True)
+        CustomStreamWrapper.chunk_creator = patched_chunk_creator
+
+    # The observable behaviour of the half that CAN be probed without a
+    # stream. That the patched wrapper is reached at all is the offline gate's
+    # claim, not this function's -- the same division as the propertyNames
+    # hook above.
+    probe = _upstream_from_chunk(
+        {
+            "provider": "CoreWeave",
+            "choices": [{"index": 0, "native_finish_reason": "stop"}],
+        }
+    )
+    if probe != ("CoreWeave", "stop"):
+        raise RuntimeError(
+            f"{OPENAI_UPSTREAM_STREAM_CAPTURE} did not take: got {probe!r}"
+        )
+    return OPENAI_UPSTREAM_STREAM_CAPTURE
 
 
 def _report(patches: list[str]) -> Path | None:

@@ -225,6 +225,7 @@ def test_apply_is_idempotent():
         litellm_patches.MAX_COMPLETION_TOKENS_RENAME,
         litellm_patches.REASONING_EFFORT_PINNED_NONE,
         litellm_patches.OPENAI_RESOLVED_PARAMS_CAPTURE,
+        litellm_patches.OPENAI_UPSTREAM_STREAM_CAPTURE,
     ]
 
 
@@ -796,6 +797,126 @@ def _map(model="moonshotai/kimi-k2.6"):
     )
 
 
+# --- the upstream identity, destroyed before any callback sees it ------------
+
+
+def _openrouter_sdk_chunk(provider=None, native=None, content="hi"):
+    """A raw OpenAI-SDK streaming chunk, the shape chunk_creator receives.
+
+    Built from the SDK's own type rather than a stub: the whole reason the
+    keys survive to chunk_creator is that the SDK's models are extra="allow",
+    and a duck-typed object would pass a test the real chunk shape decides.
+    """
+    from openai.types.chat import ChatCompletionChunk
+
+    choice = {"index": 0, "delta": {"content": content}, "finish_reason": None}
+    if native is not None:
+        choice["native_finish_reason"] = native
+    body = {
+        "id": "gen-1", "object": "chat.completion.chunk", "created": 1,
+        "model": "moonshotai/kimi-k2.6", "choices": [choice],
+    }
+    if provider is not None:
+        body["provider"] = provider
+    return ChatCompletionChunk(**body)
+
+
+def test_the_sdk_chunk_is_what_still_carries_the_openrouter_keys():
+    """The premise of the whole patch, pinned against the SDK in this venv.
+
+    litellm's own ModelResponseStream does not carry them: the openai
+    streaming handler rebuilds it from an explicit key whitelist
+    (id/object/created/model/choices/usage). If the SDK ever stopped allowing
+    extra keys, the capture would go silently empty rather than fail."""
+    chunk = _openrouter_sdk_chunk(provider="CoreWeave", native="stop")
+    assert chunk.model_extra == {"provider": "CoreWeave"}
+    assert chunk.choices[0].model_extra == {"native_finish_reason": "stop"}
+    assert litellm_patches._upstream_from_chunk(chunk) == ("CoreWeave", "stop")
+
+
+def test_upstream_extraction_reads_both_chunk_shapes_and_neither_when_absent():
+    assert litellm_patches._upstream_from_chunk(
+        {"provider": "Fireworks", "choices": [{"native_finish_reason": "length"}]}
+    ) == ("Fireworks", "length")
+    # A bedrock chunk: neither key, and nothing is invented for it.
+    assert litellm_patches._upstream_from_chunk(_openrouter_sdk_chunk()) == (None, None)
+    assert litellm_patches._upstream_from_chunk({"choices": []}) == (None, None)
+    assert litellm_patches._upstream_from_chunk(object()) == (None, None)
+
+
+def test_the_stream_wrapper_files_the_upstream_under_the_hooks_call_id():
+    """The recovery channel end to end, minus the network.
+
+    The success callback cannot read these: on a streaming call
+    `original_response` is never set and what it gets is stream_chunk_builder
+    output, which drops both keys. So the capture has to happen at the last
+    place the raw chunk exists, keyed by the id the callback will join on --
+    snapshotted at __init__ because the per-chunk translation runs in a task
+    whose context was copied before the pre-request hook.
+    """
+    from bakeoff.proxy_callback import (
+        open_resolved_capture,
+        upstream_for,
+    )
+    from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
+
+    litellm_patches.apply()
+    open_resolved_capture("call-stream")
+    try:
+        wrapper = CustomStreamWrapper(
+            completion_stream=iter([]),
+            model="moonshotai/kimi-k2.6",
+            custom_llm_provider="openai",
+            logging_obj=_LoggingStub(),
+        )
+        assert getattr(wrapper, litellm_patches._UPSTREAM_CALL_ID_ATTR) == "call-stream"
+        # Two chunks, each carrying one half, exactly as OpenRouter sends them.
+        for chunk in (
+            _openrouter_sdk_chunk(provider="CoreWeave"),
+            _openrouter_sdk_chunk(native="tool_calls", content=""),
+        ):
+            try:
+                wrapper.chunk_creator(chunk=chunk)
+            except Exception:  # noqa: BLE001 - the parse is not under test here
+                pass
+        assert upstream_for("call-stream") == {
+            "provider": "CoreWeave", "native_finish_reason": "tool_calls",
+        }
+    finally:
+        open_resolved_capture(None)
+
+
+def test_a_capture_failure_cannot_break_the_stream_it_is_observing(monkeypatch):
+    """This runs inside the paid stream. A raise here does not degrade an
+    observation, it destroys the run the observation is about -- the same rule
+    checkpoint capture is held to. So the extraction blowing up is swallowed
+    and the chunk still goes through the real parser."""
+    from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
+
+    litellm_patches.apply()
+    wrapper = CustomStreamWrapper(
+        completion_stream=iter([]),
+        model="moonshotai/kimi-k2.6",
+        custom_llm_provider="openai",
+        logging_obj=_LoggingStub(),
+    )
+
+    def explode(chunk):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(litellm_patches, "_upstream_from_chunk", explode)
+    parsed = wrapper.chunk_creator(chunk=_openrouter_sdk_chunk(provider="CoreWeave"))
+    assert parsed is None or parsed.choices[0].delta.content == "hi"
+
+
+class _LoggingStub:
+    """The two attributes CustomStreamWrapper.__init__ reads."""
+
+    def __init__(self) -> None:
+        self.model_call_details = {"litellm_params": {}, "litellm_call_id": "inner-id"}
+        self.stream_options = None
+
+
 def test_under_openrouter_the_two_mantle_rewrites_are_off_and_capture_stays_on(monkeypatch):
     """Spec §3. The rename sends a parameter no OpenRouter endpoint lists
     (zero eligible providers under require_parameters) and the pin fights
@@ -824,7 +945,7 @@ def test_under_openrouter_the_two_mantle_rewrites_are_off_and_capture_stays_on(m
     open_resolved_capture(None)
 
 
-def test_under_bedrock_all_six_ids_apply_and_capture_records_the_rewritten_params(monkeypatch):
+def test_under_bedrock_all_ids_apply_and_capture_records_the_rewritten_params(monkeypatch):
     from bakeoff.proxy_callback import open_resolved_capture, resolved_params
 
     monkeypatch.setenv("BAKEOFF_PROVIDER", "bedrock")

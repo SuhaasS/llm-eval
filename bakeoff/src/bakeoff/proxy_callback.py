@@ -161,6 +161,20 @@ def open_resolved_capture(call_id: str | None = None) -> str | None:
     return call_id
 
 
+def current_call_id() -> str | None:
+    """The call id the pre-request hook filed for THIS request context, or None.
+
+    Read by anything that has to key a capture and does not receive the id in
+    its own arguments -- the streaming stream-wrapper patch is the case. The
+    ContextVar reaches a place iff that place runs in the request's own
+    context; the measured boundary is that a stream WRAPPER's construction
+    does and the per-chunk translation beneath it does not, which is why the
+    id is snapshotted at construction rather than read per chunk.
+    """
+    call_id = _CURRENT_CALL_ID.get()
+    return call_id if isinstance(call_id, str) and call_id else None
+
+
 def record_resolved_params(params: Mapping[str, Any]) -> None:
     """File what the provider is actually being sent, under the call it is for.
 
