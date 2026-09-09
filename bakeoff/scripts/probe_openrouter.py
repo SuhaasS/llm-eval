@@ -20,8 +20,22 @@ Two legs, because two different things are under test:
     6  callback capture    upstream_provider, native_finish_reason, usage_cost,
                            resolved_state == captured, no unattributed.jsonl
 
+`--checks` gates per CHECK, not per leg: `leg_a`/`leg_b` skip any check whose
+number is not selected, so `--checks 1,2 --skip-proxy` never runs check 3's
+ten paid calls. Checks 5 and 6 read the wire entries turn 1 (and, when the
+model calls the tool, turn 2) produces, so those turns still run whenever 5
+or 6 is selected even if 4 itself is not (see the comment in `leg_b`).
+
 Leg B posts from INSIDE the proxy container (`docker exec`), the same trick
 Proxy._wait uses: the internal network has no host route.
+
+No individual check's transport failure may abort the run: each check is
+wrapped in its own try/except so a timeout or a Docker error on one check
+still lets every other requested check run and write its JSON, and the row
+for the failed check carries the exception instead of nothing (spec's
+"Silence is the enemy" -- a check that raised and a check that was never
+attempted must not look the same). A failure starting the proxy container
+itself is recorded as a single `proxy_start` row rather than aborting Leg B.
 
 Any failure prints GATE INCOMPLETE and exits 1 -- the wording verify_logger.py
 uses, so a weaker gate does not pass under the same name. Outputs one JSON
@@ -57,6 +71,7 @@ from bakeoff.envfile import load_env_file  # noqa: E402
 OPENROUTER = "https://openrouter.ai/api/v1/chat/completions"
 CONFIG = BAKEOFF / "config" / "litellm_config_openrouter.yaml"
 OUT = Path(os.environ.get("BAKEOFF_PROBE_OUT", BAKEOFF / "probe_openrouter_out"))
+ALL_CHECKS = frozenset(range(1, 7))
 
 # The parameter set Claude Code's request resolves to on the openai/ provider
 # after litellm's adapter and the config's drops (check 2). Verified against
@@ -132,6 +147,32 @@ def check_usage_exclusive(anthropic: dict[str, Any], openai: dict[str, Any]) -> 
     }
 
 
+def parse_checks(spec: str) -> set[int]:
+    """Parse `--checks` into a validated set of check numbers 1..6.
+
+    Raises ValueError with a message safe to print directly, so `main` can
+    turn a bad value into a one-line exit(2) without re-deriving the reason.
+    """
+    try:
+        checks = {int(c) for c in spec.split(",")}
+    except ValueError:
+        raise ValueError(f"--checks must be a comma-separated list of integers 1..6, got {spec!r}") from None
+    if not checks or not checks <= ALL_CHECKS:
+        raise ValueError(f"--checks must be within 1..6, got {sorted(checks)}")
+    return checks
+
+
+def unknown_arms(requested: list[str] | None, available: set[str]) -> str | None:
+    """`None` if every requested --arm is a configured model name; else a
+    printable message naming the first one that is not."""
+    if not requested:
+        return None
+    bad = [a for a in requested if a not in available]
+    if not bad:
+        return None
+    return f"unknown --arm {bad[0]!r}; expected one of {sorted(available)}"
+
+
 # ------------------------------------------------------------------ Leg A
 
 
@@ -170,28 +211,43 @@ def post_openrouter(client: httpx.Client, key: str, body: dict[str, Any]) -> dic
     return data
 
 
-def leg_a(arm: str, params: dict[str, Any], key: str, k3_order: str | None) -> list[dict[str, Any]]:
-    results = []
+def leg_a(arm: str, params: dict[str, Any], key: str, k3_order: str | None, checks: set[int]) -> list[dict[str, Any]]:
+    """Runs only the requested checks; each is contained so a transport error
+    on one (a timeout, a non-JSON body, a connection drop) still lets the
+    others run and still produces that check's JSON row."""
+    results: list[dict[str, Any]] = []
     order = params["extra_body"]["provider"]["order"]
     if arm == "kimi-k3" and k3_order:
         order = [k3_order]
     with httpx.Client() as client:
-        # 1 provider pin, 3 calls
-        responses = [post_openrouter(client, key, openrouter_body(params, [{"role": "user", "content": "Say ok."}], tools=False, order=order)) for _ in range(3)]
-        results.append({**check_provider_pin(order[0], responses), "arm": arm, "statuses": [r["_status"] for r in responses]})
-        # 2 require_parameters with Claude Code's parameter set
-        r = post_openrouter(client, key, openrouter_body(params, [{"role": "user", "content": "List the files. Use the tool."}], tools=True, order=order))
-        results.append({"check": "require_parameters", "arm": arm, "status": r["_status"], "body": r if r["_status"] != 200 else None, "pass": r["_status"] == 200})
-        # 3 cache fires, 5 replicates, 3 s apart
-        pairs = []
-        for i in range(5):
-            prefix = filler(f"{arm}-{i}", 4000)
-            msgs = [{"role": "system", "content": prefix}, {"role": "user", "content": "Reply with one word."}]
-            first = post_openrouter(client, key, openrouter_body(params, msgs, tools=False, order=order))
-            time.sleep(3)
-            second = post_openrouter(client, key, openrouter_body(params, msgs, tools=False, order=order))
-            pairs.append((first.get("usage") or {}, second.get("usage") or {}))
-        results.append({**check_cache_fires(pairs), "arm": arm})
+        if 1 in checks:
+            # 1 provider pin, 3 calls
+            try:
+                responses = [post_openrouter(client, key, openrouter_body(params, [{"role": "user", "content": "Say ok."}], tools=False, order=order)) for _ in range(3)]
+                results.append({**check_provider_pin(order[0], responses), "arm": arm, "statuses": [r["_status"] for r in responses]})
+            except Exception as exc:
+                results.append({"check": "provider_pin", "arm": arm, "pass": False, "error": f"{type(exc).__name__}: {exc}"})
+        if 2 in checks:
+            # 2 require_parameters with Claude Code's parameter set
+            try:
+                r = post_openrouter(client, key, openrouter_body(params, [{"role": "user", "content": "List the files. Use the tool."}], tools=True, order=order))
+                results.append({"check": "require_parameters", "arm": arm, "status": r["_status"], "body": r if r["_status"] != 200 else None, "pass": r["_status"] == 200})
+            except Exception as exc:
+                results.append({"check": "require_parameters", "arm": arm, "pass": False, "error": f"{type(exc).__name__}: {exc}"})
+        if 3 in checks:
+            # 3 cache fires, 5 replicates, 3 s apart
+            try:
+                pairs = []
+                for i in range(5):
+                    prefix = filler(f"{arm}-{i}", 4000)
+                    msgs = [{"role": "system", "content": prefix}, {"role": "user", "content": "Reply with one word."}]
+                    first = post_openrouter(client, key, openrouter_body(params, msgs, tools=False, order=order))
+                    time.sleep(3)
+                    second = post_openrouter(client, key, openrouter_body(params, msgs, tools=False, order=order))
+                    pairs.append((first.get("usage") or {}, second.get("usage") or {}))
+                results.append({**check_cache_fires(pairs), "arm": arm})
+            except Exception as exc:
+                results.append({"check": "cache_fires", "arm": arm, "pass": False, "error": f"{type(exc).__name__}: {exc}"})
     return results
 
 
@@ -214,45 +270,85 @@ def exec_post(proxy, path: str, body: dict[str, Any], run_id: str) -> dict[str, 
     return json.loads(result.output.decode("utf-8", "replace").strip().splitlines()[-1])
 
 
-def leg_b(arm: str, proxy, wire_dir: Path) -> list[dict[str, Any]]:
+def leg_b(arm: str, proxy, wire_dir: Path, checks: set[int]) -> list[dict[str, Any]]:
+    """Runs only the requested checks; each is contained the same way `leg_a`
+    contains its checks -- a `docker exec` failure or a malformed reply on
+    one check must not cost the others their JSON row."""
     from bakeoff.proxy_callback import read_run_entries
 
-    results = []
+    results: list[dict[str, Any]] = []
     run_id = f"probe-{arm}-{int(time.time())}"
-    anthropic_tool = {"name": "Bash", "description": "Run a shell command", "input_schema": TOOL["function"]["parameters"]}
-    turn1 = {"model": arm, "max_tokens": 256, "stream": False, "tools": [anthropic_tool], "thinking": {"type": "adaptive"},
-             "messages": [{"role": "user", "content": "Run `ls` with the Bash tool."}]}
-    r1 = exec_post(proxy, "/v1/messages", turn1, run_id)
-    blocks = r1["body"].get("content", []) if r1["status"] == 200 else []
-    tool_use = next((b for b in blocks if b.get("type") == "tool_use"), None)
-    # 4 round trip
-    if tool_use:
-        turn2 = dict(turn1)
-        turn2["messages"] = turn1["messages"] + [
-            {"role": "assistant", "content": blocks},
-            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool_use["id"], "content": "README.md\nsrc\n"}]},
-        ]
-        r2 = exec_post(proxy, "/v1/messages", turn2, run_id)
-        text = any(b.get("type") == "text" and b.get("text") for b in r2["body"].get("content", [])) if r2["status"] == 200 else False
-        results.append({"check": "thinking_round_trip", "arm": arm, "turn1_status": r1["status"], "turn2_status": r2["status"],
-                        "had_thinking_block": any(b.get("type") == "thinking" for b in blocks), "turn2_body": None if r2["status"] == 200 else r2["body"],
-                        "pass": r2["status"] == 200 and text})
-    else:
-        results.append({"check": "thinking_round_trip", "arm": arm, "turn1_status": r1["status"], "turn1_body": r1["body"], "pass": False})
-    # 5 + 6 from the wire entries this run produced
-    entries = read_run_entries(wire_dir, run_id)
-    last = entries[-1] if entries else {}
-    meta = last.get("metadata") or {}
-    openai_usage = (last.get("response") or {}).get("usage") or {}
-    results.append({**check_usage_exclusive(anthropic=r1["body"].get("usage", {}) if r1["status"] == 200 else {}, openai=openai_usage), "arm": arm})
-    results.append({
-        "check": "callback_capture", "arm": arm, "entries": len(entries),
-        "upstream_provider": meta.get("upstream_provider"), "native_finish_reason": meta.get("native_finish_reason"),
-        "usage_cost": meta.get("usage_cost"), "resolved_state": meta.get("resolved_state"),
-        "unattributed_exists": (wire_dir / "unattributed.jsonl").exists(),
-        "pass": bool(entries) and meta.get("upstream_provider") is not None and meta.get("usage_cost") is not None
-                and meta.get("resolved_state") == "captured" and not (wire_dir / "unattributed.jsonl").exists(),
-    })
+    r1: dict[str, Any] = {"status": None, "body": {}}
+    r2: dict[str, Any] = {"status": None, "body": {}}
+    blocks: list[dict[str, Any]] = []
+    tool_use = None
+    turns_error: str | None = None
+
+    # Checks 5 and 6 read the wire entries turn 1 (and, when the model calls
+    # the tool, turn 2) produces -- so those turns run whenever 4, 5 or 6 is
+    # selected, not only when 4 itself is. The check-4 verdict is still only
+    # appended when 4 was actually requested.
+    if checks & {4, 5, 6}:
+        try:
+            anthropic_tool = {"name": "Bash", "description": "Run a shell command", "input_schema": TOOL["function"]["parameters"]}
+            turn1 = {"model": arm, "max_tokens": 256, "stream": False, "tools": [anthropic_tool], "thinking": {"type": "adaptive"},
+                     "messages": [{"role": "user", "content": "Run `ls` with the Bash tool."}]}
+            r1 = exec_post(proxy, "/v1/messages", turn1, run_id)
+            blocks = r1["body"].get("content", []) if r1["status"] == 200 else []
+            tool_use = next((b for b in blocks if b.get("type") == "tool_use"), None)
+            if tool_use:
+                turn2 = dict(turn1)
+                turn2["messages"] = turn1["messages"] + [
+                    {"role": "assistant", "content": blocks},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool_use["id"], "content": "README.md\nsrc\n"}]},
+                ]
+                r2 = exec_post(proxy, "/v1/messages", turn2, run_id)
+        except Exception as exc:
+            turns_error = f"{type(exc).__name__}: {exc}"
+            if 4 in checks:
+                results.append({"check": "thinking_round_trip", "arm": arm, "pass": False, "error": turns_error})
+        else:
+            if 4 in checks:
+                try:
+                    if tool_use:
+                        text = any(b.get("type") == "text" and b.get("text") for b in r2["body"].get("content", [])) if r2["status"] == 200 else False
+                        results.append({"check": "thinking_round_trip", "arm": arm, "turn1_status": r1["status"], "turn2_status": r2["status"],
+                                        "had_thinking_block": any(b.get("type") == "thinking" for b in blocks), "turn2_body": None if r2["status"] == 200 else r2["body"],
+                                        "pass": r2["status"] == 200 and text})
+                    else:
+                        results.append({"check": "thinking_round_trip", "arm": arm, "turn1_status": r1["status"], "turn1_body": r1["body"], "pass": False})
+                except Exception as exc:
+                    results.append({"check": "thinking_round_trip", "arm": arm, "pass": False, "error": f"{type(exc).__name__}: {exc}"})
+
+    if 5 in checks:
+        try:
+            if turns_error:
+                raise RuntimeError(f"turn 1/2 failed: {turns_error}")
+            entries = read_run_entries(wire_dir, run_id)
+            last = entries[-1] if entries else {}
+            openai_usage = (last.get("response") or {}).get("usage") or {}
+            results.append({**check_usage_exclusive(anthropic=r1["body"].get("usage", {}) if r1["status"] == 200 else {}, openai=openai_usage), "arm": arm})
+        except Exception as exc:
+            results.append({"check": "usage_exclusive", "arm": arm, "pass": False, "error": f"{type(exc).__name__}: {exc}"})
+
+    if 6 in checks:
+        try:
+            if turns_error:
+                raise RuntimeError(f"turn 1/2 failed: {turns_error}")
+            entries = read_run_entries(wire_dir, run_id)
+            last = entries[-1] if entries else {}
+            meta = last.get("metadata") or {}
+            results.append({
+                "check": "callback_capture", "arm": arm, "entries": len(entries),
+                "upstream_provider": meta.get("upstream_provider"), "native_finish_reason": meta.get("native_finish_reason"),
+                "usage_cost": meta.get("usage_cost"), "resolved_state": meta.get("resolved_state"),
+                "unattributed_exists": (wire_dir / "unattributed.jsonl").exists(),
+                "pass": bool(entries) and meta.get("upstream_provider") is not None and meta.get("usage_cost") is not None
+                        and meta.get("resolved_state") == "captured" and not (wire_dir / "unattributed.jsonl").exists(),
+            })
+        except Exception as exc:
+            results.append({"check": "callback_capture", "arm": arm, "pass": False, "error": f"{type(exc).__name__}: {exc}"})
+
     return results
 
 
@@ -267,20 +363,29 @@ def main() -> int:
     parser.add_argument("--skip-proxy", action="store_true", help="Leg A only (no Docker)")
     args = parser.parse_args()
 
+    arms = arms_from_config()
+    bad_arm = unknown_arms(args.arm, set(arms))
+    if bad_arm:
+        print(bad_arm)
+        return 2
+    try:
+        checks = parse_checks(args.checks)
+    except ValueError as exc:
+        print(str(exc))
+        return 2
+    chosen = args.arm or list(arms)
+
     load_env_file(BAKEOFF / ".env")
     key = os.environ.get("OPENROUTER_API_KEY", "")
     if not key:
         print("GATE INCOMPLETE: no OPENROUTER_API_KEY")
         return 1
-    arms = arms_from_config()
-    chosen = args.arm or list(arms)
-    checks = {int(c) for c in args.checks.split(",")}
     OUT.mkdir(parents=True, exist_ok=True)
 
     results: list[dict[str, Any]] = []
     for arm in chosen:
         if checks & {1, 2, 3}:
-            results += leg_a(arm, arms[arm], key, args.k3_order)
+            results += leg_a(arm, arms[arm], key, args.k3_order, checks)
 
     if not args.skip_proxy and checks & {4, 5, 6}:
         from bakeoff.images import build_proxy_image
@@ -288,11 +393,14 @@ def main() -> int:
 
         stamp = time.strftime("%Y%m%d-%H%M%S")
         wire_dir = OUT / f"wire-{stamp}"
-        build_proxy_image(BAKEOFF)
-        with Proxy("litellm_config_openrouter.yaml", wire_dir, proxy_environment("live", "openrouter"), f"probe-{stamp}",
-                   image="bakeoff-litellm-proxy:matrix", repo_root=BAKEOFF) as proxy:
-            for arm in chosen:
-                results += leg_b(arm, proxy, wire_dir)
+        try:
+            build_proxy_image(BAKEOFF)
+            with Proxy("litellm_config_openrouter.yaml", wire_dir, proxy_environment("live", "openrouter"), f"probe-{stamp}",
+                       image="bakeoff-litellm-proxy:matrix", repo_root=BAKEOFF) as proxy:
+                for arm in chosen:
+                    results += leg_b(arm, proxy, wire_dir, checks)
+        except Exception as exc:
+            results.append({"check": "proxy_start", "arm": "all", "pass": False, "error": f"{type(exc).__name__}: {exc}"})
 
     failed = 0
     for r in results:
