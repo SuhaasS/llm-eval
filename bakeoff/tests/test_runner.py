@@ -7,7 +7,10 @@ from bakeoff.runner import (
     TaskSpec,
     assemble_record,
     finish_reasons,
+    provider_cost_usd,
     terminal_finish_reason,
+    terminal_native_finish_reason,
+    upstream_providers,
 )
 from bakeoff.schema import (
     FailureClass,
@@ -800,3 +803,74 @@ def test_no_successful_call_yields_none_not_an_empty_string():
     values."""
     assert terminal_finish_reason([_entry("stop", failed=True)]) is None
     assert finish_reasons([]) == {}
+
+
+def _or_entry(provider, native="stop", cost=0.001, failed=False):
+    return {"metadata": {
+        "failed": failed, "finish_reason": "stop",
+        "upstream_provider": provider, "native_finish_reason": native, "usage_cost": cost,
+    }}
+
+
+def test_upstream_providers_are_distinct_in_order_seen_and_skip_failures():
+    """Spec 2026-09-08 §4. A list, not a scalar: a second upstream mid-run is
+    the fallback allow_fallbacks:false forbids, and a scalar would hide it."""
+    entries = [
+        _or_entry("CoreWeave"),
+        _or_entry("CoreWeave"),
+        _or_entry("Fireworks"),
+        _or_entry(None),
+        _or_entry("Baseten", failed=True),
+    ]
+    assert upstream_providers(entries) == ["CoreWeave", "Fireworks"]
+    assert upstream_providers([]) == []
+
+
+def test_the_terminal_native_finish_reason_is_the_last_returning_calls():
+    entries = [
+        _or_entry("CoreWeave", native="tool_calls"),
+        _or_entry("CoreWeave", native="stop"),
+        _or_entry("CoreWeave", native="length", failed=True),
+    ]
+    assert terminal_native_finish_reason(entries) == "stop"
+    assert terminal_native_finish_reason([_entry("stop")]) is None
+
+
+def test_provider_cost_sums_returning_calls_and_is_none_if_any_lacks_it():
+    """None is "the provider did not say on every call", which is every
+    bedrock run. Summing the calls that did say would be a partial figure
+    wearing a total's name."""
+    assert provider_cost_usd([
+        _or_entry("CoreWeave", cost=0.5),
+        _or_entry("CoreWeave", cost=0.25),
+        _or_entry("x", cost=9, failed=True),
+    ]) == pytest.approx(0.75)
+    assert provider_cost_usd([
+        _or_entry("CoreWeave", cost=0.5),
+        _or_entry("CoreWeave", cost=None),
+    ]) is None
+    assert provider_cost_usd([]) is None
+
+
+def test_the_record_carries_the_upstream_fields_and_the_manifest_route(task, tmp_path):
+    """No test in this file assembles a record via `proxy_wire_dir` /
+    `read_manifest` -- that path is exercised in test_fault_injection.py, not
+    here. `assemble_record` takes `wire_entries` and `provider_route`
+    directly; execute_run reads both out of the manifest before calling it
+    (runner.py ~:1389-1393). This pins the same wiring `assemble_record`
+    itself is responsible for: per-call metadata threaded through the three
+    new helpers into the record, and the manifest's provider_route threaded
+    into Versions."""
+    entries = [_or_entry("CoreWeave", cost=0.001), _or_entry("CoreWeave", cost=0.001)]
+    record = assemble_record(
+        task=task, model="kimi-k2-5", sample_index=0,
+        started_at="2026-08-04T00:00:00Z", finished_at="2026-08-04T00:05:00Z",
+        trajectory_path=None, runner_result=None, checkpoints=[],
+        destructive_events=[], artifacts_root=tmp_path,
+        wire_entries=entries,
+        provider_route="openrouter",
+    )
+    assert record.versions.provider_route == "openrouter"
+    assert record.upstream_providers == ["CoreWeave"]
+    assert record.terminal_native_finish_reason == "stop"
+    assert record.cost_usd_provider == pytest.approx(0.002)

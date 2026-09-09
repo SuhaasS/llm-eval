@@ -281,7 +281,21 @@ from typing import Any
 # hold three distinct values over the same four `run_id`s -- so the field
 # changed meaning at this version and the log has no update API. Read a
 # pre-3.8.0 `collection_id` as an invocation, not as an episode.
-SCHEMA_VERSION = "3.8.0"
+#
+# 3.9.0 adds `Versions.provider_route`, `upstream_providers`,
+# `terminal_native_finish_reason` and `cost_usd_provider` for the OpenRouter
+# route (spec 2026-09-08 §4). All four default to "not observed": "" / [] /
+# None. Every earlier record is a bedrock record, but the empty
+# `provider_route` on it is NOT to be read as "bedrock" -- the proxy never
+# said, and the record does not invent a route for it.
+#
+# `upstream_providers` is a list because OpenRouter can answer one run from
+# two upstreams, which is the fallback `allow_fallbacks: false` is configured
+# to forbid; a scalar would hide the one event the field exists to expose.
+# `cost_usd_provider` is the provider's own figure summed over returning
+# calls, None if any returning call lacked it, beside the book's `cost_usd`;
+# the gap is reported, never reconciled.
+SCHEMA_VERSION = "3.9.0"
 
 
 class Outcome(str, Enum):
@@ -434,6 +448,11 @@ class Versions:
     # anything and cannot tell. Empty on records written before 2.2.0, and on
     # runs whose cost is None.
     pricing_basis: str = ""
+    # Which provider route the proxy reported serving, from the adapter
+    # manifest it writes about itself -- never the driver's --provider flag.
+    # "" means the proxy made no claim (records before 3.9.0, or a run whose
+    # manifest was never written).
+    provider_route: str = ""
 
 
 @dataclass(frozen=True)
@@ -770,6 +789,18 @@ class RunRecord:
     # None means nothing returned or nothing reported a reason, never "it just
     # stopped".
     terminal_finish_reason: str | None = None
+    # Who answered, per OpenRouter's `provider` field, distinct and in the
+    # order seen across the run's returning wire entries. Empty on every
+    # bedrock run. More than one entry is a finding: the pinned upstream was
+    # not the only one that served this run.
+    upstream_providers: list[str] = field(default_factory=list)
+    # The upstream's own word for how the last returning call stopped, beside
+    # `terminal_finish_reason` (the route's word) -- one more mapping the
+    # record would otherwise pass through unrecorded.
+    terminal_native_finish_reason: str | None = None
+    # What the provider said it charged, summed over returning calls. None
+    # when any returning call did not say. Beside `cost_usd`, never folded in.
+    cost_usd_provider: float | None = None
     wire_unattributed: int | None = None
     # Non-empty when the canonical wire artifact could not be opened -- a name
     # collision, an unwritable directory. The run still happened and its

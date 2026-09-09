@@ -369,6 +369,57 @@ def terminal_finish_reason(entries: list[dict[str, Any]]) -> str | None:
     return None
 
 
+def upstream_providers(entries: list[dict[str, Any]]) -> list[str]:
+    """Distinct `metadata.upstream_provider` values over RETURNING entries, in
+    the order first seen. Failed entries are skipped: no upstream answered.
+    Two values on a run pinned with allow_fallbacks:false is the finding the
+    field exists for (spec 2026-09-08 §4)."""
+    seen: list[str] = []
+    for entry in entries:
+        metadata = entry.get("metadata") or {}
+        if metadata.get("failed"):
+            continue
+        value = metadata.get("upstream_provider")
+        if isinstance(value, str) and value and value not in seen:
+            seen.append(value)
+    return seen
+
+
+def terminal_native_finish_reason(entries: list[dict[str, Any]]) -> str | None:
+    """The upstream's own word for how the LAST returning call stopped, the
+    same walk as terminal_finish_reason over a different key."""
+    for entry in reversed(entries):
+        metadata = entry.get("metadata") or {}
+        if metadata.get("failed"):
+            continue
+        value = metadata.get("native_finish_reason")
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def provider_cost_usd(entries: list[dict[str, Any]]) -> float | None:
+    """What the provider said it charged, summed over returning entries.
+
+    None -- not a partial sum -- when any returning entry lacks the figure,
+    and None when nothing returned. A bedrock run is None on every call; a
+    partial sum over the calls that happened to report would wear a total's
+    name. Beside `cost_usd`, never reconciled into it.
+    """
+    total = 0.0
+    counted = 0
+    for entry in entries:
+        metadata = entry.get("metadata") or {}
+        if metadata.get("failed"):
+            continue
+        value = metadata.get("usage_cost")
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return None
+        total += float(value)
+        counted += 1
+    return total if counted else None
+
+
 def resolve_reverts(
     events: list[DestructiveEvent], checkpoints: list[Checkpoint]
 ) -> list[DestructiveEvent]:
@@ -531,6 +582,10 @@ def assemble_record(
     wire_malformed_lines: int | None = None,
     adapter_patches: list[str] | None = None,
     proxy_litellm: str = "",
+    # What the proxy's manifest reported serving this run, read by
+    # execute_run from read_manifest -- never the driver's --provider flag.
+    # "" means the proxy made no claim.
+    provider_route: str = "",
     crash_error: str = "",
     scanner_error: str = "",
     checkpoint_error: str = "",
@@ -613,6 +668,9 @@ def assemble_record(
     error_statuses = terminal_error_statuses(entries)
     reason_counts = finish_reasons(entries)
     provider_finish = terminal_finish_reason(entries)
+    upstreams = upstream_providers(entries)
+    native_finish = terminal_native_finish_reason(entries)
+    cost_provider = provider_cost_usd(entries)
     failed_calls = sum(
         1 for e in entries if (e.get("metadata") or {}).get("failed")
     )
@@ -712,6 +770,7 @@ def assemble_record(
             # about the container -- it pins its own copy.
             litellm_patches=adapter_patches,
             litellm_proxy_version=proxy_litellm,
+            provider_route=provider_route,
             # Which price book produced the dollars in this record. Keyed on
             # ANY priced turn, not on the run total: a run where one turn hit
             # the cache guard has `cost_usd: null` while `per_turn[i].cost_usd`
@@ -753,6 +812,9 @@ def assemble_record(
         wire_entries_distinct=distinct_wire_calls(entries),
         finish_reasons=reason_counts,
         terminal_finish_reason=provider_finish,
+        upstream_providers=upstreams,
+        terminal_native_finish_reason=native_finish,
+        cost_usd_provider=cost_provider,
         wire_unattributed=wire_unattributed,
         exclusion=classify_exclusion(signals),
         failure_class=classify_failure(signals),
@@ -1429,6 +1491,7 @@ def execute_run(
             invocation_stamp=invocation_stamp,
             adapter_patches=adapter_patches,
             proxy_litellm=proxy_litellm,
+            provider_route=provider_route,
             crash_error=crash_error,
             scanner_error=scanner_error,
             checkpoint_error=checkpoint_error,

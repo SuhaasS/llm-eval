@@ -184,3 +184,15 @@ def test_run_record_stamps_schema_version_automatically():
         turns_used=40,
     )
     assert record.schema_version == SCHEMA_VERSION
+
+
+def test_schema_3_9_0_adds_the_provider_fields_with_no_claim_defaults():
+    from bakeoff.schema import Versions
+    import dataclasses
+
+    assert SCHEMA_VERSION == "3.9.0"
+    fields = {f.name: f for f in dataclasses.fields(RunRecord)}
+    assert fields["terminal_native_finish_reason"].default is None
+    assert fields["cost_usd_provider"].default is None
+    assert fields["upstream_providers"].default_factory() == []
+    assert {f.name: f.default for f in dataclasses.fields(Versions)}["provider_route"] == ""
