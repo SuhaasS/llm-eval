@@ -1706,12 +1706,38 @@ MUTATIONS = [
     ),
     (
         # The capture must run AFTER the rewrites, or `resolved` reports the
-        # pre-rename max_tokens with the provenance of an observation.
+        # pre-rename max_tokens with the provenance of an observation. This
+        # mutation MOVES the call above the rewrite block rather than
+        # deleting it -- deleting it tests "no capture happened", not
+        # "captured before the rewrites, reporting what did not go out".
         "openrouter: capture before the rewrites, reporting what did not go out",
         "src/bakeoff/litellm_patches.py",
+        '                if _rewrites_enabled():\n'
+        '                    if "max_tokens" in mapped:\n'
+        '                        mapped["max_completion_tokens"] = mapped.pop("max_tokens")\n'
+        "                    # Assigned unconditionally, never set-if-absent: the value\n"
+        "                    # that would otherwise be here is the one derived from\n"
+        "                    # Claude Code's `thinking` block, and it is exactly what\n"
+        "                    # has to lose.\n"
+        "                    mapped[_REASONING_EFFORT] = _REASONING_EFFORT_VALUE\n"
+        "                # THE CAPTURE, every provider, AFTER the rewrites. This is the\n"
+        "                # ONLY place that knows what the provider is getting: measured\n"
+        "                # 2026-08-12, the success callback fires on the outer\n"
+        "                # anthropic_messages call and the nested acompletion fires\n"
+        "                # nothing, so every param this wrapper touches is invisible\n"
+        "                # from where capture runs. It used to sit inside the rewrite\n"
+        "                # block; gating the block off for openrouter would have nulled\n"
+        "                # `resolved` on every call, which is why it is its own id.\n"
+        '                record_resolved_params({"model": model, **mapped})',
         '                record_resolved_params({"model": model, **mapped})\n'
-        "            return mapped",
-        "            return mapped",
+        "                if _rewrites_enabled():\n"
+        '                    if "max_tokens" in mapped:\n'
+        '                        mapped["max_completion_tokens"] = mapped.pop("max_tokens")\n'
+        "                    # Assigned unconditionally, never set-if-absent: the value\n"
+        "                    # that would otherwise be here is the one derived from\n"
+        "                    # Claude Code's `thinking` block, and it is exactly what\n"
+        "                    # has to lose.\n"
+        "                    mapped[_REASONING_EFFORT] = _REASONING_EFFORT_VALUE",
         "tests/test_litellm_patches.py -k capture_records_the_rewritten",
         "not integration",
     ),
@@ -1726,6 +1752,18 @@ MUTATIONS = [
         '            code = "api_credits"\n',
         "",
         "tests/test_classify.py -k exhausted_openrouter",
+        "not integration",
+    ),
+    (
+        # What require_parameters: true or a wrong `order` slug produces: a
+        # 404 whose body says no endpoint matched. Dropping the branch scores
+        # the pin's own failure as a generic, uncredited 404.
+        "classify: drop the router_no_endpoint branch",
+        "src/bakeoff/classify.py",
+        '        elif status == 404 and messages and NO_ENDPOINT_SIGNATURE in messages[-1]:\n'
+        '            code = "router_no_endpoint"\n',
+        "",
+        "tests/test_classify.py -k eligible_upstream",
         "not integration",
     ),
     (
