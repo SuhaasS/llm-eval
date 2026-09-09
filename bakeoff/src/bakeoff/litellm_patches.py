@@ -614,6 +614,16 @@ def _apply_openai_param_pins() -> list[str]:
                 # OpenRouter the rename names a parameter no endpoint lists,
                 # which under require_parameters is zero eligible providers,
                 # and the pin would fight the per-arm extra_body.reasoning.
+                # Off means untouched: no rename, no pin, no restore.
+                # OpenAIGPTConfig.get_supported_openai_params never lists
+                # reasoning_effort for a non-o-series model (verified against
+                # litellm 1.95.0), so `original` above has already dropped it
+                # from `mapped` by the time this branch is reached -- and that
+                # is exactly what the openrouter arms want: the config also
+                # carries reasoning_effort in additional_drop_params, and
+                # Kimi K2.6's endpoints do not list the parameter at all, so
+                # sending it under require_parameters: true is zero eligible
+                # providers, a 404 on every call.
                 if _rewrites_enabled():
                     if "max_tokens" in mapped:
                         mapped["max_completion_tokens"] = mapped.pop("max_tokens")
@@ -622,21 +632,6 @@ def _apply_openai_param_pins() -> list[str]:
                     # Claude Code's `thinking` block, and it is exactly what
                     # has to lose.
                     mapped[_REASONING_EFFORT] = _REASONING_EFFORT_VALUE
-                elif (
-                    _REASONING_EFFORT in non_default_params
-                    and _REASONING_EFFORT not in mapped
-                ):
-                    # "Off" has to mean untouched, not merely un-rewritten.
-                    # Verified against litellm 1.95.0:
-                    # OpenAIGPTConfig.get_supported_openai_params never lists
-                    # reasoning_effort for a non-o-series model, so `original`
-                    # above silently drops it before this wrapper ever runs --
-                    # independent of provider. OpenRouter's endpoints for these
-                    # models DO accept it (that is the whole reason the pin
-                    # fights extra_body.reasoning), so it is restored here
-                    # rather than left to litellm's own filter, which was
-                    # built for a different set of models.
-                    mapped[_REASONING_EFFORT] = non_default_params[_REASONING_EFFORT]
                 # THE CAPTURE, every provider, AFTER the rewrites. This is the
                 # ONLY place that knows what the provider is getting: measured
                 # 2026-08-12, the success callback fires on the outer
@@ -653,8 +648,10 @@ def _apply_openai_param_pins() -> list[str]:
 
     # The observable behaviour, not the assignment. A derived reasoning_effort
     # goes in, so under bedrock the probe also proves the pin BEATS one rather
-    # than merely filling a gap, and under openrouter it proves the pin LEFT
-    # it alone.
+    # than merely filling a gap, and under openrouter it proves the wrapper
+    # touched nothing -- litellm's own mapping already omits reasoning_effort
+    # for a non-o-series model, and that absence is what the openrouter arms
+    # want (see the comment on the wrapper above).
     probe = litellm.OpenAIConfig().map_openai_params(
         non_default_params={"max_tokens": 16, _REASONING_EFFORT: "medium"},
         optional_params={},
@@ -677,7 +674,7 @@ def _apply_openai_param_pins() -> list[str]:
             raise RuntimeError(
                 f"openrouter: the max_tokens rename applied anyway: got {probe!r}"
             )
-        if probe.get(_REASONING_EFFORT) != "medium":
+        if _REASONING_EFFORT in probe:
             raise RuntimeError(
                 f"openrouter: the reasoning_effort pin applied anyway: got {probe!r}"
             )

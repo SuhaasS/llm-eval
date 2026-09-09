@@ -813,7 +813,12 @@ def test_under_openrouter_the_two_mantle_rewrites_are_off_and_capture_stays_on(m
     open_resolved_capture("call-openrouter")
     mapped = _map()
     assert mapped.get("max_tokens") == 16 and "max_completion_tokens" not in mapped
-    assert mapped.get("reasoning_effort") == "medium"
+    # litellm's own mapping already omits reasoning_effort for a non-o-series
+    # model, and that is the desired state on openrouter: the config also
+    # drops it (additional_drop_params) and Kimi K2.6's endpoints do not list
+    # it, so sending it under require_parameters: true is zero eligible
+    # providers -- a 404 on every call.
+    assert "reasoning_effort" not in mapped
     captured = resolved_params("call-openrouter")
     assert captured is not None and captured["max_tokens"] == 16
     open_resolved_capture(None)
