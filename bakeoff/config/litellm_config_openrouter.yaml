@@ -76,6 +76,14 @@ model_list:
         usage: {include: true}
         reasoning: {enabled: true}
 
+# litellm_settings, router_settings and general_settings below are
+# VALUE-IDENTICAL to config/litellm_config.yaml. The comments there carry the
+# measurement evidence for the drop list and the chat-completions URL flag
+# (dated, against bedrock-mantle) -- that provenance is not repeated here,
+# because pasted verbatim into this file it would read as evidence measured
+# against OpenRouter, which it is not. Nothing in this block has been
+# re-measured against OpenRouter yet; scripts/probe_openrouter.py is where
+# that happens.
 litellm_settings:
   # Wire capture, registered where the calls are actually made (spec
   # section 6.2). The agent runs in its own container and this proxy is a
