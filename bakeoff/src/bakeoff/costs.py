@@ -55,7 +55,7 @@ class UnknownModelError(KeyError):
 
 # Bumped whenever a rate in PRICE_BOOK moves. Stamped into every record's
 # Versions so a stored cost says which book produced it.
-PRICING_BASIS = "sonnet-list-2026-08-11+bedrock-2026-08-05"
+PRICING_BASIS = "sonnet-list-2026-08-11+bedrock-2026-08-05+candidate-nocache-2026-08-23+openrouter-2026-09-08"
 
 
 @dataclass(frozen=True)
@@ -98,6 +98,39 @@ PRICE_BOOK.update(
         f"{name}-runtime": pricing
         for name, pricing in PRICE_BOOK.items()
         if name != "gemma-4-31b"
+    }
+)
+
+# The openrouter arms (spec 2026-09-08 §5). Rates are the ENDPOINT's, not the
+# model's: OpenRouter serves one model from many upstreams at different prices,
+# and the config pins each arm to one of them. Measured 2026-09-08 from
+# GET /api/v1/models/moonshotai/<id>/endpoints.
+#
+# cache_read is a real discount here, unlike the bedrock candidates: both
+# endpoints publish an input_cache_read rate. cache_write is 1.0 because no
+# endpoint lists input_cache_write -- a written prefix bills as plain input,
+# so 1.0 is a PRICE, not a placeholder, and the same argument as the bedrock
+# candidates' 1.0 applies. There is no 1h tier on this route; 1.0 keeps a
+# run with no cache read at exactly prompt_tokens x input_per_1m.
+#
+# Added AFTER the -runtime aliasing above on purpose: an openrouter arm has no
+# second transport, and an alias would price a deployment that cannot exist.
+PRICE_BOOK.update(
+    {
+        # coreweave/fp4: $0.65 in, $3.41 out, $0.15 cache read per 1M.
+        "kimi-k2-6": ModelPricing(
+            input_per_1m=0.65, output_per_1m=3.41,
+            cache_read_multiplier=0.15 / 0.65, cache_write_multiplier=1.0,
+            cache_write_1h_multiplier=1.0,
+        ),
+        # fireworks: $3.00 in, $15.00 out, $0.30 cache read per 1M. If
+        # probe_openrouter.py check 1 selects fireworks/us, this row becomes
+        # 3.30 / 16.50 / 0.10 BEFORE the first paid run, never after.
+        "kimi-k3": ModelPricing(
+            input_per_1m=3.00, output_per_1m=15.00,
+            cache_read_multiplier=0.10, cache_write_multiplier=1.0,
+            cache_write_1h_multiplier=1.0,
+        ),
     }
 )
 

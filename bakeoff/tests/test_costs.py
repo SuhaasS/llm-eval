@@ -108,3 +108,45 @@ def test_unknown_model_raises():
 
 def test_zero_usage_is_zero_cost():
     assert cost_usd("claude-sonnet-5", TokenUsage()) == 0.0
+
+
+def test_kimi_k2_6_prices_at_coreweave_rates_with_a_real_cache_read_discount():
+    """Spec §5. $0.65 / $3.41 per 1M, cache read $0.15 -> 0.2308x. Unlike the
+    bedrock candidates, this route publishes a cache-read rate, so the
+    multiplier is a price and a cache hit is worth money, not only latency."""
+    assert cost_usd("kimi-k2-6", TokenUsage(input=1_000_000)) == pytest.approx(0.65)
+    assert cost_usd("kimi-k2-6", TokenUsage(output=1_000_000)) == pytest.approx(3.41)
+    assert cost_usd("kimi-k2-6", TokenUsage(cache_read=1_000_000)) == pytest.approx(0.15, rel=1e-3)
+
+
+def test_kimi_k3_prices_at_fireworks_rates():
+    assert cost_usd("kimi-k3", TokenUsage(input=1_000_000)) == pytest.approx(3.00)
+    assert cost_usd("kimi-k3", TokenUsage(output=1_000_000)) == pytest.approx(15.00)
+    assert cost_usd("kimi-k3", TokenUsage(cache_read=1_000_000)) == pytest.approx(0.30, rel=1e-3)
+
+
+def test_an_openrouter_cache_write_bills_as_plain_input():
+    """No endpoint lists input_cache_write, so 1.0 is a PRICE: a written
+    prefix costs what an unwritten one costs. The 1h tier does not exist on
+    this route and takes the same rate so the total stays
+    prompt_tokens x input_per_1m when no read occurred."""
+    for name, rate in (("kimi-k2-6", 0.65), ("kimi-k3", 3.00)):
+        assert cost_usd(name, TokenUsage(cache_write=1_000_000)) == pytest.approx(rate)
+        assert cost_usd(name, TokenUsage(cache_write=1_000_000, cache_write_1h=1_000_000)) == pytest.approx(rate)
+
+
+def test_reasoning_tokens_bill_at_the_output_rate_on_the_openrouter_arms():
+    assert cost_usd("kimi-k3", TokenUsage(reasoning=1_000_000)) == pytest.approx(15.00)
+
+
+def test_the_openrouter_arms_have_no_runtime_alias():
+    """The -runtime aliases name the bedrock Converse transport. An
+    openrouter arm has no second transport, and an alias would be a price
+    for a deployment that cannot exist."""
+    assert "kimi-k2-6-runtime" not in PRICE_BOOK
+    assert "kimi-k3-runtime" not in PRICE_BOOK
+
+
+def test_the_pricing_basis_names_the_openrouter_book():
+    from bakeoff.costs import PRICING_BASIS
+    assert PRICING_BASIS.endswith("+openrouter-2026-09-08")
