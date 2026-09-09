@@ -16,6 +16,7 @@ there -- `resolve_tasks` is still the caller they describe.
 from __future__ import annotations
 
 from bakeoff.preflight import PREFLIGHT_VERSION, preflight_cache_key
+from scripts.run_matrix import config_name_for
 
 
 class _Task:
@@ -69,3 +70,12 @@ def test_the_key_still_moves_with_the_manifest_the_image_and_the_start_state():
     assert preflight_cache_key(other, image, start_sha) != base
     assert preflight_cache_key(_Task(), "sha256:other", start_sha) != base
     assert preflight_cache_key(_Task(), image, "t" * 40) != base
+
+
+def test_the_config_file_follows_the_provider_and_offline_ignores_it():
+    """Spec §1. The offline stub config is provider-neutral: nothing is
+    spent and no credential is read, so both providers share it."""
+    assert config_name_for("live", "openrouter") == "litellm_config_openrouter.yaml"
+    assert config_name_for("live", "bedrock") == "litellm_config.yaml"
+    assert config_name_for("offline", "openrouter") == "litellm_smoke_offline.yaml"
+    assert config_name_for("offline", "bedrock") == "litellm_smoke_offline.yaml"

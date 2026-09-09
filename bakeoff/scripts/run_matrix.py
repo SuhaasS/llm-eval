@@ -59,7 +59,9 @@ from bakeoff.matrix import (  # noqa: E402
 )
 from bakeoff.preflight import preflight, preflight_cache_key  # noqa: E402
 from bakeoff.proxy import (  # noqa: E402
-    EVAL_ARMS,
+    DEFAULT_PROVIDER,
+    EVAL_ARMS_BY_PROVIDER,
+    PROVIDERS,
     SSO_LOGIN_HINT,
     CredentialWindow,
     Proxy,
@@ -260,9 +262,28 @@ def run_cell(cell, task, resolved, args, event_log, wire_dir, network, artifacts
     return record, config_dump, unattributed
 
 
+def config_name_for(mode: str, provider: str) -> str:
+    """Which proxy config a (mode, provider) pair runs on.
+
+    Offline is provider-neutral on purpose: the stub answers, nothing is
+    spent, no credential is read, and the offline gate certifies the same
+    logger whichever provider the paid run will use.
+    """
+    if mode != "live":
+        return "litellm_smoke_offline.yaml"
+    return {
+        "openrouter": "litellm_config_openrouter.yaml",
+        "bedrock": "litellm_config.yaml",
+    }[provider]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["offline", "live"], default="live")
+    parser.add_argument(
+        "--provider", choices=list(PROVIDERS), default=DEFAULT_PROVIDER,
+        help="which route the proxy serves: openrouter (default) or bedrock",
+    )
     parser.add_argument("--task-set", default=str(DEFAULT_TASK_SET))
     parser.add_argument("--tasks", help="comma-separated task_ids (default: all)")
     parser.add_argument("--models", help="comma-separated arms (default: the four)")
@@ -306,7 +327,7 @@ def main() -> int:
         return 1
 
     by_id = {task.task_id: task for task in tasks}
-    models = args.models.split(",") if args.models else list(EVAL_ARMS)
+    models = args.models.split(",") if args.models else list(EVAL_ARMS_BY_PROVIDER[args.provider])
     stamp = subprocess.run(
         ["date", "-u", "+%Y%m%dT%H%M%SZ"], check=True, capture_output=True, text=True
     ).stdout.strip()
@@ -405,13 +426,15 @@ def main() -> int:
         print("\nnothing to run: every cell already has a record")
         return 0
 
-    environment = proxy_environment(args.mode)
+    environment = proxy_environment(args.mode, args.provider)
 
     # AFTER proxy_environment: that is what resolves the project-local AWS
     # config, so calling this first would read a different session from the one
     # the proxy is about to be handed.
     window = (
-        credential_window(os.environ.get("AWS_REGION_NAME") or "us-east-1")
+        credential_window(
+            os.environ.get("AWS_REGION_NAME") or "us-east-1", provider=args.provider
+        )
         if args.mode == "live"
         else CredentialWindow(None, "offline")
     )
@@ -424,6 +447,8 @@ def main() -> int:
         # rather than reported as an unreadable expiry, which would read as a
         # degraded live run.
         print("creds     none needed (offline: the stub answers, nothing is spent)")
+    elif window.source == "openrouter-static":
+        print("creds     static key, no expiry (openrouter); the abort streak is the backstop")
     else:
         print(f"creds     expiry unreadable ({window.source}): {window.error}")
         print("          the abort streak is the only backstop on this run")
@@ -444,9 +469,7 @@ def main() -> int:
         )
         return 2
 
-    config_name = (
-        "litellm_config.yaml" if args.mode == "live" else "litellm_smoke_offline.yaml"
-    )
+    config_name = config_name_for(args.mode, args.provider)
     build_proxy_image(REPO)
     artifacts = artifacts_root(CACHE, stamp)
     wire_dir = CACHE / "wire" / stamp
@@ -583,6 +606,7 @@ def main() -> int:
             {
                 "seed": args.seed,
                 "mode": args.mode,
+                "provider": args.provider,
                 "order": [cell.label for cell in order],
                 "skipped": [cell.label for cell in resume.done],
                 "rows": rows,

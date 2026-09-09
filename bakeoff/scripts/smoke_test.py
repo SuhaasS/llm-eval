@@ -47,7 +47,9 @@ sys.path.insert(0, str(REPO))
 # script is the Phase 0c gate's operator-facing entry point and its tests
 # address it by that name.
 from bakeoff.proxy import (  # noqa: E402
-    EVAL_ARMS,
+    DEFAULT_PROVIDER,
+    EVAL_ARMS_BY_PROVIDER,
+    PROVIDERS,
     SSO_LOGIN_HINT,
     Proxy as _Proxy,
     freeze_sigv4_credentials,
@@ -58,6 +60,12 @@ from bakeoff.session import (  # noqa: E402
     config_problems,
     effective_config,
 )
+
+# Not duplicated: two copies of "which config a (mode, provider) pair runs
+# on" is exactly how the offline gate and the paid driver would come to
+# certify different things. No cycle -- run_matrix.py never imports this
+# script, only names it in a docstring.
+from scripts.run_matrix import config_name_for  # noqa: E402
 
 AGENT_TAG = "bakeoff-eval-agent:smoke"
 PROXY_TAG = "bakeoff-litellm-proxy:smoke"
@@ -708,6 +716,10 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["offline", "live"], required=True)
     parser.add_argument(
+        "--provider", choices=list(PROVIDERS), default=DEFAULT_PROVIDER,
+        help="which route the proxy serves: openrouter (default) or bedrock",
+    )
+    parser.add_argument(
         "--models", help="comma-separated subset of the arms (live mode)"
     )
     parser.add_argument("--max-turns", type=int, default=30)
@@ -732,11 +744,10 @@ def main() -> int:
     from bakeoff.eventlog import EventLog
 
     expectations = LIVE if args.mode == "live" else OFFLINE
+    config_name = config_name_for(args.mode, args.provider)
     if args.mode == "live":
-        config_name = "litellm_config.yaml"
-        arms = args.models.split(",") if args.models else list(EVAL_ARMS)
+        arms = args.models.split(",") if args.models else list(EVAL_ARMS_BY_PROVIDER[args.provider])
     else:
-        config_name = "litellm_smoke_offline.yaml"
         # Two arms, not one. The second configures a temperature, which is
         # how the section 5.3 question gets answered offline: if a
         # deployment-level temperature does not reach the wire, three arms
@@ -782,7 +793,7 @@ def main() -> int:
             f" -- {expectations.why}"
         )
 
-    environment = proxy_environment(args.mode)
+    environment = proxy_environment(args.mode, args.provider)
     print("building images ...")
     image = build_images()
     print(f"image     {image[:19]}...")
