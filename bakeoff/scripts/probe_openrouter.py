@@ -114,19 +114,49 @@ def check_provider_pin(expected_slug: str, responses: list[dict[str, Any]]) -> d
     return {"check": "provider_pin", "expected": expected_slug, "seen": seen, "pass": ok}
 
 
-def check_cache_fires(pairs: list[tuple[dict[str, Any], dict[str, Any]]], min_hits: int = 3) -> dict[str, Any]:
+def check_cache_fires(pairs: list[tuple[dict[str, Any], dict[str, Any]]], min_hits: int = 1) -> dict[str, Any]:
     """Each pair is (first call usage, second call usage) for one replicate.
     A hit is cached_tokens > 0 on the second call AND a lower reported cost.
-    Pass is a hit rate, never one success -- the bedrock lottery finding."""
+
+    WHAT PASSES, AND WHY THE BAR MOVED. The check proves two things a price
+    table cannot: the route's cache MECHANISM fires on a repeated prefix, and a
+    hit is BILLED lower. Both are mechanism claims, so one observed hit (with
+    its cost drop) settles them. The HIT RATE is reported beside the verdict
+    as a measurement, never folded into it: measured 2026-09-11 on
+    coreweave/fp4, 2 of 5 replicates hit, each returning ~6k cached tokens at
+    a 72% cost drop, the other three returned zero -- a per-worker prefix
+    cache behind a per-request load balancer, the same lottery probe_cache.py
+    documented on bedrock-mantle. A 3-of-5 bar on a 40% lottery is a coin
+    flip (P(pass) ~ 0.32), which is the kind of gate that passes and fails on
+    the same route on consecutive days; the record's per-run `cache_state`
+    is where a hit rate belongs.
+
+    A replicate that reports cached tokens WITHOUT a cost drop is a billing
+    anomaly and fails the check outright: it is the exact situation the
+    bedrock candidates were in (KV reuse worth $0) and the one the price book
+    must not silently assume away.
+    """
     hits = 0
+    anomalies = 0
     rows = []
     for first, second in pairs:
         cached = cached_tokens(second) or 0
-        cheaper = isinstance(second.get("cost"), (int, float)) and isinstance(first.get("cost"), (int, float)) and second["cost"] < first["cost"]
+        priced = isinstance(second.get("cost"), (int, float)) and isinstance(first.get("cost"), (int, float))
+        cheaper = priced and second["cost"] < first["cost"]
         hit = cached > 0 and cheaper
+        anomaly = cached > 0 and priced and not cheaper
         hits += hit
-        rows.append({"cached_tokens": cached, "first_cost": first.get("cost"), "second_cost": second.get("cost"), "hit": hit})
-    return {"check": "cache_fires", "replicates": len(pairs), "hits": hits, "rows": rows, "pass": hits >= min_hits}
+        anomalies += anomaly
+        rows.append({"cached_tokens": cached, "first_cost": first.get("cost"), "second_cost": second.get("cost"), "hit": hit, "billing_anomaly": anomaly})
+    return {
+        "check": "cache_fires",
+        "replicates": len(pairs),
+        "hits": hits,
+        "hit_rate": (hits / len(pairs)) if pairs else None,
+        "billing_anomalies": anomalies,
+        "rows": rows,
+        "pass": hits >= min_hits and anomalies == 0,
+    }
 
 
 def check_usage_exclusive(anthropic: dict[str, Any], openai: dict[str, Any]) -> dict[str, Any]:
@@ -415,8 +445,18 @@ def leg_b(arm: str, proxy, wire_dir: Path, checks: set[int]) -> list[dict[str, A
                 raise RuntimeError(f"turn 1/2 failed: {turns_error}")
             entries = read_run_entries(wire_dir, run_id)
             last = entries[-1] if entries else {}
-            openai_usage = (last.get("response") or {}).get("usage") or {}
-            results.append({**check_usage_exclusive(anthropic=r1["body"].get("usage", {}) if r1["status"] == 200 else {}, openai=openai_usage), "arm": arm})
+            # The UPSTREAM's own usage off the raw final chunk, never litellm's
+            # rebuilt one: measured 2026-09-11, the logged dump's usage is
+            # litellm's token arithmetic (no cost, no reasoning_tokens) and
+            # disagrees with what OpenRouter billed. The dump is the fallback
+            # only so the row still says what litellm thought.
+            meta = last.get("metadata") or {}
+            openai_usage = meta.get("upstream_usage") or (last.get("response") or {}).get("usage") or {}
+            results.append({
+                **check_usage_exclusive(anthropic=r1["body"].get("usage", {}) if r1["status"] == 200 else {}, openai=openai_usage),
+                "openai_usage_source": "upstream_usage" if meta.get("upstream_usage") else "litellm_dump",
+                "arm": arm,
+            })
         except Exception as exc:
             results.append({"check": "usage_exclusive", "arm": arm, "pass": False, "error": f"{type(exc).__name__}: {exc}"})
 
@@ -431,8 +471,13 @@ def leg_b(arm: str, proxy, wire_dir: Path, checks: set[int]) -> list[dict[str, A
                 "check": "callback_capture", "arm": arm, "entries": len(entries),
                 "upstream_provider": meta.get("upstream_provider"), "native_finish_reason": meta.get("native_finish_reason"),
                 "usage_cost": meta.get("usage_cost"), "resolved_state": meta.get("resolved_state"),
+                "upstream_state": meta.get("upstream_state"),
+                # The raw block, so the row also carries the upstream's cached
+                # and reasoning token counts the transcript never sees.
+                "upstream_usage": meta.get("upstream_usage"),
                 "unattributed_exists": (wire_dir / "unattributed.jsonl").exists(),
                 "pass": bool(entries) and meta.get("upstream_provider") is not None and meta.get("usage_cost") is not None
+                        and isinstance(meta.get("upstream_usage"), dict)
                         and meta.get("resolved_state") == "captured" and not (wire_dir / "unattributed.jsonl").exists(),
             })
         except Exception as exc:
