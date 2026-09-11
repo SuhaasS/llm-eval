@@ -241,7 +241,15 @@ def post_openrouter(client: httpx.Client, key: str, body: dict[str, Any]) -> dic
     return data
 
 
-def leg_a(arm: str, params: dict[str, Any], key: str, k3_order: str | None, checks: set[int]) -> list[dict[str, Any]]:
+def leg_a(
+    arm: str,
+    params: dict[str, Any],
+    key: str,
+    k3_order: str | None,
+    checks: set[int],
+    cache_replicates: int = 5,
+    cache_prefix_tokens: int = 4000,
+) -> list[dict[str, Any]]:
     """Runs only the requested checks; each is contained so a transport error
     on one (a timeout, a non-JSON body, a connection drop) still lets the
     others run and still produces that check's JSON row."""
@@ -272,8 +280,8 @@ def leg_a(arm: str, params: dict[str, Any], key: str, k3_order: str | None, chec
             # 3 cache fires, 5 replicates, 3 s apart
             try:
                 pairs = []
-                for i in range(5):
-                    prefix = filler(f"{arm}-{i}", 4000)
+                for i in range(cache_replicates):
+                    prefix = filler(f"{arm}-{i}", cache_prefix_tokens)
                     msgs = [{"role": "system", "content": prefix}, {"role": "user", "content": "Reply with one word."}]
                     first = post_openrouter(client, key, openrouter_body(params, msgs, tools=False, order=order))
                     time.sleep(3)
@@ -503,6 +511,11 @@ def main() -> int:
     parser.add_argument("--checks", default="1,2,3,4,5,6")
     parser.add_argument("--k3-order", help="override kimi-k3 provider.order for check 1, e.g. fireworks/us")
     parser.add_argument("--skip-proxy", action="store_true", help="Leg A only (no Docker)")
+    # Check 3's spend knobs. The defaults (5 x 2 calls on a ~4k prefix) cost
+    # about $0.04 on K2.6 and $0.14 on K3; an account near its balance 402s
+    # partway, so an operator can shrink the run rather than lose the check.
+    parser.add_argument("--cache-replicates", type=int, default=5, help="check 3: repeated-prefix pairs per arm (default 5)")
+    parser.add_argument("--cache-prefix-tokens", type=int, default=4000, help="check 3: approximate shared-prefix size (default 4000)")
     args = parser.parse_args()
 
     arms = arms_from_config()
@@ -534,7 +547,11 @@ def main() -> int:
             # lets the remaining arms -- and Leg B -- run instead of losing
             # every arm already processed to one raw traceback.
             try:
-                arm_results = leg_a(arm, arms[arm], key, args.k3_order, checks)
+                arm_results = leg_a(
+                    arm, arms[arm], key, args.k3_order, checks,
+                    cache_replicates=args.cache_replicates,
+                    cache_prefix_tokens=args.cache_prefix_tokens,
+                )
             except Exception as exc:
                 arm_results = [{"check": "leg_a", "arm": arm, "pass": False, "error": f"{type(exc).__name__}: {exc}"}]
             for r in arm_results:
