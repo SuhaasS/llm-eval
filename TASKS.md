@@ -837,12 +837,32 @@ one ends a multi-day run outright.
   transport confound when it is known; Fireworks does not publish one for
   `kimi-k2-6` or `kimi-k3`, so it stays an open gap rather than a pinned fact.
 
-- [ ] **Whether `trajectory.py` needs a parse-time subtraction for OpenRouter's
-  `output_tokens` is pending `scripts/probe_openrouter.py` check 5** (inclusive
-  vs. exclusive of reasoning tokens on this route) — unmeasured as of
-  2026-09-09. If check 5 reports inclusive, the subtraction and its
-  `test_usage_accounting.py` pin are their own item, tracked here until landed;
-  if exclusive, this item closes with no code change.
+- [x] **`trajectory.py` needs no parse-time subtraction for OpenRouter's
+  `output_tokens`** — measured 2026-09-11 by `scripts/probe_openrouter.py`
+  check 5 on both arms: the Anthropic-shaped `output_tokens` litellm emits
+  (31 on a K2.6 call) is NOT inclusive of the upstream's `reasoning_tokens`
+  (51) — it is litellm's own count of the visible text, smaller than the
+  upstream's `completion_tokens` (75). Closed with no subtraction. What it
+  opened instead is the under-billing item below.
+
+- [ ] **A $0-credit OpenRouter account cannot run a live cell, and the first
+  one was excluded correctly.** Measured 2026-09-11: the free tier caps prompt
+  tokens per request (`402 Prompt tokens limit exceeded: 2768 > 2665 ... upgrade
+  to a paid account`, the ceiling moving with the remaining allowance) and
+  refuses requests that "would exceed your available credits given your
+  current in-flight requests". `run_matrix.py --mode live --models kimi-k2-6`
+  on `click-3360` 402'd on Claude Code's first call (~30k tokens of tool
+  schemas), the record was excluded `infra_failure/api_credits`, the driver
+  reported the row uninterpretable and exited 1. Every other part of the
+  openrouter path was exercised end to end on that run: `provider_route:
+  openrouter`, 5 patch ids, `sampling_source: resolved`, `wire_unattributed:
+  0`. Blocked on the operator buying credits ($10 floor); then re-run
+  `probe_openrouter.py` in full (the cache check at its 4k default prefix) and
+  one live cell per arm before any matrix. Note `api_error_status` was `None`
+  on that record while the exclusion fired on the 402 in
+  `terminal_error_statuses`: `final_api_error_status` reads the LAST entry,
+  which on a double-logged failure carries no status — worth a look before
+  the next live run.
 
 - [ ] **`extra_body` cannot reach the wire log, structurally — adding it to
   `REQUEST_KEYS` would not fix this.** Measured 2026-09-10 against litellm
