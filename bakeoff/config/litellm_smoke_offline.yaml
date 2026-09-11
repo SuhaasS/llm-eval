@@ -76,6 +76,72 @@ model_list:
       temperature: 1.0
       top_p: 0.95
 
+  # claude-sonnet-5-runtime and nemotron-3-super-120b: the two remaining
+  # EVAL_ARMS_BY_PROVIDER["bedrock"] names that were missing here. Without
+  # them a default (no --models) offline run against --provider bedrock hits
+  # the same "arm not in this config" refusal that kimi-k2-6/kimi-k3 hit
+  # under --provider openrouter, before this fix. See
+  # tests/test_config.py::test_every_eval_arm_has_an_offline_stub.
+  #
+  # claude-sonnet-5-runtime mirrors claude-sonnet-5 above (same anthropic/
+  # stub, no sampling params -- the production bedrock-runtime arm accepts
+  # none either).
+  - model_name: claude-sonnet-5-runtime
+    litellm_params:
+      model: anthropic/claude-sonnet-5
+      api_base: http://stub:8080
+      api_key: not-checked-by-the-stub
+
+  # nemotron-3-super-120b mirrors kimi-k2-5 above: same openai/ stub class,
+  # same sampling as the production mantle arm.
+  - model_name: nemotron-3-super-120b
+    litellm_params:
+      model: openai/nemotron-3-super-120b-stub
+      additional_drop_params: ["reasoning_effort"]
+      api_base: http://stub:8080/v1
+      api_key: not-checked-by-the-stub
+      temperature: 1.0
+      top_p: 0.95
+
+  # kimi-k2-6 and kimi-k3 exist so `--provider openrouter` (the default on
+  # both run_matrix.py and smoke_test.py) has arms to run against THIS file:
+  # config_name_for is provider-neutral for offline on purpose (the stub
+  # answers, nothing is spent, no credential is read), so the same file must
+  # serve both providers' arm names or an openrouter offline run 4xxs on an
+  # unknown model group and gets scored as a model failure instead of
+  # refused as a config mismatch (see scripts.run_matrix.arms_missing_from_config).
+  #
+  # Modeled on kimi-k2-5 above -- same stub, same openai/ provider class so
+  # the offline gate exercises the openai->anthropic adapter for these arms
+  # too -- with an `extra_body` mirroring litellm_config_openrouter.yaml's
+  # `reasoning: {enabled: true}` and `usage: {include: true}` so the stub
+  # sees the same shape OpenRouter would receive. No `provider` pin: that
+  # key is OpenRouter's own upstream-routing knob and this is not
+  # OpenRouter, so a stub deployment carrying it would test nothing.
+  - model_name: kimi-k2-6
+    litellm_params:
+      model: openai/kimi-k2-6-stub
+      additional_drop_params: ["reasoning_effort"]
+      api_base: http://stub:8080/v1
+      api_key: not-checked-by-the-stub
+      temperature: 1.0
+      top_p: 0.95
+      extra_body:
+        usage: {include: true}
+        reasoning: {enabled: true}
+
+  - model_name: kimi-k3
+    litellm_params:
+      model: openai/kimi-k3-stub
+      additional_drop_params: ["reasoning_effort"]
+      api_base: http://stub:8080/v1
+      api_key: not-checked-by-the-stub
+      temperature: 1.0
+      top_p: 0.95
+      extra_body:
+        usage: {include: true}
+        reasoning: {enabled: true}
+
 litellm_settings:
   # The same registration the production config now uses, so the offline
   # gate exercises the real capture path rather than a test-only one.

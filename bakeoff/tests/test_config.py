@@ -16,11 +16,13 @@ import pytest
 import yaml
 
 from bakeoff.costs import cost_usd
+from bakeoff.proxy import EVAL_ARMS_BY_PROVIDER
 from bakeoff.schema import TokenUsage
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
 BEDROCK = CONFIG_DIR / "litellm_config.yaml"
 OPENROUTER = CONFIG_DIR / "litellm_config_openrouter.yaml"
+OFFLINE = CONFIG_DIR / "litellm_smoke_offline.yaml"
 CONFIG = BEDROCK  # the bedrock-only pins below read this name
 CONFIGS = {"bedrock": BEDROCK, "openrouter": OPENROUTER}
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
@@ -461,3 +463,19 @@ def test_the_openrouter_config_pins_quantization_where_the_endpoint_declares_one
     assert by_name["kimi-k2-6"]["quantizations"] == ["fp4"]
     assert by_name["kimi-k3"]["order"][0].startswith("fireworks")
     assert "quantizations" not in by_name["kimi-k3"]
+
+
+def test_every_eval_arm_has_an_offline_stub():
+    """Defect B (2026-09-10): config_name_for is provider-neutral for
+    offline on purpose -- the stub answers, nothing is spent, no credential
+    is read -- so litellm_smoke_offline.yaml is the ONE config an offline run
+    reaches whichever --provider is chosen. An arm in EVAL_ARMS_BY_PROVIDER
+    with no entry there means a default (no --models) offline run 4xxs on an
+    unknown model group and the run is scored as a model failure
+    (`gave_up`) instead of refused as a config mismatch -- exactly what
+    scripts.run_matrix.arms_missing_from_config exists to catch, except this
+    pin catches it before any run is attempted at all."""
+    offline_names = {e["model_name"] for e in _model_list(OFFLINE)}
+    for provider, arms in EVAL_ARMS_BY_PROVIDER.items():
+        for arm in arms:
+            assert arm in offline_names, f"{arm} ({provider}) has no offline stub"

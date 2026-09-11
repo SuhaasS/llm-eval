@@ -120,3 +120,56 @@ def test_a_request_without_tools_is_not_policed(body):
     Bedrock accepts, and a validator that rejects valid traffic gets deleted
     rather than fixed."""
     assert stub.validate_reasoning_effort_none(body) is None
+
+
+# --- REWRITES_ENABLED off (BAKEOFF_PROVIDER=openrouter) ----------------------
+#
+# Defect B (2026-09-10): offline mode used to hand the proxy no BAKEOFF_PROVIDER
+# at all, so litellm_patches._rewrites_enabled defaulted to bedrock regardless
+# of --provider, and the offline gate certified the bedrock patch set even for
+# an openrouter run. Fixed in bakeoff.proxy.proxy_environment; these tests pin
+# the stub's half: with rewrites off, the UN-renamed, UN-pinned shape is
+# correct and the renamed/pinned shape is the thing to reject -- the exact
+# opposite of the bedrock tests above. Toggled via monkeypatch on the module
+# attribute rather than re-importing, since REWRITES_ENABLED is read from the
+# environment once at import time, matching how the real stub process reads
+# it once at startup.
+
+
+def test_openrouter_the_unrenamed_cap_passes(monkeypatch):
+    monkeypatch.setattr(stub, "REWRITES_ENABLED", False)
+    assert stub.validate_max_completion_tokens({"max_tokens": 16384}) is None
+
+
+def test_openrouter_a_renamed_cap_is_caught(monkeypatch):
+    """The rename patch is supposed to be inert under openrouter; seeing its
+    output anyway means something is applying it when it should not."""
+    monkeypatch.setattr(stub, "REWRITES_ENABLED", False)
+    problem = stub.validate_max_completion_tokens({"max_completion_tokens": 16384})
+    assert problem is not None
+    assert "BAKEOFF_PROVIDER=openrouter" in problem
+
+
+def test_openrouter_a_dropped_cap_is_still_caught(monkeypatch):
+    monkeypatch.setattr(stub, "REWRITES_ENABLED", False)
+    problem = stub.validate_max_completion_tokens({"messages": []})
+    assert problem is not None
+    assert "uncapped" in problem
+
+
+def test_openrouter_tools_with_no_reasoning_effort_pass(monkeypatch):
+    """The exact shape additional_drop_params produces, and correct here --
+    the mirror image of test_tools_with_no_reasoning_effort_are_caught."""
+    monkeypatch.setattr(stub, "REWRITES_ENABLED", False)
+    assert stub.validate_reasoning_effort_none({"tools": TOOLS}) is None
+
+
+def test_openrouter_a_pinned_reasoning_effort_is_caught(monkeypatch):
+    """The pin is supposed to be inert under openrouter; a value reaching the
+    route anyway means the pin (or something else) fired when it should not."""
+    monkeypatch.setattr(stub, "REWRITES_ENABLED", False)
+    problem = stub.validate_reasoning_effort_none(
+        {"tools": TOOLS, "reasoning_effort": "none"}
+    )
+    assert problem is not None
+    assert "BAKEOFF_PROVIDER=openrouter" in problem

@@ -26,9 +26,21 @@ measured here -- that is what --mode live is for.
 from __future__ import annotations
 
 import json
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = 8080
+
+# Mirrors bakeoff.litellm_patches._rewrites_enabled exactly -- same env var,
+# same default. Whether the max_tokens rename and the reasoning_effort pin
+# apply is a proxy-process-wide switch, not a per-arm one, so the stub has to
+# validate whichever shape THIS process's rewrites setting actually produces
+# rather than one hard-coded shape. Passed into the stub container from the
+# same `env` dict the litellm container gets (see Proxy.__enter__) --
+# offline mode carries no credential, only the provider name, so there is
+# nothing sensitive in handing it to the stub too.
+_PROVIDER_ENV = "BAKEOFF_PROVIDER"
+REWRITES_ENABLED = os.environ.get(_PROVIDER_ENV, "bedrock") != "openrouter"
 
 # The corrected fixture. Written by the stub's canned tool call, so a diff
 # lands and the section 5.6 staged-diff extraction has something to extract.
@@ -275,17 +287,26 @@ def validate_tool_call_ids(body: dict) -> str | None:
 
 
 def validate_max_completion_tokens(body: dict) -> str | None:
-    """Reject an openai-route request that still spells the cap ``max_tokens``.
+    """Reject an openai-route request carrying the wrong shape of token cap.
 
-    Stands in for what Bedrock's `/openai/v1` route started doing on
-    2026-08-12, which took Gemma 4 31B to 0/3 with every call 400ing before the
-    model saw anything: `Unsupported parameter: 'max_tokens' is not supported
-    with this model`. `bakeoff.litellm_patches` renames it to
-    `max_completion_tokens` for every `openai/` deployment.
+    Two valid shapes, one per provider, gated by the same REWRITES_ENABLED
+    switch `bakeoff.litellm_patches._rewrites_enabled` reads:
+
+    Bedrock (rewrites ON) -- stands in for what Bedrock's `/openai/v1` route
+    started doing on 2026-08-12, which took Gemma 4 31B to 0/3 with every
+    call 400ing before the model saw anything: `Unsupported parameter:
+    'max_tokens' is not supported with this model`. `bakeoff.litellm_patches`
+    renames it to `max_completion_tokens` for every `openai/` deployment, so
+    an un-renamed `max_tokens` here means the rename patch did not apply.
+
+    OpenRouter (rewrites OFF, spec 2026-09-08 §7) -- the rename never runs,
+    so Claude Code's own `max_tokens` is the correct, expected shape and a
+    renamed `max_completion_tokens` here would mean something is applying a
+    rewrite that is supposed to be off for this provider.
 
     Checked on the openai route ONLY. The `anthropic/` arms send a native
-    Anthropic body where `max_tokens` is correct and required, so a check on
-    both routes would fail Sonnet for being right.
+    Anthropic body where `max_tokens` is correct and required regardless of
+    provider, so a check on both routes would fail Sonnet for being right.
 
     Same reasoning as `validate_no_property_names`: `apply()` can prove the
     rename function works, not that litellm still routes through the entry it
@@ -296,42 +317,65 @@ def validate_max_completion_tokens(body: dict) -> str | None:
 
     Returns an error string, or None.
     """
-    if "max_tokens" in body:
+    if REWRITES_ENABLED:
+        if "max_tokens" in body:
+            return (
+                f"max_tokens={body['max_tokens']!r} reached the openai route -- "
+                "the openai_max_completion_tokens_rename patch did not apply. "
+                "Bedrock's /openai/v1 route answers 400 to this, which is what "
+                "took Gemma to 0/3 on 2026-08-12."
+            )
+        if "max_completion_tokens" not in body:
+            return (
+                "neither max_tokens nor max_completion_tokens reached the openai "
+                "route -- the cap was dropped rather than renamed, so this arm "
+                "would run uncapped while every other arm runs at 16384"
+            )
+        return None
+    # Rewrites OFF (BAKEOFF_PROVIDER=openrouter): the rename patch does not
+    # run, so the un-renamed max_tokens Claude Code sends is the CORRECT
+    # shape here, not a defect.
+    if "max_completion_tokens" in body:
         return (
-            f"max_tokens={body['max_tokens']!r} reached the openai route -- "
-            "the openai_max_completion_tokens_rename patch did not apply. "
-            "Bedrock's /openai/v1 route answers 400 to this, which is what "
-            "took Gemma to 0/3 on 2026-08-12."
+            f"max_completion_tokens={body['max_completion_tokens']!r} reached "
+            "the openai route with rewrites OFF (BAKEOFF_PROVIDER=openrouter) "
+            "-- the rename patch is supposed to be inert on this provider, so "
+            "something else is renaming the cap"
         )
-    if "max_completion_tokens" not in body:
+    if "max_tokens" not in body:
         return (
             "neither max_tokens nor max_completion_tokens reached the openai "
-            "route -- the cap was dropped rather than renamed, so this arm "
+            "route -- the cap was dropped somewhere upstream, so this arm "
             "would run uncapped while every other arm runs at 16384"
         )
     return None
 
 
 def validate_reasoning_effort_none(body: dict) -> str | None:
-    """Reject an openai-route request carrying tools without an explicit 'none'.
+    """Reject an openai-route request whose reasoning_effort is wrong for
+    whichever provider this proxy process is running (REWRITES_ENABLED).
 
-    Stands in for gemma's third wall, measured live 2026-08-12:
+    Bedrock (rewrites ON) -- stands in for gemma's third wall, measured live
+    2026-08-12:
 
         Function tools with reasoning_effort are not supported for
         google.gemma-4-31b in /v1/chat/completions. To use function tools, use
         /v1/responses or set reasoning_effort to 'none'.
 
-    The route applies a non-none default when the parameter is ABSENT, which is
-    why this refuses absence rather than only refusing a wrong value -- an
+    The route applies a non-none default when the parameter is ABSENT, which
+    is why this refuses absence rather than only refusing a wrong value -- an
     absent reasoning_effort is exactly what `additional_drop_params` produced,
     and it is what took the arm to 0/3 with the escape sitting in the error
-    message.
+    message. Also refuses a non-'none' value, because that is the shape a
+    half-applied patch produces: Claude Code sends
+    `thinking: {"type": "adaptive"}` on every arm and litellm derives "medium"
+    from it, so a pin that fails to override the derived value looks
+    configured and sends the one thing the route refuses.
 
-    Also refuses a non-'none' value, because that is the shape a half-applied
-    patch produces: Claude Code sends `thinking: {"type": "adaptive"}` on every
-    arm and litellm derives "medium" from it, so a pin that fails to override
-    the derived value looks configured and sends the one thing the route
-    refuses.
+    OpenRouter (rewrites OFF, spec 2026-09-08 §7) -- the pin never runs and
+    `additional_drop_params: ["reasoning_effort"]` removes the derived value,
+    so ABSENT is the correct shape here; any value reaching the route would
+    mean the pin (or something else) is active when it should be inert.
 
     Checked on the openai route only and only when tools are present -- that is
     the whole scope of the real constraint, and widening it would fail requests
@@ -342,19 +386,30 @@ def validate_reasoning_effort_none(body: dict) -> str | None:
     if not body.get("tools"):
         return None
     effort = body.get("reasoning_effort")
-    if effort is None:
+    if REWRITES_ENABLED:
+        if effort is None:
+            return (
+                "tools were sent with no reasoning_effort -- the "
+                "openai_reasoning_effort_pinned_none patch did not apply. Gemma's "
+                "route applies a non-none default and then refuses the tools, "
+                "which is what took it to 0/3 on 2026-08-12."
+            )
+        if effort != "none":
+            return (
+                f"tools were sent with reasoning_effort={effort!r} -- the pin did "
+                "not override the value litellm derives from Claude Code's "
+                "`thinking` block, so the arm would run thinking-on against "
+                "thinking-off arms (spec section 5.4) even where the route allows it."
+            )
+        return None
+    # Rewrites OFF (BAKEOFF_PROVIDER=openrouter): the pin does not run and
+    # additional_drop_params removes the derived value, so absence is correct.
+    if effort is not None:
         return (
-            "tools were sent with no reasoning_effort -- the "
-            "openai_reasoning_effort_pinned_none patch did not apply. Gemma's "
-            "route applies a non-none default and then refuses the tools, "
-            "which is what took it to 0/3 on 2026-08-12."
-        )
-    if effort != "none":
-        return (
-            f"tools were sent with reasoning_effort={effort!r} -- the pin did "
-            "not override the value litellm derives from Claude Code's "
-            "`thinking` block, so the arm would run thinking-on against "
-            "thinking-off arms (spec section 5.4) even where the route allows it."
+            f"tools were sent with reasoning_effort={effort!r} with rewrites "
+            "OFF (BAKEOFF_PROVIDER=openrouter) -- the pin is supposed to be "
+            "inert on this provider and additional_drop_params is supposed to "
+            "remove the derived value, so something is putting it back"
         )
     return None
 
