@@ -251,7 +251,7 @@ def resolved_params(call_id: str | None = None) -> dict[str, Any] | None:
 # OpenRouter run -- which renders identically to a bedrock run, where no
 # upstream was ever named. `metadata.upstream_state` is the other half of that
 # fix and holds whether or not this channel is reachable.
-_UPSTREAM_BY_CALL: dict[str, dict[str, str]] = {}
+_UPSTREAM_BY_CALL: dict[str, dict[str, Any]] = {}
 _UPSTREAM_LOCK = threading.Lock()
 _UPSTREAM_MAX = 512
 
@@ -260,14 +260,23 @@ def record_upstream(
     call_id: str | None,
     provider: str | None = None,
     native_finish_reason: str | None = None,
+    usage: dict[str, Any] | None = None,
 ) -> None:
     """File what a raw chunk said about the upstream, under the call it is for.
 
-    MERGES rather than overwrites, and only over non-empty values: the two
-    facts arrive on different chunks -- OpenRouter names the provider on the
-    first and the native finish reason on the last -- so a later chunk carrying
-    only one of them must not blank out the other. Overwriting is what
-    `record_resolved_params` wants and is the wrong rule here.
+    MERGES rather than overwrites, and only over non-empty values: the facts
+    arrive on different chunks -- OpenRouter names the provider on the first
+    and the native finish reason and usage block on the last -- so a later
+    chunk carrying only some of them must not blank out the others.
+    Overwriting is what `record_resolved_params` wants and is the wrong rule
+    here.
+
+    `usage` is OpenRouter's own accounting off the raw final chunk -- `cost`,
+    `cost_details`, `is_byok`, and the real `completion_tokens_details.
+    reasoning_tokens` -- none of which the Anthropic adapter or litellm's
+    rebuilt `Usage` object ever carries. Filed under the string key `"usage"`
+    beside `provider` and `native_finish_reason`, so `upstream_for` returns
+    one dict with all three.
 
     A no-op without a call id: an unkeyed capture can only be attributed by
     guessing, and one arm's upstream under another arm's entry is exactly the
@@ -275,11 +284,13 @@ def record_upstream(
     """
     if not isinstance(call_id, str) or not call_id:
         return
-    fields = {
+    fields: dict[str, Any] = {
         "provider": provider,
         "native_finish_reason": native_finish_reason,
     }
-    present = {k: v for k, v in fields.items() if isinstance(v, str) and v}
+    present: dict[str, Any] = {k: v for k, v in fields.items() if isinstance(v, str) and v}
+    if isinstance(usage, dict) and usage:
+        present["usage"] = usage
     if not present:
         return
     with _UPSTREAM_LOCK:
@@ -289,7 +300,7 @@ def record_upstream(
             _UPSTREAM_BY_CALL.pop(next(iter(_UPSTREAM_BY_CALL)))
 
 
-def upstream_for(call_id: str | None) -> dict[str, str] | None:
+def upstream_for(call_id: str | None) -> dict[str, Any] | None:
     """What the streaming hook filed for THIS call, or None.
 
     Read without consuming, for the same reason `resolved_params` is: a failed
@@ -478,25 +489,43 @@ def finish_reason(response: dict[str, Any]) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def upstream(kwargs: dict, response: dict[str, Any]) -> tuple[str | None, str | None, float | None]:
-    """(upstream provider, its native finish reason, its reported cost), or Nones.
+def upstream(
+    kwargs: dict, response: dict[str, Any]
+) -> tuple[str | None, str | None, float | None, dict[str, Any] | None]:
+    """(upstream provider, its native finish reason, its reported cost, its
+    raw usage dict), or Nones.
 
     OpenRouter returns top-level `provider`, `choices[].native_finish_reason`
-    and -- with `usage: {include: true}` -- `usage.cost` in every response body
-    (spec 2026-09-08 §4). Three sources are consulted, in this order, because
-    each covers a case the next one does not:
+    and -- with `usage: {include: true}` -- a `usage` block carrying `cost`
+    in every response body (spec 2026-09-08 §4). Three sources are consulted
+    for provider/native/cost, in this order, because each covers a case the
+    next one does not:
 
       1. the per-call channel above, filled by the streaming hook from the RAW
          chunks. The only source that works on a streaming call, which is every
          real call: litellm's `openai/` streaming path never calls
          `logging_obj.post_call` and hands the callback a rebuilt
-         ModelResponse, so 2 is unset and 3 has already dropped both keys.
+         ModelResponse, so 2 is unset and 3 has already dropped these keys.
       2. `kwargs["original_response"]`, the raw provider JSON litellm passes a
          NON-streaming success callback, as a string.
       3. the logged response dump, for a route that happens to preserve them.
 
-    `usage.cost` is not in the channel and does not need to be:
-    `stream_chunk_builder` carries usage across, so 3 answers for it.
+    This docstring used to claim `usage.cost` survives into 3 because
+    `stream_chunk_builder` carries usage across. Measured false, 2026-09-11:
+    litellm 1.95.0 rebuilds `usage` as its own `Usage` object on the way to
+    the callback, and `cost` -- along with `cost_details`, `is_byok`, and the
+    real `completion_tokens_details.reasoning_tokens` -- is gone with it. So
+    `cost` is read from the channel's `usage["cost"]` FIRST (numeric, not
+    bool), and only then from sources 2 and 3, kept as a fallback for a route
+    that happens to preserve it there rather than as the primary source.
+
+    `usage`, the fourth return value, is the raw dict itself: the channel's,
+    if the streaming hook filed one, else the raw `original_response`'s
+    `usage` field, else None. It NEVER falls back to `response` (source 3):
+    that is the logged dump, which on a streaming call is
+    `stream_chunk_builder`'s own reconstruction -- litellm's arithmetic, not
+    an observation of what the upstream reported -- and returning it here
+    would misattribute one as the other.
 
     None, never the config's `provider.order`: that is what was ASKED for,
     and only the response says who answered. Verifying the pin per call is
@@ -507,23 +536,31 @@ def upstream(kwargs: dict, response: dict[str, Any]) -> tuple[str | None, str | 
     provider: str | None = None
     native: str | None = None
     cost: float | None = None
+    channel_usage: dict[str, Any] | None = None
 
     captured = upstream_for(kwargs.get("litellm_call_id"))
     if captured:
         provider = captured.get("provider") or None
         native = captured.get("native_finish_reason") or None
+        raw_usage = captured.get("usage")
+        if isinstance(raw_usage, dict) and raw_usage:
+            channel_usage = raw_usage
 
     raw = kwargs.get("original_response")
-    sources: list[dict[str, Any]] = []
+    raw_parsed: dict[str, Any] | None = None
     if isinstance(raw, (str, bytes)):
         try:
             parsed = json.loads(raw)
             if isinstance(parsed, dict):
-                sources.append(parsed)
+                raw_parsed = parsed
         except (json.JSONDecodeError, UnicodeDecodeError):
             pass
     elif isinstance(raw, dict):
-        sources.append(raw)
+        raw_parsed = raw
+
+    sources: list[dict[str, Any]] = []
+    if raw_parsed is not None:
+        sources.append(raw_parsed)
     if isinstance(response, dict):
         sources.append(response)
 
@@ -538,13 +575,27 @@ def upstream(kwargs: dict, response: dict[str, Any]) -> tuple[str | None, str | 
                 value = choices[0].get("native_finish_reason")
                 if isinstance(value, str) and value:
                     native = value
-        if cost is None:
+
+    if channel_usage is not None:
+        value = channel_usage.get("cost")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            cost = float(value)
+    if cost is None:
+        for source in sources:
             usage = source.get("usage")
             if isinstance(usage, dict):
                 value = usage.get("cost")
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
                     cost = float(value)
-    return provider, native, cost
+                    break
+
+    usage_result: dict[str, Any] | None = channel_usage
+    if usage_result is None and raw_parsed is not None:
+        raw_usage_field = raw_parsed.get("usage")
+        if isinstance(raw_usage_field, dict) and raw_usage_field:
+            usage_result = raw_usage_field
+
+    return provider, native, cost, usage_result
 
 
 def upstream_state(upstream_provider: str | None) -> str:
@@ -624,7 +675,7 @@ class BakeoffProxyCallback(CustomLogger):
         else:
             response = {"raw_completion": str(raw)}
 
-        upstream_provider, native_finish_reason, usage_cost = upstream(kwargs, response)
+        upstream_provider, native_finish_reason, usage_cost, upstream_usage = upstream(kwargs, response)
 
         with self._lock:
             self._call_index[run_id] = self._call_index.get(run_id, 0) + 1
@@ -650,6 +701,12 @@ class BakeoffProxyCallback(CustomLogger):
                     "upstream_provider": upstream_provider,
                     "native_finish_reason": native_finish_reason,
                     "usage_cost": usage_cost,
+                    # OpenRouter's own usage block, raw -- cost_details,
+                    # is_byok, and the real completion_tokens_details.
+                    # reasoning_tokens, none of which litellm's rebuilt Usage
+                    # object carries. Never sourced from the logged dump; see
+                    # `upstream`'s docstring for why.
+                    "upstream_usage": upstream_usage,
                     # Whether anybody named an upstream on this call, so a
                     # broken capture on an OpenRouter run cannot read as a
                     # bedrock run's honest silence. See upstream_state.

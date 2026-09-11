@@ -709,10 +709,14 @@ def _apply_openai_param_pins() -> list[str]:
 # before anything the harness can register gets to see it.
 #
 # WHAT IS LOST. OpenRouter answers with a top-level ``provider`` naming the
-# upstream that served the call, and ``choices[].native_finish_reason`` -- the
-# upstream's own word for why generation stopped. Verifying the ``order`` pin
-# per call is the whole reason `RunRecord.upstream_providers` exists, and
-# ``allow_fallbacks: false`` is a request, not a proof.
+# upstream that served the call, ``choices[].native_finish_reason`` -- the
+# upstream's own word for why generation stopped -- and, on the final chunk,
+# its own ``usage`` block (``cost``, ``cost_details``, ``is_byok``, and the
+# REAL ``completion_tokens_details.reasoning_tokens``; measured 2026-09-11,
+# Anthropic-side ``reasoning_tokens`` reads 0 on a call where OpenRouter's own
+# usage carried 52). Verifying the ``order`` pin per call is the whole reason
+# `RunRecord.upstream_providers` exists, and ``allow_fallbacks: false`` is a
+# request, not a proof.
 #
 # WHY NO CALLBACK OR HOOK CAN SEE THEM, traced through litellm 1.95.0. Every
 # real call streams, and on the streaming path:
@@ -721,8 +725,12 @@ def _apply_openai_param_pins() -> list[str]:
 #     ``logging_obj.post_call``, so ``kwargs["original_response"]`` -- the raw
 #     provider JSON a NON-streaming success callback gets -- is never set.
 #   * what reaches ``log_success_event`` is ``stream_chunk_builder`` output,
-#     which rebuilds a ModelResponse and carries neither key across (it does
-#     carry ``usage.cost``, which is why the cost field needs no rescue).
+#     which rebuilds a ModelResponse and carries none of the three across.
+#     This module used to claim ``usage.cost`` was the exception -- measured
+#     false, 2026-09-11: litellm rebuilds ``usage`` as its own ``Usage``
+#     object, and ``cost`` (along with everything else OpenRouter put in
+#     ``usage``) is gone with it. So ``usage`` needs the same rescue as the
+#     other two, not an exemption from it.
 #   * ``async_post_call_streaming_hook`` IS dispatched on /v1/messages, but
 #     ``ProxyLogging.async_post_call_streaming_hook`` hands a CustomLogger
 #     ``response=complete_response`` -- the accumulated text STRING, not the
@@ -732,11 +740,12 @@ def _apply_openai_param_pins() -> list[str]:
 #     output: Anthropic SSE events translated from the OpenAI chunks, several
 #     layers after the keys are gone.
 #
-# So the last place both keys still exist is the raw provider chunk, and the
+# So the last place all three still exist is the raw provider chunk, and the
 # last code to hold one is ``CustomStreamWrapper.chunk_creator``. The keys
 # survive that far only because the OpenAI SDK's models are ``extra="allow"``
 # -- verified in this venv: ChatCompletionChunk(**raw).model_extra is
-# {'provider': ...} and the choice's is {'native_finish_reason': ...}. Note
+# {'provider': ...}, the choice's is {'native_finish_reason': ...}, and the
+# usage object's is {'cost': ..., 'is_byok': ..., 'cost_details': ...}. Note
 # what happens one layer down: ``OpenAIChatCompletionStreamingHandler.
 # chunk_parser`` rebuilds ModelResponseStream from an explicit key whitelist
 # (id/object/created/model/choices/usage), so the top-level provider dies
@@ -749,8 +758,8 @@ def _apply_openai_param_pins() -> list[str]:
 # translation runs in a task whose context was copied before the hook. So the
 # id is read once at __init__ and carried on the object.
 #
-# PROVIDER-NEUTRAL, applied on every route. A bedrock chunk carries neither
-# key, ``record_upstream`` files nothing, and the entry reads
+# PROVIDER-NEUTRAL, applied on every route. A bedrock chunk carries none of
+# the three, ``record_upstream`` files nothing, and the entry reads
 # ``upstream_state: not_in_response`` -- which is the truth there. Scoping it
 # to openrouter would make transport a per-arm difference (section 5.4) for
 # no gain.
@@ -762,17 +771,28 @@ _UPSTREAM_CALL_ID_ATTR = "_bakeoff_upstream_call_id"
 _UPSTREAM_SEEN_ATTR = "_bakeoff_upstream_seen"
 
 
-def _upstream_from_chunk(chunk: Any) -> tuple[str | None, str | None]:
-    """(provider, native_finish_reason) off ONE raw provider chunk.
+def _upstream_from_chunk(chunk: Any) -> tuple[str | None, str | None, dict[str, Any] | None]:
+    """(provider, native_finish_reason, usage) off ONE raw provider chunk.
 
     A pure function so the extraction is testable without a proxy, a stream or
     a network. Reads attributes first (the OpenAI SDK shape) and mapping keys
     second (the httpx shape), because both reach chunk_creator depending on
     which client litellm chose for the deployment.
 
-    Returns Nones for a chunk that carries neither, which is every chunk on
-    every bedrock arm and most chunks on an OpenRouter one -- the provider is
-    named on the first chunk and the native finish reason on the last.
+    ``usage`` is the third element and the only one shaped as a dict rather
+    than a scalar: OpenRouter's own accounting -- ``cost``, ``cost_details``,
+    ``is_byok`` and the real ``completion_tokens_details.reasoning_tokens`` --
+    none of which the Anthropic adapter or litellm's rebuilt ``Usage`` object
+    ever carries. On the OpenAI-SDK shape ``usage`` arrives as a
+    ``CompletionUsage`` pydantic object (``extra="allow"``); its extras are
+    read out of ``model_extra`` and merged over ``model_dump()`` in case a
+    future SDK version stops folding them in on its own. On the httpx/mapping
+    shape it is already a plain dict and is returned as one, verbatim.
+
+    Returns Nones/None for a chunk that carries none of these, which is every
+    chunk on every bedrock arm and most chunks on an OpenRouter one -- the
+    provider is named on the first chunk, the native finish reason and the
+    usage block on the last.
     """
     def _read(source: Any, key: str) -> str | None:
         value = None
@@ -792,7 +812,20 @@ def _upstream_from_chunk(chunk: Any) -> tuple[str | None, str | None]:
     choices = chunk.get("choices") if isinstance(chunk, Mapping) else getattr(chunk, "choices", None)
     if isinstance(choices, (list, tuple)) and choices:
         native = _read(choices[0], "native_finish_reason")
-    return provider, native
+
+    usage_raw = chunk.get("usage") if isinstance(chunk, Mapping) else getattr(chunk, "usage", None)
+    usage: dict[str, Any] | None = None
+    if isinstance(usage_raw, Mapping):
+        candidate = dict(usage_raw)
+        usage = candidate if candidate else None
+    elif usage_raw is not None and hasattr(usage_raw, "model_dump"):
+        candidate = dict(usage_raw.model_dump())
+        extra = getattr(usage_raw, "model_extra", None)
+        if isinstance(extra, Mapping):
+            candidate.update(extra)
+        usage = candidate if candidate else None
+
+    return provider, native, usage
 
 
 def _apply_upstream_stream_capture() -> str:
@@ -843,25 +876,33 @@ def _apply_upstream_stream_capture() -> str:
         def patched_chunk_creator(self, chunk, *args, **kwargs):
             try:
                 seen = getattr(self, _UPSTREAM_SEEN_ATTR, None)
-                if seen is not None and len(seen) < 2:
-                    provider, native = _upstream_from_chunk(chunk)
+                if seen is not None and len(seen) < 3:
+                    provider, native, usage = _upstream_from_chunk(chunk)
                     # Only the FIRST sighting of each: a stream is hundreds of
                     # chunks and the values do not change within one call, so
-                    # re-filing them would take the lock for nothing.
+                    # re-filing them would take the lock for nothing. Usage
+                    # arrives on the final chunk only, so in practice this
+                    # fires once for it -- the guard is kept for symmetry with
+                    # the other two, not because a second sighting is expected.
                     if provider is not None and "provider" in seen:
                         provider = None
                     if native is not None and "native" in seen:
                         native = None
-                    if provider is not None or native is not None:
+                    if usage is not None and "usage" in seen:
+                        usage = None
+                    if provider is not None or native is not None or usage is not None:
                         record_upstream(
                             getattr(self, _UPSTREAM_CALL_ID_ATTR, None),
                             provider=provider,
                             native_finish_reason=native,
+                            usage=usage,
                         )
                         if provider is not None:
                             seen.add("provider")
                         if native is not None:
                             seen.add("native")
+                        if usage is not None:
+                            seen.add("usage")
             except Exception:  # noqa: BLE001 - observation may not cost the run
                 pass
             return original_chunk_creator(self, chunk, *args, **kwargs)
@@ -877,9 +918,12 @@ def _apply_upstream_stream_capture() -> str:
         {
             "provider": "CoreWeave",
             "choices": [{"index": 0, "native_finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "cost": 0.1},
         }
     )
-    if probe != ("CoreWeave", "stop"):
+    if probe != (
+        "CoreWeave", "stop", {"prompt_tokens": 1, "completion_tokens": 2, "cost": 0.1},
+    ):
         raise RuntimeError(
             f"{OPENAI_UPSTREAM_STREAM_CAPTURE} did not take: got {probe!r}"
         )

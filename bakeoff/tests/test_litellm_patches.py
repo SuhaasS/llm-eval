@@ -800,7 +800,7 @@ def _map(model="moonshotai/kimi-k2.6"):
 # --- the upstream identity, destroyed before any callback sees it ------------
 
 
-def _openrouter_sdk_chunk(provider=None, native=None, content="hi"):
+def _openrouter_sdk_chunk(provider=None, native=None, content="hi", usage=None):
     """A raw OpenAI-SDK streaming chunk, the shape chunk_creator receives.
 
     Built from the SDK's own type rather than a stub: the whole reason the
@@ -818,6 +818,8 @@ def _openrouter_sdk_chunk(provider=None, native=None, content="hi"):
     }
     if provider is not None:
         body["provider"] = provider
+    if usage is not None:
+        body["usage"] = usage
     return ChatCompletionChunk(**body)
 
 
@@ -831,17 +833,71 @@ def test_the_sdk_chunk_is_what_still_carries_the_openrouter_keys():
     chunk = _openrouter_sdk_chunk(provider="CoreWeave", native="stop")
     assert chunk.model_extra == {"provider": "CoreWeave"}
     assert chunk.choices[0].model_extra == {"native_finish_reason": "stop"}
-    assert litellm_patches._upstream_from_chunk(chunk) == ("CoreWeave", "stop")
+    assert litellm_patches._upstream_from_chunk(chunk) == ("CoreWeave", "stop", None)
 
 
 def test_upstream_extraction_reads_both_chunk_shapes_and_neither_when_absent():
     assert litellm_patches._upstream_from_chunk(
         {"provider": "Fireworks", "choices": [{"native_finish_reason": "length"}]}
-    ) == ("Fireworks", "length")
+    ) == ("Fireworks", "length", None)
     # A bedrock chunk: neither key, and nothing is invented for it.
-    assert litellm_patches._upstream_from_chunk(_openrouter_sdk_chunk()) == (None, None)
-    assert litellm_patches._upstream_from_chunk({"choices": []}) == (None, None)
-    assert litellm_patches._upstream_from_chunk(object()) == (None, None)
+    assert litellm_patches._upstream_from_chunk(_openrouter_sdk_chunk()) == (None, None, None)
+    assert litellm_patches._upstream_from_chunk({"choices": []}) == (None, None, None)
+    assert litellm_patches._upstream_from_chunk(object()) == (None, None, None)
+
+
+# OpenRouter's own final-chunk usage shape, verbatim (2026-09-11 measurement).
+_OPENROUTER_RAW_USAGE = {
+    "prompt_tokens": 11,
+    "completion_tokens": 8,
+    "total_tokens": 19,
+    "cost": 3.443e-05,
+    "is_byok": False,
+    "prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+    "cost_details": {"upstream_inference_cost": None},
+    "completion_tokens_details": {"reasoning_tokens": 8},
+}
+
+
+def test_upstream_extraction_reads_usage_from_a_mapping_chunk():
+    """The mapping-shaped chunk (the httpx path) carries usage as a plain
+    dict; that dict is returned verbatim, including OpenRouter's own
+    cost/cost_details/is_byok/reasoning_tokens -- none of which the Anthropic
+    adapter or litellm's rebuilt Usage object ever surfaces."""
+    provider, native, usage = litellm_patches._upstream_from_chunk(
+        {
+            "provider": "CoreWeave",
+            "choices": [{"native_finish_reason": "stop"}],
+            "usage": dict(_OPENROUTER_RAW_USAGE),
+        }
+    )
+    assert (provider, native) == ("CoreWeave", "stop")
+    assert usage == _OPENROUTER_RAW_USAGE
+
+
+def test_upstream_extraction_reads_usage_from_an_openai_sdk_chunk():
+    """The OpenAI-SDK shape: `usage` is a `CompletionUsage` pydantic object
+    whose extras (`cost`, `cost_details`, `is_byok`) live in `model_extra`.
+    `model_dump()` already folds those back in on this SDK version, and the
+    merge is the safety net for a version where it does not."""
+    chunk = _openrouter_sdk_chunk(
+        provider="CoreWeave", native="stop", usage=dict(_OPENROUTER_RAW_USAGE)
+    )
+    assert chunk.usage.model_extra == {
+        "cost": 3.443e-05, "is_byok": False,
+        "cost_details": {"upstream_inference_cost": None},
+    }
+    provider, native, usage = litellm_patches._upstream_from_chunk(chunk)
+    assert (provider, native) == ("CoreWeave", "stop")
+    assert usage["cost"] == pytest.approx(3.443e-05)
+    assert usage["is_byok"] is False
+    assert usage["completion_tokens_details"]["reasoning_tokens"] == 8
+
+
+def test_upstream_extraction_of_usage_is_none_for_no_usage_or_empty_usage():
+    assert litellm_patches._upstream_from_chunk({"usage": {}}) == (None, None, None)
+    assert litellm_patches._upstream_from_chunk(_openrouter_sdk_chunk()) == (None, None, None)
+    assert litellm_patches._upstream_from_chunk({"usage": "not-a-dict"}) == (None, None, None)
 
 
 def test_the_stream_wrapper_files_the_upstream_under_the_hooks_call_id():
@@ -870,18 +926,23 @@ def test_the_stream_wrapper_files_the_upstream_under_the_hooks_call_id():
             logging_obj=_LoggingStub(),
         )
         assert getattr(wrapper, litellm_patches._UPSTREAM_CALL_ID_ATTR) == "call-stream"
-        # Two chunks, each carrying one half, exactly as OpenRouter sends them.
+        # Three chunks, each carrying one piece, exactly as OpenRouter sends
+        # them: provider on the first, native finish reason and usage on the
+        # last.
         for chunk in (
             _openrouter_sdk_chunk(provider="CoreWeave"),
-            _openrouter_sdk_chunk(native="tool_calls", content=""),
+            _openrouter_sdk_chunk(
+                native="tool_calls", content="", usage=dict(_OPENROUTER_RAW_USAGE)
+            ),
         ):
             try:
                 wrapper.chunk_creator(chunk=chunk)
             except Exception:  # noqa: BLE001 - the parse is not under test here
                 pass
-        assert upstream_for("call-stream") == {
-            "provider": "CoreWeave", "native_finish_reason": "tool_calls",
-        }
+        captured = upstream_for("call-stream")
+        assert captured["provider"] == "CoreWeave"
+        assert captured["native_finish_reason"] == "tool_calls"
+        assert captured["usage"]["cost"] == pytest.approx(3.443e-05)
     finally:
         open_resolved_capture(None)
 

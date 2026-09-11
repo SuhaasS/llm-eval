@@ -871,6 +871,22 @@ one ends a multi-day run outright.
   the other OpenRouter provider-pin verification work in
   `scripts/probe_openrouter.py` rather than in the wire-log projection.
 
+- [ ] **`cost_usd` under-bills thinking output on OpenRouter; `cost_usd_provider`
+  is the accurate figure until this lands.** Measured 2026-09-11, live,
+  kimi-k2-6 through the proxy: the Anthropic-side transcript that
+  `parse_trajectory` reads off reports `reasoning_tokens: 0` on a call where
+  `metadata.upstream_usage.completion_tokens_details.reasoning_tokens` (now
+  captured — see the streaming usage fix landed this session in
+  `litellm_patches.py`/`proxy_callback.py`/`wire.py`) was **52**. litellm's
+  Anthropic adapter surfaces none of OpenRouter's own token accounting, so
+  `cost_usd`, which prices off the transcript's token counts, bills the
+  thinking output at zero on every OpenRouter arm while `cost_usd_provider`
+  (`provider_cost_usd`, which now sums `metadata.usage_cost` populated by the
+  same fix) reflects what OpenRouter actually charged. Closing this needs a
+  record-level `upstream_reasoning_tokens` field — a schema bump, deferred
+  rather than folded into the usage-capture fix, since that fix is pure
+  observation and a schema bump is a decision about what the record claims.
+
 ---
 
 ## P2 — Derivation gaps (Gate 3; safe to close after collection)

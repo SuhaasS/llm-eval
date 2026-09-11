@@ -759,6 +759,96 @@ def test_the_streaming_hook_channel_supplies_what_the_rebuilt_dump_lost(wire_dir
     assert metadata["upstream_state"] == "captured"
 
 
+OPENROUTER_RAW_USAGE = {
+    "prompt_tokens": 11,
+    "completion_tokens": 8,
+    "total_tokens": 19,
+    "cost": 3.443e-05,
+    "is_byok": False,
+    "prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+    "cost_details": {"upstream_inference_cost": None},
+    "completion_tokens_details": {"reasoning_tokens": 8},
+}
+
+
+def test_record_upstream_merges_a_non_empty_usage_dict():
+    """The third field on the channel: OpenRouter's own usage block, filed
+    once by the streaming hook off the final chunk."""
+    from bakeoff.proxy_callback import record_upstream, upstream_for
+
+    call_id = "call-usage"
+    record_upstream(call_id, provider="CoreWeave")
+    record_upstream(call_id, native_finish_reason="stop", usage=dict(OPENROUTER_RAW_USAGE))
+    captured = upstream_for(call_id)
+    assert captured["provider"] == "CoreWeave"
+    assert captured["native_finish_reason"] == "stop"
+    assert captured["usage"] == OPENROUTER_RAW_USAGE
+
+    # An empty usage dict is not a fact and must not overwrite what is there.
+    record_upstream(call_id, usage={})
+    assert upstream_for(call_id)["usage"] == OPENROUTER_RAW_USAGE
+
+
+def test_upstream_takes_cost_from_the_channel_usage_before_any_other_source(wire_dir):
+    """spec: cost comes from the channel's usage['cost'] first, then the
+    existing two sources -- because the raw chunk's cost is the real
+    OpenRouter figure and the rebuilt dump's is either absent or, per the
+    corrected docstring, litellm's own (usually absent) arithmetic."""
+    from bakeoff.proxy_callback import record_upstream, upstream
+
+    call_id = "call-cost-priority"
+    kwargs = {**kwargs_for("run-cost-priority"), "litellm_call_id": call_id}
+    record_upstream(call_id, provider="CoreWeave", usage=dict(OPENROUTER_RAW_USAGE))
+    # A response dump claiming a DIFFERENT cost -- the channel must win.
+    response = {"choices": [{"finish_reason": "stop"}], "usage": {"cost": 999.0}}
+    provider, native, cost, usage = upstream(kwargs, response)
+    assert provider == "CoreWeave"
+    assert cost == pytest.approx(3.443e-05)
+    assert usage == OPENROUTER_RAW_USAGE
+
+
+def test_upstream_usage_never_falls_back_to_the_logged_dump(wire_dir):
+    """usage is the channel's raw dict, else original_response's raw usage,
+    else None -- NEVER the litellm dump's rebuilt usage, which is litellm's
+    own arithmetic and not an observation of the upstream."""
+    from bakeoff.proxy_callback import upstream
+
+    kwargs = kwargs_for("run-no-channel")
+    # No channel entry, no original_response: only the logged dump has usage.
+    response = {"choices": [{"finish_reason": "stop"}], "usage": {"cost": 0.5, "prompt_tokens": 1}}
+    provider, native, cost, usage = upstream(kwargs, response)
+    # cost keeps its existing fallback to the dump (a route that preserves it).
+    assert cost == pytest.approx(0.5)
+    # but the raw usage dict itself is never sourced from the dump.
+    assert usage is None
+
+
+def test_upstream_usage_falls_back_to_original_response_when_no_channel_entry(wire_dir):
+    from bakeoff.proxy_callback import upstream
+
+    kwargs = kwargs_for("run-raw-fallback")
+    kwargs["original_response"] = json.dumps(
+        {"provider": "Fireworks", "choices": [{"native_finish_reason": "stop"}],
+         "usage": dict(OPENROUTER_RAW_USAGE)}
+    )
+    provider, native, cost, usage = upstream(kwargs, {"choices": [{"finish_reason": "stop"}]})
+    assert provider == "Fireworks"
+    assert cost == pytest.approx(3.443e-05)
+    assert usage == OPENROUTER_RAW_USAGE
+
+
+def test_an_entry_written_after_record_upstream_with_usage_carries_both_new_fields(wire_dir):
+    from bakeoff.proxy_callback import record_upstream
+
+    call_id = "call-entry-usage"
+    kwargs = {**kwargs_for("run-entry-usage"), "litellm_call_id": call_id}
+    record_upstream(call_id, provider="CoreWeave", usage=dict(OPENROUTER_RAW_USAGE))
+    BakeoffProxyCallback().log_success_event(kwargs, dict(ASSEMBLED_STREAM_DUMP), None, None)
+    metadata = read_run_entries(wire_dir, "run-entry-usage")[0]["metadata"]
+    assert metadata["usage_cost"] == pytest.approx(3.443e-05)
+    assert metadata["upstream_usage"] == OPENROUTER_RAW_USAGE
+
+
 def test_an_unkeyed_upstream_capture_is_dropped_rather_than_guessed_at():
     """Same rule as record_resolved_params: attributing a capture on
     proximity puts one arm's upstream under another arm's entry."""

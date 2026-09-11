@@ -176,7 +176,7 @@ class BakeoffCallback(CustomLogger):
             if error is not None
             else raw if isinstance(raw, dict) else {"raw_completion": str(raw)}
         )
-        upstream_provider, native_finish_reason, usage_cost = upstream(kwargs, payload)
+        upstream_provider, native_finish_reason, usage_cost, upstream_usage = upstream(kwargs, payload)
         self.logger.log_call(
             # Projected through the shared allowlist, so this path and the proxy
             # one cannot drift: a run's canonical artifact is written from
@@ -209,6 +209,10 @@ class BakeoffCallback(CustomLogger):
                 "upstream_provider": upstream_provider,
                 "native_finish_reason": native_finish_reason,
                 "usage_cost": usage_cost,
+                # Same key as proxy_callback._write, and the same rule: never
+                # the logged dump's rebuilt usage, only the raw chunk's or
+                # original_response's. See upstream()'s docstring.
+                "upstream_usage": upstream_usage,
                 "upstream_state": upstream_state(upstream_provider),
                 # Measured generation time, as opposed to the trajectory
                 # parser's estimate from transcript timestamps.

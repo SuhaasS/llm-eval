@@ -362,6 +362,7 @@ def test_both_capture_paths_write_the_same_metadata_keys(tmp_path, monkeypatch):
     inproc_keys = set(logger.entries()[0]["metadata"])
 
     assert {
-        "upstream_provider", "native_finish_reason", "usage_cost", "upstream_state",
+        "upstream_provider", "native_finish_reason", "usage_cost", "upstream_usage",
+        "upstream_state",
     } <= proxy_keys
     assert proxy_keys - {"resolved_state"} == inproc_keys - {"bedrock_request_id"}
