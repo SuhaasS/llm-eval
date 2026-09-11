@@ -844,6 +844,33 @@ one ends a multi-day run outright.
   `test_usage_accounting.py` pin are their own item, tracked here until landed;
   if exclusive, this item closes with no code change.
 
+- [ ] **`extra_body` cannot reach the wire log, structurally — adding it to
+  `REQUEST_KEYS` would not fix this.** Measured 2026-09-10 against litellm
+  1.95.0 source (`.venv/lib/python3.12/site-packages/litellm`). The
+  resolved-params capture (`bakeoff.litellm_patches`, `OPENAI_RESOLVED_PARAMS_CAPTURE`)
+  wraps `litellm.OpenAIConfig.map_openai_params` and calls
+  `record_resolved_params({"model": model, **mapped})` where `mapped` is
+  exactly that method's own return value (`litellm_patches.py` around the
+  `patched()` closure). But `extra_body` is never part of that return value:
+  in `litellm/utils.py`'s `get_optional_params`, `provider_config.map_openai_params(...)`
+  (the wrapped call) runs and returns first, and only AFTER it returns does a
+  *separate* function, `add_provider_specific_params_to_optional_params`
+  (`litellm/utils.py` ~L4363), build `extra_body` from `passed_params` and
+  write it onto `optional_params["extra_body"]` — a dict the wrapper already
+  handed back and never sees again.
+
+  So whether `reasoning`, `provider` and `usage` actually left the proxy for
+  the two OpenRouter arms (spec §7 Measurement C in the 2026-09-10 defect
+  report) is unobservable from `proxy_callback.REQUEST_KEYS`/`resolved` no
+  matter which keys that projection lists — the field the projection would
+  read from (`optional_params`, post-`get_optional_params`) is not the field
+  the resolved-params channel captures (`mapped`, pre-`add_provider_specific_params_to_optional_params`).
+  Seeing it would need a second capture point after `get_optional_params`
+  returns, or a call-site hook on `add_provider_specific_params_to_optional_params`
+  itself — either is new plumbing, not a `REQUEST_KEYS` edit, and belongs with
+  the other OpenRouter provider-pin verification work in
+  `scripts/probe_openrouter.py` rather than in the wire-log projection.
+
 ---
 
 ## P2 — Derivation gaps (Gate 3; safe to close after collection)
