@@ -138,25 +138,54 @@ def check_cache_fires(pairs: list[tuple[dict[str, Any], dict[str, Any]]], min_hi
     """
     hits = 0
     anomalies = 0
+    unpriced = 0
     rows = []
     for first, second in pairs:
-        cached = cached_tokens(second) or 0
-        priced = isinstance(second.get("cost"), (int, float)) and isinstance(first.get("cost"), (int, float))
-        cheaper = priced and second["cost"] < first["cost"]
+        first_usage, first_status, first_error = _usage_status_error(first)
+        second_usage, second_status, second_error = _usage_status_error(second)
+        cached = cached_tokens(second_usage) or 0
+        priced = isinstance(second_usage.get("cost"), (int, float)) and isinstance(first_usage.get("cost"), (int, float))
+        cheaper = priced and second_usage["cost"] < first_usage["cost"]
         hit = cached > 0 and cheaper
         anomaly = cached > 0 and priced and not cheaper
         hits += hit
         anomalies += anomaly
-        rows.append({"cached_tokens": cached, "first_cost": first.get("cost"), "second_cost": second.get("cost"), "hit": hit, "billing_anomaly": anomaly})
+        unpriced += not priced
+        rows.append({
+            "cached_tokens": cached,
+            "first_cost": first_usage.get("cost"), "second_cost": second_usage.get("cost"),
+            # A replicate the provider refused (402, 429, 5xx) was never
+            # priced and says nothing about the cache. It is neither a hit nor
+            # a miss, and it must not render as one.
+            "first_status": first_status, "second_status": second_status,
+            "error": first_error or second_error,
+            "priced": priced, "hit": hit, "billing_anomaly": anomaly,
+        })
+    priced_count = len(pairs) - unpriced
     return {
         "check": "cache_fires",
         "replicates": len(pairs),
+        "priced_replicates": priced_count,
+        "unpriced_replicates": unpriced,
         "hits": hits,
-        "hit_rate": (hits / len(pairs)) if pairs else None,
+        "hit_rate": (hits / priced_count) if priced_count else None,
         "billing_anomalies": anomalies,
         "rows": rows,
         "pass": hits >= min_hits and anomalies == 0,
+        **({"error": f"no priced replicate: {[r['first_status'] or r['second_status'] for r in rows]}"} if pairs and not priced_count else {}),
     }
+
+
+def _usage_status_error(response: dict[str, Any]) -> tuple[dict[str, Any], int | None, str | None]:
+    """(usage, http status, error message) off a response dict, tolerating the
+    older shape where callers passed a bare usage dict (the unit tests do)."""
+    if "usage" in response or "_status" in response or "error" in response:
+        usage = response.get("usage") or {}
+        status = response.get("_status")
+        error = response.get("error")
+        message = error.get("message") if isinstance(error, dict) else (str(error) if error else None)
+        return usage if isinstance(usage, dict) else {}, status if isinstance(status, int) else None, message
+    return response, None, None
 
 
 def check_usage_exclusive(anthropic: dict[str, Any], openai: dict[str, Any]) -> dict[str, Any]:
@@ -286,7 +315,11 @@ def leg_a(
                     first = post_openrouter(client, key, openrouter_body(params, msgs, tools=False, order=order))
                     time.sleep(3)
                     second = post_openrouter(client, key, openrouter_body(params, msgs, tools=False, order=order))
-                    pairs.append((first.get("usage") or {}, second.get("usage") or {}))
+                    # The whole response, not just usage: a 402 or 429 must be
+                    # read as "this replicate was never priced", never as a
+                    # cache miss. Measured 2026-09-11 on K3, two 402s rendered
+                    # as two misses and the check reported a 0% hit rate.
+                    pairs.append((first, second))
                 results.append({**check_cache_fires(pairs), "arm": arm})
             except Exception as exc:
                 results.append({"check": "cache_fires", "arm": arm, "pass": False, "error": f"{type(exc).__name__}: {exc}"})

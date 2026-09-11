@@ -61,6 +61,24 @@ def test_no_hit_at_all_fails_the_cache_check():
     assert result["pass"] is False and result["hit_rate"] == 0.0
 
 
+def test_a_refused_replicate_is_unpriced_not_a_miss():
+    """Measured 2026-09-11 on K3: two 402s ("would exceed your available
+    credits") rendered as two cache misses and a 0% hit rate. A replicate the
+    provider never priced says nothing about the cache."""
+    refused = {"_status": 402, "error": {"message": "This request would exceed your available credits", "code": 402}}
+    priced_hit = ({"_status": 200, "usage": HIT[0]}, {"_status": 200, "usage": HIT[1]})
+    result = check_cache_fires([(refused, refused), priced_hit])
+    assert result["unpriced_replicates"] == 1 and result["priced_replicates"] == 1
+    assert result["hit_rate"] == 1.0  # over PRICED replicates only
+    assert result["rows"][0]["first_status"] == 402 and "exceed" in result["rows"][0]["error"]
+    assert result["rows"][0]["hit"] is False and result["rows"][0]["priced"] is False
+    assert result["pass"] is True
+
+    nothing_priced = check_cache_fires([(refused, refused)] * 2)
+    assert nothing_priced["pass"] is False and nothing_priced["hit_rate"] is None
+    assert "no priced replicate" in nothing_priced["error"]
+
+
 def test_cached_tokens_without_a_cost_drop_is_a_billing_anomaly_and_fails():
     """The bedrock-candidate shape: KV reuse reported, worth $0. The price
     book's cache_read multiplier would silently under-bill it."""
