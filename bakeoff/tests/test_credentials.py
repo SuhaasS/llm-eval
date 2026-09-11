@@ -231,9 +231,13 @@ def test_the_openrouter_environment_is_exactly_the_key_and_the_provider_name(mon
     assert env == {OPENROUTER_KEY_ENV: "sk-or-test", PROVIDER_ENV: "openrouter"}
 
 
-def test_offline_mode_hands_the_proxy_nothing_for_either_provider():
-    assert proxy_environment("offline", "openrouter") == {}
-    assert proxy_environment("offline", "bedrock") == {}
+def test_offline_mode_hands_the_proxy_only_the_provider_name():
+    """No credential either way -- the stub answers, nothing is spent -- but
+    PROVIDER_ENV must still name the route under test. Without it,
+    litellm_patches._rewrites_enabled defaults to "bedrock" and the offline
+    gate certifies the bedrock patch set regardless of --provider."""
+    assert proxy_environment("offline", "openrouter") == {PROVIDER_ENV: "openrouter"}
+    assert proxy_environment("offline", "bedrock") == {PROVIDER_ENV: "bedrock"}
 
 
 def test_a_missing_openrouter_key_refuses_before_the_proxy_is_built(monkeypatch):

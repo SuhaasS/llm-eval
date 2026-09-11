@@ -130,12 +130,21 @@ class Proxy:
             # On the internal network only. It stands in for Bedrock, so if
             # it could be reached any other way the offline gate would stop
             # proving that the agent's only route is through the proxy.
+            #
+            # `environment=self.env`, same as the litellm container below: the
+            # stub's validators (fixtures/anthropic_stub.py REWRITES_ENABLED)
+            # read BAKEOFF_PROVIDER the same way litellm_patches does, so they
+            # validate the shape THIS run's provider actually produces rather
+            # than one hard-coded shape. Offline carries no credential, only
+            # the provider name (proxy.proxy_environment), so nothing
+            # sensitive reaches the stub by handing it the same dict.
             self.stub = client.containers.run(
                 self.image,
                 entrypoint=["python", "/app/fixtures/anthropic_stub.py"],
                 command=[],
                 name=f"stub-{self.tag}",
                 network=self.internal_name,
+                environment=self.env,
                 volumes={
                     str(self.repo_root / "fixtures"): {
                         "bind": "/app/fixtures",
@@ -443,23 +452,30 @@ def credential_stop(window: CredentialWindow, now: datetime, needed_s: int) -> s
 
 
 def proxy_environment(mode: str, provider: str) -> dict[str, str]:
-    """Credentials for the proxy container. Live mode only.
+    """Credentials for the proxy container, live or offline.
 
     The agent is passed none of these and never sees them: it reaches the
     provider through the proxy over HTTP, which is what makes every credential
     here a single-hop secret.
 
-    Two providers, two bodies, no shared code (spec 2026-09-08 §1). The
-    openrouter branch must not import the bedrock preflight or botocore: a
-    path that needs no AWS credential must not resolve one, and the test
-    asserts it on `sys.modules` in a fresh interpreter.
+    Two providers, two credential bodies, no shared code (spec 2026-09-08
+    §1). The openrouter branch must not import the bedrock preflight or
+    botocore: a path that needs no AWS credential must not resolve one, and
+    the test asserts it on `sys.modules` in a fresh interpreter.
 
-    Every return carries PROVIDER_ENV. That is how the proxy process learns
-    which rewrites to apply (litellm_patches) and what to write into the
-    adapter manifest (`provider_route` on the record).
+    Every return carries PROVIDER_ENV, live or offline. `litellm_patches.
+    _rewrites_enabled` reads it to decide whether the two mantle-only
+    rewrites (max_completion_tokens rename, reasoning_effort pin) apply, and
+    it defaults to "bedrock" when the variable is absent -- so an offline run
+    that returned `{}` here silently certified the bedrock patch set no
+    matter what `--provider` asked for, and `provider_route` on the record
+    came back `""` instead of naming the route under test. Offline carries no
+    credential -- the stub answers, nothing is spent -- but the provider name
+    is not a secret and the proxy needs it to behave like the route it is
+    standing in for.
     """
     if mode != "live":
-        return {}
+        return {PROVIDER_ENV: provider}
     if provider == "openrouter":
         return _openrouter_environment()
     if provider == "bedrock":
