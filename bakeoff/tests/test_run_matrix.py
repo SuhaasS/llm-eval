@@ -16,7 +16,7 @@ there -- `resolve_tasks` is still the caller they describe.
 from __future__ import annotations
 
 from bakeoff.preflight import PREFLIGHT_VERSION, preflight_cache_key
-from scripts.run_matrix import config_name_for
+from scripts.run_matrix import arms_missing_from_config, config_name_for
 
 
 class _Task:
@@ -79,3 +79,44 @@ def test_the_config_file_follows_the_provider_and_offline_ignores_it():
     assert config_name_for("live", "bedrock") == "litellm_config.yaml"
     assert config_name_for("offline", "openrouter") == "litellm_smoke_offline.yaml"
     assert config_name_for("offline", "bedrock") == "litellm_smoke_offline.yaml"
+
+
+def _write_config(path, *model_names):
+    lines = ["model_list:"]
+    for name in model_names:
+        lines.append(f"  - model_name: {name}")
+        lines.append("    litellm_params:")
+        lines.append(f"      model: openai/{name}-stub")
+    path.write_text("\n".join(lines) + "\n")
+
+
+def test_an_arm_present_in_the_config_is_not_reported_missing(tmp_path):
+    config = tmp_path / "config.yaml"
+    _write_config(config, "kimi-k2-6", "kimi-k3")
+    assert arms_missing_from_config(["kimi-k2-6"], config) == []
+
+
+def test_an_arm_absent_from_the_config_is_named(tmp_path):
+    """This is the whole defect: a typo'd --models value or a provider/config
+    mismatch (openrouter arms requested against a bedrock-only config, say)
+    must be refused here, before an image is built or a token spent -- not
+    discovered as a permanent `gave_up` record after LiteLLM 4xxs on an
+    unknown model group."""
+    config = tmp_path / "config.yaml"
+    _write_config(config, "claude-sonnet-5-runtime", "gemma-4-31b")
+    assert arms_missing_from_config(["kimi-k2-6", "kimi-k3"], config) == [
+        "kimi-k2-6",
+        "kimi-k3",
+    ]
+
+
+def test_only_the_missing_arms_are_named_not_the_ones_present(tmp_path):
+    config = tmp_path / "config.yaml"
+    _write_config(config, "kimi-k2-6")
+    assert arms_missing_from_config(["kimi-k2-6", "kimi-k3"], config) == ["kimi-k3"]
+
+
+def test_no_requested_arms_means_nothing_missing(tmp_path):
+    config = tmp_path / "config.yaml"
+    _write_config(config, "kimi-k2-6")
+    assert arms_missing_from_config([], config) == []

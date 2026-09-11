@@ -278,6 +278,29 @@ def config_name_for(mode: str, provider: str) -> str:
     }[provider]
 
 
+def arms_missing_from_config(arms: list[str], config_path: Path) -> list[str]:
+    """Which of `arms` have no `model_name` entry in this proxy config.
+
+    An arm absent from the chosen config is not a model failure: LiteLLM
+    answers an unknown model group with a 4xx that `classify` correctly (per
+    section 6.4) treats as not-infra, so a typo'd --models value or a
+    provider/config mismatch (the openrouter default run against a config
+    that only serves bedrock arms, say) writes a permanent `gave_up` record
+    that reads as the model giving up. Checked here, before any image is
+    built or the proxy started, so the failure is a refusal instead of a
+    scored cell.
+    """
+    import yaml
+
+    config = yaml.safe_load(config_path.read_text()) or {}
+    known = {
+        entry.get("model_name")
+        for entry in config.get("model_list", []) or []
+        if isinstance(entry, dict)
+    }
+    return [arm for arm in arms if arm not in known]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["offline", "live"], default="live")
@@ -329,6 +352,7 @@ def main() -> int:
 
     by_id = {task.task_id: task for task in tasks}
     models = args.models.split(",") if args.models else list(EVAL_ARMS_BY_PROVIDER[args.provider])
+    config_name = config_name_for(args.mode, args.provider)
     stamp = subprocess.run(
         ["date", "-u", "+%Y%m%dT%H%M%SZ"], check=True, capture_output=True, text=True
     ).stdout.strip()
@@ -338,6 +362,15 @@ def main() -> int:
     print(f"arms      {', '.join(models)}")
     print(f"repeats   {args.repeats}   seed {args.seed}")
     print(f"event log {args.event_log}")
+
+    # Before any image is built or the proxy started: an arm absent from the
+    # chosen config is an operator error (a typo, or a config/provider
+    # mismatch), not a model failure, and the proxy's 4xx for an unknown
+    # model group reads as one if this does not catch it first.
+    missing = arms_missing_from_config(models, REPO / "config" / config_name)
+    if missing:
+        print(f"\narm(s) not in {config_name}: {', '.join(missing)}")
+        return 2
 
     print("\nbuilding base image ...", flush=True)
     base_image = build_base_image(REPO)
@@ -476,7 +509,6 @@ def main() -> int:
         )
         return 2
 
-    config_name = config_name_for(args.mode, args.provider)
     build_proxy_image(REPO)
     artifacts = artifacts_root(CACHE, stamp)
     wire_dir = CACHE / "wire" / stamp

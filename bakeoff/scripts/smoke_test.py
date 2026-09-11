@@ -65,7 +65,7 @@ from bakeoff.session import (  # noqa: E402
 # on" is exactly how the offline gate and the paid driver would come to
 # certify different things. No cycle -- run_matrix.py never imports this
 # script, only names it in a docstring.
-from scripts.run_matrix import config_name_for  # noqa: E402
+from scripts.run_matrix import arms_missing_from_config, config_name_for  # noqa: E402
 
 AGENT_TAG = "bakeoff-eval-agent:smoke"
 PROXY_TAG = "bakeoff-litellm-proxy:smoke"
@@ -763,6 +763,13 @@ def main() -> int:
             if args.models
             else ["claude-sonnet-5", "gemma-4-31b", "kimi-k2-5"]
         )
+
+    # Before any image is built or the proxy started: an arm absent from the
+    # chosen config is an operator error (a typo, or a config/provider
+    # mismatch), not a model failure -- see arms_missing_from_config.
+    missing = arms_missing_from_config(arms, REPO / "config" / config_name)
+    if missing:
+        raise SystemExit(f"arm(s) not in {config_name}: {', '.join(missing)}")
 
     # Under $HOME, never /var/folders: the Docker VM on macOS mounts $HOME
     # only, and a repo bind-mounted from elsewhere appears inside the
