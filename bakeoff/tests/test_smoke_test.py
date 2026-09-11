@@ -515,6 +515,42 @@ def test_interleaving_cannot_separate_a_single_arm():
     assert adjacent_repeats(order) == ["sonnet", "sonnet"]
 
 
+# --- the arm/config refusal --------------------------------------------------
+
+
+def test_an_arm_absent_from_the_offline_config_is_refused_before_any_build(
+    monkeypatch, capsys
+):
+    """Mirrors run_matrix.py's arms_missing_from_config refusal: an arm
+    absent from the chosen config (a typo'd --models value, or a
+    config/provider mismatch) is an operator error, not a model failure, and
+    has to be caught before an image is built or the proxy started -- not
+    after, when LiteLLM's 4xx for an unknown model group would read as the
+    model giving up.
+
+    build_images is monkeypatched to raise so that if a future edit ever
+    moves this check after it, the test fails loudly (a hang or a real
+    docker build) instead of silently passing on the old ordering.
+    """
+    import scripts.smoke_test as smoke_test
+
+    def _must_not_be_called():
+        raise AssertionError(
+            "build_images() was called -- the arm/config check ran too late"
+        )
+
+    monkeypatch.setattr(smoke_test, "build_images", _must_not_be_called)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["smoke_test.py", "--mode", "offline", "--models", "nonexistent-arm"],
+    )
+
+    exit_code = smoke_test.main()
+
+    assert exit_code == 2
+    assert "nonexistent-arm" in capsys.readouterr().err
+
+
 # --- the fixture -------------------------------------------------------------
 
 

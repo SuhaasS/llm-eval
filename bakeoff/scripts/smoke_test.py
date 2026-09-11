@@ -769,7 +769,14 @@ def main() -> int:
     # mismatch), not a model failure -- see arms_missing_from_config.
     missing = arms_missing_from_config(arms, REPO / "config" / config_name)
     if missing:
-        raise SystemExit(f"arm(s) not in {config_name}: {', '.join(missing)}")
+        # Exit 2, not 1: run_matrix.py returns 2 for this same refusal and
+        # reserves 2 for "stopped before spending anything, re-invoke to
+        # retry" (credential_stop uses it the same way). `raise
+        # SystemExit(str)` prints the string but exits 1 -- verified via
+        # `python3 -c 'raise SystemExit("boom")'; echo $?` -> 1 -- so the
+        # message is printed explicitly and 2 is returned instead.
+        print(f"arm(s) not in {config_name}: {', '.join(missing)}", file=sys.stderr)
+        return 2
 
     # Under $HOME, never /var/folders: the Docker VM on macOS mounts $HOME
     # only, and a repo bind-mounted from elsewhere appears inside the
