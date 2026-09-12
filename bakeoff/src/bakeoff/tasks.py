@@ -24,8 +24,9 @@ Three things are load-bearing and are argued where they happen:
   capability figure, arriving through the dataset instead of the image.
 
   That commit is deterministic. Fixed author, committer, date and message, so
-  its SHA is a pure function of (base_sha, test half, gitignore_extra) and
-  section 5.1's byte-identical world stays checkable rather than asserted.
+  its SHA is a pure function of (base_sha, strip_paths, test half,
+  gitignore_extra) and section 5.1's byte-identical world stays checkable
+  rather than asserted.
   `start_sha` in the manifest is optional and, when present, verified: a
   re-cut patch or an edited manifest that moves the start state is exactly
   what it catches.
@@ -47,6 +48,8 @@ from dataclasses import fields as dataclass_fields
 from pathlib import Path, PurePosixPath
 from typing import Any
 from uuid import uuid4
+
+from bakeoff.runners import for_framework
 
 MANIFEST_NAME = "task.yaml"
 REFERENCE_NAME = "reference.diff"
@@ -122,6 +125,15 @@ class TaskTests:
     #: the fix" needs a source-tree oracle the harness does not have; an
     #: unlisted file still lands in the solution half.
     allow_extra_paths: tuple[str, ...] = ()
+    #: Which runner adapter reads this suite. `pytest` -- the default -- keeps
+    #: every existing manifest loading unchanged. See `_FRAMEWORKS` for why
+    #: the set is closed, and `bakeoff/src/bakeoff/runners/` for what an
+    #: adapter is and which pytest-specific judgement each method replaces.
+    #:
+    #: Last in the field order rather than beside `runner`, which is where it
+    #: reads best, because a frozen dataclass needs every field after the
+    #: first defaulted one to carry a default and `f2p` does not.
+    framework: str = "pytest"
 
 
 @dataclass(frozen=True)
@@ -159,12 +171,81 @@ class TaskGrading:
 #: on a manifest that is correct.
 _GRADING_KEYS = tuple(f.name for f in dataclass_fields(TaskGrading))
 
+#: The base Dockerfile's own `ARG BASE_PYTHON_VERSION` default, restated here
+#: as `TaskImage.python`'s default. Pinned equal by
+#: `tests/test_images.py::test_the_dockerfile_default_matches_the_manifest_default`
+#: -- two defaults that can drift means a manifest declaring nothing loads as a
+#: task whose base was never built.
+#:
+#: It must also be a member of `_PYTHON_VERSIONS` below, and that is the one
+#: relationship neither constant's own checks cover: `_python_version` returns
+#: this value BEFORE the allowlist check, so a default outside the set is the
+#: single value that reaches a build ungated -- and it reaches it from every
+#: manifest that declares nothing, which is all of them today. Pinned by
+#: `tests/test_tasks.py::test_the_default_is_itself_an_allowlisted_version`.
+_DEFAULT_PYTHON = "3.12"
+
+#: `TaskImage.node`'s default, and the node base Dockerfile's own
+#: `ARG BASE_NODE_VERSION` default. Same pair, and the same failure, as
+#: `_DEFAULT_PYTHON` one line up: two defaults that can drift means a manifest
+#: declaring nothing loads as a task whose base was never built. It must also
+#: be a member of `_NODE_VERSIONS`, for the reason stated there -- `_node_version`
+#: returns this value BEFORE the allowlist check, so the default is the one
+#: value that can reach a build ungated.
+_DEFAULT_NODE = "22"
+
 
 @dataclass(frozen=True)
 class TaskImage:
     apt: tuple[str, ...] = ()
     pip: tuple[str, ...] = ()
     build: tuple[str, ...] = ()
+    #: Environment baked into the task image as Dockerfile ENV lines, so it
+    #: reaches EVERY process in the container -- preflight's runner, the
+    #: oracle's, the grader's, the agent's `claude` -- and the commands the
+    #: agent invents. That last one is the whole reason it is here and not in
+    #: `tests.runner`: the agent is never told the runner argv (it gets
+    #: `task.prompt` and nothing else), so a flag in the runner would leave
+    #: the gate measuring one suite and section 3.3's self-correction loop
+    #: running another. Same shape, and the same argument, as the base image's
+    #: PYTHONDONTWRITEBYTECODE.
+    #:
+    #: Keys are restricted to `_IMAGE_ENV_ALLOWED`. See its comment: an
+    #: unrestricted map re-opens the CLAUDE_CODE_USE_BEDROCK hole that
+    #: `claude_runner`'s env allowlist exists to close.
+    env: dict[str, str] = field(default_factory=dict)
+    #: The base image's Python. Every ARM of a task runs the same base, so
+    #: this is a per-task property and not a section 5.4 divergence -- what
+    #: that section holds identical is the environment two ARMS are compared
+    #: in, and a task is compared against itself.
+    #:
+    #: Validated against `_PYTHON_VERSIONS` at load time. It selects which
+    #: base image the drivers build and hand to `build_task_image`; preflight
+    #: reads `python --version` back out of the finished container and refuses
+    #: a mismatch, because the tag is mutable and local and a stale one leaves
+    #: every unit test green while the suite runs under the wrong interpreter.
+    python: str = _DEFAULT_PYTHON
+    #: The node base image's major, for a `vitest` or `jest` task. Mirrors
+    #: `python` above key for key -- validated against a closed set, quoted or
+    #: refused, read back out of the finished container by preflight.
+    #:
+    #: DECLARING IT ON A PYTEST TASK IS A LOAD ERROR, and so is declaring
+    #: `python` on a node task. The runtime is derived from
+    #: `tests.framework` (see `task_runtime`); two keys that each imply one is
+    #: two sources for one fact, and the failure of a disagreement between
+    #: them is a task gated in one interpreter and run in another -- silently,
+    #: because both halves build and both halves run.
+    node: str = _DEFAULT_NODE
+
+
+#: The keys `image:` accepts, derived from the dataclass for the same reason
+#: `_GRADING_KEYS` is. This one guards the typo NOTHING downstream can see:
+#: preflight reads `python --version` back out of the finished container and
+#: compares it against `task.image.python`, so a misspelled `pyhton:` loads as
+#: the default, builds the default base, and the read-back agrees with the
+#: field it was compared to -- every gate green under an interpreter the author
+#: did not ask for.
+_IMAGE_KEYS = tuple(f.name for f in dataclass_fields(TaskImage))
 
 
 @dataclass(frozen=True)
@@ -173,8 +254,153 @@ class TaskBudget:
     # until the section 3.5 calibration pilot sets them from the
     # slowest-converging model's p95 -- tuning them to the incumbent is
     # exactly what that section forbids.
+    # All three are positive integers, refused at load by name if not --
+    # see `_positive_int`. No upper bound on max_turns: wall_clock_timeout_s
+    # is the outer stop and section 3.5's pilot owns the number.
     max_turns: int = 40
     wall_clock_timeout_s: int = 900
+    #: The coreutils `timeout` bound on every command preflight, the oracle
+    #: and the offline grader run INSIDE the container -- each suite
+    #: invocation and each declared `grading.*` argv alike. "Suite" is the
+    #: short name; the breadth is the point, because the gate and the grader
+    #: run the SAME commands and a second key for the grading argvs would be
+    #: a second number that can diverge between them.
+    #:
+    #: It does NOT bound the agent: the agent's own suite runs happen inside
+    #: `wall_clock_timeout_s` with no per-command bound (`claude_runner`
+    #: wraps the whole `claude -p`). That independence is why the two keys
+    #: are separate, and the `>` refusal in `load_task` is the one place
+    #: they are compared.
+    #:
+    #: 600 is the constant this replaced, in three copies: `preflight(
+    #: timeout_s=600)`, `ensure_oracle(timeout_s=600)` and the grader's own
+    #: per-check bound (`_check_command`/`_check_f2p`/`_check_p2p`, formerly
+    #: `GRADE_TIMEOUT_S`). A manifest that does not declare the key therefore
+    #: gates and grades byte-identically to before. `grader.SCAN_TIMEOUT_S`
+    #: is not one of the three: it bounds only the host-side gitleaks scan,
+    #: which has no `task` in scope and never ran in a container.
+    suite_timeout_s: int = 600
+
+
+@dataclass(frozen=True)
+class Submodule:
+    """One gitlink at `base_sha`, DERIVED rather than declared (see the
+    module docstring's third load-bearing item, and spec section 3.7).
+
+    Every field is inside the tree `base_sha` already pins: `path` and `sha`
+    are a `160000` entry in `git ls-tree`, `name` and `url_declared` are the
+    section header and value in the `.gitmodules` blob. A manifest key
+    restating them would be configuration reported as observation, and it
+    could drift from the tree while every other check passed.
+
+    `name` is not `path`: the `[submodule "NAME"]` header is what
+    `submodule.<name>.url` keys on, and git does not require the two to match.
+
+    `url_declared` is the `.gitmodules` value VERBATIM -- measured 2026-09-02,
+    nothing the harness does rewrites that blob, so it stays the
+    manifest-adjacent fact. `url_resolved` is what the mirror was built from
+    and what the run tree persists: equal to `url_declared` whenever the
+    declared url was already absolute, resolved by `_resolve_submodule_url`
+    when it was relative, and `None` -- a third value, not `""` -- when this
+    submodule is declared unneeded and was therefore never resolved at all.
+    `""` remains "the stanza declared no url", which is a different absence.
+
+    `declared_unneeded` is the one field that is NOT derived. It is the
+    manifest's `submodules_unneeded` list, joined onto the derived entry by
+    path, and it is carried here rather than consulted separately so that every
+    reader of a `Submodule` -- the initialiser, the image builder, the gate's
+    evidence -- sees one answer instead of three lookups that can disagree. The
+    entry is kept in the tuple rather than filtered out: a filtered submodule
+    renders as a tree with no gitlink there, which is a different tree. It is
+    settable at DEPTH 1 ONLY -- `_read_level` refuses a declaration naming a
+    gitlink at depth >= 2, because `container.submodule_states`' `git ls-files`
+    read is taken at the superproject root and cannot see under an INITIALISED
+    parent, so an agent's writes into a level-2 empty directory would be
+    recorded nowhere while `submodules_dirty` claimed the tree was read.
+
+    `path` is the FULL superproject-relative path at every depth, because every
+    consumer compares it against superproject-relative paths: the `strip_paths`
+    refusal, the reference-diff refusal, item 2's `submodules_unneeded`, the
+    build context, `_init_submodules`' `checked` and its two leak guards, and
+    the gate's evidence. A level-local `path` would make all six silently wrong
+    at depth >= 2 -- a `strip_paths: ["vendor/deep"]` would match a submodule
+    actually at `vendor/lib/vendor/deep`, and a reference diff touching
+    `vendor/lib/vendor/deep/x.py` would slip past the refusal built to catch it.
+
+    `depth` is 1 for a submodule of the superproject and 2 for a submodule of
+    one of those; `_MAX_SUBMODULE_DEPTH` is the cap. `parent` is the parent's
+    full path, `""` at depth 1. `parent` is a FIELD and not derived from
+    `path`: deriving it means finding the longest known path that is a prefix
+    of this one, which is prefix arithmetic over paths -- the defect
+    `preflight._parse_submodule_status`' boundary anchoring exists to prevent,
+    and ambiguous exactly where it matters (`vendor/lib` beside
+    `vendor/lib dep`).
+    """
+
+    name: str
+    path: str
+    url_declared: str
+    url_resolved: str | None
+    sha: str
+    declared_unneeded: bool = False
+    depth: int = 1
+    parent: str = ""
+
+    @property
+    def local_path(self) -> str:
+        """The path git uses INSIDE the parent -- what `submodule update --init
+        -- <path>` takes, and what the parent's `.gitmodules` declared.
+
+        `path` is this joined onto `parent`, so `relative_to` inverts a join
+        this class performed rather than slicing a string whose prefix is an
+        assumption: on a violated invariant it RAISES, where
+        `path[len(parent) + 1:]` would return a plausible wrong path. Measured
+        2026-09-02 (git 2.50.1): the level-2 update runs with `cwd` at the inner
+        working tree and takes `vendor/deep`, not `vendor/lib/vendor/deep`.
+        """
+        if not self.parent:
+            return self.path
+        return str(PurePosixPath(self.path).relative_to(self.parent))
+
+
+#: gitmodules(5)'s two relative forms, and git's own trigger: a bare `..`
+#: matches neither and is stored verbatim (measured 2026-09-02, git 2.50.1,
+#: table R row T), which is why the tuple carries the slashes.
+_RELATIVE_URL_PREFIXES = ("./", "../")
+
+#: The only submodule url shape the eval can fetch, judged against the
+#: RESOLVED url. A relative url ("../x.git") is resolved against
+#: `task.repo_url` by `_resolve_submodule_url` -- git resolves it against
+#: `remote.origin.url`, which `materialize` deletes, and git then falls back to
+#: the superproject's own host path (measured 2026-09-02, git 2.50.1: a warning
+#: and a clone of `<run tree>/../x.git` that does not exist). ssh needs keys the
+#: eval does not carry; file:// points at the task author's laptop. Refused at
+#: derivation so the failure names the manifest, not `git submodule update`'s
+#: clone error.
+_SUBMODULE_URL_PREFIX = "https://"
+
+#: How deep the submodule recursion goes. 1 is a submodule of the superproject,
+#: 2 is a submodule of one of those. A submodule at `_MAX_SUBMODULE_DEPTH` whose
+#: own tree carries a gitlink is refused -- the same refusal that refused level 2
+#: before this change, for the same measured reason: the directory one level
+#: further down would arrive empty and `git status --porcelain` reports a tree in
+#: that state as CLEAN (measured 2026-09-02, git 2.50.1, at two levels).
+#:
+#: A cap and not a visited set, and git itself imposes none (measured: a
+#: four-repository chain populates at exit 0). Three reasons. Termination
+#: becomes a property of this code rather than of an argument about upstream
+#: history. Every level multiplies the surfaces where an empty directory reads
+#: as clean -- a pruned mirror, two leak guards, three post-conditions, a `git
+#: archive` into the build context, an `ls-files` recursion in the gate, a
+#: `--show-prefix` probe and an evidence entry, all discovered after the
+#: preflight cache key was computed. And every gitlink in the screened corpus
+#: the harness can reach is FLAT (measured 2026-09-02: four submodules across
+#: tomlkit and yaml carry no `.gitmodules` and zero `160000` entries at their
+#: pinned shas; the fifth is a private repository the harness never fetches),
+#: so this broadening is built on a prediction and the honest version of a
+#: speculative broadening moves the floor by exactly one level. Raising it is a
+#: one-line edit plus the tests that name it.
+_MAX_SUBMODULE_DEPTH = 2
 
 
 @dataclass(frozen=True)
@@ -199,6 +425,23 @@ class TaskManifest:
     root: Path
     declared_start_sha: str = ""
     gitignore_extra: tuple[str, ...] = ()
+    #: Paths removed from the start state in the same setup commit that
+    #: applies the test half. What lifts a repository's agent-file or
+    #: vendored-tree date floor without hand-rewriting `base_sha`: the
+    #: modification is in the manifest, so it is in `manifest_digest` and in
+    #: `start_sha`, rather than in a rewritten history a reader diffing
+    #: against upstream would not find there.
+    strip_paths: tuple[str, ...] = ()
+    #: Submodule paths this task declares it does not need. The gitlink stays
+    #: in the index and the tree exactly as at `base_sha`; the directory is
+    #: never populated, its `.gitmodules` url is never checked -- nor is a
+    #: readable `.gitmodules` required to exist for it at all -- and no pruned
+    #: mirror is built for it. What lifts a repository's submodule floor
+    #: without rewriting history: `tobymao/sqlglot` carries an ssh-url
+    #: submodule from 2026-02-27 that closed every later `base_sha`, for
+    #: suites that guard on its presence and never read it. Section 6.4
+    #: confound: the humans who wrote the PR had the submodule.
+    submodules_unneeded: tuple[str, ...] = ()
     provenance: dict[str, Any] = field(default_factory=dict)
     #: Git commit of the task-set repository, `-dirty` when the task set has
     #: uncommitted changes. This is what makes a stored record re-derivable
@@ -398,6 +641,459 @@ def _validate_prefixes(prefixes: tuple[str, ...], where: str) -> None:
             raise TaskError(f"{where}: {prefix!r} must be relative and free of '..'")
 
 
+#: Pathspec magic `git rm` would honour and this key does not accept. See
+#: `_validate_strip_paths`.
+_PATHSPEC_MAGIC = ("*", "?", "[", "]")
+
+#: Where `RunContainer` binds the run tree. Spelled here rather than imported
+#: from `container.REPO_MOUNT`, because container.py imports `docker` at
+#: module level and this loader deliberately runs without a daemon.
+#: `test_the_repo_mount_constant_matches_the_container_it_describes` is where
+#: the drift is caught.
+_REPO_MOUNT = "/repo"
+
+#: The only keys `image.env` may set. An ALLOWLIST, not a denylist, for
+#: exactly the reason `claude_runner`'s module docstring gives: a denylist has
+#: to anticipate every contaminant, and the one that matters most --
+#: CLAUDE_CODE_USE_BEDROCK / _USE_VERTEX -- makes the CLI ignore
+#: ANTHROPIC_BASE_URL, bypass the proxy, and leave the mandatory wire log
+#: empty with the run still looking normal. Those two are kept out of the HOST
+#: environment by PASSTHROUGH_ENV and are not set by `container_env`, so an
+#: image ENV is precisely the route that is otherwise open.
+#:
+#: Every entry is argued once, here:
+#:
+#:   CI  -- Hypothesis registers a built-in `ci` profile at import time
+#:          (derandomize=True, database=None, deadline=None) and auto-loads it
+#:          whenever any of twelve CI variables is present; `"CI": None` in
+#:          its `_CI_VARS` means presence alone, any value. Measured
+#:          2026-09-01 against hypothesis 6.167.1: a property-based suite that
+#:          gives `0 0 0 0 1 1 1 1 0 0` over ten fresh runs gives `1 1 1 1 1 1`
+#:          under CI=1. It is also INERT where it does not apply -- in an
+#:          image without hypothesis, `CI=1 pytest` is exit 0 and writes
+#:          nothing, where any `--hypothesis-*` flag is exit 4 before
+#:          collection.
+#:
+#:   HYPOTHESIS_STORAGE_DIRECTORY -- Hypothesis's storage root is
+#:          `Path.cwd() / ".hypothesis"` fixed at import time
+#:          (configuration.py:20), so with workdir=/repo it lands in the tree
+#:          the section 5.6 submission diff is taken against. CI=1 stops the
+#:          `examples/` database but not the `constants/` cache, and an agent
+#:          running pytest from a subdirectory gets a second copy in a
+#:          directory whose self-written .gitignore guard never fired. This is
+#:          the only lever that keeps all of it out.
+#:
+#:   TZ  -- Date/time libraries are a large, well-shaped slice of the corpus
+#:          (deterministic input, exact string output) and nearly all of them
+#:          pin a zone in CI. Measured 2026-09-01
+#:          (`~/.cache/bakeoff-probe/reports/d7-node.md`): `moment`/`luxon`
+#:          were rejected as jest candidates purely because their suites
+#:          assert against `TZ=America/New_York` (`test/zones/local.test.js`)
+#:          and this allowlist had no way to grant it. `_env_map` holds TZ to
+#:          an extra value shape the other two keys do not need
+#:          (`_TZ_VALUE = re.compile(r"\A(?!/)[A-Za-z0-9_+\-/]+\Z")`): a `TZ`
+#:          value is consumed by libc, not by this harness, and a leading `:`
+#:          OR `/` makes glibc read the rest as a FILE PATH rather than a
+#:          zone name -- the character-blacklist check above this constant
+#:          does not catch a bare `/etc/localtime` (no colon at all, and `/`
+#:          is a legal zone-name character), so TZ needs a positive allowlist
+#:          of its own on top of it.
+_IMAGE_ENV_ALLOWED = frozenset({"CI", "HYPOTHESIS_STORAGE_DIRECTORY", "TZ"})
+
+#: The test frameworks this harness can classify. Closed, and it must equal
+#: `bakeoff.runners.FRAMEWORKS` -- pinned from both files, because a reader of
+#: either constant has to be told it is half of a pair. `for_framework` raises
+#: KeyError rather than defaulting, and this allowlist is the only thing that
+#: keeps that raise unreachable; a default in either place classifies a jest
+#: run with pytest's exit codes, which means exit 1 for a BROKEN CONFIG read as
+#: a test failure and stamped on the model, permanently, in an append-only
+#: store.
+#:
+#: Measured 2026-09-01 in node:22-bookworm-slim, vitest 3.2.7 and jest 30.5.0:
+#: both exit 1 for a failing test, an unresolvable import, a syntax error, a
+#: nonexistent file argument AND a broken config, and BOTH exit 0 when a `-t`
+#: pattern matches nothing. That is why each entry needs an adapter that reads
+#: a JSON report rather than a row in a table of exit codes.
+_FRAMEWORKS = frozenset({"pytest", "vitest", "jest"})
+
+#: The frameworks that need the node base image. Derived from the framework
+#: rather than declared, so there is one source for the runtime.
+_NODE_FRAMEWORKS = frozenset({"vitest", "jest"})
+
+
+def _framework(value: Any, where: str) -> str:
+    """`tests.framework`, validated. `"pytest"` when absent.
+
+    Absent means pytest and not "unknown", because every manifest that exists
+    predates the key -- backwards compatibility is a constraint of this
+    broadening, not a hope.
+    """
+    if value is None:
+        return "pytest"
+    if not isinstance(value, str) or value not in _FRAMEWORKS:
+        raise TaskError(
+            f"{where}: {value!r} is not a test framework this harness can "
+            f"classify. Allowed: {sorted(_FRAMEWORKS)}. The gate tells 'the "
+            "bug is present' from 'the environment is broken' by reading what "
+            "the runner reported, and each framework reports it differently -- "
+            "pytest through its exit code, vitest and jest through a JSON "
+            "report, because both of those exit 1 for a test failure and for a "
+            "broken config alike"
+        )
+    return value
+
+
+#: Python versions the base Dockerfile is KNOWN to build, because someone
+#: built it. A closed set rather than a free string, for two reasons that are
+#: each silent without it:
+#:
+#:   A floating tag is a moving base. `python:3-slim-bookworm` and
+#:   `python:3.13-slim-bookworm` are both republished, so two collections
+#:   months apart run different interpreters under one manifest and nothing in
+#:   the record says which -- the defect `image.pip`'s "pinned, not floored"
+#:   rule exists to prevent, one key over.
+#:
+#:   An unbuildable string fails LATE. Measured 2026-09-01, Docker 29.5.2:
+#:   `--build-arg BASE_PYTHON_VERSION=3.99` gets `failed to resolve reference
+#:   "docker.io/library/python:3.99-slim-bookworm": ... not found` at the FROM,
+#:   after a build has started and over the network. Here it is a TaskError
+#:   with the manifest path in it, before any daemon is touched.
+#:
+#: Each entry was measured by building `docker/eval-agent.Dockerfile` at that
+#: version and confirming BOTH in-Dockerfile pin assertions fired -- `pytest
+#: 9.1.1 pinned` and `claude 2.1.220 pinned`. Verified 2026-09-01 for all
+#: three; 3.11 gave Python 3.11.16, 3.12 gave 3.12.13, 3.13 gave 3.13.15.
+#:
+#: TO ADD A VERSION, all three steps: build the real base at it and confirm
+#: both assertions fire; add the string here with the date; add the row to
+#: taskset/HARVESTING.md's table and the note in docs/BUILDING-A-TASK-SET.md.
+#: `python:3.14-slim-bookworm` exists and is deliberately absent -- nobody has
+#: built the eval image on it, and an unmeasured entry is this constant
+#: claiming something it does not know.
+#:
+#: `_DEFAULT_PYTHON` above must stay a member of this set. Removing a version
+#: that happens to be the default leaves every manifest that declares nothing
+#: pointing at a base nobody builds, and no refusal fires -- the default is
+#: returned before this set is consulted.
+_PYTHON_VERSIONS = frozenset({"3.11", "3.12", "3.13"})
+
+
+def _python_version(value: Any, where: str) -> str:
+    """`image.python`, validated. The default when absent.
+
+    A `str` is REQUIRED, never coerced. YAML parses an unquoted `3.11` as the
+    float 3.11 and an unquoted `3.10` as `3.1` -- so `str(value)` would turn a
+    manifest asking for 3.10 into one asking for a version that is not in the
+    allowlist at all, or (had 3.1 been listed) into a silently different
+    interpreter. Same class as `_ENV_VALUE_REFUSED`'s `$`: a value that is a
+    property of the parser rather than of the manifest.
+    """
+    if value is None:
+        return _DEFAULT_PYTHON
+    if not isinstance(value, str):
+        raise TaskError(
+            f"{where}: {value!r} is {type(value).__name__}, not a string -- "
+            "quote it (`python: \"3.11\"`). YAML reads an unquoted 3.11 as a "
+            "float and an unquoted 3.10 as 3.1, so the version that reaches "
+            "the build is not the one the manifest names"
+        )
+    if value not in _PYTHON_VERSIONS:
+        raise TaskError(
+            f"{where}: {value!r} is not a Python version this base image is "
+            f"known to build. Allowed: {sorted(_PYTHON_VERSIONS)}. A version "
+            "outside the set is either a floating tag -- two collections "
+            "months apart running different interpreters under one manifest, "
+            "with nothing in the record saying so -- or one that fails at the "
+            "FROM with a registry error mid-build. To add one, build "
+            "docker/eval-agent.Dockerfile with "
+            "`--build-arg BASE_PYTHON_VERSION=<v>`, confirm the pytest and "
+            "claude pin assertions fire, then add it to _PYTHON_VERSIONS and "
+            "to taskset/HARVESTING.md"
+        )
+    return value
+
+
+#: Node majors the node base Dockerfile is KNOWN to build, because someone
+#: built it. The same closed-set argument `_PYTHON_VERSIONS` makes, both halves
+#: of it: `node:22-bookworm-slim` is republished, so an unpinned entry means
+#: two collections months apart run different runtimes under one manifest with
+#: nothing in the record saying so; and an unbuildable string fails at the FROM
+#: with a registry error, over the network, mid-build.
+#:
+#: Verified 2026-09-01: node v22.23.2, npm 10.9.8, vitest 3.2.7, jest 30.5.0,
+#: Claude Code 2.1.220, uid 1000 (after `userdel -r node` -- the base image
+#: ships a `node` user at that uid and `useradd --uid 1000` exits 4 without
+#: it).
+#:
+#: TO ADD A VERSION, all three steps: build docker/eval-agent-node.Dockerfile
+#: with `--build-arg BASE_NODE_VERSION=<v>` and confirm the claude and runner
+#: pin assertions fire; add the string here with the date; add the row to
+#: taskset/HARVESTING.md. `20` and `24` exist as tags and are deliberately
+#: absent -- an unmeasured entry is this constant claiming what it does not
+#: know.
+#:
+#: `_DEFAULT_NODE` must stay a member of this set, for the reason stated
+#: beside it: `_node_version` returns the default BEFORE this check.
+_NODE_VERSIONS = frozenset({"22"})
+
+
+def _node_version(value: Any, where: str) -> str:
+    """`image.node`, validated. The default when absent.
+
+    A `str` is REQUIRED, never coerced, for `_python_version`'s reason and not
+    for a weaker one. `str(22)` happens to be right today; the refusal is here
+    because the next version to be added is `22.1`, and YAML reads a bare
+    `22.10` as the float `22.1` -- a value that is a property of the parser
+    rather than of the manifest.
+    """
+    if value is None:
+        return _DEFAULT_NODE
+    if not isinstance(value, str):
+        raise TaskError(
+            f"{where}: {value!r} is {type(value).__name__}, not a string -- "
+            'quote it (`node: "22"`). YAML reads an unquoted 22.10 as the '
+            "float 22.1, so the version that reaches the build is not the one "
+            "the manifest names"
+        )
+    if value not in _NODE_VERSIONS:
+        raise TaskError(
+            f"{where}: {value!r} is not a Node version this base image is "
+            f"known to build. Allowed: {sorted(_NODE_VERSIONS)}. To add one, "
+            "build docker/eval-agent-node.Dockerfile with `--build-arg "
+            "BASE_NODE_VERSION=<v>`, confirm the claude and runner pin "
+            "assertions fire, then add it to _NODE_VERSIONS and to "
+            "taskset/HARVESTING.md"
+        )
+    return value
+
+
+def task_runtime(task: TaskManifest) -> tuple[str, str]:
+    """Which base image this task needs: `("python", "3.12")` or `("node", "22")`.
+
+    Derived from `tests.framework`, never declared. Two manifest keys that can
+    each imply a runtime is two sources for one fact, and a disagreement
+    between them is a task gated in one interpreter and run in another -- the
+    silent shape, because both halves build and both halves run. `load_task`
+    therefore refuses a manifest that declares the key belonging to the other
+    runtime, which is what leaves this function total.
+    """
+    if task.tests.framework in _NODE_FRAMEWORKS:
+        return ("node", task.image.node)
+    return ("python", task.image.python)
+
+
+#: Characters that do not survive a generated `ENV KEY="value"` line. `$` is
+#: the one that is not about syntax: Docker EXPANDS it against the build
+#: environment, which would make the value a property of the builder rather
+#: than of the manifest -- the argument that refuses pathspec magic in
+#: strip_paths, one key over.
+_ENV_VALUE_REFUSED = ('\n', '\r', '"', '\\', '$')
+
+_ENV_KEY = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
+
+#: The extra shape a TZ value must have, on top of `_ENV_VALUE_REFUSED`. An
+#: IANA zone name (`America/New_York`) or `UTC`/`Etc/GMT+N` -- letters,
+#: digits, `_`, `+`, `-`, `/`. glibc's `tzset` reads a `TZ` value starting
+#: with `:` OR `/` as a FILE PATH rather than a zone name: a leading `:` is
+#: already refused by the character class (`:` was never in it), but a
+#: leading `/` was not, and `/` IS in the class for `America/New_York` and
+#: `Etc/GMT+5`. Measured 2026-09-02 in the eval image (glibc 2.36):
+#: `TZ=/usr/share/zoneinfo/Asia/Tokyo` resolves identically to
+#: `TZ=:/usr/share/zoneinfo/Asia/Tokyo`, and `TZ=/etc/localtime` resolves
+#: too -- so a bare leading `/`, with no colon anywhere, hands libc a path
+#: into the image just as effectively, including a path an agent's own edits
+#: could reach (`/repo/tzfile`, say). The negative lookahead below refuses
+#: only a LEADING `/`; the character elsewhere in the value is unaffected.
+_TZ_VALUE = re.compile(r"\A(?!/)[A-Za-z0-9_+\-/]+\Z")
+
+
+def _env_map(value: Any, where: str) -> dict[str, str]:
+    """`image.env`, validated. Empty when absent.
+
+    Five refusals, each naming a failure that is silent without it:
+
+    * a key outside `_IMAGE_ENV_ALLOWED` -- see that constant;
+    * a key the harness itself sets -- Docker's exec env wins over the image's
+      (measured), so the value would apply to preflight and the grader and NOT
+      to the agent, which is two environments for one task;
+    * a value carrying `_ENV_VALUE_REFUSED`;
+    * HYPOTHESIS_STORAGE_DIRECTORY inside /repo, which undoes the only thing
+      that key is for;
+    * a TZ value outside `_TZ_VALUE` -- see that constant.
+    """
+    from bakeoff.claude_runner import pinned_env_keys
+
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise TaskError(f"{where}: expected a mapping, got {value!r}")
+
+    pinned = pinned_env_keys()
+    env: dict[str, str] = {}
+    for raw_key, raw_value in value.items():
+        key = str(raw_key)
+        if not _ENV_KEY.match(key):
+            raise TaskError(
+                f"{where}: {key!r} is not a usable environment variable name"
+            )
+        if key in pinned:
+            raise TaskError(
+                f"{where}: {key!r} is a key the harness sets itself. Docker "
+                "merges an exec's environment into the image's with the "
+                "exec's keys winning, so this would apply to preflight and "
+                "the grader and be overridden on the agent's own process -- "
+                "two environments for one task, with nothing recording which"
+            )
+        if key not in _IMAGE_ENV_ALLOWED:
+            raise TaskError(
+                f"{where}: {key!r} is not an allowed image.env key. The "
+                "allowed set is "
+                f"{sorted(_IMAGE_ENV_ALLOWED)}; it is an allowlist because a "
+                "denylist would have to anticipate CLAUDE_CODE_USE_BEDROCK, "
+                "which bypasses the proxy and leaves the wire log empty with "
+                "the run still looking normal"
+            )
+        if not isinstance(raw_value, str) or not raw_value:
+            raise TaskError(
+                f"{where}: {key!r} must be a non-empty string, got "
+                f"{raw_value!r}"
+            )
+        bad = [ch for ch in _ENV_VALUE_REFUSED if ch in raw_value]
+        if bad:
+            raise TaskError(
+                f"{where}: {key!r} carries {bad!r}, which would not survive "
+                'a generated `ENV KEY="value"` line ("$" is expanded by the '
+                "builder, so the value would be a property of the build "
+                "rather than of the manifest)"
+            )
+        if key == "HYPOTHESIS_STORAGE_DIRECTORY":
+            path = PurePosixPath(raw_value)
+            # `is_relative_to` covers the equal case too -- measured,
+            # `PurePosixPath("/repo").is_relative_to("/repo")` is True -- so
+            # `/repo` itself and anything under it are one check, and the
+            # `is_absolute` clause is what catches a relative entry before
+            # `is_relative_to` is asked a question about a path with no root.
+            if not path.is_absolute() or path.is_relative_to(_REPO_MOUNT):
+                raise TaskError(
+                    f"{where}: {raw_value!r} must be an absolute path outside "
+                    f"{_REPO_MOUNT}. This key exists to keep hypothesis's "
+                    "writes out of the tree the section 5.6 submission diff "
+                    "is taken against; pointed back inside it, it undoes "
+                    "exactly that"
+                )
+        if key == "TZ" and not _TZ_VALUE.match(raw_value):
+            raise TaskError(
+                f"{where}: {key!r} value {raw_value!r} is not an IANA zone "
+                "name or UTC/Etc/GMT+N. A TZ value is consumed by libc, not "
+                "by this harness -- a leading `:` OR `/` makes glibc read "
+                "the rest as a file path rather than a zone name, which the "
+                "character blacklist above does not catch on its own"
+            )
+        env[key] = raw_value
+    return env
+
+
+def _validate_strip_paths(paths: tuple[str, ...], where: str) -> None:
+    """Refuse a strip entry that would remove something nobody asked for.
+
+    `_validate_prefixes` covers empty, padded, absolute and `..`-bearing
+    entries. The three refusals here are specific to a key whose effect is a
+    DELETE rather than a classification.
+
+    `.` and `./` pass every one of those checks and name the whole tree:
+    measured, `PurePosixPath(".").parts` is `()` and
+    `PurePosixPath("a/b").is_relative_to(PurePosixPath("."))` is True. The
+    start state would be emptied and `start_sha` would still be a pure
+    function of the manifest -- perfectly reproducible and completely wrong.
+
+    `.git` is the same shape one level worse: the delete runs in the run tree,
+    so it would destroy the repository the section 5.6 submission diff is
+    taken against.
+
+    Pathspec magic is refused because `git rm` takes PATHSPECS, not paths.
+    `strip_paths: ["*.log"]` would glob, and `_strip_paths_from_tree`'s
+    existence check would then pass on one accidental match while the author
+    meant something else -- a manifest key whose meaning is a property of the
+    tree it is applied to, inside the one field that has to be a pure function
+    of the manifest.
+    """
+    _validate_prefixes(paths, where)
+    for path in paths:
+        parts = PurePosixPath(path).parts
+        if not parts:
+            raise TaskError(
+                f"{where}: {path!r} names the whole tree; strip_paths removes "
+                "what it names, so this would empty the start state"
+            )
+        if parts[0] == ".git":
+            raise TaskError(
+                f"{where}: {path!r} is inside the repository's own .git; the "
+                "strip runs in the run tree and would destroy the repository "
+                "the submission diff is taken against"
+            )
+        if path.startswith(":") or any(ch in path for ch in _PATHSPEC_MAGIC):
+            raise TaskError(
+                f"{where}: {path!r} carries pathspec magic; this key names "
+                "paths, and a pattern would make what is removed a property "
+                "of the tree rather than of the manifest"
+            )
+
+
+def _validate_unneeded_submodules(paths: tuple[str, ...], where: str) -> None:
+    """The SHAPE half of `submodules_unneeded`, which is all that can run here.
+
+    `load_task` runs on the host, offline, with no repository and no cache
+    root, so the question that matters most -- is this path a gitlink at
+    `base_sha`? -- cannot be asked at load time at all. It is asked in
+    `derive_submodules`, which holds the mirror, exactly as `strip_paths`'
+    "names nothing tracked" check lives in `_strip_paths_from_tree` rather
+    than here. What is left for this function is the shape.
+
+    `_validate_prefixes` covers empty, padded, absolute and `..`-bearing
+    entries. The three after it are the same three `_validate_strip_paths`
+    refuses and for the same reasons one key over: `.`/`./` names the whole
+    tree and a tree is not a gitlink, a `.git`-rooted path is inside the
+    repository's own metadata where no tree entry lives, and pathspec magic
+    would make which submodules are left unpopulated a property of the tree
+    rather than of the manifest.
+
+    The DUPLICATE refusal is the one `strip_paths` does not have, and it is
+    here because this key is consumed as a SET -- `set(task.submodules_unneeded)`
+    in `derive_submodules`, a `frozenset` in `preflight`. A repeat is
+    therefore invisible to every downstream comparison: it cannot change any
+    behaviour, so a manifest carrying one means something the key cannot
+    express, and saying nothing is how an author's actual intent gets lost.
+    """
+    _validate_prefixes(paths, where)
+    seen: set[str] = set()
+    for path in paths:
+        parts = PurePosixPath(path).parts
+        if not parts:
+            raise TaskError(
+                f"{where}: {path!r} names the whole tree; this key names one "
+                "submodule path per entry, and a tree is not a gitlink"
+            )
+        if parts[0] == ".git":
+            raise TaskError(
+                f"{where}: {path!r} is inside the repository's own .git; a "
+                "gitlink is a tree entry, and nothing under .git is one"
+            )
+        if path.startswith(":") or any(ch in path for ch in _PATHSPEC_MAGIC):
+            raise TaskError(
+                f"{where}: {path!r} carries pathspec magic; this key names "
+                "paths, and a pattern would make which submodules are left "
+                "unpopulated a property of the tree rather than of the "
+                "manifest"
+            )
+        if path in seen:
+            raise TaskError(
+                f"{where}: {path!r} is listed twice; the second entry cannot "
+                "change anything, so a manifest carrying it means something "
+                "the key cannot express"
+            )
+        seen.add(path)
+
+
 def split_reference_diff(
     diff: str, test_paths: tuple[str, ...], *, extra_paths: tuple[str, ...] = ()
 ) -> tuple[str, str, tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
@@ -489,7 +1185,52 @@ def split_reference_diff(
     )
 
 
+def _refuse_stripped_halves(
+    test_files: tuple[str, ...],
+    solution_files: tuple[str, ...],
+    strip_paths: tuple[str, ...],
+    where: str,
+) -> None:
+    """A path the strip removes and the reference diff changes is refused.
+
+    STRIP DOES NOT IMPLY EXCLUSION, deliberately. Silently dropping the chunk
+    would make `solution_diff` something other than the merged PR that section
+    3.2 requires verbatim, and preflight would only notice when the missing
+    hunk happened to be one the f2p tests need -- so the case that survives
+    every gate is a reference that is no longer a reference. From the TEST
+    half it is worse: the oracle shrinks and every arm is graded against less
+    than the manifest says.
+
+    `allow_extra_paths` is the declared way to say "neither half", it is what
+    taskset/HARVESTING.md already tells an author to reach for here, and it
+    leaves the file named in `extra_files` -- so the combination stays visible
+    instead of being inferred from two keys that never mention each other.
+
+    Called from `load_task` rather than from `split_reference_diff`: that
+    function is a three-class partition of a diff by path and takes no
+    manifest, and a fourth prefix argument would invite exactly the reading
+    this refusal rejects. Renames need no special case, because
+    `split_reference_diff` puts both endpoints into the file lists.
+    """
+    for half, files in (("test", test_files), ("solution", solution_files)):
+        caught = sorted(path for path in files if _under(path, strip_paths))
+        if caught:
+            raise TaskError(
+                f"{where}: strip_paths removes {', '.join(caught)}, which the "
+                f"reference diff's {half} half also changes -- the patch would "
+                "be applied onto a path that no longer exists. List those "
+                "paths in tests.allow_extra_paths to keep them out of both "
+                "halves, or narrow the strip."
+            )
+
+
 # --- loading -----------------------------------------------------------------
+
+
+#: "the key is not in the manifest", which is not the same as `null`. A `None`
+#: default would collapse the two, and `key: null` is a key the author WROTE
+#: -- reading it as "never written" is the wrong repair.
+_ABSENT = object()
 
 
 def _require(data: dict, key: str, kind: type, where: str) -> Any:
@@ -509,6 +1250,55 @@ def _strs(value: Any, where: str) -> tuple[str, ...]:
     if not isinstance(value, list) or any(not isinstance(v, str) for v in value):
         raise TaskError(f"{where}: expected a list of strings, got {value!r}")
     return tuple(value)
+
+
+def _positive_int(value: Any, where: str, default: int) -> int:
+    """A budget number, or a `TaskError` that names the key.
+
+    Three things a bare `int(...)` gets wrong, and the third is the reason
+    this exists at all:
+
+    * `int("forty")` raises a bare `ValueError` out of `load_task`, with no
+      manifest path in the traceback -- and `int(None)` a bare `TypeError`,
+      which is how `max_turns` and `wall_clock_timeout_s` behaved before
+      2026-09-02. An author is handed a stack trace naming this module
+      instead of a message naming their file and their key.
+    * `int("600")` and `int(600.0)` SUCCEED, so a quoted or floated value is
+      accepted silently and the manifest stops being a faithful record.
+    * `bool` IS an `int` in Python: `int(True)` is 1. `suite_timeout_s: true`
+      would kill every gated and graded command after one second, which reads
+      as a task whose tests hang -- a NO-GO at the gate and `timed_out`
+      stamped on every arm past it -- for a YAML typo. So the bool test comes
+      FIRST; folded into the int test it is dead code a mutation cannot catch.
+
+    `_ABSENT` rather than `None` for "not declared", so an explicit `key: null`
+    falls through to the refusal.
+
+    Applied to all three `budget:` keys. `max_turns` and `wall_clock_timeout_s`
+    kept a bare `int(...)` until 2026-09-02, and the cost was not the shapes
+    that raised -- it was the shapes that did NOT. `wall_clock_timeout_s: true`
+    loaded as 1 second, and the `>` refusal below then reported the manifest's
+    defect as a `suite_timeout_s` the author had never declared, ending in
+    "lower suite_timeout_s", which is advice about the wrong key. `: 0.5`
+    loaded as 0 the same way. Measured across the nine manifests that existed
+    that day, extending this validator refused none of them.
+
+    No UPPER bound on `max_turns`, deliberately: `wall_clock_timeout_s` is the
+    outer stop whatever this says, section 5.4 leaves the number to the
+    section 3.5 calibration pilot, and there is no downstream limit to mirror
+    AT THE VERSION MEASURED -- verified against claude 2.1.258 on the host,
+    where `--max-turns` is absent from `--help` entirely and `--max-turns 0`
+    starts a session and calls the API rather than being refused. The eval
+    image pins 2.1.220 and was not measured; a stricter check there would
+    only move the failure earlier, never make this refusal wrong. The bottom
+    is what the container cannot survive, and `value <= 0` is what refuses
+    it.
+    """
+    if value is _ABSENT:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise TaskError(f"{where}: must be a positive integer, got {value!r}")
+    return value
 
 
 def task_set_commit(root: Path) -> str:
@@ -614,11 +1404,90 @@ def load_task(task_dir: Path, set_commit: str = "") -> TaskManifest:
         raise TaskError(
             f"{where}: {sorted(overlap)} are declared as both f2p and p2p"
         )
+    framework = _framework(tests_raw.get("framework"), f"{where}:tests.framework")
+    adapter = for_framework(framework)
+    # Cross-checked rather than derived from each other, in either direction:
+    # each key catches the other's typo. A runner read by the wrong adapter is
+    # classified by the wrong rules -- and on the node side there is no exit
+    # code that would say so, because vitest and jest exit 1 for a failing
+    # test and for a broken config alike.
+    if not any(adapter.runner_marker in part for part in runner):
+        raise TaskError(
+            f"{where}: tests.framework is {framework!r} but no element of "
+            f"tests.runner contains {adapter.runner_marker!r} "
+            f"({list(runner)!r}). Each key catches the other's typo, which is "
+            "why neither is derived from the other -- and a runner read by the "
+            "wrong adapter is classified by the wrong rules."
+        )
+    # Per-framework, and EMPTY for pytest: pytest selects by the whole node id,
+    # path included, so a shape rule added here now could refuse a manifest
+    # that loads today.
+    for node_id in (*f2p, *p2p):
+        adapter.validate_node_id(node_id, test_paths, where)
+    adapter.validate_id_set((*f2p, *p2p), where)
 
-    image_raw = data.get("image") or {}
+    # `is None`, NOT `or {}`, for the reason given at `budget_raw` and
+    # `grading_raw` below -- and this section is the one where a silently
+    # discarded body costs the most. Measured 2026-09-02: `image: []`, `: 0`
+    # and `: ""` all loaded as the default python with EMPTY apt, pip and
+    # build, so one stray bracket throws away `build: ["pip install -e ."]`
+    # (imports then resolve to site-packages and nothing the agent writes
+    # takes effect) and `apt: ["less"]` (189 tests error on a closed stdout
+    # in the pager test). Preflight catches both, which is the only reason
+    # this was ever a hygiene defect rather than a P0.
+    image_raw = data.get("image")
+    if image_raw is None:
+        image_raw = {}
     if not isinstance(image_raw, dict):
         raise TaskError(f"{where}: image must be a mapping")
-    budget_raw = data.get("budget") or {}
+    # The same guard `grading:` has below, needed here for a sharper reason: a
+    # misspelled `image:` key is the one failure preflight's read-back cannot
+    # see. It asks the container which interpreter it runs and compares that
+    # against `task.image.python` -- but `pyhton: "3.11"` loads as the default,
+    # so the base that was built and the field it is compared to are the same
+    # wrong value, and they agree.
+    unknown = sorted(str(k) for k in set(image_raw) - set(_IMAGE_KEYS))
+    if unknown:
+        raise TaskError(
+            f"{where}: unknown image key(s) {unknown}; allowed: "
+            f"{list(_IMAGE_KEYS)}"
+        )
+    # The runtime is DERIVED from `tests.framework` -- see `task_runtime`. The
+    # key belonging to the other runtime is refused rather than ignored,
+    # because ignoring it is the silent half: a manifest declaring
+    # `python: "3.11"` beside `framework: vitest` would build a node base and
+    # say nothing, and the author would have no way to learn that the version
+    # they pinned was never consulted.
+    declared_node = image_raw.get("node")
+    declared_python = image_raw.get("python")
+    is_node = framework in _NODE_FRAMEWORKS
+    if is_node and declared_python is not None:
+        raise TaskError(
+            f"{where}: image.python is declared but tests.framework is "
+            f"{framework!r}, which runs on the node base image. The runtime "
+            "comes from the framework; declaring both is two sources for one "
+            "fact, and a disagreement gates the task in one interpreter and "
+            "runs it in another."
+        )
+    if not is_node and declared_node is not None:
+        raise TaskError(
+            f"{where}: image.node is declared but tests.framework is "
+            f"{framework!r}, which runs on the python base image. The runtime "
+            "comes from the framework; declaring both is two sources for one "
+            "fact."
+        )
+    # `is None`, NOT `or {}` -- for the reason the `grading:` block below
+    # gives in the same words: `budget: []` is what an author who started a
+    # list and never wrote the keys leaves behind, and `or {}` reads it as a
+    # section they never wrote, applying all three defaults to a manifest
+    # that visibly asked for something else. Measured 2026-09-02: `[]`, `0`
+    # and `""` all loaded as 40/900/600. An explicit `budget: null` still
+    # takes the defaults, which is a commented-out block and is what the
+    # defaults are for -- unlike a null KEY, which is an author reaching for
+    # one number and writing none, and is refused by `_positive_int`.
+    budget_raw = data.get("budget")
+    if budget_raw is None:
+        budget_raw = {}
     if not isinstance(budget_raw, dict):
         raise TaskError(f"{where}: budget must be a mapping")
     # Optional: absent is `not_configured`, not an error. Whether the declared
@@ -655,6 +1524,19 @@ def load_task(task_dir: Path, set_commit: str = "") -> TaskManifest:
     extra_paths = _strs(
         tests_raw.get("allow_extra_paths"), f"{where}:tests.allow_extra_paths"
     )
+    # Validated before the split so a malformed entry is reported without
+    # first paying for git's per-chunk parse of the whole reference.
+    # `manifest_digest` needs no term for this key: it hashes the raw manifest
+    # bytes, so declaring or editing a strip already invalidates the task's
+    # preflight cache entry.
+    strip_paths = _strs(data.get("strip_paths"), f"{where}:strip_paths")
+    _validate_strip_paths(strip_paths, f"{where}:strip_paths")
+    submodules_unneeded = _strs(
+        data.get("submodules_unneeded"), f"{where}:submodules_unneeded"
+    )
+    _validate_unneeded_submodules(
+        submodules_unneeded, f"{where}:submodules_unneeded"
+    )
     test_diff, solution_diff, test_files, solution_files, extra_files = (
         split_reference_diff(reference, test_paths, extra_paths=extra_paths)
     )
@@ -672,6 +1554,62 @@ def load_task(task_dir: Path, set_commit: str = "") -> TaskManifest:
             f"under tests.paths {list(test_paths)} or "
             f"allow_extra_paths {list(extra_paths)}"
         )
+    _refuse_stripped_halves(test_files, solution_files, strip_paths, where)
+
+    # All three through one validator, and the two below the comparison
+    # matter most: a bare `int(...)` accepted `wall_clock_timeout_s: true`
+    # as 1 and `: 0.5` as 0, and the `>` refusal further down then reported
+    # the manifest's problem as a `suite_timeout_s` the author never
+    # declared -- advising them to lower the one number that was correct.
+    # `_ABSENT` rather than the dataclass default, so `key: null` is refused
+    # instead of read as a key nobody wrote.
+    #
+    # Keyword arguments evaluate left to right, so a manifest with two bad
+    # keys is refused by the FIRST in this order. Deterministic, and it is
+    # the order the keys appear in the dataclass and in every manifest.
+    budget = TaskBudget(
+        max_turns=_positive_int(
+            budget_raw.get("max_turns", _ABSENT),
+            f"{where}:budget.max_turns",
+            TaskBudget.max_turns,
+        ),
+        wall_clock_timeout_s=_positive_int(
+            budget_raw.get("wall_clock_timeout_s", _ABSENT),
+            f"{where}:budget.wall_clock_timeout_s",
+            TaskBudget.wall_clock_timeout_s,
+        ),
+        suite_timeout_s=_positive_int(
+            budget_raw.get("suite_timeout_s", _ABSENT),
+            f"{where}:budget.suite_timeout_s",
+            TaskBudget.suite_timeout_s,
+        ),
+    )
+    # The agent re-runs this suite INSIDE its wall clock and nothing bounds it
+    # per command there, so a suite the author says may need longer than the
+    # agent's whole run is a task no arm can verify even once: section 3.3
+    # measures a loop that ends in "runs tests, sees failures, self-corrects",
+    # and this is that loop truncated by a SIGTERM mid-suite, with a diff
+    # nobody checked. Settled by arithmetic over two manifest numbers, so it
+    # is refused HERE rather than in preflight -- an image build is a high
+    # price for a contradiction visible in the YAML. Strictly `>`: equality is
+    # degenerate but is a judgement about slack, not something arithmetic
+    # settles.
+    # Runs after all three keys are validated above, which is what lets this
+    # message be trusted: on a bare `int(...)` it fired for a boolean
+    # `wall_clock_timeout_s` and blamed `suite_timeout_s`.
+    if budget.suite_timeout_s > budget.wall_clock_timeout_s:
+        raise TaskError(
+            f"{where}: budget.suite_timeout_s ({budget.suite_timeout_s}) "
+            "exceeds budget.wall_clock_timeout_s "
+            f"({budget.wall_clock_timeout_s}) by "
+            f"{budget.suite_timeout_s - budget.wall_clock_timeout_s}s. The "
+            "agent re-runs this suite inside its wall clock, so it could not "
+            "verify its own work even once -- the run would be terminated "
+            "mid-suite with an unchecked diff, and that is indistinguishable "
+            "from a model that simply ran out of time. Raise "
+            "wall_clock_timeout_s, or lower suite_timeout_s to what the suite "
+            "actually needs."
+        )
 
     return TaskManifest(
         task_id=task_id,
@@ -683,12 +1621,15 @@ def load_task(task_dir: Path, set_commit: str = "") -> TaskManifest:
         prompt=prompt,
         tests=TaskTests(
             paths=test_paths, runner=runner, f2p=f2p, p2p=p2p,
-            allow_extra_paths=extra_paths,
+            allow_extra_paths=extra_paths, framework=framework,
         ),
         image=TaskImage(
             apt=_strs(image_raw.get("apt"), f"{where}:image.apt"),
             pip=_strs(image_raw.get("pip"), f"{where}:image.pip"),
             build=_strs(image_raw.get("build"), f"{where}:image.build"),
+            env=_env_map(image_raw.get("env"), f"{where}:image.env"),
+            python=_python_version(declared_python, f"{where}:image.python"),
+            node=_node_version(declared_node, f"{where}:image.node"),
         ),
         grading=TaskGrading(
             build=_strs(grading_raw.get("build"), f"{where}:grading.build"),
@@ -697,12 +1638,7 @@ def load_task(task_dir: Path, set_commit: str = "") -> TaskManifest:
             ),
             lint=_strs(grading_raw.get("lint"), f"{where}:grading.lint"),
         ),
-        budget=TaskBudget(
-            max_turns=int(budget_raw.get("max_turns", TaskBudget.max_turns)),
-            wall_clock_timeout_s=int(
-                budget_raw.get("wall_clock_timeout_s", TaskBudget.wall_clock_timeout_s)
-            ),
-        ),
+        budget=budget,
         reference_diff=reference,
         test_diff=test_diff,
         solution_diff=solution_diff,
@@ -712,38 +1648,320 @@ def load_task(task_dir: Path, set_commit: str = "") -> TaskManifest:
         root=task_dir,
         declared_start_sha=str(declared_start),
         gitignore_extra=_strs(data.get("gitignore_extra"), f"{where}:gitignore_extra"),
+        strip_paths=strip_paths,
+        submodules_unneeded=submodules_unneeded,
+        # `or {}` deliberately: an empty and an absent provenance are the
+        # same field, nothing branches on it, and `is None` would hand
+        # `provenance: 0` to `dict(0)` -- a bare `TypeError`, the opposite of
+        # what the sibling refusals (`image`, `budget`, `grading`) are for.
         provenance=dict(data.get("provenance") or {}),
         task_set_commit=set_commit,
         manifest_digest=hashlib.sha256(raw_manifest + raw_reference).hexdigest()[:16],
     )
 
 
-def load_task_set(root: Path, only: list[str] | None = None) -> list[TaskManifest]:
-    """Every task under `root`, validated, in a stable order.
+@dataclass(frozen=True)
+class RefusedManifest:
+    """One task directory under a task-set root whose manifest did not load.
+
+    `error` is the message the load raised. A `TaskError` already opens with
+    the absolute path of the offending `task.yaml` (`load_task`'s `where`), so
+    a caller printing these never has to reconstruct which file is meant; the
+    collector prefixes the path itself for the exception types that do not
+    carry one.
+
+    `committed` is the whole reason a refusal can ever be downgraded to a
+    warning, and it is stated per DIRECTORY rather than per set: it means
+    "this directory is part of the revision a record would name". A directory
+    that is untracked, ignored, or in no repository at all is work in progress
+    -- `docs/BUILDING-A-TASK-SET.md` section 1.5 says to commit the task set
+    before every collection, so an uncommitted one is by definition not the
+    thing a collection runs against. A TRACKED manifest that does not load is
+    a different animal: the set's own revision is broken, every record written
+    against it names a sha that promises a set which does not load whole, and
+    `grade.py` -- which has no `--tasks` and loads the set whole -- grades
+    every record naming that task as TASK_NOT_FOUND, at exit code 0. So such a
+    refusal is fatal whatever the selection says, and the drafting affordance
+    cannot be used to carry a broken task set through a collection.
+    """
+
+    directory: Path
+    error: str
+    committed: bool
+
+
+def _manifest_committed(root: Path, task_dir: Path) -> bool:
+    """True when this task directory is part of the revision a record names.
+
+    TWO facts, in this order, because one of them alone answers a different
+    question. `git status --porcelain -- <dir>` reports what the enclosing
+    repository has to SAY about a path, and it says nothing about an IGNORED
+    path -- measured, git 2.50.1: a scratch task set inside a repo whose
+    `.gitignore` holds `scratch/` gets exit 0 and empty stdout, while `git
+    ls-files --error-unmatch` on the same path exits non-zero because nothing
+    there is tracked. Status alone therefore calls an untracked drafting
+    directory "committed" and hard-refuses it under a message asserting the
+    opposite of the truth -- which re-breaks the exact workflow the warning
+    path exists to allow. So: tracked decides whether the path is in the
+    index at all, and only then does clean decide whether it is modified.
+
+    Pathspec discipline, learned the way `task_set_commit` learned it: `git
+    status -- <pathspec>` resolves the pathspec against the CWD, so a relative
+    path plus `cwd=root` asks about `<root>/<root>/...`, matches nothing, and
+    git prints nothing and exits 0 -- every directory would read as committed.
+    Here that is not cosmetic: it would flip every warning back into the
+    refusal this function exists to lift. Both paths are resolved first, for
+    both calls.
+
+    The status half fails CLOSED. Once a path is known to be tracked, a `git
+    status` that cannot run leaves us unable to prove the manifest is work in
+    progress, and guessing permissively is how a committed task set that does
+    not load whole reaches the end of a collection.
+
+    "Committed" means committed to whatever repository ENCLOSES this path.
+    `task_set_commit` names the enclosing repo, which for the in-repo task set
+    (`bakeoff/taskset/`) is the harness repo rather than a task-set repo. That
+    is pre-existing, and this is the first code to turn it into a refuse/warn
+    decision.
+
+    The caller does not call this when the set has no commit at all -- an
+    empty `task_set_commit` means not a git repository, or git unusable, or no
+    commits yet -- and that guard is NOT what makes the non-repo case correct.
+    Measured, git 2.50.1: called on a root outside any repository this returns
+    `False` on its own, because `ls-files` exits non-zero and the path reads as
+    untracked before the status half is reached. The guard is kept because
+    asking git twice about a directory in no repository spends two subprocesses
+    to learn nothing, and because the caller is the layer that already knows
+    the set has no revision. Do not read it as the thing that covers a non-repo
+    root: under the SUPERSEDED one-term predicate it was, and removing the
+    `ls-files` term on that reading reintroduces the ignored-directory refusal
+    above.
+
+    TOTAL: returns a bool for every input and raises for none. It is called
+    from inside the collector's `except` block, where a raise would chain onto
+    the manifest's own error and escape `load_task_set_with_refusals` as an
+    exception no driver catches -- the traceback this change exists to remove,
+    reintroduced one layer over. Both `resolve()` calls are inside the same
+    guard as the `ls-files` call, not ahead of it: `resolve()` is non-strict
+    and will not raise on a missing path, but it can raise `OSError` on a
+    pathological one, and the totality claim above covers that too.
+    """
+    try:
+        root = Path(root).resolve()
+        task_dir = Path(task_dir).resolve()
+        tracked = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "--", str(task_dir)],
+            cwd=root, capture_output=True, text=True,
+        ).returncode == 0
+    except OSError:
+        return True
+    if not tracked:
+        return False
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--", str(task_dir)],
+            cwd=root, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+    except (subprocess.CalledProcessError, OSError):
+        return True
+    return not status
+
+
+def _fatal_reason(refusal: RefusedManifest, wanted: set[str] | None) -> str:
+    """Why THIS refusal cannot be skipped. Order is precedence, not taste:
+    a directory that is both selected and committed is refused because it was
+    asked for, which is the fact the operator can act on.
+
+    The third branch names the SELECTION, not just the sibling. `TASKS.md`
+    states the remedy as "the error should name the offending sibling AND say
+    explicitly that it is not the selected task", and the committed-unselected
+    branch is the one a curated task set hits every time -- the branch this
+    change creates. Without the selection in the text it reproduces exactly
+    the operator experience the probe reported: a message about a sibling,
+    with no mention of what was actually asked for.
+    """
+    if wanted is not None and refusal.directory.name in wanted:
+        return f"SELECTED by --tasks as {refusal.directory.name!r}"
+    if wanted is None:
+        return "no --tasks selection was given, so the whole set is required"
+    return (
+        f"committed, and NOT the task you selected "
+        f"({', '.join(sorted(wanted))}): this manifest is not work in "
+        "progress, so the task set's own revision does not load and no "
+        "selection can skip it"
+    )
+
+
+def _refusal_report(root: Path, fatal: list[RefusedManifest],
+                    wanted: set[str] | None, skippable: int) -> str:
+    """The refusal text. `skippable` is the count of refusals that were NOT
+    fatal, and it is stated when non-zero because the header claims every
+    listed manifest is required -- a reader who knows there were four
+    refusals and sees one listed would otherwise be reading a report that
+    silently dropped three."""
+    lines = [
+        f"{root}: {len(fatal)} manifest(s) in this task set did not load, "
+        "and every one of them is required here:"
+    ]
+    for refusal in fatal:
+        lines.append(f"  - [{_fatal_reason(refusal, wanted)}]")
+        lines.append(f"    {refusal.error}")
+    if skippable:
+        lines.append(
+            f"({skippable} further manifest(s) here also did not load and "
+            "would have been skippable under this selection; they are listed "
+            "only when the load is allowed to proceed.)"
+        )
+    lines.append(
+        "Every record stamps task_set_commit -- the revision of this whole "
+        "directory -- so a set that does not load whole is not a state to "
+        "record against, and grade.py, which has no --tasks and loads the set "
+        "whole, cannot tell that a manifest it cannot read is not the one a "
+        "record names. Fix the manifest, or move it out of this directory. "
+        "Only work in progress can be skipped -- a manifest not tracked in "
+        "this directory's revision, or in a directory that has none -- and "
+        "only by a --tasks selection that does not name it "
+        "(docs/BUILDING-A-TASK-SET.md section 1.5: commit the task set before "
+        "every collection)."
+    )
+    return "\n".join(lines)
+
+
+def refusal_warnings(refusals: list[RefusedManifest], *, root: Path,
+                     selected: set[str]) -> list[str]:
+    """The lines a driver prints for refusals it was allowed to skip.
+
+    A list of lines rather than a print, because `tasks.py` is a library and a
+    module that prints cannot be asserted against. Returned as text rather
+    than as the refusals themselves so that two drivers cannot word the same
+    finding differently -- the reason this is a function at all.
+
+    The middle clause claims only what was measured. "Uncommitted work in
+    progress" would be an overclaim about a directory in a tree that is not a
+    git repository at all, where nothing is known about work in progress; what
+    IS known is that no such refusal is committed in this task set's revision
+    -- because the directory is in no repository, because the manifest is
+    untracked or ignored there, or because it is tracked but modified since
+    the last commit (the ordinary drafting loop: editing an existing tracked
+    task rather than adding a new one). All three collapse to the same
+    observable fact -- `_manifest_committed` returned False -- and the
+    parenthetical below states exactly those three, not just the first two.
+
+    Empty whenever `refusals` is: `load_task_set_with_refusals` returns a
+    non-empty list only on the branch that was allowed to proceed.
+    """
+    if not refusals:
+        return []
+    lines = [
+        f"WARNING: {len(refusals)} manifest(s) under {root} did not load and "
+        f"were skipped. None of them is a selected task "
+        f"({', '.join(sorted(selected))}), and none is committed in this task "
+        "set's revision (this directory is in no repository, the manifest is "
+        "untracked or ignored there, or it is modified since the last "
+        "commit):"
+    ]
+    lines += [f"  - {refusal.error}" for refusal in refusals]
+    lines.append(
+        "WARNING: these are refusals, not skips. A run without --tasks, and "
+        "any grade.py run over this directory, refuses until each one is "
+        "fixed or moved out. This warning is the only place the skip is "
+        "recorded -- no record field carries it."
+    )
+    return lines
+
+
+def load_task_set_with_refusals(
+    root: Path, only: list[str] | None = None
+) -> tuple[list[TaskManifest], list[RefusedManifest]]:
+    """Every task under `root`, validated, in a stable order -- and the
+    directories that would not load, when the caller is allowed to skip them.
 
     Duplicate task_ids raise. `run_id` is a hash of (task_id, model, sample,
     attempt), so two tasks sharing an id would collide in the event log and
     the second one's records would be refused as immutability violations --
     at the far end of a matrix, after the tokens were spent.
+
+    A refusal is NOT raised where it is found. Measured 2026-09-02 in a shared
+    drafting directory: one worker's in-progress `image.env` typo blocked a
+    different worker's `--tasks <unrelated>` gate, and the printed error named
+    only the sibling. Refusals are collected and judged once, against three
+    facts -- was a selection given, does it name this directory, is this
+    manifest tracked in the enclosing revision -- because each answers a
+    different question. The selection says what the operator asked for;
+    tracked-ness says whether the task set's own revision is broken or whether
+    this is work in progress in a tree that has no revision for a record to
+    name (`task_set_commit` is then `""`, never `"<sha>-dirty"` -- a scratch
+    task set is typically not a git repository at all).
+
+    A refused directory is matched against `only` by DIRECTORY NAME, because a
+    manifest that did not load has no readable task_id. `load_task` does not
+    require the two to agree, so a refused `foo/` could declare `task_id: bar`
+    and a `--tasks bar` selection would proceed past it. That cannot pass
+    quietly: `bar` is then missing from the loaded ids and the "no such task"
+    refusal below names every surviving refusal as a directory it could not
+    check.
+
+    `only` is read for truthiness, not for `is not None`, exactly as before:
+    an empty selection has always meant "no selection", and `run_matrix.py`
+    passes `None` for an absent `--tasks`.
     """
     root = Path(root)
     if not root.is_dir():
         raise TaskError(f"{root}: no such task set")
     commit = task_set_commit(root)
     tasks: list[TaskManifest] = []
+    refusals: list[RefusedManifest] = []
     for task_dir in sorted(p for p in root.iterdir() if p.is_dir()):
         if not (task_dir / MANIFEST_NAME).exists():
             continue
-        tasks.append(load_task(task_dir, set_commit=commit))
-    if only:
-        wanted = set(only)
+        try:
+            tasks.append(load_task(task_dir, set_commit=commit))
+        except Exception as exc:  # noqa: BLE001 - one manifest, not the set
+            # Broad on purpose. `load_task` raises TaskError for everything it
+            # checks, but `yaml.safe_load` raises `yaml.YAMLError` and an
+            # unreadable file raises OSError -- neither is a TaskError, so a
+            # sibling with malformed YAML used to reach the operator as a
+            # traceback straight through both drivers' `except TaskError`.
+            # Nothing gets quieter: every collected refusal is re-raised as a
+            # TaskError below unless it is provably skippable.
+            refusals.append(RefusedManifest(
+                directory=task_dir,
+                error=(str(exc) if isinstance(exc, TaskError) else
+                       f"{task_dir / MANIFEST_NAME}: "
+                       f"{type(exc).__module__}.{type(exc).__name__}: {exc}"),
+                # Only asked when the set has a revision at all -- see
+                # `_manifest_committed`'s docstring for why the empty-commit
+                # case must not reach it.
+                committed=(bool(commit)
+                           and _manifest_committed(root, task_dir)),
+            ))
+
+    wanted = set(only) if only else None
+    fatal = [r for r in refusals
+             if wanted is None or r.committed or r.directory.name in wanted]
+    if fatal:
+        raise TaskError(
+            _refusal_report(root, fatal, wanted, len(refusals) - len(fatal))
+        )
+
+    if wanted is not None:
         known = {task.task_id for task in tasks}
         missing = wanted - known
         if missing:
+            unchecked = ""
+            if refusals:
+                unchecked = (
+                    f"; {len(refusals)} manifest(s) here did not load and were "
+                    "matched against the selection by DIRECTORY NAME only, so "
+                    "one of them may be the task you asked for: "
+                    + ", ".join(str(r.directory) for r in refusals)
+                )
             raise TaskError(
-                f"no such task(s) in {root}: {', '.join(sorted(missing))}"
+                f"no such task(s) in {root}: "
+                f"{', '.join(sorted(missing))}{unchecked}"
             )
         tasks = [task for task in tasks if task.task_id in wanted]
+
     seen: set[str] = set()
     for task in tasks:
         if task.task_id in seen:
@@ -751,6 +1969,20 @@ def load_task_set(root: Path, only: list[str] | None = None) -> list[TaskManifes
         seen.add(task.task_id)
     if not tasks:
         raise TaskError(f"{root}: no tasks")
+    return tasks, refusals
+
+
+def load_task_set(root: Path, only: list[str] | None = None
+                  ) -> list[TaskManifest]:
+    """`load_task_set_with_refusals` for a caller with nothing to skip.
+
+    Signature and return type are unchanged, so `scripts/grade.py` and
+    `scripts/judge.py` keep their call sites and inherit the refusal text
+    without an edit. Both pass no selection, which is the branch on which
+    `refusals` is empty by construction: a caller that named no subset is
+    asking for the whole set, and every manifest in it is required.
+    """
+    tasks, _ = load_task_set_with_refusals(root, only)
     return tasks
 
 
@@ -873,6 +2105,660 @@ def ensure_mirror(repo_url: str, base_sha: str, cache_root: Path) -> Path:
                 "nothing and record the result as an ordinary run."
             )
         return mirror
+
+
+def derive_submodules(task: TaskManifest, mirror: Path,
+                      cache_root: Path) -> tuple[Submodule, ...]:
+    """The submodules of `task.base_sha`, from git's own parsers, cross-checked,
+    at every level down to `_MAX_SUBMODULE_DEPTH`.
+
+    TWO independent readers, and their agreement is the guarantee. `ls-tree`
+    gives the paths that have a gitlink; `.gitmodules` gives the paths that
+    have a url. A path in one set and not the other is a QUIET failure in both
+    directions -- a url with no gitlink makes the init fail with git's message
+    instead of one naming the task, and a gitlink with no url leaves the
+    directory empty, which is byte-identical to a suite that cannot import and
+    is scored as capability on every arm (measured 2026-09-01, git 2.50.1:
+    `git status --porcelain` is EMPTY in a run tree whose submodule directory
+    has zero entries).
+
+    Both reads are NUL-delimited, for the reason `_chunk_path`'s docstring
+    gives: paths come from git, never from a regex over a header line.
+
+    RECURSIVE, and a PRE-ORDER tuple: a parent precedes its children.
+    Measured 2026-09-02 (M1), `git ls-tree -r` does NOT descend through a
+    gitlink, so the second level is a second repository's tree and the
+    derivation has to ask it. Both readers are already generic over
+    `(mirror, sha)` (M2), which is what makes this a parameter change rather
+    than a new parser: `_read_level` is the level body and `_derive_from` is
+    the driver. `cache_root` is required, and not a keyword defaulting to
+    `None`: a `None` silently meaning "do not recurse" would make the
+    derivation answer a different question depending on its caller.
+
+    The url rule is enforced through the module constant
+    `_SUBMODULE_URL_PREFIX` rather than a parameter, so the test fixtures --
+    local repositories, so the whole materialization path runs offline -- relax
+    it by monkeypatching one name, and no shipping signature carries a flag
+    that only tests ever set.
+
+    A RELATIVE url is resolved in `_read_level`, against `task.repo_url` at
+    depth 1 and against the PARENT's resolved url below it, and the resolution
+    runs LAST -- after the unreadable-.gitmodules raise and after the
+    `unfetchable` raise -- so a gitlink with no url is told that rather than
+    told that "" does not resolve.
+    """
+    subs = _derive_from(task, mirror, task.base_sha, parent=None, depth=1,
+                        cache_root=cache_root)
+    # THE SECOND HALF of item 2's typo refusal. The first half is in
+    # `_read_level`, at item 2's own position and guarded to depth 1, and it
+    # DEFERS any declared path that sits under a gitlink at that level --
+    # `vendor/lib/vendor/deep` under `vendor/lib` is a shape no level-1 reader
+    # can explain, and the level that CAN explain it refuses it as too deep.
+    # This is where a deferral that no level explained at all is refused, and
+    # it is also what refuses declaring BOTH a parent and its child: the
+    # recursion does not descend into a declared-unneeded submodule, so the
+    # child is in no `sub.path`.
+    unexplained = sorted(set(task.submodules_unneeded)
+                         - {sub.path for sub in subs})
+    if unexplained:
+        raise TaskError(
+            f"{task.task_id}: submodules_unneeded names "
+            f"{', '.join(unexplained)}, which is under a gitlink but is not a "
+            "gitlink at any level the derivation reached. A typo declares "
+            "nothing: the submodule it was meant to name is still populated "
+            "(or still refused for its url), and nothing downstream would say "
+            "the key did not apply."
+        )
+    return subs
+
+
+def _derive_from(task: TaskManifest, mirror: Path, sha: str,
+                 parent: Submodule | None, depth: int,
+                 cache_root: Path) -> tuple[Submodule, ...]:
+    """One level, then its children. Pre-order: the parent precedes them.
+
+    TWO `_refuse_submodule_conflicts` calls per level, and the ordering is not
+    stylistic: the url refusal has to run BEFORE the url it refuses is handed
+    to a clone. A `git@github.com:...` url reaching `ensure_pruned_mirror` is a
+    fetch against a host the eval carries no key for -- git's own error, or a
+    credential prompt, instead of the loader's message naming the task. The
+    second call is a strict superset of the first: the depth refusal is the
+    only one that needs an artifact rather than a comparison.
+
+    `parent` is the parent `Submodule` and not its path, because two things
+    need more than the path: `_read_level` resolves a relative url against
+    `parent.url_resolved` (item 16's base at depth >= 2), and the `Submodule`
+    it constructs needs `parent.path`. `None` reads as "the superproject",
+    which is what `task.repo_url` is the base for.
+    """
+    subs = _read_level(task, mirror, sha, parent, depth)
+    _refuse_submodule_conflicts(task, subs, mirrors={})
+    mirrors = {
+        sub.path: ensure_pruned_mirror(sub.url_resolved, sub.sha, cache_root)
+        for sub in subs if not sub.declared_unneeded
+    }
+    _refuse_submodule_conflicts(task, subs, mirrors=mirrors)
+    out: list[Submodule] = []
+    for sub in subs:
+        out.append(sub)
+        # ITEM 2, EXPLICITLY. Nothing is populated for a declared path, so its
+        # own `.gitmodules` is never read and its children never exist. NOT
+        # left to `mirrors.get(...)` returning None: that is a coincidence of
+        # the comprehension above, and a coincidence cannot be mutation-tested.
+        if sub.declared_unneeded:
+            continue
+        if _has_gitlinks(mirrors[sub.path], sub.sha):
+            out.extend(_derive_from(task, mirrors[sub.path], sub.sha,
+                                    parent=sub, depth=depth + 1,
+                                    cache_root=cache_root))
+    return tuple(out)
+
+
+def _read_level(task: TaskManifest, mirror: Path, sha: str,
+                parent: Submodule | None, depth: int) -> tuple[Submodule, ...]:
+    """The two readers, against ONE `(mirror, sha)` pair.
+
+    This is `derive_submodules`' original body with `task.base_sha` replaced by
+    `sha` and every path joined onto `parent.path`. Measured 2026-09-02 (M2),
+    both reads work verbatim against an inner mirror at an inner gitlink sha,
+    which is why the recursion is a parameter change and not a second parser.
+    """
+    entries = _git("ls-tree", "-r", "-z", sha, cwd=mirror).stdout
+    gitlinks: dict[str, str] = {}
+    full_by_local: dict[str, str] = {}
+    for record in entries.split("\0"):
+        if not record:
+            continue
+        meta, _, local = record.partition("\t")
+        mode, _, rest = meta.partition(" ")
+        if mode != "160000":
+            continue
+        # THE JOIN, and it is computed once and used four times: item 2's
+        # `needed_gitlinks` subtraction, item 2's `declared_unneeded` stamp,
+        # `path=` on the constructed entry, and both refusal messages. Item 2
+        # computes the first two against level-LOCAL keys, and at depth 2 the
+        # local key is `vendor/deep` while the declared path is
+        # `vendor/lib/vendor/deep` -- so without this the subtraction never
+        # matches, the flag is always False, and a level-2 submodule declared
+        # unneeded is still refused for its url and still populated, silently.
+        full = str(PurePosixPath(parent.path) / local) if parent else local
+        full_by_local[local] = full
+        gitlinks[full] = rest.split(" ")[-1]
+
+    if depth == 1:
+        # FIRST, before anything reads `.gitmodules`. Both of the refusals below
+        # are derived from that file, and an author who misspells the path of the
+        # very submodule they are exempting must be told about the typo rather
+        # than about a url or an unreadable blob. The position is the message.
+        #
+        # A declared path that sits UNDER a gitlink at this level may still be
+        # a real gitlink one level down (`vendor/lib/vendor/deep` under
+        # `vendor/lib`), so it is DEFERRED to `derive_submodules`' second check
+        # rather than called a typo here. Deferred, not accepted: the level
+        # that finds it refuses it as too deep (the `else` branch below) and a
+        # level that never finds it refuses it as a typo, so the two refusals
+        # split the cases and each names the one it actually caught. `_under` is component-wise
+        # (`PurePosixPath.is_relative_to`), so a near-miss is not deferred:
+        # measured 2026-09-02, `vendor/libdeps` is not under `vendor/libdep`
+        # and `vendor/typo` is not under it either, which is what keeps item
+        # 2's two ordering tests passing unchanged. Guarded to depth 1 because
+        # at depth 2 the same subtraction would see a level-1 declared path it
+        # cannot explain and call THAT a typo.
+        deferred = {p for p in task.submodules_unneeded
+                    for g in gitlinks if p != g and _under(p, (g,))}
+        unknown = sorted(set(task.submodules_unneeded) - set(gitlinks) - deferred)
+        if unknown:
+            raise TaskError(
+                f"{task.task_id}: submodules_unneeded names "
+                f"{', '.join(unknown)}, which the tree at {task.base_sha} has no "
+                "gitlink at. A typo declares nothing: the submodule it was meant "
+                "to name is still populated (or still refused for its url), and "
+                "nothing downstream would say the key did not apply."
+            )
+    else:
+        # ITEM 2'S LEVER IS DEPTH-1 ONLY, and this is where that is enforced.
+        # `parent` is never None on this branch: depth > 1 is reached only
+        # through `_derive_from`'s recursion, which always passes the level's
+        # own submodule.
+        #
+        # The GATE can see an uninitialised submodule at any depth -- item 18
+        # gave preflight a per-level walk and an `ls -A` read at each one --
+        # but the RUN-TIME reader cannot. `container.submodule_states`
+        # enumerates gitlinks with `git ls-files -s -z` at the SUPERPROJECT
+        # ROOT, and measured 2026-09-03 (git 2.50.1) `ls-files` does not
+        # descend through a gitlink: a level-2 gitlink inside a POPULATED
+        # level-1 submodule is never enumerated and so never probed, while the
+        # level-1 path that IS enumerated carries a `.git` and is skipped by
+        # `_uninitialised_with_content` by design. The `--porcelain=v2` stream
+        # is silent for it as well. So content an agent writes into that empty
+        # level-2 directory is recorded NOWHERE and `submodules_dirty` comes
+        # back `{}` -- which `container.submodule_states` documents as the
+        # positive measurement "read, nothing dirty", not as an absence.
+        # `grader._submodule_edits` collapses it to `()`, the ladder stamps
+        # EMPTY_PATCH, and that is a `GradeFailure`: `resolved: False`, an
+        # accusation that the model changed nothing, permanently, in an
+        # append-only file. Exactly the accusation item 17 exists to prevent,
+        # reproduced one level down.
+        #
+        # Refused at LOAD rather than closed by a deeper reader, because that
+        # makes the state unrepresentable and costs nothing today -- no corpus
+        # task nests at all. The alternative, running `_GITLINK_ARGV` per
+        # initialised level with paths joined onto the level prefix, is a new
+        # measured surface at run time and wants its own anchors. Nothing
+        # about a gate verdict changes, so `PREFLIGHT_VERSION` does not move.
+        too_deep = sorted(set(task.submodules_unneeded) & set(gitlinks))
+        if too_deep:
+            raise TaskError(
+                f"{task.task_id}: submodules_unneeded names "
+                f"{', '.join(too_deep)}, a gitlink at depth {depth} inside the "
+                f"submodule {parent.path}. A submodule can be declared "
+                "unneeded at DEPTH 1 ONLY: the run-time reader enumerates "
+                "gitlinks with `git ls-files` at the superproject root, which "
+                "does not descend through an initialised parent, so anything "
+                "an agent writes into that uninitialised directory is "
+                "recorded nowhere and the run's submodules_dirty reads `{}` "
+                "-- the positive claim that the tree was read and is clean. "
+                "Populate it, or declare its depth-1 parent instead, which "
+                "declines its children."
+            )
+    # ONE derived set for BOTH `.gitmodules` refusals, not two subtractions,
+    # because they are the same claim: nothing is fetched for a declared path,
+    # so neither a url nor a readable `.gitmodules` is needed for it. One line
+    # carries the exemption and one mutation can revert both.
+    needed_gitlinks = set(gitlinks) - set(task.submodules_unneeded)
+
+    # The level clause every refusal message below carries when this is not the
+    # superproject, so a message names a tree the task author can find.
+    at_level = (f" That tree is the submodule {parent.path} at depth "
+                f"{depth - 1}." if parent else "")
+
+    declared: dict[str, dict[str, str]] = {}
+    if gitlinks or _has_gitmodules(mirror, sha):
+        listing = _git("config", "--blob", f"{sha}:.gitmodules",
+                       "--list", "-z", cwd=mirror, check=False)
+        if listing.returncode != 0 and needed_gitlinks:
+            raise TaskError(
+                f"{task.task_id}: {sha} carries gitlinks "
+                f"({', '.join(sorted(needed_gitlinks))}) but no readable "
+                ".gitmodules, so no url exists to fetch them from and the "
+                "directories would arrive empty." + at_level
+            )
+        for record in listing.stdout.split("\0"):
+            key, _, value = record.partition("\n")
+            if not key.startswith("submodule."):
+                continue
+            name, _, field = key[len("submodule."):].rpartition(".")
+            if field in ("path", "url"):
+                declared.setdefault(name, {})[field] = value
+
+    # Keyed by the FULL path, because `needed_gitlinks` is. The `.get` fallback
+    # is for a stanza with no gitlink at this level -- an orphan, which is
+    # inert (see `unfetchable` below) and whose key is never read back.
+    by_path = {full_by_local.get(v["path"], v["path"]): (name, v)
+               for name, v in declared.items() if "path" in v}
+    # ONE-DIRECTIONAL, and the direction is the decision. A gitlink with no
+    # url has nothing to fetch from and leaves a directory `git status
+    # --porcelain` reports as CLEAN -- quiet, and fatal. The reverse is inert:
+    # measured 2026-09-01, a `.gitmodules` entry naming a path with no gitlink
+    # is not listed by `git submodule status`, is not fetched by `update
+    # --init` (exit 0) and creates no directory, because git drives everything
+    # off the index. Refusing it would refuse a real, working shape -- a
+    # submodule `git rm --cached`'d with its stanza left behind. Preflight
+    # records those names as `submodules_orphaned` instead -- a key with no
+    # producer until Task 4 computes it inside the container, where it is an
+    # observation of the tree rather than a re-derivation on the host.
+    unfetchable = sorted(needed_gitlinks - set(by_path))
+    if unfetchable:
+        raise TaskError(
+            f"{task.task_id}: the tree at {sha} carries gitlinks "
+            f"with no .gitmodules url: {', '.join(unfetchable)}. There is "
+            "nothing to fetch them from, so each directory would arrive empty "
+            "-- and an empty submodule directory leaves `git status "
+            "--porcelain` clean, so nothing downstream would say so." + at_level
+        )
+
+    # `by_path.get(path, (path, {}))` is what lets a DECLARED-UNNEEDED gitlink
+    # construct an entry with no stanza at all, and even with no readable
+    # `.gitmodules`: `name` falls back to the path and `url` to `""`. That
+    # combination is unreachable for a needed submodule, because the two
+    # refusals above rule it out. Bound ONCE per gitlink here (a comprehension
+    # would evaluate it twice), and used for both `declared_unneeded` and
+    # `url_resolved` below.
+    #
+    # The resolution base is `task.repo_url` at depth 1 and the PARENT's
+    # RESOLVED url below it (item 16's resolver already took the base; what
+    # was hard-coded was this argument). "Resolved-of-resolved" is not a case:
+    # a depth-1 relative url is already absolute by the time depth 2 is read.
+    base_url = parent.url_resolved if parent else task.repo_url
+    unneeded = set(task.submodules_unneeded)
+    subs_list: list[Submodule] = []
+    for full_path, link_sha in sorted(gitlinks.items()):
+        name, entry = by_path.get(full_path, (full_path, {}))
+        declared_url = entry.get("url", "")
+        subs_list.append(Submodule(
+            name=name, path=full_path, sha=link_sha,
+            url_declared=declared_url,
+            # Written explicitly. Its default is `False`, so omitting this
+            # keyword compiles, constructs, and silently reverts the whole of
+            # the declared-unneeded exemption -- the url-refusal guard,
+            # `_init_submodules`' filter, `_extract_submodules`' skip and
+            # preflight's GO.
+            declared_unneeded=full_path in unneeded,
+            # Written explicitly for the same reason, and this one is worse:
+            # both default to the depth-1 values, so an omitted keyword makes
+            # every level read as a submodule of the superproject and
+            # `local_path` hand `submodule update --init` a path its cwd has
+            # never heard of.
+            depth=depth,
+            parent=parent.path if parent else "",
+            # NEVER resolved for a declared-unneeded path: nothing fetches
+            # it, so no url has to exist for it at all (a declared-unneeded
+            # gitlink may have no stanza behind it, in which case
+            # `declared_url` is already ""). `None` is "not resolved", a
+            # different absence from `""` ("declared no url").
+            url_resolved=None if full_path in unneeded else _resolve_submodule_url(
+                base_url, declared_url, task_id=task.task_id, path=full_path),
+        ))
+    return tuple(subs_list)
+
+
+def _has_gitmodules(mirror: Path, sha: str) -> bool:
+    return _git("cat-file", "-e", f"{sha}:.gitmodules", cwd=mirror,
+                check=False).returncode == 0
+
+
+def _has_gitlinks(mirror: Path, sha: str) -> bool:
+    """Whether the tree at `sha` has at least one 160000 entry.
+
+    NOT `_has_gitmodules`. Measured 2026-09-02 (M21): a repository whose
+    submodule was `git rm --cached`'d with its stanza left behind has a readable
+    `.gitmodules` and no gitlink at all -- the inert shape `derive_submodules`'
+    own comment says must be recorded rather than refused, and which preflight
+    files as `submodules_orphaned`. Using the blob's existence as the predicate
+    would both descend into a level that yields nothing and, at the cap, REFUSE
+    a task the eval can run.
+
+    The descent guard and the cap refusal read THIS ONE predicate, so the two
+    cannot disagree about what a nested submodule is.
+    """
+    entries = _git("ls-tree", "-r", "-z", sha, cwd=mirror).stdout
+    return any(record.startswith("160000 ") for record in entries.split("\0"))
+
+
+def _resolve_submodule_url(repo_url: str, declared: str, *,
+                           task_id: str, path: str) -> str:
+    """git's resolution of a relative `.gitmodules` url, offline.
+
+    gitmodules(5) resolves `./` and `../` against the superproject's default
+    remote, `remote.origin.url`, or -- with no remote -- against the
+    superproject's own path. `materialize` removes `origin` on purpose, so
+    measured 2026-09-02 (git 2.50.1) git takes the third branch, warns
+    *"Assuming this repository is its own authoritative upstream"*, and tries
+    to clone `<run tree>/../x.git`, which does not exist. `task.repo_url` is
+    the same fact the deleted remote carried, it is in the manifest, and it is
+    offline -- so the resolution is done here instead.
+
+    THIS IS A SUPERSET OF REFUSALS OVER GIT, not a port of `relative_url()`.
+    git is defined to produce something for every input, at exit 0, which is
+    why `../../../sub.git` under `https://github.com/org/super.git` measures as
+    `https://sub.git` (a host named `sub.git`) and one more `../` measures as
+    `https:/sub.git` (not a url at all). Everything accepted here git accepts
+    identically; everything refused here git accepts and hands back a url the
+    eval would fail to clone in the middle of a matrix. The 33 measured rows
+    are in `docs/superpowers/plans/2026-09-03-round2-16-relative-submodule-urls.md`.
+
+    No scheme check: the resolver returns a url and
+    `_refuse_submodule_conflicts` judges it against `_SUBMODULE_URL_PREFIX`,
+    which is the one place that decides what is fetchable -- and is the one
+    name the test fixtures relax so a local path can stand in for a url.
+    """
+    if not declared.startswith(_RELATIVE_URL_PREFIXES):
+        # git's own trigger, and it is a two-string prefix set rather than a
+        # `..` check: measured, a bare `..` matches neither and git stores it
+        # verbatim. Falling through leaves it for the url refusal to name.
+        return declared
+
+    where = f"{task_id}: submodule {path} declares the relative url " \
+            f"{declared!r}"
+    for char, what in (("?", "a query"), ("#", "a fragment")):
+        if char in repo_url:
+            raise TaskError(
+                f"{where}, and repo.url {repo_url!r} carries {what}. Measured "
+                "2026-09-02: git silently discards it when the `../` chain "
+                "pops the segment holding it and embeds it mid-path for a "
+                "`./`, so the resolved url is not a url anyone wrote down."
+            )
+    scheme, sep, rest = repo_url.partition("://")
+    if sep:
+        authority, slash, tail = rest.partition("/")
+        if not slash:
+            raise TaskError(
+                f"{where}, and repo.url {repo_url!r} has no path to resolve "
+                "against. Measured 2026-09-02: git pops the HOST in that "
+                "case, giving `https://sub.git` -- a url naming a host that "
+                "does not exist, at exit 0."
+            )
+        prefix = f"{scheme}://{authority}"
+    elif repo_url.startswith("/"):
+        # Reachable only from the test fixtures, where a local path stands in
+        # for a url and `_SUBMODULE_URL_PREFIX` is relaxed to "". The prefix is
+        # empty and the join below restores the leading slash, so the segment
+        # arithmetic is the same one git does.
+        prefix, tail = "", repo_url[1:]
+    else:
+        raise TaskError(
+            f"{where}, and repo.url {repo_url!r} is neither a `scheme://` url "
+            "nor an absolute path, so there is nothing to resolve against. An "
+            "scp-style url (`git@host:org/repo.git`) resolves in git to "
+            "another scp-style url, which this eval cannot fetch either."
+        )
+    tail = tail.rstrip("/")
+    if not tail:
+        raise TaskError(
+            f"{where}, and repo.url {repo_url!r} has no path to resolve "
+            "against."
+        )
+    segments = tail.split("/")
+    if any(not segment for segment in segments):
+        raise TaskError(
+            f"{where}, and repo.url {repo_url!r} carries an empty path "
+            "segment, so which segment a `../` pops is not well defined."
+        )
+
+    remainder = declared
+    while True:
+        if remainder.startswith("./"):
+            # Measured: `./` appends to the WHOLE base, `super.git` included.
+            remainder = remainder[2:]
+        elif remainder.startswith("../"):
+            remainder = remainder[3:]
+            if not segments:
+                # BEFORE the pop, not after, and that is the whole boundary:
+                # two pops from two segments is `https://github.com/other/
+                # sub.git`, exactly what git gives; a third pop is where git
+                # starts eating the host and this stops.
+                raise TaskError(
+                    f"{where}, which climbs above the path of repo.url "
+                    f"{repo_url!r}. Measured 2026-09-02: git pops the host "
+                    "and then the scheme's second slash rather than failing, "
+                    "so the clone target is a url naming a host that does not "
+                    "exist."
+                )
+            segments.pop()
+        else:
+            break
+
+    if not remainder:
+        raise TaskError(
+            f"{where}, which resolves to a directory rather than to a "
+            "repository."
+        )
+    if remainder.endswith("/"):
+        raise TaskError(
+            f"{where}, which ends in a slash. Measured 2026-09-02: git "
+            "consumes exactly one trailing slash, so `../x.git/` and "
+            "`../x.git//` resolve to two different urls."
+        )
+    parts = remainder.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise TaskError(
+            f"{where}, which carries an empty or dot path component after its "
+            "leading `./`/`../` chain. Measured 2026-09-02: git copies those "
+            "through verbatim, so the clone target holds a literal `..` or an "
+            "empty segment."
+        )
+    if any(char in remainder for char in "?#\\:") or \
+            any(char.isspace() for char in remainder):
+        raise TaskError(
+            f"{where}, which carries a query, fragment, backslash, colon or "
+            "whitespace. A relative submodule url is a path, and git appends "
+            "it to the resolved base without escaping it."
+        )
+    return "/".join([prefix, *segments, remainder])
+
+
+def _refuse_submodule_conflicts(task: TaskManifest, subs: tuple[Submodule, ...],
+                                mirrors: dict[str, Path]) -> None:
+    """The four refusals that are not about the two readers agreeing -- two of
+    which a `submodules_unneeded` declaration skips, and two of which it does
+    NOT.
+
+    SKIPPED for a declared path: the url check (nothing is fetched for it, so
+    no url is needed) and the depth check (no pruned mirror is built for it, so
+    `mirrors.get` returns `None` and the check already no-ops; the guard makes
+    that explicit rather than leaving it to the coincidence).
+
+    KEPT for a declared path, and both are OUTSIDE the guard on purpose:
+
+    - a `strip_paths` entry covering the path. Unrelated to population --
+      `_strip_paths_from_tree`'s `git rm -r` still removes the gitlink, still
+      leaves `.gitmodules` naming a path that no longer exists, and still
+      moves `start_sha` while doing it.
+    - a reference diff touching the path. `git add -A` stages NOTHING for a
+      gitlink path in either state, so a task whose fix lives there is
+      ungradable by construction however the manifest declares it.
+
+    `mutation_check.py` anchors the PLACEMENT of both, not only the guard: the
+    edit a later editor reaches for is tidying them inside it, which would
+    silently drop the two refusals the key promises to keep.
+
+    `mirrors` maps a submodule path to its pruned mirror. `_derive_from` calls
+    this TWICE PER LEVEL: first with `{}`, because a url must be REFUSED BEFORE
+    IT IS CLONED -- a `git@github.com:...` url reaching `ensure_pruned_mirror`
+    is git's own fetch error, or a credential prompt, instead of the loader's
+    message naming the task -- and then with that level's real mapping, where
+    the one refusal that needs an artifact rather than a comparison (the depth
+    cap) can run. The second call is a strict superset of the first: the cheap
+    refusals run wherever the derivation runs, and re-running them costs three
+    comparisons over tuples already in hand.
+
+    `_init_submodules` calls it a THIRD time, over the flat pre-order tuple.
+    That call cannot fire -- `sub.depth` is what makes it inert, since the
+    recursion only descended into levels whose gitlinks it had already accepted
+    -- and it asserts that materialization and derivation agree about the same
+    tuple. One function owning every refusal beats splitting them across two so
+    that a reader has to know which half ran where.
+
+    Four refusals here, not five: the gitlink-with-no-url check is
+    `derive_submodules`' own, because it is a property of the pair of readers
+    rather than of one entry.
+
+    Each is a shape that would otherwise fail LATE and describe the wrong
+    thing: a bad url as `git submodule update`'s clone error, a submodule past
+    the depth cap as an empty directory one level further down, a strip as a
+    `git rm` against a path the manifest never meant, and a reference diff
+    touching submodule content as a preflight green-after that passes on a fix
+    no submission diff can contain (measured 2026-09-01: plain `git apply`
+    edits inside a submodule at exit 0, and `git add -A` then stages NOTHING
+    for it -- the checkpoint diff is zero bytes).
+    """
+    for sub in subs:
+        # NOT a `continue` at the top of the loop. That is the shape a later
+        # editor reaches for, and it would silently drop the two refusals
+        # below -- which are the two this key promises to keep.
+        if not sub.declared_unneeded:
+            # `no url` rather than `url ''`: an empty value is what a
+            # `.gitmodules` stanza carrying a `path` and nothing else yields,
+            # and quoting the empty string reads as a url that is present and
+            # strange rather than as a field the author never wrote. Three-way
+            # rather than two-way, because `url_resolved` can now differ from
+            # `url_declared`: `is None` is unreachable here (item 2's guard
+            # skips this whole check for a declared-unneeded submodule) and is
+            # written anyway so a future editor who moves that guard gets the
+            # sentence rather than an `AttributeError`.
+            if sub.url_resolved is None:
+                stated = "no url (declared unneeded)"
+            elif not sub.url_declared:
+                stated = "no url"
+            elif sub.url_resolved == sub.url_declared:
+                stated = f"url {sub.url_declared!r}"
+            else:
+                # The BASE the resolution actually used, not `task.repo_url`
+                # unconditionally: `_read_level` resolves against
+                # `parent.url_resolved` at depth >= 2, so naming `repo.url`
+                # there reports configuration where the message means to
+                # report what happened. `sub.parent` is the parent's PATH,
+                # which is what an author can find in `.gitmodules`; the url
+                # behind it is not carried on the child.
+                base = (f"the resolved url of submodule {sub.parent}"
+                        if sub.parent else repr(task.repo_url))
+                stated = (f"url {sub.url_declared!r}, which resolves against "
+                          f"{base} to {sub.url_resolved!r}")
+            # `(sub.url_resolved or "")`, never a bare `.startswith`: both ""
+            # (the stanza declared no url) and None (declared unneeded, never
+            # resolved) must fall through to this raise, and `sub.url_resolved
+            # .startswith(...)` would throw `AttributeError` on `None` one
+            # line after `stated` was built to describe it.
+            if not (sub.url_resolved or "").startswith(_SUBMODULE_URL_PREFIX):
+                raise TaskError(
+                    f"{task.task_id}: submodule {sub.path} declares {stated}; "
+                    f"only {_SUBMODULE_URL_PREFIX} urls can be fetched by this "
+                    "eval. A relative url is resolved first -- against "
+                    "repo.url at depth 1 and against the parent submodule's "
+                    "resolved url below it -- and it is the RESULT that is "
+                    "judged; ssh, http and file urls cannot be fetched at all."
+                )
+            # FIRST after the url check, and the only refusal that needs an
+            # artifact rather than a comparison -- hence `mirrors`, and hence
+            # the skip wherever no mirror exists.
+            mirror_for = mirrors.get(sub.path)
+            if (sub.depth >= _MAX_SUBMODULE_DEPTH
+                    and mirror_for is not None
+                    and _has_gitlinks(mirror_for, sub.sha)):
+                raise TaskError(
+                    f"{task.task_id}: submodule {sub.path} at {sub.sha} "
+                    f"declares submodules of its own, which would be "
+                    f"{sub.depth + 1} levels below the superproject; this "
+                    f"eval populates at most {_MAX_SUBMODULE_DEPTH}. `git "
+                    "submodule update --init` is run per level, so a level "
+                    "below the cap would arrive empty -- and an empty "
+                    "submodule directory leaves `git status --porcelain` "
+                    "clean, so nothing downstream would say so."
+                )
+        # BOTH DIRECTIONS, and the ancestor one is the half that used to fall
+        # through. `_under` is `PurePosixPath.is_relative_to`, so the first
+        # conjunct already matches the path itself and an `or p == sub.path`
+        # would be dead; the second is a strip that covers the submodule from
+        # ABOVE (`strip_paths: ["vendor"]`, gitlink `vendor/libdep`). That
+        # shape was accepted, and it does not fail late in a way that names
+        # the task: `_strip_paths_from_tree`'s `git rm -r` removes the
+        # gitlink, so `_init_submodules`' `git submodule update --init` writes
+        # nothing and the very next command runs with `cwd=dest/vendor/libdep`
+        # -- a directory that does not exist. That is a bare `FileNotFoundError`
+        # out of `subprocess.run`, not a `TaskError` carrying `task_id`, which
+        # is the loader refusing a manifest wearing the costume of a harness
+        # crash.
+        stripped = [p for p in task.strip_paths
+                    if _under(p, (sub.path,)) or _under(sub.path, (p,))]
+        if stripped:
+            raise TaskError(
+                f"{task.task_id}: strip_paths names {', '.join(stripped)}, "
+                f"which covers the submodule {sub.path} from above or below. "
+                "The strip runs against a start state where the submodule is "
+                "not initialised, so it would remove the gitlink and leave "
+                ".gitmodules naming a path that no longer exists."
+            )
+        touched = [p for p in (*task.test_files, *task.solution_files,
+                               *task.extra_files)
+                   if _under(p, (sub.path,))]
+        if touched:
+            raise TaskError(
+                f"{task.task_id}: the reference diff touches "
+                f"{', '.join(sorted(touched))}, which is at or under the "
+                f"submodule {sub.path}. A submission diff cannot carry an edit "
+                "inside a submodule -- `git add -A` stages nothing for it -- so "
+                "a task whose fix lives there is ungradable by construction."
+            )
+
+
+def task_submodules(task: TaskManifest, cache_root: Path) -> tuple[Submodule, ...]:
+    """`ensure_mirror` then `derive_submodules`. THE entry point.
+
+    One caller, which does not hold a mirror at the point it needs the answer:
+    `images.build_task_image`. `materialize` deliberately does NOT come
+    through here -- it already holds the PRUNED superproject mirror, which
+    carries `base_sha`'s history and answers both reads, so it calls
+    `derive_submodules` against that and takes no second trip through
+    `ensure_mirror`.
+
+    `grader.grade_run` was the second caller and is NOT one any more. Its
+    gitlink refusal reads the submission's own chunks instead, because the
+    DECLARED set is empty for every task in today's corpus while an agent can
+    create a gitlink with `git init` in any tracked subdirectory of any of
+    them -- so the declared set was the wrong authority, and asking for it
+    cost the grader a mirror clone per record for a question the diff already
+    answers.
+
+    Deriving per caller costs two git reads per level, plus one
+    `ensure_pruned_mirror` call per submodule per level -- which is a cache
+    HIT, because the derivation is what built those mirrors, and the same call
+    `_extract_submodules` and `_init_submodules` make next. Threading one value
+    through three signatures would make each caller depend on a neighbour
+    having run the refusals in `derive_submodules`, which is the failure this
+    module's every other check is shaped to avoid.
+    """
+    mirror = ensure_mirror(task.repo_url, task.base_sha, cache_root)
+    return derive_submodules(task, mirror, cache_root)
 
 
 # Bumping this invalidates every cached pruned mirror. Bump it whenever the
@@ -1383,6 +3269,381 @@ def ensure_pruned_mirror(repo_url: str, base_sha: str, cache_root: Path) -> Path
         return _build_pruned_mirror(source, dest, base_sha)
 
 
+def _strip_paths_from_tree(
+    repo: Path, strip_paths: tuple[str, ...], task_id: str
+) -> bool:
+    """Remove the declared paths from index AND worktree. True if anything went.
+
+    `git rm -r`, not `git rm -r --cached`: the point of the key is that the
+    agent does not read a stripped CLAUDE.md and `pip install -e .` does not
+    resolve against a stripped vendored tree, and both need the file gone from
+    disk rather than only from the index. The deletions are staged, so the
+    caller's existing setup commit carries them and `start_sha` moves.
+
+    A path that matches nothing is a TaskError, and `--ignore-unmatch` is
+    deliberately absent. A typo (`.cluade/`) strips nothing and leaves the
+    file in the start state -- and nothing downstream says so, because
+    preflight's `_CONTEXT_FILES` check knows four names, so a mistyped
+    vendored tree or a fifth agent-file spelling passes every gate and the
+    confound is permanent in an append-only log. That is the failure this key
+    exists to prevent, so it cannot also be the failure the key introduces.
+
+    The existence check reads `git ls-files`'s OUTPUT, not its exit code:
+    measured 2026-09-01, `git ls-files -z -- nope` exits 0 with an empty
+    stdout, which is the silent zero `container._checked_exec` exists to
+    refuse. It asks about TRACKED content, because only tracked content is in
+    the tree `start_sha` names -- which is also why a strip cannot name a file
+    the reference diff CREATES, even one `allow_extra_paths` legitimately
+    lists. (`git rm` also refuses an unmatched pathspec, exit 128; this check
+    is kept because it names the manifest key and reports every missing entry
+    at once instead of the first.)
+    """
+    if not strip_paths:
+        return False
+    missing = [
+        path for path in strip_paths
+        if not _git("ls-files", "-z", "--", path, cwd=repo).stdout
+    ]
+    if missing:
+        raise TaskError(
+            f"{task_id}: strip_paths names {', '.join(missing)}, which no "
+            "tracked file is at or under in the start state. A typo strips "
+            "nothing and silently leaves behind the file the task was cut to "
+            "remove."
+        )
+    _git("rm", "-r", "-q", "--", *strip_paths, cwd=repo)
+    return True
+
+
+def _init_submodules(task: TaskManifest, dest: Path,
+                     subs: tuple[Submodule, ...], cache_root: Path) -> None:
+    """Populate every submodule from a PRUNED mirror, with no network.
+
+    Three things are load-bearing and each was measured on 2026-09-01 against
+    git 2.50.1.
+
+    THE MIRROR IS PRUNED. `git submodule update --init` against the declared
+    url clones the submodule's whole history, `remotes/origin/main` included,
+    so the run tree would carry submodule content NEWER than the gitlink --
+    `ensure_pruned_mirror`'s founding leak, one level down, and differential in
+    the same way, since only an arm that looks inside `vendor/.../.git`
+    collects it. `ensure_pruned_mirror` is reused UNCHANGED: it is already
+    generic over (url, sha), so the submodule gets its own cache entry, its own
+    repo lock, and its own `_verify_pruned` post-condition. Do not add a term
+    to `_pack_fingerprint` for this; see HANDOFF.md.
+
+    THE REFLOG EXPIRE IS A LEAK GUARD. `logs/HEAD` and `logs/refs/heads/main`
+    both record `clone: from <host cache path>`, and nothing else removes them
+    -- the config files are clean without it, so a check that greps only those
+    passes with the leak in place. It runs `check=True`.
+
+    Both guards are `check=True` and neither is the last word: `materialize`
+    calls `_refuse_host_mirror_path` over the finished tree, which is what makes
+    "no host path survives" a property re-checked against the artifact rather
+    than an inference from four commands having exited zero.
+
+    THE URL IS PERSISTED, THEN REWRITTEN. A transient `-c submodule.<n>.url=`
+    populates the tree but leaves `git submodule status` reading `-<sha>` --
+    uninitialised -- because `submodule init` skips its registration step when
+    the value is already visible, so `.git/config` never gets it. Preflight
+    reads exactly that character. The value is then rewritten to the
+    `.gitmodules` url, and `origin` removed from the submodule, for the same
+    reason `materialize` removes the superproject's: a host cache path inside
+    the container is both an unresolvable error surface for the agent and a
+    leak of the operator's cache layout.
+
+    That first sentence is stated as the reason for the shape and is NOT
+    independently anchored, which is worth saying rather than leaving for the
+    next reader to discover. Measured 2026-09-01 against this function: with
+    the trailing rewrite in place, a transient `-c` reaches the SAME end state
+    -- the rewrite is itself a `git config` write, so it performs the
+    registration `submodule init` skipped, and `git submodule status` reads a
+    leading space either way. The measurement the sentence comes from was
+    taken with no trailing write. The persisted form is kept because it puts
+    the url git clones from and the url the run tree carries in one place, in
+    that order; it is a legibility choice here, not a behavioural one.
+
+    The value persisted is `url_resolved`, which for a relative `.gitmodules`
+    url is NOT what the blob says. That is fidelity, not invention: measured
+    2026-09-02, a clone with a reachable remote has git itself write the
+    resolved url into `.git/config`. Persisting the raw value instead would
+    leave a tree in which any command that re-derives from `.gitmodules`
+    resolves against the `origin` `materialize` removed and falls back to the
+    superproject's own path fallback -- on the host that is a host path, and
+    inside the container, where the tree is mounted at `/repo`, it is
+    `/sub.git` (measured: a warning, then a clone of a path that does not
+    exist, in both cases). `git submodule sync` re-derives that way and is
+    deliberately not covered; what this removes is the passive path.
+
+    `protocol.file.allow=always` stays TRANSIENT and is REQUIRED in production,
+    not only in tests: git has refused the file transport for submodules since
+    the CVE-2022-39253 hardening, and a local pruned mirror is a file
+    transport. Without it the update exits 1 with `transport 'file' not
+    allowed`.
+
+    THE UPDATE RUNS AT THE PARENT, NEVER WITH `--recursive`. Measured
+    2026-09-02 (M4/M5): one `submodule update --init --recursive` under a
+    transient `-c submodule.<n>.url=` DOES populate every level -- the override
+    propagates through `GIT_CONFIG_PARAMETERS` -- and then `git submodule
+    status --recursive` reads `-` for the level it just populated, because the
+    inner `submodule init` skipped its registration step for the same reason
+    the paragraph above documents one level up, and the inner repository's
+    config never gets the key. Preflight reads exactly that character, so the
+    one-shot form produces a populated tree the gate NO-GOes. Measured also
+    (M14): a single process-wide `-c submodule.<name>.url=` COLLIDES across
+    levels, because submodule names are per-repository and need not be unique
+    -- two levels both declaring `[submodule "dep"]` sent the inner clone at
+    the wrong mirror, loudly here (`not our ref`) and silently where the two
+    same-named submodules are a repository and a fork of it. The per-level
+    form, with `cwd` at the parent's working tree and `sub.local_path` as the
+    argument, has neither problem and reuses this code path exactly.
+
+    The post-condition is the point of the function. An empty submodule
+    directory leaves `git status --porcelain` EMPTY -- byte-identical to a
+    healthy tree -- so a silent failure here reads as a suite that cannot
+    import, on every arm, and is scored as capability. Its existence-and-
+    non-empty half runs IMMEDIATELY after the update and before anything
+    takes `dest/sub.path` as a working directory, so a directory that was
+    never written is a `TaskError` naming the task rather than a
+    `FileNotFoundError` out of `subprocess.run`; the HEAD comparison stays
+    below, where it has a repository to ask. Both halves are required and
+    neither is redundant: M14's residue is a directory holding only `.git`,
+    which satisfies `any(checked.iterdir())`, so the HEAD comparison is what
+    catches a level populated from the wrong mirror.
+
+    A submodule the manifest declared UNNEEDED is skipped here entirely, and
+    the `if not needed: return` above the mirror comprehension is what makes
+    "no pruned mirror is built for it" a property of the code rather than of
+    an empty comprehension. Its url is never read, so an ssh or relative url
+    costs nothing; its directory stays as `git checkout` left it, which is
+    present and empty (measured 2026-09-02, git 2.50.1: `git clean -xfd` does
+    not remove it, `git status --porcelain` reports the tree clean, and `git
+    submodule status` reads `-<sha>`). The refusals still run over the FULL
+    tuple, because two of them -- a strip covering the path, and a reference
+    diff touching it -- are unrelated to whether the directory is populated.
+    """
+    if not subs:
+        return
+    needed = tuple(sub for sub in subs if not sub.declared_unneeded)
+    if not needed:
+        return
+    # `materialize`'s own `_repo_lock` critical section has long exited by the
+    # time this runs (it wraps the clone only), so `ensure_pruned_mirror`'s
+    # acquisitions here are never nested inside it -- which flock would punish
+    # with a same-process deadlock on the same slug.
+    mirrors = {
+        sub.path: ensure_pruned_mirror(sub.url_resolved, sub.sha, cache_root)
+        for sub in needed
+    }
+    _refuse_submodule_conflicts(task, subs, mirrors=mirrors)
+    for sub in needed:
+        key = f"submodule.{sub.name}.url"
+        # `dest` at depth 1, the PARENT's working tree below it, and the tuple
+        # is pre-order so the parent is already populated when its child is
+        # reached. The config key lives in the parent's config -- at depth 2
+        # that is `.git/modules/<outer NAME>/config`, reached through the
+        # `.git` FILE and never by a path this code assembles, because a
+        # module directory is named by the submodule NAME and not its path
+        # (measured 2026-09-02, M19).
+        parent_tree = Path(dest) / sub.parent if sub.parent else Path(dest)
+        _git("config", key, str(mirrors[sub.path]), cwd=parent_tree)
+        _git("-c", "protocol.file.allow=always",
+             "submodule", "update", "--init", "--", sub.local_path,
+             cwd=parent_tree)
+        _git("config", key, sub.url_resolved, cwd=parent_tree)
+
+        # BEFORE the two commands that run with `cwd=dest/sub.path`, and that
+        # order is the whole point. Everything below this guard -- `remote
+        # remove`, `reflog expire`, the HEAD check -- names the submodule
+        # directory as its working directory, and `subprocess.run` against a
+        # cwd that does not exist raises `FileNotFoundError` from the C
+        # library, not `TaskError`. So any residual way of reaching this loop
+        # with no directory (the loader's strip refusal is the one measured
+        # shape, but it is not the only way an `update --init` can write
+        # nothing) used to surface as a bare OSError naming a path, with no
+        # task_id and nothing saying which of a task set's manifests was at
+        # fault. `iterdir()` raises the same way, so the emptiness half has to
+        # move with the existence half rather than stay below.
+        checked = dest / sub.path
+        if not checked.is_dir() or not any(checked.iterdir()):
+            raise TaskError(
+                f"{task.task_id}: submodule {sub.path} is missing or empty "
+                "after initialisation. An empty submodule directory leaves "
+                "`git status --porcelain` clean, so the suite would simply "
+                "fail to collect and every arm would be scored on an "
+                "environment defect."
+            )
+
+        # EVERY remote, by the name GIT gave it -- not the literal "origin",
+        # and not `check=False`. Measured 2026-09-02, git 2.50.1: a clone
+        # ALWAYS gets a remote, so "a submodule git chose not to give a
+        # remote" does not exist; the only way it is not called `origin` is
+        # an operator with `clone.defaultRemoteName` set, and in exactly that
+        # case `git remote remove origin` exits 2 ("error: No such remote:
+        # 'origin'"), the old `check=False` swallowed it, and
+        # `.git/modules/<name>/config` rode into the run tree carrying the
+        # host cache path with `git status --porcelain` clean. So the one
+        # reachable failure of this guard WAS the leak it exists to remove.
+        # Listing and removing instead of refusing fixes that case rather
+        # than stopping the matrix on it. `check=True` on the LISTING too,
+        # and for a narrower reason than "a listing that fails": at
+        # check=False a failed listing returns stdout="", which is
+        # byte-identical to a repository with no remotes, so the loop would
+        # iterate zero times and the guard would report success having done
+        # nothing.
+        for remote in _git("remote", cwd=checked).stdout.splitlines():
+            if remote.strip():
+                _git("remote", "remove", remote.strip(), cwd=checked)
+        # check=True (the default). This is a LEAK GUARD, not tidiness:
+        # measured 2026-09-01, the submodule's `logs/HEAD` AND
+        # `logs/refs/heads/main` each carry `clone: from <host cache path>`
+        # after the two rewrites above -- the pruned mirror publishes
+        # `refs/heads/main`, so the clone creates a local branch and logs the
+        # source twice -- and this expire is the only thing that removes them.
+        # There is a THIRD reflog, `logs/refs/remotes/origin/HEAD`, and the
+        # removal above is what clears it (measured 2026-09-02, git 2.50.1).
+        # `.git/modules/<name>/config` is clean here ONLY BECAUSE that removal
+        # ran: it is the one file the removal exists for, which is why a
+        # config-only check placed after both sees nothing, and why the
+        # removal is no longer allowed to fail quietly.
+        _git("reflog", "expire", "--expire=now", "--all", cwd=checked)
+
+        head = _git("rev-parse", "HEAD", cwd=checked, check=False)
+        if head.returncode != 0 or head.stdout.strip() != sub.sha:
+            raise TaskError(
+                f"{task.task_id}: submodule {sub.path} is not at its gitlink "
+                f"{sub.sha} after initialisation (got "
+                f"{head.stdout.strip() or 'nothing'}). An empty or wrong "
+                "submodule leaves `git status --porcelain` clean, so the suite "
+                "would simply fail to collect and every arm would be scored on "
+                "an environment defect."
+            )
+
+
+#: Chunk size for the run-tree leak scan. Measured 2026-09-02: the largest
+#: single file under a run tree's `.git` across the probe corpus is a 40.3 MB
+#: hardlinked pack (`pytest-10210`), and a whole-file `read_bytes()` peaks the
+#: process at 109 MB for it. Chunking bounds the peak at this constant instead
+#: of at the corpus.
+_LEAK_SCAN_CHUNK = 1 << 20
+
+
+def _file_contains(path: Path, needle: bytes) -> bool:
+    """`needle in path`'s bytes, without reading the whole file into memory.
+
+    The `len(needle) - 1` byte carry-over is the whole reason this is not a
+    loop over `read()`: a needle that straddles a chunk boundary is invisible
+    to a per-chunk test, and the run tree's largest files are exactly the ones
+    that need more than one chunk. Verified at every offset 0..39 against an
+    8-byte chunk before it was written down.
+
+    The empty-needle guard is not defensive decoration. `overlap` would be
+    -1, which is TRUTHY, so the carry-over would evaluate `[-(-1):]` == `[1:]`
+    and keep all but one byte of everything read so far -- the whole file in
+    memory, which is the one property this function exists to avoid. The
+    caller's needle is `<cache_root>/repos` and can never be empty, so the
+    guard is unreachable today; it is here because the failure it prevents is
+    silent growth rather than an exception, and the next caller does not
+    inherit the caller's guarantee.
+    """
+    if not needle:
+        raise ValueError("_file_contains needs a non-empty needle")
+    overlap = len(needle) - 1
+    tail = b""
+    with path.open("rb") as handle:
+        while chunk := handle.read(_LEAK_SCAN_CHUNK):
+            if needle in tail + chunk:
+                return True
+            tail = (tail + chunk)[-overlap:] if overlap else b""
+    return False
+
+
+def _refuse_host_mirror_path(dest: Path, cache_root: Path, task_id: str) -> None:
+    """No file under the run tree's `.git` may name the operator's mirror cache.
+
+    THE POST-CONDITION FOR EVERY LEAK GUARD IN THIS MODULE'S RUN-TREE PATH.
+    `materialize` and `_init_submodules` between them run four scrubs -- two
+    `git remote remove` loops and two `git reflog expire`s -- and every one of
+    them could fail, or miss, in a way `git status --porcelain` renders as a
+    clean tree. Measured 2026-09-02, git 2.50.1: an operator with
+    `clone.defaultRemoteName = upstream` in their global config gets a run
+    tree whose `.git/config` AND `.git/modules/<name>/config` both carry
+    `[remote "upstream"] url = <host cache path>`, with materialization
+    reporting success and the working tree clean. The path is two defects at
+    once: a host path the container cannot resolve (an error surface the agent
+    is scored on) and a publication of the operator's cache layout.
+
+    The needle is `<cache_root>/repos`, NOT `cache_root`, and that is
+    load-bearing: all five `materialize` call sites put run trees UNDERNEATH
+    the cache root (`preflight-tree`, `artifacts`, `oracle-tree`,
+    `grade-tree`, `grade-preflight-tree`), so a whole-cache-root needle is a
+    prefix of the tree's own path. `mirror_path` and `pruned_mirror_path` both
+    land under `repos/` and nothing else does, so one needle covers the
+    superproject's mirror and every submodule's, pruned and unpruned.
+
+    `os.walk` with `onerror`, NOT `Path.rglob`: pathlib's recursive glob
+    SUPPRESSES the PermissionError a directory it cannot list raises, so the
+    leaking files under it are skipped with no exception and no trace
+    (measured -- `rglob('*')` returns the mode-000 directory and nothing
+    inside it, while `os.walk(..., onerror=)` reports errno 13). A "clean"
+    verdict produced by a directory this function never entered is the exact
+    silence it exists to remove, so the WALK raising is as load-bearing as the
+    READ raising. Entries are sorted so the first leak reported is
+    deterministic.
+
+    Bytes, never text: a decode would need `errors="replace"`, and a replaced
+    byte is a match this check would miss. `objects/` is scanned rather than
+    skipped -- packs are compressed and contribute nothing either way, but
+    `objects/info/alternates` is plain text, and while `materialize` checks
+    the superproject's own copy by name, NOTHING checks
+    `.git/modules/<name>/objects/info/alternates`. Measured cost: 0.005-0.013 s
+    across the probe corpus against a `materialize` of 0.29-0.35 s.
+
+    The needle is `os.fsencode`d, not UTF-8-encoded: the bytes git itself
+    wrote into `.git/config` and the reflogs are the filesystem encoding, and
+    on a host where that is not UTF-8 a `.encode()` needle would disagree
+    with the file's bytes and report clean over a real leak -- the exact
+    silent false negative this function exists to remove.
+    """
+    needle = os.fsencode(Path(cache_root) / "repos")
+    base = Path(dest) / ".git"
+
+    def _refuse_walk_error(exc: OSError) -> None:
+        raise TaskError(
+            f"{task_id}: {exc.filename} under the run tree's .git could not "
+            f"be listed ({exc}), so the host-path leak check could not "
+            "complete. A clean verdict here would be a claim this process is "
+            "not in a position to make."
+        )
+
+    for root, dirnames, filenames in os.walk(base, onerror=_refuse_walk_error):
+        dirnames.sort()
+        for name in sorted(filenames):
+            path = Path(root) / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                hit = _file_contains(path, needle)
+            except OSError as exc:
+                raise TaskError(
+                    f"{task_id}: {path} under the run tree's .git could not "
+                    f"be read ({exc}), so the host-path leak check could not "
+                    "complete. A clean verdict here would be a claim this "
+                    "process is not in a position to make."
+                ) from exc
+            if hit:
+                raise TaskError(
+                    f"{task_id}: {path.relative_to(dest)} in the run tree "
+                    f"carries the host mirror path {needle.decode()}. That is "
+                    "a path the container cannot resolve and a publication of "
+                    "the operator's cache layout, and `git status "
+                    "--porcelain` is clean either way -- so nothing "
+                    "downstream would notice. One of materialization's leak "
+                    "guards (`git remote remove`, `git reflog expire`) did "
+                    "not remove it."
+                )
+
+
 def materialize(task: TaskManifest, dest: Path, cache_root: Path) -> str:
     """Build the run's start state on disk and return its commit SHA.
 
@@ -1396,11 +3657,32 @@ def materialize(task: TaskManifest, dest: Path, cache_root: Path) -> str:
     while still removing the future. Pruning here instead would repack the
     whole store per run and break the hardlink.
 
-    `origin` is then removed -- it points at a host path that does not exist
+    Every remote is then removed -- not only one literally named `origin`,
+    because an operator with `clone.defaultRemoteName` set gets a clone whose
+    remote is called something else, and `git remote remove origin` on that
+    machine exits 2. A remote points at a host path that does not exist
     inside the container, which is both a confusing error surface for the
     agent and a host path leaked into the run. The reflog is expired for the
     same reason: the clone records `clone: from <host cache path>` in
     `.git/logs/HEAD`, which now carries the cache layout and `base_sha`.
+    `_refuse_host_mirror_path` is the post-condition over the finished tree
+    that both guards, and their submodule counterparts, are checked against.
+
+    `strip_paths` is applied first and lands in the same setup commit, so the
+    commit's SHA stays a pure function of (base_sha, strip_paths, test half,
+    gitignore_extra) and `start_sha` remains pinnable. A strip that did not
+    move `start_sha` would be a change to what every arm was asked to do that
+    no stored record could distinguish.
+
+    Submodules are initialised LAST, after `start_sha` is settled and compared
+    against its pin, and each from its own PRUNED mirror rather than from the
+    url `.gitmodules` declares (spec section 5.1; see `_init_submodules`). The
+    ordering is the guarantee, not an observation about what `git add -A`
+    stages: the tree `start_sha` is computed over has never seen a submodule
+    checkout, so initialising cannot move it. Deriving here rather than through
+    `task_submodules` reuses the pruned mirror this function already holds --
+    it carries `base_sha`'s history, so both reads answer from it and no second
+    lock is taken.
     """
     dest = Path(dest)
     if dest.exists():
@@ -1415,8 +3697,25 @@ def materialize(task: TaskManifest, dest: Path, cache_root: Path) -> str:
     with _repo_lock(task.repo_url, cache_root):
         _git("clone", "--local", "--no-checkout", str(mirror), str(dest))
     _git("checkout", "--detach", task.base_sha, cwd=dest)
-    _git("remote", "remove", "origin", cwd=dest, check=False)
-    _git("reflog", "expire", "--expire=now", "--all", cwd=dest, check=False)
+    # Same shape as `_init_submodules`, one level up, and for the same
+    # measured reason (2026-09-02, git 2.50.1): under an operator's
+    # `clone.defaultRemoteName` the remote is not called `origin`,
+    # `git remote remove origin` exits 2, and `check=False` used to let
+    # `.git/config` reach the agent carrying the host cache path.
+    for remote in _git("remote", cwd=dest).stdout.splitlines():
+        if remote.strip():
+            _git("remote", "remove", remote.strip(), cwd=dest)
+    # `check=True` (the default) here too. No failure shape was found for
+    # this call -- it runs in a repository created one statement ago -- but
+    # a leak guard that is allowed to fail quietly is the defect this whole
+    # item is about, and raising is affordable for the same reason the
+    # alternates check below gives: `materialize` runs before the container,
+    # so it costs setup time and zero tokens, and `run_matrix` catches per
+    # cell. NOTE the ordering: the setup commit further down appends to
+    # `.git/logs/HEAD` AFTER this expire, so that file is non-empty in the
+    # finished tree -- non-empty and needle-free, which is what the tests
+    # assert rather than a size of zero.
+    _git("reflog", "expire", "--expire=now", "--all", cwd=dest)
 
     # Every other check in the object-leak path is a check on the CACHE. This
     # one is on the artifact the agent actually receives, and it is the only
@@ -1444,7 +3743,13 @@ def materialize(task: TaskManifest, dest: Path, cache_root: Path) -> str:
             "resolve. The pruned mirror it was cloned from needs --dissociate."
         )
 
-    staged = False
+    # FIRST, before the test half and before `gitignore_extra`. The loader
+    # refuses a strip that covers either half of the reference, so nothing the
+    # test patch writes can land under a stripped prefix; `.gitignore` is the
+    # only path a later step can legitimately re-create there, and running the
+    # strip first is what makes that deterministic rather than an order the
+    # reader has to infer.
+    staged = _strip_paths_from_tree(dest, task.strip_paths, task.task_id)
     if task.test_diff.strip():
         patch = dest / ".bakeoff-test.patch"
         patch.write_text(task.test_diff)
@@ -1482,4 +3787,19 @@ def materialize(task: TaskManifest, dest: Path, cache_root: Path) -> str:
             "-- a re-cut patch, an edited manifest, or a different git. Every "
             "record written against the old SHA describes a different task."
         )
+    # LAST. `start_sha` is computed from a tree that has never seen a submodule
+    # checkout, which is what makes "initialising cannot move the pin" a
+    # property of the ordering rather than a coincidence about what `git add -A`
+    # happens to stage. Failing fast on a moved start state also avoids paying a
+    # clone per submodule for a task that is already refused. Measured: `git
+    # clean -xfd` above does NOT wipe an initialised submodule (that needs
+    # `-ffd`), so the order is safe in the other direction too.
+    _init_submodules(task, dest, derive_submodules(task, mirror, cache_root),
+                     cache_root)
+    # AFTER `_init_submodules`, which is the last thing that writes into
+    # `.git`, and in `materialize` rather than inside it: `_init_submodules`
+    # returns early for a task with no submodules (and, since item 2, for one
+    # whose submodules are all declared unneeded), and the superproject's own
+    # two guards ran long before it was called.
+    _refuse_host_mirror_path(dest, cache_root, task.task_id)
     return start_sha

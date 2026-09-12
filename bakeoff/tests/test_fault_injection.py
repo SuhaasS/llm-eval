@@ -105,9 +105,13 @@ class FakeContainer:
     """Stands in for RunContainer. `fail_snapshot_after` models a disk
     filling up mid-run: the first N snapshots succeed, the next raises."""
 
-    def __init__(self, fail_snapshot_after: int | None = None) -> None:
+    def __init__(self, fail_snapshot_after: int | None = None,
+                 states: dict[str, str] | None = None) -> None:
         self.fail_snapshot_after = fail_snapshot_after
         self.snapshots = 0
+        # `{}` and not `None`: `{}` is the measurement "read, nothing dirty",
+        # which is a real container's answer on a tree with no submodule.
+        self.states = {} if states is None else states
 
     def __enter__(self):
         return self
@@ -147,6 +151,13 @@ class FakeContainer:
         ):
             raise OSError("No space left on device")
         return (f"diff-{self.snapshots}", [f"file{self.snapshots}.py"])
+
+    def submodule_states(self) -> dict[str, str]:
+        # A double MISSING this method does not fail loudly --
+        # `SupportsSnapshot` is a Protocol and is not runtime-checked, so the
+        # `AttributeError` lands inside `_capture`'s containment and the test
+        # goes on passing with a spurious `recorder.errors` entry.
+        return self.states
 
 
 class FakeRunner:
@@ -2054,6 +2065,28 @@ def test_the_minimal_record_keeps_the_submission_diff(task, tmp_path, monkeypatc
     assert record.artifacts.final_diff is not None
 
 
+def test_the_minimal_record_carries_the_submodule_state_too(
+    task, tmp_path, monkeypatch
+):
+    """`_minimal_record`'s own rule: every field it defaults is a claim it
+    fabricates. The rescue path carries real checkpoints, so it can carry
+    this honestly -- and defaulting it to `None` on a run whose capture DID
+    read a dirty submodule would hand the offline grader "nobody looked" and
+    let the row grade as `EMPTY_PATCH`, which is exactly the accusation the
+    field exists to stop."""
+    import bakeoff.runner as runner_module
+
+    monkeypatch.setattr(
+        runner_module, "assemble_record", lambda **_k: (_ for _ in ()).throw(
+            ValueError("nope")
+        )
+    )
+    box = FakeContainer(states={"vendor/libdep": "S..U"})
+    record = _fake_run(monkeypatch, task, tmp_path, container=box)
+
+    assert record.submodules_dirty_at_exit == {"vendor/libdep": "S..U"}
+
+
 def test_the_minimal_record_does_not_manufacture_a_safety_claim(
     task, tmp_path, monkeypatch
 ):
@@ -2215,3 +2248,21 @@ def test_invocation_stamp_is_threaded_through_execute_run(task, tmp_path, monkey
     )
     assert record.collection_id == "coll-1"
     assert record.invocation_stamp == "inv-9"
+
+
+def test_two_runs_under_one_artifacts_root_get_different_config_dirs(
+    task, tmp_path, monkeypatch
+):
+    """The run-level-retry shape at the one mounted path nothing checks.
+    `CLAUDE_CONFIG_DIR` was `artifacts_root/claude-config`, rmtree'd and
+    re-created per run -- and the Docker VM serves a replaced host inode from
+    its cache (measured 2026-09-02, empty every other container). Unlike
+    `/repo` there is no `_assert_repo_mounted` behind it: the agent writes its
+    transcript into the cached inode, this directory stays empty, transcript
+    discovery globs it and finds nothing, and the run is recorded with zero
+    turns, zero tokens and zero cost after the tokens are spent."""
+    log = EventLog(tmp_path / "log")
+    _fake_run(monkeypatch, task, tmp_path, event_log=log, sample_index=0)
+    _fake_run(monkeypatch, task, tmp_path, event_log=log, sample_index=1)
+
+    assert len(list((tmp_path / "artifacts" / "claude-config").iterdir())) == 2

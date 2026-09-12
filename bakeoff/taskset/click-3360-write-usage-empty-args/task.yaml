@@ -68,10 +68,49 @@ tests:
   # What splits reference.diff into the oracle the agent starts with and the
   # fix it is graded against.
   paths: ["tests/"]
+  # Which runner adapter reads this suite: pytest (the default), vitest or
+  # jest. It decides how "the tests failed" is told from "the environment is
+  # broken" -- pytest answers with its exit code, and the node frameworks
+  # cannot: measured 2026-09-01, vitest 3.2.7 and jest 30.5.0 both exit 1 for a
+  # failing test, an unresolvable import, a syntax error and a broken config
+  # alike, so their adapter reads a JSON report instead.
+  #
+  # framework: pytest
+  #
+  # A vitest task instead declares, and its f2p ids carry the reporter's
+  # fullName after `::` rather than a pytest node path:
+  #
+  #   framework: vitest
+  #   runner: ["/node_modules/.bin/vitest", "run", "--no-cache"]
+  #   f2p: ["tests/formatting.test.ts::HelpFormatter writes usage with no args"]
+  #
+  #   # The fullName must be unique inside its own file: a node id carries no
+  #   # positional index, so two identically titled tests in one file are one
+  #   # id -- `-t` runs both and deselects both -- and preflight refuses a
+  #   # manifest that declares it.
+  #
+  # and, under `image:`, the node base's major instead of image.python:
+  #
+  #   node: "22"
+  #
   # `-p no:cacheprovider` so the suite writes no .pytest_cache into the tree:
   # section 5.6 stages everything, so anything the test run drops lands in
   # every submission diff.
   runner: ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider"]
+  # An addopts-bypass runner -- one carrying `--override-ini=addopts=`, which
+  # throws away this repo's own pyproject.toml/pytest.ini addopts rather than
+  # satisfying them -- does NOT excuse `image.pip` from installing whatever
+  # those addopts name. Preflight's bare-runner probe (fix 2) reads the
+  # repo's OWN config with none of this argv's extra arguments, exactly as an
+  # agent typing a bare `pytest` would, and refuses a task whose gated runner
+  # passes only because it bypassed a plugin requirement the image never
+  # installed (measured on bidict-389-putall-rollback-clean:
+  # --numprocesses=auto / pytest-xdist).
+  #
+  # `-c /dev/null` is NOT a safe alternative bypass -- measured 2026-09-02 on
+  # jab/bidict, it retargets pytest's rootdir to /dev and every reported node
+  # id no longer matches the declared f2p ids, so the gate reports "declared
+  # f2p tests did not fail at the start state" for tests that, in fact, did.
   # Measured, not guessed: these are exactly the tests that fail at the start
   # state and pass after the reference fix. They assert rendered output rather
   # than any internal name, so a different-but-correct fix passes -- which is
@@ -98,7 +137,131 @@ tests:
   # lands in the fix half exactly as before.
   allow_extra_paths: ["CHANGES.rst"]
 
+# strip_paths: NOT USED by this task -- pallets/click carries no agent file
+# and no vendored tree at this base_sha. Shown because this manifest is the
+# documentation for the key.
+#
+# Top-level, beside gitignore_extra, because like gitignore_extra it is a
+# modification the harness makes rather than a statement about upstream --
+# `repo:` holds only what can be checked against GitHub. The listed paths are
+# removed from the index AND the worktree in the same fixed-identity setup
+# commit that applies the test half, so declaring one MOVES start_sha (re-pin
+# it, and bump task_version).
+#
+#   strip_paths: ["CLAUDE.md", "AGENTS.md", ".claude"]
+#
+# Files or directories, matched by path component (".claude" covers
+# ".claude/settings.json" and not ".claudeignore"). Refused at load: an
+# absolute path, "..", a glob, "." and ".git". Refused when the start state is
+# built: a path no TRACKED file is at or under -- a typo strips nothing, and
+# nothing downstream would say so. That also means a file the PR creates
+# cannot be stripped, since it is not there at base_sha to remove.
+#
+# A path the reference diff also touches must be listed in
+# tests.allow_extra_paths as well, which keeps it out of both halves. Strip
+# does not imply exclusion: silently dropping the chunk would make
+# solution_diff something other than the merged PR.
+#
+# Symlinks: list the link AND its target -- preflight does NOT catch a
+# target-only strip. Stripping only the target leaves a dangling link the
+# agent's `ls` still shows: the strip probe checks only the paths THIS task
+# declared, and the context-file probe that would otherwise flag a leftover
+# CLAUDE.md/AGENTS.md is `-e` only, which calls a dangling link absent. The
+# gate passes clean on the mistake, so list both names.
+#
+# Section 6.4 confound, to be recorded here by any task that uses it: the
+# humans who wrote the PR had the stripped file.
+
+# submodules_unneeded: NOT USED by this task -- pallets/click carries no
+# submodule at this base_sha. Shown because this manifest is the
+# documentation for the key.
+#
+# Top-level, beside strip_paths and gitignore_extra, for the same reason:
+# it is a modification the harness makes rather than a statement about
+# upstream, and `repo:` holds only what can be checked against GitHub. Its
+# truth is a property of THIS TASK's suite, not of the repository.
+#
+#   submodules_unneeded: ["sqlglot-integration-tests"]
+#
+# Each entry is a submodule path at base_sha -- a path, not a
+# [submodule "NAME"] name, because git does not require the two to match and
+# only the path comes from `git ls-tree`. The gitlink stays in the index and
+# the tree exactly as it is; the directory is created empty by the checkout
+# and by `git archive`, is never populated, its .gitmodules url is never
+# checked -- nor does a readable .gitmodules have to exist for it at all --
+# and no mirror is built for it. Declaring it does NOT move start_sha:
+# nothing here takes part in the setup commit, and submodules are initialised
+# after start_sha is settled.
+#
+# Each entry is a submodule path AT DEPTH 1 ONLY -- a submodule of the
+# superproject. A level-2 path (`vendor/lib/vendor/deep`) is refused at load,
+# and the reason is the run-time reader rather than the gate:
+# container.submodule_states enumerates gitlinks with `git ls-files -s -z` at
+# the superproject root, and git does not descend through a gitlink, so a
+# level-2 gitlink inside a POPULATED level-1 submodule is never enumerated and
+# never probed (the level-1 path that IS enumerated carries a .git and is
+# skipped by design, and --porcelain=v2 is silent too). What an agent wrote
+# into that empty directory would be recorded nowhere while submodules_dirty
+# read `{}` -- the positive claim that the tree was read and is clean -- and
+# the offline grader would stamp EMPTY_PATCH, `resolved: False`, on a
+# submission that really edited files.
+#
+# Paths are always superproject-relative, never the level-local one an inner
+# .gitmodules declares. DECLARING A PARENT IMPLICITLY DECLINES ITS CHILDREN,
+# because the harness does not descend into a submodule it was told not to
+# populate; so declaring both a parent and one of its children is refused, and
+# the refusal names the child.
+#
+# What it does NOT relax: a strip_paths entry covering the submodule is
+# still refused (the strip removes the gitlink and moves start_sha), and a
+# reference diff touching the submodule path -- either half -- is still
+# refused (`git add -A` stages nothing for a gitlink path in any state, so a
+# fix living there is ungradable by construction). A submission that moves
+# the gitlink is still refused by the offline grader.
+#
+# Refused at load: an absolute path, "..", ".", ".git", a glob, a repeat.
+# Refused when the mirror exists: a path the tree at base_sha has no gitlink
+# at -- a typo must not silently declare nothing -- and a path that IS a
+# gitlink but at depth 2 or below, which is refused by the level that finds
+# it, so the message names the depth and the parent rather than calling a
+# real path a typo.
+#
+# What the gate CHECKS, and it is narrower than the key's name: the
+# directory exists, is EMPTY and `git submodule status` reads `-`; the
+# declared f2p ids are red before the reference fix and green after it; and
+# the p2p sweep is green -- all with the directory empty. It re-reads
+# emptiness after the suite, because git does not descend into a gitlink
+# path and `git status --porcelain` cannot see a file written in there. What
+# it CANNOT check is that no test anywhere needed the submodule: a suite
+# that guards on its presence silently collects fewer tests, and no
+# collected-test count is recorded.
+#
+# The submission diff carries NOTHING for the path -- but only because
+# `container.snapshot_diff` seeds its scratch index from the start state
+# first. Without that seed an uninitialised gitlink reads as a DELETION
+# against an index `git add -A` built from a worktree scan, and the offline
+# grader refuses every such submission as submodule_gitlink_ungradable
+# (measured 2026-09-02: 237 bytes on `tobymao/sqlglot` at start_sha
+# 4b61ee5603e7..., clean tree -- this repository, pallets/click, has no
+# submodule at its base_sha, so the figure cannot be reproduced here).
+#
+# Section 6.4 confound, to be recorded here by any task that uses it: the
+# humans who wrote the PR had the submodule.
+
 image:
+  # python: "3.12"
+  #
+  # Omitted, which means the default -- and the default is what this repository
+  # needs. Declare it only when the suite requires another interpreter, and
+  # QUOTE it: YAML reads an unquoted 3.10 as the float 3.1, so the version that
+  # reaches the build would not be the one written here. Accepted values are
+  # "3.11", "3.12" and "3.13" -- the three the base image has been built at
+  # (verified 2026-09-01; pytest 9.1.1 and Claude Code 2.1.220 install on all
+  # three). Every ARM of a task runs the same base, so this is a property of
+  # the task and not a section 5.4 divergence; preflight reads `python --version`
+  # back out of the container and refuses a mismatch, because the base tag is
+  # local and mutable and a stale one leaves every other gate green.
+  #
   # `less` is a TEST dependency of this repository and the base image ships no
   # pager. tests/test_utils.py parametrizes `test_echo_via_pager` over
   # ["cat", "less", ...]; with no `less` on PATH the pager path closes the
@@ -120,7 +283,87 @@ image:
   # EDITABLE, and it has to be. A plain `pip install .` resolves imports to
   # site-packages, so nothing the agent writes to /repo takes effect and every
   # arm fails identically -- preflight's green-after check is what catches it.
+  #
+  # And nothing this step writes into /repo survives it: at run time the
+  # materialized tree is bind-mounted over the image's scaffold copy, so a
+  # file the build generated is simply absent from every command the agent,
+  # the gate, the oracle and the grader run. Measured 2026-09-02 -- click's
+  # flit_core backend writes nothing into the tree (the image's /repo and the
+  # build context agree file for file, 149 each), which is why this worked
+  # example never hit it and a setuptools_scm repo does. See HARVESTING.md,
+  # "The image".
   build: ["pip install -e ."]
+  # env: NOT USED by this task -- click's suite is example-based, so nothing
+  # here needs pinning. Shown because this manifest is the documentation for
+  # the key.
+  #
+  # Baked into the task image as Dockerfile ENV lines, AFTER every build step
+  # (so a value declared for the test runner cannot change how the image was
+  # assembled) and therefore in the finished image's config. Docker merges an
+  # image's environment into every exec with the exec's own keys winning, so
+  # these reach preflight's runner, the oracle's, the grader's, the agent's
+  # `claude` and every command the agent invents -- which is the point.
+  # `tests.runner` could not do that: the agent is never told the runner argv,
+  # it gets `prompt` and nothing else.
+  #
+  #   env:
+  #     CI: "1"
+  #     HYPOTHESIS_STORAGE_DIRECTORY: "/tmp/bakeoff-hypothesis"
+  #     TZ: "America/New_York"
+  #
+  # An ALLOWLIST of keys, not a free map: CI, HYPOTHESIS_STORAGE_DIRECTORY and
+  # TZ, and nothing else. An unrestricted map would reopen the hole the
+  # harness's env allowlist exists to close -- CLAUDE_CODE_USE_BEDROCK here
+  # would make the CLI ignore ANTHROPIC_BASE_URL, bypass the proxy, and leave
+  # the mandatory wire log empty with the run still looking normal.
+  #
+  # TZ is for a suite that pins a zone (date/time libraries do this
+  # routinely, e.g. moment/luxon asserting against America/New_York). The
+  # value must be an IANA zone name or UTC/Etc/GMT+N -- letters, digits, `_`
+  # `+` `-` `/` only, refused otherwise, because it is consumed by libc's
+  # tzset rather than by this harness: a leading `:` OR `/` makes glibc read
+  # the rest as a FILE PATH instead of a zone name, which the newline/quote/`$`
+  # blacklist below does not catch on its own. A task pinning TZ scores every
+  # arm on that zone's behaviour -- same class of section 6.4 confound as CI.
+  #
+  # CI=1 is what makes a hypothesis suite deterministic: hypothesis registers
+  # a built-in `ci` profile (derandomize=True, database=None, deadline=None)
+  # and auto-loads it on the presence of that variable. Measured 2026-09-01
+  # against hypothesis 6.167.1: ten fresh runs of one property test gave
+  # `0 0 0 0 1 1 1 1 0 0`, and six under CI=1 gave `1 1 1 1 1 1`. There is no
+  # HYPOTHESIS_PROFILE environment variable to use instead.
+  #
+  # CI is a hypothesis lever with NO NODE ANALOGUE. Measured 2026-09-02:
+  # fast-check reads no environment variable at all in either 3.23.2 or
+  # 2.25.0, so a node property suite (fast-check, @fast-check/*, jest-fuzz,
+  # jsverify) is refused by preflight's own scan rather than levered by this
+  # key -- see round-2 item 12 and HARVESTING.md's "A node p2p-BEFORE sweep"
+  # bullet. Adding NODE_OPTIONS to the image.env allowlist would not fix it
+  # either: measured, the one lever that would work (a NODE_OPTIONS preload
+  # calling fc.configureGlobal) is defeated by jest's module registry, and it
+  # would also reach the agent's own `claude` process. This manifest is the
+  # documentation for the key, so a reader arriving here must not conclude it
+  # covers node.
+  #
+  # HYPOTHESIS_STORAGE_DIRECTORY must be absolute and outside /repo -- refused
+  # at load otherwise. Hypothesis's storage root is fixed to the cwd at import
+  # time, so without it the `constants/` cache lands in the tree the section
+  # 5.6 submission diff is taken against.
+  #
+  # Values may not carry a newline, a carriage return, a quote, a backslash
+  # or a `$`: the last one is EXPANDED by the builder, which would make the
+  # value a property of the build rather than of the manifest.
+  #
+  # Declaring env does NOT move start_sha -- it is under `image:`, which is
+  # not an input to the start state. It does move the image id, and therefore
+  # `Versions.container_image_digest` on every record, which is where a reader
+  # finds it: the record deliberately carries no copy of this map, because a
+  # manifest field published under a record's provenance would be
+  # configuration reported as observation.
+  #
+  # Section 6.4 confound, to be recorded here by any task that uses it: `CI`
+  # is a general-purpose signal and the repository's own code may branch on
+  # it, so the arms are scored on that repo's CI-mode suite.
 
 # grading: WAIVED -- all three keys, deliberately, and recorded here because
 # HARVESTING.md requires a task to declare a `grading:` block or to say why
@@ -146,8 +389,41 @@ image:
 budget:
   # Section 5.4 placeholders. Real caps come from the section 3.5 calibration
   # pilot's slowest-converging model, not from the incumbent.
+  # All three keys are positive integers and are refused at load by name
+  # otherwise -- a quoted "40", a floated 40.0, `true`, `false`, `null`, 0
+  # or a negative each raise a TaskError naming this file and the key.
+  # QUOTE nothing here: unlike image.python, which must be quoted because
+  # YAML reads an unquoted 3.10 as the float 3.1, a quoted number in this
+  # block is refused rather than coerced.
   max_turns: 40
   wall_clock_timeout_s: 900
+  # suite_timeout_s: NOT USED by this task -- click's suite runs in 1.4 s, so
+  # the 600 s default is 400x the headroom it needs. Shown because this
+  # manifest is the documentation for the key.
+  #
+  # It is the coreutils `timeout` bound on every command preflight, the
+  # oracle and the offline grader run inside the container: each suite
+  # invocation AND each declared grading.* argv. It does NOT bound the agent,
+  # whose own suite runs happen inside wall_clock_timeout_s.
+  #
+  #   suite_timeout_s: 1800
+  #
+  # A positive integer, and it may not exceed wall_clock_timeout_s -- the
+  # agent re-runs this suite inside that budget, so a longer one describes a
+  # task no arm could verify even once. That comparison runs only after all
+  # three keys above have been validated, so a bad wall_clock_timeout_s is
+  # refused as itself rather than surfacing here as this key exceeding it.
+  # Raising it multiplies the gate's wall cost: preflight runs the suite
+  # five times (four when tests.p2p is declared) plus once per declared
+  # grading.* argv plus the bare pytest collection the gate makes on every
+  # pytest task -- 9x worst case on a pytest task (8x on a node one) -- all
+  # before the proxy starts and inside the same one-hour SSO session the
+  # matrix needs.
+  #
+  # Size it from bounded_run_durations_s in the cached verdict
+  # (<cache>/preflight/<task_id>.json), which is what the gate itself
+  # observed in this image -- not from a `time docker run` on the host,
+  # which measures a different environment than the one the bound kills in.
 
 provenance:
   repo: pallets/click

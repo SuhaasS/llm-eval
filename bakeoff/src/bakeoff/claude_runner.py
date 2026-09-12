@@ -149,7 +149,17 @@ def build_command(config: ClaudeCodeConfig) -> list[str]:
 
 
 def _eval_env(config: ClaudeCodeConfig) -> dict[str, str]:
-    """The variables the harness sets deliberately."""
+    """The variables the harness sets deliberately.
+
+    A key added here CONDITIONALLY -- emitted only when some config field is
+    set, the way `ANTHROPIC_CUSTOM_HEADERS` is -- must also be forced by
+    `pinned_env_keys()`'s sentinel config below. That function derives its set
+    by calling this one, so a key absent under the sentinel is a key
+    `tasks._env_map` will happily let a task image set, and the agent's exec
+    then silently overrides it: preflight and the grader see one environment
+    and the agent sees another. The disjointness test cannot catch it, because
+    the key is missing from the set the test compares against.
+    """
     extra = (
         {"ANTHROPIC_CUSTOM_HEADERS": config.custom_headers}
         if config.custom_headers
@@ -191,6 +201,63 @@ def container_env(config: ClaudeCodeConfig) -> dict[str, str]:
     which decides where the agent writes state.
     """
     return _eval_env(config)
+
+
+#: The base image's own ENV, and the one member of `pinned_env_keys` that
+#: nothing in this process can derive -- it is set in
+#: docker/eval-agent.Dockerfile, not by `_eval_env`. Listed here so the
+#: refusal in tasks.py has one source for the whole set.
+#:
+#: CPython invalidates a .pyc on (source mtime in whole seconds, source size)
+#: and both halves are ordinary here, so a task image that turned this off
+#: would feed section 3.3's self-correction loop the code the agent already
+#: replaced. Measured 2026-08-13 in the eval image, and it made
+#: verify_logger.py fail on 2 of 3 consecutive runs.
+_BASE_IMAGE_ENV = frozenset({"PYTHONDONTWRITEBYTECODE"})
+
+
+def pinned_env_keys() -> frozenset[str]:
+    """Every environment key the harness itself decides. `tasks.py` refuses these.
+
+    Docker MERGES an exec's environment into the image's, with the exec's keys
+    winning (measured 2026-09-01, Docker 29.5.2). So a task image declaring a
+    key this function names would be overridden on the AGENT's process --
+    which alone gets `container_env` -- while still applying to preflight's
+    and the grader's execs, which pass no env. That is two environments for
+    one task, and nothing in the record would say which one produced a result.
+
+    DERIVED from `_eval_env` and `PASSTHROUGH_ENV` rather than hand-listed,
+    for `_GRADING_KEYS`' reason: a copy goes stale the first time a key is
+    added, and the failure of a stale list is the silent one.
+
+    The sentinel matters. `_eval_env` emits ANTHROPIC_CUSTOM_HEADERS only when
+    `custom_headers` is truthy and the dataclass default is "", so a default
+    config would leave the set missing exactly the key that carries the run id
+    -- the one whose loss makes every call unattributed.
+
+    TZ is the one PASSTHROUGH_ENV member carved back out, and it is a
+    carve-out rather than a hole in the derivation: PATH and HOME stay pinned
+    because `container_env` omitting them means the IMAGE's declared value
+    would apply unopposed -- a task-declared PATH would stop `claude`
+    resolving, which is exactly the "harness sets it" argument this function
+    exists to enforce. TZ is not that. `container_env`/`_eval_env` never emit
+    it either (measured beside PATH and HOME), so an image-declared TZ is
+    equally unopposed for every process that touches this image -- preflight,
+    the oracle, the grader AND the agent -- which is what `_IMAGE_ENV_ALLOWED`
+    now grants it for. PASSTHROUGH_ENV still forwards the HOST's TZ into
+    `build_env` for `HostBackend`, but that path runs no task image at all,
+    so nothing there collides with what a manifest declares.
+    """
+    sentinel = ClaudeCodeConfig(
+        model="", base_url="", auth_token="", settings_path="",
+        config_dir="", max_turns=0, wall_clock_timeout_s=0,
+        custom_headers="X-Bakeoff-Run-Id: sentinel",
+    )
+    return (
+        frozenset(_eval_env(sentinel))
+        | (frozenset(PASSTHROUGH_ENV) - {"TZ"})
+        | _BASE_IMAGE_ENV
+    )
 
 
 def config_digest(config: ClaudeCodeConfig) -> str:

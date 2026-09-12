@@ -282,7 +282,7 @@ from typing import Any
 # changed meaning at this version and the log has no update API. Read a
 # pre-3.8.0 `collection_id` as an invocation, not as an episode.
 #
-# 3.9.0 adds `Versions.provider_route`, `upstream_providers`,
+# 3.9.0 (provider lineage) adds `Versions.provider_route`, `upstream_providers`,
 # `terminal_native_finish_reason` and `cost_usd_provider` for the OpenRouter
 # route (spec 2026-09-08 §4). All four default to "not observed": "" / None.
 # Every earlier record is a bedrock record, but the empty `provider_route` on
@@ -302,7 +302,80 @@ from typing import Any
 # `cost_usd_provider` is the provider's own figure summed over returning
 # calls, None if any returning call lacked it, beside the book's `cost_usd`;
 # the gap is reported, never reconciled.
-SCHEMA_VERSION = "3.9.0"
+#
+# 3.9.0 (task-set lineage) is the version at which `artifacts.final_diff` and every
+# `Checkpoint.diff` stopped asserting deletions that never happened.
+# `container.snapshot_diff` stages into a scratch index, and before this
+# version that index was built by `git add -A` alone -- which skips a file that
+# is tracked at the start state but also matches `.gitignore`, and never
+# descends into a gitlink path. Both absences read as DELETIONS against
+# `base_sha`. Measured 2026-09-02: `eemeli/yaml` carries 15 such tracked-but-
+# ignored files (`.editorconfig`, `.github/workflows/*`, `.gitignore` and
+# `.gitmodules` among them) and `bidict` 1 (`.coveragerc`), so a pre-3.9.0
+# record of either task asserts deletions the agent never made -- and the
+# offline grader APPLIES that diff, so the ladder really did delete them in the
+# grading tree before running the suite. An uninitialised submodule directory
+# (`submodules_unneeded`) produced the same shape as a `deleted file mode
+# 160000` chunk, which `grader._gitlinks_touched` refuses outright. No field is
+# added and none is removed; an existing field changed what it asserts, which
+# is why the constant moved on that lineage. Measured 2026-09-02: 18 event logs under
+# `~/.cache/bakeoff` hold four task_ids -- click-3360 (41 records, 0
+# tracked-but-ignored files at its `base_sha`, clean) and three trucking tasks
+# (98 records). ONE of those carries the tracked-but-ignored phantom:
+# `trucking-dry3/runs/71212309ce6538ea.json` (trucking-2-stale-job-reaper,
+# schema 3.8.0) has 2,902 `deleted file mode` chunks at turn 1 with
+# `destructive_events: []`, matching the 2,902 files tracked under
+# `lib/python3.12/site-packages/` at `base_sha` 66609e41 while `.gitignore`
+# names `lib/` (the two sibling shas track 0 such files). It was graded
+# (`grades.jsonl`, `resolved: False`, `GRADER_VERSION 2`), so the ladder
+# applied those 2,902 deletions in the grading tree before running the suite.
+# Pre-3.9.0 records are readable only with that in hand.
+#
+# 3.10.0 adds `Checkpoint.submodules_dirty`, `RunRecord.
+# submodules_dirty_at_exit` and the marker `SUBMODULE_UNINITIALISED_CONTENT`
+# they can carry -- what a submission diff cannot say. Measured 2026-09-02
+# (git 2.50.1) through `container.snapshot_diff`'s own command sequence: `git
+# add -A` stages ZERO BYTES for an uncommitted edit, for an untracked file and
+# for an `rm` of tracked content inside an INITIALISED submodule, and zero for
+# content inside an UNINITIALISED one, while a commit inside one stages 245
+# bytes and a removed gitlink directory 199 per path. So a run that edited a
+# submodule was byte-identical to one that changed nothing, and the offline
+# grader stamped `EMPTY_PATCH` -- a `GradeFailure`, hence `resolved: False`,
+# an accusation -- on it. The bump is what keeps an ABSENT field on a 3.9.0
+# record from reading as `{}`: absent means nobody looked, on exactly the
+# records where looking was impossible, and `{}` is the measurement "read,
+# nothing dirty". A 3.9.0 reader has neither the fields nor the marker.
+#
+# 3.11.0 adds no field of its own. It exists because TWO lineages both minted a
+# 3.9.0, and a version is worthless the moment one string names two schemas.
+# The provider lineage's 3.9.0 added `Versions.provider_route`,
+# `upstream_providers`, `terminal_native_finish_reason` and `cost_usd_provider`;
+# the task-set lineage's added no field at all and instead changed what
+# `artifacts.final_diff` and `Checkpoint.diff` assert, then its 3.10.0 added
+# `Checkpoint.submodules_dirty` and `RunRecord.submodules_dirty_at_exit`. A
+# 3.11.0 record carries all of it. Both paragraphs are kept above under their
+# original numbers, because the records they describe were written and the log
+# has no update API.
+#
+# Telling the two apart costs a key lookup, not a guess: every stored 3.9.0
+# record came from the provider lineage, so `versions.provider_route` is
+# PRESENT on all of them -- measured 2026-09-11, 11 records in five event logs
+# under `~/.cache/bakeoff`, of which the five under `eventlog-openrouter-*`
+# minus the offline pair are the live ones. Present-and-empty is two of those
+# five (`eventlog-openrouter-offline-check`, written before the field was
+# stamped), so it is the KEY that discriminates and never its value. A 3.9.0
+# record with no `versions.provider_route` key at all would be a task-set
+# lineage record; none exists in the store, and the task-set lineage's own
+# 3.9.0 claim -- no phantom deletions in the diff -- does not hold for any
+# record that lacks the key. Read a keyless 3.9.0, should one ever surface,
+# as pre-provider-route, and read every 3.10.0 as task-set lineage only: the
+# provider lineage never minted one.
+#
+# Neither lineage's defaults change here. `provider_route` stays "",
+# `upstream_providers` / `terminal_native_finish_reason` / `cost_usd_provider`
+# stay None, and `submodules_dirty` / `submodules_dirty_at_exit` stay absent-
+# means-nobody-looked rather than `{}`.
+SCHEMA_VERSION = "3.11.0"
 
 
 class Outcome(str, Enum):
@@ -481,6 +554,20 @@ class TestResult:
     stdout_ref: str | None = None
 
 
+#: What `Checkpoint.submodules_dirty` records for a gitlink directory that git
+#: will not describe: uninitialised, and holding content anyway.
+#:
+#: ONE CHARACTER, and deliberately not a four-character `S...` shape. git's own
+#: sub-state is always exactly four characters beginning with `S`, and
+#: `container._parse_status_v2` files nothing else -- so a reader can always
+#: tell which of the two readers spoke, and `grader._submodule_edits`'
+#: `len(state) == 4` guard stays a statement about what GIT said. Writing
+#: `"S..U"` here would forge a verdict git never issued, which is the
+#: configuration-reported-as-observation family; `?` borrows git's own
+#: porcelain vocabulary for untracked, which is exactly what this is.
+SUBMODULE_UNINITIALISED_CONTENT = "?"
+
+
 @dataclass(frozen=True)
 class Checkpoint:
     turn: int
@@ -489,6 +576,24 @@ class Checkpoint:
     elapsed_ms: int
     tests_pass: bool | None = None
     per_test: list[TestResult] = field(default_factory=list)
+    # Per-gitlink dirt the diff above cannot carry, from
+    # `container.submodule_states` -- `{path: sub_state}`, git's own
+    # four-character `S<c><m><u>` for an initialised submodule and the single
+    # character `SUBMODULE_UNINITIALISED_CONTENT` for an uninitialised
+    # directory holding content.
+    #
+    # Three values, and the difference between the first two is the point:
+    # `None` is NOT READ (the read failed and `checkpoint_error` names it, or
+    # the checkpoint predates this field), `{}` is READ AND NOTHING DIRTY, and
+    # a non-empty mapping is what was observed.
+    #
+    # The asymmetry that makes two readers necessary, measured 2026-09-02 (git
+    # 2.50.1) through `snapshot_diff`'s own command sequence: an INITIALISED
+    # submodule's uncommitted edit is in the v2 record and not in the diff (0
+    # bytes), while an UNINITIALISED one's stray file is in neither -- `git
+    # add -A` does not descend through the gitlink boundary once the scratch
+    # index carries it, and git reports nothing for a path it will not enter.
+    submodules_dirty: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -840,6 +945,26 @@ class RunRecord:
     tool_calls: ToolCallStats = field(default_factory=ToolCallStats)
     truncation_events: list[dict[str, Any]] = field(default_factory=list)
     destructive_events: list[DestructiveEvent] = field(default_factory=list)
+
+    # The LAST capture's `Checkpoint.submodules_dirty`, so the states
+    # `artifacts.final_diff` cannot carry are in the record beside it.
+    #
+    # The LAST capture, not necessarily the final one: on a run that crashed
+    # mid-loop this is a mid-run snapshot, exactly as `artifacts.final_diff`
+    # -- the same expression -- is. A reader who needs "at exit" specifically
+    # has the test `grader.not_graded_gate` performs,
+    # `checkpoints[-1].turn == turns_streamed`, whose comment records two
+    # wrong formulations of it.
+    #
+    # `None` is "nobody looked" -- no capture at all, a contained read
+    # failure, or a record written before schema 3.10.0 -- and `{}` is "read,
+    # nothing dirty". Producing `{}` from the absence of any observation would
+    # be a positive claim manufactured by a failure.
+    #
+    # On `RunRecord` and not on `Artifacts`: that block holds paths that are
+    # existence- AND ownership-checked, and a mapping of observed states is
+    # not that kind of thing.
+    submodules_dirty_at_exit: dict[str, str] | None = None
 
     # True only when the agent ran inside the pinned container with no route
     # off the host except the recording proxy (spec section 5.1). A run with

@@ -40,8 +40,14 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO))
 
+# Module scope on purpose. `bakeoff.container` imports `docker` and NOT
+# litellm, so it does not undo the reason `bakeoff.runner`,
+# `bakeoff.claude_runner` and `bakeoff.proxy_callback` are deferred into
+# `run_cell`: `--preflight-only` has to stay off litellm.
+from bakeoff.container import fresh_tree  # noqa: E402
 from bakeoff.images import (  # noqa: E402
-    build_base_image,
+    ImageError,
+    build_base_images,
     build_proxy_image,
     build_task_image,
     image_entrypoint,
@@ -57,7 +63,11 @@ from bakeoff.matrix import (  # noqa: E402
     to_task_spec,
     write_json,
 )
-from bakeoff.preflight import preflight, preflight_cache_key  # noqa: E402
+from bakeoff.preflight import (  # noqa: E402
+    preflight,
+    preflight_cache_key,
+    verdict_matches_key,
+)
 from bakeoff.proxy import (  # noqa: E402
     DEFAULT_PROVIDER,
     EVAL_ARMS_BY_PROVIDER,
@@ -71,7 +81,13 @@ from bakeoff.proxy import (  # noqa: E402
     proxy_environment,
 )
 from bakeoff.session import effective_config  # noqa: E402
-from bakeoff.tasks import TaskError, load_task_set, materialize  # noqa: E402
+from bakeoff.tasks import (  # noqa: E402
+    TaskError,
+    load_task_set_with_refusals,
+    materialize,
+    refusal_warnings,
+    task_runtime,
+)
 
 # Under $HOME, never /var/folders: the Docker VM on macOS mounts $HOME only,
 # and a repo bind-mounted from elsewhere appears inside the container as a
@@ -93,6 +109,29 @@ DEFAULT_TASK_SET = REPO / "taskset"
 CELL_OVERHEAD_S = 120
 
 
+def _base_label(key: tuple[str, str]) -> str:
+    """One base, named the way an operator would say it: `python 3.12`.
+
+    A tuple's repr in a refusal message (`('node', '22')`) is readable but
+    reads as a data structure rather than as the thing that failed, and these
+    messages are the whole product of a gate that refuses an invocation.
+    """
+    return " ".join(key)
+
+
+def _short_base_label(key) -> str:
+    """The build banner's form: `py3.12`, `node22`.
+
+    Kept distinct from `_base_label` so the python line reads exactly as it did
+    before node existed -- `base py3.12  sha256:...` is what every stored
+    preflight log and every runbook shows. The line now carries a trailing
+    `(reused)` or `(built: <reason>)`, appended by `prepare_bases`; this
+    function's own return value is unchanged.
+    """
+    runtime, version = key
+    return f"py{version}" if runtime == "python" else f"{runtime}{version}"
+
+
 def base_claude_version(image: str) -> str:
     probe = subprocess.run(
         ["docker", "run", "--rm", "--entrypoint", "sh", image, "-c", "claude --version"],
@@ -101,12 +140,227 @@ def base_claude_version(image: str) -> str:
     return probe.stdout.strip().split()[0] if probe.returncode == 0 else ""
 
 
-def resolve_tasks(tasks, base_image, expected_version, cache, force):
+def assert_one_agent(bases: dict[tuple[str, str], str]) -> str:
+    """Every base ships the same Claude Code, or nothing runs.
+
+    What this replaces. `preflight`'s `expected_claude_version` refusal says
+    "two tasks would run different agents and the comparison across them is
+    not one". Handing each task its OWN base's version keeps the useful half
+    of that -- it still catches a task image whose `image.pip`/`image.build`
+    clobbered `claude` -- and loses exactly one thing: cross-BASE agreement.
+    Nothing downstream restores it. `Versions.claude_code` is read from the
+    transcript, per run, and no reader compares it across tasks, so two bases
+    on two agents would pass every gate and be invisible in the log.
+
+    Probing ONE base and passing that string to everyone would also restore
+    it, and is rejected: it makes one base arbitrarily canonical, and it
+    surfaces a build-level defect as a per-task preflight failure late in the
+    run rather than before the first task image is built.
+
+    EMPTY IS A REFUSAL, and it is checked before agreement.
+    `base_claude_version` returns "" when its `docker run` exits non-zero, so
+    "every base failed to answer" collapses to the single value "" -- which
+    reads as agreement, and is falsy, so preflight's
+    `elif expected_claude_version and ...` guard never fires and the
+    agent-version check is off for every task in the matrix. A gate that
+    disables another gate by returning its own failure is worse than no gate.
+
+    It used to be true that they always agree, because there was one
+    `ARG CLAUDE_CODE_VERSION` in one file. Broadening 7 added a SECOND base
+    Dockerfile with its own copy of that line, which is where this check earns
+    the most -- and `tests/test_images.py` asserts the two pins are equal as a
+    cheap offline first line, because this one needs a daemon and two builds.
+
+    Nothing here DECIDES on the key -- it is carried into the message and
+    nowhere else. Broadening 5 keyed `bases` by python version; this takes
+    `(runtime, version)`, and the widening is a type annotation plus how a key
+    is spelled in a refusal.
+    """
+    seen = {key: base_claude_version(image)
+            for key, image in sorted(bases.items())}
+    rendered = ", ".join(
+        f"{_base_label(k)} -> {c or '<no answer>'}" for k, c in seen.items()
+    )
+    blank = sorted(_base_label(k) for k, c in seen.items() if not c)
+    if blank:
+        raise ImageError(
+            f"`claude --version` answered nothing in the base image(s) for "
+            f"{', '.join(blank)}: {rendered}. An empty version is not "
+            "agreement -- it is falsy, so preflight's expected_claude_version "
+            "check would be silently disabled for every task in this matrix. "
+            "Rebuild the bases."
+        )
+    distinct = set(seen.values())
+    if len(distinct) > 1:
+        raise ImageError(
+            f"the base images do not all ship the same Claude Code: {rendered}. "
+            "Section 5.4 holds the agent identical across everything being "
+            "compared, and no per-task check can see this -- each task is "
+            "gated against its own base. Rebuild them all, and check that "
+            "docker/eval-agent.Dockerfile and docker/eval-agent-node.Dockerfile "
+            "still carry the same ARG CLAUDE_CODE_VERSION."
+        )
+    return distinct.pop()
+
+
+def prepare_bases(tasks) -> tuple[dict[tuple[str, str], str], str]:
+    """The base images this task set needs, built and checked.
+
+    Called by `main` BEFORE `resolve_tasks` and before the proxy image is
+    built, because both of the refusals below are free and offline while
+    everything after them costs an image build or a token.
+
+    The set comes from the TASKS, never from `tasks._PYTHON_VERSIONS` /
+    `_NODE_VERSIONS`: building every allowed runtime on every invocation is
+    several image builds for a task set that uses one, in the half of the run
+    documented as free.
+
+    `task_runtime`, never `task.image.python` -- EVERY task carries a python
+    version, node ones included (it is a dataclass default nobody read), so
+    indexing on that key hands a vitest task the python base. That image builds
+    and that container starts; the runner is simply absent, and it reaches the
+    model as exit 127 on every arm.
+
+    A base the daemon already carries is REUSED rather than rebuilt, and the
+    banner says which happened AND why. `images.build_base_images` decides that
+    by reading the three `bakeoff.base.*` labels off the tag; anything that does
+    not say it is exactly this base -- a mutated tag, an unlabelled image, no
+    such tag -- is rebuilt with the reason named. That reason is the whole point
+    of returning the decision rather than asking for it twice: `(built)` alone
+    reads identically on a cold machine and on a tag someone mistagged, and the
+    second is the case a probe of preflight's read-back was silently defeated by
+    on 2026-09-02.
+    """
+    keys = sorted({task_runtime(task) for task in tasks})
+    print(f"\nbuilding {len(keys)} base image(s): "
+          f"{', '.join(_base_label(k) for k in keys)} ...", flush=True)
+    built = build_base_images(REPO, keys)
+    bases = {key: base.image_id for key, base in built.items()}
+    expected = assert_one_agent(bases)
+    for key in keys:
+        base = built[key]
+        state = "reused" if base.reused else f"built: {base.reason}"
+        print(f"base {_short_base_label(key)}  {base.image_id[:19]}...  "
+              f"claude {expected}  ({state})")
+    return bases, expected
+
+
+def suite_time_line(verdict: dict) -> str:
+    """One line: what the gate's bounded runs cost, against the bound they carried.
+
+    The bound comes from `evidence["suite_timeout_s"]`, which
+    `_Runner.last_timeout_s` read off the ARGV, and never from
+    `task.budget.suite_timeout_s`, which is in scope at both call sites.
+    They can disagree, and printing the configured number beside a measured
+    duration is configuration reported as observation -- in the one line
+    whose entire purpose is to let an author compare the two.
+
+    The denominator is the SCHEMA's size, not this task's worst case, and
+    the wording says so: a node task can make at most eight of these nine
+    (the bare-runner probe is pytest-only) and a task with an explicit
+    `tests.p2p` never makes the scoped one. "2 of the schema's 9" is a
+    statement about the key set; the ceiling for a given task is not
+    derivable from a verdict and is not claimed here.
+
+    Three answers, because the absences differ. A verdict written before
+    the bump in this commit has no durations at all and says so with the
+    version that wrote it; a verdict whose runs are all null is a gate that
+    started nothing; anything else is a measurement.
+    """
+    evidence = verdict.get("evidence") or {}
+    durations = evidence.get("bounded_run_durations_s")
+    if not isinstance(durations, dict):
+        return ("suite time  not recorded: written by preflight_version "
+                f"{verdict.get('preflight_version') or '?'}")
+    slowest = evidence.get("bounded_run_duration_max_s")
+    if slowest is None:
+        return "suite time  no bounded command ran"
+    measured = [v for v in durations.values() if v is not None]
+    bound = evidence.get("suite_timeout_s")
+    return (
+        f"suite time  slowest {slowest:.1f}s of the "
+        + (f"{bound}s bound" if bound is not None else "unrecorded bound")
+        + f"; {sum(measured):.1f}s over {len(measured)} of the schema's "
+        + f"{len(durations)} bounded runs"
+    )
+
+
+def _measured_total(verdict: dict) -> float:
+    """The bounded seconds a verdict recorded, 0.0 when it recorded none.
+
+    Reads the same key `suite_time_line` reads, with the same guard --
+    `isinstance(durations, dict)`, not a bare `.get` fallback, because
+    `... or {}` only rescues a FALSY non-dict and a hand-edited blob whose
+    `bounded_run_durations_s` is a list or string would otherwise raise out
+    of `resolve_tasks` on the very line after `suite_time_line` printed its
+    "not recorded" sentence for the same blob. A reporting affordance may
+    not be the thing that stops a matrix.
+    """
+    evidence = verdict.get("evidence") or {}
+    durations = evidence.get("bounded_run_durations_s")
+    if not isinstance(durations, dict):
+        return 0.0
+    return sum(v for v in durations.values() if v is not None)
+
+
+def cached_verdict(cache: Path, task_id: str, key: str) -> dict | None:
+    """The stored verdict blob for THIS key, or `None` -- never a raise.
+
+    `<cache>/preflight/<task_id>.json` is filed under the task id alone and
+    is written BEFORE the `ok` test, while `preflight.json` -- the cache
+    that decides a PASS -- is written only on PASS. So a --force-preflight
+    run that NO-GOes leaves a stale PASS key in the one file and its own
+    NO-GO blob in the other, and a later warm invocation would read seconds
+    from a verdict that refused the task. `preflight.verdict_matches_key`
+    plus `ok is True` is what catches it.
+
+    A miss on anything -- absent, unreadable, not JSON, wrong key, not a
+    PASS -- is `None`, and the caller prints nothing.
+    """
+    path = Path(cache) / "preflight" / f"{task_id}.json"
+    try:
+        blob = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(blob, dict) or blob.get("ok") is not True:
+        return None
+    return blob if verdict_matches_key(blob, key) else None
+
+
+def _print_build_generated(evidence: dict) -> None:
+    state = str((evidence or {}).get("build_generated_state") or "")
+    if state.startswith("failed: "):
+        # A scan that could not run and a scan that found nothing are both
+        # `build_generated_paths` falsy -- `_evidence_seed`'s whole point is
+        # that those two absences must not render identically, and the
+        # console is the one place an author actually looks. Checked first,
+        # so a failed scan is never silently reported as "nothing found".
+        print(f"note      the build-output scan did not complete: {state[8:]}")
+        return
+    generated = (evidence or {}).get("build_generated_paths") or []
+    if not generated:
+        return
+    total = (evidence or {}).get("build_generated_count") or len(generated)
+    shown = ", ".join(generated[:5])
+    more = " ..." if total > 5 else ""
+    print(
+        f"note      the image build wrote {total} file(s) into /repo that the "
+        f"run tree does not have; nothing the agent, the gate, the oracle or "
+        f"the grader runs will see them: {shown}{more}"
+    )
+
+
+def resolve_tasks(tasks, bases, expected_version, cache, force):
     """Build each task's image, materialize its start state, and preflight.
 
     Returns (resolved, failures). `resolved` maps task_id to a dict carrying
     the image id and the start sha -- everything a run needs that is not in
     the manifest.
+
+    `bases` maps a `(runtime, version)` pair to a base image id, and the base
+    is chosen PER TASK by `task_runtime`. Handing every task the first entry
+    still builds and still runs -- under an interpreter, or a runtime, the task
+    was not cut for, with only preflight's read-back saying so.
 
     The preflight cache is keyed by `preflight.preflight_cache_key` --
     (manifest digest, image id, start sha, PREFLIGHT_VERSION).
@@ -114,6 +368,15 @@ def resolve_tasks(tasks, base_image, expected_version, cache, force):
     into half an hour, and a gate that is expensive to run is a gate that
     gets skipped -- the same argument verify_logger.py makes for staying
     free.
+
+    The preflight tree is allocated by `container.fresh_tree` and removed when
+    the resolution ends. The shape it replaces -- one stable path per task,
+    `rmtree`'d at the TOP of the next invocation -- is the stale bind mount
+    measured 2026-09-02: the Docker VM serves the directory it cached for a
+    mount source, so the second container on that path saw an EMPTY `/repo`
+    (`[files], [], [files], []` over four cycles). On a vitest task that is
+    `No test files found` at exit 1, the exit a genuinely red suite gives, so
+    every second `--preflight-only` invocation gated on nothing at all.
     """
     cache_path = cache / "preflight.json"
     cached = {}
@@ -125,9 +388,13 @@ def resolve_tasks(tasks, base_image, expected_version, cache, force):
 
     resolved: dict[str, dict] = {}
     failures: list[str] = []
+    gate_seconds = 0.0
+    gate_tasks = 0
+    gate_cached = 0
     for task in tasks:
         print(f"\n=== {task.task_id} ===", flush=True)
-        image = build_task_image(task, base_image, cache / "build", cache)
+        image = build_task_image(task, bases[task_runtime(task)],
+                                 cache / "build", cache)
         entrypoint = image_entrypoint(image)
         if entrypoint:
             failures.append(
@@ -137,39 +404,76 @@ def resolve_tasks(tasks, base_image, expected_version, cache, force):
             )
             continue
 
-        work = cache / "preflight-tree" / task.task_id
-        shutil.rmtree(work, ignore_errors=True)
-        start_sha = materialize(task, work / "repo", cache)
-        print(f"image     {image[:19]}...")
-        print(f"start_sha {start_sha}  (base {task.base_sha[:12]} + test half)")
-        if not task.declared_start_sha:
-            print(f"          pin it: repo.start_sha: {start_sha}")
+        work = fresh_tree(cache / "preflight-tree" / task.task_id)
+        try:
+            start_sha = materialize(task, work / "repo", cache)
+            print(f"image     {image[:19]}...")
+            print(f"start_sha {start_sha}  (base {task.base_sha[:12]} + test half)")
+            if not task.declared_start_sha:
+                print(f"          pin it: repo.start_sha: {start_sha}")
 
-        key = preflight_cache_key(task, image, start_sha)
-        if cached.get(task.task_id, {}).get("key") == key:
-            print("preflight cached PASS (--force-preflight to re-run)")
-            resolved[task.task_id] = {"image": image, "start_sha": start_sha,
-                                      "repo": work / "repo"}
-            continue
+            key = preflight_cache_key(task, image, start_sha)
+            if cached.get(task.task_id, {}).get("key") == key:
+                print("preflight cached PASS (--force-preflight to re-run)")
+                blob = cached_verdict(cache, task.task_id, key)
+                if blob is not None:
+                    _print_build_generated(blob.get("evidence") or {})
+                    print(f"          {suite_time_line(blob)}")
+                    gate_seconds += _measured_total(blob)
+                    gate_cached += 1
+                    gate_tasks += 1
+                resolved[task.task_id] = {"image": image,
+                                          "start_sha": start_sha}
+                continue
 
-        result = preflight(
-            task, image=image, repo_path=work / "repo", start_sha=start_sha,
-            expected_claude_version=expected_version,
-        )
-        write_json(cache / "preflight" / f"{task.task_id}.json", result.to_dict())
-        if not result.ok:
-            print("preflight NO-GO")
-            for problem in result.problems:
-                print(f"  - {problem}")
-            failures.append(f"{task.task_id}: {len(result.problems)} problem(s)")
-            continue
+            result = preflight(
+                task, image=image, repo_path=work / "repo", start_sha=start_sha,
+                expected_claude_version=expected_version,
+            )
+            blob = result.to_dict()
+            write_json(cache / "preflight" / f"{task.task_id}.json", blob)
+            # Totalled BEFORE the verdict branch, and the NO-GO branch prints
+            # its line too. A task refused because a bounded run hit `timeout`
+            # burned the FULL suite_timeout_s, up to nine times -- the largest
+            # single contributor to the number this total exists to check the
+            # one-hour SSO window against, and the exact task whose bound an
+            # author is about to resize. A total that quietly meant "the
+            # tasks that passed" is the defect the caveat line below warns
+            # about, one line up.
+            gate_seconds += _measured_total(blob)
+            gate_tasks += 1
+            _print_build_generated(result.evidence)
+            if not result.ok:
+                print("preflight NO-GO")
+                for problem in result.problems:
+                    print(f"  - {problem}")
+                print(f"          {suite_time_line(blob)}")
+                failures.append(
+                    f"{task.task_id}: {len(result.problems)} problem(s)")
+                continue
+            print(
+                "preflight PASS  f2p red at start, green after the reference; "
+                "p2p green both ways; tree clean"
+            )
+            print(f"          {suite_time_line(blob)}")
+            cached[task.task_id] = {"key": key}
+            resolved[task.task_id] = {"image": image, "start_sha": start_sha}
+        finally:
+            # The tree does not outlive the resolution, and both `continue`
+            # paths above pass through here. Removing it is safe only because
+            # `fresh_tree` will never reissue the name -- which is the whole
+            # difference from the shape this replaces.
+            shutil.rmtree(work, ignore_errors=True)
+
+    if gate_tasks:
         print(
-            "preflight PASS  f2p red at start, green after the reference; "
-            "p2p green both ways; tree clean"
+            f"\ngate suite time  {gate_seconds:.1f}s across {gate_tasks} task(s)"
+            + (f", {gate_cached} from cached verdicts" if gate_cached else "")
         )
-        cached[task.task_id] = {"key": key}
-        resolved[task.task_id] = {"image": image, "start_sha": start_sha,
-                                  "repo": work / "repo"}
+        print(
+            "                 bounded runs only -- image build, materialization "
+            "and container start are NOT in this number"
+        )
 
     write_json(cache_path, cached)
     return resolved, failures
@@ -201,14 +505,17 @@ def run_cell(cell, task, resolved, args, event_log, wire_dir, network, artifacts
     from bakeoff.runner import execute_run
 
     run_root = artifacts / f"{cell.task_id}-{cell.model}-{cell.sample_index}"
-    repo = run_root / "repo"
-    # No rmtree. The artifacts root is per-invocation, so this path is new
-    # every time and there is nothing to clear -- and a delete keyed on a path
-    # with no attempt_number in it becomes the artifacts-collision bug the
-    # moment run-level retry lands (TASKS.md P1): two attempts of one cell
-    # would share a stamp AND a directory, and the second would delete the
-    # first's artifacts and its record.unwritten.json while both records live
-    # in the log.
+    repo = fresh_tree(run_root / "tree") / "repo"
+    # No rmtree. The artifacts root is per-invocation AND the tree leaf is per
+    # materialization, so this path is new every time and there is nothing to
+    # clear -- and a delete keyed on a path with no attempt_number in it
+    # becomes the artifacts-collision bug the moment run-level retry lands
+    # (TASKS.md P1): two attempts of one cell would share a stamp AND a
+    # directory, and the second would delete the first's artifacts and its
+    # record.unwritten.json while both records live in the log. The leaf is
+    # also what keeps a retry off a path a container has already mounted: the
+    # Docker VM serves a replaced host inode from its cache, EMPTY (measured
+    # 2026-09-02, `[files], [], [files], []` over four cycles).
     # A fresh tree per run. Sharing one would let a later sample start from
     # an earlier sample's dirty state and report a diff its own agent never
     # made (spec section 5.1: fresh container per sample, no state bleed).
@@ -258,9 +565,16 @@ def run_cell(cell, task, resolved, args, event_log, wire_dir, network, artifacts
     write_json(run_root / "artifacts" / "effective_config.json", config_dump)
 
     unattributed = unattributed_count(wire_dir) - before
-    if not args.keep:
-        shutil.rmtree(repo, ignore_errors=True)
-    return record, config_dump, unattributed
+    kept = None
+    if args.keep:
+        kept = str(repo)
+        print(f"  kept {repo}")
+    else:
+        # The whole leaf, not just `repo`: the leaf is the allocation, and
+        # leaving it behind is the husk `fresh_tree` cannot collect under a
+        # key nothing allocates under again.
+        shutil.rmtree(repo.parent, ignore_errors=True)
+    return record, config_dump, unattributed, kept
 
 
 def config_name_for(mode: str, provider: str) -> str:
@@ -342,10 +656,11 @@ def main() -> int:
 
     from bakeoff.eventlog import EventLog
 
+    selected = args.tasks.split(",") if args.tasks else None
     try:
-        tasks = load_task_set(Path(args.task_set), only=(
-            args.tasks.split(",") if args.tasks else None
-        ))
+        tasks, refusals = load_task_set_with_refusals(
+            Path(args.task_set), only=selected
+        )
     except TaskError as exc:
         print(f"task set: {exc}")
         return 1
@@ -363,6 +678,10 @@ def main() -> int:
     print(f"repeats   {args.repeats}   seed {args.seed}")
     print(f"event log {args.event_log}")
 
+    for line in refusal_warnings(refusals, root=Path(args.task_set),
+                                 selected=set(selected or ())):
+        print(line)
+
     # Before any image is built or the proxy started: an arm absent from the
     # chosen config is an operator error (a typo, or a config/provider
     # mismatch), not a model failure, and the proxy's 4xx for an unknown
@@ -372,13 +691,16 @@ def main() -> int:
         print(f"\narm(s) not in {config_name}: {', '.join(missing)}")
         return 2
 
-    print("\nbuilding base image ...", flush=True)
-    base_image = build_base_image(REPO)
-    expected_version = base_claude_version(base_image)
-    print(f"base      {base_image[:19]}...  claude {expected_version}")
+    try:
+        bases, expected_version = prepare_bases(tasks)
+    except ImageError as exc:
+        # Same shape as the preflight NO-GO below: nothing was run, nothing
+        # was spent, and the operator gets the reason rather than a traceback.
+        print(f"\nBASE IMAGE NO-GO -- nothing was run and nothing was spent\n  {exc}")
+        return 1
 
     resolved, failures = resolve_tasks(
-        tasks, base_image, expected_version, CACHE, args.force_preflight
+        tasks, bases, expected_version, CACHE, args.force_preflight
     )
     if failures:
         print("\nPREFLIGHT NO-GO -- nothing was run and nothing was spent")
@@ -554,7 +876,7 @@ def main() -> int:
             print(f"\n[{index}/{len(resume.todo)}] {cell.label}", flush=True)
             try:
                 cell_started = time.monotonic()
-                record, config_dump, unattributed = run_cell(
+                record, config_dump, unattributed, kept = run_cell(
                     cell, task, resolved[cell.task_id], args,
                     event_log, wire_dir, proxy.internal_name, artifacts,
                     # Both are this invocation's stamp today, which is exactly
@@ -588,23 +910,28 @@ def main() -> int:
             if problems:
                 infra[cell.label] = problems
             abort = tracker.record(cell.model, bad=bool(problems))
-            rows.append(
-                {
-                    "cell": cell.label,
-                    "outcome": record.outcome.value,
-                    "turns": record.turns_used,
-                    "tools": record.tool_calls.total,
-                    "wire": record.wire_entries_seen,
-                    "cost": record.cost_usd,
-                    "wall_s": record.time.wall_clock_total_ms / 1000,
-                    # The whole cell, not just the agent. The two differ by
-                    # exactly CELL_OVERHEAD_S's true value, which is the
-                    # measurement that constant is standing in for.
-                    "cell_wall_s": round(cell_wall_s, 1),
-                    "diff_b": len(record.artifacts.final_diff or ""),
-                    "problems": problems,
-                }
-            )
+            row = {
+                "cell": cell.label,
+                "outcome": record.outcome.value,
+                "turns": record.turns_used,
+                "tools": record.tool_calls.total,
+                "wire": record.wire_entries_seen,
+                "cost": record.cost_usd,
+                "wall_s": record.time.wall_clock_total_ms / 1000,
+                # The whole cell, not just the agent. The two differ by
+                # exactly CELL_OVERHEAD_S's true value, which is the
+                # measurement that constant is standing in for.
+                "cell_wall_s": round(cell_wall_s, 1),
+                "diff_b": len(record.artifacts.final_diff or ""),
+                "problems": problems,
+            }
+            # Never a path that is not this run's -- and absent, not null,
+            # because a row without `--keep` has no path to name. Under
+            # `--keep` the run tree outlives the cell and a reader wants the
+            # path.
+            if kept:
+                row["kept_repo"] = kept
+            rows.append(row)
             cost = "unpriced" if record.cost_usd is None else f"{record.cost_usd:.5f}"
             print(
                 f"  {record.outcome.value:18} turns={record.turns_used:<3} "

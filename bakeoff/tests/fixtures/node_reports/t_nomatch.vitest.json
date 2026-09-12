@@ -1,0 +1,68 @@
+{
+  "numFailedTestSuites": 0,
+  "numFailedTests": 0,
+  "numPassedTestSuites": 2,
+  "numPassedTests": 0,
+  "numPendingTestSuites": 0,
+  "numPendingTests": 3,
+  "numTodoTests": 0,
+  "numTotalTestSuites": 2,
+  "numTotalTests": 3,
+  "snapshot": {
+    "added": 0,
+    "didUpdate": false,
+    "failure": false,
+    "filesAdded": 0,
+    "filesRemoved": 0,
+    "filesRemovedList": [],
+    "filesUnmatched": 0,
+    "filesUpdated": 0,
+    "matched": 0,
+    "total": 0,
+    "unchecked": 0,
+    "uncheckedKeysByFile": [],
+    "unmatched": 0,
+    "updated": 0
+  },
+  "startTime": 1788348508437,
+  "success": true,
+  "testResults": [
+    {
+      "assertionResults": [
+        {
+          "ancestorTitles": [
+            "outer"
+          ],
+          "failureMessages": [],
+          "fullName": "outer adds",
+          "meta": {},
+          "status": "skipped",
+          "title": "adds"
+        },
+        {
+          "ancestorTitles": [
+            "outer"
+          ],
+          "failureMessages": [],
+          "fullName": "outer subs",
+          "meta": {},
+          "status": "skipped",
+          "title": "subs"
+        },
+        {
+          "ancestorTitles": [],
+          "failureMessages": [],
+          "fullName": "top level",
+          "meta": {},
+          "status": "skipped",
+          "title": "top level"
+        }
+      ],
+      "endTime": 1788348508437,
+      "message": "",
+      "name": "/repo/tests/pass.test.js",
+      "startTime": 1788348508437,
+      "status": "passed"
+    }
+  ]
+}

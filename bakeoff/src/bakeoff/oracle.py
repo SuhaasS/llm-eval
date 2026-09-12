@@ -64,15 +64,13 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from bakeoff.container import RunContainer
+from bakeoff.container import RunContainer, fresh_tree
 from bakeoff.preflight import (
-    EXIT_ALL_PASSED,
-    EXIT_TESTS_FAILED,
-    _EXIT_MEANING,
     _Runner,
     _existing_prefixes,
-    failed_node_ids,
 )
+from bakeoff.runners import KIND_FAILED, KIND_PASSED, for_framework
+from bakeoff.runners.pytest_adapter import _PROCESS_EXIT_MEANING
 from bakeoff.tasks import materialize
 
 #: What this derivation asserts, as a version, and it is in the fingerprint for
@@ -80,21 +78,78 @@ from bakeoff.tasks import materialize
 #: digest nor the image digest moves when THIS file changes, so without it a
 #: warm cache serves a quarantine derived by the old rules and a change to
 #: those rules is inert on exactly the tasks about to be graded.
-ORACLE_VERSION: str = "1"
+#:
+#: 1 -> 2: the derivation's two reference runs are bounded by
+#: `budget.suite_timeout_s` rather than by a function default. The manifest
+#: digest does not cover it -- a manifest that already carries the key loads
+#: under the older loader, which ignores unknown `budget` sub-keys -- so
+#: without this every cached quarantine would be one derived at 600 against a
+#: manifest asking for something else.
+#: 2 -> 3: `_classify` reads an `Outcome` rather than an exit code. A
+#: quarantine cached under 2 was derived by rules that could not classify a
+#: node run at all -- vitest and jest answer a failing test, an unresolvable
+#: import, a syntax error and a broken config with exit 1 alike -- and whose
+#: "the quarantine swallowed the whole p2p list" guard depended on pytest's
+#: exit 5, which those frameworks answer with 0 and a report of every test
+#: skipped. No quarantine on today's corpus changes: every stored task is a
+#: pytest one and the pytest adapter maps each exit code onto the kind this
+#: derivation already branched on.
+#:
+#: 3 -> 4: `pytest_adapter._FAILED_LINE` learned `SUBFAILED` (fix 3,
+#: 2026-09-02). `_classify` takes `set(outcome.failed_ids)` straight from that
+#: regex on `KIND_FAILED`, and `derive_quarantine` XORs the two reference
+#: runs' sets -- so a p2p node that flakes only through `unittest.subTest`
+#: under pytest's core-integrated subtests (pytest >= 9) was invisible to
+#: both runs' sets under 3 and could never land in the quarantine, whatever it
+#: did across the two references. A quarantine derived under 3 for a task with
+#: such a node silently omits it, and `_check_p2p` then leaves it selected at
+#: grade time -- P2P_REGRESSION on a submission the flaky node never touched.
+#: No quarantine on today's corpus changes retroactively without a re-run:
+#: the fix widens what the SAME two reference runs can report, so a cached
+#: verdict must be re-derived, not merely re-read, to pick it up.
+#:
+#: 4 -> 5: node selection and deselection became per-file (round 2 item 1,
+#: 2026-09-03). `_derive`'s two reference runs are now the per-file argv
+#: sequence, so a quarantine cached under 4 for a NODE task was derived from
+#: runs in which a deselection crossed files -- it can name an id that never
+#: needed quarantining, and miss one whose own file's run was distorted by
+#: another file's deselection. No pytest quarantine changes: that adapter
+#: emits one group whose argv is the v4 argv. A cached node verdict must be
+#: re-derived rather than re-read.
+#:
+#: 5 -> 6: the reference runs' argv again, and this bump lands LATE -- item
+#: 12's fix wave (`d75ceba`, 2026-09-03) moved `adapter.report_args` to the
+#: FRONT of every group's argv and moved `PREFLIGHT_VERSION` only.
+#: `_derive` constructs a `preflight._Runner` and `derive_quarantine` drives
+#: it through `pass_to_pass` twice, so the two reference runs ARE the runs
+#: that changed: quarantines derived before and after the reorder sat under
+#: one fingerprint (`manifest|image|5`) and one was served for the other.
+#: The blast radius is NODE tasks whose `tests.runner` ends in an
+#: array-valued flag. Before the reorder that greedy flag swallowed the
+#: run's own scope positional, so the p2p reference run left `tests.paths`
+#: and executed files outside it (the measurement `PREFLIGHT_VERSION`'s
+#: `20 -> 21` entry records) -- and the XOR of the two reference runs was
+#: therefore taken over a different file set than the same manifest yields
+#: today. That is not a hypothetical shape: `HARVESTING.md`'s own worked
+#: remedy tells an author to write four trailing `--testPathIgnorePatterns=`
+#: entries. No PYTEST quarantine moves: `PytestAdapter.report_args` is `[]`,
+#: so the reorder is behaviourally inert there, and every task in the stored
+#: corpus is a pytest one. A cached node verdict must be re-derived rather
+#: than re-read; the two entries on disk under `"5"` are node ones (yaml-474
+#: under jest, ufo-214 under vitest) whose `tests.runner` carries no trailing
+#: array-valued flag, so the reorder changed nothing they measured -- they are
+#: re-derived only because the fingerprint moves.
+ORACLE_VERSION: str = "6"
 
 #: preflight's pytest exit meanings plus the codes the `timeout` wrapper and
 #: the shell contribute. Non-{0,1} is refused whatever the code, but the
 #: message has to name a cause an operator can act on: 127 is a runner that is
 #: not on PATH, 137 is the container being killed (OOM, most often), and each
 #: of those reads as "no tests failed" to a classifier that only checks for
-#: exit 1.
-_ORACLE_EXIT_MEANING = {
-    **_EXIT_MEANING,
-    125: "the `timeout` wrapper itself failed",
-    126: "the runner was found but could not be executed",
-    127: "the runner is not on PATH in this image",
-    137: "the command was killed (SIGKILL -- usually the container OOM)",
-}
+#: exit 1. Imported rather than re-defined -- `preflight.py`'s own bare-probe
+#: gate wants the exact same codes and this module already imports from
+#: `preflight.py`, so a second copy here would be the thing that drifts.
+_ORACLE_EXIT_MEANING = _PROCESS_EXIT_MEANING
 
 
 class OracleError(RuntimeError):
@@ -144,7 +199,7 @@ def oracle_fingerprint(task, image: str) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-def _classify(result) -> set[str]:
+def _classify(outcome, result) -> set[str]:
     """What failed in one p2p run, or a refusal that the run did not happen.
 
     The whole point of reading pytest's exit code rather than `!= 0` is the
@@ -154,19 +209,30 @@ def _classify(result) -> set[str]:
     classifier that only asked "did anything fail?" would read a suite that
     never collected as a clean run and derive an empty quarantine from two of
     them.
+
+    Stated over `Outcome.kind` rather than over an exit code, because on vitest
+    and jest there is no exit code to state it over: measured 2026-09-01, both
+    return 1 for a failing test and for a broken config, and BOTH return 0 for
+    a `-t` pattern that matched nothing -- which is exactly what a quarantine
+    covering the whole p2p list produces. `KIND_NOTHING_RAN` is what carries
+    that now; the exit code used to.
     """
-    code = result.exit_code
-    if code == EXIT_ALL_PASSED:
+    if outcome.kind == KIND_PASSED:
         return set()
-    if code == EXIT_TESTS_FAILED:
-        return failed_node_ids(result.stdout + result.stderr)
-    meaning = _ORACLE_EXIT_MEANING.get(code)
+    if outcome.kind == KIND_FAILED:
+        return set(outcome.failed_ids)
+    meaning = _ORACLE_EXIT_MEANING.get(outcome.exit_code) or outcome.explain
     detail = f" -- {meaning}" if meaning else ""
+    # `result` is carried alongside the outcome solely for this tail, which the
+    # exit-code version already had. Every path through here is a BROKEN
+    # ORACLE, which is the failure an operator has to debug from the message
+    # alone -- so dropping the output would be the one regression this refactor
+    # could make that no test would see.
     raise OracleError(
-        f"the p2p run at the reference state exited {code}{detail}. The "
-        "quarantine is derived from which tests failed, and a run that did "
-        "not happen reports none -- so this would be indistinguishable from a "
-        "clean run and would quarantine nothing.\n"
+        f"the p2p run at the reference state exited {outcome.exit_code} "
+        f"({outcome.kind}){detail}. The quarantine is derived from which tests "
+        "failed, and a run that did not happen reports none -- so this would "
+        "be indistinguishable from a clean run and would quarantine nothing.\n"
         + (result.stdout or result.stderr)[-2000:]
     )
 
@@ -184,8 +250,10 @@ def derive_quarantine(runner, tests, scope: tuple[str, ...] = ()) -> tuple[str, 
     uses. See the module docstring: an id derived outside the graded scope
     deselects nothing and does it silently.
     """
-    first = _classify(runner.pass_to_pass(tests, scope=scope))
-    second = _classify(runner.pass_to_pass(tests, scope=scope))
+    first_result = runner.pass_to_pass(tests, scope=scope)
+    first = _classify(runner.classify(first_result), first_result)
+    second_result = runner.pass_to_pass(tests, scope=scope)
+    second = _classify(runner.classify(second_result), second_result)
 
     both = first & second
     if both:
@@ -209,18 +277,25 @@ def derive_quarantine(runner, tests, scope: tuple[str, ...] = ()) -> tuple[str, 
         # grade-time surface is a NAMED scope_collected_nothing / exit-5
         # record, not silence, and the leaf-shape requirement on `tests.p2p`
         # goes into HARVESTING.md (Task 7) where the set is authored.
+        #
+        # On pytest this surfaces because deselecting every selected id makes
+        # pytest exit 5. On vitest and jest it exits **0** with every test
+        # reported skipped (measured 2026-09-01) -- so what carries it there is
+        # `classify`'s rule that zero assertions with a terminal status is
+        # `KIND_NOTHING_RAN` whatever the exit code was. The guard's claim is
+        # unchanged; the mechanism behind it is no longer the exit code.
         raise OracleError(
             "the quarantine covers the entire declared p2p list ("
             + ", ".join(sorted(tests.p2p))
             + "), so the graded run would deselect every node id it selects "
-            "and pytest would exit 5. That surfaces as an ungraded record "
-            "rather than as the broken oracle it is."
+            "and the suite would report nothing collected. That surfaces as "
+            "an ungraded record rather than as the broken oracle it is."
         )
 
     return quarantine
 
 
-def _derive(task, image: str, cache_root: Path, timeout_s: int) -> tuple[str, ...]:
+def _derive(task, image: str, cache_root: Path) -> tuple[str, ...]:
     """The Docker-touching half: a fresh tree at the reference state, twice run.
 
     Separated from `derive_quarantine` so the derivation's semantics are
@@ -236,8 +311,13 @@ def _derive(task, image: str, cache_root: Path, timeout_s: int) -> tuple[str, ..
     paths that leave it behind are exactly the failure paths -- a diff that
     does not apply, a refused exit code, a red-in-both refusal.
     """
-    tree = Path(cache_root) / "oracle-tree" / task.task_id
-    shutil.rmtree(tree, ignore_errors=True)
+    # A path no container has mounted, never `task_id` alone. The Docker VM
+    # caches the directory it serves for a bind-mount source, so a second
+    # derivation on one path is served the cached, EMPTY copy (measured
+    # 2026-09-02, `[files], [], [files], []` over four cycles) -- and against
+    # an empty tree the reference fix does not apply, so `_derive` raises and
+    # a sound task becomes ungradable. Loud, but for the wrong reason.
+    tree = fresh_tree(Path(cache_root) / "oracle-tree" / task.task_id)
     start_sha = materialize(task, tree / "repo", cache_root)
 
     try:
@@ -268,7 +348,25 @@ def _derive(task, image: str, cache_root: Path, timeout_s: int) -> tuple[str, ..
                     + (applied.stderr or applied.stdout).strip()[:1000]
                 )
 
-            runner = _Runner(container, task.tests.runner, timeout_s)
+            # Off the manifest, and the parameter is gone rather than
+            # defaulted: `grade.py` calls `ensure_oracle(task, image,
+            # Path(cache))` with no bound, so a default here would derive the
+            # quarantine under a number the task does not ask for while
+            # preflight gated it under one that it does. A slow-but-healthy
+            # reference run then exits 124, `_classify` raises, and the task
+            # becomes ungradable -- silently, since the cache stores only the
+            # verdict.
+            #
+            # The adapter is passed EXPLICITLY, never left on `_Runner`'s
+            # pytest default: this derivation's every refusal is stated over
+            # what the run DID, and under jest exit 1 is what a config error,
+            # an import error and a failing assertion all return alike. A call
+            # site left on the default would read a broken jest run as "these
+            # tests failed" and quarantine them -- shrinking the regression
+            # check on every submission of that task, forever.
+            runner = _Runner(container, task.tests.runner,
+                             task.budget.suite_timeout_s,
+                             for_framework(task.tests.framework))
             # Filtered through preflight's own existence check rather than
             # passed raw, because that is the filter the grader's check 6
             # applies. A declared prefix absent at the post-fix state is an
@@ -290,8 +388,7 @@ def _derive(task, image: str, cache_root: Path, timeout_s: int) -> tuple[str, ..
         shutil.rmtree(tree, ignore_errors=True)
 
 
-def ensure_oracle(task, image: str, cache_root: Path,
-                  timeout_s: int = 600) -> Oracle:
+def ensure_oracle(task, image: str, cache_root: Path) -> Oracle:
     """The task's quarantine, derived once per (manifest, image, version).
 
     Deriving is two full suite runs inside a container; across 80 tasks that
@@ -330,7 +427,7 @@ def ensure_oracle(task, image: str, cache_root: Path,
 
     oracle = Oracle(
         fingerprint=fingerprint,
-        quarantined=tuple(_derive(task, image, cache_root, timeout_s)),
+        quarantined=tuple(_derive(task, image, cache_root)),
         # Explicit on this path too, so the two constructions are the same
         # statement. Leaning on the default here and naming it there makes the
         # cache-miss version look like it could differ from the cache-hit one.

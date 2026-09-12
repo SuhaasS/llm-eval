@@ -1,9 +1,21 @@
+import os
+import re
+import shutil
+import stat
+import subprocess
 import threading
 import time
 
 import pytest
 
-from bakeoff.container import ContainerError, HostSampler, RunContainer
+import bakeoff.container
+from bakeoff.container import (
+    STALE_TREE_AGE_S,
+    ContainerError,
+    HostSampler,
+    RunContainer,
+    fresh_tree,
+)
 
 integration = pytest.mark.integration
 
@@ -130,6 +142,10 @@ def test_snapshot_diff_raises_when_git_fails(alpine_container):
     a Checkpoint stores as "the agent had changed nothing by this turn."
     That is a fabricated measurement feeding the cost-at-budget-K curve, not
     a visible error. Fail instead.
+
+    The FIRST command that touches git is now the scratch-index seed (`git
+    read-tree <base_sha>`), not `git add -A`, so that is where this raises;
+    the assertion is unchanged because both name git.
     """
     with pytest.raises(ContainerError, match="git"):
         alpine_container.snapshot_diff("abc123")
@@ -246,6 +262,141 @@ def test_no_network_at_all_is_not_reported_as_isolated(alpine_container):
     assert "no recording proxy" in evidence
 
 
+# --- the bind mount actually landed ------------------------------------------
+
+
+class _FakeExec:
+    """One `exec_run` answer, in the shape the docker SDK returns under
+    `demux=True`: `(exit_code, (stdout, stderr))` with both halves bytes."""
+
+    def __init__(self, exit_code: int = 0, stdout: bytes = b""):
+        self.exit_code = exit_code
+        self.output = (stdout, b"")
+
+
+class _FakeContainer:
+    """A started container that answers a scripted `/repo` listing.
+
+    `removed` is the assertion this class exists for: `__exit__` is NOT
+    invoked when `__enter__` raises, so a post-condition that refuses without
+    removing leaves a live container carrying `bakeoff.eval_agent` -- the
+    label `HostSampler` counts peers by -- and every concurrent run would file
+    `contention_flag: true` against a container nobody is using.
+    """
+
+    def __init__(self, listing: bytes):
+        self.id = "fake"
+        self.listing = listing
+        self.removed = False
+        self.killed = False
+
+    def exec_run(self, cmd, **_kw):
+        if cmd[:1] == ["find"] or cmd[:1] == ["ls"]:
+            return _FakeExec(0, self.listing)
+        return _FakeExec(0, b"")
+
+    def kill(self):
+        self.killed = True
+
+    def remove(self, force=False):
+        self.removed = True
+
+
+class _FakeClient:
+    def __init__(self, container):
+        self.containers = self
+        self._container = container
+
+    def run(self, *_a, **_kw):
+        return self._container
+
+
+def _fake_docker(monkeypatch, container):
+    import bakeoff.container as container_module
+
+    monkeypatch.setattr(
+        container_module.docker, "from_env", lambda: _FakeClient(container)
+    )
+
+
+def test_a_bind_mount_that_did_not_land_is_refused_and_the_container_removed(
+    monkeypatch, tmp_path
+):
+    """The production half of the trap `test_integration_node_task._mounted`
+    found. A host path the Docker VM does share, rmtree'd and re-materialized
+    between containers, is served from a stale mount cache and appears EMPTY
+    inside the container -- measured, four cycles of the same path gave
+    `[files], [], [files], []`.
+
+    Nothing downstream can tell that apart from a legitimate answer. An empty
+    `/repo` exits **1** with `No test files found` under both node frameworks,
+    which is the same exit a failing test gives; on the offline grader it
+    becomes `APPLY_FAILED` and stamps `resolved: False` -- an accusation
+    against a submission the model actually produced -- over an environment
+    difference the model never saw. So the check is here, at the one place
+    every call site goes through, rather than in each of the four that reuse a
+    host path.
+
+    The removal is half the guarantee. `__exit__` is not invoked when
+    `__enter__` raises, and the container carries `bakeoff.eval_agent` -- the
+    label `HostSampler` counts peers by -- so a refusal that left it running
+    would flip `contention_flag` on every concurrent run for as long as it
+    survived.
+    """
+    (tmp_path / "repo").mkdir()
+    (tmp_path / "repo" / "a.txt").write_text("x")
+    fake = _FakeContainer(listing=b"")
+    _fake_docker(monkeypatch, fake)
+
+    with pytest.raises(ContainerError, match="bind mount"):
+        with RunContainer(
+            image="sha256:" + "0" * 64,
+            repo_path=str(tmp_path / "repo"),
+            base_sha="",
+        ):
+            pass
+
+    assert fake.removed, (
+        "a refused container was left running under the label the sampler "
+        "counts peers by"
+    )
+
+
+def test_a_bind_mount_that_landed_is_not_refused(monkeypatch, tmp_path):
+    """The other half: a container that answers with anything at all is the
+    ordinary case, and this check must never cost a run that would work."""
+    (tmp_path / "repo").mkdir()
+    (tmp_path / "repo" / "a.txt").write_text("x")
+    fake = _FakeContainer(listing=b"/repo/a.txt\n")
+    _fake_docker(monkeypatch, fake)
+
+    with RunContainer(
+        image="sha256:" + "0" * 64,
+        repo_path=str(tmp_path / "repo"),
+        base_sha="",
+    ) as container:
+        assert container._container is fake
+    assert fake.removed, "the ordinary exit still removes the container"
+
+
+def test_an_empty_host_directory_is_not_a_mount_failure(monkeypatch, tmp_path):
+    """The post-condition is conditioned on the HOST side being non-empty,
+    because an empty answer is only evidence of a stale mount when there was
+    something to see. `oracle.py` and the grader both start a container over a
+    directory they are about to populate, and refusing those would turn a
+    defensive check into an outage."""
+    (tmp_path / "repo").mkdir()
+    fake = _FakeContainer(listing=b"")
+    _fake_docker(monkeypatch, fake)
+
+    with RunContainer(
+        image="sha256:" + "0" * 64,
+        repo_path=str(tmp_path / "repo"),
+        base_sha="",
+    ):
+        pass
+
+
 class _AddSequence:
     """A `git add -A` that fails the way the real race does, N times."""
 
@@ -265,12 +416,49 @@ class _AddSequence:
         return ExecResult(0, "diff-body", "", 1)
 
 
+class _SnapshotCalls:
+    """Records (argv, env) per exec and can fail one command by prefix.
+
+    `_FakeContainer` cannot serve the seed tests: its `exec_run(cmd, **_kw)`
+    discards `environment=` and records nothing, so neither "read-tree before
+    add" nor "the read-tree carried GIT_INDEX_FILE" is observable through it.
+    """
+
+    def __init__(self, fail_on: list[str] | None = None,
+                 exit_code: int = 1, message: str = "boom"):
+        self.calls: list[tuple[list[str], dict | None]] = []
+        self.fail_on = fail_on
+        self.exit_code = exit_code
+        self.message = message
+
+    def __call__(self, cmd, env=None):
+        from bakeoff.container import ExecResult
+
+        self.calls.append((list(cmd), dict(env) if env else None))
+        if self.fail_on and cmd[:len(self.fail_on)] == self.fail_on:
+            return ExecResult(self.exit_code, "", self.message, 1)
+        return ExecResult(0, "diff-body", "", 1)
+
+    @property
+    def argv(self) -> list[list[str]]:
+        return [cmd for cmd, _env in self.calls]
+
+
 def _container_with(exec_stub) -> RunContainer:
+    """The REAL `checked_exec` over a stubbed `exec`, deliberately.
+
+    This helper used to fake `checked_exec` too, with a lambda that never
+    looked at the exit code -- so a stub returning non-zero for the snapshot
+    index seed would be swallowed and `test_a_failed_seed_raises_rather_than_diffing`
+    would assert nothing. `RunContainer.checked_exec` calls `self.exec`, which
+    IS stubbed, so removing the override exercises the production check
+    through the same stub. Both `_AddSequence` users return exit 0 for every
+    non-`add` command, so the real check is a no-op for them.
+    """
     container = RunContainer(
         image="sha256:" + "0" * 64, repo_path="/tmp/x", base_sha="abc"
     )
     container.exec = exec_stub  # type: ignore[method-assign]
-    container.checked_exec = lambda cmd, env=None: exec_stub(cmd, env)  # type: ignore
     return container
 
 
@@ -319,7 +507,395 @@ def test_an_unrelated_git_failure_is_not_retried():
     assert stub.add_calls == 1
 
 
-# --- HostSampler: the host block is measured, or says it was not -------------
+# --- the snapshot index is SEEDED from the start state -----------------------
+#
+# `GIT_INDEX_FILE` starts empty and `git add -A` does not descend into a
+# gitlink path, so an uninitialised submodule diffed against `base_sha` reads
+# as `deleted file mode 160000` on a clean tree -- measured 2026-09-02, 199
+# bytes on a fixture and 239 on `tobymao/sqlglot`, agent having done nothing.
+# `grader._GITLINK_MODE` matches that line, so every such submission would be
+# refused SUBMODULE_GITLINK_UNGRADABLE.
+
+
+def test_the_snapshot_index_is_seeded_from_base_before_staging():
+    """ORDER, not presence: a read-tree issued after the staging is a seed the
+    `git add -A` never saw, and the index it wrote would already be the one
+    built from a worktree scan that cannot see the gitlink."""
+    stub = _SnapshotCalls()
+    container = _container_with(stub)
+
+    container.snapshot_diff("abc")
+
+    assert stub.argv[0] == ["git", "read-tree", "abc"]
+    assert stub.argv[1] == ["git", "add", "-A"]
+
+
+def test_the_seed_writes_the_scratch_index_not_the_agents_own():
+    """Without `env=` the read-tree writes the repository's OWN `.git/index`,
+    which is the agent's staging area and runs concurrently with it -- the
+    exact thing `snapshot_diff`'s docstring says it must never touch. That is
+    worse than the bug being fixed, so the env is pinned and not only the
+    argv."""
+    from bakeoff.container import SNAPSHOT_INDEX
+
+    stub = _SnapshotCalls()
+    container = _container_with(stub)
+
+    container.snapshot_diff("abc")
+
+    seed_argv, seed_env = stub.calls[0]
+    assert seed_argv == ["git", "read-tree", "abc"]
+    assert seed_env == {"GIT_INDEX_FILE": SNAPSHOT_INDEX}
+
+
+def test_a_failed_seed_raises_rather_than_diffing():
+    """The fallback for a silently failed seed IS the phantom deletion, which
+    is an accusation the agent deleted a submodule it never touched -- the
+    same argument `grader._refresh_index` makes for raising. Containment lives
+    one layer up in `checkpoints.maybe_capture`."""
+    stub = _SnapshotCalls(fail_on=["git", "read-tree"])
+    container = _container_with(stub)
+
+    with pytest.raises(ContainerError):
+        container.snapshot_diff("abc")
+
+    assert not any(cmd[:2] == ["git", "diff"] for cmd in stub.argv)
+
+
+def _fabricate_gitlink(repo, path="vendor/libdep", sha="1" * 40):
+    """A `160000` index entry over an empty directory, with no second
+    repository and no file transport.
+
+    Measured 2026-09-02, git 2.50.1: this gives a tree whose `git ls-files -s`
+    carries the gitlink, an empty directory at that path, and `git status
+    --porcelain` empty -- exactly the declared-unneeded state.
+    """
+    (repo / path).mkdir(parents=True)
+    subprocess.run(
+        ["git", "update-index", "--add", "--cacheinfo",
+         f"160000,{sha},{path}"],
+        cwd=repo, check=True, capture_output=True,
+    )
+
+
+@integration
+def test_an_uninitialised_gitlink_is_not_reported_as_a_deletion(
+        git_container_factory):
+    """The blocker this seed exists for. Measured UNSEEDED on this exact
+    fixture: 199 bytes, naming `["vendor/libdep"]`, on a clean tree the agent
+    never touched."""
+    def build(repo):
+        (repo / "calc.py").write_text("x = 1\n")
+        _fabricate_gitlink(repo)
+
+    container, start = git_container_factory(build)
+
+    assert container.snapshot_diff(start) == ("", [])
+
+
+@integration
+def test_a_repo_with_no_submodules_snapshots_byte_identically(git_container):
+    """The pin for the seed's UNCONDITIONALITY. `container.py` has no manifest
+    and must not gain one, which is affordable only because a repository with
+    no gitlink diffs identically either way.
+
+    The unseeded reference is produced IN THE TEST with raw `container.exec`
+    against a second scratch index: `snapshot_diff` always seeds after this
+    change, so it cannot produce its own control.
+    """
+    sha = git_container.base_sha
+    git_container.exec(["sh", "-c", "echo modified > /repo/tests/test_a.py"])
+    git_container.exec(["sh", "-c", "echo added > /repo/added.py"])
+    git_container.exec(["sh", "-c", "echo '*.log' > /repo/.gitignore"])
+    git_container.exec(["sh", "-c", "echo noise > /repo/scratch.log"])
+
+    unseeded_env = {"GIT_INDEX_FILE": "/tmp/bakeoff-unseeded-index"}
+    git_container.exec(["git", "add", "-A"], env=unseeded_env)
+    unseeded = git_container.exec(
+        ["git", "diff", "--cached", sha], env=unseeded_env
+    ).stdout
+
+    seeded, _files = git_container.snapshot_diff(sha)
+
+    assert seeded == unseeded
+    assert "added.py" in seeded
+
+
+@integration
+def test_a_tracked_file_matching_gitignore_is_not_reported_as_deleted(
+        git_container_factory):
+    """A PRE-EXISTING phantom the same empty index produced, and the shape
+    `eemeli/yaml` carries fifteen of (`.editorconfig`, `.github/workflows/*`,
+    `.gitignore` and `.gitmodules` themselves) and `bidict` one
+    (`.coveragerc`). From an empty index every path is untracked and `add -A`
+    honours the ignore rules, so a file tracked at the start state and also
+    matching `.gitignore` was absent from the index and reported DELETED.
+    Measured unseeded: names `[".coveragerc"]`.
+    """
+    def build(repo):
+        (repo / "calc.py").write_text("x = 1\n")
+        (repo / ".gitignore").write_text(".coveragerc\n")
+        (repo / ".coveragerc").write_text("[run]\n")
+        subprocess.run(["git", "add", "-f", ".coveragerc"], cwd=repo,
+                       check=True, capture_output=True)
+
+    container, start = git_container_factory(build)
+
+    _diff, files = container.snapshot_diff(start)
+
+    assert ".coveragerc" not in files
+
+
+@integration
+def test_a_moved_gitlink_still_reaches_the_submission(git_container_factory):
+    """D7's guarantee, pinned rather than assumed: the seed must not make the
+    grader's gitlink refusal unreachable. An agent handed an empty tracked
+    directory may well `git init` in it, and the content then lives in the run
+    tree's `.git/modules` and nowhere else -- so the ladder would grade the
+    original tree and stamp `resolved: False` on work it could not see.
+    """
+    def build(repo):
+        (repo / "calc.py").write_text("x = 1\n")
+        _fabricate_gitlink(repo)
+
+    container, start = git_container_factory(build)
+    container.exec(["sh", "-c",
+                    "cd /repo/vendor/libdep && git init -q "
+                    "&& git config user.email a@b.c && git config user.name a "
+                    "&& echo hi > f.txt && git add -A "
+                    "&& git commit -q -m inner"])
+
+    diff, files = container.snapshot_diff(start)
+
+    assert "vendor/libdep" in files
+    # A bare "160000" substring is satisfied by `deleted file mode 160000` --
+    # the phantom this seed removes -- as much as by a genuine move, so it
+    # cannot tell the two apart. `grader._GITLINK_MODE` matches on the mode
+    # line's exact shape; assert that shape, and rule the phantom out
+    # explicitly rather than relying on the positive match alone.
+    assert re.search(r"^index [0-9a-f]+\.\.[0-9a-f]+ 160000$", diff,
+                      re.MULTILINE)
+    assert "deleted file mode 160000" not in diff
+
+
+# --- round 2 item 17: the submodule state the diff cannot carry -------------
+
+
+class _ArgvRecorder:
+    """Records every argv it is handed and answers with canned stdout."""
+
+    def __init__(self, stdout: str = "", exit_code: int = 0, stderr: str = ""):
+        self.argvs: list[list[str]] = []
+        self._result = (exit_code, stdout, stderr)
+
+    def __call__(self, cmd, env=None):
+        from bakeoff.container import ExecResult
+
+        self.argvs.append(list(cmd))
+        return ExecResult(*self._result, 1)
+
+
+class _StatesDispatch(_ArgvRecorder):
+    """Three canned answers, one per argv `submodule_states` issues.
+
+    The second reader needs a stub that tells the three apart, which
+    `_ArgvRecorder` alone cannot: it answers every argv identically.
+    """
+
+    def __init__(self, status: str = "", ls_files: str = "", probe: str = ""):
+        super().__init__()
+        self._answers = {"status": status, "ls_files": ls_files,
+                         "probe": probe}
+
+    def __call__(self, cmd, env=None):
+        from bakeoff.container import ExecResult
+
+        self.argvs.append(list(cmd))
+        if cmd[0] == "sh":
+            out = self._answers["probe"]
+        elif cmd[:2] == ["git", "ls-files"]:
+            out = self._answers["ls_files"]
+        else:
+            out = self._answers["status"]
+        return ExecResult(0, out, "", 1)
+
+
+def test_the_submodule_state_argv_is_pinned_word_for_word():
+    """Every token was measured on 2026-09-02 (git 2.50.1).
+
+    `--no-optional-locks`: `git status` REWRITES the index, and the
+    submodule's index too. Both were stamped to `1577865600` and the command
+    re-run --
+
+        after --no-optional-locks:  super=1577865600  sub=1577865600
+        after plain status:         super=1788384510  sub=1788384510
+
+    -- so a plain `status` breaks the one rule `SNAPSHOT_INDEX`'s comment
+    states, in a method called from inside the agent's stdout loop while the
+    agent's own git is running.
+
+    `--ignore-submodules=none`: three config sites silence the entry
+    completely without it, each measured in isolation in a dirty state --
+    `submodule.<name>.ignore=all` in `.git/config`, `diff.ignoreSubmodules
+    =all` in `.git/config`, and `submodule.<name>.ignore=all` in
+    `.gitmodules`. The third is REPOSITORY-AUTHORED: it ships in the upstream
+    tree the task was cut from, so without the flag a file the task author
+    never wrote disarms the record.
+
+    `-z`: the path field is C-quoted under `core.quotePath` and
+    space-delimited otherwise.
+    """
+    stub = _ArgvRecorder(stdout="")
+    container = _container_with(stub)
+
+    container.submodule_states()
+
+    assert stub.argvs[0] == [
+        "git", "--no-optional-locks", "status",
+        "--porcelain=v2", "--ignore-submodules=none", "-z",
+    ]
+
+
+def test_a_submodule_state_read_takes_paths_and_states_from_the_nul_stream():
+    """The forged-record shape, measured 2026-09-02 (git 2.50.1).
+
+    A `2` (rename/copy) record occupies TWO NUL items -- the new path, then
+    the ORIGINAL. That second item is a path, which is repository-authored
+    text, and a path may be NAMED so that it reads as a record. A tracked file
+    named
+
+        `1 .M S.M. 160000 160000 160000 aaaaaaa bbbbbbb sneakysub`
+
+    renamed to `ordinary.py` puts exactly that string in the second slot:
+
+        2 R. N... 100644 100644 100644 <h> <h> R100 ordinary.py\0
+        1 .M S.M. 160000 160000 160000 aaaaaaa bbbbbbb sneakysub\0
+
+    A parser that advances by ONE reads that second item at the top of its
+    loop, matches `"1 "`, and files a submodule state for `sneakysub` on a
+    repository with no submodule at that path -- content reaching column zero
+    of a record, the failure `grader._GITLINK_MODE` states one level down.
+    `"sneakysub" not in states` is the assertion that goes red under
+    `index += 1`.
+
+    The ordinary file is excluded by its `N` sub-field, and the untracked
+    `a dir/` shows the field split is by COUNT and not fooled by a space.
+    """
+    stream = "\0".join([
+        "1 .M S.M. 160000 160000 160000 aaaa bbbb vendor/libdep",
+        "1 .M N... 100644 100644 100644 cccc dddd calc.py",
+        "2 R. N... 100644 100644 100644 eeee ffff R100 ordinary.py",
+        "1 .M S.M. 160000 160000 160000 aaaaaaa bbbbbbb sneakysub",
+        "? a dir/",
+        "",
+    ])
+    container = _container_with(_ArgvRecorder(stdout=stream))
+
+    states = container.submodule_states()
+
+    assert states == {"vendor/libdep": "S.M."}
+    assert "sneakysub" not in states
+
+
+def test_a_failed_submodule_state_read_raises_rather_than_reporting_a_clean_tree():
+    """`checked_exec`, never `exec`: an empty stdout from a failed
+    `git status` is byte-identical to a tree with no dirty submodule, so
+    reading that silence as "clean" fabricates the measurement this whole
+    field exists to make honestly.
+
+    `_container_with` stubs `exec` ONLY and leaves the production
+    `checked_exec` in place, which is what makes it usable here -- it used to
+    replace that method too, and under the old helper this test would have
+    asserted nothing.
+    """
+    container = _container_with(
+        _ArgvRecorder(exit_code=1, stderr="fatal: not a git repository")
+    )
+
+    with pytest.raises(ContainerError) as excinfo:
+        container.submodule_states()
+
+    assert "fatal: not a git repository" in str(excinfo.value)
+
+
+def test_content_in_an_uninitialised_submodule_is_recorded_as_a_distinct_marker():
+    """The state NOTHING else can see, measured 2026-09-02.
+
+    With the scratch index seeded from `base_sha`, `git add -A` does not
+    descend through a gitlink boundary -- so a file an agent writes into an
+    UNINITIALISED submodule directory stages 0 bytes, and git emits no v2
+    record for it either, because the path is a boundary git will not enter.
+    Recorded nowhere at all without this second reader.
+
+    The marker is ONE CHARACTER and deliberately not a four-character `S...`
+    shape: git's sub-state is always four characters beginning with `S`, so a
+    forged `S..U` would be a verdict git never issued passing
+    `grader._submodule_edits`' `len(state) == 4` guard silently.
+    """
+    from bakeoff.schema import SUBMODULE_UNINITIALISED_CONTENT
+
+    stub = _StatesDispatch(
+        status="", ls_files="160000 " + "a" * 40 + " 0\tvendor/libdep\0",
+        probe="vendor/libdep\0",
+    )
+    container = _container_with(stub)
+
+    states = container.submodule_states()
+
+    assert states == {"vendor/libdep": SUBMODULE_UNINITIALISED_CONTENT}
+    assert states["vendor/libdep"] != "S..U"
+
+
+def test_an_initialised_submodule_is_left_to_git_and_not_probed():
+    """The probe cannot overwrite a git verdict, and M7's disjointness is why
+    it never tries. The rule is a DIRECTORY test, not a `.git` test: on a
+    path with no `.git`, v2 fires only when the directory is ABSENT (a removed
+    gitlink gives `1 .D S...`) and the probe only when it is NON-EMPTY, which
+    are mutually exclusive. The `.git` test is what makes the probe cheap --
+    an initialised path is skipped without a `find` -- and the real script
+    prints nothing here for exactly that reason."""
+    stub = _StatesDispatch(
+        status="1 .M S.M. 160000 160000 160000 aaaa bbbb vendor/libdep\0",
+        ls_files="160000 " + "a" * 40 + " 0\tvendor/libdep\0",
+        probe="",
+    )
+    container = _container_with(stub)
+
+    assert container.submodule_states() == {"vendor/libdep": "S.M."}
+
+
+def test_the_uninitialised_probe_argv_is_pinned_word_for_word():
+    """Paths go through `"$@"` and never through string interpolation, so a
+    gitlink path containing a space, a quote or a `$` is passed verbatim --
+    `vendor/lib dep` was measured coming back whole. `"sh"` fills the `$0`
+    slot, which is what makes `"$@"` start at the first real path."""
+    from bakeoff.container import _UNINITIALISED_CONTENT_SH
+
+    stub = _StatesDispatch(
+        status="", ls_files="160000 " + "a" * 40 + " 0\tvendor/libdep\0",
+        probe="",
+    )
+    container = _container_with(stub)
+
+    container.submodule_states()
+
+    assert stub.argvs[-1] == [
+        "sh", "-c", _UNINITIALISED_CONTENT_SH, "sh", "vendor/libdep",
+    ]
+
+
+def test_a_tree_with_no_gitlinks_never_runs_the_probe():
+    """The short-circuit that keeps the cost off every task in today's corpus
+    but one: `ls-files` returns nothing, `_uninitialised_with_content` returns
+    before the exec, and the tree pays one extra `ls-files` and nothing
+    more."""
+    stub = _StatesDispatch(status="", ls_files="", probe="unreachable\0")
+    container = _container_with(stub)
+
+    states = container.submodule_states()
+
+    assert states == {}
+    assert not any(argv[0] == "sh" for argv in stub.argvs)
 
 
 def test_a_first_stream_frame_yields_no_percentage():
@@ -588,3 +1164,120 @@ def test_no_container_is_nothing_to_sample_not_a_sampling_failure():
     assert metrics.error == ""
     assert metrics.samples == 0
     assert metrics.contention_flag is None
+
+
+# --- fresh_tree: a host path no container has mounted before ---
+
+
+def test_two_allocations_under_one_parent_are_different_paths(tmp_path):
+    """The Docker VM caches the directory it serves for a bind-mount source,
+    so a second container on one host path is served the cached copy -- EMPTY,
+    measured 2026-09-02 as `[files], [], [files], []` over four cycles. Two
+    allocations under one key must therefore never be one path."""
+    key = tmp_path / "grade-tree" / "run-a"
+    first = fresh_tree(key)
+    second = fresh_tree(key)
+
+    assert first != second
+    assert first.is_dir() and second.is_dir()
+    assert list(first.iterdir()) == []
+    assert list(second.iterdir()) == []
+    # The stable key stays in the path, so an operator can still find a tree
+    # by grepping the cache layout; only the leaf is unique.
+    assert first.parent == second.parent == key
+
+
+def test_an_allocated_tree_is_empty_even_when_a_sibling_holds_content(tmp_path):
+    """`materialize` refuses an existing destination and creates its parent,
+    so allocating the leaf before `materialize(..., leaf / "repo", ...)` is
+    only correct while the leaf itself arrives empty."""
+    key = tmp_path / "preflight-tree" / "click-3360"
+    first = fresh_tree(key)
+    (first / "repo").mkdir()
+    (first / "repo" / "README.md").write_text("x")
+
+    second = fresh_tree(key)
+
+    assert list(second.iterdir()) == []
+    assert (first / "repo" / "README.md").read_text() == "x"
+
+
+def test_a_removed_tree_is_never_handed_out_again(tmp_path):
+    """The rule that makes every caller's `finally: rmtree(tree)` safe: a
+    caller may remove a tree this returned precisely BECAUSE the allocator
+    will not reissue the name. Removing a path that comes back is the defect
+    itself."""
+    key = tmp_path / "grade-tree" / "run-a"
+    removed = fresh_tree(key)
+    shutil.rmtree(removed)
+
+    later = [fresh_tree(key) for _ in range(50)]
+
+    assert removed not in later
+
+
+def test_a_sibling_older_than_a_day_is_swept_and_a_fresh_one_is_not(tmp_path):
+    """The husks a killed process leaves behind are collected by AGE, never by
+    "every sibling": `run_matrix` and `grade.py` run against one cache at the
+    same time on purpose, and deleting a live tree out from under another
+    process is worse than leaking an inode. The recent-sibling half is the
+    load-bearing one."""
+    key = tmp_path / "preflight-tree" / "click-3360"
+    key.mkdir(parents=True)
+    old = key / "an-abandoned-husk"
+    old.mkdir()
+    recent = key / "a-live-tree"
+    recent.mkdir()
+    stale = time.time() - STALE_TREE_AGE_S - 60
+    os.utime(old, (stale, stale))
+
+    allocated = fresh_tree(key)
+
+    assert not old.exists()
+    assert recent.is_dir()
+    assert allocated.is_dir()
+
+
+@pytest.mark.parametrize("failing", ["scandir", "rmtree"])
+def test_a_sweep_that_fails_does_not_cost_the_allocation(
+    tmp_path, monkeypatch, failing
+):
+    """The rule `HostSampler.start` and `checkpoints.maybe_capture` keep: an
+    observation that cannot be made must not cost the work it was observing.
+    A sweep is housekeeping; the allocation is the product."""
+    key = tmp_path / "preflight-tree" / "click-3360"
+    key.mkdir(parents=True)
+    husk = key / "husk"
+    husk.mkdir()
+    stale = time.time() - STALE_TREE_AGE_S - 60
+    os.utime(husk, (stale, stale))
+
+    def _boom(*args, **kwargs):
+        raise OSError("sweep denied")
+
+    if failing == "scandir":
+        monkeypatch.setattr(bakeoff.container.os, "scandir", _boom)
+    else:
+        monkeypatch.setattr(bakeoff.container.shutil, "rmtree", _boom)
+
+    tree = fresh_tree(key)
+
+    assert tree.is_dir()
+    assert list(tree.iterdir()) == []
+
+
+def test_an_allocated_tree_is_not_mkdtemps_owner_only_mode(tmp_path):
+    """`tempfile.mkdtemp` hard-codes 0o700. The container runs as uid 1000 and
+    the host directory is owned by the operator, so on a Linux host (no
+    ownership remapping) that mode makes the bind mount unreadable to the
+    agent -- which is why this allocator is a `mkdir` and not an `mkdtemp`.
+
+    The assertion is relative to the process umask, so it is honest at every
+    umask and red under `mkdtemp` at every umask. Do NOT delete or weaken it:
+    the neighbouring `grader._ContainerEnv.scan_secrets` does use `mkdtemp`
+    (correctly -- gitleaks runs as root in its own container), which makes
+    this the decision a future refactor is most likely to undo."""
+    old = os.umask(0o022)
+    os.umask(old)
+    tree = fresh_tree(tmp_path / "grade-tree" / "run-a")
+    assert stat.S_IMODE(tree.stat().st_mode) == 0o777 & ~old

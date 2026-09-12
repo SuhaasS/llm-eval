@@ -3,6 +3,7 @@ import json
 from bakeoff.schema import (
     SCHEMA_VERSION,
     CacheState,
+    Checkpoint,
     Outcome,
     RunRecord,
     TerminationReason,
@@ -72,6 +73,61 @@ def test_an_undetermined_cache_state_survives_the_json_boundary():
     assert restored.cache_state.warm is None
     assert restored.cache_state.prior_same_task_run_id == "r-002"
     assert restored == record
+
+
+def test_an_empty_submodule_state_is_not_an_unread_one_across_the_json_boundary():
+    """`submodules_dirty` and `submodules_dirty_at_exit` have three states, and
+    the two that render as containers are the ones that must not merge: `{}` is
+    READ AND NOTHING DIRTY, `None` is NOT READ. An encoder that dropped empty
+    containers -- or a decoder that read a missing key as `{}` -- would restore
+    "nothing is dirty" for "nobody looked", which is the accusation-shaped
+    failure 3.10.0 exists to prevent. Modelled on `cache_state.warm`'s own
+    boundary test above, for the same reason."""
+    def build(dirty):
+        return RunRecord(
+            run_id="r-011",
+            task_id="t-001",
+            task_version=1,
+            model="claude-sonnet-5",
+            harness="claude-code",
+            sample_index=0,
+            started_at="2026-08-04T00:00:00Z",
+            finished_at="2026-08-04T00:05:00Z",
+            outcome=Outcome.FAILED,
+            terminated_by=TerminationReason.AGENT_FINISH,
+            turns_used=3,
+            submodules_dirty_at_exit=dirty,
+            checkpoints=[Checkpoint(
+                turn=1,
+                diff_vs_base="",
+                files_touched=[],
+                elapsed_ms=10,
+                submodules_dirty=dirty,
+            )],
+        )
+
+    measured = RunRecord.from_dict(json.loads(json.dumps(build({}).to_dict())))
+    assert measured.submodules_dirty_at_exit == {}
+    assert measured.submodules_dirty_at_exit is not None
+    assert measured.checkpoints[0].submodules_dirty == {}
+    assert measured.checkpoints[0].submodules_dirty is not None
+
+    unread = RunRecord.from_dict(json.loads(json.dumps(build(None).to_dict())))
+    assert unread.submodules_dirty_at_exit is None
+    assert unread.checkpoints[0].submodules_dirty is None
+
+    observed = RunRecord.from_dict(
+        json.loads(json.dumps(build({"vendor/lib": "S.M."}).to_dict()))
+    )
+    assert observed.submodules_dirty_at_exit == {"vendor/lib": "S.M."}
+    assert observed.checkpoints[0].submodules_dirty == {"vendor/lib": "S.M."}
+
+    absent = json.loads(json.dumps(build({}).to_dict()))
+    absent.pop("submodules_dirty_at_exit")
+    absent["checkpoints"][0].pop("submodules_dirty")
+    restored = RunRecord.from_dict(absent)
+    assert restored.submodules_dirty_at_exit is None
+    assert restored.checkpoints[0].submodules_dirty is None
 
 
 def test_a_schema_2_0_0_record_still_loads_with_its_own_version():
@@ -186,11 +242,28 @@ def test_run_record_stamps_schema_version_automatically():
     assert record.schema_version == SCHEMA_VERSION
 
 
-def test_schema_3_9_0_adds_the_provider_fields_with_no_claim_defaults():
+def test_schema_3_11_0_carries_both_lineages_with_no_claim_defaults():
+    """Two lineages each minted a 3.9.0 -- the provider one added these four
+    fields, the task-set one changed what the diff asserts and then added the
+    submodule pair at its 3.10.0. The merged record carries all of it, so the
+    constant has to name a version neither lineage used; a reader that saw
+    `3.9.0` could not tell which schema it was holding.
+
+    Pinned here rather than left to the changelog because the defaults are the
+    claim: every one of them has to keep saying "not observed" after the
+    merge, and a dataclass default is exactly the thing a merge silently
+    rewrites."""
     from bakeoff.schema import Versions
     import dataclasses
 
-    assert SCHEMA_VERSION == "3.9.0"
+    assert SCHEMA_VERSION == "3.11.0"
+    # The task-set lineage's 3.10.0 half. `None` is "nobody looked" and `{}`
+    # is "read, nothing dirty"; a default of `{}` would convert every run
+    # predating the read into the second claim.
+    assert {f.name: f.default
+            for f in dataclasses.fields(RunRecord)}["submodules_dirty_at_exit"] is None
+    assert {f.name: f.default
+            for f in dataclasses.fields(Checkpoint)}["submodules_dirty"] is None
     fields = {f.name: f for f in dataclasses.fields(RunRecord)}
     assert fields["terminal_native_finish_reason"].default is None
     assert fields["cost_usd_provider"].default is None

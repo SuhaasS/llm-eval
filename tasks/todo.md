@@ -2508,3 +2508,2926 @@ paths against a faked `_run_codex`, and the supersession rules against
 hand-built judgment lines. Whether a real pass reproduces the two-block split
 F2 fixed, and whether a real codex reply exercises the extractor's rescan, are
 still live-run questions.
+
+## Broadening 1 — `strip_paths` — 2026-09-01
+
+The corpus's binding constraint was not the loader's strictness but a *date*:
+most public repositories added `CLAUDE.md` or `AGENTS.md` at some point, and
+every candidate PR after that commit was out. sqlglot — the richest source by
+an order of magnitude — lost 116 candidates to a file no bug-fix PR touches.
+`strip_paths` removes the named paths in the same fixed-identity setup commit
+that already applies the test half and `gitignore_extra`, so the modification
+lands in `manifest_digest` and in `start_sha` instead of in a hand-rewritten
+history nobody can find upstream.
+
+Five decisions worth keeping:
+
+- **Strip does not imply exclusion from the reference halves.** The tempting
+  shape is for a stripped path to be dropped from `solution_diff`
+  automatically. That makes the reference stop being the merged PR verbatim,
+  and preflight only notices when the missing hunk happens to be one the f2p
+  tests need — so the case that survives every gate is a reference that is no
+  longer a reference. `allow_extra_paths` already means "neither half" and
+  already leaves the file named in `extra_files`, so requiring it keeps the
+  combination visible.
+- **A path matching nothing raises, in `materialize`.** Not at load — the
+  loader never sees the tree. Not in preflight — verdicts there are cached, and
+  the code that would silently do nothing is `materialize`. `--ignore-unmatch`
+  is what a typo needs to become permanent: preflight's `_CONTEXT_FILES` check
+  knows four names, so a mistyped vendored tree would pass every gate into an
+  append-only log. The cost is a constraint task authors have to know: a strip
+  only applies to a path tracked at `base_sha`, so a file the PR *creates*
+  cannot be stripped even when `allow_extra_paths` legitimately names it.
+- **The existence check reads `git ls-files`'s output, not its exit code.**
+  Measured: `git ls-files -z -- nope` exits **0** with an empty stdout. Same
+  silent zero `container._checked_exec` exists to refuse.
+- **The strip probe is `-e` OR `-L`; the context-file probe stays `-e`.**
+  Measured: for a symlink whose target is gone, `[ -e x ]` exits 1 and
+  `[ -L x ]` exits 0. sqlglot's `CLAUDE.md` is a symlink to `AGENTS.md`, so
+  stripping the target alone leaves a path the agent's `ls` shows and an
+  `-e`-only assertion calls removed. The two callers want opposite answers on
+  that input, which is why the predicate takes a flag rather than picking one.
+- **The build context is stripped too.** For agent files it does not matter —
+  the bind mount replaces `/repo`. For a committed venv it does: the tree is on
+  the import path when `image.build` runs `pip install -e .`, so the image
+  pins an environment resolved against a directory the run tree does not have.
+
+Two things the validation had to add beyond `_validate_prefixes`, both because
+this key's effect is a delete rather than a classification: `.` passes every
+existing check and names the whole tree (`PurePosixPath(".").parts` is `()`,
+and `is_relative_to(".")` is True for everything), and `git rm` reads
+pathspecs, so an unrefused `*` would make what is removed a property of the
+tree rather than of the manifest.
+
+Both one-line **call sites** are pinned by default-suite tests rather than by
+mutation anchors, and that was round 1 of the plan review's finding: helper
+tests leave `build_task_image`'s call and `preflight`'s assertion deletable
+with the suite green, and an integration-only pin is deselected by
+`addopts = "-m 'not integration'"` on the run anyone actually makes.
+
+`PREFLIGHT_VERSION` 2 → 3, and the grader's prose reference to version 2 became
+"2 or later". `SCHEMA_VERSION` did not move: nothing new is written into a
+record, and the strip is already visible there as the start sha `to_task_spec`
+carries in `base_sha`.
+
+Confound recorded in HARVESTING.md rather than in code: the humans who wrote
+the PR had the stripped file. A repository whose `CLAUDE.md` shaped how its
+contributors worked is not quite the repository the models are handed once it
+is gone, and that belongs in each manifest's comments as a §6.4 caveat.
+
+## Broadening 2 — f2p that cannot be COLLECTED at the start state — 2026-09-01
+
+A task whose fix ADDS a symbol has always had a real shape: the test half
+raises `ImportError` at the start state instead of an assertion failing, and
+preflight refused it outright as a broken environment. This broadening accepts
+it, under a measured, narrow condition — and the plan's own first draft got
+the mechanics wrong twice before landing.
+
+- **The brief said exit 2; the gate sees exit 4.** `_Runner.select` passes node
+  ids positionally, and pytest answers a node id whose module raises on import
+  with a usage error. Exit 2 is a directory or module-path run — how the
+  `trucking-doc-extraction` #3 measurement was taken. An acceptance written for
+  2 alone would have been dead code on every task preflight actually
+  runs. Measured against pytest 9.1.1 and 8.3.5; they agree on every row.
+- **`--continue-on-collection-errors` was measured and rejected.** Exit 4 on
+  the f2p selection with and without it, byte-identical. It does rescue the
+  p2p run, but only to exit 1, and applying it to the *graded* p2p would turn a
+  broken import anywhere in the tree from an environment error into a
+  `p2p_regression` — an accusation manufactured out of the environment.
+  `--ignore=<module>` on preflight's p2p-before, the one p2p argv the grader
+  never makes, gives exit 0 instead.
+- **The confinement parse alone is `returncode != 0` wearing a regex.** The
+  f2p selection imports only the f2p modules, so a missing interpreter
+  dependency produces exactly the confined error set the task shape produces.
+  The p2p baseline is the second conjunct, and it is why the f2p verdict is
+  deferred until after the p2p run rather than the runs being reordered.
+- **Equality in preflight, containment in the grader.** Preflight must account
+  for every declared id and a partial collection error hides the rest of the
+  selection (measured), so equality is the id-level rule at module
+  granularity. The grader must never accuse for anything outside the task, so
+  a partially fixed submission errors on a subset and is still `f2p_failed`,
+  while a stranger module stays an environment error.
+- **The mis-bucketing the grader change fixes was directional.** A do-nothing
+  arm graded NOT GRADED and a half-fixing arm graded `False`, so the arm that
+  did nothing was invisible in every view counting `False`.
+- **The acceptance is a THREE-way conjunction, and the first draft of this
+  plan claimed two.** A dependency imported *only* by the f2p module is
+  confined (the f2p selection imports nothing else) and leaves p2p green (p2p
+  never imports it), so neither of the first two conjuncts can see it.
+  **Green-after is the environment discriminator** — and the existing Phase 0c
+  integration fixture is that shape exactly.
+- **The Phase 0c end-to-end pin had to be rewritten, and its mutation anchor
+  repointed.** That fixture's broken import lives in the declared f2p module,
+  so it became *confined* and was intercepted by the new branch — the
+  assertion no longer matched and, worse, `mutation_check`'s revert of
+  `elif red.exit_code != EXIT_TESTS_FAILED:` became **inert**, i.e. green on a
+  reverted guarantee. The replacement puts the missing module in
+  `tests/conftest.py`: measured, that exits 4 with no `short test summary
+  info` section at all, so the reported set is empty and the run is
+  unconfined.
+- **The new `MUTATIONS` entry anchors on the equality, not on the
+  `and p2p_green` conjunct.** `if not p2p_green:` is unconditional, so
+  reverting that conjunct changes the refusal *message* and not the verdict;
+  dropping the equality flips a NO-GO into a GO.
+- **What was NOT relaxed:** green-after (pinned by its own test), check 6,
+  `oracle._classify`, the graded p2p argv, and `tests.runner` must contain
+  `pytest`.
+- **Operator note carried into `HANDOFF`-style prose rather than left
+  implicit:** `GRADER_VERSION` 2 → 3 makes `scripts/grade.py`'s resume gate
+  re-grade **every stored run**, into a fresh `v3` artifacts directory beside
+  the existing one. That is intended (a verdict derived under a different
+  ladder is a new line whose disagreement with the old one is the finding),
+  and it costs a full grading pass per event log — budget for it rather than
+  discovering it mid-run.
+- `PREFLIGHT_VERSION` 3 → 4, `GRADER_VERSION` 2 → 3, `SCHEMA_VERSION` unmoved,
+  no manifest key, `click-3360`'s `start_sha` unmoved.
+
+Two small fixes folded in with the docs, from this task's own review: the
+red-before refusal message used to print `sorted(collected) if collected else
+'empty'`, but `collected` is also `None` when the exit code fell outside
+`EXIT_COLLECTION_FAILURES` and the parse never ran — a case that used to read
+as "pytest reported nothing" when the branch never looked. The message now
+says which. And `test_an_f2p_module_that_will_not_import_is_accepted_when_p2p_is_green`
+is parametrized over exit codes `[4, 2]` — the exit-2 arm, reachable via a
+bare-module f2p entry, was unpinned.
+
+## Broadening 3 — hypothesis suites — 2026-09-01
+
+Layer 2 categorically excluded a property-based suite: "a hypothesis-driven
+suite can pass a wrong fix on a lucky draw and fail a right one on an unlucky
+seed." Five commits (`c41d20a`, `e34aeb7`, `009ac45`, `5f4caab`, `579579e`)
+replace that exclusion with a manifest `image.env` key — an allowlist of exactly `CI` and
+`HYPOTHESIS_STORAGE_DIRECTORY` — baked into the task Dockerfile as `ENV` lines
+after every build step, so Hypothesis's determinism reaches every process in
+the container: the gate's runner, the oracle's, the grader's, the agent's own
+`claude`, and the commands the agent invents. `pinned_env_keys()` proves the
+allowlist disjoint from the keys the harness itself sets, so nothing an image
+declares can be silently shadowed on one exec and not another.
+
+Measurements that decided it:
+
+- **§1a's ten-run row.** One property test over a rare input, no seed,
+  default profile: `0 0 0 0 1 1 1 1 0 0` across ten fresh runs of unchanged
+  code on an unchanged tree. Under `CI=1`: `1 1 1 1 1 1`.
+- **The `ci` profile is three settings, not one, registered at import.**
+  `derandomize=True`, `database=None`, `deadline=None`, auto-loaded on any of
+  twelve CI variables being present — `"CI"` counts on presence alone, any
+  value. `derandomize=True` *implies* `database=None` (passing a non-`None`
+  database alongside it raises `InvalidArgument`), so seed and database are
+  one lever, not two.
+- **`HYPOTHESIS_PROFILE` is not an environment variable.** Grepping hypothesis
+  6.167.1's site-packages for it returns no matches; the string in
+  `pytest --help` is argparse's metavar for `--hypothesis-profile`, and that
+  flag with an unregistered profile name is `INTERNALERROR`, exit 3, zero
+  tests run.
+- **`.hypothesis/.gitignore` self-ignores.** Hypothesis writes it containing
+  `*` the first time it creates the directory, so `git status --porcelain` is
+  already clean and `git add -A` does not sweep it into a submission diff.
+- **`--hypothesis-seed` is exit 4 without the plugin**, identically via the
+  CLI and via `PYTEST_ADDOPTS`, in an image without hypothesis — where `CI=1`
+  is inert there (exit 0, nothing written). That asymmetry is why `CI` is the
+  key and a seed flag is not: a seed flag would break every other task's
+  image the moment hypothesis was absent.
+- **The Docker merge was measured, not taken from the docstring.** Against an
+  image declaring three `ENV` keys, three exec shapes agree on one rule:
+  merge, with the exec's own keys winning. No `env=` argument sees all three
+  image keys; an `env={...}` argument sees all three plus its own; an
+  overriding `env=` sees the override and the other two unchanged. That is
+  what makes `container_env` naming none of `_IMAGE_ENV_ALLOWED` load-bearing,
+  pinned by `pinned_env_keys()`'s disjointness assertion offline and by
+  `5f4caab`'s integration test against a real image and both exec shapes.
+- **§1g's constant-mining table, the finding that reshaped Layer 2.** Same
+  property, same `CI=1`, varying only a literal in an imported `magic.py`:
+  `MAGIC = 137` finds a one-in-a-billion bug `1 1 1 1 1 1`, `MAGIC = 1370`
+  misses it `0 0 0 0 0 0`, `MAGIC = 137` again finds it, `MAGIC = 999` misses
+  it — reversible, six of six each way. The same literal in a file the suite
+  does not import changes nothing. Determinism makes the oracle reproducible;
+  it does not make it correct, and the example pool a submission is judged by
+  is a function of the source under test — coupled to exactly the modules the
+  agent is asked to edit.
+- **The `claude` 2.1.220 grep, settled by a live probe rather than left as a
+  reading of a 272 MB bundle.** Every `CI` hit in the bundled CLI is colour
+  selection or an environment-name function; seven of eight `isCI` matches are
+  false positives from bundled zod's `isCIDR`. The offline smoke gate then ran
+  the real CLI over the real transport twice — once against the unmodified
+  base image, once against a throwaway image carrying `ENV CI=1` appended at
+  the end of `docker/eval-agent.Dockerfile`, reverted immediately after. Both
+  runs agreed on all three arms: `turns_streamed=3`, `stdout_malformed_lines=0`,
+  `turns_used=3`, verdict `go`. `TASKS.md` keeps only what this cannot answer —
+  whether a *live* run differs.
+
+Four things the plan's own first draft got wrong, corrected before code was
+written:
+
+1. It assumed a `HYPOTHESIS_PROFILE` environment variable existed; §1b found
+   none.
+2. It assumed `gitignore_extra` was needed for `.hypothesis/`; the tree is in
+   fact already clean without it (decision 10), and the entry would have
+   moved `start_sha` for no observable change.
+3. It assumed a seed and a database were separate levers to pull; measured,
+   `derandomize=True` implies `database=None`, so they are one.
+4. **Its mechanism for tree-dependence was wrong.** The first draft blamed
+   "the agent edits the tree" — adding an unrelated file at the repo root
+   holding the falsifying literal changed nothing (`0 0 0`, §1g). The real
+   mechanism is Hypothesis mining constants out of the modules the suite
+   **imports**, which is narrower than the first draft's claim, worse (it is
+   coupled to exactly the files the agent is asked to change), and reversible
+   in both directions on the same literal.
+
+Deliberately not built (decision 12): no `tests.env` or per-exec env plumbing
+(decision 3's rejected mechanism, because the agent is never told
+`tests.runner`); no new `RunRecord`/`GradeRecord` field and no
+`SCHEMA_VERSION`/`GRADER_VERSION` bump (decision 8 —
+`Versions.container_image_digest` already pins the `ENV` layer as an
+observation of the built image); no hypothesis in the base image (a task that
+needs it declares `image.pip`, like any other dependency); no unknown-key
+rejection for the `image:` block generally; no new task cut from
+`attrs`/`cattrs` — their other blocker, an editable install colliding with a
+site-packages `attr`, is unmeasured, and `HARVESTING.md` records that rather
+than implying the repositories are now usable; no `--hypothesis-seed`,
+`--hypothesis-profile`, `HYPOTHESIS_DATABASE_FILE` or
+`PYTEST_DISABLE_PLUGIN_AUTOLOAD` anywhere (decisions 1e, 2, 11).
+
+`PREFLIGHT_VERSION` 4 → 5 (the env read-back and the two hypothesis probes are
+new preflight assertions). `SCHEMA_VERSION` and `GRADER_VERSION` unmoved —
+nothing new reaches a record and no ladder check changes what it means.
+`click-3360`'s `start_sha` unmoved: the new key is under `image:`, which is
+not an input to `materialize`. Unit suite: 1225 passed, 50 deselected.
+
+Final-review fix wave (this section's own commit): a loader-table row for
+`image.env` and two preflight bullets for the hypothesis-without-CI NO-GO and
+the rg-could-not-answer refusal, both of which were code refusals listed only
+under Layer 2; the `PREFLIGHT_VERSION` 5 comment corrected from "two
+environment assertions" to the three that shipped; the ambiguous "hypothesis-
+import probe" wording (confusable with the `import hypothesis` probe) renamed
+to "hypothesis-import scan (rg over tests.paths)", with the never-ran test's
+substring assertion updated to match; a missing `"--"` before the scanned
+paths in the rg argv, so a `tests.paths` entry starting with `-` cannot parse
+as a flag; two new params on the non-empty-string `_env_map` refusal (`CI: 1`
+as a YAML int, `CI: ""` as an empty string), which had no coverage; and the
+click `task.yaml` refused-chars comment, which named a newline, a quote, a
+backslash and `$` but not `\r`. Verified: full unit suite; the integration leg
+including `task_image` (the env-merge test at
+`tests/test_integration_grader.py` had never run); a fresh `--preflight-only`
+GO on `click-3360-write-usage-empty-args`; and `mutation_check.py` run solo.
+
+## Broadening 4 — a per-task suite timeout — 2026-09-01
+
+The 600 s bound wrapping every in-container command preflight, the oracle and
+the offline grader run was a constant three consumers each held their own
+copy of. `budget.suite_timeout_s` (default 600, same number) moves it into the
+manifest, so a task whose suite legitimately needs more than 600 s can be
+gated and graded under a bound the author actually declared, instead of being
+refused by the gate or stamped `timed_out` by the grader on a number nobody
+chose. One key, not two: it bounds the suite invocations **and** every
+declared `grading.*` argv (build / typecheck / lint), because a second key
+for the grading commands would be a second number that can diverge between
+the gate and the grader — the exact defect being closed, for a distinction
+nobody asked for.
+
+- **The parameters are deleted, not defaulted.** `preflight()` and
+  `ensure_oracle()` both already take `task`, so a `timeout_s: int = 600`
+  parameter beside it would be a second source for one number whose
+  divergence is invisible: a suite that fits one bound and is killed under
+  the other stamps `timed_out` — a `GradeFailure`, i.e. `resolved: False` — on
+  a number the model never saw. Deleting the parameter makes "a consumer left
+  on the constant" unrepresentable rather than merely tested for. **Neither
+  driver needed a line changed as a result** — `run_matrix.py` and
+  `grade.py` call both functions with `task` and never passed a bound today —
+  which is the evidence the seam (`task.budget.suite_timeout_s`, read at each
+  call site) was the right one rather than a parameter threaded through two
+  more layers.
+
+- **`suite_timeout_s > wall_clock_timeout_s` is a `load_task` refusal, not a
+  preflight problem and not author advice.** The agent re-runs this suite
+  *inside* its wall clock with no per-command bound (`claude_runner`'s
+  container backend wraps the whole `claude -p` in one `timeout`, fed
+  `wall_clock_timeout_s`), so a longer `suite_timeout_s` describes a task no
+  arm could verify even once — spec §3.3 measures a loop that ends in "runs
+  tests, sees failures, self-corrects", and a run SIGTERMed mid-suite is that
+  loop truncated with an unchecked diff, indistinguishable on the record from
+  an honest `BUDGET_EXHAUSTED`. It is a *load* error rather than a preflight
+  one because it is settled by arithmetic over two manifest numbers — no
+  container, no daemon, no measurement needed to see the contradiction — and
+  pushing it to preflight would pay an image build to discover what is
+  already visible in the YAML.
+
+- **Versions.** `PREFLIGHT_VERSION` "5" → "6" (broadening 3 had already moved
+  it off "4"), `ORACLE_VERSION` "1" → "2", `GRADER_VERSION` "3" → "4",
+  `GRADE_SCHEMA_VERSION` "1.0.0" → "1.1.0". `SCHEMA_VERSION` **unmoved** — the
+  bound never touches the agent's container, so no `RunRecord` field changes.
+  `click-3360`'s `start_sha` **unmoved** — `suite_timeout_s` is a `budget:`
+  key, not an input to `materialize`. `manifest_digest` **does** move on any
+  manifest that adds the YAML comment or an actual value, because it is
+  `sha256(manifest bytes + reference bytes)`.
+
+- **Operator cost, and why it is intended rather than swallowed.** The
+  `GRADER_VERSION` bump makes `scripts/grade.py`'s `(run_id, grader_version)`
+  resume key treat every stored run as ungraded, so the next grading pass
+  re-grades everything into a fresh `v4` artifacts directory beside the
+  existing `v3` one — on today's corpus this changes **no verdict** (no
+  stored manifest declares the key, so every ladder still runs at 600), and
+  it still cannot wait: `grade.py`'s resume key never consults
+  `manifest_digest`, so the first manifest edit that raises the bound would
+  otherwise find every affected run already marked graded under the old
+  behaviour, with nothing on either line saying they were measured against
+  different bounds. The bump has to land with the code that makes the
+  divergence possible, not with the manifest that first exercises it — so
+  it's schedulable rather than urgent, but it is on purpose, the same shape
+  as broadening 2 and 3's version bumps. `PREFLIGHT_VERSION` and
+  `ORACLE_VERSION` moving invalidates every cached verdict and quarantine the
+  same way, deliberately: a warm cache would otherwise serve a verdict
+  computed under a bound the manifest no longer asks for.
+
+- **`GRADE_TIMEOUT_S` → `SCAN_TIMEOUT_S`.** The gitleaks secret scan is a
+  fixed-size scan of one diff on the *host*, not the task's suite —
+  `_ContainerEnv.scan_secrets` has no `task` in scope — so it keeps a
+  constant rather than reading the manifest. Renamed because leaving it
+  called "the grade timeout" was the trap: a constant with that name invites
+  the next consumer to reach for it instead of `task.budget.suite_timeout_s`.
+
+- **The doc correction found on the way.** `HARVESTING.md` said preflight
+  runs the suite "four times." It is **five** on the branch every task
+  actually takes — f2p-before, p2p-before, f2p-after, p2p-after, and the
+  scoped p2p-after the grader will also make — and only four when
+  `tests.p2p` is declared explicitly, which skips the scoped run
+  (`if not tests.p2p`). On top of that it runs one command per declared
+  `grading.*` argv, so the worst case is 8 × `suite_timeout_s` per task at
+  the gate, all of it before the proxy starts and inside the one-hour SSO
+  session the matrix itself needs. No new gate is added on that worst case —
+  it is a bound, not a duration, and nothing yet measures preflight's actual
+  elapsed time per task to check it against. That measurement is named as a
+  follow-up in `TASKS.md`, alongside the still-bare `int(...)` parse on
+  `max_turns` and `wall_clock_timeout_s`.
+
+Unit suite: 1256 passed, 50 deselected (docs-only task; the count reflects
+Tasks 1-5's plumbing and test pins, not this task, which touched no `.py`
+file).
+
+## Broadening 5 — a per-task Python version — 2026-09-01
+
+- **The `ARG` name is measured, not stylistic.** The `python:` images set their
+  own `ENV PYTHON_VERSION` (3.11.16 / 3.12.13 / 3.13.15) and `ENV` beats `ARG`,
+  so `${PYTHON_VERSION}` after the `FROM` reads the patch level even when
+  redeclared. Latent today; a plausible wrong value the moment anything
+  expands it.
+- **The default is byte-identical.** The parameterised file with no
+  `--build-arg` builds to `sha256:dfd2cc06…`, the same id as the
+  unparameterised one, so no stored `container_image_digest` and no cached
+  verdict moved.
+- **`assert_one_agent` is the check the broadening created.** Several bases
+  make preflight's `expected_claude_version` refusal tautological; the
+  driver-level comparison is the only place a split agent is visible.
+- **No record field.** `execute_run` makes no `claude --version` exec —
+  `Versions.claude_code` comes from the transcript — so there was no free
+  run-time read to make an observation out of. Digest + manifest is the join,
+  as it is for `image.env`, and `SCHEMA_VERSION` did not move.
+- **What was not done:** no repository was re-screened at 3.11 or 3.13, so no
+  currently-excluded repo has been shown to be reopened by this key (see
+  `TASKS.md` follow-up below).
+
+Also fixed on review of Tasks 3-4: `preflight.py`'s `python_observed` no longer
+collapses two different absences into the same `None`. A container that starts
+but whose `python --version` exits non-zero now records `""` — an observed
+empty answer — while `None` stays reserved for the path that never starts a
+container at all (`tests.runner` without `pytest`). One line in `preflight.py`
+plus one test assertion in `test_preflight.py` changed; the mutation anchor
+line was left byte-identical.
+
+Unit suite: 1290 passed, 51 deselected.
+
+## Broadening 6 — git submodules — 2026-09-02
+
+A repository whose suite needs a git submodule can now be cut as a task.
+Nothing is declared in the manifest: a submodule's path, url and pinned
+commit are all inside the tree at `base_sha`, so `derive_submodules` reads
+them out with git's own parsers (`git ls-tree` for the gitlink, `.gitmodules`
+for the url) and cross-checks the two — **asymmetrically**, because the two
+directions of disagreement are not the same fact. A gitlink with no
+`.gitmodules` url is refused at load: nothing could populate that directory,
+and an empty submodule directory leaves `git status --porcelain` clean. The
+reverse, a stanza naming no gitlink, is *inert* — git drives submodules off
+the index, so it is never listed, never fetched and creates no directory —
+and is recorded as `submodules_orphaned` rather than refused.
+Content comes from a per-`(submodule url, gitlink sha)` pruned bare mirror
+built by the existing `ensure_pruned_mirror`, unchanged — a new caller, not a
+new mechanism. `materialize` initialises each submodule from that local
+mirror with no network; `build_task_image` extracts a second `git archive`
+into the submodule's path so the build context stays `.git`-free and
+oracle-free; preflight reads `git submodule status` back out of the
+container; the grader refuses a submission that moves a gitlink, because it
+applies green and grades the wrong content.
+
+**The measurements that drove each decision.**
+
+- **M3 — the future-commit leak.** `git submodule update --init` against a
+  submodule's real url fetches its *whole* history, future commits included —
+  the same leak `ensure_pruned_mirror` exists to close for the superproject,
+  reproduced one level down. It is why content comes from a pruned mirror
+  rather than a live clone, and why that mirror is keyed on
+  `(submodule url, gitlink sha)` rather than reused from anywhere else.
+- **M4 — the transient `-c` leaves the submodule uninitialised.**
+  `git -c submodule.<name>.url=<mirror> submodule update --init` populates
+  the content with no network, but `git submodule status` afterwards still
+  reads `-<sha>` — uninitialised — because the transient form never writes
+  `submodule.<name>.url` into `.git/config` and `submodule init` skips
+  registration. The url has to be persisted with `git config` first, which is
+  why `_init_submodules` writes it, updates, then rewrites it back to the
+  `.gitmodules` value once the host cache path is no longer needed.
+- **M5 — the file-transport refusal.** git has refused a submodule clone over
+  `file://` by default since CVE-2022-39253, and the pruned mirror is a local
+  path — so `protocol.file.allow=always` is a *production* requirement, not a
+  test-fixture one, and both failure modes (transport refused, url
+  unreachable) exit loudly rather than leaving anything silent.
+- **M8 — the zero-byte submission diff.** `git add -A` does not recurse into
+  a submodule, so an uncommitted edit inside one is invisible to every
+  checkpoint and to the final diff — not even the `-dirty` gitlink line
+  survives staging. This is the whole argument for refusing a task whose fix
+  touches submodule content, and it leaves one residual this broadening
+  **records rather than closes** — see *The residual* below.
+- **M11 — the green apply.** An agent that *commits* inside a submodule moves
+  the gitlink, and that diff applies cleanly to a fresh tree: the index moves,
+  the working tree does not, and the ladder then grades the original content.
+  The verdict that falls out is `resolved: False` — an accusation for work the
+  harness could not see — which is why the grader gained a refusal
+  (`NotGradedReason.SUBMODULE_GITLINK_UNGRADABLE`) read out of the submission
+  itself rather than out of the task's declared submodule set, so it also
+  catches an agent-created nested repo on a task with no submodules at all.
+- **M13 — the container probe.** The `safe.directory /repo` line
+  `RunContainer.__enter__` already sets is sufficient for a submodule tree at
+  uid 1000 against a repo owned by uid 0, on both git 2.39.5 (production) and
+  2.54.0 — so `container.py` did not change.
+
+**What was deliberately not built.** No manifest key — the submodule set is a
+pure function of `base_sha`, which the manifest already pins, and a declared
+copy could drift from the tree. No `RunRecord` field — `Versions.task_set_commit`
+plus `container_image_digest` already let a reader re-derive the same tuple
+offline. No `SCHEMA_VERSION` or `ORACLE_VERSION` bump — no run-record field
+changed meaning, and the oracle already reaches submodules through
+`materialize`. No `container.py` change — M13 measured the existing
+`safe.directory` line is enough. No relative-url resolution — `../x.git`
+resolves against the superproject's own remote, which the run tree does not
+carry, and the resolution rules need their own measurement before they are
+written (`TASKS.md`). No `--recursive` — nested submodules are refused rather
+than supported, because the untested path leaves the inner directory empty,
+which reads as clean.
+
+**The residual.** M11's green apply is caught; M8's zero-byte diff is not, and
+cannot be from inside the harness. An agent that edits submodule content and
+never commits it produces a submission diff that is **empty** — `git add -A`
+stages nothing for it — so the grader's ladder stops at `EMPTY_PATCH`, which
+is a `GradeFailure` and stamps `resolved: False`. That verdict is
+indistinguishable from an honest empty run: a model that read the repository,
+concluded nothing needed changing and stopped produces a byte-identical
+submission. No field anywhere says which of the two happened, because the
+harness never saw the edit at all. Refusing a task whose *reference* fix
+touches submodule content keeps this off the tasks where it would be the
+expected path, but it stays reachable on any task with a submodule, since
+what an agent chooses to edit is not something a manifest can constrain. It
+is carried in `TASKS.md` rather than closed here: closing it means capturing
+per-submodule state the checkpoint mechanism does not currently take, and
+that is a change to what a run *records*, not to how one is graded.
+
+**Versions.** `PREFLIGHT_VERSION` 7 → 9 (7 → 8 in the broadening itself: a
+cached PASS under the old gate was written by a check that never looked at a
+submodule; 8 → 9 in the final-review fix wave, which changed what those
+submodule assertions assert — the boundary-anchored status match, the reverse
+gitlink cross-check, and the `--get-regexp -z` orphan read). `GRADER_VERSION` 4 → 5
+(a run graded under the old version was graded by a ladder that would have
+said `False` here). `GRADE_SCHEMA_VERSION` 1.1.0 → 1.2.0, a minor bump for the
+additive `SUBMODULE_GITLINK_UNGRADABLE` member. `click-3360`'s `start_sha`
+stays `33575cc0b75608fa5cbcb1d3ae3347b81eac437f` — it has no gitlink, and on
+the **host** a zero-submodule task takes a path that runs no extra git command
+against the run tree (`derive_submodules` returns `()`, so `_init_submodules`
+returns immediately and `build_task_image` takes no second archive). In the
+**container** it is not free and the distinction matters for anyone reading a
+gate's timing: preflight runs its three submodule probes — `git submodule
+status`, `git ls-files -s -z`, `git config -f .gitmodules --get-regexp -z` —
+on every task, submodule or not, because "this tree has none" has to be an
+observation rather than an assumption. That is what makes the empty evidence
+lists a measurement instead of a default.
+
+`python-poetry/tomlkit` moves out of `HARVESTING.md`'s Excluded table on a
+measured `.gitmodules` (one submodule, https, non-nested) rather than on the
+assumption that being unblocked on submodules makes it usable — its other
+screening criteria are still unmeasured.
+
+Unit suite: 1338 passed, 52 deselected.
+
+## Broadening 7 — a second test runner (vitest/jest) — 2026-09-02
+
+A JavaScript or TypeScript repository can now be cut as a task. A manifest
+declares `tests.framework: vitest | jest` (default `pytest`, so no existing
+manifest changes), and every pytest-specific judgement — what an exit code
+means, how a failed id is parsed, how a selection and a deselection are
+spelled, what "nothing was collected" looks like — moved behind a **runner
+adapter** in a new package, `bakeoff/src/bakeoff/runners/`:
+`pytest_adapter.py` is today's logic moved verbatim (argv-byte-identical, and
+the existing argv-identity test was never edited); `node_adapter.py` is one
+classifier shared by both node frameworks, because the report shapes agree
+closely enough that a second, framework-specific branch would be a second
+thing that can be wrong about what happened. `preflight.py`, `oracle.py` and
+`grader.py` kept their structure and now call the adapter instead of
+branching on pytest's numbers. Node needs its own base image
+(`docker/eval-agent-node.Dockerfile`), so `images.base_tag`/`build_base_images`
+grew from a version key to a `(runtime, version)` key, derived from
+`tests.framework` rather than declared a second time — declaring the wrong
+runtime's `image.*` key is refused at load. `GradeRecord.framework` names
+which adapter produced a record's `f2p_failed_node_ids`,
+`p2p_failed_node_ids` and `p2p_deselected`, because the id shapes and the
+units differ per framework and a reader summing across a mixed task set
+needs to know which is which.
+
+**The measurements that drove each decision.** The full table is in the
+plan's Measurements section; these are the three that decided the shape of
+the adapter and would otherwise be re-derived by the next reader.
+
+- **M1 — the exit code carries no information.** Every measured failure shape
+  — a failing test, an unresolvable import, a syntax error, a nonexistent
+  file argument, a broken config file — exits **1** on both vitest 3.2.7 and
+  jest 30.5.0, exactly like a passing selection exits **0**. The row that
+  matters most has no pytest analogue: `-t '<pattern matching nothing>'`
+  exits **0** on both frameworks, reporting every test skipped, under a
+  summary that reads like success (`Tests 3 skipped (3)` /
+  `Tests: 3 skipped, 3 total`). pytest answers the same input with exit 4 and
+  `ERROR: not found:`. So a manifest naming a renamed f2p test, or an oracle
+  quarantine that swallowed the whole p2p list, is silently green on node —
+  which is the whole reason this adapter reads a JSON report instead of a
+  number, and why `Outcome.not_run` and `KIND_NOTHING_RAN` exist at all.
+- **M2 — the JSON report, per framework.** `vitest run --reporter=json
+  --outputFile=<f>` and `jest --json --outputFile=<f>` are a near-superset of
+  each other. Three consequences drove the classifier: `success` is not the
+  classifier (jest reports `success: true` while exiting 1 on "no test files
+  matched"); the load-error discriminator is portable and needs no
+  jest-specific key — a `testResults` entry with `status == "failed"` and an
+  **empty** `assertionResults` is a file that failed to load, on both
+  frameworks, on an import error and a syntax error alike; and it must be
+  checked **before** the failing-assertion branch, because one good file plus
+  one unloadable file reports three *passing* tests and zero failing ones —
+  read in the other order, a task whose f2p file stopped importing grades as
+  solved. And a **broken config file writes no report at all**, on either
+  framework, which is what makes an absent report the config-error signal
+  rather than an edge case to special-case.
+- **M8 — `node_modules` cannot be baked at `/repo`, and `/node_modules`
+  works.** The whole reason `pip install -e .` is correct in this codebase is
+  that site-packages survives the bind mount; node has no site-packages.
+  Measured: a Dockerfile that `npm install`s into `/repo/node_modules` shows
+  it PRESENT without the bind mount and GONE with the run tree mounted over
+  `/repo` — the exact defect the editable pytest install avoids, with no
+  node equivalent escape. Installing at the container root instead works,
+  measured with `NODE_PATH` **unset** and as the non-root **uid 1000**: node's
+  resolver walks up from the importing file (`/repo/tests/x.test.js` →
+  `/repo/node_modules` → `/node_modules`), the repo's own `vitest.config.js`
+  is still discovered, and `/node_modules` is not writable by the eval user.
+  `/node_modules/.bin` is not on `PATH` by default (a bare `vitest` is exit
+  127 while `npx vitest` works), so the node Dockerfile adds
+  `ENV PATH=/node_modules/.bin:$PATH`.
+
+**Task 5's real node-base build, pasted verbatim** (`docker build -f
+docker/eval-agent-node.Dockerfile --build-arg BASE_NODE_VERSION=22 -t
+bakeoff-eval-agent:base-node-22 .`, then a probe container):
+
+```
+vitest 3.2.7 pinned
+jest 30.5.0 pinned
+claude 2.1.220 pinned
+Successfully tagged bakeoff-eval-agent:base-node-22
+```
+
+```
+v22.23.2
+vitest/3.2.7 linux-arm64 node-v22.23.2
+3.2.7             <- vitest, from its package.json
+30.5.0            <- jest, from its package.json
+30.4.2            <- jest --version, the stale bundled string
+2.1.220 (Claude Code)
+1000
+/usr/bin/git
+/usr/bin/rg
+/usr/bin/timeout
+/node_modules/.bin/vitest
+/node_modules/.bin/jest
+3.2.7 30.5.0      <- the exported pins
+```
+
+The `jest --version` line is the reason neither in-Dockerfile pin assertion
+nor the `image.build` re-assertion (D15) reads `jest --version`: jest's CLI
+prints `@jest/core`'s bundled `getVersion()`, which stayed `30.4.2` while
+`npm install jest@30.5.0` resolved `jest`/`jest-cli`/`@jest/core` all to
+`30.5.0` — the CLI's own banner lags the package it ships. Both assertions
+read `node -p 'require(".../package.json").version'` instead, for vitest too
+once found, for the reason two probes answering one question in two shapes
+is how one of them quietly stops being checked.
+
+**What the review process corrected before any code was written.** The plan
+records a direct disagreement between an earlier reviewer's measurement and
+its own re-measurement of the same command, and resolves it by keeping both
+rather than picking a winner: *"The reviewer measured `npm ci --prefix /`
+removing `/node_modules/.bin/vitest`. Reproducing it here with the lockfile
+at `/repo` rather than at `/`, it did **not**."* Both are real — `npm ci`'s
+documented contract is to delete `node_modules` before installing, and
+whether it fires depends on which `package.json`/`package-lock.json` pair npm
+resolves for the given prefix and cwd, which a task author's `image.build`
+line decides by accident. The plan's own conclusion is that the disagreement
+*is* the finding, not a bug in either measurement: "a convention that is
+right only under an unstated cwd is not a convention" is why `HARVESTING.md`
+recommends `npm install` over `npm ci` and why D15's build-time
+re-assertion — not the recommendation — is what actually holds the line.
+That is also why the plan spends a whole adapter method (`p2p_args`) rather
+than composable `select`/`deselect` calls: M4's `-t` measurement found the
+two frameworks disagree in two different ways (vitest rejects a second `-t`
+outright; jest comma-joins it into a pattern matching nothing and exits 0),
+so a design built by composing two independently-correct pieces would have
+reproduced exactly the silent-wrong-argv class of bug this repo has already
+lost five drafts of a diff parser to — caught in review, before Task 1
+started, rather than found later as a fixture failure.
+
+**What was deliberately not built.** No `.pyc`-analogue mitigation in the
+node image — measured directly (overwrite a fix at the same byte count
+inside the same second, re-run): both frameworks went green, because
+`node_modules/.vite` is vite's dependency-optimiser cache, not a
+source-transform cache, and jest's cache is content-hash keyed. No third
+framework (mocha, `node --test`) — YAGNI, and each is a measured exit-code
+table plus a report shape. No property-based determinism check for the node
+frameworks — `TASKS.md` follow-up, and the two places in the code that cite
+it needed the entry adding, which this task did.
+
+**Versions.** `PREFLIGHT_VERSION` 9 → 10, `ORACLE_VERSION` 2 → 3,
+`GRADER_VERSION` 5 → 6, `GRADE_SCHEMA_VERSION` 1.2.0 → 1.3.0 (the additive
+`GradeRecord.framework`). `SCHEMA_VERSION` did not move — no `RunRecord`
+field was added or changed meaning. Task 9's live gate-and-grade run against
+a real vitest fixture task found two hazards no earlier task's fixtures could
+surface: a shared, `rmtree`'d-and-rematerialized run-tree path served stale
+by the Docker VM's mount cache roughly every other cycle (measured
+`[files], [], [files], []`), which reads as a passing measurement rather than
+a failure on both a node preflight and the offline grader; and
+`duplicate_full_names` / `scope_files_outside` evidence keys that changed
+from `[]` to `None` for a scoped run that wrote no report at all, without the
+`PREFLIGHT_VERSION` bump that change should have carried. Neither is closed
+here — see `TASKS.md`.
+
+Unit suite: 1506 passed, 61 deselected.
+
+---
+
+## Round 2 item 3 — a unique host path per bind-mounted tree — 2026-09-03
+
+Plan: [docs/superpowers/plans/2026-09-03-round2-3-unique-run-trees.md](../docs/superpowers/plans/2026-09-03-round2-3-unique-run-trees.md).
+
+Broadening 7 landed the post-condition; this closes the **cause**. Every host
+path the harness bind-mounts is now allocated by one helper,
+`container.fresh_tree(parent)`, which returns `<parent>/<uuid4().hex>` — a
+directory no container has ever mounted. The stable key (`run_id`, `task_id`,
+the cell label, the artifacts root) stays in the path as the *parent*, so a
+tree is still findable by grep; only the leaf is unique.
+
+**The measurement, restated because everything here rests on it.** Four cycles
+of `rmtree` → `materialize` → new container on one host path, `ls /repo`
+inside each container (2026-09-02):
+
+```
+cycle 0  ls /repo -> ['README.md', 'package.json', 'src', 'tests']
+cycle 1  ls /repo -> []
+cycle 2  ls /repo -> ['README.md', 'package.json', 'src', 'tests']
+cycle 3  ls /repo -> []
+```
+
+This is not the `/var/folders` trap (a path the Docker VM does not share at
+all, which the `--basetemp` convention covers). It is a path the VM *does*
+share, whose inode the host replaced underneath the VM's cache. An empty mount
+**resolves** rather than failing: an empty `/repo` is `No test files found` at
+exit 1 under vitest and jest — the exit a genuinely red suite gives — and
+`git apply` fails against it, which the grader reads as `APPLY_FAILED` →
+`resolved: False`.
+
+**Six sites, not the four `TASKS.md` named.** Review 1 found the sixth.
+
+| # | site | path | caught by `_assert_repo_mounted`? |
+|---|---|---|---|
+| 1 | `grader.grade_run` | `<cache>/grade-tree/<run_id>` | yes |
+| 2 | `oracle._derive` | `<cache>/oracle-tree/<task_id>` | yes |
+| 3 | `grade.resolve_task` | `<cache>/grade-preflight-tree/<task_id>` | yes |
+| 4 | `run_matrix.resolve_tasks` | `<cache>/preflight-tree/<task_id>` | yes |
+| 5 | `run_matrix.run_cell` | `<artifacts>/<stamp>/<cell>/repo` | yes |
+| 6 | `runner.execute_run` | `<artifacts_root>/claude-config` | **no** |
+
+Site 6 is the one with no backstop at all, and it is the worst of the six on
+every axis: the `rmtree` → `mkdir` → mount sequence was already written,
+`_assert_repo_mounted` checks `REPO_MOUNT` and only `REPO_MOUNT`, and the
+failure is not loud. The agent writes its transcript into the cached inode,
+the host directory stays empty, transcript discovery globs it and finds
+nothing, and the run parses to zero turns, zero tokens and zero cost — with
+the tokens already spent. That is a *lost cell*, not a wrong one, and it is
+why the site-6 mutation anchor is not optional: with no guard behind it, the
+anchor is the only thing keeping that allocation from being reverted.
+`runner.py`'s emptiness read-back is **not** a mount post-condition and is now
+worded as what it is — it reads the *host* side, which after `fresh_tree` is
+empty by construction, so it answers for the allocator and never for the mount.
+
+**`_assert_repo_mounted` stays, unchanged in behaviour.** The cause it caught
+is one of several: `/var/folders`, a future call site that builds a path by
+hand, a daemon fault. It is the post-condition; `fresh_tree` is the cause.
+
+**Version bumps.** `GRADER_VERSION` 8 → 9 and `PREFLIGHT_VERSION` 13 → 14.
+Neither changes what any check asserts; both retire verdicts that may have
+been produced through a container this code can no longer interrogate.
+`grade.py`'s resume key is `(run_id, GRADER_VERSION)` alone, so without the
+bump a suspect `APPLY_FAILED` line is never revisited — and an operator cannot
+tell a stale-mount one from a real one by reading either line. The preflight
+key runs through `preflight_cache_key`, so `preflight.json` (run_matrix) and
+`preflight-grade.json` (grade.py) invalidate together: one offline re-gate per
+task per driver, no credentials and no spend. `ORACLE_VERSION` did **not**
+move — a derivation over an empty tree cannot cache a wrong verdict, because
+the reference fix fails to apply and `_derive` raises before any verdict
+exists. `SCHEMA_VERSION` and `GRADE_SCHEMA_VERSION` did not move: no record or
+grade field was added.
+
+**No field was added, and the one path now written down is written only when
+it is true.** `run_cell` returns the kept tree under `--keep`, `main` puts it
+in the `matrix-<stamp>.json` row under a **`kept_repo`** key present only then,
+and the cell also prints `  kept <path>`. Present-or-absent is the
+`artifacts.wire_log_gz` discipline; a null would have been two absences
+rendering identically. The key is `kept_repo` rather than `repo` because this
+same commit deletes a dead `"repo"` key from `resolved` a few hundred lines up
+in the same file (M5: nothing ever read it), and a live `"repo"` key here
+would make the diff read as a move.
+
+**The sweep's real bound, stated honestly rather than overclaimed.**
+`_sweep_stale_trees` runs at the **leaf** level with a 24 h age guard, so it
+only ever collects a husk under a key that is allocated under again — true of
+`preflight-tree/<task_id>` and `grade-preflight-tree/<task_id>` on every
+invocation, and not true of `grade-tree/<run_id>`, `oracle-tree/<task_id>`, a
+per-cell `tree/` or a per-run `claude-config/`. The empty key directories are
+never collected at all (~960 inodes for an 80 × 4 × 3 matrix). Sweeping the
+key level was **refused**, not deferred: `fresh_tree` opens with
+`parent.mkdir(parents=True, exist_ok=True)`, which does not refresh an
+existing directory's mtime, so an age-guarded key sweep would `rmtree` a key a
+concurrent allocator has just passed through and is about to put a leaf under,
+whose `mkdir` then raises `FileNotFoundError` — the same race that rejected
+`parent.rmdir()`. Carried as a P3 line. One free consequence: the legacy
+`preflight-tree/<task_id>/repo` trees the old shape left on disk are ordinary
+leaves to the sweep and are collected once they age past a day.
+
+**uuid4, not a stamp plus a counter.** The reuse that bites is *across
+processes* — `run_matrix` invoked twice on one task, `grade.py` twice on one
+cache — and a counter restarts at `0` in a new process, so `…-0` is precisely
+the path the previous process already mounted. And not `tempfile.mkdtemp`,
+which hard-codes 0o700: the container runs as uid 1000 while the host
+directory is owned by the operator, so on a Linux host that mode makes the
+mount unreadable to the agent. `test_an_allocated_tree_is_not_mkdtemps_owner_only_mode`
+pins it relative to the process umask, which is honest at every umask.
+
+**Docs checked and not moved.** `docs/BUILDING-A-TASK-SET.md`: two greps run
+per the plan — the cache-layout one (`preflight-tree|grade-tree|oracle-tree|
+.cache/bakeoff`) finds no tree paths, and the constants one finds four
+**historical attributions** (`PREFLIGHT_VERSION` at 239, 282, 786;
+`GRADER_VERSION` at 729) which all stay true after both bumps. Recorded here
+so a later reader does not re-check. `HANDOFF.md` does not move: no sweep
+reaches the pruned-mirror cache — every `fresh_tree` parent is a `grade-tree`,
+`oracle-tree`, `grade-preflight-tree`, `preflight-tree`, per-cell `tree/` or
+per-run `claude-config/`, and no mirror path is a parent of any of them.
+
+**Tests.** 13 new named tests, 15 collected (two parametrized ×2): six on
+`fresh_tree` itself in `test_container.py` (two allocations differ; a fresh
+leaf is empty beside a populated sibling; a removed name is never reissued
+across 50 more allocations; a day-old sibling is swept and a fresh one is
+not; a sweep that raises does not cost the allocation, ×2 over `scandir` and
+`rmtree`; the umask assertion), and one per production site elsewhere. Four
+existing tests changed without changing the count: the two `test_oracle.py`
+tree-removal assertions became `iterdir()` checks (the key directory survives
+as an empty husk by design; what must not survive is the leaf holding the
+reference fix), and the two version pins moved with their constants'
+changelog docstrings.
+
+**Verification.**
+
+- Unit: `1554 passed, 62 deselected` (1539 baseline + 15).
+- `scripts/verify_logger.py`: **GATE PASSED**.
+- `scripts/mutation_check.py`, run solo: **164/164** (160 baseline + four new
+  anchors, one per site whose revert is a distinct guarantee — the allocator
+  itself, `preflight-tree`, `grade-tree`, and site 6's config dir). All four
+  CAUGHT.
+- Integration, node: `tests/test_integration_node_task.py`, 8 passed, with
+  `node_tree` now going through `fresh_tree` instead of its own private uuid.
+  `_mounted` stays: it asserts the expected *content* is there, which is
+  strictly stronger than `_assert_repo_mounted`'s "anything at all".
+- Integration, grader: `tests/test_integration_grader.py`, 7 passed.
+- **The acceptance test — the loop that measured the defect.** Four
+  consecutive `run_matrix.py --preflight-only --force-preflight` invocations
+  on the vitest task `ufo-214-without-trailing-slash-query`: **PASS, PASS,
+  PASS, PASS**, exit 0 each time. Before this change the even-numbered
+  invocations refused with `_assert_repo_mounted`'s `ContainerError`, and
+  before that guard existed they passed while measuring nothing.
+- **The grader half.** Two `grade.py --re-grade` passes over
+  `eventlog-ufo-214-without-trailing-slash-query` against one cache root: both
+  wrote `resolved: False` for the empty submission and `resolved: True` for
+  the reference, with identical check names and per-check verdicts. No
+  `APPLY_FAILED` appearing only in the second. The first pass rewrote both
+  already-graded runs because `GRADER_VERSION` moved — by design.
+
+**Left open.** The husk residue above (P3). Site 6 still has no mount
+post-condition, which is accepted and stated rather than hidden: a freshly
+allocated config directory is *supposed* to be empty on the host, so there is
+nothing for a mount-time check to compare, and the only downstream signal
+would be `trajectory_parse_error` on a zero-turn run after the tokens are
+spent. The pre-container region of `execute_run` is still uncontained — an
+`OSError` from `fresh_tree`'s two `mkdir`s escapes exactly as the bare `mkdir`
+there does today; one concrete failure mode (a silent `rmtree` failure into
+`FileExistsError`) was removed and none was added. Containing it needs a
+`finalize_error`-style channel for that phase, which is its own change.
+
+Unit suite: 1554 passed, 62 deselected.
+
+## Round 2 item 1 — a node selection that carries the file half — 2026-09-03
+
+**The defect, measured.** A node id is `<file>::<fullName>` and is
+unambiguous; the selection built from it was not. `select_args` emitted every
+declared file as a positional and ONE `-t` alternation over every declared
+name, ANDed across the whole invocation and never zipped — measured
+2026-09-02 in `bakeoff-eval-agent:base-node-22`, two positionals plus one
+union `-t` over one title from each file executed a THIRD test, on jest and
+vitest alike. `p2p_args`' deselect branch was worse: one negative `-t` over
+the whole declared scope, so a quarantine of `a::works` removed `b::works`
+too, silently, with `p2p_deselected` agreeing because two tests really were
+skipped. Two guards existed to make that safe, and both refused task shapes
+the id spelling already disambiguated. The cost was real: widening
+`eemeli/yaml`'s `tests.paths` from one file to `tests/` gated NO-GO on four
+collisions under `describe('circular references', ...)`, none of them a test
+the manifest named.
+
+**The design.** The adapters now return a SEQUENCE of argvs and `_Runner`
+runs the sequence and merges the reports. A node selection is one argv per
+file; a node deselection is 1 + K — group 0 is the scope with every
+deselected file excluded and no `-t` at all, then one group per such file
+carrying only its own titles. pytest returns exactly one group whose element
+is byte-identical to the argv it always emitted, so
+`test_grading_p2p_with_no_extras_is_the_argv_preflight_validated` — the
+argv-identity gate — stayed green without being edited, which is the property
+that gate exists to have.
+
+**Two framework asymmetries decided the rest, and both are measurements.**
+jest's file positional is a JS `RegExp` tested against BOTH the repo-relative
+and the absolute path, so only `^/repo/<escaped path>$` names one file;
+vitest's is a substring filter no anchoring reaches, and the absolute form
+pulled a tail-colliding file in too. So the per-file filter is per flavour,
+and the vitest trees that cannot be separated are REFUSED per task rather
+than papered over — `ambiguous_file_filters`, computed over the union of
+`files_run` across every node run the gate makes, because `select_argvs`
+groups by file as well and an explicit-`tests.p2p` task makes no scoped run
+at all.
+
+**The jest ignore-flag finding, which changed the plan.**
+`--testPathIgnorePatterns` REPLACES a jest config's own value rather than
+adding to it, and re-emitting `/node_modules/` beside it restores jest's
+BUILT-IN default, never the repository's. `eemeli/yaml` — the corpus's only
+node task — reports `["tests/_utils", "tests/json-test-suite/"]` and no
+`/node_modules/` through its own `--showConfig`, and `tests/_utils` matches
+its `testMatch`. So the flag would have pulled that task's helper modules
+into the regression check at gate time and at grade time alike, where the
+result is `P2P_REGRESSION`, `resolved: False`, on every arm. jest therefore
+emits that flag NOWHERE now: it excludes through two negative lookaheads
+folded into the positional, one per path spelling, with the scope segment
+kept raw behind a `.*` so `scope_files_outside` keeps the semantics it was
+measured against. Reading the effective config back was rejected — the graded
+tree is the tree the model edited, so the argv would become a function of a
+file the model can rewrite.
+
+**What the refusals became.** `node_adapter.validate_id_set` is a no-op with
+a docstring saying why; preflight's `duplicate_full_names` keeps its exact
+string shape and its cross-file meaning as EVIDENCE and is no longer a
+problem; `ambiguous_file_filters` is the new, narrower refusal.
+`PREFLIGHT_VERSION` 14 → 15, `GRADER_VERSION` 9 → 10, `ORACLE_VERSION` 4 → 5,
+each with a changelog paragraph naming what a stored verdict of the older
+number could have been wrong about — including that
+`duplicate_full_names`' CONTENT grows for an unchanged task, because group 0
+now runs the f2p files' siblings unfiltered where the global deselection
+skipped them. `SCHEMA_VERSION` did not move.
+
+**One defect the plan did not have, found by its own verification step.**
+`tests.paths` may name a FILE rather than a directory prefix —
+`yaml-474-single-newline-empty-value` declares
+`["tests/doc/stringify.ts"]`, which is also its only f2p file. Group 0 then
+excluded the whole of its own scope and collected nothing, which both
+frameworks answer with exit 1 and a report of zero tests, and the gate read
+that as "the p2p run the GRADER will make is not green" — a NO-GO on the one
+node task in the corpus. Fixed by dropping scope prefixes that ARE an
+excluded file and omitting group 0 when nothing is left for it to run, but
+only while some other group will run: an empty sequence is what `_Runner.run`
+refuses, and a loud empty invocation is the better failure of the two. Pinned
+by two tests, and the task re-gates PASS in 47 s.
+
+**The K-invocation cost is filed, not hidden.** A node check is now 1 + K
+commands, each carrying its own `timeout <suite_timeout_s>` prefix, so
+`GradeRecord.suite_timeout_s: 600` is true of every command and is NOT the
+check's wall-clock bound. Nothing records K. Splitting the budget across
+groups was rejected for the opposite reason — it would make the gated bound a
+function of the quarantine, so two tasks declaring the same number would get
+different ones. New P2 item in `TASKS.md`.
+
+**Verification.**
+
+- Unit: `1585 passed, 63 deselected` (1554 baseline + 31).
+- `scripts/verify_logger.py`: **GATE PASSED**.
+- `scripts/mutation_check.py`, run solo: **165/165 caught** (164 baseline − 2
+  anchors whose guards are gone, + 3 new). The `if not pattern:` anchor is
+  kept verbatim; its selector moved with the test's name, to the argv-literal
+  assertion — the surviving `count("-t") <= 1` tests would not have failed
+  under it.
+- Integration: `-m integration`, 60 passed, 3 skipped, including a new
+  `task_image` test that builds a fixture with two files carrying the same
+  `fullName`, gates it green, and asserts the duplicate file's tests are in
+  the p2p run's executed set — the thing the global deselection silently
+  removed.
+- **The acceptance, on the task that measured the defect.**
+  `yaml-474-single-newline-empty-value` widened to `["tests/doc/"]`: **PASS**,
+  four collisions recorded under `duplicate_full_names`,
+  `ambiguous_file_filters: []`, 10 files in `scope_files_run`. Widened to
+  `["tests/"]` — the scope whose 2026-09-02 NO-GO is inherited verbatim:
+  **PASS**, the same four collisions, 25 files, nothing outside the scope.
+- No regression on the narrow gated node task (**PASS**, 47 s) or on the
+  vitest task `ufo-214-without-trailing-slash-query` (**PASS**).
+- No pytest verdict moves: `sqlglot-6927-dremio-trycast` re-gated PASS, and
+  the only evidence key this item adds to it is
+  `ambiguous_file_filters: None` — "pytest reports no file list, so nothing
+  was measured".
+- The grader still grades under the new versions: two lines at
+  `grader_version: "10"`, `oracle_version: "5"`,
+  `graded_under_preflight_version: "15"`, `framework: jest`, reference
+  `resolved: true` and empty-patch `grade_failure: empty_patch` — the same
+  verdicts the stored v6 lines carry.
+
+**Left open.** The same-file duplicate `fullName` (item 11) — a same-file
+pair collapses to the identical node id string, so it is a manifest
+REPRESENTATION problem while this was a selection-argv one, and
+`validate_id_set` becoming a no-op is the evidence: a loader comparing
+`(fullName, path)` pairs cannot see a pair whose `path` agrees. K is not
+recorded. `ambiguous_file_filters` is computed against the PREFLIGHT tree, so
+a submission that adds a test file whose path contains a declared one's is
+not caught by it. `CLAUDE.md` is unedited per the round's constraint; the
+three sentences it should gain are in the plan's §6.
+
+Unit suite: 1585 passed, 63 deselected.
+
+---
+
+## Round 2 item 19 — re-screening the corpus at 3.11 and 3.13 — 2026-09-02
+
+Report: `~/.cache/bakeoff-probe/reports/r2-19-rescreen.md` (outside the repo,
+not committed).
+
+Broadening 5 gave a manifest `image.python` key, closed and enforced at load
+time, but no candidate had ever actually been re-run against 3.11 or 3.13 —
+the whole `docs/BUILDING-A-TASK-SET.md` §2 screen only ever ran under
+`python:3.12-slim-bookworm`. This item is that measurement, not a reversal
+of the item's own premise ("no repository has been shown to be reopened by
+this key today"): it still stands.
+
+**Eight repos, not the whole excluded-or-undiagnosed set.** The three
+*Excluded* rows whose reason is version-shaped (`giampaolo/pyftpdlib`,
+`tornadoweb/tornado`, `pytest-dev/pytest-localserver`) plus the five rows in
+*Usable once a dependency is declared* that were not already gated
+(`pygments/pygments`, `Textualize/rich`, `python-humanize/humanize`,
+`python-attrs/attrs`, `python-attrs/cattrs`). `un33k/python-slugify` (no
+harvestable PRs) and the five already-gated rows (`sqlglot`, `tomlkit`,
+`bidict`, `pytest`, `chimera`) were out of scope and were not touched.
+
+**Result: zero reopened.** Every one of the eight shows the identical
+blocker — or, for pygments, the identical green — on `python:3.11-`,
+`3.12-` and `3.13-slim-bookworm`. Every cross-version diff in the report is
+either cold-container wall-clock noise or a `sys.version_info`-gated
+`SKIPPED` count shifting by a handful, never a pass/fail verdict.
+
+**The attrs/cattrs Pass-1/Pass-2 split.** A bare `pip install -e .` pulls no
+test-only extra, so Pass 1 (the bare §2 command) died at collection on both
+repos with `ModuleNotFoundError: No module named 'hypothesis'` on all three
+versions — before the site-packages-collision question the item exists to
+answer could even be asked. Pass 2 added `pip install -q pytest hypothesis`
+plus the `CI`/`HYPOTHESIS_STORAGE_DIRECTORY` env this file already names for
+this row, then ran `python -c "import attr, sys; print(attr.__file__)"`
+right after that install chain and before the suite. That is the run
+reported as the row's primary result.
+
+**Three diagnoses that changed a row's story, not just its version-count:**
+
+- **humanize**'s "6 import errors, undiagnosed" is now two ordinary,
+  already-catalogued shapes — a missing `humanize._version`
+  (`SETUPTOOLS_SCM_PRETEND_VERSION`-shaped) and a missing `image.pip:
+  ["freezegun"]` — neither version-dependent.
+- **pyftpdlib**'s exclusion reason (the asyncore/asynchat PEP 594 removal)
+  no longer manifests at HEAD at all — the repo's own PR #605 (2023-08)
+  already fixed it. The re-screen's blocker is unrelated: a bare screen
+  doesn't install `pytest-instafail`, which the repo's own addopts name.
+- **tornado**'s originally-measured blocker
+  (`d5-python-version.md`'s `AsyncTestCase`/pytest-9 incompatibility, at a
+  2023-era candidate `base_sha`) did not reproduce at HEAD at all; the
+  re-screen's blocker is unscoped collection into `maint/`'s local helper
+  packages, unrelated to any of the three interpreters.
+
+**cattrs remains the one open question.** Its site-packages `attr`/`attrs`
+collision is real (measured: `attr.__file__` resolves to site-packages, not
+the clone, on all three versions) but is masked in every screen so far by an
+earlier `pytest-benchmark` addopts usage error (exit 4) the repo's own
+`pyproject.toml` triggers against a bare `pytest` install — the suite never
+reaches a single test. See `HARVESTING.md`'s attrs/cattrs paragraph for what
+would actually catch it (the green-after gate, not the bare-runner probe) and
+why nobody has run it yet.
+
+No manifest, `HARVESTING.md`, or `docs/BUILDING-A-TASK-SET.md` change was
+made by the measurement itself; folding the findings in was a separate docs
+commit.
+
+---
+
+## A submodule the suite never reads is declared, not populated — 2026-09-02
+
+Round 2 item 2. Plan:
+[docs/superpowers/plans/2026-09-03-round2-2-unneeded-submodule.md](../docs/superpowers/plans/2026-09-03-round2-2-unneeded-submodule.md),
+four review rounds folded in.
+
+**The measured defect.** `sqlglot-8225-mysql-key-constraint` at `base_sha`
+`05eed63b281f7ac020045e2b792beef8fad8d3ee` never reached preflight — exit 1,
+111 s, no image, no cache entry:
+
+```
+bakeoff.tasks.TaskError: sqlglot-8225-mysql-key-constraint: submodule
+sqlglot-integration-tests declares url 'git@github.com:fivetran/...'; only
+https:// urls can be fetched by this eval.
+```
+
+`tobymao/sqlglot` added that `.gitmodules` in `3a930dad6` (PR #7167, merged
+2026-02-27) and it is still at HEAD, so **every** `base_sha` at or after that
+date was closed — the richest single source in the screened corpus, for a
+suite that never reads the submodule. `strip_paths` cannot lift it: a strip
+covering a submodule path is itself refused, and for good reason.
+
+**What shipped.** Top-level `submodules_unneeded: ["<path>"]`. A flat list of
+paths, not a block and not a boolean: a block invites sub-keys (a url
+override, a sha pin) that would each restate what `base_sha` already pins,
+and a boolean cannot be checked against the tree, so a `base_sha` bumped to
+one carrying a *second* submodule would silently stop populating it. Paths
+rather than `[submodule "NAME"]` names, because git does not require the two
+to match and only the path comes from `git ls-tree` — which is also the one
+reader a declared-unneeded submodule is allowed to be missing a `.gitmodules`
+stanza for.
+
+**What it does NOT relax, and the placement is anchored.** Four of the six
+submodule refusals become conditional; two do not. A `strip_paths` entry
+covering the path still fires (the strip removes the gitlink and moves
+`start_sha`), and a reference diff touching the path still fires (`git add
+-A` stages nothing for a gitlink path in *either* state, so a fix living
+there is ungradable by construction — the key makes that more true, not
+less). Both live OUTSIDE the `if not sub.declared_unneeded:` guard, and
+mutation entries 3 and 4 anchor exactly the edit a later editor tidying them
+inside would make.
+
+**Three measurements shaped the design.**
+
+- **git is blind inside a gitlink path, in any state.** A file written into
+  an uninitialised submodule directory is invisible to `git status
+  --porcelain` (with or without `-uall`), to `git ls-files -o` and to `git
+  add -A`. So preflight's clean-tree check cannot see a suite that writes in
+  there, and `HARVESTING.md`'s "a suite that writes inside the submodule is
+  out" rule had **no enforcement at all** for the new case. That bullet was
+  asserting an enforcement that does not exist; it is corrected, and the
+  enforcement is now two `ls -A` reads, before the suite and after it.
+- **The suite guards, it does not require.** `git grep
+  sqlglot-integration-tests <base_sha> -- tests/` finds exactly two files and
+  both sit behind `os.path.isdir(...)`. That is what makes the declaration
+  truthful here — and it is also what bounds the claim: the suite silently
+  *shrinks* rather than failing, and no collected-test count is recorded, so
+  the gate cannot tell a guarded suite from one that lost tests. Filed in
+  `TASKS.md` rather than closed, because recording that count is a
+  runner-adapter change across three frameworks.
+- **A tree with gitlinks and NO `.gitmodules` blob exits 128, not 1.** That
+  is a sixth refusal, reached ahead of the per-path url one, and the first
+  draft of the plan neither counted it nor exempted it. Both `.gitmodules`
+  refusals are now exempted through one derived `needed_gitlinks` set, so one
+  line carries the exemption and one mutation reverts both.
+
+**The cross-item blocker, and it was the whole reason for a fourth review
+round.** `container.snapshot_diff` stages into a **scratch** index
+(`GIT_INDEX_FILE`), and a scratch index starts EMPTY — so `git add -A` builds
+it from a worktree scan that cannot see a gitlink, and the diff against the
+start state reports an uninitialised submodule as **deleted**. Measured on
+the real vehicle, materialized, clean tree, agent having done nothing:
+
+```
+UNSEEDED   237 bytes   names: sqlglot-integration-tests
+           diff --git a/sqlglot-integration-tests b/sqlglot-integration-tests
+           deleted file mode 160000
+           -Subproject commit 4d539e4369b07cba70d8249924136d0826cf7ea5
+SEEDED       0 bytes   names: (none)
+```
+
+`grader._GITLINK_MODE` matches `^deleted file mode 160000$`, so without the
+seed **every run of this task — including a clean one — would have graded
+`SUBMODULE_GITLINK_UNGRADABLE`** and left the denominator with a verdict that
+reads as the agent's doing. The fix is one line before the staging loop,
+`git read-tree <base_sha>` into the same scratch index, `checked_exec` so a
+failed seed raises rather than falling through to the accusation.
+
+It is unconditional, because `container.py` holds no manifest and must not
+gain one; that is affordable because a repository with no gitlink diffs
+byte-identically either way (pinned by an integration test). The rejected
+alternative — re-staging the gitlink with `git update-index --cacheinfo`
+after `add -A` — was refused by measurement, not taste: it fails with
+`'vendor/libdep' appears as both a file and as a directory` in exactly the
+case that matters, an agent that wrote into the empty directory.
+
+**One line, two phantoms.** The same empty index also reported a file that is
+tracked at the start state and *also* matches `.gitignore` as deleted.
+Measured: `eemeli/yaml` carries **15** such files (`.editorconfig`,
+`.github/workflows/*`, and `.gitignore` and `.gitmodules` themselves) and
+`bidict` **1** (`.coveragerc`) — both round-2 verification vehicles. So a
+pre-fix record of `yaml-474` asserted fifteen deletions that never happened,
+and the offline grader *applies* `final_diff`, so the ladder really did
+delete them in the grading tree before running the suite. That is an existing
+field changing what it asserts, which is why `SCHEMA_VERSION` moved.
+
+**What the gate proves, at its real width.** Not "the submodule is unneeded".
+It proves the declared f2p ids are red before the reference fix and green
+after it, and the p2p sweep is green, **with the directory empty** — plus,
+new here, that the directory exists, is empty and reads marker `-`, before
+and after the suite.
+
+**Verification.**
+
+| step | result |
+|---|---|
+| unit | `1624 passed, 67 deselected` (from `1588 / 63`) |
+| integration | `64 passed, 3 skipped` |
+| `verify_logger.py` | GATE PASSED |
+| `mutation_check.py` | **176/176** (from 165) |
+| sqlglot-8225 gate | **PASS**, `start_sha 4b61ee5603e7ffc0cac8d127e709a0a14150fdff` |
+| tomlkit-514 re-gate | PASS, `start_sha e1d72b883d2e452ca14835047e2fa7db02cdc4d8` — unchanged |
+| click-3360 re-gate | PASS, `start_sha 33575cc0b75608fa5cbcb1d3ae3347b81eac437f` — unchanged |
+| self-grade | reference `resolved: true` (9/9 ladder, three `not_configured`), empty `EMPTY_PATCH`. **Not** `SUBMODULE_GITLINK_UNGRADABLE` |
+
+The gated evidence, verbatim from
+`~/.cache/bakeoff/preflight/sqlglot-8225-mysql-key-constraint.json`:
+
+```json
+"submodules": [{"path": "sqlglot-integration-tests",
+                "sha": "4d539e4369b07cba70d8249924136d0826cf7ea5",
+                "initialised": false, "marker": "-",
+                "declared_unneeded": true, "empty": true}],
+"submodules_orphaned": [],
+"submodules_empty_after_suite": {"sqlglot-integration-tests": true},
+"stripped_paths": ["CLAUDE.md", "AGENTS.md"],
+"stripped_paths_present": [],
+"dirty_after_tests": ""
+```
+
+`PREFLIGHT_VERSION` 15 → 16 (the evidence shape moved for **every** task, not
+only declaring ones, and those manifests' digests do not move) and
+`SCHEMA_VERSION` 3.8.0 → 3.9.0. `start_sha`, `ORACLE_VERSION`,
+`GRADER_VERSION` and `GRADE_SCHEMA_VERSION` do not move.
+
+**Still open, and filed rather than closed.** An agent that writes *into* the
+declared-unneeded directory produces a 0-byte diff post-seed while `ls -A`
+sees the file — the submission cannot carry it and neither can a checkpoint.
+Preflight's two reads refuse the *task*; capturing it during a *run* is round
+2 item 17's job, and a `TASKS.md` entry names the gap until that lands.
+
+
+## Round 2 item 5 — one evidence schema for `preflight` — 2026-09-03
+
+Plan: [docs/superpowers/plans/2026-09-03-round2-5-evidence-schema.md](../docs/superpowers/plans/2026-09-03-round2-5-evidence-schema.md).
+
+**The defect, and the item under-counted it by a factor of six.** `TASKS.md`
+named three keys — `stripped_paths`, `stripped_paths_present`,
+`suite_timeout_s` — as written where they are measured and therefore absent
+from the pre-container early return. Taken by AST off every `evidence[...] =`
+statement in `preflight()`, the real family is **twenty** of the forty-two
+keys. Its own line citation (`preflight.py:507-523`) was stale too: it pointed
+inside `_gitlink_paths`' docstring, not at the seed block.
+
+Rows the three-key framing misses are the ones that matter most. `f2p_after_exit`,
+`p2p_after_exit`, the three `grading_*_exit` and all three scope keys are absent
+on paths that **do** start a container (the reference fix not applying is the
+plain one), so "many nulls" was never a usable proxy for "no container ran".
+And `grading_build_exit`, `grading_typecheck_exit`, `grading_lint_exit` and
+`scope_prefixes_absent` are absent from the **ordinary healthy GO** verdict —
+the blob in `<cache>/preflight/<task_id>.json` a task author reads most — so
+moving only the item's three keys would have left the schema unreadable across
+exactly the two blobs a reader is most likely to diff.
+
+**What the item actually closes is the absence of an enforcement.** The shape
+had already been got wrong twice inside this file, both times caught by review
+rather than by a test: `PREFLIGHT_VERSION` 11 moved `duplicate_full_names`,
+`scope_files_outside` and `f2p_before_not_run` from `[]` to `None` because `[]`
+claimed a measurement never made, and the `bare_runner_skipped` note records a
+fourth key "left out of this seed once". Nothing asserted that the two families
+agreed, so each drift survived until somebody read the diff.
+
+**The design.** One tuple, `preflight.EVIDENCE_KEYS`, listing all 42 keys in the
+order the gate writes them, with the three grading names DERIVED from
+`tasks._GRADING_KEYS` rather than restated. One helper, `_evidence_seed()`,
+returning `dict.fromkeys(EVIDENCE_KEYS)` — uniformly `None`, one rule stated
+once. `preflight()` starts from it; `PreflightResult.evidence`'s
+`default_factory` is it; `PreflightResult.__post_init__` raises `ValueError` on
+a key set that is not exactly it, naming both directions of the difference
+because the remedies differ (a *missing* key means a path building the result by
+hand, an *unlisted* key means a write never added to the tuple). One new key,
+`early_return`, carries `EARLY_RETURN_RUNNER_MISMATCH` on the one pre-container
+return and `None` everywhere else.
+
+The raise is safe here where `_gitlink_paths` argues for a NO-GO, and the
+difference is the cause: that one guards a defect in the DATA, which an operator
+can hit; this one can only be caused by an edit to `preflight()` itself, since
+with the seed in place every key is either seeded or an overwrite of a seeded
+key. The one input-dependent write (`grading_<key>_exit`) takes its names from
+`dataclass_fields(task.grading)`, which `load_task`'s unknown-key refusal closes
+and which raises `TypeError` inside `_declared_grading` first for anything that
+is not a dataclass at all.
+
+**Rejected.** A nested `evidence["grading"] = {...}` sub-dict — it closes the key
+set without an import and renames a key six tests and every stored blob already
+carry, for no gain; the flat name is what makes an old verdict and a new one
+comparable, which is the property under repair. A sentinel string — four of
+these keys are string-typed (`dirty_after_tests`, `claude_version`,
+`f2p_red_kind`, `bare_runner_skipped`) and a sentinel would be indistinguishable
+from a measurement on exactly them. A `defaultdict` — it hides the drift instead
+of failing it, and a key nothing touches still does not reach `to_dict()`.
+Tests-only enforcement — a test covers the routes it enumerates, and the route
+somebody adds next is the one that has failed twice.
+
+**The plan's own first draft shipped a tuple two keys short, and that is why
+T3.2 exists.** It was written against HEAD 8232032 and would have been
+implemented after items 1–4 landed; a transcribed tuple would have made
+`__post_init__` raise on **every path of every task**. Three defences now:
+Task 0 derives the tuple from the tree before any code is written, V1 is the
+command that does it, and
+`test_evidence_keys_lists_exactly_what_preflight_writes` is the standing AST
+walk that re-derives it on every run. The failure was *the plan being right
+about the wrong tree*, which no amount of care about the current tree would have
+caught — worth recording plainly.
+
+**Review 2's three LOW items**, recorded here at the reviewer's request rather
+than in another revision cycle. **N1**: the `node_happy` route skips
+`python_observed` alone, not `python_declared` — the latter IS written on that
+route, as the `None` that says a node manifest may not declare `image.python`.
+**N2**: `test_the_grading_evidence_keys_read_the_grading_dataclass_and_not_a_copy`'s
+`<=` cannot tell the star-unpack from three literal strings, and neither can
+T3.2's equality (both its sides read `_GRADING_KEYS`); the `ast.Starred`
+assertion added to T3.2 is the only thing that can, and the docstrings now claim
+only what they pin. **N3**: the new tests' imports were the one place an
+implementer would have had to invent, so the plan names them exactly.
+
+**Deviations from the plan, all forced by the tree.**
+
+| what the plan said | what the tree said |
+|---|---|
+| two additions to D2's tuple: `ambiguous_file_filters`, `submodules_populated_after_suite` | `ambiguous_file_filters` and **`submodules_empty_after_suite`** — item 2 landed the key under the other name. Same count, same position; the derivation is what said so |
+| `PREFLIGHT_VERSION` "16" → "17" (expected) | confirmed on disk, "16" → "17" |
+| "exactly two absence assertions in the tree" (review 1 grepped it) | **three** — item 1 landed a third `assert "p2p_scoped_after_exit" not in result.evidence` in `test_ambiguous_file_filters_is_measured_off_the_f2p_run_too`. Converted the same way |
+| the three hand constructions in `test_grade_script.py` | **five**, counting two in the same file's `fake_preflight` stubs and one in `test_run_matrix.py`. None passes `evidence=`, so the property the plan relied on holds and all five pass unedited |
+| no test named that pins `PREFLIGHT_VERSION` | `test_the_preflight_version_moved_with_the_new_assertion` asserts the literal and carries a running docstring of every bump. Updated to "17" with a 16 → 17 paragraph in the file's own style |
+| D2: a write-order tuple so `<cache>/preflight/<task_id>.json` "reads top to bottom in the order a reader would walk the gate" | **false for the artifact.** `matrix.write_json` dumps with `sort_keys=True`, so the stored blob is alphabetical from `ambiguous_file_filters` — verified against the click-3360 gate. The tuple stays in write order (that is the right shape for the constant and for `to_dict()`) *(superseded by a048693: membership, not order)*, and its docstring now says plainly that the order does not survive to the file, rather than transcribing a claim the artifact refutes |
+
+**Also gated, and it did not pass — for a reason that is not this commit's.**
+The plan named `bidict-389-putall-rollback-clean` as its vehicle. It gates
+**NO-GO** on that manifest today, and the refusal is fix 2's bare-runner probe:
+`bare_runner_exit: 4`, `unrecognized arguments: --numprocesses=auto`, `image.pip`
+needs `pytest-xdist`. That is a gap in the probe task set's manifest, not a
+verdict this commit moved — the schema assertion holds on it exactly as on the
+GO: `preflight_version 17`, `len(evidence) == 42`, `early_return: null`. Gating
+a GO and a NO-GO is the better evidence anyway, since the two blobs are what a
+reader diffs.
+
+**Where the deleted seed's prose went.** Three of the measurements it carried
+already existed at the sites that measure them, verbatim: `python_observed`'s
+three-absence paragraph is in the `python is None` branch, `submodules`' "`None`,
+not `[]`" is on both failure branches, and `submodules_empty_after_suite`'s
+mapping semantics are at its write. Two did not and were relocated:
+`f2p_before_not_run`'s two-paths note now sits at its write, and
+`bare_runner_skipped`'s "left out of this seed once" now sits in the early-return
+block that used to be its victim. `ambiguous_file_filters`' `[]`-vs-`None`
+sentence was moved to its write for the same reason.
+
+**Verification.**
+
+| step | result |
+|---|---|
+| unit | `1652 passed, 67 deselected` (from `1637 passed, 67 deselected`) |
+| `mutation_check.py` | **183/183** (from 181), run solo |
+| V1, post-Task-2 | 42 keys derived, `set(EVIDENCE_KEYS) == written`, no `early_return` union needed |
+| route null-sets | nine routes, nine distinct null sets (counts 35/9/11/16/14/8/11/8/11), each reaching its claimed verdict |
+| `tests/test_grade_script.py` | passes with **no edit** — the proof `default_factory=_evidence_seed` absorbed the assertion |
+| GATE | `click-3360-write-usage-empty-args` **PASS** at `preflight_version 17`, `len(evidence) == 42`, `early_return: null`, all three `grading_*_exit: null` where the v16 blob carried no such key at all |
+
+**Docs checked, no edit required.** `bakeoff/taskset/HARVESTING.md:83` names the
+only two evidence keys any doc names — "`bare_runner_exit` stays `null` and
+`bare_runner_skipped` names why" on a node task — and both stay true verbatim.
+Its other `suite_timeout_s` hits (`:705`, `:712`, `:719`) and
+`docs/BUILDING-A-TASK-SET.md`'s (`:246`, `:475`) are all `budget.suite_timeout_s`,
+the manifest key, not the evidence key — resolved here so the next reader need
+not re-resolve them.
+
+**One thing this does NOT do**, beyond the plan's own list: it does not re-audit
+the remaining keys for the OTHER shape of the defect — a key whose *value* means
+two things. That was `PREFLIGHT_VERSION` 11's round and is done for the four keys
+it found.
+
+**Review fix wave (`.superpowers/broaden/round2/impl-5-review.md`).** One
+blocking finding: `EVIDENCE_KEYS`' docstring claimed twice, at `:301` and
+`:323-325`, that the tuple is written "in the order it writes them" and that
+`to_dict()` hands a reader "the order a reader would walk the gate" — measured
+against the AST, 113 pairwise inversions between the tuple's order and each
+key's actual first-write line. The tuple GROUPS keys the way the gate's
+narrative runs (what is knowable before a container starts, then what each
+stage measures), carrying forward the old hand-written seed block's grouping;
+membership is the invariant `__post_init__` and T3.2 enforce, not order, and
+the stored artifact is alphabetical regardless of this tuple's order
+(`matrix.write_json`'s `sort_keys=True`). Reflowed both sentences to say that
+— no code, test, or `PREFLIGHT_VERSION` change; a new key joins by appending
+to the group it belongs in.
+
+Six non-blocking findings. This section's own "nine distinct null counts" is
+corrected above to "nine distinct null sets (counts 35/9/11/16/14/8/11/8/11)"
+— two of the nine counts repeat (8 and 11, each twice), so "distinct counts"
+was a stronger claim than the measurement supports; "distinct sets" is the one
+that is actually true. `test_evidence_keys_lists_exactly_what_preflight_writes`'s
+AST walk now filters on `isinstance(n.ctx, ast.Store)`, so a future *read* of
+an evidence key cannot be miscounted as a write by a test whose own name says
+"writes" — equivalent today (zero `ast.Load` evidence subscripts exist), but
+no longer merely equivalent by accident. The over-length docstring line
+(`:329`, 90 columns) folded into the finding-1 reflow.
+
+The three findings that ask a *queued* plan (items 7, 11, 12, 13, 14) to be
+amended were not applied here: those plans are not edited mid-round, per this
+round's own process (implementation is strictly sequential; a plan is revised
+by its own reviewer before its own implementer, not by a later item's fix
+wave). Recorded instead as a standing note in
+`.superpowers/broaden/round2/CONTEXT.md` (git-ignored scratch, not part of
+this commit): every new evidence key must be appended to `EVIDENCE_KEYS` (it
+is seeded automatically from there) and `PREFLIGHT_VERSION` bumped, or
+`PreflightResult.__post_init__` raises on every path of every task — the
+failure mode items 11 and 12 would hit verbatim, and item 7's `_SCHEMA_ROUTES`
+reuse and item 14's now-stale seed-site line reference are each item's own
+implementer's problem to catch against the tree as it stands when that item is
+picked up.
+
+Verified: `.venv/bin/python -m pytest tests/ -q` — `1652 passed, 67
+deselected`, unchanged (docstring and a test-comprehension guard only, no new
+test). Both mutation anchors for this section (`evidence: dict =
+_evidence_seed()` and `if set(self.evidence) != set(EVIDENCE_KEYS):`)
+re-checked present and unique in `preflight.py` by `grep -c`; neither line
+moved, so `mutation_check.py` was not re-run.
+
+## Round 2 item 7 — the gate records how long its own bounded runs took — 2026-09-03
+
+Plan: [docs/superpowers/plans/2026-09-03-round2-7-suite-durations.md](../docs/superpowers/plans/2026-09-03-round2-7-suite-durations.md).
+
+**What was found.** `~/.cache/bakeoff/preflight/*.json` carried 21 stored
+verdicts and not one key whose name contained `dur` — every author sized
+`budget.suite_timeout_s` from a number measured by hand in a shell (`time
+docker run`), outside the image the gate actually runs in. The item's own
+count was wrong by one in three places (`HARVESTING.md`, `docs/BUILDING-A-
+TASK-SET.md`, the click manifest's comment): preflight makes **nine** bounded
+commands on a pytest task, not eight — the five suite runs and up to three
+`grading.*` argvs, plus the bare pytest collection `PREFLIGHT_VERSION` 13
+added, which carries the same `timeout` prefix and was left out of every
+count. And half the item's own framing was already stale: `grader._timing`
+already fills `CheckResult.duration_s` from every rung that ran a command
+(`_State.passed`, `_State.fail`, `_State.environment`) — what was actually
+missing was the *reference* measurement, preflight's own, not a new
+`GradeRecord` field.
+
+**What was built.** `preflight.BOUNDED_RUN_KEYS`, a 9-entry tuple (6 fixed +
+`_GRADING_KEYS`, derived rather than restated), and two new evidence keys,
+`bounded_run_durations_s` (a dict keyed by `BOUNDED_RUN_KEYS`, `null` per run
+that did not happen) and `bounded_run_duration_max_s`. Both are seeded by
+`_evidence_seed()` — the inner dict built fresh per call, never a shared
+mutable — and `PreflightResult.__post_init__` gained two clauses, after item
+5's outer key-set check, refusing a non-dict or a mismatched inner key set.
+`_elapsed_s(result)` reads `result.duration_ms / 1000.0` off the same
+`ExecResult` `RunContainer.exec` already times with `time.monotonic()` on the
+host — no second clock. Seven statement pairs (the grading one a loop body)
+write all nine durations beside their exit codes; one null-aware maximum is
+computed once, after the container block, before the final return.
+`preflight_cache_key`'s join was extracted to `_key_parts`, shared with the
+new `verdict_matches_key`, so the two cache-key derivations cannot drift.
+`run_matrix.suite_time_line` prints the slowest run beside the bound on every
+task's line — cached, PASS and NO-GO alike, the NO-GO deliberately included
+since a `timeout`-killed task burns the full bound up to nine times and is the
+largest single contributor to the gate's own cost — and totals the gate at
+the end, with a caveat that image build, materialization and container start
+are not in that number. `cached_verdict` re-checks a stored blob against the
+key before trusting it, because `<cache>/preflight/<task_id>.json` is written
+before the `ok` test while `preflight.json` (the PASS cache) is written only
+on PASS, so the two can disagree on a `--force-preflight` run that NO-GOes.
+`PREFLIGHT_VERSION` "17" → "18". No `GradeRecord` field, no
+`GRADE_SCHEMA_VERSION` / `GRADER_VERSION` / `ORACLE_VERSION` move, no
+`_Runner` edit — the gated and graded argv stay byte-identical, and the
+grader's fake envs need no `duration_ms`.
+
+**Real-gate numbers — the first measurement of the gate's own cost this
+repository has.** `pytest-10210-approx-nested-container`
+(`~/.cache/bakeoff-probe/taskset`), `--preflight-only --force-preflight`:
+PASS, `suite time  slowest 114.4s of the 240s bound; 320.9s over 6 of the
+schema's 9 bounded runs`, `gate suite time  320.9s across 1 task(s)`. The
+stored blob (`~/.cache/bakeoff/preflight/pytest-10210-approx-nested-
+container.json`) carries all nine `bounded_run_durations_s` entries: `bare_runner
+0.075`, `f2p_before 0.745`, `p2p_before 114.388`, `f2p_after 0.57`, `p2p_after
+104.602`, all three `grading_*` `null` (this manifest declares none),
+`p2p_scoped_after 100.506`; `bounded_run_duration_max_s: 114.388`, equal to
+`p2p_before`, the largest entry. The manifest's own hand-measured comparison
+(`~/.cache/bakeoff-probe/reports/d4-suite-timeout.md`, "4470 passed... in
+106.34s") is close to but not the same interval as any single one of these —
+consistent with D2's argument that the host-side `docker exec` round trip is
+the right number and not an approximation of the container-internal one. A
+warm re-run (no `--force-preflight`) hit the cached-PASS branch and printed
+the **identical** suite-time line out of the stored blob, with `, 1 from
+cached verdicts` appended to the gate total — confirming `cached_verdict` /
+`verdict_matches_key` read the right file.
+
+**A plan defect found and fixed, not merely transcribed.** D7's claim that
+item 5's AST walk (`test_evidence_keys_lists_exactly_what_preflight_writes`)
+would find `bounded_run_durations_s` "through the inner subscript" of
+`evidence["bounded_run_durations_s"]["bare_runner"] = ...` is false as
+written: `ast.dump` on exactly that shape shows the *inner* Subscript node
+carries `ctx=Load`, not `Store` — only the outermost node in a chained
+assignment target is `Store`. The landed test filters on
+`isinstance(n.ctx, ast.Store)`, so neither the outer node (`.value` is a
+Subscript, not the Name `evidence`) nor the inner one (wrong ctx) matched, and
+the test failed with `bounded_run_durations_s` reported as an extra key on
+first run. The plan's own instruction — "verify that by running it, not by
+reasoning about it" — is what caught this; reasoning about the described
+behaviour would have shipped it broken. Fixed by adding a second comprehension
+to the walk that reads the OUTER Store node's `.value` (itself a Subscript on
+`evidence`) instead of requiring `Store` on the inner node directly — this
+realizes D7's stated intent rather than replacing it, and no top-level write
+of the shape was added to `preflight()` to work around it.
+
+**Deviations from the plan.**
+
+| what the plan said | what was done |
+|---|---|
+| T3.2 (the AST walk) "needs no change — verify that by running it" | needed a change; see above. The fix is additive (a second comprehension), so the existing walk's coverage of every other key is untouched |
+| D9's cached-branch code snippet included `resolved[task.task_id] = {"image": image, "start_sha": start_sha, "repo": work / "repo"}` | the tree's actual `resolved` dict shape (both branches, before this item) carries no `"repo"` key and nothing downstream reads one — kept it that way; adding an unused key to a dict a different item's design owns would be an unrequested, unreviewed change to a struct this item does not otherwise touch |
+| a pre-existing mutation anchor, "preflight: serve a verdict from an older preflight forever", targeted the literal line `return f"{task.manifest_digest}|{image}|{start_sha}|{PREFLIGHT_VERSION}"` | D10's `_key_parts` extraction removes that exact line from `preflight_cache_key`'s body (it now calls `_key_parts(...)`), so the anchor went STALE on the first mutation run (186/187). Moved the anchor to `_key_parts`'s own f-string — the one place the version is now dropped from — re-ran mutation_check.py solo a second time: 187/187, no stale anchors |
+| — | `test_the_preflight_version_moved_with_the_new_assertion` (a pre-existing version-pin test the plan's File Structure did not name) needed its literal `"17"` → `"18"` and a new 17→18 paragraph in the file's own running-narrative style; not doing so would have left a red test unrelated to any listed task |
+
+**Rejected alternatives**, per the plan's own D3/D4/D10 and confirmed still
+correct against the landed tree: a `GradeRecord.suite_duration_s` field
+(duplicates `CheckResult.duration_s`, forces `GRADE_SCHEMA_VERSION`); timing
+the oracle's two suite runs (forces `ORACLE_VERSION`, buys two full suite runs
+per task for a reading neither (a) nor (b) needs); storing the seconds in
+`preflight.json` beside the cache key instead of in the per-task verdict
+(needs no re-check but puts a derived copy where `grade.py`'s
+`record_preflight_pass` would never carry it); and a `suite_*`-prefixed key
+name (rejected because the bare-runner probe is a collection, not a suite
+run, and "bounded run" is what the tuple actually enumerates).
+
+Verified: `.venv/bin/python -m pytest tests/ -q` — `1674 passed, 67
+deselected` (baseline 1652 + 18 in `test_preflight.py` [4 + 5 unparametrized +
+9 parametrized over `_SCHEMA_ROUTES`] + 4 in `test_run_matrix.py`, matching the
+plan's own formula exactly). `test_grade_script.py` and `test_grader.py`
+untouched and green. `.venv/bin/python scripts/mutation_check.py` run solo
+twice (once to find the stale anchor above, once clean): **187/187 caught**,
+zero stale, up from the round's opening 183. `scripts/verify_logger.py` run
+(unchanged code path, run anyway per the plan's Verification list): **GATE
+PASSED**, `GO (offline criteria): every arm completed a loop on all 1 of 1
+run(s).` Real gate: see numbers above.
+
+## Round 2 item 6 — every `budget:` number goes through one validator — 2026-09-03
+
+Closed `docs/superpowers/plans/2026-09-03-round2-6-budget-ints.md`. `max_turns`
+and `wall_clock_timeout_s` now go through `tasks._positive_int`, the same
+validator `suite_timeout_s` already used — a quoted, floated, boolean, null,
+zero or negative value is a `TaskError` naming the manifest path and the key,
+where before a bare `int(...)` either accepted the value silently (`"40"` →
+40, `40.0` → 40, `true` → 1, `false` → 0) or raised with no manifest path in
+it (`None`, a non-numeric string). The worst measured case:
+`wall_clock_timeout_s: true` used to load as 1 and the `suite_timeout_s >
+wall_clock_timeout_s` refusal below then blamed a `suite_timeout_s` the
+manifest never declared (600 is the dataclass default), ending in "lower
+suite_timeout_s" — advice about the one number that was correct. That
+comparison still runs exactly where it did, but its correctness now rests on
+validation that happens first; T1.3's added comment says so at the call site.
+
+Rode along per D4: `budget: []` / `: 0` / `: ""` and the identical `image:`
+shapes stopped reading a written-but-falsy section as an unwritten one
+(`data.get(...) or {}` → an explicit `is None` check), matching the existing
+`grading:` precedent nine lines below in the same function. `image: []` was
+the sharper case — it silently discarded `build: ["pip install -e ."]` and
+`apt: ["less"]`, both caught by preflight today but invisible at load.
+
+**Deliberately NOT done** (all filed or already tracked): no upper bound on
+`max_turns` (D5 — `wall_clock_timeout_s` is the outer stop, section 5.4
+leaves the number to section 3.5's pilot, and claude 2.1.258 on the host
+enforces nothing on `--max-turns`, including `0`); `0x28` still resolves to
+the int 40 and is accepted (D6, YAML does the coercion, not this loader);
+unknown keys under `budget:` still load silently with every default (D7 —
+filed as a new `TASKS.md` entry, the `_BUDGET_KEYS` fix is future work);
+`provenance:` keeps its `or {}` (D4's last paragraph — `dict(0)` raises a
+bare `TypeError`, so switching it would introduce an unhandled path for
+exactly the case D4 exists to catch). No version constant moved:
+`SCHEMA_VERSION`, `GRADE_SCHEMA_VERSION`, `GRADER_VERSION`, `ORACLE_VERSION`
+and `PREFLIGHT_VERSION` are all untouched — nothing a verdict asserts
+changed, only which manifests fail to load before any of those versions is
+ever stamped on anything. `manifest_digest` for the click task moved because
+T5 edited its `budget:` comments (hashed as raw bytes), which is the cache
+key doing its job, not a version bump.
+
+One recorded caveat: `--max-turns 0`/`false`/`-1` not being refused downstream
+is measured against **claude 2.1.258 on the host**; the eval image pins
+**2.1.220**, which was deliberately not re-measured for this commit (D5's
+caveat) — a stricter check at 2.1.220 would only move the failure earlier,
+never make the load-time refusal wrong.
+
+**Deviation from the plan.** T2.11 offered two shapes for pinning that
+`image: null` still defaults ("in the same test or a one-line sibling").
+Written as a separate sibling test the total would have landed at 33 new
+cases against the plan's own stated arithmetic of 32 (`2.1`'s 9 + `2.2`'s 2 +
+`2.3`'s 7 + `2.4`'s 2 + `2.5`'s 3 + `2.6`'s 1 + `2.7`'s 3 + `2.8`'s 1 + `2.9`'s
+1 + `2.11`'s 3 = 32) — so the null check was folded into the same
+parametrized test instead, running once per parametrize case rather than as
+its own node. Both options were explicitly offered by the plan; this is the
+one that keeps the arithmetic exact. A second deviation: by the time this
+item was implemented, round-2 item 7 had already edited the click manifest's
+`budget:` comments and `docs/BUILDING-A-TASK-SET.md`'s prose, so T4.1's and
+T5.2's quoted "before" blocks no longer matched either file byte-for-byte;
+both edits were made by applying the plan's stated intent to the drifted
+text rather than by literal transcription.
+
+Verified: `.venv/bin/python -m pytest tests/ -q` — `1706 passed, 67
+deselected`, exactly baseline `1674` + the plan's stated `32`.
+`.venv/bin/python -m pytest tests/test_tasks.py -k budget -v` — 9 passed.
+`.venv/bin/python scripts/mutation_check.py` run solo: **191/191 caught**, 0
+stale (187 + the 4 new anchors in Task 3; each selector re-verified with
+`--collect-only` to match only its intended parametrized cases, per T3.5).
+Source tree confirmed byte-clean after the mutation run (`git status` shows
+only the intended diff). V2's compatibility walk re-run before and after Task
+1: `taskset` 1/1, `~/.cache/bakeoff-probe/taskset` now **10 directories, 9
+with a manifest** (grown by one, `sqlglot-8225-mysql-key-constraint`, since
+the plan's 9/8 measurement) — every one of the nine manifests loaded
+identically before and after, no new refusal, `image.build` unchanged on
+every task. V4 — `scripts/run_matrix.py --preflight-only` — **PASS** for
+`click-3360-write-usage-empty-args`, and the gate visibly re-ran rather than
+reporting a cached verdict (no ", N from cached verdicts" suffix on the gate
+total line), confirming T5's comment edit moved `manifest_digest` as
+intended. V7 — the end-to-end defect reproduction on a scratch copy of the
+click manifest — all four mutated bodies now raise `TaskError` naming
+`budget.<key>` and `must be a positive integer`; the `wall_clock_timeout_s:
+true` case no longer mentions `suite_timeout_s`.
+`scripts/verify_logger.py` (offline logger gate, unchanged code path):
+**GATE PASSED** on a clean re-run (`1706 passed, 67 deselected` in the unit
+phase, `44 passed` integration, dry run OK, offline smoke GO). One earlier
+invocation reported `GATE FAILED: unit suite`, but the failing test itself
+was not captured: the invocation was piped through `tail -30`, and
+`verify_logger.py` prints its `GATE FAILED: {failures}` summary only at the
+very end, so the tail carried the verdict and none of the pytest output that
+would identify it. The cause is therefore unknown, not a confirmed flake —
+`scripts/mutation_check.py` had just been run solo and backgrounded past the
+tool's timeout, waited out with `until ! pgrep`, and a unit phase that
+overlapped a still-mutated tree would produce exactly this signature (unit
+suite red, every later phase green) without being a flake at all. Re-run
+immediately after with full output captured showed a clean pass across all
+four phases with no code changes in between; item 6's own code review
+independently re-ran the gate twice more, both `GATE PASSED` with identical
+counts (`1706 passed, 67 deselected` in the unit phase, `44 passed`
+integration, each run). Flagged here rather than silently discarded, since
+this repository already tracks at least one other flaky fixture (`git log`,
+"record the flaky fixture in the wave's review log").
+
+## Round 2 item 8 — `_check_p2p` gains the `not_run` branch — 2026-09-03
+
+Plan: [docs/superpowers/plans/2026-09-03-round2-8-p2p-not-run.md](../docs/superpowers/plans/2026-09-03-round2-8-p2p-not-run.md).
+
+**What was found (already measured by the plan, restated for this log).**
+`grader._check_f2p` has read `outcome.not_run` and routed a non-empty set to
+`state.environment(...)` since 5 -> 6; `_check_p2p` had no such branch. On a
+node task with an explicit `tests.p2p`, a `-t` pattern naming a test that no
+longer matches exits **0** on both vitest and jest with every test in the
+file reported skipped (measured 2026-09-01). So a *partly* stale p2p
+selection ran what still matched, passed, and reached
+`state.passed("p2p")` at exit 0 — `resolved: True` over a regression check
+part of which never ran, invisible to the exit code, to `p2p_deselected`
+and to `p2p_failed_node_ids`. The plan's own bullet-in-`TASKS.md` was itself
+half-stale: `preflight._Runner.pass_to_pass` has written
+`self._selected = tuple(tests.p2p)` on the explicit branch since `59f4488`,
+so the data was not structurally absent as the old bullet claimed — only
+unread by `_check_p2p`.
+
+**What was built.** `_check_p2p` gained a `not_run` branch mirrored from
+`_check_f2p`, inserted immediately before the `KIND_PASSED` check and so
+ahead of `KIND_PASSED`, `KIND_FAILED` and the timeout branch alike (D4): a
+partially-executed selection is not the run any of those three claims to
+describe. `GradeRecord` and the ladder's `LadderResult`/`_State` gained one
+new field, `not_run_node_ids: tuple[str, ...] | None`, written by both
+`_check_f2p` and `_check_p2p` (only one can ever reach it, since both raise
+`_Stop` through `state.environment`) — beside the message rather than
+instead of it, because a node `fullName` may itself contain `", "` and the
+joined prose is not losslessly splittable back into ids.
+
+The blocking fix (D1a) is upstream of the grader: `preflight._Runner.pass_to_pass`'s
+explicit branch used to set `self._selected = tuple(tests.p2p)` verbatim,
+which included the quarantine — and `p2p_args` folds a quarantined id into
+the same `-t` as a negative lookahead, so it is SKIPPED, carries no terminal
+status, and is invisible to `executed_names`. Left unfixed, the new branch
+would have graded `not_graded` on every healthy node run of any task with
+one flake. Fixed at the source: `_selected` is now `tests.p2p` **minus**
+`extra_deselect`, which is identity at every preflight and oracle call site
+(`grader.py`'s p2p check is the only caller that ever passes
+`extra_deselect`), so `PREFLIGHT_VERSION` did not move.
+`GRADER_VERSION` "10" -> "11" (round-2 item 1 had already moved it from
+"9"); `GRADE_SCHEMA_VERSION` "1.3.0" -> "1.4.0". No `ORACLE_VERSION` or
+`SCHEMA_VERSION` move — no oracle field and no `RunRecord` field changed.
+
+**Verification vehicle A — no-regression proof on a real pytest task
+(`werkzeug-3037-duplicate-rule-error`).** Preflight PASS on
+`~/.cache/bakeoff-probe/taskset`. Built an `extra.diff` as `solution_diff`
+verbatim plus a hunk deleting `tests/test_routing.py` (the task's entire
+declared `tests.paths`), via the plan's recipe: materialize, apply
+`solution_diff`, `git rm tests/test_routing.py`, `git add -A`,
+`git diff --cached <start_sha>`. Self-graded against
+`~/.cache/bakeoff-probe/eventlog-r2i8`: both the reference run and the
+`-extra` run (agent deleted its own p2p test file) graded **`resolved: True`**
+identically — `agent_modified_tests` `False` on the reference and `True` on
+`-extra`, `not_run_node_ids: null` on both. Confirms §1.5(c)'s ruling: check
+2's restore (`git rm -r` + `git checkout <start_sha> --
+tests/test_routing.py`) puts the file back before check 6 runs, so "the
+agent deleted a p2p test" never reaches the new branch.
+
+**Verification vehicle B — the branch itself, on a real node task.** No
+gated manifest declares an explicit `tests.p2p` (checked: the two node
+manifests in `~/.cache/bakeoff-probe/taskset` both carry `p2p: []`), so a
+scratch copy (`~/.cache/bakeoff-probe/ts-r2i8`, reverted afterward) edited
+only `ufo-214-without-trailing-slash-query/task.yaml`: `tests.p2p` from `[]`
+to two ids in `test/trailing-slash.test.ts` (under `tests.paths`, neither
+colliding with the task's one `tests.f2p` id) — one real
+(`... bar`, read out of the materialized tree) and one invented
+(`... this-test-does-not-exist`). `run_matrix.py --preflight-only
+--force-preflight` on the scratch task set gated **GO** despite the invented
+id, exactly as the plan predicted (§8.5): preflight's p2p-after site reads
+only `runner.classify(after_p2p).kind != KIND_PASSED` and never looks at
+`not_run` — the asymmetry filed as this item's second new `TASKS.md`
+bullet. Self-graded the reference run: `not_graded_reason: environment_error`,
+`environment_error_check: "p2p"`, `not_run_node_ids` naming exactly the
+invented id, `environment_error` reading "these declared p2p ids did not run:
+test/trailing-slash.test.ts::withoutTrailingSlash, queryParams: true
+this-test-does-not-exist" — matching the plan's predicted verdict exactly.
+
+**Verification vehicle C — not run.** Forcing the quarantine through
+`derive_quarantine` on the scratch task (two full suite runs plus deriving a
+real flake) was not attempted; the plan explicitly permits recording this
+step as not run with the unit pin (§4.2(3),
+`test_a_quarantined_p2p_id_is_not_reported_as_not_run`) standing in its
+place, which is what was done. Not recorded as passed.
+
+**Deviation from the plan.** §4.3's test 9
+(`test_the_ids_that_did_not_run_are_recorded_as_a_tuple_not_only_in_a_message`)
+specified the id `"tests/b.test.js::formats a, b and c"`, asserting both
+`not_run_node_ids == (id,)` (length 1) and
+`environment_error.split(", ")` yielding more than two parts. That id
+carries exactly one `", "`, so the message it produces splits into exactly
+two parts, not more than two — the two assertions as written are not
+simultaneously satisfiable with a single comma. Used
+`"tests/b.test.js::formats a, b, and c"` instead (an added Oxford comma,
+two `", "` occurrences), which makes both of the plan's stated assertions
+literally true while preserving the test's intent unchanged.
+
+Everything else in the plan (D1a's comment block, D1b's branch and comment,
+D2's field and docstring, D3, D4's ordering, D5's K=1 fixture constraint, D6's
+refusal, the version-bump paragraphs, all thirteen named tests, all three
+mutation anchors) was transcribed as written; no other defect was found.
+
+Verified: `.venv/bin/python -m pytest tests/ -q` — `1717 passed, 67
+deselected`, exactly baseline `1706` + the plan's stated `+11` (§4.2's eight,
+§4.3's two, §4.4(12); §4.4(11) and the two concrete edits in §4.4(13) edit
+existing tests without adding to the count). One additional pre-existing
+version-pin test not named in the plan's own file list needed its
+literal moved for the same reason `test_the_preflight_version_moved_with_the_new_assertion`
+needed it in item 7: `test_the_grader_version_moved_with_what_check_5_means`
+(`"10"` -> `"11"`, plus a new `10 -> 11` paragraph). §4.4(11) named the
+other, `test_the_grade_schema_version_moved_with_what_the_record_means`
+(`"1.3.0"` -> `"1.4.0"`, plus a new paragraph), explicitly — both would
+otherwise have been left red by a version bump neither test's own plan owned.
+`tests/test_preflight.py -k argv_preflight_validated` green with no edit, as
+required (§4.5). `.venv/bin/python scripts/mutation_check.py` run solo:
+**194/194 caught**, 0 stale (191 + the 3 new anchors), tree byte-clean
+after (`git status` showed only the intended diff). `scripts/verify_logger.py`:
+**GATE PASSED** — unit `1717 passed, 67 deselected` in 83.12s, integration
+`44 passed, 1740 deselected` in 112.30s, dry run OK, offline smoke GO.
+`graphify update .` run after the source edits.
+
+## Round 2 item 9 — a pure gitlink rename is refused, not applied and graded — 2026-09-03
+
+Plan: [docs/superpowers/plans/2026-09-03-round2-9-gitlink-rename.md](../docs/superpowers/plans/2026-09-03-round2-9-gitlink-rename.md).
+
+**What was found (measured by the plan, restated here).** `grader._chunk_is_gitlink`
+reads only a chunk's HEADER for a `160000` mode line, and `container.snapshot_diff`
+runs `git diff --cached <base_sha>` with no `-M` and no `--no-renames` in a run
+tree that sets no `diff.renames` — so rename detection is ON (git's default since
+2.9). A submission whose only change to a submodule is a rename therefore emits
+`similarity index 100%` / `rename from` / `rename to` and **nothing else**: no
+mode line, no `index <a>..<b> <mode>` line, no hunk body. `_chunk_is_gitlink`
+returns `False`, and `_gitlinks_touched` — which only inspects chunks that return
+`True` — never sees the path. The existing refusal's own docstring claimed this
+shape was "out of reach" because renaming a submodule means editing `.gitmodules`
+too; measured false in both halves: a plain `mv sub newsub` followed by
+`git add -A` (the ordinary way an agent moves a directory) produces **no**
+`.gitmodules` chunk at all, and `git mv`'s own `.gitmodules` chunk is mode
+`100644` and would not have matched the check anyway. `git apply --index` of the
+four-line chunk exits 0, moves the index entry to the new path, and leaves the
+submodule's fully-populated files at the **old** path with an empty directory at
+the new one — so the ladder would grade a tree the agent's move never reached and
+return `resolved: False`, an accusation over a limitation of the harness's own
+diff capture. No diff-only rule can close this: a 100%-similarity rename of an
+*ordinary* file is byte-identical in shape, differing only in the paths, and a
+path's mode is not in the diff.
+
+**What was built.** Three new functions in `grader.py`, between `_gitlinks_touched`
+and `_added_lines`:
+
+- `_rename_pairs(diff)` — the `(source, destination)` pairs a submission renames,
+  read off `_chunk_path`'s forward/reverse `git apply --numstat -z` (never the
+  `rename from`/`rename to` header text, for `tasks.py`'s standing reason: those
+  lines are not `-z`-framed, are C-quoted for non-ASCII, and a path containing
+  `" b/"` makes the `diff --git` line ambiguous).
+- `_start_state_gitlinks(repo, start_sha, paths)` — which of `paths` are `160000`
+  gitlinks in `start_sha`'s tree, via `git ls-tree -r -z <start_sha> --
+  :(literal)<path>...`, reusing `_ls_tree_gitlinks`'s existing parser. Raises
+  `TaskError` on a failed listing rather than reading it as "no gitlinks" (D4) —
+  the fallback for a silent failure here is grading a tree the submission's
+  content never reached. Pathspecs are `:(literal)`-prefixed (D8): measured, a
+  gitlink literally named `:weird` is returned **only** under the literal
+  spelling, and the bare one exits 0 with **empty output**, which would read as
+  "not a gitlink" and let it through.
+- `_renamed_gitlinks(diff, repo, start_sha)` — composes the two: no rename pairs
+  means no `git ls-tree` at all (measured, 115/115 stored records take this path),
+  and only the **source** side of each pair is asked about, since a rename's
+  destination cannot exist at `start_sha` by construction.
+
+`grade_run` gained a second refusal branch, **inside** the existing `try:` block
+(so the `finally: shutil.rmtree(tree, ...)` still removes the tree on this path —
+T3.9 pins the ordering), between `materialize` and `RunContainer`. This is D1/D3's
+central decision: the mode of the rename source is not in the diff, so the
+authority has to be `start_sha`'s tree, and that tree does not exist until
+`materialize` builds it — no rearrangement asks the question earlier, because the
+pruned mirror is at `base_sha` and `declared_start_sha` names a commit no
+repository holds. So the gitlink refusal is now **in two places**: every shape
+carrying a `160000` mode line is refused before the artifacts wipe and before
+`materialize` (free); a pure rename is refused after `materialize` and before the
+container (one hardlinked `--local` clone, D3); a submission with no rename chunk
+pays nothing extra beyond one additional `_parse_submission` call (D7, priced at
+~690 short-lived git processes across the 115-row stored corpus — declined to
+collapse into one parse because the saving is tens of milliseconds and the cost is
+architectural, per D7's rejected-alternative section).
+
+**D2, in its current framing.** The alternative — passing `--no-renames` to
+`container.snapshot_diff` so every gitlink change carries a mode line and the
+existing check is complete on its own — was measured to work. It is not rejected
+as the worse recording; it is **insufficient** as *the* fix, for one argument in
+two halves: it cannot reach a row already written to the append-only event log
+(all 115 stored rows were captured renames-on), and it would make the grader's
+soundness depend invisibly on a flag in another process (delete `--no-renames`
+from `container.py` a year from now and the check silently goes blind again, with
+nothing offline able to tell a renames-off diff from a renames-on diff that
+happens to contain no rename). The grader-side `ls-tree` is required whatever the
+harness later records, so the two are not alternatives — and whether the *record*
+itself should carry renames at all (measured: with renames on, `files_touched`
+reports only a rename's destination, dropping the source silently) is a separate
+question, filed as its own `TASKS.md` P2 entry (T5.2) rather than folded in here,
+because one commit must not change both what is measured and what is graded.
+
+**D5/D6.** No new `NotGradedReason`: this is the same absence
+`SUBMODULE_GITLINK_UNGRADABLE` already names (a gitlink moved in the index without
+its content following), distinguished from the mode-line case only in
+`not_graded_detail`'s prose (an arrow, `sub -> newsub`, where the existing message
+lists plain paths). `GRADER_VERSION` moved 11 -> 12 by reading the constant and
+adding one, per the standing rule — a submission the ladder used to accept and
+grade (`git apply --index` exits 0, measured) is now taken out of the denominator,
+which is a change to what the ladder means on an input it already accepted, so the
+version moves whether or not any stored row hits it. Measured: **0 of 115** stored
+records under `~/.cache/bakeoff` carry a rename chunk of any kind, so no stored
+verdict changes — the bump is for `scripts/grade.py`'s resume gate
+(`(run_id, GRADER_VERSION)` alone), not for a flip.
+
+**Tests.** Eight new in `tests/test_grader.py`, plus one edited
+(`test_the_grader_version_moved_with_what_check_5_means`, literal `"11"` ->
+`"12"` with a new `11 -> 12` paragraph): the two fixtures and the hermetic
+`_start_state_repo` helper (built with real `git update-index --add --cacheinfo
+160000,<sha>,<path>` — no submodule, no clone, no network); the pure-rename
+refusal and its ordinary-file control; `_rename_pairs` reading off git rather
+than the header; the zero-cost no-rename path (an `AssertionError`-raising fake
+proves `_start_state_gitlinks` is never called); the exact `git ls-tree` argv
+(source only, `start_sha`, `:(literal)`-prefixed); the `grade_run` branch itself
+(no container starts, `NotGradedReason.SUBMODULE_GITLINK_UNGRADABLE`, the arrow
+in `not_graded_detail`, `artifacts_dir is None`); the refused row leaving no
+materialized tree behind (explicitly **not** asserting the key-level
+`grade-tree/<run_id>` husk is gone — that survival is `fresh_tree`'s documented,
+deliberate cost since round-2 item 3, and asserting it away would fail against
+correct code); and a failed `git ls-tree` raising `TaskError` rather than falling
+through.
+
+**Deviation from the plan.** T3.10 (`test_a_start_state_listing_that_fails_stops_the_grade`)
+could not be transcribed as a bare "make `grader.subprocess.run` return
+`returncode=128`" fake: `subprocess` is one process-global module, and
+`_renamed_gitlinks` calls it **twice** on the way to the `git ls-tree` this test
+is about — once for real, inside `_rename_pairs` (`_parse_submission` ->
+`_chunk_path` -> `_numstat`, which must actually parse the fixture's rename chunk
+to produce a pair worth looking up). A fake that intercepts every call
+unconditionally makes `_numstat`'s own real `git apply --numstat` invocation see
+the broken reply too, so `_parse_submission` raises `TaskError`, `_rename_pairs`
+catches it and returns `()`, and `_renamed_gitlinks` returns `()` **without ever
+reaching** `_start_state_gitlinks` — the test would pass for the wrong reason (no
+exception at all, not the intended `TaskError`) or fail outright. Fixed by having
+the fake intercept only a `git ls-tree` argv and delegate everything else
+(including the real numstat call's `input=` kwarg, which the plan's literal
+three-parameter signature does not accept) to the real `subprocess.run`, captured
+before the patch. The assertions themselves (`pytest.raises(TaskError)`,
+`"not a tree object" in str(...)`) are exactly as the plan specifies.
+
+**Verification.**
+- `.venv/bin/python -m pytest tests/ -q` — **1725 passed, 67 deselected**,
+  exactly baseline `1717` + **8** (T3.3-T3.10; T3.11 edits an existing test and
+  adds none, matching the plan's corrected count from review 2).
+- `tests/test_grader.py -q -k "gitlink or rename"` — **13 passed** (the eight
+  new plus the four pre-existing gitlink tests plus one).
+- The two pre-materialize tests (`not_graded_rather_than_failed`,
+  `nested_repo_is_not_graded_either`) still pass with no Docker and no mirror.
+- `.venv/bin/python scripts/mutation_check.py` run solo (backgrounded past the
+  120 s tool timeout, waited out with `until ! pgrep -f mutation_check.py`):
+  **195/195 caught**, 0 stale (194 + the one new anchor), tree byte-clean
+  after.
+- Manual re-measurement of the load-bearing external fact, on the real
+  `tomlkit-514-inline-table-comment-separator` task materialized into a scratch
+  tree (`~/.cache/bakeoff-probe/taskset-w6-isolated`, `start_sha
+  e1d72b883d2e452ca14835047e2fa7db02cdc4d8`): `mv tests/toml-test tests/toml_test
+  && git add -A && git diff --cached <start_sha>` printed exactly
+  `similarity index 100%` / `rename from tests/toml-test` / `rename to
+  tests/toml_test`, no mode line, no `.gitmodules` chunk — confirming M8's
+  reachability claim on a real submodule task, not only on the synthetic
+  fixture.
+- Self-grade on that same task (`~/.cache/bakeoff-probe/self_grade.py` writing
+  reference/empty/extra records, `scripts/grade.py --taskset
+  ~/.cache/bakeoff-probe/taskset-w6-isolated`), with the extra diff being the
+  real rename captured above:
+  ```
+  reference: resolved=true, not_graded_reason=null, grade_failure=null
+  empty:     resolved=false, grade_failure=empty_patch
+  extra:     resolved=null, not_graded_reason=submodule_gitlink_ungradable,
+             not_graded_detail="the submission renames the gitlink(s)
+             tests/toml-test -> tests/toml_test; a 100%-similarity rename
+             carries no mode line and no content, so applying it moves the
+             index entry and leaves the submodule's files at the old path"
+  ```
+  `grader_version` on every line reads `"12"`. Exactly the plan's predicted
+  verdict, and the reference stays `resolved: true` beside it — the refusal is
+  specific to the rename, not a blanket NO-GO on the task. Evidence left at
+  `~/.cache/bakeoff-probe/eventlog-tomlkit-514-gitlink-rename`; the rename diff
+  itself at `.superpowers/broaden/round2/gitlink_rename_extra.diff`.
+
+Everything else in the plan (D1's authority choice, D3's cost accounting, D4's
+raise-don't-fall-through, D7's rejected refactor and its correction from review
+1, D8's `:(literal)` reasoning, the `GRADER_VERSION` comment block, the
+`_chunk_is_gitlink` docstring correction, the `grade_run` docstring rewrite) was
+transcribed as written; no other defect was found.
+
+`graphify update .` run after the source edits.
+
+## Round 2 item 10 — the submodule leak guards are made total, and given a post-condition — 2026-09-03
+
+Plan: `docs/superpowers/plans/2026-09-03-round2-10-submodule-leak-guards.md`
+(reviewed twice, APPROVED, 0 open findings after review 2). Transcribed as
+written; no deviation disputed the design.
+
+**What changed, in one paragraph.** `TASKS.md`'s own P3 bullet on this item
+said "Leave the code as it is... What is missing is the measurement, not the
+fix" — the plan's M4 inverts that conclusion. Measured, git 2.50.1: a clone
+always gets a remote, so "origin does not exist on a submodule git chose not
+to give a remote" does not exist as a shape; the only way a remote is not
+called `origin` is an operator's `clone.defaultRemoteName`, and in exactly
+that case `git remote remove origin` exits 2, the old `check=False` swallowed
+it, and `.git/config` plus `.git/modules/<name>/config` rode into the run
+tree carrying the host cache path with materialization reporting success and
+`git status --porcelain` clean. So the one reachable failure of that guard
+WAS the leak it existed to prevent. Fixed by listing remotes and removing
+each by name, at `check=True` on both the listing and the removal, in both
+`_init_submodules` (the submodule half) and `materialize` (the superproject
+half, which M5 showed leaks the identical way from the identical cause).
+`materialize` also gained a post-condition, `_refuse_host_mirror_path`, that
+walks the whole `.git` subtree of the finished run tree in 1 MiB chunks and
+raises `TaskError` naming the first file that still carries
+`<cache_root>/repos` — a property re-checked against the artifact itself,
+the same move `CLAUDE.md` already makes for the pruned mirror's own cache.
+
+**Confirmed against the tree before starting.** Round-2 item 2
+(`submodules_unneeded`) landed first, as the plan required: `_init_submodules`
+filters to `needed = tuple(sub for sub in subs if not sub.declared_unneeded)`
+and returns early when `needed` is empty (`tasks.py:2914-2915`), so a
+submodule declared unneeded is never initialised and neither leak guard runs
+for it — exactly what the plan's "Composition with item 2" section predicted,
+and the reason the post-condition lives in `materialize` rather than inside
+`_init_submodules` (D4): the latter returns early for a growing set of tasks,
+and the superproject's own two guards ran before it was ever called.
+
+**Deviations from the plan, and why.**
+
+1. **V3 (red-before-green on the new `clone.defaultRemoteName` test) was not
+   run as a standalone step**, because the fix was implemented as one
+   sequential edit rather than test-then-code; running it would have meant
+   reverting Task 2/3's edits, running the test alone, and reapplying. The
+   defect it would have shown is already the plan's own M4 measurement
+   (reproduced independently by review 1), and V4 below gives the equivalent
+   assurance from the other direction — that the fake genuinely raises rather
+   than the test passing for a reason it does not state.
+2. **The V4 probe was run as a temporary, uncommitted test appended to
+   `test_tasks.py`**, executed with `pytest -k`, confirmed to fail with
+   exactly `TaskError: git reflog expire --expire=now --all failed (exit 1):
+   boom` escaping `materialize` uncaught (not swallowed, not miscaught), then
+   deleted before the real commit. This is the plan's own V4 step, run
+   literally: "run one of them with the fake in place and no `pytest.raises`,
+   confirm a `TaskError` escapes with the expected message."
+3. **The `clone.defaultRemoteName=upstream` end-to-end check (V10) does NOT
+   refuse.** It succeeds cleanly, with zero leaking files anywhere under
+   `.git`. This is correct and is what the plan's own design predicts —
+   D1 explicitly rejects "refuse instead of fix" as worse than the
+   alternative, and review 1's re-measurement (quoted in the plan) already
+   says so: "removing every listed remote in both the run tree and the
+   submodule clears both files and the dangling `[branch "main"]` section,
+   the whole-`.git` scan then comes back clean." Reproduced independently
+   here on the real `tomlkit-514-inline-table-comment-separator` task from
+   `~/.cache/bakeoff-probe/taskset-w6-isolated`, fresh cache and run tree,
+   `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=clone.defaultRemoteName
+   GIT_CONFIG_VALUE_0=upstream`: `materialize` returned `start_sha
+   e1d72b883d2e452ca14835047e2fa7db02cdc4d8` (unchanged), `git remote -v` in
+   both the run tree and `tests/toml-test` printed nothing, and neither
+   `.git/config` nor `.git/modules/tests/toml-test/config` carries a `[remote
+   ...]` section of any name — the section is gone entirely, not merely
+   renamed. A whole-`.git` byte scan for `<cache>/repos` returned zero hits.
+   The post-condition's REFUSING behaviour is exercised instead by the unit
+   tests that synthesize a guard that silently no-ops (`returncode=0`) —
+   `test_a_host_mirror_path_surviving_in_the_submodules_reflog_is_refused`
+   and its superproject counterpart — which is the only way to observe the
+   post-condition catching something, precisely because Task 2/3's fix closes
+   the one measured real-world path to a leak.
+
+**Verification.**
+- `.venv/bin/python -m pytest tests/ -q` — **1734 passed, 69 deselected**,
+  exactly baseline `1725`/`67` + **9 passed** (4.1-4.7, 4.9, 4.10; 4.8 is a
+  rename+widen of an existing test, not an addition) and **+2 deselected**
+  (5.1, 5.2 — the two new integration tests, deselected by `-m "not
+  integration"`, proving they were collected with both markers).
+- `.venv/bin/python scripts/mutation_check.py`, run solo — **198/198 caught**
+  (195 baseline + the 3 new anchors), including the three this item adds:
+  `tasks: stop refusing a run tree that carries the host mirror path`,
+  `tasks: remove only a remote literally named origin` (the mutant keeps
+  `check=True`, so it is louder than the pre-fix code and goes red on the
+  raise rather than on a remote assertion), and `tasks: let the leak scan
+  skip a directory it cannot list`. Tree byte-clean afterward (`git status`
+  shows only the intended source edits, no `if False:` or other mutation
+  residue).
+- `.venv/bin/python scripts/run_matrix.py --preflight-only --force-preflight
+  --task-set ~/.cache/bakeoff-probe/taskset --tasks
+  tomlkit-514-inline-table-comment-separator` — `start_sha
+  e1d72b883d2e452ca14835047e2fa7db02cdc4d8` (unchanged from before this
+  commit), `preflight PASS`, f2p red-then-green, p2p green both ways, tree
+  clean. Confirms D7's claim end to end: nothing in this item moves an
+  object, a ref, the index or a tracked file, only already-scrubbed `.git`
+  metadata.
+- The `clone.defaultRemoteName=upstream` real-task check (V10), detailed in
+  deviation 3 above: clean materialize, zero leaks, `start_sha` unchanged.
+- `.venv/bin/python scripts/verify_logger.py` (V6) — **GATE PASSED**.
+- `.venv/bin/python -m pytest -v -m "integration and task_image"
+  tests/test_integration_submodules.py -k
+  "no_host_mirror_path_under_dot_git or skipped_reflog_expire_is_refused"
+  --basetemp="$HOME/.cache/bakeoff-pytest"` (V7) — **2 passed, 2 deselected**,
+  both new integration tests collected and green under both markers, closing
+  the gap the item's own report left (two new tests had shipped without ever
+  having been run).
+- `.venv/bin/python scripts/run_matrix.py --preflight-only` over
+  `bakeoff/taskset/` (V9) — `preflight PASS` on the one task in the taskset,
+  6.6s of bounded-run time; `PREFLIGHT_VERSION` does not move in this item, so
+  this is confirmation the cached verdict is genuinely undisturbed rather than
+  merely argued to be.
+- The chunked-read memory bound (V11), re-measured against a synthetic 60 MB
+  packfile: peak RSS delta ~2 MB, confirming `_refuse_host_mirror_path` does
+  not materialize the file whole (the code review's own measurement against
+  `pytest-10210`'s real 40.3 MB pack found chunked 28 MB peak RSS against
+  154 MB for the `read_bytes()` version it replaced).
+
+Everything else in the plan (D2's superproject symmetry, D3's chunked-read and
+`os.walk(onerror=)` reasoning, D5's naming, D6's widened test, D7's
+version-constant argument, the M6 corpus table, the M7 non-vacuity correction
+distinguishing the submodule's 0-byte `logs/HEAD` from the superproject's
+non-empty one, and the OQ1/OQ4 rulings) was transcribed as written; no other
+defect was found.
+
+`graphify update .` run after the source edits.
+
+## Round 2 item 11 — a declared node id that names two tests in its own file — 2026-09-03
+
+Plan: `docs/superpowers/plans/2026-09-03-round2-11-same-file-duplicates.md`
+(reviewed twice, APPROVED, 0 open findings after review 2). Transcribed as
+written, plus one carried-forward fix (below).
+
+**What was measured (M11.1-M11.6).** A node id is `<file>::<fullName>` with no
+positional index. On a file holding two tests titled `outer adds`, measured
+2026-09-02 (vitest 3.2.7, jest 30.5.0): the report carries two
+`assertionResults` with the identical `fullName`, `title` and
+`ancestorTitles`, and on the runs this harness makes neither framework reports
+a `location` that separates them — vitest emits the key only when a `file:line`
+positional turns task-location capture on, jest's is `null` without
+`--testLocationInResults`. An exact anchored `-t '^(?:outer adds)$'` ran BOTH
+on both frameworks — one passed and one failed in the same run — and the
+negated form skipped BOTH at `numPendingTests: 2` for one requested id. So
+`classify` reports ONE `failed_id` for the pair, `verify_selected` reports
+nothing missing, and a deselected duplicate is not in `_TERMINAL_STATUSES` (so
+the scoped p2p run — which deselects the f2p ids — cannot see an f2p
+duplicate at all). A positional index would not help either: vitest's
+`file:line` positional selects one of the pair but jest reads it as a path
+regex and collects zero tests, and neither framework can *deselect* by line,
+which the quarantine needs.
+
+**The boundary (D1).** Preflight refuses a task whose **declared** f2p or p2p
+id resolves to more than one terminal assertion in its own file
+(`same_file_duplicate_ids` intersected with `tests.f2p ∪ tests.p2p`), and
+records — without refusing — every same-file collision, declared or not, in
+that same evidence key. The line is drawn at what the gate can *prove*: for a
+declared id, the f2p-before run shows two terminal assertions at `passed` and
+`failed` and the f2p-after run shows two at `passed`, so the two claims the
+gate exists to make ("these tests were red", "these tests are green") are
+demonstrably satisfied by *different tests*, and nothing downstream can say
+which. For an undeclared duplicate the gate proves only that both twins ran
+and both passed; the harm needs the id to reach `oracle._derive`'s
+grade-time quarantine, which this gate never computes, so refusing on it would
+refuse repositories over a condition the refusing component cannot evaluate —
+re-erecting the corpus-wide exclusion item 1 dismantled, in the round convened
+to raise yield. The accepted residual is real and named rather than closed: a
+flaky undeclared twin CAN be quarantined, `_derive` deselects by node id, and
+that removes BOTH twins from check 6 — so a submission that broke the healthy
+twin can still grade `resolved: true`. Filed as a P2 bullet in `TASKS.md`
+rather than left only in this plan, since a residual nobody records is
+silence.
+
+**The accumulator (D2) and the refactor (D3).** `same_file_duplicate_ids` is
+accumulated over EVERY node run this gate makes (not the scoped one alone,
+for the reason above), per `testResults` entry (never across entries, so a
+`merge_reports`-concatenated report can only under-report a duplicate, never
+invent one), combined by MAX across runs (never SUM — the same test executes
+in the before-run and the after-run, and test 14's `f2p_twice=True` shape
+pins that a summing implementation reads 4 where the answer is 2), over
+terminal statuses only. `node_adapter.executed_names` is refactored onto a
+private `_executed(report)` generator that both it and the new
+`duplicate_ids(report)` delegate to, carrying the `report is None` guard for
+all three readers; `_executed` is defined immediately above `executed_names`
+and below `classify`, because `mutation_check.py`'s existing
+`if report is None:` anchor replaces the FIRST eight-space occurrence in the
+module and that must stay `classify`'s. `pytest_adapter.duplicate_ids` is
+`{}` unconditionally — a CLAIM pytest's node ids back (file + class + a
+parametrize index makes a pytest id unique by construction), not an absence.
+
+**Deviation from the plan: a pre-existing test-harness gap, fixed.**
+`_ScriptedContainer._node_timeout`'s p2p branch recognises the deselect-branch
+shape by `"-t" not in rest`("opening" a check). An EXPLICIT `tests.p2p` takes
+`p2p_argvs`' SELECTED branch instead, whose every group carries a `-t` for the
+identical reason `_f2p_open`'s own comment already gives for f2p's selection
+groups — so the heuristic misread the very first (and only) group of an
+explicit p2p check as a continuation and served it `{"testResults": []}`,
+regardless of what a test scripted into `container.reports`. Measured: this
+predates round 2 item 11 entirely (reproduced against `50464d4`, before any of
+this item's edits, with a plain single-id `p2p=(...)`), and no existing test
+had ever asserted content-correctness of an explicit-p2p run, so it went
+uncaught. Plan test 15 (`test_a_declared_p2p_id_that_names_more_than_one_test_
+is_a_problem`) is the first test that needed it. Fixed the same way `_f2p_open`
+and `_scoped_groups` already are: a memoized `_p2p_select_groups` (the
+adapter's own selected-branch argv for `tests.p2p`) matched against the
+invocation, with a `_p2p_open` flag mirroring `_f2p_open`'s. `None`/empty
+when `tests.p2p` is empty, so it cannot affect the deselect-branch path any
+existing test exercises. This is a test-only fix (`tests/test_preflight.py`),
+touches no production code, and every test that passed before still does.
+
+**Real-corpus finding, not a defect.** The plan's own §6.5 verification step
+(re-gate `yaml-474-single-newline-empty-value` with `--force-preflight`)
+predicted either `same_file_duplicate_ids: {}` or a genuine finding to record.
+Measured here: **non-empty on both real node tasks in the probe corpus** —
+`yaml-474` reports three undeclared same-file collisions in
+`tests/doc/stringify.ts`, and `ufo-214-without-trailing-slash-query` reports
+two in `test/query.test.ts` and `test/utilities.test.ts` — and both still gate
+`preflight PASS`, because none of the six ids are declared. This is the D1
+boundary working as designed on real repositories: recorded, not refused. Not
+a HARVESTING.md screened-corpus entry, because that instruction is for a
+DECLARED duplicate producing a NO-GO, which did not happen on either task.
+
+**Verification.**
+- `.venv/bin/python -m pytest tests/ -q` — **1762 passed, 70 deselected**
+  (baseline 1734/69 + 28 passed, +1 deselected: 19 in `test_runners.py` —
+  eight new tests ×2 frameworks plus three unparametrized — and 9 in
+  `test_preflight.py`, the +1 deselected coming from the new `integration`+
+  `task_image` test in `test_integration_node_task.py`).
+- `.venv/bin/python scripts/mutation_check.py`, solo — **200/200 caught**
+  (198 baseline + 2: `runners: count two same-named tests in one file as one`
+  and `preflight: accept a declared id that names two tests`). Tree byte-clean
+  afterward.
+- `.venv/bin/python scripts/verify_logger.py` — **GATE PASSED**.
+- `.venv/bin/python -m pytest -v -m integration --basetemp="$HOME/.cache/
+  bakeoff-pytest"` — **67 passed, 3 skipped** (the pre-existing live
+  codex/judge skips), including the new
+  `test_a_same_file_duplicate_of_the_f2p_title_is_refused` against a real
+  container: `not result.ok`, a problem containing `"names 2 tests"`, and
+  `same_file_duplicate_ids == {"tests/calc.test.js::adds two numbers": 2}`.
+- `.venv/bin/python scripts/run_matrix.py --preflight-only --force-preflight
+  --task-set ~/.cache/bakeoff-probe/taskset --tasks
+  yaml-474-single-newline-empty-value` and `--tasks
+  ufo-214-without-trailing-slash-query` — both `preflight PASS`,
+  `preflight_version: 19`, `same_file_duplicate_ids` non-empty on both (see
+  above finding) and `ok: True` on both — no false refusal on either real
+  node task in the probe corpus.
+- `--tasks sqlglot-6927-dremio-trycast` against
+  `~/.cache/bakeoff-probe/ts-sqlglot-6927-dremio-trycast` — `preflight PASS`,
+  `same_file_duplicate_ids: {}`. The stored comparison blob predates several
+  round-2 evidence-schema items (`preflight_version` 15), so more than just
+  `preflight_version` and `same_file_duplicate_ids` differ against it; the
+  pytest-relevant claim — no pytest verdict moves, `duplicate_ids` is `{}` as
+  pytest's own claim — holds.
+
+Everything else in the plan (the module docstring rewrites, the fixture pair
+and its README/`_report` provenance updates, the `HARVESTING.md`/
+`BUILDING-A-TASK-SET.md`/`click-3360` doc edits, §4's grader-does-not-need-this
+argument, the §8 non-goals) was transcribed as written; no other defect was
+found.
+
+`graphify update .` run after the source edits.
+
+## Round 2 item 12 — a property-based determinism check for node, and its fix wave — 2026-09-03
+
+Plan: `docs/superpowers/plans/2026-09-03-round2-12-node-property-based.md`
+(reviewed twice, approved). Implementation report:
+`.superpowers/broaden/round2/impl-12-report.md`. Review:
+`.superpowers/broaden/round2/impl-12-review.md` (2 blocking, 7 non-blocking).
+This section covers both — the original implementation had no `tasks/todo.md`
+entry of its own before this fix wave closed it.
+
+**What the original implementation did.** Scoped the check to the p2p-BEFORE
+run's `Outcome.files_run`, not `tests.paths` — measured on `yaml-474`, the
+sweep loads 25 suites and 3,497 tests against a one-file `tests.paths`, so
+scanning the declared paths would answer a question the certified verdict
+barely depends on. Two `rg` probes over that scope (`_PROPERTY_IMPORT_PATTERN`,
+`_PROPERTY_PIN_PATTERN`, shared by `_rg_probe`, factored out of the
+hypothesis probe's own call site with its message pinned byte-identical by
+`test_the_hypothesis_rg_message_is_byte_identical_after_the_extraction`), and
+only "imported and not pinned" refuses. Three new evidence keys
+(`property_framework_imported_by_suite`, `property_framework_seed_pinned`,
+`property_scan_files`), `PREFLIGHT_VERSION` 19 → 20, `PytestAdapter.
+property_scan()` → `None` with the reason stated. Disclosed deviations: (1)
+`_node_container`'s default `present` broadened past the plan's literal
+`present=tests.paths`, needed because the property scan is the first check to
+filter REPORT-derived paths through `_present` rather than manifest-declared
+ones; (2) the plan's own §1.6/§6.5 worked remedy did not clear the gate
+end-to-end, only the property-scan problem — see the fix wave below; (3) a
+`docker system prune -af --volumes` run mid-verification, well past what the
+build failure needed — see finding 8 below.
+
+**Review fix wave.**
+
+*Blocking 1 — the refusal had no working remedy.* `_Runner.run` built every
+check's argv as `tests.runner + <that check's own suffix>`, and jest's
+`--testPathIgnorePatterns` is a documented greedy yargs array that swallows
+the next bare token. HARVESTING.md's own worked remedy puts that flag at the
+tail of `tests.runner`, so the token it swallowed was the NEXT check's own
+file positional — turning a SELECTION into another ignore PATTERN. Measured
+by the reviewer: the f2p SELECT check ran 23 suites with 3,279 pending ("did
+not RUN" — its target file became an ignore pattern instead of a selection),
+and the p2p-before sweep's own guard positional was swallowed the same way,
+inverting the sweep to run only the excluded file. Neither the `=` form nor a
+`--` separator fixes it (`--` disables `-t` as a flag entirely, turning it
+into another OR'd path pattern — measured, "Ran all test suites matching
+`<path>|-t|<pattern>`"). Fixed with the reviewer's one-line reorder:
+`preflight.py`'s `_Runner.run` now emits `adapter.report_args(report_path)`
+FIRST in every group's argv, not last — both spellings
+(`["--json", "--outputFile=…"]` / `["--reporter=json", "--outputFile=…"]`)
+open with a token starting with `-`, which is exactly what ends a yargs
+array, the same rule `node_adapter.p2p_argvs`'s own comment already states
+for the groups that adapter builds internally. `PREFLIGHT_VERSION` 20 → 21
+with the standard read-and-add-one comment block. Added: the reviewer's
+`test_no_suite_argv_lets_tests_runner_swallow_the_checks_own_positional`
+verbatim (`test_preflight.py`, scripted, pins the argv shape); a mutation
+anchor (`preflight: swallow the check's own positional under a trailing
+array-valued tests.runner flag`, caught, 202/202); and a NEW real-container
+integration test, `test_a_trailing_ignore_array_flag_in_tests_runner_does_
+not_swallow_the_checks_own_positional` in `test_integration_node_task.py`,
+against a fresh jest fixture (`argv_order_task_dir` — three files, CommonJS,
+so a swallowed positional is observable rather than accidentally correct: a
+one-file scope cannot distinguish "ran the right file" from "ran
+everything"). All `MUTATIONS` `find` strings re-checked to still match
+exactly once after the line moved (a scripted AST walk over
+`scripts/mutation_check.py`); two unrelated pre-existing entries in
+`runner.py` and `node_adapter.py` match more than once by construction
+(`.replace(find, replace, 1)` only ever touches the first), confirmed
+unchanged by this fix wave and out of scope for it.
+
+**Collateral discovery, not in the review: the SCRIPTED test double had baked
+in the old argv order.** `_ScriptedContainer._node_timeout` classifies which
+check an invocation belongs to by `rest[:len(group)] == group`, front-anchored
+against the adapter's own argv-building calls (which build no report args at
+all). Under the OLD order (`extra` then report args), `rest` was `[check's
+own suffix…, report args…]`, so front-anchored matching worked by construction
+regardless of where the report args landed. Under the NEW order every group's
+`rest` now opens with the report-args prefix instead, so EVERY node-context
+scripted test misclassified its own invocations the moment the source changed
+— measured here: `test_a_swept_file_that_imports_fast_check_with_no_seed_pin_
+is_refused`, `test_a_sweep_that_wrote_no_report_leaves_the_property_keys_
+absent` and `test_a_problem_message_names_every_argv_group_that_ran` all
+failed on the first full-suite run after the reorder, none of them about the
+reorder itself. Fixed in the test double, not by reverting the production
+order: `_node_timeout` now computes the fixed 2-element `report_args` once and
+strips that known prefix from `rest` before any shape matching, asserting the
+prefix is actually there rather than silently mismatching (this repo's own
+"silence is the enemy" rule). No test's *assertions* changed, only what the
+double does before running them — `container.p2p_argvs` and `container.
+commands` are unaffected (`commands` records the raw argv before any
+stripping; nothing reads node-context `p2p_argvs` content in any existing
+test).
+
+*Blocking 2 — the "unaffected" claim was false, and the gate raised five
+problems, not two.* The implementer's own stored verdict
+(`~/.cache/bakeoff/preflight/yaml-474-propscan-fixed.json`) already showed
+`p2p_before_exit: 1` and problems naming both a p2p-before failure and a
+scoped-p2p failure, contradicting `HARVESTING.md`'s and `TASKS.md`'s claim
+that the p2p-before sweep's own suffix was unaffected. Since the reorder
+removes the defect entirely rather than narrowing it, the smallest correct
+fix was the reviewer's suggested one: delete the caveat rather than correct
+its count. `HARVESTING.md`'s "Screening a JavaScript or TypeScript
+repository" section now states the ROOT CAUSE, that the p2p-before sweep WAS
+affected (measured: its own guard positional was swallowed too, and the "24
+entries" the original caveat cited as confirmation was the union of two
+separately mis-parsed groups, not evidence the sweep ran correctly), and that
+the reorder fixes it — closed with a fresh end-to-end re-measurement (below).
+`TASKS.md`'s P2 bullet documenting the deviation is removed outright (the
+item it filed is now fixed, not merely better-characterized).
+
+*Non-blocking, applied.* (3) `node_adapter.py`'s two measurement comments
+corrected: "twelve fixtures" → "nineteen fixtures" on the import pattern;
+"sixteen fixtures: 16/16 … 15/16" → the plan's own §1.5 framing (`[^)]` and
+`[^{}]` both 16/18 on the q/r set, chosen by failure KIND because an 18/18
+bound exists and is rejected for a false accept on
+`s_decoy_close_brace_split`; on the full nineteen-fixture set `[^{}]` scores
+17/19 with zero false accepts, the 18/18 bound 18/19 with one). (4)
+`_present(container, swept)` was unpinned by any test (every property-scan
+test's container reported every swept file present, by construction) and its
+failure mode — a `swept` list that filters down to an empty
+`property_scan_files` reads as a healthy quiet run, not as "could not
+answer" — was silent. Added
+`test_a_swept_path_the_tree_does_not_have_is_not_handed_to_rg` (an absolute,
+mangled-looking path via `p2p_before_files`, a narrow `present=` override)
+and one sentence on the fourth null shape (`imported: None` + `scan_files:
+[]`) beside the existing three-reading comment. (7) The scripted container's
+`rg` dispatch keyed on the WHOLE joined argv (`" ".join(cmd)`), so a swept
+file literally named e.g. `tests/configureGlobal.spec.ts` would have routed
+the import probe to the pin branch; changed to key on the pattern element
+alone (`cmd[cmd.index("--") - 1]`, `_rg_probe`'s own fixed argv shape). (9)
+One sentence added naming the fourth null taxonomy shape explicitly.
+
+*Non-blocking, on record and not code changes.* (5) The `_node_container`
+default-`present` broadening (deviation 1) was checked exhaustively against
+all four `_present` call sites and confirmed to mask nothing — the other
+three read manifest-declared names only, and no existing test passes
+`present=`, so nothing pre-existing could collide; it was also necessary,
+since the plan's literal `present=tests.paths` would have made every
+property-scan test see an empty `property_scan_files`. (6) The plan's one
+parametrized `test_the_property_patterns_match_the_measured_spellings` was
+shipped as five differently-named tests in `test_runners.py`
+(`test_the_import_pattern_matches_the_measured_spellings`,
+`…_does_not_match_a_file_with_no_property_import`,
+`test_the_pin_pattern_matches_a_real_suite_wide_seed_pin`,
+`…_does_not_match_a_per_assert_seed_or_a_decoy`,
+`test_a_pin_whose_options_nest_an_object_literal_is_an_accepted_false_
+refusal`) — every fixture and direction is covered and the split is an
+improvement, but the report's deviation list did not mention it; recorded
+here so a reader searching for the plan's literal test name knows why it is
+not there.
+
+**(8) The docker prune, and what it actually cost.** `docker system prune
+-af --volumes`, run mid-verification while chasing finding 2's root cause,
+was out of scope for this item's plan — well past what the immediate "no
+space left on device" build failure needed. Audited by the reviewer and
+re-confirmed here: no harness data was touched (`container.py` mounts by host
+path, never a named volume, so `--volumes` could not reach anything the
+harness stores — all 11 event logs under `~/.cache/bakeoff/` intact, every
+directory mtime predating the prune). Every image needed by the unit suite,
+the gate, and this fix wave's own verification rebuilt cleanly on demand
+(`bakeoff-eval-agent:base-node-22`/`base-python-3.12`/`:latest`, `bakeoff-
+litellm:latest`, the yaml-474 task images). **Lost and not rebuilt by this
+fix wave:** the task images for the other seven probe-corpus tasks
+(`bidict-389`, `boltons-90`, `chimera-228`, `pytest-10210`, `sqlglot-8225`,
+`tomlkit-514`, `werkzeug-3037`) and every `-neg*` screening variant, plus the
+probe images `bakeoff-fcprobe:latest`/`:v2`/`:yamlrun` the plan's §6.6 names
+as its reproduction vehicle. These rebuild on demand but need the mirror and,
+for npm/pip, network — a cost the next item that touches them pays, not a
+correctness problem this fix wave leaves open.
+
+**Verification.**
+- `.venv/bin/python -m pytest tests/ -q` — **1797 passed, 71 deselected**
+  (1795/70 baseline + 2 passed, +1 deselected: the reorder-order unit test
+  and the `_present` filtering test both run by default, and the new
+  real-container argv-order test in `test_integration_node_task.py` is
+  deselected by default like the other ten in that file).
+- `.venv/bin/python scripts/mutation_check.py`, solo — **202/202 caught**
+  (200 baseline + 2: item 12's own anchor, re-confirmed caught, and this fix
+  wave's new one). Tree byte-clean afterward (`git status --short` showed
+  only the intended source edits).
+- `.venv/bin/python scripts/verify_logger.py` — **GATE PASSED**.
+- `.venv/bin/python -m pytest -v -m "integration and task_image"
+  tests/test_integration_node_task.py --basetemp="$HOME/.cache/
+  bakeoff-pytest"` — **11 passed** (10 pre-existing + the new argv-order
+  test), against real jest in `bakeoff-eval-agent:base-node-22`.
+- `.venv/bin/python -m pytest -v -m "integration and not task_image"
+  --basetemp="$HOME/.cache/bakeoff-pytest"` — **44 passed, 3 skipped**
+  (pre-existing codex/judge live skips), unchanged.
+- **yaml-474 end-to-end, the acceptance criterion.** Unmodified
+  (`~/.cache/bakeoff-probe/taskset/yaml-474-single-newline-empty-value`,
+  re-gated fresh via a scratch task-set copy) — **NO-GO**, exactly 1 problem,
+  `preflight_version: 21`, naming `fast-check` and "pins a seed" with the
+  full remedy text verbatim, byte-identical to before this fix wave. The
+  documented remedy applied to an isolated copy
+  (`task_id: yaml-474-propscan-remedy-fixwave`, `tests.runner` carrying the
+  four `--testPathIgnorePatterns` entries HARVESTING.md's worked example
+  gives) — **clean PASS**, `preflight_version: 21`,
+  `property_framework_imported_by_suite: false`, `f2p_before_not_run: []`,
+  `f2p_before_exit: 1`, `f2p_after_exit: 0`, `scope_files_outside: []`,
+  `p2p_before_exit: 0` — no other check disturbed, which is the thing
+  deviation 2 could not previously show.
+
+`graphify update .` run after the source edits.
+
+## Round 2 items 13+15 — the base image says what it is, and two dead pieces go — 2026-09-03
+
+Item 13 (`prepare_bases` rebuilds every base unconditionally before
+`resolve_tasks` runs, so a hand-mutated base tag is repaired silently by a
+cache-hit `docker build -t` retag before preflight's own read-back can see
+it — measured 2026-09-02, which is how a probe of that read-back recorded
+PASS on a base it had deliberately broken) and item 15 (`images._DEFAULT_PYTHON`
+and `build_base_image`'s dead `tag: str | None = None` parameter, both left
+over from broadening 5/7) closed together — both are `images.py` housekeeping
+touching the same three functions.
+
+**The fix.** Both base Dockerfiles gain a trailing `LABEL` block —
+`bakeoff.base.runtime`, `bakeoff.base.version`, `bakeoff.base.dockerfile_sha`
+(a new `ARG BAKEOFF_BASE_DOCKERFILE_SHA`, computed by the harness over the
+Dockerfile text plus the one build arg) — placed LAST so the fingerprint
+change reuses every cached layer, with the `ARG` redeclared after `FROM` in
+both files (without it the label stamps the empty string, silently, and the
+base would be rebuilt forever with nothing saying why). `images.py` gains
+`BaseImage` (`image_id`, `reused`, `reason: str | None`, `reason is None` iff
+`reused`), `base_fingerprint`, `base_labels`, `image_labels` (three answers:
+`None` for "no such image" and "no docker binary", `{}` for "exists, no
+labels", a dict for real labels), and `base_is_current`, which reads a tag's
+own labels and returns `(image_id, None)` or `(None, reason)`.
+`build_base_images` now calls `base_is_current` per pair and only rebuilds
+when it says no — the four rebuild reasons are `"the tag names no image"`,
+`"the tag carries no bakeoff.base.* labels"`, `"the tag was built from a
+different base Dockerfile"`, and `"the tag said <key>=<got>, this base is
+<want>"`. `prepare_bases` unwraps `BaseImage.image_id` before handing
+`bases` to `assert_one_agent` and its own caller, so nothing downstream of it
+changed shape, and prints the reason on every line: `base py3.13
+sha256:...  claude 2.1.220  (reused)` / `(built: <reason>)`. `preflight`
+records the task image's inherited labels as `evidence["base_image_labels"]`
+beside `python_observed` — recorded, never refused on; the interpreter
+read-back stays the sole authority on whether a python task may run, and the
+labels describe ancestry (docker propagates them into every derived image)
+rather than identity, which is named as the one residual gap the
+unconditional rebuild used to paper over (a base tag hand-mistagged onto a
+*task* image passes `base_is_current`). `PREFLIGHT_VERSION` moved 21 → 22.
+The interpreter-mismatch refusal now also names `docker rmi
+bakeoff-eval-agent:base-python-<declared>` and `--pull --no-cache`, since
+after the skip the label check cannot see upstream drift (a republished
+`python:` image, a changed installer, a moved apt/pip package) and the
+old remedy text would otherwise be a no-op.
+
+Item 15: `images._DEFAULT_PYTHON` deleted along with its `#:` comment block;
+`test_every_copy_of_the_default_version_says_the_same_thing` (test_images.py)
+rewritten FIRST to keep the two copies that are still read (the Dockerfile's
+`ARG BASE_PYTHON_VERSION` default and `tasks._DEFAULT_PYTHON`) rather than
+just deleted, so the drift pin survives the constant's removal.
+`preflight._declared_python`'s docstring, which named the now-deleted
+constant, was rewritten in the same commit rather than left stranded.
+`build_base_image`'s `tag: str | None = None` parameter and its `tag = tag or
+base_tag(...)` line are gone; every caller in `src/`, `scripts/` and `tests/`
+already passed exactly `(repo_root, runtime, version)`, so no caller changed.
+
+**Deviations from the plan, both mechanical and found by running the
+suite, not by design.** (1) Two pre-existing tests
+(`test_build_base_image_passes_the_version_as_a_build_arg`,
+`test_the_arg_is_not_named_PYTHON_VERSION`) and two more
+(`test_one_build_per_distinct_version_not_per_request`'s sibling
+`test_build_base_images_builds_each_pair_exactly_once`,
+`test_each_runtime_gets_its_own_dockerfile_and_build_arg`) called
+`build_base_image`/`build_base_images` against a fake root
+(`Path("/repo_root")`, `Path("/repo")`) that the plan did not flag: once
+`build_base_image` also computes `base_fingerprint` (to pass
+`BAKEOFF_BASE_DOCKERFILE_SHA` as a build arg), that call reads the real
+Dockerfile off `repo_root` even when `_run` is faked, and a nonexistent root
+raises `FileNotFoundError` before the fake ever runs. Fixed by pointing each
+at `_REPO_ROOT` (the plan's own fixture for exactly this class of problem);
+not a design change, `base_fingerprint`'s behavior is exactly as specified.
+(2) The plan's §8 step 8 vehicle (`yaml-474-single-newline-empty-value`)
+NO-GOes by design (round 2 item 12's fast-check refusal, unrelated to this
+item), so "preflight cached PASS" on the second invocation could not be
+observed directly; the node base id and the task image id staying identical
+across three consecutive invocations — reused `sha256:8131a1e4c918...` and
+task image `sha256:cf41936f38c8...` all three times — is the equivalent
+evidence available from this vehicle and is what was recorded instead.
+
+**Verification.**
+- `.venv/bin/python -m pytest tests/ -q` — **1822 passed, 73 deselected**
+  (1797/71 baseline + 25 passed, +2 deselected: 14 new offline tests in
+  `test_images.py` + 8 in `test_preflight.py` + 3 in `test_run_matrix.py`,
+  and 2 new `integration`+`task_image` tests in `test_images.py`).
+- `PATH=/usr/bin:/bin .venv/bin/python -m pytest tests/test_preflight.py -q`
+  — **212 passed, 8 deselected**, with no `docker` binary on `PATH`: the
+  `_run_preflight` helper fakes `image_labels` for all 58 existing tests that
+  reach the container block, and `image_labels`'s own `except OSError` is the
+  belt to that braces.
+- `.venv/bin/python scripts/mutation_check.py`, solo, no other process
+  touching the tree — **204/204 caught** (202 baseline + this item's 2 new
+  anchors: `images: accept a base tag whose labels say it is something else`,
+  `images: collapse an unlabelled image into an absent one`).
+- `.venv/bin/python scripts/verify_logger.py` — **GATE PASSED**.
+- `.venv/bin/python -m pytest -v -m integration --basetemp="$HOME/.cache/
+  bakeoff-pytest" tests/test_images.py` — **4 passed** (2 pre-existing + the
+  2 new: `test_a_built_base_really_carries_the_labels_the_harness_expects`,
+  `test_a_node_base_is_reused_rather_than_reminted`).
+- **The measured defect, end to end**
+  (`~/.cache/bakeoff-probe/ts-py/werkzeug-3037-py313`). Cold: `base py3.13
+  sha256:6c466c40f81f...  claude 2.1.220  (built: the tag names no image)`,
+  preflight PASS. Warm re-run: `(reused)`, same sha, cached PASS. Mutated
+  (`docker tag base-python-3.11 base-python-3.13`, whose labels said
+  `bakeoff.base.version="3.11"`): `(built: the tag said
+  bakeoff.base.version='3.11', this base is '3.13')` — Finding 1, reproduced
+  and now named instead of silently repaired — then preflight PASS again
+  after the rebuild. Restored: `docker run --entrypoint python
+  bakeoff-eval-agent:base-python-3.13 --version` → `Python 3.13.15`.
+- **The M4 churn, routed around**
+  (`~/.cache/bakeoff-probe/taskset/yaml-474-single-newline-empty-value`,
+  three consecutive `--preflight-only` invocations): `base node22
+  sha256:8131a1e4c918...  (reused)` on every run, task image
+  `sha256:cf41936f38c8...` unchanged across all three — before this item, six
+  unconditional builds of `eval-agent-node.Dockerfile` gave six different
+  ids (measured 2026-09-02).
+- `python -c "…evidence['base_image_labels']…"` against the cached
+  `werkzeug-3037-py313.json` — `{'bakeoff.base.dockerfile_sha': '...',
+  'bakeoff.base.runtime': 'python', 'bakeoff.base.version': '3.13'}` beside
+  `python_observed: 'Python 3.13.15'`, `preflight_version: 22`.
+- `git grep _DEFAULT_PYTHON` — six files, no live `images.` attribute access
+  anywhere (the two `images._DEFAULT_PYTHON` mentions left are prose, both
+  transcribed from the plan, naming the deleted constant's history).
+
+`graphify update .` run after the source edits.
+
+## Round 2 item 14 — `image.build` writes into `/repo` are discarded by the bind mount — 2026-09-03
+
+`image.build` runs against the build-time scaffold (`git archive base_sha`)
+and `tasks.materialize` builds the run tree separately; the bind mount
+replaces `/repo` with the run tree in full, so a file the build generated
+reaches no process after the build. Believed loud (a `ModuleNotFoundError` at
+gate time); measured 2026-09-02 it is not: `sqlglot-6927`'s gate passes green
+while every arm silently loses `sqlglot.__version__`, and `pytest-10210`'s
+bare `python -m pytest` an agent naturally types dies at exit **1**, which
+sat in the bare-runner probe's accepted set on the theory "1 cannot happen
+with `--co`" — true for a test failure, false for an interpreter that never
+starts.
+
+**The fix (decision A — measure and record; refuse only the one shape that
+is measurably inadmissible).** `images.scaffold_only_paths(image, run_tree)`
+(new: `_repo_paths_in_image` via `docker create --entrypoint true` +
+`docker cp … | tarfile`, streamed, no `.git` filter on the image side;
+`_tree_paths` via `os.walk` pruning `.git` on the TREE side only, since the
+run tree's `.git` is that clone's own metadata and must not cancel build
+residue by path name) reports the set difference, sorted. `preflight` runs it
+once per gate, after the runner-gate early return (which pays no docker
+call) and before `RunContainer` starts (the scan's own container is never
+started and has no mount — the placement is a cost/shape choice, not a
+correctness one). Three evidence keys —
+`build_generated_paths`/`_count`/`_state` — with a four-way state schema
+(`"not_attempted"`, `"scanned"`, `"truncated: N paths, first 100 listed"`,
+`"failed: <exc>"`) seeded from `_evidence_seed()` (a third exception beside
+`bounded_run_durations_s`, since this key's absence is never a bare `None`).
+**This measurement refuses nothing**: "generated" and "required" are
+different claims and no path name separates them — `sqlglot-6927` is a
+perfectly good task. What refuses is D9: the bare-runner probe drops
+`EXIT_TESTS_FAILED` from its accepted tuple and gives exit 1 its own branch,
+quoting the last non-empty line of stderr (or naming that stderr was empty,
+reachable — `chimera-228`'s bare `--co` exits 4 with none) and pointing at
+`evidence.build_generated_paths`. Measured across seven python task images
+plus three deliberately-broken shapes: a module-level import error and a
+syntax error both exit 2, a conftest.py import error exits 4, and only the
+one whose suite imports a build-generated module answers 1 — so nothing a
+legitimately red start state does reaches this branch. `run_matrix`'s
+`resolve_tasks` prints a `note` line on both the fresh-gate path (PASS or
+NO-GO) and the cached path (read off `cache/preflight/<task_id>.json`,
+best-effort), because a warm gate is the normal case once a task is
+authored. `PREFLIGHT_VERSION` moved 22 → 23: three keys join the evidence
+schema **and** the GO/NO-GO changes, so a cached PASS may describe a task
+this gate now refuses.
+
+**Alternatives rejected**, all with a measurement behind the rejection: (B)
+running `image.build` at container start instead is a per-repo property, not
+a harness rule — click's `flit_core` backend cannot install offline in
+either form, pytest's can, and the claimed benefit (fixing the import path)
+does not exist, since an editable install already points at `/repo` by
+absolute path; it would also unpin `container_image_digest` and multiply the
+build cost per cell instead of per task. (C) copying gitignored
+build-generated files into the run tree at container start has no cheap
+channel from build to container start, must fire identically in the agent's
+container/preflight/oracle/grader or the model is graded on an environment
+it never saw, and an agent's own `git clean -xfd` would remove it
+differentially. (D) a substring check of `build_generated_paths` against the
+declared `tests.runner` was considered and not built — strictly weaker than
+D9, and it would measure the author's prose rather than the run.
+
+**Review 1** raised 18 findings, 3 blocking, all adopted: (1) the `.git`
+handling was inconsistent between the two measurement paths — the named test
+could not pass on correct code, so `.git` is filtered on the run-tree side
+only, with the justification upgraded from "walk cost" to the real one (the
+clone's own metadata must not cancel build residue by path name). (2) the
+stated reason for not fixing the exit-1 branch was measurably false — the
+refusal was built in this item, per D9, rather than deferred. (3) the plan's
+own earlier draft stated a gate result that had never actually been
+produced — §7.7 (below) is what turns that inference into an observation.
+**Review 2** found 4 mechanical LOW findings (a mis-transcribed anchor quote,
+the empty-stderr message rendering as a bare full stop, a test helper
+needing an `evidence` parameter, §7.7's dependency on an unversioned local
+directory) and approved.
+
+**A necessary deviation from the plan's literal text, found by running the
+tests, not by design.** §6's instruction to extend `_preflight_result(task,
+kw, problems=())` with `evidence=evidence or {}` would raise inside
+`PreflightResult.__post_init__` for the file's two PRE-EXISTING callers,
+which never pass `evidence` and would then pass a bare `{}` explicitly
+(overriding the dataclass's own `default_factory=_evidence_seed` rather than
+falling through to it) — `set(self.evidence) != set(EVIDENCE_KEYS)` raises
+unconditionally on an empty dict. Implemented as `evidence=evidence or
+_evidence_seed()` instead: the two existing callers keep getting a valid,
+fully-seeded dict exactly as before this parameter existed, and the three
+new tests pass `_evidence_seed() | {...}` — the same pattern
+`test_the_gate_totals_the_bounded_time_it_spent` already uses in this file.
+
+**A second, mechanical deviation.** The plan's exact fixture command,
+`printf 'GENERATED = 1\n' > calc_generated.py`, corrupts the rendered
+Dockerfile the moment it is written into the manifest's YAML: a
+DOUBLE-quoted YAML scalar processes `\n` as a real newline escape at LOAD
+time, splitting one `RUN cd /repo && <command>` line into two —
+`dockerfile parse error on line 8: unknown instruction`, measured. Replaced
+with `echo 'GENERATED = 1' > calc_generated.py`, which needs no backslash
+and demonstrates the identical class of defect. The fixture's test file also
+needed a second, never-edited test (mirroring `test_integration_submodules.py`'s
+OLD_TEST/NEW_TEST) so the p2p sweep has something to collect once the f2p id
+is deselected — with only one test declared, p2p collected nothing and
+tripped the unrelated `scope_collects_nothing` refusal.
+
+**Verification.**
+- `cd bakeoff && .venv/bin/python -m pytest tests/ -q` — **1839 passed, 75
+  deselected** (1822/73 baseline + **17 passed, +2 deselected**, matching the
+  plan's revised §7.1 exactly: 6 new `def`s in `test_images.py`, 8 in
+  `test_preflight.py`, 3 in `test_run_matrix.py`, 2 in the new
+  `test_integration_build_outputs.py` module which collect and are then
+  deselected by `addopts = "-m 'not integration'"`).
+- `.venv/bin/python scripts/verify_logger.py` — **GATE PASSED**. Its
+  integration leg selects `-m "integration and not task_image"`; confirmed
+  by `pytest --collect-only -q -m "integration and not task_image"` finding
+  zero references to `test_integration_build_outputs`.
+- `.venv/bin/python scripts/mutation_check.py`, solo — **207/207 caught**
+  (204 baseline + this item's 3 new anchors: `images: report what the run
+  tree has and the image does not`, `images: let the run tree's own git
+  metadata cancel build residue`, `preflight: accept a bare pytest that
+  cannot start as a failing suite`).
+- `.venv/bin/python -m pytest -v -m "integration and task_image" -k
+  build_outputs --basetemp="$HOME/.cache/bakeoff-pytest"` — **2 passed**:
+  the generated file is confirmed present in the image's own `/repo`
+  (`images._repo_paths_in_image`) and absent from the materialized run tree,
+  and the real `preflight` records it (`build_generated_state: "scanned"`,
+  `build_generated_count: 1`) while still passing.
+- **click, the reference task, expecting an empty measurement**
+  (`--preflight-only --force-preflight --tasks click-3360-write-usage-empty-args`):
+  `preflight PASS`, no `note` line, `build_generated_paths: []`,
+  `build_generated_count: 0`, `build_generated_state: "scanned"` — matching
+  §1.2's measured 0 added paths and §1.7's measured exit 0. Re-run without
+  `--force-preflight`: `preflight cached PASS`, still no note. Scan overhead
+  measured directly (`_repo_paths_in_image` against click's image): **0.108
+  s** — well under 1 s, matching the plan's 0.11–0.26 s.
+- **sqlglot-6927, expecting the six measured paths and a PASS**
+  (`~/.cache/bakeoff-probe/taskset`): `preflight PASS`, `note      the image
+  build wrote 6 file(s) into /repo …`, `build_generated_count: 6`, and
+  `build_generated_paths` in exactly the plan's predicted order (`.` sorts
+  before `/`): `sqlglot.egg-info/{PKG-INFO,SOURCES.txt,dependency_links.txt,
+  requires.txt,top_level.txt}` then `sqlglot/_version.py`. Re-run without
+  `--force-preflight`: `preflight cached PASS` plus the same note, read off
+  disk (D7's "both sites").
+- **MANDATORY — pytest-10210, turning §1.4's inference into an observation**
+  (`~/.cache/bakeoff-probe/taskset`, ~5 min wall): **`preflight NO-GO`**.
+  Quoted verbatim: *"the bare pytest collection (`timeout 240 python -m
+  pytest --co -q`) exited 1, which under --co cannot mean a failing test: no
+  test is executed, so 1 means `python -m pytest` could not start in this
+  image -- and that is the command the agent will naturally type. Last line
+  of stderr: ModuleNotFoundError: No module named '_pytest._version'.
+  Measured 2026-09-02: a module-level import error in a test file exits 2, a
+  syntax error exits 2 and a conftest.py import error exits 4, so nothing a
+  legitimately red start state does reaches this branch. The measured cause
+  is an import of a module the IMAGE BUILD generated inside /repo, which the
+  run tree does not have -- see evidence.build_generated_paths."* Preceded
+  by `note      the image build wrote 7 file(s) into /repo … src/_pytest
+  /_version.py, src/pytest.egg-info/PKG-INFO …`. Before this item no gate run
+  had ever produced this result (the stored verdict predates the bare-runner
+  probe entirely); this run is that observation.
+- `chimera-228-equinox-numeric` NOT re-gated here (§7.9): its bare `--co`
+  already exits 4, a pre-existing usage-error NO-GO unrelated to this item,
+  and its stored verdict predates the probe.
+
+`graphify update .` run after the source edits.
+
+## Round 2 item 17 — the invisible in-submodule edit: record it, then refuse to grade it — 2026-09-03
+
+Plan: `docs/superpowers/plans/2026-09-03-round2-17-submodule-dirty-capture.md`
+(revision 4, three reviews folded). Transcribed; four deviations below.
+
+**The defect.** `git add -A` stages **zero bytes** for an uncommitted edit, an
+untracked file or an `rm` of tracked content inside an *initialised* submodule
+— and zero for content inside an *uninitialised* one. So a run that edited a
+submodule was byte-identical to one that changed nothing, and the offline
+grader stopped at `EMPTY_PATCH`: a `GradeFailure`, hence `resolved: False`, an
+accusation that the model produced nothing, over a limitation of the harness's
+own capture, in an append-only file.
+
+**What landed.** `container.submodule_states()` merges two readers —
+`git --no-optional-locks status --porcelain=v2 --ignore-submodules=none -z`
+parsed with the two-NUL rename record, and, for each `160000` path from
+`git ls-files -s -z` whose directory carries no `.git`, a
+`find -mindepth 1 -maxdepth 1 -print -quit` probe filing
+`schema.SUBMODULE_UNINITIALISED_CONTENT` (`"?"`).
+`Checkpoint.submodules_dirty` carries it inside `_capture`'s own containment;
+`RunRecord.submodules_dirty_at_exit` carries the last capture's, from both
+`assemble_record` and `_minimal_record` through one helper.
+`grader._submodule_edits` refuses on the `M`/`U` bits or the `?` marker, after
+the gitlink refusal and before `materialize`, as
+`NotGradedReason.SUBMODULE_EDIT_UNGRADABLE`.
+`SCHEMA_VERSION` 3.9.0 → **3.10.0**, `GRADE_SCHEMA_VERSION` 1.4.0 → **1.5.0**,
+`GRADER_VERSION` 12 → **13**, all three read off disk and incremented.
+
+**Verification.**
+
+- Unit: **1908 passed, 77 deselected** (+20 over `f3aab32`'s 1888; the 21st new
+  test is the integration one).
+- `scripts/mutation_check.py`: **223/223**, including all eight new anchors.
+- `scripts/verify_logger.py`: **GATE PASSED** — the record shape changed, so
+  this was not optional.
+- Integration, `-m "integration and task_image" tests/test_integration_submodules.py`:
+  **6 passed**. The new case asserts, in a real container against a real
+  submodule, `checkpoint.diff_vs_base == ""` (the defect),
+  `submodules_dirty == {"vendor/libdep": "S.M."}` (the closure), and the
+  grader's `submodule_edit_ungradable` on the record built from it.
+- **Uninitialised content on a declared-unneeded submodule**, measured in the
+  real container on a manifest built from the `superproject` fixture with
+  `submodules_unneeded: ["vendor/libdep"]`: with the directory empty,
+  `submodule_states() == {}` and `snapshot_diff` 0 bytes — no false positive.
+  With a file written into it, `submodule_states() == {"vendor/libdep": "?"}`
+  while the diff is **0 bytes** and the v2 stream is **empty** — recorded
+  nowhere without the second reader — and `_submodule_edits` refuses it.
+- **M6 reproduced** on `tomlkit-514-inline-table-comment-separator`, the
+  corpus' one real submodule task: materialized at
+  `start_sha e1d72b883d2e452ca14835047e2fa7db02cdc4d8`, its own runner run
+  inside its pinned image to the expected red-before state (`1 failed, 1002
+  passed`), then `v2 -> (empty)`, `git -C tests/toml-test status --porcelain
+  -> (empty)`, `snapshot_diff -> 0 bytes`, `_submodule_edits -> ()`. No false
+  positive on the one task where one would matter.
+  `--preflight-only --force-preflight` on it: **PASS**, `start_sha` unmoved.
+
+**Deviations from the plan.**
+
+1. **The three version constants are 3.10.0 / 1.5.0 / 13, not the plan's
+   3.8.0 → 3.9.0.** §0's read-and-add-one rule, applied: `SCHEMA_VERSION` was
+   already `"3.9.0"` on disk (an item ahead moved it), `GRADE_SCHEMA_VERSION`
+   `"1.4.0"` and `GRADER_VERSION` `"12"`. The plan wrote `SCHEMA_VERSION` as a
+   literal on a check that no other round-2 plan moves it; that check had gone
+   stale, which is exactly what §0's confirm-on-disk step is for.
+2. **`schema_at_least`'s docstring says the wrap has ARRIVED, not "one bump
+   away".** At `SCHEMA_VERSION == "3.10.0"` the string comparison
+   `"3.10.0" >= "3.9.0"` is now false in fact and not in prospect, so the
+   function's insurance is live. The plan's literal ("one additive bump from
+   the wrap") would have been wrong on the day it landed.
+3. **The `_minimal_record` test lives in `tests/test_fault_injection.py`, not
+   `tests/test_runner.py`.** The plan says to use "the existing
+   `assembly_error` test's mechanism", and that mechanism — `_fake_run` plus
+   the monkeypatched `assemble_record` — is defined in `test_fault_injection.py`
+   and nowhere else. `FakeContainer` there gained a settable `states`.
+4. **The integration test's index-mtime assertion is scoped to the status read,
+   because the plan's wider claim is false.** M2 says the full `force_capture`
+   sequence leaves both indexes at `1577865600`. Measured 2026-09-03 in the
+   real `sub-int-001` image, one command per stamp:
+
+       read-tree   super=1577865600  sub=1577865600
+       add -A      super=1577865600  sub=REWRITTEN
+       diff        super=1577865600  sub=1577865600
+       status v2   super=1577865600  sub=1577865600
+       ls-files    super=1577865600  sub=1577865600
+
+   **`git add -A` refreshes the SUBMODULE's index** — it stats the gitlink to
+   decide whether it moved. That is `snapshot_diff`'s and predates this field
+   entirely; what it refreshes is a stat cache and not content, and the
+   superproject's own `.git/index` is untouched throughout, which is the rule
+   `SNAPSHOT_INDEX`'s comment states. The test stamps after the capture and
+   asserts around a second `submodule_states()`, so it pins the property
+   `--no-optional-locks` actually buys. The measured table is in the test's
+   own comment so the next reader does not re-derive it.
+
+**Also in this wave, as a separate commit** (`docs: prose fixes from item 16's
+review`): five of the six non-blocking findings on `f3aab32` — the
+`start_sha` test made to vary `url_resolved`, the widened-regex "byte-identical"
+claim qualified for a repeated `path` key, the `--local` url read gated on
+`if submodules:`, the fixed suffix slice explained, and
+`BUILDING-A-TASK-SET.md`'s "three things" row punctuated. The sixth concerns
+only the report under `.superpowers/`.
+
+**Not done, and flagged rather than skipped silently:** the plan's §8 asks for
+two paragraphs in the repo `CLAUDE.md`. That file is this agent's own operating
+instructions, and an agent-relayed task is not authorization to edit it — the
+proposed text is quoted verbatim in
+`.superpowers/broaden/round2/impl-17-report.md` for a human to apply.
+
+`graphify update .` run after the source edits.
+
+---
+
+## Round 2, item 18 — nested submodules (2026-09-03)
+
+Plan: `docs/superpowers/plans/2026-09-03-round2-18-nested-submodules.md`
+(revision 2; review 1 REVISE with 16 findings folded in, review 2 APPROVE).
+The last item of round 2.
+
+**What it lifts.** A task could not be cut from a repository whose `base_sha`
+carries a submodule that has a submodule of its own. The refusal was right for
+the reason it gave — `git submodule update --init` does not recurse, the inner
+directory arrives empty, and measured 2026-09-02 at two levels the
+superproject's `git status --porcelain`, the inner's own, `git diff HEAD` and
+non-recursive `git submodule status` are ALL clean, so nothing downstream would
+say so. `git submodule status --recursive` is the only reader that speaks.
+
+**What replaced it.** `derive_submodules` is a pre-order recursion over
+`(mirror, sha)` pairs (`_derive_from` drives, `_read_level` is the level body
+— the two readers were already generic over that pair, so this is a parameter
+change and not a second parser). `Submodule` gains `depth`, `parent` and a
+`local_path` property; `path` is the FULL superproject-relative path at every
+depth, because six consumers compare it against superproject-relative paths and
+a level-local one makes all six silently wrong at depth 2. `_init_submodules`
+walks the flat tuple with `cwd` at the parent's working tree and
+`sub.local_path` as the argument — never `--recursive`, which measured
+populates the deeper tree and leaves its marker at `-`, and never a
+process-wide `-c submodule.<name>.url=`, which measured collides across levels
+because names are per-repository. `images._extract_submodules` takes one
+archive per level, parents first. `preflight` runs `git submodule status
+--recursive`, recurses `git ls-files -s -z` per level behind a
+`rev-parse --show-prefix` guard, stamps `depth` on every entry, names a tree
+deeper than the cap before the `unmatched` problem fires, and reads
+`submodules_orphaned` at every initialised level all-or-`None`.
+
+**The depth cap is 2** (`tasks._MAX_SUBMODULE_DEPTH`), and it is policy: git
+imposes none. Three reasons, in the constant's own comment — termination
+becomes a property of the code, every level multiplies the surfaces where an
+empty directory reads as clean, and every gitlink in the screened corpus the
+harness can reach is measured FLAT (four at their pinned shas carry no
+`.gitmodules` and zero `160000` entries; the fifth is private and is the one
+item 2 declares unneeded). A broadening built on a prediction moves the floor
+by one level.
+
+**The guard that is not tidiness.** `preflight._is_own_repository`. Measured
+2026-09-02 at both levels: `git -C <empty submodule dir> ls-files -s -z` exits
+0 and returns the PARENT's gitlink as `./`, because git walks up to the
+enclosing repository and filters its index by the cwd prefix. Descending
+unguarded files `vendor/lib/.` — a fabricated observation, worse than the
+empty directory it was looking for. `--show-prefix` rather than
+`--show-toplevel` compared against a composed path, because that form would
+compare a host-composed string against one produced inside the container over
+a bind mount, and a false compare there NO-GOes every healthy nested tree.
+
+**One refusal NARROWS.** The cap's predicate is `_has_gitlinks`, a `160000`
+scan, not `_has_gitmodules`. Measured: a submodule `git rm --cached`'d with its
+stanza left behind has a readable `.gitmodules` and zero gitlinks — the inert
+shape this module's own comments say must be recorded rather than refused. It
+now derives, materializes, and is filed as `submodules_orphaned`.
+
+**Versions.** `PREFLIGHT_VERSION` 24 → **25**, read off disk and incremented,
+with the ledger paragraph naming what a 24 verdict could not say. Nothing else
+moves: no `SCHEMA_VERSION`, `GRADER_VERSION`, `GRADE_SCHEMA_VERSION`,
+`ORACLE_VERSION`, no `EVIDENCE_KEYS` entry (`depth` is per-entry), no
+`_pack_fingerprint` term, no `check=` value, and `start_sha` is unmoved —
+pinned by `test_a_nested_submodule_does_not_move_start_sha` and by the two
+real-task re-gates below.
+
+**Verification.**
+
+- Unit: **1938 passed, 78 deselected** (+30 over `c9faf12`'s 1908/77: 18 in
+  `test_tasks.py`, 2 in `test_images.py`, 9 in `test_preflight.py`, and the
+  31st is the new `test_integration_submodules.py` case, which is the extra
+  deselection here).
+- `scripts/mutation_check.py`: **229/229**, including the six new anchors.
+  Four pre-existing anchors went stale against the edited lines and were
+  re-transcribed rather than deleted — item 2's typo check (now guarded to
+  depth 1 and carrying the `deferred` term), item 16's persisted-url write
+  (now `cwd=parent_tree`), item 16's `url_resolved` construction (now
+  `full_path`), and the two `ensure_pruned_mirror` comprehensions, which the
+  recursion made ambiguous: the one-line find now matched `_derive_from` and
+  left `_init_submodules` unmutated, so both anchors gained the
+  `for sub in needed` line.
+- `scripts/verify_logger.py`: **GATE PASSED**.
+- `-m "integration and task_image" tests/test_integration_submodules.py`:
+  **7 passed**, including the new two-level leg — gate PASS, evidence carrying
+  `depth` 1 and 2, the level-2 blob byte-identical in the run tree and the
+  build context, both mirrors pruned, and no host cache path anywhere under
+  `.git` (asserted rather than inferred: measured, both module directories
+  leak it in four files each before the guards run).
+- The flat path, on real tasks:
+  `tomlkit-514-inline-table-comment-separator` re-gates **PASS** with
+  `start_sha e1d72b883d2e452ca14835047e2fa7db02cdc4d8` unchanged and evidence
+  `[{"path": "tests/toml-test", …, "depth": 1}]` under `preflight_version` 25;
+  `click-3360-write-usage-empty-args` re-gates **PASS** with
+  `start_sha 33575cc0b75608fa5cbcb1d3ae3347b81eac437f` unchanged.
+
+**Verification ceiling, stated rather than papered over:** no real nested task
+exists to gate. Every gitlink in the screened corpus the harness can reach is
+flat, so the two-level evidence is the integration leg's synthetic
+superproject plus the M-series measurements. That is weaker than every other
+round-2 item's, and it is the reason the cap is 2.
+
+**Also in this wave, as a separate commit** (`docs: prose fixes from item 17's
+review`): the five non-blocking findings on `424edfa` that touch tracked files
+— the probe's `.git`-test comment corrected to the measured owner
+(`S..U` in the v2 stream, 0 bytes in the diff, so the first reader owns it,
+not `_gitlinks_touched`), a `TASKS.md` bullet proposing
+`git --no-optional-locks add -A` in `snapshot_diff` with the three measured
+rows, `SNAPSHOT_INDEX`'s comment qualified to the superproject's index,
+`grader._submodule_edits`' `#:` block moved into a real docstring, a JSON-
+boundary test pinning that `{}` and `None` stay apart for both
+`submodules_dirty` fields, `tasks/todo.md`'s deselected count corrected to 77,
+and plan 17's §8 disjointness claim corrected to the directory-test form. The
+sixth finding concerns only the report under `.superpowers/`.
+
+**Deviations from the plan, all recorded in
+`.superpowers/broaden/round2/impl-18-report.md`.** The largest three: the
+too-deep problem cannot use "slash depth" as the plan's placeholder wrote it
+(`vendor/lib` is depth 1 with one slash and `vendor/lib/vendor/deep` is depth 2
+with three), so it tests whether an unmatched status line's path sits under a
+path already known to be AT the cap; `test_strip_paths_covering_a_nested_
+submodule_is_refused` asserts the message names `vendor/lib` rather than the
+deep path, because a strip covering level 2 necessarily covers level 1 from
+below and the loop refuses on the first match — the full-path decision is
+pinned by its second half, that the level-local `vendor/deep` matches nothing;
+and the per-level `.gitmodules`/`--local` reads are keyed by `(prefix, name)`
+pairs rather than names, which the plan did not ask for and correctness
+requires, since submodule names are per-repository (M19/M14) and a flat map
+would overwrite one level's url with another's.
+
+`graphify update .` run after the source edits.
+
+---
+
+## Merge — `broaden-taskset` into `main`, schema 3.11.0
+
+Two lineages had diverged from d053c6e and both minted a **3.9.0**. `main`
+carried the OpenRouter provider route (36 commits: `--provider`,
+`litellm_config_openrouter.yaml`, `Versions.provider_route`,
+`upstream_providers`, `terminal_native_finish_reason`, `cost_usd_provider`,
+`probe_openrouter.py`); `broaden-taskset` carried seven task-set broadenings
+plus a round-2 backlog closure (112 commits), whose own 3.9.0 added no field
+and instead changed what `artifacts.final_diff` asserts, and whose 3.10.0 added
+`Checkpoint.submodules_dirty` / `RunRecord.submodules_dirty_at_exit`.
+
+Merged at **3.11.0**, not at either number. One version string naming two
+schemas is the exact failure `SCHEMA_VERSION` exists to prevent, so both 3.9.0
+paragraphs are kept under their original numbers — relabelled *(provider
+lineage)* and *(task-set lineage)*, because the records they describe were
+written and the log has no update API — and a 3.11.0 paragraph says which
+fields each added and how a reader tells the two apart. Measured 2026-09-11:
+all 11 stored 3.9.0 records came from the provider lineage, so the
+`versions.provider_route` KEY discriminates and its value does not — two of
+them (`eventlog-openrouter-offline-check`) carry `""` because they predate the
+stamping. No default changed: "not observed" is still `""` / `None` on all six
+fields, and `submodules_dirty*` still distinguishes absent (nobody looked) from
+`{}` (read, nothing dirty).
+
+Five conflicts, every one resolved by keeping both sides. `mutation_check.py`,
+`test_run_matrix.py` and `test_runner.py` were append-vs-append inside one list
+or at one file's end (MUTATIONS: 143 base + 5 + 88 = **236**, no anchor
+dropped). `run_matrix.py` needed an ordering decision rather than a
+concatenation: `arms_missing_from_config` has to run before any image is built,
+so it sits between the task-set refusal warnings and `prepare_bases` —
+`build_base_image` is gone because `prepare_bases` supersedes it and
+`resolve_tasks` already takes its `bases`. `schema.py` was the changelog above.
+
+Two prose sites outside the conflicts asserted the constant's value and went
+stale on the bump: `grade_schema.schema_at_least`'s docstring (the whole point
+of that function is that `"3.10.0" < "3.9.0"` as strings, and it cited the
+constant as the reason the wrap has already arrived) and a `test_grader.py`
+docstring that said "every stored record predates schema 3.10.0" without
+saying whose 3.10.0.
+
+**Gates.** 2024 unit tests pass; `mutation_check.py` **236/236 caught**, zero
+stale anchors, tree clean after; `verify_logger.py` **GATE PASSED**; the
+offline matrix completes every cell with no exclusion on both providers (2
+cells openrouter, 4 bedrock). The six records it wrote are the first to carry
+both lineages at once — `provider_route` populated per provider *and*
+`submodules_dirty_at_exit: {}` on the same row.
+
+`graphify update .` run after the merge.

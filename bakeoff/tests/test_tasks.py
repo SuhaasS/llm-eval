@@ -10,6 +10,8 @@ of a matrix, after the tokens are spent.
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import os
 import shutil
 import subprocess
@@ -18,13 +20,18 @@ from pathlib import Path
 
 import pytest
 
+from bakeoff import tasks
 from bakeoff.tasks import (
+    RefusedManifest,
+    TaskBudget,
     TaskError,
     TaskGrading,
     diff_chunks,
     load_task,
     load_task_set,
+    load_task_set_with_refusals,
     materialize,
+    refusal_warnings,
     split_reference_diff,
     task_set_commit,
 )
@@ -35,6 +42,19 @@ OLD_TEST = "from calc import add\n\n\ndef test_old():\n    assert add(0, 0) == 0
 NEW_TEST = (
     "from calc import add\n\n\ndef test_old():\n    assert add(0, 0) == 0\n\n\n"
     "def test_new():\n    assert add(2, 3) == 5\n"
+)
+
+# A chunk for a file the fix commit does not touch, appended to a reference so
+# a test can exercise the three-class split. `git apply --numstat` PARSES a
+# chunk rather than applying it -- the same property the `_chunks_of` tests
+# further down already rely on.
+CHANGELOG_CHUNK = (
+    "diff --git a/CHANGES.md b/CHANGES.md\n"
+    "--- a/CHANGES.md\n"
+    "+++ b/CHANGES.md\n"
+    "@@ -1 +1,2 @@\n"
+    " changelog\n"
+    "+- fixed add()\n"
 )
 
 
@@ -51,13 +71,28 @@ def upstream(tmp_path):
     Local rather than remote on purpose: `materialize` clones with
     `--mirror`, which works against a path, so the whole materialization path
     is exercised offline. A test that needed the network would be a test that
-    stops running.
+    stops running. It also carries `CLAUDE.md`, `.claude/settings.json`,
+    `vendor/dep.py` and `CHANGES.md` alongside `calc.py` and its test, because
+    `strip_paths` exists for exactly those shapes -- an agent file, a
+    vendored tree, and a changelog the fix commit does not touch.
     """
     repo = tmp_path / "upstream"
     (repo / "tests").mkdir(parents=True)
     (repo / "calc.py").write_text(BUGGY)
     (repo / "tests" / "test_calc.py").write_text(OLD_TEST)
     (repo / ".gitignore").write_text("__pycache__/\n")
+    # A repository whose base_sha carries an agent file, a vendored tree and a
+    # changelog is the shape `strip_paths` exists for, and all three were
+    # measured on real repositories (sqlglot's CLAUDE.md, the internal repo's
+    # committed venv, click's CHANGES.rst). None of them is touched by the fix
+    # commit, so the reference diff below is unchanged and every other test in
+    # this module sees exactly the halves it saw before.
+    (repo / "CLAUDE.md").write_text("# project notes\n")
+    (repo / ".claude").mkdir()
+    (repo / ".claude" / "settings.json").write_text("{}\n")
+    (repo / "vendor").mkdir()
+    (repo / "vendor" / "dep.py").write_text("VERSION = '1.0'\n")
+    (repo / "CHANGES.md").write_text("changelog\n")
     _sh("git", "init", "-q", cwd=repo)
     _sh("git", "config", "user.email", "t@t.test", cwd=repo)
     _sh("git", "config", "user.name", "t", cwd=repo)
@@ -78,6 +113,300 @@ def upstream(tmp_path):
     return {"path": repo, "base": base, "head": head, "reference": reference}
 
 
+SUB_LIB = "VALUE = 1\n"
+SUB_LIB_FUTURE = "VALUE = 999\n"
+
+
+@pytest.fixture
+def upstream_submodule(tmp_path):
+    """A superproject with one submodule, whose upstream has moved PAST the pin.
+
+    The future commit is the point. `git submodule update --init` against the
+    real url clones the submodule's whole history (measured 2026-09-01, git
+    2.50.1), so a fixture whose submodule has nothing after the gitlink cannot
+    tell a pruned mirror from an unpruned one -- which is the guarantee Task 2
+    exists to pin.
+
+    `-c protocol.file.allow=always` on every submodule-touching command: git
+    refuses the file transport for submodules by default since the CVE-2022-39253
+    hardening, and a local path is a file transport. Production needs the same
+    flag for the same reason (the pruned mirror is a local path), so this is not
+    a fixture-only concession.
+    """
+    lib = tmp_path / "libdep"
+    (lib / "libdep").mkdir(parents=True)
+    (lib / "libdep" / "__init__.py").write_text(SUB_LIB)
+    _sh("git", "init", "-q", cwd=lib)
+    _sh("git", "config", "user.email", "t@t.test", cwd=lib)
+    _sh("git", "config", "user.name", "t", cwd=lib)
+    _sh("git", "add", "-A", cwd=lib)
+    _sh("git", "commit", "-q", "-m", "libdep v1", cwd=lib)
+    pinned = _sh("git", "rev-parse", "HEAD", cwd=lib)
+    (lib / "libdep" / "__init__.py").write_text(SUB_LIB_FUTURE)
+    _sh("git", "commit", "-q", "-am", "libdep FUTURE", cwd=lib)
+    future = _sh("git", "rev-parse", "HEAD", cwd=lib)
+
+    repo = tmp_path / "super"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "calc.py").write_text(BUGGY)
+    (repo / "tests" / "test_calc.py").write_text(OLD_TEST)
+    _sh("git", "init", "-q", cwd=repo)
+    _sh("git", "config", "user.email", "t@t.test", cwd=repo)
+    _sh("git", "config", "user.name", "t", cwd=repo)
+    _sh("git", "add", "-A", cwd=repo)
+    _sh("git", "commit", "-q", "-m", "base", cwd=repo)
+    _sh("git", "-c", "protocol.file.allow=always", "submodule", "add", "-q",
+        str(lib), "vendor/libdep", cwd=repo)
+    _sh("git", "-c", "protocol.file.allow=always", "-C", "vendor/libdep",
+        "checkout", "-q", pinned, cwd=repo)
+    _sh("git", "add", "-A", cwd=repo)
+    _sh("git", "commit", "-q", "-m", "pin the submodule", cwd=repo)
+    base = _sh("git", "rev-parse", "HEAD", cwd=repo)
+
+    (repo / "calc.py").write_text(FIXED)
+    (repo / "tests" / "test_calc.py").write_text(NEW_TEST)
+    _sh("git", "add", "-A", cwd=repo)
+    _sh("git", "commit", "-q", "-m", "fix", cwd=repo)
+    head = _sh("git", "rev-parse", "HEAD", cwd=repo)
+    reference = subprocess.run(
+        ["git", "diff", base, head], cwd=repo, check=True,
+        capture_output=True, text=True,
+    ).stdout
+    return {"path": repo, "base": base, "head": head, "reference": reference,
+            "lib": lib, "pinned": pinned, "future": future,
+            "sub_path": "vendor/libdep"}
+
+
+@pytest.fixture
+def upstream_two_submodules(tmp_path):
+    """`upstream_submodule` with a SECOND gitlink, at `vendor/other`.
+
+    Beside that fixture rather than parameterising it: every existing test in
+    the submodule section depends on `upstream_submodule`'s exact halves, and
+    a second gitlink changes the derivation's output for all of them.
+
+    Yields a builder taking one keyword, `stanzas: int = 2`. At `stanzas=1`
+    the fixture rewrites `.gitmodules` to carry the `vendor/libdep` stanza
+    ALONE and commits that, which is the readable-but-no-stanza tree D4 row 2
+    is about: `vendor/other` keeps its gitlink and loses its url, and is
+    workable only when the manifest declares it unneeded.
+
+    `-c protocol.file.allow=always` on every submodule-touching command, for
+    the reason `upstream_submodule`'s docstring gives.
+    """
+    def _build(stanzas: int = 2):
+        libs = {}
+        for name in ("libdep", "other"):
+            lib = tmp_path / f"two-{name}"
+            (lib / name).mkdir(parents=True)
+            (lib / name / "__init__.py").write_text(SUB_LIB)
+            _sh("git", "init", "-q", cwd=lib)
+            _sh("git", "config", "user.email", "t@t.test", cwd=lib)
+            _sh("git", "config", "user.name", "t", cwd=lib)
+            _sh("git", "add", "-A", cwd=lib)
+            _sh("git", "commit", "-q", "-m", f"{name} v1", cwd=lib)
+            libs[name] = (lib, _sh("git", "rev-parse", "HEAD", cwd=lib))
+
+        repo = tmp_path / "super-two"
+        (repo / "tests").mkdir(parents=True)
+        (repo / "calc.py").write_text(BUGGY)
+        (repo / "tests" / "test_calc.py").write_text(OLD_TEST)
+        _sh("git", "init", "-q", cwd=repo)
+        _sh("git", "config", "user.email", "t@t.test", cwd=repo)
+        _sh("git", "config", "user.name", "t", cwd=repo)
+        _sh("git", "add", "-A", cwd=repo)
+        _sh("git", "commit", "-q", "-m", "base", cwd=repo)
+        for name, path in (("libdep", "vendor/libdep"),
+                           ("other", "vendor/other")):
+            _sh("git", "-c", "protocol.file.allow=always", "submodule", "add",
+                "-q", str(libs[name][0]), path, cwd=repo)
+        _sh("git", "add", "-A", cwd=repo)
+        _sh("git", "commit", "-q", "-m", "pin both submodules", cwd=repo)
+        if stanzas == 1:
+            # The `vendor/libdep` stanza ALONE. `vendor/other` keeps its
+            # gitlink and loses its url, which is the one shape the
+            # `by_path.get` fallback in `derive_submodules` exists for.
+            (repo / ".gitmodules").write_text(
+                '[submodule "vendor/libdep"]\n'
+                "\tpath = vendor/libdep\n"
+                f"\turl = {libs['libdep'][0]}\n"
+            )
+            _sh("git", "add", ".gitmodules", cwd=repo)
+            _sh("git", "commit", "-q", "-m", "drop the other stanza", cwd=repo)
+        base = _sh("git", "rev-parse", "HEAD", cwd=repo)
+
+        (repo / "calc.py").write_text(FIXED)
+        (repo / "tests" / "test_calc.py").write_text(NEW_TEST)
+        _sh("git", "add", "-A", cwd=repo)
+        _sh("git", "commit", "-q", "-m", "fix", cwd=repo)
+        head = _sh("git", "rev-parse", "HEAD", cwd=repo)
+        reference = subprocess.run(
+            ["git", "diff", base, head], cwd=repo, check=True,
+            capture_output=True, text=True,
+        ).stdout
+        return {
+            "path": repo, "base": base, "head": head, "reference": reference,
+            "lib": libs["libdep"][0], "pinned": libs["libdep"][1],
+            "sub_path": "vendor/libdep",
+            "other_lib": libs["other"][0], "other_pinned": libs["other"][1],
+            "sub_path_other": "vendor/other",
+        }
+
+    return _build
+
+
+SUB_DEEP = "DEEP = 1\n"
+SUB_DEEP_FUTURE = "DEEP = 999\n"
+
+
+def _init_repo(path: Path) -> None:
+    _sh("git", "init", "-q", cwd=path)
+    _sh("git", "config", "user.email", "t@t.test", cwd=path)
+    _sh("git", "config", "user.name", "t", cwd=path)
+
+
+@pytest.fixture
+def nested_submodule(tmp_path):
+    """A superproject -> `vendor/lib` -> `vendor/lib/vendor/deep`.
+
+    Yields a builder taking one keyword, `levels: int = 2`, so the same three
+    repositories can be extended to a fourth for the depth-cap refusal without
+    a second fixture whose two halves could drift apart.
+
+    EVERY level carries a commit PAST its gitlink, for the reason
+    `upstream_submodule`'s docstring gives one level up: `git submodule update
+    --init` against the real url clones the submodule's whole history, so a
+    fixture whose inner repository has nothing after the pin cannot tell a
+    pruned mirror from an unpruned one. Two pins here, two futures, and the
+    materialization tests assert both are unreachable.
+
+    The build ORDER is forced by the nesting and is worth stating: the
+    innermost is committed first because `inner`'s pinned commit has to name
+    it, and `inner`'s pinned commit has to exist before the superproject can
+    pin THAT. Writing it the other way round pins each level at a commit whose
+    gitlink is empty.
+
+    `-c protocol.file.allow=always` on every submodule-touching command, for
+    the reason `upstream_submodule`'s docstring gives.
+    """
+    def _build(levels: int = 2, deep_url: str | None = None,
+               deep_stanza: bool = True, orphan_in_innermost: bool = False):
+        """`levels=3` adds a fourth repository under `innermost`, so the
+        innermost tree carries a gitlink and the depth cap fires. `deep_url`
+        rewrites the INNER's `.gitmodules` url before its pinned commit, which
+        is how a level-2 url is made unfetchable without touching level 1.
+        `deep_stanza=False` drops that stanza entirely, leaving the level-2
+        gitlink with no url. `orphan_in_innermost` gives the innermost tree a
+        `.gitmodules` and ZERO gitlinks -- the `git rm --cached` shape, which
+        must NOT be refused at the cap."""
+        deepest = None
+        if levels >= 3:
+            # A FOURTH repository, one level below `innermost`, which is what
+            # makes the innermost tree carry a gitlink of its own and the
+            # depth cap fire.
+            deepest = tmp_path / "deepest"
+            (deepest / "deepestdep").mkdir(parents=True)
+            (deepest / "deepestdep" / "__init__.py").write_text("BOTTOM = 1\n")
+            _init_repo(deepest)
+            _sh("git", "add", "-A", cwd=deepest)
+            _sh("git", "commit", "-q", "-m", "deepest v1", cwd=deepest)
+
+        innermost = tmp_path / "innermost"
+        (innermost / "deepdep").mkdir(parents=True)
+        (innermost / "deepdep" / "__init__.py").write_text(SUB_DEEP)
+        _init_repo(innermost)
+        _sh("git", "add", "-A", cwd=innermost)
+        _sh("git", "commit", "-q", "-m", "deepdep v1", cwd=innermost)
+        if deepest is not None:
+            _sh("git", "-c", "protocol.file.allow=always", "submodule", "add",
+                "-q", str(deepest), "vendor/bottom", cwd=innermost)
+            _sh("git", "commit", "-q", "-m", "nest the bottom", cwd=innermost)
+        if orphan_in_innermost:
+            # A stanza with NO gitlink, which is what a `git rm --cached`
+            # leaves behind. `_has_gitmodules` is true for this tree and
+            # `_has_gitlinks` is false, and only the second may drive the cap.
+            (innermost / ".gitmodules").write_text(
+                '[submodule "gone"]\n\tpath = gone\n\turl = https://x/y.git\n'
+            )
+            _sh("git", "add", ".gitmodules", cwd=innermost)
+            _sh("git", "commit", "-q", "-m", "an orphan stanza", cwd=innermost)
+        deep_pinned = _sh("git", "rev-parse", "HEAD", cwd=innermost)
+        (innermost / "deepdep" / "__init__.py").write_text(SUB_DEEP_FUTURE)
+        _sh("git", "commit", "-q", "-am", "deepdep FUTURE", cwd=innermost)
+        deep_future = _sh("git", "rev-parse", "HEAD", cwd=innermost)
+
+        inner = tmp_path / "inner"
+        (inner / "libdep").mkdir(parents=True)
+        (inner / "libdep" / "__init__.py").write_text(SUB_LIB)
+        _init_repo(inner)
+        _sh("git", "add", "-A", cwd=inner)
+        _sh("git", "commit", "-q", "-m", "libdep v1", cwd=inner)
+        _sh("git", "-c", "protocol.file.allow=always", "submodule", "add", "-q",
+            str(innermost), "vendor/deep", cwd=inner)
+        _sh("git", "-c", "protocol.file.allow=always", "-C", "vendor/deep",
+            "checkout", "-q", deep_pinned, cwd=inner)
+        if not deep_stanza:
+            (inner / ".gitmodules").write_text("")
+        elif deep_url is not None:
+            (inner / ".gitmodules").write_text(
+                '[submodule "vendor/deep"]\n\tpath = vendor/deep\n'
+                f"\turl = {deep_url}\n"
+            )
+        _sh("git", "add", "-A", cwd=inner)
+        _sh("git", "commit", "-q", "-m", "pin the inner submodule", cwd=inner)
+        inner_pinned = _sh("git", "rev-parse", "HEAD", cwd=inner)
+        (inner / "libdep" / "__init__.py").write_text(SUB_LIB_FUTURE)
+        _sh("git", "commit", "-q", "-am", "libdep FUTURE", cwd=inner)
+        inner_future = _sh("git", "rev-parse", "HEAD", cwd=inner)
+
+        repo = tmp_path / "super-nested"
+        (repo / "tests").mkdir(parents=True)
+        (repo / "calc.py").write_text(BUGGY)
+        (repo / "tests" / "test_calc.py").write_text(OLD_TEST)
+        _init_repo(repo)
+        _sh("git", "add", "-A", cwd=repo)
+        _sh("git", "commit", "-q", "-m", "base", cwd=repo)
+        _sh("git", "-c", "protocol.file.allow=always", "submodule", "add", "-q",
+            str(inner), "vendor/lib", cwd=repo)
+        _sh("git", "-c", "protocol.file.allow=always", "-C", "vendor/lib",
+            "checkout", "-q", inner_pinned, cwd=repo)
+        _sh("git", "add", "-A", cwd=repo)
+        _sh("git", "commit", "-q", "-m", "pin the outer submodule", cwd=repo)
+        base = _sh("git", "rev-parse", "HEAD", cwd=repo)
+
+        (repo / "calc.py").write_text(FIXED)
+        (repo / "tests" / "test_calc.py").write_text(NEW_TEST)
+        _sh("git", "add", "-A", cwd=repo)
+        _sh("git", "commit", "-q", "-m", "fix", cwd=repo)
+        head = _sh("git", "rev-parse", "HEAD", cwd=repo)
+        reference = subprocess.run(
+            ["git", "diff", base, head], cwd=repo, check=True,
+            capture_output=True, text=True,
+        ).stdout
+        return {
+            "path": repo, "base": base, "head": head, "reference": reference,
+            "inner": inner, "innermost": innermost, "deepest": deepest,
+            "inner_pinned": inner_pinned, "inner_future": inner_future,
+            "deep_pinned": deep_pinned, "deep_future": deep_future,
+            "sub_path": "vendor/lib",
+            "sub_path_deep": "vendor/lib/vendor/deep",
+        }
+
+    return _build
+
+
+@pytest.fixture
+def local_urls(monkeypatch):
+    """Accept the fixtures' local-path submodule urls.
+
+    Empties `_SUBMODULE_URL_PREFIX` so `startswith` is vacuously true. The
+    fixtures are local repositories on purpose -- the same reason `upstream`
+    is -- so that the whole materialization path runs offline; a test that
+    needed the network would be a test that stops running.
+    """
+    monkeypatch.setattr(tasks, "_SUBMODULE_URL_PREFIX", "")
+
+
 def _manifest(**overrides) -> str:
     data = {
         "task_id": "t-001",
@@ -89,6 +418,13 @@ def _manifest(**overrides) -> str:
         "runner": '["python", "-m", "pytest", "-q"]',
         "f2p": '["tests/test_calc.py::test_new"]',
         "start_sha": "",
+        # Raw YAML appended INSIDE the `tests:` block, after `f2p`. Separate
+        # from `extra_yaml` because a `tests.` key has to be indented under a
+        # mapping this helper already opened; and because a key repeated after
+        # the default -- `runner:`, `f2p:` -- overrides it, PyYAML taking the
+        # last occurrence, which is what lets a test restate one key without a
+        # keyword for every key.
+        "tests_extra": "",
         # A raw YAML block appended verbatim, so a test can write a `grading:`
         # section -- including the malformed shapes a keyword-per-key helper
         # could not express.
@@ -112,6 +448,8 @@ def _manifest(**overrides) -> str:
         f"  runner: {data['runner']}",
         f"  f2p: {data['f2p']}",
     ]
+    if data["tests_extra"]:
+        lines.append(data["tests_extra"].rstrip("\n"))
     if data["extra_yaml"]:
         lines.append(data["extra_yaml"])
     lines.append("")
@@ -126,6 +464,342 @@ def _write_task(root: Path, upstream, name="t-001", **overrides) -> Path:
     (task_dir / "task.yaml").write_text(_manifest(**fields))
     (task_dir / "reference.diff").write_text(upstream["reference"])
     return task_dir
+
+
+_BROKEN_IMAGE_ENV = (
+    "image:\n"
+    "  env:\n"
+    "    SETUPTOOLS_SCM_PRETEND_VERSION: '1.0'\n"
+)
+
+
+def _write_broken_task(root: Path, upstream, name="t-002") -> Path:
+    """A sibling that refuses exactly the way the 2026-09-02 measurement did.
+
+    The `image.env` allowlist is the real defect the probe hit; any refusal
+    would exercise the collector, but this one keeps the test and the report
+    describing one thing. `task_id` is set to the directory name because
+    `_manifest`'s default is a fixed `t-001` and these tests turn on the
+    selection matching directories by name.
+    """
+    return _write_task(root, upstream, name=name, task_id=name,
+                       extra_yaml=_BROKEN_IMAGE_ENV)
+
+
+def _git_task_set(root: Path, *, commit: str = "tasks") -> None:
+    """Make the task-set directory a git repository with everything in it
+    committed. Separate from the `upstream` fixture's repo: this one is the
+    SET, and `_manifest_committed` reads its status."""
+    _sh("git", "init", "-q", cwd=root)
+    _sh("git", "config", "user.email", "t@t.test", cwd=root)
+    _sh("git", "config", "user.name", "t", cwd=root)
+    _sh("git", "add", "-A", cwd=root)
+    _sh("git", "commit", "-q", "-m", commit, cwd=root)
+
+
+def _write_node_task(root: Path, upstream, *, paths=("tests/",), f2p=None,
+                     p2p=None, extra_yaml="") -> Path:
+    """A `tests.framework: vitest` manifest over the same fixture repository.
+
+    The repository underneath is still the Python one -- nothing in these
+    tests runs a suite, and the reference diff only has to split under
+    `paths`. What is under test is the LOADER, which is where a node manifest
+    is refused or accepted.
+
+    `extra_yaml` here is the BODY of the `image:` block, not a top-level
+    block, because every image key these tests state (`node:`, `python:`)
+    lives under one mapping and writing `image:\\n` in each caller would be
+    four copies of the same line.
+    """
+    tests_extra = ["  framework: vitest"]
+    if p2p is not None:
+        tests_extra.append(f"  p2p: {json.dumps(list(p2p))}")
+    return _write_task(
+        root, upstream,
+        paths=json.dumps(list(paths)),
+        runner=json.dumps(["/node_modules/.bin/vitest", "run", "--no-cache"]),
+        f2p=json.dumps(list(
+            f2p if f2p is not None else ["tests/a.test.js::does a thing"]
+        )),
+        tests_extra="\n".join(tests_extra),
+        extra_yaml=("image:\n" + extra_yaml.rstrip("\n")) if extra_yaml else "",
+    )
+
+
+def _budget_task(tmp_path, upstream, body: str) -> Path:
+    """A manifest whose `budget:` block is the literal YAML in `body`.
+
+    `extra_yaml` is appended verbatim, which is what lets these tests state
+    the malformed shapes a keyword-per-key helper could not express -- the
+    same reason the `grading:` tests use it.
+    """
+    return _write_task(tmp_path / "set", upstream,
+                       extra_yaml="budget:\n" + body)
+
+
+def test_the_suite_timeout_defaults_to_the_constant_it_replaces(
+    tmp_path, upstream
+):
+    """600 was `preflight(timeout_s=600)`, `ensure_oracle(timeout_s=600)` and
+    the grader's own per-check bound (formerly `GRADE_TIMEOUT_S`, now read off
+    this field directly), three copies of one number. `grader.SCAN_TIMEOUT_S`
+    is a fourth, separate constant -- it bounds only the host-side gitleaks
+    scan, not a copy of this default. A manifest that does not mention the
+    key must gate and grade exactly as it did before, so the default is that
+    number and not a rounder one."""
+    task = load_task(_write_task(tmp_path / "set", upstream))
+    assert task.budget.suite_timeout_s == 600
+
+
+def test_a_declared_suite_timeout_is_read(tmp_path, upstream):
+    task = load_task(_budget_task(tmp_path, upstream, (
+        "  max_turns: 40\n"
+        "  wall_clock_timeout_s: 3600\n"
+        "  suite_timeout_s: 1800\n"
+    )))
+    assert task.budget.suite_timeout_s == 1800
+
+
+@pytest.mark.parametrize("yaml_value", ['"600"', "600.0", "null", "0", "-1"])
+def test_a_suite_timeout_that_is_not_a_positive_int_is_a_load_error(
+    tmp_path, upstream, yaml_value
+):
+    """`int("600")` and `int(600.0)` both SUCCEED, so a bare `int(...)` accepts
+    a quoted or floated value silently, which is how the other two budget keys
+    behaved until 2026-09-02 -- and the manifest stops being a faithful
+    record. An explicit `null` is refused
+    rather than defaulted: the author WROTE the key, so reading it as "never
+    written" is the wrong repair -- which is why `_positive_int` takes an
+    `_ABSENT` sentinel and not a `None` default.
+
+    Parametrized over YAML SOURCE. `'"600"'` reaches the file with its quotes;
+    written as a Python `"600"` it would render unquoted, parse as the int
+    600, and this case would silently stop testing anything."""
+    with pytest.raises(TaskError, match="budget.suite_timeout_s"):
+        load_task(_budget_task(
+            tmp_path, upstream, f"  suite_timeout_s: {yaml_value}\n"))
+
+
+def test_a_boolean_suite_timeout_is_refused_rather_than_read_as_one_second(
+    tmp_path, upstream
+):
+    """Its own test, because the failure mode differs from every value above:
+    those are visibly wrong, and this one is ACCEPTED. `bool` IS an `int` in
+    Python, so `int(True)` is 1 and `suite_timeout_s: true` kills every gated
+    and graded command after one second -- a NO-GO at the gate and, past it,
+    `timed_out` stamped on every arm -- for a YAML typo. `isinstance(value,
+    bool)` must be tested BEFORE `isinstance(value, int)`; folded into it the
+    bool branch is dead code a mutation cannot catch."""
+    with pytest.raises(TaskError, match="budget.suite_timeout_s"):
+        load_task(_budget_task(tmp_path, upstream, "  suite_timeout_s: true\n"))
+
+
+def test_a_suite_timeout_over_the_agents_wall_clock_is_refused_with_the_sum(
+    tmp_path, upstream
+):
+    """The agent re-runs this suite INSIDE `wall_clock_timeout_s` and there is
+    no per-command bound in its container, so a suite the author says may need
+    longer than the agent's whole run is a task no arm can verify even once --
+    the run is SIGTERMed mid-suite and the diff is unchecked. Spec section 3.3
+    measures a loop that ends in "runs tests, sees failures, self-corrects";
+    this is that loop truncated, and it is settled by arithmetic over two
+    manifest numbers, so it is a LOAD error rather than a preflight one.
+
+    The message must carry both numbers: an author told only "too large" has
+    to guess which of the two to move."""
+    with pytest.raises(TaskError) as exc:
+        load_task(_budget_task(tmp_path, upstream, (
+            "  wall_clock_timeout_s: 900\n"
+            "  suite_timeout_s: 1800\n"
+        )))
+    message = str(exc.value)
+    assert "1800" in message and "900" in message
+    assert "wall_clock_timeout_s" in message
+
+
+def test_a_suite_timeout_equal_to_the_wall_clock_loads(tmp_path, upstream):
+    """Strictly `>`, not `>=`. Equality leaves the agent exactly one suite run
+    and no editing time, which is degenerate -- but "degenerate" is a judgement
+    about how much slack an agent needs, and this rule asserts only what
+    arithmetic settles. Pinned so a later tightening is a deliberate change
+    rather than an unnoticed one."""
+    task = load_task(_budget_task(tmp_path, upstream, (
+        "  wall_clock_timeout_s: 900\n"
+        "  suite_timeout_s: 900\n"
+    )))
+    assert task.budget.suite_timeout_s == 900
+
+
+def test_the_default_budget_pair_is_self_consistent():
+    """The defaults must not be a pair the loader would refuse: 600 <= 900."""
+    assert TaskBudget().suite_timeout_s <= TaskBudget().wall_clock_timeout_s
+
+
+@pytest.mark.parametrize(
+    "yaml_value",
+    ['"40"', "40.0", "3.7", "null", "0", "-1", "forty", "1e3", "[40]"],
+)
+def test_a_max_turns_that_is_not_a_positive_int_is_a_load_error(
+    tmp_path, upstream, yaml_value
+):
+    """Until 2026-09-02 `max_turns` was parsed with a bare `int(...)`, which
+    accepted three of these shapes silently: `"40"` -> 40, `40.0` -> 40, and
+    `3.7` -> 3 (truncated, not rounded) -- a manifest that stops being a
+    faithful record of what an arm was asked to do. `forty` and `null` raised
+    a bare `ValueError`/`TypeError` with no manifest path in it. `1e3` is a
+    `str` to PyYAML 6.0.3, not a float: YAML 1.1's float resolver requires a
+    decimal point in the mantissa and a signed exponent (`1.0e+3`), so the
+    shorthand an author reaches for to raise a bound by an order of magnitude
+    is one of the cases that must now raise a named `TaskError`."""
+    with pytest.raises(TaskError, match="budget.max_turns"):
+        load_task(_budget_task(tmp_path, upstream, f"  max_turns: {yaml_value}\n"))
+
+
+@pytest.mark.parametrize("yaml_value", ["true", "false"])
+def test_a_boolean_max_turns_is_refused_rather_than_read_as_one_turn(
+    tmp_path, upstream, yaml_value
+):
+    """`bool` IS an `int`, so `int(True)` is 1 and `int(False)` is 0 -- the
+    failure mode differs from every value in the previous test because these
+    were ACCEPTED. `max_turns: true` gave every arm of that task one API call
+    and a record that reads as a model that stopped after one turn;
+    `max_turns: false` gave it zero. Measured 2026-09-02 that the CLI does not
+    save this: against claude 2.1.258 (the host binary; the eval image pins
+    2.1.220) with `ANTHROPIC_BASE_URL` pointed at an unreachable port,
+    `claude -p --output-format stream-json --verbose --max-turns 0 "say hi"`
+    emits the `system/init` event and then `api_retry` events -- it starts a
+    session and calls the API. `--max-turns -1` and `--max-turns 0.5` behave
+    the same. Only a non-numeric argument is refused, by commander, before any
+    network: `error: option '--max-turns <turns>' argument 'abc' is invalid.
+    must be a number` -- and `--max-turns` is not listed in `claude --help` at
+    all, so there is no downstream backstop."""
+    with pytest.raises(TaskError, match="budget.max_turns"):
+        load_task(_budget_task(tmp_path, upstream, f"  max_turns: {yaml_value}\n"))
+
+
+@pytest.mark.parametrize(
+    "yaml_value", ['"900"', "900.0", "null", "0", "-1", "forty", "[900]"]
+)
+def test_a_wall_clock_timeout_that_is_not_a_positive_int_is_a_load_error(
+    tmp_path, upstream, yaml_value
+):
+    """`"900"` was accepted silently by the bare `int(...)` this replaced.
+    This key is also read by `run_matrix`'s per-cell credential margin
+    (`wall_clock_timeout_s + CELL_OVERHEAD_S`, handed to
+    `proxy.credential_stop`), so a value nobody wrote used to propagate into
+    a refusal-to-start decision about the SSO window."""
+    with pytest.raises(TaskError, match="budget.wall_clock_timeout_s"):
+        load_task(_budget_task(
+            tmp_path, upstream, f"  wall_clock_timeout_s: {yaml_value}\n"))
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "  wall_clock_timeout_s: true\n",
+        "  wall_clock_timeout_s: 0\n  suite_timeout_s: 1800\n",
+    ],
+)
+def test_a_bad_wall_clock_names_its_own_key_not_the_suite_comparison(
+    tmp_path, upstream, body
+):
+    """The item's measured defect, and the ordering pin. Before 2026-09-02,
+    with no `suite_timeout_s` declared (the click shape), this manifest
+    raised:
+
+        budget.suite_timeout_s (600) exceeds budget.wall_clock_timeout_s (1)
+        by 599s ... Raise wall_clock_timeout_s, or lower suite_timeout_s to
+        what the suite actually needs.
+
+    600 is the dataclass default for a key the manifest never mentions, so
+    the refusal named a key the author never wrote, did arithmetic over a
+    boolean (`int(True)` is 1), and advised lowering the one number that was
+    correct. The `not in` assertions below are the load-bearing half: with
+    the validation removed the comparison still fires and still raises a
+    `TaskError`, so a bare `pytest.raises(TaskError)` would pass on the bug."""
+    with pytest.raises(TaskError) as exc:
+        load_task(_budget_task(tmp_path, upstream, body))
+    message = str(exc.value)
+    assert "budget.wall_clock_timeout_s" in message
+    assert "must be a positive integer" in message
+    assert "suite_timeout_s" not in message
+    assert "exceeds" not in message
+
+
+@pytest.mark.parametrize(
+    "name", [f.name for f in dataclasses.fields(TaskBudget)]
+)
+def test_every_budget_key_refuses_a_boolean(tmp_path, upstream, name):
+    """Derived from the dataclass rather than listing three names, so a
+    fourth budget key added later and wired up with a bare `int(...)` fails
+    here instead of shipping.
+
+    `match=` on the key name alone is NOT enough, and this is measured:
+    against a package with only `wall_clock_timeout_s` reverted to the bare
+    `int(...)`, `pytest.raises(TaskError, match="budget.wall_clock_timeout_s")`
+    PASSES on the bug -- the comparison's own message contains that key name
+    (`"... budget.suite_timeout_s (600) exceeds budget.wall_clock_timeout_s
+    (1) by 599s..."`). So the test advertised as the drift pin would have
+    gone green for the one key this whole item exists to fix. Asserting
+    `"must be a positive integer"` as well flips that case to a failure; a
+    reader who trims this back to `match=` alone re-opens the hole silently."""
+    with pytest.raises(TaskError) as exc:
+        load_task(_budget_task(tmp_path, upstream, f"  {name}: true\n"))
+    message = str(exc.value)
+    assert f"budget.{name}" in message
+    assert "must be a positive integer" in message
+    assert "exceeds" not in message
+
+
+def test_max_turns_has_no_upper_bound(tmp_path, upstream):
+    """A ceiling is a judgement about how much is too much, section 5.4
+    leaves the number to section 3.5's pilot, `wall_clock_timeout_s` is the
+    outer stop whatever `max_turns` says, and the CLI enforces nothing
+    (measured in the boolean test above). Pinned so a later cap is a
+    deliberate change rather than an unnoticed one."""
+    task = load_task(_budget_task(tmp_path, upstream, "  max_turns: 100000\n"))
+    assert task.budget.max_turns == 100000
+
+
+@pytest.mark.parametrize("block", ["budget: []", "budget: 0", 'budget: ""'])
+def test_a_budget_section_that_is_not_a_mapping_is_refused_rather_than_defaulted(
+    tmp_path, upstream, block
+):
+    """`budget_raw = data.get("budget") or {}` read every falsy value as an
+    unwritten section and applied all three defaults, measured 2026-09-02.
+    The precedent is `test_a_grading_section_that_is_not_a_mapping_is_refused_at_load`,
+    nine lines below `budget:` in the same function and already parametrized
+    over exactly `['grading: ruff', 'grading: []', "grading: ''", 'grading:
+    0']` -- this test is that one, for the section that predates it."""
+    task_dir = _write_task(tmp_path / "set", upstream, extra_yaml=block)
+
+    with pytest.raises(TaskError, match="budget must be a mapping"):
+        load_task(task_dir)
+
+
+def test_a_null_budget_section_reads_as_absent(tmp_path, upstream):
+    """The deliberate asymmetry against `max_turns: null`, which is refused:
+    a null SECTION is a commented-out block whose keys all have defaults that
+    are exactly the prior behaviour; a null KEY is an author reaching for one
+    number and writing none. Pins that the previous test did not tighten this
+    by accident."""
+    task_dir = _write_task(tmp_path / "set", upstream, extra_yaml="budget: null")
+    task = load_task(task_dir)
+    defaults = TaskBudget()
+    assert task.budget.max_turns == defaults.max_turns
+    assert task.budget.wall_clock_timeout_s == defaults.wall_clock_timeout_s
+    assert task.budget.suite_timeout_s == defaults.suite_timeout_s
+
+
+def test_an_absent_budget_block_takes_every_default(tmp_path, upstream):
+    """The click manifest and every probe manifest rely on the defaults for
+    at least one key, so the no-`budget:` path is the one every task
+    actually takes."""
+    task = load_task(_write_task(tmp_path / "set", upstream))
+    defaults = TaskBudget()
+    assert task.budget.max_turns == defaults.max_turns
+    assert task.budget.wall_clock_timeout_s == defaults.wall_clock_timeout_s
+    assert task.budget.suite_timeout_s == defaults.suite_timeout_s
 
 
 # --- the split ---------------------------------------------------------------
@@ -353,6 +1027,144 @@ def test_a_misspelled_grading_key_is_refused_rather_than_dropped(
     assert "typecheck" in str(excinfo.value), "the message must name the allowed set"
 
 
+def test_a_misspelled_image_key_is_refused_rather_than_dropped(
+    tmp_path, upstream
+):
+    """The `image:` twin of the check above, and the one typo NOTHING
+    downstream can see. Preflight reads `python --version` back out of the
+    finished container and compares it against `task.image.python` -- so a
+    manifest asking for `pyhton: "3.11"` loads as the 3.12 default, builds a
+    3.12 base, and the read-back agrees with the field it was compared to.
+    Every gate goes green while the suite runs under an interpreter the author
+    did not ask for. `grading:` has had this guard since it shipped; the same
+    four lines were simply never written for `image:`."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream, extra_yaml='image:\n  pyhton: "3.11"'
+    )
+
+    with pytest.raises(TaskError, match="unknown image key") as excinfo:
+        load_task(task_dir)
+    assert "pyhton" in str(excinfo.value)
+    assert "python" in str(excinfo.value), "the message must name the allowed set"
+
+
+def test_strip_paths_loads_and_is_exposed(tmp_path, upstream):
+    """A manifest key nothing can read is configuration nobody can report.
+    `materialize`, `build_task_image` and preflight all need this list."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream,
+        extra_yaml='strip_paths: ["CLAUDE.md", ".claude"]',
+    )
+
+    task = load_task(task_dir)
+
+    assert task.strip_paths == ("CLAUDE.md", ".claude")
+
+
+def test_a_manifest_with_no_strip_paths_still_loads(tmp_path, upstream):
+    """Every manifest written before this key existed keeps loading, and the
+    absent case is one value rather than a None every caller re-decides."""
+    assert load_task(_write_task(tmp_path / "set", upstream)).strip_paths == ()
+
+
+@pytest.mark.parametrize(
+    "bad, match",
+    [
+        ("", "empty or padded"),
+        (" CLAUDE.md", "empty or padded"),
+        ("/etc/passwd", "relative and free of"),
+        ("../outside", "relative and free of"),
+        (".", "names the whole tree"),
+        ("./", "names the whole tree"),
+        (".git", "own .git"),
+        (".git/hooks", "own .git"),
+        ("*.log", "pathspec magic"),
+        ("docs/*", "pathspec magic"),
+        (":(glob)**/x", "pathspec magic"),
+    ],
+)
+def test_a_strip_path_that_would_remove_the_wrong_thing_is_refused(
+    tmp_path, upstream, bad, match
+):
+    """This key's effect is a DELETE, so the validation is stricter than
+    `_validate_prefixes` alone.
+
+    `.` and `./` pass every check that function makes -- measured,
+    `PurePosixPath(".").parts` is `()` and `is_relative_to(".")` is True for
+    every path -- and name the whole tree, so the start state would be emptied
+    and `start_sha` would still be a pure function of the manifest. `.git`
+    would take the repository the submission diff is computed against. Glob
+    and pathspec magic would make what gets removed a property of the tree
+    rather than of the manifest, and the existence check in `materialize`
+    would then pass on one accidental match.
+
+    `match` pins the specific refusal, not just the `where` prefix every
+    message carries -- a generic `match="strip_paths"` would pass even if
+    every branch below raised the same message."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream, extra_yaml=f"strip_paths: [{bad!r}]",
+    )
+
+    with pytest.raises(TaskError, match=match):
+        load_task(task_dir)
+
+
+def test_a_stripped_path_in_the_solution_half_is_refused(tmp_path, upstream):
+    """Strip does NOT imply exclusion, and this is why.
+
+    Dropping the chunk silently would make `solution_diff` something other
+    than the merged PR (section 3.2's verbatim reference), and preflight would
+    only notice when the missing hunk happened to be one the f2p tests need.
+    The surviving case is a reference that is no longer a reference, with
+    every gate green."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream, extra_yaml='strip_paths: ["calc.py"]',
+    )
+
+    with pytest.raises(TaskError, match=r"strip_paths.*calc\.py.*solution"):
+        load_task(task_dir)
+
+
+def test_a_stripped_path_in_the_test_half_is_refused(tmp_path, upstream):
+    """The worse direction: the oracle shrinks, and every arm is then graded
+    against less than the task says it is graded against."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream, extra_yaml='strip_paths: ["tests"]',
+    )
+
+    with pytest.raises(TaskError, match=r"test_calc\.py.*test half"):
+        load_task(task_dir)
+
+
+def test_a_stripped_path_excluded_from_both_halves_loads(tmp_path, upstream):
+    """The sanctioned combination, and the one HARVESTING.md already sends an
+    author to: `allow_extra_paths` puts the file in neither half, so nothing
+    tries to apply a patch onto a path the strip removed -- and `extra_files`
+    still names it, so the combination is visible rather than inferred from
+    two keys that never mention each other.
+
+    Load-only here on purpose: the refusal this task adds is a load-time one,
+    and the strip that makes the combination true end to end lands in Task 3.
+    `test_a_stripped_extra_path_is_gone_from_the_start_state` there is the
+    other half."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream,
+        extra_yaml=(
+            '  allow_extra_paths: ["CHANGES.md"]\n'
+            'strip_paths: ["CHANGES.md"]'
+        ),
+    )
+    (task_dir / "reference.diff").write_text(
+        upstream["reference"] + CHANGELOG_CHUNK
+    )
+
+    task = load_task(task_dir)
+
+    assert task.extra_files == ("CHANGES.md",)
+    assert "CHANGES.md" not in task.solution_diff
+    assert "CHANGES.md" not in task.test_diff
+
+
 # --- provenance --------------------------------------------------------------
 
 
@@ -501,6 +1313,145 @@ def test_the_host_path_does_not_travel_into_the_run(tmp_path, upstream):
         if path.is_file() and str(cache) in path.read_text()
     ]
     assert leaked == []
+
+
+def test_strip_paths_removes_the_path_in_the_setup_commit(tmp_path, upstream):
+    """One commit onto base, not two.
+
+    `start_sha` is pinned in the manifest and verified on every
+    materialization; its job is that one manifest names one tree. A second
+    commit would still be deterministic but would make `start_sha` describe a
+    two-step history for some tasks and a one-step history for others."""
+    task = load_task(_write_task(
+        tmp_path / "set", upstream,
+        extra_yaml='strip_paths: ["CLAUDE.md", ".claude", "vendor"]',
+    ))
+    repo = tmp_path / "run" / "repo"
+
+    start = materialize(task, repo, tmp_path / "cache")
+
+    assert not (repo / "CLAUDE.md").exists()
+    assert not (repo / ".claude").exists()
+    assert not (repo / "vendor").exists()
+    tracked = _sh("git", "ls-tree", "-r", "--name-only", start, cwd=repo)
+    assert "CLAUDE.md" not in tracked
+    assert "vendor/dep.py" not in tracked
+    assert "calc.py" in tracked, "the strip must remove only what it names"
+    assert not _sh("git", "status", "--porcelain", cwd=repo), \
+        "committed, not left dirty"
+    assert _sh("git", "rev-list", "--count", f"{upstream['base']}..{start}",
+               cwd=repo) == "1"
+
+
+def test_declaring_strip_paths_moves_the_start_state(tmp_path, upstream):
+    """The modification is in the manifest, so it has to be in the sha every
+    record names. A strip invisible to `start_sha` would be a change to what
+    every arm was asked to do that no stored record could distinguish."""
+    plain = load_task(_write_task(tmp_path / "a", upstream))
+    stripped = load_task(_write_task(
+        tmp_path / "b", upstream, extra_yaml='strip_paths: ["CLAUDE.md"]',
+    ))
+
+    assert materialize(plain, tmp_path / "ra" / "repo", tmp_path / "cache") \
+        != materialize(stripped, tmp_path / "rb" / "repo", tmp_path / "cache")
+
+
+def test_an_empty_strip_paths_does_not_move_the_start_state(tmp_path, upstream):
+    """Backwards compatibility, stated as a property. Every manifest written
+    before this key existed -- the click task among them, whose `start_sha` is
+    pinned in its task.yaml -- must materialize to exactly what it did
+    before, so an absent key and an empty list have to be the same state and
+    neither may run a git call."""
+    absent = load_task(_write_task(tmp_path / "a", upstream))
+    empty = load_task(_write_task(
+        tmp_path / "b", upstream, extra_yaml="strip_paths: []",
+    ))
+
+    assert materialize(absent, tmp_path / "ra" / "repo", tmp_path / "cache") \
+        == materialize(empty, tmp_path / "rb" / "repo", tmp_path / "cache")
+
+
+def test_a_declared_strip_path_that_is_not_in_the_tree_is_refused(
+    tmp_path, upstream
+):
+    """The failure this key must not introduce. A typo strips nothing, the
+    file stays in the start state, and nothing downstream says so: preflight's
+    context-file check knows four names, so a mistyped vendored tree or a
+    fifth agent-file spelling passes every gate and the confound is permanent
+    in an append-only log. `--ignore-unmatch` is deliberately absent."""
+    task = load_task(_write_task(
+        tmp_path / "set", upstream, extra_yaml='strip_paths: [".cluade"]',
+    ))
+
+    with pytest.raises(TaskError, match=r"strip_paths.*\.cluade"):
+        materialize(task, tmp_path / "run" / "repo", tmp_path / "cache")
+
+
+def test_an_untracked_path_is_not_something_a_strip_can_remove(
+    tmp_path, upstream
+):
+    """The existence check asks git about TRACKED content, because only
+    tracked content is in the tree `start_sha` names. It also reads
+    `ls-files`'s OUTPUT rather than its exit code: measured,
+    `git ls-files -z -- nope` exits 0 with empty stdout, which is the silent
+    zero `container._checked_exec` exists to refuse.
+
+    The same rule is why `strip_paths` cannot name a file the PR CREATES,
+    even when `allow_extra_paths` also names it."""
+    (upstream["path"] / "scratch.txt").write_text("untracked\n")
+    task = load_task(_write_task(
+        tmp_path / "set", upstream, extra_yaml='strip_paths: ["scratch.txt"]',
+    ))
+
+    with pytest.raises(TaskError, match=r"strip_paths.*scratch\.txt"):
+        materialize(task, tmp_path / "run" / "repo", tmp_path / "cache")
+
+
+def test_a_stripped_extra_path_is_gone_from_the_start_state(tmp_path, upstream):
+    """The other half of Task 2's `..._loads`: the exclusion and the strip are
+    enforced in two different places, and only a materialization shows they
+    agree -- `allow_extra_paths` keeps the file out of both halves, the strip
+    removes it, and nothing tries to apply a patch onto a path that is gone.
+
+    It also demonstrates the constraint task authors have to know about: the
+    strip needs the path to be TRACKED at base_sha, so this combination works
+    for a changelog the PR edits and not for one it creates."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream,
+        extra_yaml=(
+            '  allow_extra_paths: ["CHANGES.md"]\n'
+            'strip_paths: ["CHANGES.md"]'
+        ),
+    )
+    (task_dir / "reference.diff").write_text(
+        upstream["reference"] + CHANGELOG_CHUNK
+    )
+    task = load_task(task_dir)
+    repo = tmp_path / "run" / "repo"
+
+    materialize(task, repo, tmp_path / "cache")
+
+    assert not (repo / "CHANGES.md").exists()
+
+
+def test_the_strip_runs_before_the_gitignore_is_written(tmp_path, upstream):
+    """Order: strip, then the test half, then `gitignore_extra`, then one
+    commit. A stripped path the TEST half re-creates cannot occur -- the
+    loader refuses that overlap -- so `.gitignore` is the only path a later
+    step can legitimately re-create under a strip prefix, and strip-first is
+    what makes that deterministic. Reversed, the strip would delete the file
+    the manifest just asked for."""
+    task = load_task(_write_task(
+        tmp_path / "set", upstream,
+        extra_yaml='strip_paths: [".gitignore"]\ngitignore_extra: ["*.log"]',
+    ))
+    repo = tmp_path / "run" / "repo"
+
+    materialize(task, repo, tmp_path / "cache")
+
+    text = (repo / ".gitignore").read_text()
+    assert "*.log" in text
+    assert "__pycache__/" not in text, "upstream's .gitignore was stripped"
 
 
 # --- the run tree does not contain the answer --------------------------------
@@ -1621,3 +2572,2901 @@ def test_leading_blank_lines_are_refused_rather_than_dropped():
 
     with pytest.raises(TaskError, match="byte for byte"):
         diff_chunks(diff)
+
+
+# --- image.env ---------------------------------------------------------------
+
+
+def test_image_env_defaults_to_empty_and_an_old_manifest_still_loads(
+    tmp_path, upstream
+):
+    """Every manifest written before this key existed must load unchanged, and
+    the absent case has to be ONE value rather than a None every caller
+    re-decides -- the reason `grading` is defaulted the same way."""
+    task_dir = _write_task(tmp_path / "set", upstream)  # no image: block
+
+    assert load_task(task_dir).image.env == {}
+
+
+def test_image_env_is_carried_verbatim(tmp_path, upstream):
+    task_dir = _write_task(
+        tmp_path / "set", upstream,
+        extra_yaml=(
+            "image:\n"
+            '  env:\n'
+            '    CI: "1"\n'
+            '    HYPOTHESIS_STORAGE_DIRECTORY: "/tmp/bakeoff-hypothesis"\n'
+        ),
+    )
+
+    assert load_task(task_dir).image.env == {
+        "CI": "1",
+        "HYPOTHESIS_STORAGE_DIRECTORY": "/tmp/bakeoff-hypothesis",
+    }
+
+
+def test_a_key_outside_the_allowlist_is_refused(tmp_path, upstream):
+    """An unrestricted image.env re-opens the hole the env ALLOWLIST exists to
+    close from the other side: CLAUDE_CODE_USE_BEDROCK is kept out of the host
+    environment by PASSTHROUGH_ENV and is not set by container_env, so an image
+    ENV carrying it would reach the agent, make the CLI ignore
+    ANTHROPIC_BASE_URL, bypass the proxy, and leave the mandatory wire log
+    empty with the run still looking normal."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream,
+        extra_yaml='image:\n  env:\n    CLAUDE_CODE_USE_BEDROCK: "1"\n',
+    )
+
+    with pytest.raises(TaskError) as exc:
+        load_task(task_dir)
+
+    assert "CLAUDE_CODE_USE_BEDROCK" in str(exc.value)
+    assert "HYPOTHESIS_STORAGE_DIRECTORY" in str(exc.value)  # names the set
+
+
+def test_an_image_env_that_is_not_a_mapping_is_refused(tmp_path, upstream):
+    """`image: {env: []}` is what an author who started a list and never wrote
+    the keys leaves behind. `or {}` cannot tell it from absent, so it would
+    load as a task declaring no environment -- and a hypothesis suite whose
+    determinism lever silently never applied is a suite that sometimes
+    passes."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream, extra_yaml="image:\n  env: []\n"
+    )
+
+    with pytest.raises(TaskError, match="expected a mapping"):
+        load_task(task_dir)
+
+
+@pytest.mark.parametrize("block", ["image: []", "image: 0", 'image: ""'])
+def test_an_image_section_that_is_not_a_mapping_is_refused_rather_than_defaulted(
+    tmp_path, upstream, block
+):
+    """Measured 2026-09-02: each of these loaded as the default python with
+    EMPTY `apt`, `pip` and `build`, so one stray bracket throws away
+    `build: ["pip install -e ."]` -- imports resolve to site-packages,
+    nothing the agent writes takes effect, and every arm fails identically --
+    and `apt: ["less"]`, whose absence errors 189 unrelated tests in click's
+    pager test. Preflight catches both, so this is hygiene rather than a live
+    hole; the point is that `image:` must not be the one section left
+    reading a written value as an unwritten one.
+
+    Keep the substring `image_section_that_is_not_a_mapping` in this test's
+    name: mutation anchor 3.4 selects on it, and the neighbourhood already
+    holds `test_an_image_env_that_is_not_a_mapping_is_refused`, so a
+    plausible shortening would both over-collect (`-k
+    not_a_mapping_is_refused` takes 5/185) and be selected for the wrong
+    reason -- the long form takes 0/185 today.
+
+    Also pins T1.7 as a NARROWING and not a tightening of the null path, in
+    the same test rather than a separate one: `image: null` is a
+    commented-out block and must keep taking the default base, exactly like
+    an absent `image:` block."""
+    task_dir = _write_task(tmp_path / "set", upstream, extra_yaml=block)
+
+    with pytest.raises(TaskError, match="image must be a mapping"):
+        load_task(task_dir)
+
+    null_task_dir = _write_task(
+        tmp_path / "set-null", upstream, extra_yaml="image: null"
+    )
+    null_task = load_task(null_task_dir)
+    assert null_task.image.build == ()
+    assert null_task.image.apt == ()
+    assert null_task.image.pip == ()
+
+
+def test_the_allowlist_and_the_harness_pinned_keys_are_disjoint():
+    """Checked as a property of the two sets, not of one manifest.
+
+    An allowlist entry naming a key `_eval_env` also sets would be silently
+    overridden on the AGENT's exec while still applying to preflight's and the
+    grader's -- two environments for one task, with nothing in the record
+    saying which. This is what makes adding a careless allowlist entry a red
+    suite rather than a bad eval.
+
+    It does NOT cover the proxy-bypass hole, and the second assertion is what
+    says so. `CLAUDE_CODE_USE_BEDROCK` / `_USE_VERTEX` are pinned by ABSENCE
+    -- `PASSTHROUGH_ENV` keeps them out and `_eval_env` never sets them -- so
+    `pinned_env_keys()` cannot see them and this disjointness holds vacuously
+    for exactly the two keys that matter most. They are named literally
+    instead, because an image `ENV CLAUDE_CODE_USE_BEDROCK=1` would make the
+    CLI ignore `ANTHROPIC_BASE_URL`, bypass the proxy, and leave the mandatory
+    wire log empty with the run still looking normal."""
+    from bakeoff.claude_runner import pinned_env_keys
+
+    assert not (tasks._IMAGE_ENV_ALLOWED & pinned_env_keys())
+    assert not (tasks._IMAGE_ENV_ALLOWED
+                & {"CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"})
+
+
+def test_a_pinned_key_is_refused_even_if_someone_allowlists_it(
+    tmp_path, upstream, monkeypatch
+):
+    """Belt and braces, and the braces are the half that survives a future
+    edit: the allowlist is what an author reads, and this refusal is what
+    catches an entry added to it without reading decision 6."""
+    monkeypatch.setattr(
+        tasks, "_IMAGE_ENV_ALLOWED",
+        tasks._IMAGE_ENV_ALLOWED | {"CLAUDE_CONFIG_DIR"},
+    )
+    task_dir = _write_task(
+        tmp_path / "set", upstream,
+        extra_yaml='image:\n  env:\n    CLAUDE_CONFIG_DIR: "/elsewhere"\n',
+    )
+
+    with pytest.raises(TaskError) as exc:
+        load_task(task_dir)
+
+    assert "the harness sets" in str(exc.value)
+
+
+@pytest.mark.parametrize("literal", [
+    '"/tmp/a\\nb"',        # a newline would end the ENV line early
+    "'/tmp/a\"b'",         # the value is emitted double-quoted
+    "'/tmp/a\\\\b'",       # a backslash continues a Dockerfile line
+    '"$HOME/hyp"',         # Docker EXPANDS this against the build environment
+])
+def test_a_value_that_would_not_survive_a_dockerfile_line_is_refused(
+    tmp_path, upstream, literal
+):
+    """The `$` case is the one that is not about syntax. Docker expands $VAR
+    in an ENV value against the BUILD environment, so the recorded value would
+    be a property of the builder rather than of the manifest -- the same
+    argument that refuses pathspec magic in strip_paths.
+
+    Written as YAML literals rather than Python strings because the loader
+    reads YAML: `"a\\nb"` in double quotes is a real newline to the parser,
+    which is the shape that has to be refused."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream,
+        extra_yaml=(
+            f"image:\n  env:\n    HYPOTHESIS_STORAGE_DIRECTORY: {literal}\n"
+        ),
+    )
+
+    with pytest.raises(TaskError):
+        load_task(task_dir)
+
+
+@pytest.mark.parametrize("extra_yaml", [
+    "image:\n  env:\n    CI: 1\n",      # a YAML int, not a string
+    'image:\n  env:\n    CI: ""\n',     # a string, but empty
+])
+def test_a_non_string_or_empty_env_value_is_refused(
+    tmp_path, upstream, extra_yaml
+):
+    """The fourth `_env_map` refusal has no coverage elsewhere: a YAML scalar
+    that is not a string (`CI: 1` parses as an int) and a value that is a
+    string but empty (`CI: ""`) both fail `isinstance(raw_value, str) and
+    raw_value` and must be refused before the char-level checks above ever
+    run."""
+    task_dir = _write_task(tmp_path / "set", upstream, extra_yaml=extra_yaml)
+
+    with pytest.raises(TaskError) as exc:
+        load_task(task_dir)
+
+    assert "non-empty string" in str(exc.value)
+
+
+@pytest.mark.parametrize("value", ["relative/path", "/repo", "/repo/.hyp"])
+def test_a_storage_directory_inside_the_repo_is_refused(
+    tmp_path, upstream, value
+):
+    """The key exists to keep hypothesis's writes out of the tree the §5.6
+    submission diff is taken against. Pointed back into /repo it undoes
+    exactly that, and what lands in the tree becomes a property of a string an
+    author typed."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream,
+        extra_yaml=(
+            f'image:\n  env:\n    HYPOTHESIS_STORAGE_DIRECTORY: "{value}"\n'
+        ),
+    )
+
+    with pytest.raises(TaskError) as exc:
+        load_task(task_dir)
+
+    assert "/repo" in str(exc.value)
+
+
+@pytest.mark.parametrize("value", ["America/New_York", "UTC", "Etc/GMT+5"])
+def test_a_well_shaped_tz_value_loads(tmp_path, upstream, value):
+    """The allowlist admits TZ so a suite that pins a zone -- date/time
+    libraries do this routinely, e.g. moment/luxon asserting against
+    America/New_York -- is a task rather than a rejection. An IANA name, UTC,
+    and an Etc/GMT+N form must all load unchanged."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream,
+        extra_yaml=f'image:\n  env:\n    TZ: "{value}"\n',
+    )
+
+    assert load_task(task_dir).image.env == {"TZ": value}
+
+
+@pytest.mark.parametrize("value", [":/etc/localtime", ":America/New_York"])
+def test_a_leading_colon_tz_value_is_refused(tmp_path, upstream, value):
+    """A TZ value is consumed by libc's tzset, not by this harness: a value
+    starting with `:` makes glibc read the rest as a FILE PATH rather than a
+    zone name, and the newline/quote/backslash/`$` blacklist every key gets
+    does not catch a bare `:` on its own -- TZ needs a positive allowlist of
+    its own shape on top of it."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream,
+        extra_yaml=f'image:\n  env:\n    TZ: "{value}"\n',
+    )
+
+    with pytest.raises(TaskError) as exc:
+        load_task(task_dir)
+
+    assert "IANA zone" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "value", ["/etc/localtime", "/usr/share/zoneinfo/Asia/Tokyo", "/repo/tzfile"]
+)
+def test_a_leading_slash_tz_value_is_refused(tmp_path, upstream, value):
+    """The colon guard alone does not close this: glibc's `tzset` reads a
+    leading `/` exactly like a leading `:` -- a FILE PATH rather than a zone
+    name -- and `/` is a character `_TZ_VALUE`'s class already allows for
+    `America/New_York` and `Etc/GMT+5`. Measured 2026-09-02 in the eval image
+    (glibc 2.36): `TZ=/usr/share/zoneinfo/Asia/Tokyo` resolves identically to
+    `TZ=:/usr/share/zoneinfo/Asia/Tokyo`, and `TZ=/etc/localtime` resolves
+    too, with no colon anywhere. Without a leading-`/` refusal a manifest
+    could point TZ at a file inside the tree the agent itself edits
+    (`/repo/tzfile`), making the zone a property of the run rather than of
+    the manifest."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream,
+        extra_yaml=f'image:\n  env:\n    TZ: "{value}"\n',
+    )
+
+    with pytest.raises(TaskError) as exc:
+        load_task(task_dir)
+
+    assert "IANA zone" in str(exc.value)
+
+
+def test_the_repo_mount_constant_matches_the_container_it_describes():
+    """tasks.py spells /repo itself rather than importing REPO_MOUNT, because
+    container.py imports `docker` at module level and the loader deliberately
+    does not depend on a daemon. The drift belongs here."""
+    from bakeoff.container import REPO_MOUNT
+
+    assert tasks._REPO_MOUNT == REPO_MOUNT
+
+
+# --- image.python -------------------------------------------------------------
+
+
+def test_image_python_defaults_to_the_base_images_version(tmp_path, upstream):
+    """Every manifest written before this key existed must load unchanged, and
+    the default has to be the version the base Dockerfile's own ARG default
+    builds -- two defaults that can drift is one manifest loading as a task
+    whose image nobody built."""
+    task_dir = _write_task(tmp_path / "set", upstream)  # no image: block
+
+    assert load_task(task_dir).image.python == "3.12"
+
+
+def test_the_default_is_itself_an_allowlisted_version():
+    """`_python_version` returns the default BEFORE the allowlist check, so a
+    default outside the set is the one value that reaches a build ungated --
+    every manifest that declares nothing, which is all of them today."""
+    assert tasks._DEFAULT_PYTHON in tasks._PYTHON_VERSIONS
+
+
+def test_the_node_default_is_itself_an_allowlisted_version():
+    """The same relationship one key over, and the same hole: `_node_version`
+    returns `_DEFAULT_NODE` before consulting the set, so a default outside it
+    reaches a build ungated -- from every node manifest that declares
+    nothing."""
+    assert tasks._DEFAULT_NODE in tasks._NODE_VERSIONS
+
+
+def test_an_allowlisted_version_is_carried_verbatim(tmp_path, upstream):
+    task_dir = _write_task(
+        tmp_path / "set", upstream, extra_yaml='image:\n  python: "3.11"\n'
+    )
+
+    assert load_task(task_dir).image.python == "3.11"
+
+
+def test_a_version_nobody_built_is_refused_at_load_time(tmp_path, upstream):
+    """Measured 2026-09-01: `--build-arg BASE_PYTHON_VERSION=3.99` fails with
+    `failed to resolve reference "docker.io/library/python:3.99-slim-bookworm"
+    ... not found` -- a registry round-trip, mid-build, on a machine that may
+    be offline. The allowlist turns that into a message naming the manifest."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream, extra_yaml='image:\n  python: "3.99"\n'
+    )
+
+    with pytest.raises(TaskError) as excinfo:
+        load_task(task_dir)
+
+    assert "3.99" in str(excinfo.value)
+    assert "3.12" in str(excinfo.value)  # the allowlist is in the message
+
+
+def test_a_floating_major_version_is_refused(tmp_path, upstream):
+    """`python:3-slim-bookworm` resolves and is republished, so two collections
+    months apart run different interpreters under one manifest and no record
+    says so. Same defect `image.pip`'s "pinned, not floored" rule prevents."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream, extra_yaml='image:\n  python: "3"\n'
+    )
+
+    with pytest.raises(TaskError):
+        load_task(task_dir)
+
+
+def test_an_unquoted_version_is_refused_rather_than_coerced(tmp_path, upstream):
+    """YAML parses bare `3.11` as a float and bare `3.10` as `3.1`. Coercing
+    with str() would turn the second into a version nobody named; the refusal
+    names the quotes."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream, extra_yaml="image:\n  python: 3.11\n"
+    )
+
+    with pytest.raises(TaskError) as excinfo:
+        load_task(task_dir)
+
+    assert "quote" in str(excinfo.value).lower()
+
+
+def test_the_worked_example_task_still_loads_on_the_default(tmp_path):
+    """Backwards compatibility, stated over the real manifest rather than a
+    fixture: click declares no `python:` and must keep the base it has."""
+    task = load_task(
+        Path(__file__).resolve().parent.parent
+        / "taskset" / "click-3360-write-usage-empty-args"
+    )
+
+    assert task.image.python == "3.12"
+
+
+def test_declaring_a_python_version_moves_the_digest_but_not_the_start_state(
+    tmp_path, upstream
+):
+    """`manifest_digest` hashes the manifest BYTES, so the key participates
+    with no term of its own and every preflight and oracle cache keyed on it
+    invalidates. `start_sha` must NOT move: the key takes no part in the setup
+    commit, and a task whose start state moved is a different task."""
+    plain = load_task(_write_task(tmp_path / "a", upstream))
+    pinned = load_task(
+        _write_task(tmp_path / "b", upstream,
+                    extra_yaml='image:\n  python: "3.11"\n')
+    )
+
+    assert pinned.manifest_digest != plain.manifest_digest
+    assert materialize(pinned, tmp_path / "tb" / "repo", tmp_path / "cb") == \
+        materialize(plain, tmp_path / "ta" / "repo", tmp_path / "ca")
+
+
+# --- relative submodule urls -------------------------------------------------
+#
+# Every test here calls `tasks._resolve_submodule_url` with plain strings --
+# no fixture, no repository. The 33-row measurement table (table R) these
+# tests transcribe lives in
+# docs/superpowers/plans/2026-09-03-round2-16-relative-submodule-urls.md.
+
+
+def test_a_parent_relative_url_resolves_against_repo_url():
+    """row A."""
+    assert tasks._resolve_submodule_url(
+        "https://github.com/org/super.git", "../sub.git",
+        task_id="t", path="vendor/sub",
+    ) == "https://github.com/org/sub.git"
+
+
+def test_the_superprojects_last_segment_is_popped_whole_and_no_git_suffix_is_stripped():
+    """rows A + B: git does not "strip a trailing .git" -- it pops a whole
+    `/`-separated segment per `../`, and `.git` is simply part of the segment
+    that goes. Nothing is appended either: `../sub` keeps `sub` with no
+    `.git`."""
+    assert tasks._resolve_submodule_url(
+        "https://github.com/org/super.git", "../sub.git",
+        task_id="t", path="p",
+    ) == "https://github.com/org/sub.git"
+    assert tasks._resolve_submodule_url(
+        "https://github.com/org/super.git", "../sub",
+        task_id="t", path="p",
+    ) == "https://github.com/org/sub"
+
+
+def test_a_repo_url_with_no_git_suffix_resolves_identically():
+    """row D."""
+    assert tasks._resolve_submodule_url(
+        "https://github.com/org/super", "../sub.git",
+        task_id="t", path="p",
+    ) == "https://github.com/org/sub.git"
+
+
+def test_a_trailing_slash_on_repo_url_is_absorbed():
+    """rows E and X give the same answer as A, with or without `.git`."""
+    assert tasks._resolve_submodule_url(
+        "https://github.com/org/super/", "../sub.git", task_id="t", path="p",
+    ) == "https://github.com/org/sub.git"
+    assert tasks._resolve_submodule_url(
+        "https://github.com/org/super.git/", "../sub.git",
+        task_id="t", path="p",
+    ) == "https://github.com/org/sub.git"
+
+
+def test_a_dot_slash_url_appends_to_the_whole_base():
+    """row C: `./` appends to the WHOLE base, `super.git` included, and pops
+    nothing. Row Y is the same shape with a trailing slash on the relative
+    url and is refused by test 24, not accepted here."""
+    assert tasks._resolve_submodule_url(
+        "https://github.com/org/super.git", "./sub.git",
+        task_id="t", path="p",
+    ) == "https://github.com/org/super.git/sub.git"
+
+
+def test_a_two_level_climb_empties_the_path_without_refusing():
+    """row F: the boundary case for the pre-pop guard -- two pops from two
+    segments is legal."""
+    assert tasks._resolve_submodule_url(
+        "https://github.com/org/super.git", "../../other/sub.git",
+        task_id="t", path="p",
+    ) == "https://github.com/other/sub.git"
+
+
+def test_each_climb_pops_exactly_one_segment():
+    """row P."""
+    assert tasks._resolve_submodule_url(
+        "https://github.com/org/super.git", "../../org2/sub.git",
+        task_id="t", path="p",
+    ) == "https://github.com/org2/sub.git"
+
+
+def test_userinfo_in_repo_url_survives():
+    """row N: a port and a userinfo live in the authority and are carried
+    through -- the resolver's colon refusal is on the REMAINDER only."""
+    assert tasks._resolve_submodule_url(
+        "https://user@github.com/org/super.git", "../sub.git",
+        task_id="t", path="p",
+    ) == "https://user@github.com/org/sub.git"
+
+
+def test_the_resolution_is_case_preserving():
+    """row U."""
+    assert tasks._resolve_submodule_url(
+        "https://github.com/org/super.git", "../SUB.git",
+        task_id="t", path="p",
+    ) == "https://github.com/org/SUB.git"
+
+
+def test_an_absolute_url_is_returned_unchanged():
+    assert tasks._resolve_submodule_url(
+        "https://github.com/org/super.git", "https://github.com/x/y.git",
+        task_id="t", path="p",
+    ) == "https://github.com/x/y.git"
+    assert tasks._resolve_submodule_url(
+        "https://github.com/org/super.git", "",
+        task_id="t", path="p",
+    ) == ""
+
+
+def test_a_bare_dot_dot_is_not_a_relative_url():
+    """row T: git's trigger is the two-string prefix set `("./", "../")`, and
+    a bare `..` matches neither, so it is stored verbatim -- no raise."""
+    assert tasks._resolve_submodule_url(
+        "https://github.com/org/super.git", "..",
+        task_id="t", path="p",
+    ) == ".."
+
+
+def test_an_absolute_local_path_base_resolves_by_the_same_arithmetic():
+    """The fixture branch: an absolute local path stands in for a url under
+    the test fixtures' `_SUBMODULE_URL_PREFIX` relaxation, and resolves by
+    the same segment arithmetic git uses against a real url."""
+    assert tasks._resolve_submodule_url(
+        "/tmp/a/super", "../lib", task_id="t", path="p",
+    ) == "/tmp/a/lib"
+
+
+def test_a_climb_past_the_host_is_refused():
+    """row G: three pops from two segments is where git starts eating the
+    host and hands back `https://sub.git` -- a url naming a host that does
+    not exist, at exit 0. This resolver refuses instead."""
+    with pytest.raises(TaskError, match="climbs above the path of repo.url"):
+        tasks._resolve_submodule_url(
+            "https://github.com/org/super.git", "../../../sub.git",
+            task_id="t", path="p",
+        )
+
+
+def test_a_climb_past_the_scheme_is_refused():
+    """row H: one more `../` than G, refused at the same guard."""
+    with pytest.raises(TaskError, match="climbs above the path of repo.url"):
+        tasks._resolve_submodule_url(
+            "https://github.com/org/super.git", "../../../../sub.git",
+            task_id="t", path="p",
+        )
+
+
+def test_a_repo_url_with_no_path_is_refused():
+    """row N1's shape, and its trailing-slash sibling: git pops the HOST in
+    that case, at exit 0. Both are refused with the same message."""
+    for repo_url in ("https://github.com", "https://github.com/"):
+        with pytest.raises(TaskError, match="no path to resolve against"):
+            tasks._resolve_submodule_url(
+                repo_url, "../sub.git", task_id="t", path="p",
+            )
+
+
+def test_a_repo_url_with_a_query_is_refused():
+    """row K: git silently discards the query when the `../` chain pops the
+    segment holding it."""
+    with pytest.raises(TaskError, match="carries a query"):
+        tasks._resolve_submodule_url(
+            "https://github.com/org/super.git?x=1", "../sub.git",
+            task_id="t", path="p",
+        )
+
+
+def test_a_repo_url_with_a_fragment_is_refused():
+    """row L."""
+    with pytest.raises(TaskError, match="carries a fragment"):
+        tasks._resolve_submodule_url(
+            "https://github.com/org/super.git#frag", "../sub.git",
+            task_id="t", path="p",
+        )
+
+
+def test_an_scp_style_repo_url_is_refused():
+    """row M: an scp-style repo.url has no `://` and is not absolute, so the
+    resolver refuses it itself -- one measured deviation from the plan's
+    first draft, which filed this as "refused one check later" for its
+    scheme; it never reaches that check."""
+    with pytest.raises(
+        TaskError,
+        match=r"neither a `scheme://` url nor an absolute path",
+    ):
+        tasks._resolve_submodule_url(
+            "git@example.invalid:org/super.git", "../sub.git",
+            task_id="t", path="p",
+        )
+
+
+def test_a_relative_repo_url_is_refused():
+    """The same refusal for a bare relative repo.url."""
+    with pytest.raises(
+        TaskError,
+        match=r"neither a `scheme://` url nor an absolute path",
+    ):
+        tasks._resolve_submodule_url(
+            "org/super.git", "../sub.git", task_id="t", path="p",
+        )
+
+
+def test_a_repo_url_with_an_empty_path_segment_is_refused():
+    with pytest.raises(TaskError, match="empty path segment"):
+        tasks._resolve_submodule_url(
+            "https://github.com/org//super.git", "../sub.git",
+            task_id="t", path="p",
+        )
+
+
+def test_an_interior_dot_or_dot_dot_component_is_refused():
+    """row I (`../a/../b.git`) and row DOTA (`../a/./b.git`, measured to pass
+    through git verbatim as `.../org/a/./b.git`): normalising either would
+    make the eval clone something git does not, which is the opposite of the
+    design's claim."""
+    with pytest.raises(TaskError, match="empty or dot path component"):
+        tasks._resolve_submodule_url(
+            "https://github.com/org/super.git", "../a/../b.git",
+            task_id="t", path="p",
+        )
+    with pytest.raises(TaskError, match="empty or dot path component"):
+        tasks._resolve_submodule_url(
+            "https://github.com/org/super.git", "../a/./b.git",
+            task_id="t", path="p",
+        )
+
+
+def test_an_empty_component_in_the_relative_url_is_refused():
+    """row R."""
+    with pytest.raises(TaskError, match="empty or dot path component"):
+        tasks._resolve_submodule_url(
+            "https://github.com/org/super.git", "..//sub.git",
+            task_id="t", path="p",
+        )
+
+
+def test_a_relative_url_that_resolves_to_a_directory_is_refused():
+    """rows S and V: those shapes name a directory, not a repository."""
+    with pytest.raises(TaskError, match="resolves to a directory"):
+        tasks._resolve_submodule_url(
+            "https://github.com/org/super.git", "../",
+            task_id="t", path="p",
+        )
+    with pytest.raises(TaskError, match="resolves to a directory"):
+        tasks._resolve_submodule_url(
+            "https://github.com/org/sub.git", "./",
+            task_id="t", path="p",
+        )
+
+
+def test_a_trailing_slash_on_the_relative_url_is_refused():
+    """rows O, O2 and Y: empty and trailing-slash remainders are
+    inconsistent even in git (O consumes one trailing slash, O2 keeps the
+    second) -- those shapes name a directory, not a repository, either
+    way."""
+    for declared in ("../sub.git/", "../sub.git//", "./sub.git/"):
+        with pytest.raises(TaskError, match="ends in a slash"):
+            tasks._resolve_submodule_url(
+                "https://github.com/org/super.git", declared,
+                task_id="t", path="p",
+            )
+
+
+def test_a_relative_url_carrying_a_query_or_whitespace_is_refused():
+    for declared in ("../sub.git?x=1", "../sub .git"):
+        with pytest.raises(
+            TaskError,
+            match="query, fragment, backslash, colon or whitespace",
+        ):
+            tasks._resolve_submodule_url(
+                "https://github.com/org/super.git", declared,
+                task_id="t", path="p",
+            )
+
+
+def test_the_refusal_names_the_task_and_the_submodule_path():
+    with pytest.raises(TaskError) as excinfo:
+        tasks._resolve_submodule_url(
+            "https://github.com/org/super.git", "../../../sub.git",
+            task_id="my-task-007", path="vendor/deep/sub",
+        )
+
+    assert "my-task-007" in str(excinfo.value)
+    assert "vendor/deep/sub" in str(excinfo.value)
+
+
+# --- submodules --------------------------------------------------------------
+
+
+def _sub_task(tmp_path, up, **overrides):
+    return load_task(_write_task(tmp_path / "set", up, **overrides))
+
+
+def test_a_repository_with_no_submodules_derives_an_empty_tuple(tmp_path, upstream):
+    task = _sub_task(tmp_path, upstream)
+    mirror = tasks.ensure_mirror(str(upstream["path"]), upstream["base"],
+                                 tmp_path / "cache")
+
+    assert tasks.derive_submodules(task, mirror, tmp_path / "cache") == ()
+
+
+def test_the_gitlink_and_the_gitmodules_blob_are_both_read(tmp_path,
+                                                           upstream_submodule,
+                                                           local_urls):
+    """Path and sha come from `ls-tree`, url from `.gitmodules`, name from the
+    section header -- all four from git's own parsers over NUL-delimited output.
+    """
+    up = upstream_submodule
+    task = _sub_task(tmp_path, up)
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
+
+    (sub,) = tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+    assert sub.path == "vendor/libdep"
+    assert sub.name == "vendor/libdep"
+    assert sub.sha == up["pinned"]
+    assert sub.url_declared == str(up["lib"])
+    # The corpus shape: an already-absolute url resolves to itself.
+    assert sub.url_resolved == sub.url_declared
+
+
+def test_a_gitlink_with_no_gitmodules_url_is_refused(tmp_path,
+                                                     upstream_submodule,
+                                                     local_urls):
+    """The quiet shape: no url, so the directory would simply stay empty and
+    the suite would fail to collect on every arm -- with `git status
+    --porcelain` reporting the tree as clean throughout.
+
+    It `git rm --cached`s `.gitmodules`, so the refusal it actually reaches is
+    the UNREADABLE-BLOB one (measured 2026-09-02: `git config --blob
+    <sha>:.gitmodules --list -z` exits 128), not the per-path
+    gitlink-with-no-stanza one. The neighbouring
+    `test_a_gitlink_whose_only_gitmodules_stanza_names_another_path_is_refused`
+    covers that second shape. Both stay refused for a submodule the manifest
+    does NOT declare unneeded.
+    """
+    up = upstream_submodule
+    _sh("git", "rm", "-q", "--cached", ".gitmodules", cwd=up["path"])
+    _sh("git", "-c", "user.email=t@t.test", "-c", "user.name=t",
+        "commit", "-q", "-m", "drop .gitmodules", cwd=up["path"])
+    base = _sh("git", "rev-parse", "HEAD", cwd=up["path"])
+    task = _sub_task(tmp_path, {**up, "base": base})
+    mirror = tasks.ensure_mirror(str(up["path"]), base, tmp_path / "cache")
+
+    with pytest.raises(TaskError, match="vendor/libdep"):
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+
+def test_a_gitmodules_stanza_with_a_path_and_no_url_is_refused(
+        tmp_path, upstream_submodule):
+    """A THIRD shape, between the two neighbouring tests: `.gitmodules` is
+    readable and the stanza names this exact path, so both the set difference
+    and the "no readable .gitmodules" refusal are satisfied and neither fires.
+    What is missing is the url alone, which leaves `Submodule.url_declared`
+    an empty string -- and an empty string is not a url, it is a stanza
+    someone hand-edited or a `git submodule add` that never finished.
+
+    Deliberately WITHOUT the `local_urls` fixture. That fixture empties
+    `_SUBMODULE_URL_PREFIX` so `startswith` is vacuously true, and `""` starts
+    with `""` -- so under it this refusal cannot fire at all, and a test that
+    used it would pass with the check deleted.
+    """
+    up = upstream_submodule
+    (up["path"] / ".gitmodules").write_text(
+        '[submodule "vendor/libdep"]\n\tpath = vendor/libdep\n'
+    )
+    _sh("git", "add", ".gitmodules", cwd=up["path"])
+    _sh("git", "-c", "user.email=t@t.test", "-c", "user.name=t",
+        "commit", "-q", "-m", "drop the url", cwd=up["path"])
+    base = _sh("git", "rev-parse", "HEAD", cwd=up["path"])
+    task = _sub_task(tmp_path, {**up, "base": base})
+    mirror = tasks.ensure_mirror(str(up["path"]), base, tmp_path / "cache")
+
+    with pytest.raises(TaskError, match="declares no url") as excinfo:
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+    # `no url`, never `url ''`: an empty value reads as a url that is present
+    # and strange rather than one that was never written.
+    assert "vendor/libdep" in str(excinfo.value)
+
+
+def test_a_gitmodules_entry_with_no_gitlink_is_NOT_refused(tmp_path,
+                                                           upstream_submodule,
+                                                           local_urls):
+    """The other direction is inert, and refusing it would refuse a working
+    task. Measured 2026-09-01, git 2.50.1: git drives everything off the
+    index, so an orphaned stanza is not listed by `git submodule status`, is
+    not fetched by `update --init` (exit 0), creates no directory and leaves
+    the tree clean. The shape is real -- a submodule `git rm --cached`'d with
+    its .gitmodules stanza left behind. Preflight records the name as
+    `submodules_orphaned` instead.
+    """
+    up = upstream_submodule
+    gitmodules = up["path"] / ".gitmodules"
+    gitmodules.write_text(
+        gitmodules.read_text()
+        + '\n[submodule "vendor/gone"]\n\tpath = vendor/gone\n'
+        '\turl = https://example.invalid/gone.git\n'
+    )
+    _sh("git", "add", ".gitmodules", cwd=up["path"])
+    _sh("git", "-c", "user.email=t@t.test", "-c", "user.name=t",
+        "commit", "-q", "-m", "orphan stanza", cwd=up["path"])
+    base = _sh("git", "rev-parse", "HEAD", cwd=up["path"])
+    task = _sub_task(tmp_path, {**up, "base": base})
+    mirror = tasks.ensure_mirror(str(up["path"]), base, tmp_path / "cache")
+
+    assert [s.path for s in tasks.derive_submodules(task, mirror, tmp_path / "cache")] \
+        == ["vendor/libdep"]
+
+
+def test_a_non_https_submodule_url_is_refused(tmp_path, upstream_submodule):
+    """The fixture's own url is a local path, which is exactly the shape that
+    must be refused in production -- so this test needs no extra setup, while
+    every OTHER test in this section relaxes the constant (see `local_urls`).
+    """
+    up = upstream_submodule
+    task = _sub_task(tmp_path, up)
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
+
+    with pytest.raises(TaskError, match="https://"):
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+
+def test_a_strip_path_covering_a_submodule_is_refused(tmp_path,
+                                                      upstream_submodule,
+                                                      local_urls):
+    up = upstream_submodule
+    task = _sub_task(tmp_path, up, extra_yaml='strip_paths: ["vendor/libdep"]')
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
+
+    with pytest.raises(TaskError, match="strip_paths"):
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+
+def test_a_strip_path_covering_a_submodule_from_above_is_refused(
+        tmp_path, upstream_submodule, local_urls):
+    """The ANCESTOR direction, which the neighbour above cannot cover.
+
+    `strip_paths: ["vendor"]` with the gitlink at `vendor/libdep` is not AT or
+    UNDER the submodule, it CONTAINS it, so the descendant test stays green
+    with this half of the refusal deleted. Measured 2026-09-01: accepted, the
+    strip's `git rm -r` removes the gitlink, `git submodule update --init`
+    then writes nothing, and the next command in `_init_submodules` runs with
+    `cwd=<dest>/vendor/libdep` -- a bare `FileNotFoundError` out of
+    `subprocess.run`, with no task_id in it, hours into a matrix, wearing the
+    costume of a harness crash rather than a manifest the loader could have
+    refused in milliseconds.
+    """
+    up = upstream_submodule
+    task = _sub_task(tmp_path, up, extra_yaml='strip_paths: ["vendor"]')
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
+
+    with pytest.raises(TaskError, match="above or below") as excinfo:
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+    assert "vendor/libdep" in str(excinfo.value)
+
+
+def test_a_reference_diff_touching_a_submodule_path_is_refused(
+        tmp_path, upstream_submodule, local_urls):
+    """Measured 2026-09-01: `git apply` WITHOUT `--index` applies such a patch
+    exit 0 and edits submodule content, which is how preflight's green-after
+    check would pass on a fix no submission diff can ever contain.
+    """
+    up = upstream_submodule
+    reference = up["reference"] + (
+        "diff --git a/vendor/libdep/libdep/__init__.py"
+        " b/vendor/libdep/libdep/__init__.py\n"
+        "--- a/vendor/libdep/libdep/__init__.py\n"
+        "+++ b/vendor/libdep/libdep/__init__.py\n"
+        "@@ -1 +1 @@\n"
+        "-VALUE = 1\n"
+        "+VALUE = 2\n"
+    )
+    task = _sub_task(tmp_path, {**up, "reference": reference})
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
+
+    with pytest.raises(TaskError, match="reference diff"):
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+
+def test_a_gitlink_whose_only_gitmodules_stanza_names_another_path_is_refused(
+        tmp_path, upstream_submodule, local_urls):
+    """The set difference, with a READABLE `.gitmodules` on the other side.
+
+    The neighbouring refusal covers "no .gitmodules at all"; this one covers
+    the shape that actually happens -- a stanza edited to a path the tree does
+    not carry, leaving the real gitlink with nothing to fetch from while every
+    other check still passes. Both directions are exercised at once: the
+    orphaned name is inert (it is not what the message names) and the
+    url-less gitlink is fatal.
+    """
+    up = upstream_submodule
+    (up["path"] / ".gitmodules").write_text(
+        '[submodule "vendor/gone"]\n\tpath = vendor/gone\n'
+        '\turl = https://example.invalid/gone.git\n'
+    )
+    _sh("git", "add", ".gitmodules", cwd=up["path"])
+    _sh("git", "-c", "user.email=t@t.test", "-c", "user.name=t",
+        "commit", "-q", "-m", "point the only stanza elsewhere", cwd=up["path"])
+    base = _sh("git", "rev-parse", "HEAD", cwd=up["path"])
+    task = _sub_task(tmp_path, {**up, "base": base})
+    mirror = tasks.ensure_mirror(str(up["path"]), base, tmp_path / "cache")
+
+    with pytest.raises(TaskError, match="no .gitmodules url") as excinfo:
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
+    assert "vendor/libdep" in str(excinfo.value)
+    assert "vendor/gone" not in str(excinfo.value)
+
+
+def _materialize_sub(tmp_path, up, **overrides):
+    """Materialize a submodule task. Requires the `local_urls` fixture."""
+    task = _sub_task(tmp_path, up, **overrides)
+    start = materialize(task, tmp_path / "run", tmp_path / "cache")
+    return task, tmp_path / "run", start
+
+
+def test_materialize_populates_the_submodule_at_the_gitlink(
+        tmp_path, upstream_submodule, local_urls):
+    up = upstream_submodule
+    _, run, _ = _materialize_sub(tmp_path, up)
+
+    assert (run / "vendor" / "libdep" / "libdep" / "__init__.py").read_text() \
+        == SUB_LIB
+    assert _sh("git", "-C", "vendor/libdep", "rev-parse", "HEAD", cwd=run) \
+        == up["pinned"]
+
+
+def test_the_run_trees_submodule_cannot_reach_the_future(
+        tmp_path, upstream_submodule, local_urls):
+    """The leak argument one level down. Measured 2026-09-01: `git submodule
+    update --init` against the REAL url clones the whole submodule history,
+    so without the pruned mirror `git -C vendor/libdep log main` hands the
+    agent content newer than the pin -- differentially, since only an arm
+    that looks collects it.
+    """
+    up = upstream_submodule
+    _, run, _ = _materialize_sub(tmp_path, up)
+    sub = run / "vendor" / "libdep"
+
+    found = subprocess.run(["git", "cat-file", "-e", up["future"]],
+                           cwd=sub, capture_output=True)
+
+    assert found.returncode != 0
+
+
+def test_initialising_a_submodule_does_not_move_start_sha(
+        tmp_path, upstream_submodule, local_urls):
+    """`materialize` initialises AFTER `start_sha` is settled, so the pin is a
+    property of the ordering rather than of `git add -A` happening not to
+    stage a gitlink.
+    """
+    up = upstream_submodule
+    task, run, start = _materialize_sub(tmp_path, up)
+    head_tree = _sh("git", "rev-parse", "HEAD^{tree}", cwd=run)
+
+    assert start == _sh("git", "rev-parse", "HEAD", cwd=run)
+    assert head_tree == _sh("git", "rev-parse", f"{start}^{{tree}}", cwd=run)
+
+
+def test_the_materialized_tree_is_clean_after_initialisation(
+        tmp_path, upstream_submodule, local_urls):
+    """The leading SPACE is the whole assertion. Measured: `-` is
+    uninitialised (and is what a transient `-c submodule.<n>.url=` leaves
+    behind), `+` is initialised at the wrong commit, and a space is the one
+    acceptable state. Preflight gates on the same character in Task 4.
+    """
+    up = upstream_submodule
+    _, run, _ = _materialize_sub(tmp_path, up)
+    # NOT `_sh`, which strips -- and the leading space is the whole assertion,
+    # so a stripped read cannot tell the acceptable state from the two
+    # unacceptable ones.
+    status = subprocess.run(["git", "submodule", "status"], cwd=run,
+                            check=True, capture_output=True, text=True).stdout
+
+    assert _sh("git", "status", "--porcelain", cwd=run) == ""
+    assert status.startswith(f" {up['pinned']}")
+
+
+def _fake_run(monkeypatch, predicate, returncode=1, stderr="boom"):
+    """Make `tasks`' own `subprocess.run` fail (or no-op) for ONE git call.
+
+    `predicate(argv, cwd)` selects it. Everything else, including this file's
+    `_sh` helper, delegates to the real `subprocess.run`.
+
+    Patching `subprocess.run` rather than `tasks._git` is what makes the
+    asserted message OBSERVED: `_git`'s `check=True` branch is what formats
+    `git <argv> failed (exit N): <stderr>`, and a fake that replaced `_git`
+    would never reach it.
+    """
+    real_run = subprocess.run
+
+    def run(*popenargs, **kwargs):
+        argv = popenargs[0]
+        if predicate(list(argv), str(kwargs.get("cwd"))):
+            return subprocess.CompletedProcess(list(argv), returncode,
+                                               "", stderr)
+        return real_run(*popenargs, **kwargs)
+
+    monkeypatch.setattr(tasks.subprocess, "run", run)
+
+
+def test_a_submodule_remote_git_did_not_name_origin_is_still_removed(
+        tmp_path, upstream_submodule, local_urls, monkeypatch):
+    """Red before Task 2/3 lands. Measured 2026-09-02, git 2.50.1: a clone
+    always gets a remote, and the only way it is not called `origin` is an
+    operator's `clone.defaultRemoteName`, in which case `remote remove
+    origin` exits 2 and the old `check=False` swallowed it -- leaking
+    `.git/modules/vendor/libdep/config` and `.git/config`, with
+    materialization reporting success.
+    """
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "clone.defaultRemoteName")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "upstream")
+    up = upstream_submodule
+
+    assert _sh("git", "config", "--get", "clone.defaultRemoteName",
+               cwd=tmp_path) == "upstream"
+    _, run, _ = _materialize_sub(tmp_path, up)
+
+    assert _sh("git", "-C", "vendor/libdep", "remote", cwd=run) == ""
+    assert _sh("git", "remote", cwd=run) == ""
+    needle = str(tmp_path / "cache").encode()
+    leaking = [
+        path for path in (run / ".git").rglob("*")
+        if path.is_file() and not path.is_symlink()
+        and needle in path.read_bytes()
+    ]
+    assert leaking == []
+
+
+def test_a_failed_submodule_remote_listing_is_a_task_error(
+        tmp_path, upstream_submodule, local_urls, monkeypatch):
+    """Pins `check=True` on the LISTING. Its absence would let the D1
+    silence back in: at `check=False` a failed listing returns `""`,
+    byte-identical to a repository with no remotes, so the loop below it
+    would iterate zero times and materialization would simply succeed.
+    """
+    up = upstream_submodule
+    _fake_run(
+        monkeypatch,
+        lambda argv, cwd: argv == ["git", "remote"]
+        and cwd == str(tmp_path / "run" / "vendor" / "libdep"),
+    )
+
+    with pytest.raises(TaskError, match=r"git remote failed \(exit 1\): boom"):
+        _materialize_sub(tmp_path, up)
+
+
+def test_a_failed_submodule_remote_removal_is_a_task_error(
+        tmp_path, upstream_submodule, local_urls, monkeypatch):
+    up = upstream_submodule
+    _fake_run(
+        monkeypatch,
+        lambda argv, cwd: argv[:3] == ["git", "remote", "remove"]
+        and cwd == str(tmp_path / "run" / "vendor" / "libdep"),
+    )
+
+    with pytest.raises(
+        TaskError, match=r"git remote remove \S+ failed \(exit 1\): boom"
+    ):
+        _materialize_sub(tmp_path, up)
+
+
+def test_a_failed_submodule_reflog_expire_is_a_task_error(
+        tmp_path, upstream_submodule, local_urls, monkeypatch):
+    """The predicate is positive and exact, never `cwd != dest`. Measured:
+    `reflog expire` runs THREE times under one `materialize` --
+    `_build_pruned_mirror` runs it for the superproject's mirror and again
+    for the submodule's, both `cwd=<cache>/repos/prune-...tmp`, both
+    `check=False` -- so `cwd != dest` would intercept all three and this
+    test would be green for a reason it does not state.
+    """
+    up = upstream_submodule
+    _fake_run(
+        monkeypatch,
+        lambda argv, cwd: argv[:2] == ["git", "reflog"]
+        and cwd == str(tmp_path / "run" / "vendor" / "libdep"),
+    )
+
+    with pytest.raises(
+        TaskError,
+        match=r"git reflog expire --expire=now --all failed \(exit 1\): boom",
+    ):
+        _materialize_sub(tmp_path, up)
+
+
+def test_a_failed_superproject_reflog_expire_is_a_task_error(
+        tmp_path, upstream, monkeypatch):
+    """Pins Task 3's tightening, on a task with no submodules."""
+    task = load_task(_write_task(tmp_path / "set", upstream))
+    repo = tmp_path / "run" / "repo"
+    _fake_run(
+        monkeypatch,
+        lambda argv, cwd: argv[:2] == ["git", "reflog"] and cwd == str(repo),
+    )
+
+    with pytest.raises(
+        TaskError,
+        match=r"git reflog expire --expire=now --all failed \(exit 1\): boom",
+    ):
+        materialize(task, repo, tmp_path / "cache")
+
+
+def test_a_host_mirror_path_surviving_in_the_submodules_reflog_is_refused(
+        tmp_path, upstream_submodule, local_urls, monkeypatch):
+    """Exit 0, so `_git`'s own `check=True` cannot fire -- the
+    POST-CONDITION is the thing under test. The `match=` is what separates
+    this failure from the previous test's; both raise `TaskError`.
+    """
+    up = upstream_submodule
+    _fake_run(
+        monkeypatch,
+        lambda argv, cwd: argv[:2] == ["git", "reflog"]
+        and cwd == str(tmp_path / "run" / "vendor" / "libdep"),
+        returncode=0,
+        stderr="",
+    )
+
+    with pytest.raises(
+        TaskError, match=r"\.git/modules/vendor/libdep/logs/HEAD"
+    ):
+        _materialize_sub(tmp_path, up)
+
+
+def test_a_host_mirror_path_surviving_in_the_superprojects_reflog_is_refused(
+        tmp_path, upstream, monkeypatch):
+    """Pins D4: the post-condition is in `materialize`, not inside
+    `_init_submodules`, and it runs for a submodule-free task.
+    """
+    task = load_task(_write_task(tmp_path / "set", upstream))
+    repo = tmp_path / "run" / "repo"
+    _fake_run(
+        monkeypatch,
+        lambda argv, cwd: argv[:2] == ["git", "reflog"] and cwd == str(repo),
+        returncode=0,
+        stderr="",
+    )
+
+    with pytest.raises(TaskError, match=r"\.git/logs/HEAD"):
+        materialize(task, repo, tmp_path / "cache")
+
+
+def test_the_run_tree_carries_no_host_cache_path_anywhere_under_dot_git(
+        tmp_path, upstream_submodule, local_urls):
+    """The WHOLE `.git` subtree, not `.git/modules` and not the config files
+    alone.
+
+    Measured 2026-09-01/02, git 2.50.1: after `remote remove` and the url
+    rewrite the config files are already clean, and the cache path survives in
+    `logs/HEAD` and `logs/refs/heads/main` as `clone: from /…/cache/repos/…`
+    -- a config-only assertion passes with the leak present, which is exactly
+    what the first draft of this test did. Widened further: `.git/logs/*` is
+    the SUPERPROJECT's own leak surface, from the identical cause one level up
+    in `materialize`'s two guards, and a `.git/modules`-only scan cannot see
+    it. The removal clears `logs/refs/remotes/origin/HEAD` and
+    `.git/modules/<n>/config`; the expire clears `logs/HEAD` and
+    `logs/refs/heads/main`; between them nothing survives.
+    """
+    up = upstream_submodule
+    _, run, _ = _materialize_sub(tmp_path, up)
+    cache = str(tmp_path / "cache")
+    needle = cache.encode()
+
+    leaking = [
+        path for path in (run / ".git").rglob("*")
+        if path.is_file() and not path.is_symlink()
+        and needle in path.read_bytes()
+    ]
+
+    assert leaking == []
+    assert cache not in (run / ".git" / "config").read_text()
+    assert str(up["lib"]) in (run / ".git" / "config").read_text()
+
+    # NOT vacuous, and the two files need DIFFERENT assertions. Measured
+    # 2026-09-02, git 2.50.1: `reflog expire` TRUNCATES rather than unlinks,
+    # so the submodule's `logs/HEAD` -- whose expire is the last write to it
+    # -- is present at 0 bytes. The superproject's is NOT: `materialize`'s
+    # expire runs before the setup commit, and that commit appends 160 bytes
+    # ("commit: bakeoff: task setup (test oracle)"). So the superproject file
+    # is asserted present, NON-EMPTY and needle-free, which is strictly
+    # stronger non-vacuity than a size of zero.
+    sub_head = run / ".git" / "modules" / "vendor" / "libdep" / "logs" / "HEAD"
+    assert sub_head.is_file() and sub_head.stat().st_size == 0
+
+    super_head = run / ".git" / "logs" / "HEAD"
+    assert super_head.is_file() and super_head.stat().st_size > 0
+    assert cache not in super_head.read_text()
+
+
+def test_an_alternates_file_under_a_submodule_is_refused(
+        tmp_path, upstream_submodule, local_urls):
+    """Not covered by the two reflog-refusal tests above: `materialize`'s
+    dedicated alternates check is `dest/.git/objects/info/alternates` only
+    and runs BEFORE `_init_submodules`, so the submodule's own copy is
+    checked by nothing else, and a later narrowing of the walk to skip
+    `objects/` would leave every other test in this set green.
+    """
+    up = upstream_submodule
+    _, run, _ = _materialize_sub(tmp_path, up)
+
+    alternates = (run / ".git" / "modules" / "vendor" / "libdep"
+                  / "objects" / "info" / "alternates")
+    alternates.parent.mkdir(parents=True, exist_ok=True)
+    alternates.write_text(f"{tmp_path / 'cache' / 'repos' / 'x.git'}/objects\n")
+
+    with pytest.raises(TaskError, match=r"objects/info/alternates"):
+        tasks._refuse_host_mirror_path(run, tmp_path / "cache", "t-001")
+
+
+def test_a_directory_under_dot_git_that_cannot_be_listed_is_refused(
+        tmp_path, upstream_submodule, local_urls):
+    """The anchor for the `os.walk(..., onerror=)` decision. Measured:
+    `Path.rglob` returns the mode-000 directory and nothing inside it, with
+    no error; `os.walk(..., onerror=)` reports errno 13.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory permissions")
+    up = upstream_submodule
+    _, run, _ = _materialize_sub(tmp_path, up)
+
+    blocked = run / ".git" / "modules" / "vendor" / "libdep" / "logs"
+    mode = blocked.stat().st_mode
+    os.chmod(blocked, 0o000)
+    try:
+        with pytest.raises(TaskError, match=r"could not be listed"):
+            tasks._refuse_host_mirror_path(run, tmp_path / "cache", "t-001")
+    finally:
+        os.chmod(blocked, mode)
+
+
+def test_an_unreachable_submodule_mirror_is_a_task_error(
+        tmp_path, upstream_submodule, local_urls):
+    """Loud, not empty. Measured: `git submodule update --init` exits 1 both
+    when the url does not resolve and when the file transport is refused, and
+    an empty submodule directory leaves `git status --porcelain` clean.
+    """
+    up = upstream_submodule
+    shutil.rmtree(up["lib"])
+
+    with pytest.raises(TaskError):
+        _materialize_sub(tmp_path, up)
+
+
+def test_a_nested_submodule_is_no_longer_refused_and_both_levels_populate(
+        tmp_path, upstream_submodule, local_urls):
+    """The refusal round-2 item 18 LIFTED, on the tree that pinned it.
+
+    Until item 18 this shape raised *"declares submodules of its own"*, because
+    `submodule update --init` does not recurse and the inner directory arrived
+    empty -- and an empty submodule directory leaves `git status --porcelain`
+    clean. It is now populated one level at a time, with `cwd` at the parent's
+    working tree, so both levels arrive. Depth 3 is still refused, by
+    `test_a_submodule_three_levels_deep_is_refused_by_the_depth_cap`.
+
+    Kept beside the `nested_submodule` fixture's own tests rather than folded
+    into them: this tree is built by REPINNING an existing submodule at a
+    commit that already carries a gitlink, which is the shape a real task
+    author meets, and its two traps below are measured.
+
+    Two details this test got wrong once and is now pinned against. The
+    superproject is detached back to `up["base"]` before the gitlink moves, so
+    the new base still carries the pre-fix tree and the reference diff still
+    applies -- otherwise `materialize` raises out of `git apply --index` long
+    before a submodule is touched. And `match=` names the message rather than
+    the word "nested": `pytest.raises(match=...)` searches the whole exception
+    string, this test's own tmp_path contains "nested", and the loose pattern
+    therefore matched that `git apply` failure -- green against a tree with no
+    refusal in it at all.
+    """
+    up = upstream_submodule
+    inner = tmp_path / "inner-repinned"
+    inner.mkdir()
+    (inner / "x.py").write_text("X = 1\n")
+    _sh("git", "init", "-q", cwd=inner)
+    _sh("git", "config", "user.email", "t@t.test", cwd=inner)
+    _sh("git", "config", "user.name", "t", cwd=inner)
+    _sh("git", "add", "-A", cwd=inner)
+    _sh("git", "commit", "-q", "-m", "inner", cwd=inner)
+    _sh("git", "-c", "protocol.file.allow=always", "submodule", "add", "-q",
+        str(inner), "inner", cwd=up["lib"])
+    _sh("git", "commit", "-q", "-m", "nest", cwd=up["lib"])
+    nested = _sh("git", "rev-parse", "HEAD", cwd=up["lib"])
+    _sh("git", "checkout", "-q", "--detach", up["base"], cwd=up["path"])
+    _sh("git", "-c", "protocol.file.allow=always", "-C", "vendor/libdep",
+        "fetch", "-q", "origin", cwd=up["path"])
+    _sh("git", "-C", "vendor/libdep", "checkout", "-q", nested, cwd=up["path"])
+    _sh("git", "add", "-A", cwd=up["path"])
+    _sh("git", "-c", "user.email=t@t.test", "-c", "user.name=t",
+        "commit", "-q", "-m", "repin at the nested commit", cwd=up["path"])
+    base = _sh("git", "rev-parse", "HEAD", cwd=up["path"])
+
+    _, run, _ = _materialize_sub(tmp_path, {**up, "base": base})
+
+    assert (run / "vendor" / "libdep" / "inner" / "x.py").read_text() == "X = 1\n"
+    assert _sh("git", "-C", "vendor/libdep/inner", "rev-parse", "HEAD",
+               cwd=run) == _sh("git", "rev-parse", "HEAD", cwd=inner)
+    assert _sh("git", "status", "--porcelain", cwd=run) == ""
+
+
+def test_a_submodule_the_update_left_unpopulated_is_refused(
+        tmp_path, upstream_submodule, local_urls, monkeypatch):
+    """The post-condition, against a `submodule update` that exits 0 and does
+    nothing -- which is the shape the whole function exists for, because an
+    empty submodule directory leaves `git status --porcelain` clean and reads
+    downstream as a suite that cannot import.
+
+    The EXISTENCE-AND-NON-EMPTY half is what catches it, and that is a
+    correction: this half used to sit last and the sha comparison answered
+    first. It moved above `remote remove`/`reflog expire` because both of
+    those take `dest/sub.path` as their working directory, and
+    `subprocess.run` against a cwd that does not exist raises
+    `FileNotFoundError` -- a bare OSError naming a path, with no task_id, in
+    place of the TaskError this raises.
+
+    The sha comparison did not become redundant, and its own reason is pinned
+    by the neighbour below rather than here. Measured 2026-09-01: `git -C
+    vendor/libdep rev-parse HEAD` inside an EMPTY gitlink directory SUCCEEDS
+    and answers with the SUPERPROJECT's HEAD -- git walks up to the enclosing
+    repository -- so `head.returncode != 0` alone never fires.
+    """
+    up = upstream_submodule
+    real_git = tasks._git
+
+    def a_git_whose_update_does_nothing(*args, **kwargs):
+        if "submodule" in args and "update" in args:
+            return subprocess.CompletedProcess(list(args), 0, "", "")
+        return real_git(*args, **kwargs)
+
+    monkeypatch.setattr(tasks, "_git", a_git_whose_update_does_nothing)
+
+    with pytest.raises(TaskError, match="missing or empty") as excinfo:
+        _materialize_sub(tmp_path, up)
+    assert "vendor/libdep" in str(excinfo.value)
+
+
+def test_a_submodule_left_at_the_wrong_commit_is_refused(
+        tmp_path, upstream_submodule, local_urls, monkeypatch):
+    """What the sha comparison alone can catch, now that the emptiness check
+    runs before it.
+
+    A submodule that is POPULATED but not at its gitlink passes the existence
+    and non-empty guard and passes `rev-parse HEAD` exit 0; only comparing
+    against `sub.sha` says anything is wrong. It is the `+` marker preflight
+    reports one layer down, and it is worse than empty in one respect -- the
+    suite imports SOMETHING, so it collects and then passes or fails for
+    reasons that are not the model's.
+
+    Scripted by moving the submodule's HEAD off the gitlink after the real
+    update has populated it -- an empty commit, so the WORKING TREE is
+    byte-identical to the healthy case and only HEAD differs. That is what
+    makes this the sha comparison's own test: nothing about the directory's
+    contents can distinguish it.
+    """
+    up = upstream_submodule
+    real_git = tasks._git
+
+    def a_git_that_moves_the_submodule_head(*args, **kwargs):
+        result = real_git(*args, **kwargs)
+        if "submodule" in args and "update" in args:
+            real_git("-c", "user.email=t@t.test", "-c", "user.name=t",
+                     "commit", "-q", "--allow-empty", "-m", "drift",
+                     cwd=kwargs["cwd"] / "vendor" / "libdep")
+        return result
+
+    monkeypatch.setattr(tasks, "_git", a_git_that_moves_the_submodule_head)
+
+    with pytest.raises(TaskError, match="not at its gitlink") as excinfo:
+        _materialize_sub(tmp_path, up)
+    assert up["pinned"] in str(excinfo.value)
+
+
+# --- submodules_unneeded ------------------------------------------------------
+#
+# The manifest lever that lets a task be cut from a repository whose base_sha
+# carries a submodule the suite never reads. The key reaches a fixture manifest
+# through `extra_yaml=`, which is the established route for a TOP-LEVEL key
+# (`_manifest` has no keyword for it and must not gain one); a test needing two
+# top-level keys concatenates them with a newline.
+
+
+def _ssh_url_fixture(up):
+    """`upstream_submodule` with the submodule url rewritten to an ssh one.
+
+    The measured defect verbatim: `tobymao/sqlglot` declares
+    `git@github.com:fivetran/sqlglot-integration-tests.git`, which
+    `_refuse_submodule_conflicts` refuses before any container starts.
+
+    Returns a dict UPDATE, not just a sha, because the rewrite lands on top of
+    the fixture's own fix commit: the new base has to carry the BUGGY halves
+    again and a new head has to carry the fixed ones, or the reference diff
+    the manifest ships no longer applies at the base it names.
+    """
+    repo = up["path"]
+
+    def commit(message):
+        _sh("git", "add", "-A", cwd=repo)
+        _sh("git", "-c", "user.email=t@t.test", "-c", "user.name=t",
+            "commit", "-q", "-m", message, cwd=repo)
+        return _sh("git", "rev-parse", "HEAD", cwd=repo)
+
+    (repo / ".gitmodules").write_text(
+        '[submodule "vendor/libdep"]\n'
+        "\tpath = vendor/libdep\n"
+        "\turl = git@example.invalid:x/y.git\n"
+    )
+    (repo / "calc.py").write_text(BUGGY)
+    (repo / "tests" / "test_calc.py").write_text(OLD_TEST)
+    base = commit("an ssh url, back at the buggy state")
+    (repo / "calc.py").write_text(FIXED)
+    (repo / "tests" / "test_calc.py").write_text(NEW_TEST)
+    head = commit("fix")
+    reference = subprocess.run(
+        ["git", "diff", base, head], cwd=repo, check=True,
+        capture_output=True, text=True,
+    ).stdout
+    return {**up, "base": base, "head": head, "reference": reference}
+
+
+def test_a_declared_unneeded_submodule_is_not_refused_for_its_url(
+        tmp_path, upstream_submodule):
+    """The item, in one test.
+
+    Deliberately WITHOUT `local_urls`: that fixture empties
+    `_SUBMODULE_URL_PREFIX`, under which the url refusal cannot fire at all
+    and this test would pass with the exemption deleted.
+    """
+    up = _ssh_url_fixture(upstream_submodule)
+    task = _sub_task(tmp_path, up,
+                     extra_yaml='submodules_unneeded: ["vendor/libdep"]')
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"],
+                                 tmp_path / "cache")
+
+    (sub,) = tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+    assert sub.declared_unneeded is True
+    assert sub.url_declared == "git@example.invalid:x/y.git"
+    # Never resolved: nothing fetches this submodule, so no url has to
+    # exist for it -- a different absence from "" ("declares no url").
+    assert sub.url_resolved is None
+
+
+def test_an_unneeded_declaration_naming_no_gitlink_is_refused(
+        tmp_path, upstream_submodule, local_urls):
+    """A typo declares NOTHING: the submodule it was meant to name is still
+    populated, or still refused for its url, and nothing downstream would say
+    the key did not apply."""
+    up = upstream_submodule
+    task = _sub_task(tmp_path, up,
+                     extra_yaml='submodules_unneeded: ["vendor/typo"]')
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"],
+                                 tmp_path / "cache")
+
+    with pytest.raises(TaskError, match="vendor/typo") as excinfo:
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+    assert "no gitlink" in str(excinfo.value)
+
+
+def test_the_typo_refusal_beats_the_url_refusal(tmp_path, upstream_submodule):
+    """The typo check's POSITION is the message. It runs immediately after the
+    gitlink scan and before anything reads `.gitmodules`, so an author who
+    misspells the path of the very submodule they are exempting is told about
+    the typo rather than about a url they were trying to opt out of."""
+    up = _ssh_url_fixture(upstream_submodule)
+    task = _sub_task(tmp_path, up,
+                     extra_yaml='submodules_unneeded: ["vendor/libdeps"]')
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"],
+                                 tmp_path / "cache")
+
+    with pytest.raises(TaskError) as excinfo:
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+    assert "submodules_unneeded" in str(excinfo.value)
+    assert "git@example.invalid" not in str(excinfo.value)
+
+
+def test_the_typo_refusal_beats_the_unreadable_gitmodules_refusal(
+        tmp_path, upstream_submodule, local_urls):
+    """The other ordering half. Together with the row above this pins the
+    typo check to ONE line rather than to a range: either of the two
+    `.gitmodules`-derived refusals winning means the check moved."""
+    up = upstream_submodule
+    _sh("git", "rm", "-q", "--cached", ".gitmodules", cwd=up["path"])
+    _sh("git", "-c", "user.email=t@t.test", "-c", "user.name=t",
+        "commit", "-q", "-m", "drop .gitmodules", cwd=up["path"])
+    base = _sh("git", "rev-parse", "HEAD", cwd=up["path"])
+    task = _sub_task(tmp_path, {**up, "base": base},
+                     extra_yaml='submodules_unneeded: ["vendor/typo"]')
+    mirror = tasks.ensure_mirror(str(up["path"]), base, tmp_path / "cache")
+
+    with pytest.raises(TaskError) as excinfo:
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+    assert "submodules_unneeded" in str(excinfo.value)
+    assert "no readable .gitmodules" not in str(excinfo.value)
+
+
+def test_a_declared_unneeded_gitlink_survives_an_unreadable_gitmodules(
+        tmp_path, upstream_submodule, local_urls):
+    """Measured 2026-09-02: a tree with gitlinks and no `.gitmodules` BLOB
+    makes `git config --blob <sha>:.gitmodules --list -z` exit 128, which is a
+    refusal of its own and reached ahead of the per-path url one. A tree whose
+    only gitlinks are declared is fully workable with no `.gitmodules` at all,
+    because nothing is fetched for them."""
+    up = upstream_submodule
+    _sh("git", "rm", "-q", "--cached", ".gitmodules", cwd=up["path"])
+    _sh("git", "-c", "user.email=t@t.test", "-c", "user.name=t",
+        "commit", "-q", "-m", "drop .gitmodules", cwd=up["path"])
+    base = _sh("git", "rev-parse", "HEAD", cwd=up["path"])
+    task = _sub_task(tmp_path, {**up, "base": base},
+                     extra_yaml='submodules_unneeded: ["vendor/libdep"]')
+    mirror = tasks.ensure_mirror(str(up["path"]), base, tmp_path / "cache")
+
+    (sub,) = tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+    assert sub.declared_unneeded is True
+    assert sub.url_declared == ""
+    assert sub.url_resolved is None
+    assert sub.name == "vendor/libdep"
+
+
+def test_a_declared_unneeded_gitlink_with_no_stanza_in_a_readable_gitmodules(
+        tmp_path, upstream_two_submodules, local_urls):
+    """The narrower shape the `by_path.get` fallback was justified for:
+    `.gitmodules` is READABLE and carries a stanza for the first gitlink only,
+    so the second has a gitlink and no url -- fatal when it is needed, fine
+    when it is declared."""
+    up = upstream_two_submodules(stanzas=1)
+    task = _sub_task(tmp_path, up,
+                     extra_yaml='submodules_unneeded: ["vendor/other"]')
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"],
+                                 tmp_path / "cache")
+
+    subs = tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+    assert [s.path for s in subs] == ["vendor/libdep", "vendor/other"]
+    other = subs[1]
+    assert other.declared_unneeded is True
+    assert other.url_declared == ""
+    assert other.url_resolved is None
+    assert subs[0].declared_unneeded is False
+
+
+def test_a_strip_path_covering_a_declared_unneeded_submodule_is_still_refused(
+        tmp_path, upstream_submodule, local_urls):
+    """KEPT, and outside the guard. A strip is unrelated to population:
+    `_strip_paths_from_tree`'s `git rm -r` still removes the gitlink, still
+    leaves `.gitmodules` naming a path that no longer exists, and moves
+    `start_sha` while doing it."""
+    up = upstream_submodule
+    task = _sub_task(
+        tmp_path, up,
+        extra_yaml=('strip_paths: ["vendor/libdep"]\n'
+                    'submodules_unneeded: ["vendor/libdep"]'),
+    )
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"],
+                                 tmp_path / "cache")
+
+    with pytest.raises(TaskError, match="strip_paths"):
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+
+def test_a_reference_diff_touching_a_declared_unneeded_submodule_is_still_refused(
+        tmp_path, upstream_submodule, local_urls):
+    """KEPT, and the reason is STRONGER here rather than weaker: `git add -A`
+    stages nothing for a gitlink path in either state, so a task whose fix
+    lives there is ungradable by construction however the manifest declares
+    it."""
+    up = upstream_submodule
+    reference = up["reference"] + (
+        "diff --git a/vendor/libdep/tests/test_sub.py"
+        " b/vendor/libdep/tests/test_sub.py\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/vendor/libdep/tests/test_sub.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+def test_sub():\n"
+    )
+    task = _sub_task(tmp_path, {**up, "reference": reference},
+                     extra_yaml='submodules_unneeded: ["vendor/libdep"]')
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"],
+                                 tmp_path / "cache")
+
+    with pytest.raises(TaskError, match="ungradable"):
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+
+@pytest.mark.parametrize("bad", [
+    "/abs", "../up", ".", "./", ".git", ".git/modules", "vendor/*",
+    ":(exclude)v", "", " v",
+])
+def test_an_unneeded_declaration_is_shape_validated_at_load(
+        tmp_path, upstream, bad):
+    """The SHAPE half runs offline, with no repository at all -- these
+    manifests carry `base_sha` `"0" * 40` against a repo that does not exist.
+    The existence half cannot run here and lives in `derive_submodules`,
+    exactly as `strip_paths`' does in `_strip_paths_from_tree`."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream,
+        extra_yaml=f"submodules_unneeded: [{bad!r}]",
+    )
+
+    with pytest.raises(TaskError):
+        load_task(task_dir)
+
+
+def test_a_duplicated_unneeded_declaration_is_refused(tmp_path, upstream):
+    """The refusal `strip_paths` does not have. This key is consumed as a SET,
+    so a repeat is invisible to every downstream comparison -- it cannot
+    change any behaviour, which makes a manifest carrying one a statement the
+    key cannot express."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream,
+        extra_yaml='submodules_unneeded: ["vendor/libdep", "vendor/libdep"]',
+    )
+
+    with pytest.raises(TaskError, match="listed twice"):
+        load_task(task_dir)
+
+
+def test_materialize_leaves_a_declared_unneeded_submodule_empty(
+        tmp_path, upstream_submodule, local_urls):
+    """The shape the run tree ALREADY has when `_init_submodules` does nothing.
+
+    Measured 2026-09-02, git 2.50.1: `materialize`'s `git clean -xfd` does not
+    remove the directory, `git status --porcelain` reports the tree clean, the
+    index gitlink is untouched, and `git submodule status` reads `-<sha>`.
+    Nothing new is built to produce the state; what changed is the verdict
+    rendered over it.
+    """
+    up = upstream_submodule
+    _, run, _ = _materialize_sub(
+        tmp_path, up, extra_yaml='submodules_unneeded: ["vendor/libdep"]')
+    sub = run / "vendor" / "libdep"
+
+    assert sub.is_dir()
+    assert list(sub.iterdir()) == []
+    # NOT `_sh`, which strips -- the leading character is the assertion.
+    status = subprocess.run(["git", "submodule", "status"], cwd=run,
+                            check=True, capture_output=True, text=True).stdout
+    assert status.startswith("-")
+    assert _sh("git", "status", "--porcelain", cwd=run) == ""
+    assert f"160000 {up['pinned']}" in _sh("git", "ls-files", "-s", cwd=run)
+    assert not (run / ".git" / "modules").exists()
+
+
+def test_no_pruned_mirror_is_built_for_a_declared_unneeded_submodule(
+        tmp_path, upstream_submodule, monkeypatch):
+    """The `if not needed: return` above the mirror comprehension is what makes
+    this a property of the code rather than of an empty comprehension.
+
+    The ssh-url variant, so a mirror attempt would also fail loudly rather
+    than quietly succeeding against a path that happens to exist.
+    """
+    up = _ssh_url_fixture(upstream_submodule)
+    calls = []
+    real = tasks.ensure_pruned_mirror
+
+    def recording(url, sha, cache_root):
+        calls.append((url, sha))
+        return real(url, sha, cache_root)
+
+    task = _sub_task(tmp_path, up,
+                     extra_yaml='submodules_unneeded: ["vendor/libdep"]')
+    monkeypatch.setattr(tasks, "ensure_pruned_mirror", recording)
+    materialize(task, tmp_path / "run", tmp_path / "cache")
+
+    assert "git@example.invalid:x/y.git" not in [url for url, _sha in calls]
+    # The superproject's own mirror IS built, so an assertion that simply
+    # counted zero calls would pass with `_init_submodules` deleted entirely.
+    assert calls
+
+
+def test_declaring_an_unneeded_submodule_does_not_move_start_sha(
+        tmp_path, upstream_submodule, local_urls):
+    """D8's pin. Nothing this key changes is an input to the setup commit --
+    `start_sha` is base_sha + strip_paths + the committed test half +
+    gitignore_extra -- and `_init_submodules` runs AFTER `start_sha` is
+    computed and compared."""
+    up = upstream_submodule
+    declared = _sub_task(tmp_path / "a", up,
+                         extra_yaml='submodules_unneeded: ["vendor/libdep"]')
+    plain = _sub_task(tmp_path / "b", up)
+
+    assert materialize(declared, tmp_path / "ra", tmp_path / "ca") == \
+        materialize(plain, tmp_path / "rb", tmp_path / "cb")
+
+
+def test_a_mixed_task_populates_the_needed_submodule_and_not_the_other(
+        tmp_path, upstream_two_submodules, local_urls):
+    """The filter is per ENTRY, not per task: a repository can carry two
+    submodules of which one is needed (`eemeli/yaml` carries four), which is
+    why the key is a list of paths rather than a boolean."""
+    up = upstream_two_submodules()
+    task = _sub_task(tmp_path, up,
+                     extra_yaml='submodules_unneeded: ["vendor/other"]')
+    materialize(task, tmp_path / "run", tmp_path / "cache")
+    run = tmp_path / "run"
+
+    assert list((run / "vendor" / "other").iterdir()) == []
+    assert (run / "vendor" / "libdep" / "libdep" / "__init__.py").exists()
+    # NOT `_sh`, which strips: the leading character is the whole assertion.
+    # `-` is uninitialised, a space is initialised at the gitlink. The path is
+    # field 2; an initialised line carries a `(heads/main)` suffix after it.
+    status = subprocess.run(["git", "submodule", "status"], cwd=run,
+                            check=True, capture_output=True, text=True).stdout
+    markers = {line.split()[1]: line[0]
+               for line in status.splitlines() if line}
+    assert markers["vendor/other"] == "-"
+    assert markers["vendor/libdep"] == " "
+
+
+# --- round 2 item 16: relative-url derivation and wiring ----------------------
+
+
+def _relative_url_fixture(up):
+    """`upstream_submodule` with the committed `.gitmodules` url rewritten to
+    the RELATIVE form `../libdep`.
+
+    `../libdep`, not `../lib`: `upstream_submodule` builds the submodule
+    source at `tmp_path / "libdep"` (returned under the dict key `"lib"`) and
+    the superproject at `tmp_path / "super"`, with the gitlink at
+    `vendor/libdep`. From base `<tmp_path>/super`, one `../` pops `super` and
+    the remainder appends, giving `<tmp_path>/libdep` -- `str(up["lib"])`.
+    `../lib` would resolve to `<tmp_path>/lib`, which does not exist, and
+    `ensure_pruned_mirror` would fail on `git clone --mirror` of a missing
+    path with a bare `CalledProcessError` instead of the assertion a test
+    below was written for.
+
+    Same shape as `_ssh_url_fixture`: the rewrite lands on top of the
+    fixture's own fix commit, so a new base and a new head are both cut, or
+    the reference diff the manifest ships no longer applies at the base it
+    names.
+    """
+    repo = up["path"]
+
+    def commit(message):
+        _sh("git", "add", "-A", cwd=repo)
+        _sh("git", "-c", "user.email=t@t.test", "-c", "user.name=t",
+            "commit", "-q", "-m", message, cwd=repo)
+        return _sh("git", "rev-parse", "HEAD", cwd=repo)
+
+    _sh("git", "config", "-f", ".gitmodules",
+        "submodule.vendor/libdep.url", "../libdep", cwd=repo)
+    (repo / "calc.py").write_text(BUGGY)
+    (repo / "tests" / "test_calc.py").write_text(OLD_TEST)
+    base = commit("a relative url, back at the buggy state")
+    (repo / "calc.py").write_text(FIXED)
+    (repo / "tests" / "test_calc.py").write_text(NEW_TEST)
+    head = commit("fix")
+    reference = subprocess.run(
+        ["git", "diff", base, head], cwd=repo, check=True,
+        capture_output=True, text=True,
+    ).stdout
+    return {**up, "base": base, "head": head, "reference": reference}
+
+
+def test_both_urls_are_recorded_on_the_submodule_record(
+        tmp_path, upstream_submodule, local_urls):
+    up = _relative_url_fixture(upstream_submodule)
+    task = _sub_task(tmp_path, up)
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"],
+                                 tmp_path / "cache")
+
+    (sub,) = tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+    assert sub.url_declared == "../libdep"
+    assert sub.url_resolved == str(up["lib"])
+
+
+def test_an_absolute_url_records_the_same_value_twice(
+        tmp_path, upstream_submodule, local_urls):
+    up = upstream_submodule
+    task = _sub_task(tmp_path, up)
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"],
+                                 tmp_path / "cache")
+
+    (sub,) = tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+    assert sub.url_declared == sub.url_resolved
+
+
+def test_a_gitlink_with_no_url_is_refused_before_the_resolver_runs(
+        tmp_path, upstream_submodule):
+    """The ordering the D6 comment states: an author whose gitlink has NO url
+    at all must be told that, not told that "" does not resolve -- which it
+    would in fact do, unchanged, since `_resolve_submodule_url` returns any
+    non-relative string verbatim.
+
+    Deliberately WITHOUT `local_urls`: that fixture empties
+    `_SUBMODULE_URL_PREFIX`, under which `"".startswith("")` is True and the
+    "no url" refusal cannot fire at all -- this test would pass with the
+    refusal deleted. The resolver itself never inspects `repo.url`'s shape
+    for a non-relative (here, empty) declared value, so a local-path
+    `repo.url` costs nothing here either way.
+    """
+    up = upstream_submodule
+    _sh("git", "rm", "-q", "--cached", ".gitmodules", cwd=up["path"])
+    (up["path"] / ".gitmodules").write_text(
+        '[submodule "vendor/libdep"]\n'
+        "\tpath = vendor/libdep\n"
+    )
+    _sh("git", "add", "-A", cwd=up["path"])
+    _sh("git", "-c", "user.email=t@t.test", "-c", "user.name=t",
+        "commit", "-q", "-m", "no url in the stanza", cwd=up["path"])
+    base = _sh("git", "rev-parse", "HEAD", cwd=up["path"])
+    task = _sub_task(tmp_path, {**up, "base": base})
+    mirror = tasks.ensure_mirror(str(up["path"]), base, tmp_path / "cache")
+
+    with pytest.raises(TaskError, match="no url") as excinfo:
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+    assert "does not resolve" not in str(excinfo.value)
+
+
+def test_an_unresolvable_relative_url_is_refused_at_derivation(
+        tmp_path, upstream_submodule, local_urls):
+    up = _relative_url_fixture(upstream_submodule)
+    _sh("git", "config", "-f", ".gitmodules",
+        # 50 pops -- comfortably more than any pytest tmp_path is deep --
+        # rather than the table's 3: `repo_url` here is `str(up["path"])`,
+        # an ABSOLUTE LOCAL PATH under `local_urls`' relaxation, and a real
+        # tmp_path has far more than two segments to pop through before the
+        # climb runs out.
+        "submodule.vendor/libdep.url", "../" * 50 + "x.git", cwd=up["path"])
+    _sh("git", "add", "-A", cwd=up["path"])
+    _sh("git", "-c", "user.email=t@t.test", "-c", "user.name=t",
+        "commit", "-q", "-m", "climbs past the host", cwd=up["path"])
+    base = _sh("git", "rev-parse", "HEAD", cwd=up["path"])
+    task = _sub_task(tmp_path, {**up, "base": base})
+    mirror = tasks.ensure_mirror(str(up["path"]), base, tmp_path / "cache")
+
+    with pytest.raises(TaskError, match="climbs above"):
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+
+def test_a_declared_unneeded_submodule_is_never_resolved(
+        tmp_path, upstream_submodule, local_urls):
+    up = _relative_url_fixture(upstream_submodule)
+    _sh("git", "config", "-f", ".gitmodules",
+        # 50 pops -- comfortably more than any pytest tmp_path is deep --
+        # rather than the table's 3: `repo_url` here is `str(up["path"])`,
+        # an ABSOLUTE LOCAL PATH under `local_urls`' relaxation, and a real
+        # tmp_path has far more than two segments to pop through before the
+        # climb runs out.
+        "submodule.vendor/libdep.url", "../" * 50 + "x.git", cwd=up["path"])
+    _sh("git", "add", "-A", cwd=up["path"])
+    _sh("git", "-c", "user.email=t@t.test", "-c", "user.name=t",
+        "commit", "-q", "-m", "unresolvable, but declared unneeded",
+        cwd=up["path"])
+    base = _sh("git", "rev-parse", "HEAD", cwd=up["path"])
+    task = _sub_task(tmp_path, {**up, "base": base},
+                     extra_yaml='submodules_unneeded: ["vendor/libdep"]')
+    mirror = tasks.ensure_mirror(str(up["path"]), base, tmp_path / "cache")
+
+    (sub,) = tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+    assert sub.declared_unneeded is True
+    assert sub.url_resolved is None
+    assert sub.url_declared == "../" * 50 + "x.git"
+
+
+def test_no_mirror_is_keyed_on_the_raw_relative_url(
+        tmp_path, upstream_submodule, local_urls):
+    up = _relative_url_fixture(upstream_submodule)
+    task = _sub_task(tmp_path, up)
+    cache = tmp_path / "cache"
+
+    materialize(task, tmp_path / "run", cache)
+
+    (sub,) = tasks.derive_submodules(
+        task, tasks.ensure_mirror(str(up["path"]), up["base"], cache), cache)
+    assert tasks.pruned_mirror_path(sub.url_resolved, sub.sha, cache).exists()
+    # The raw url would slug to a DIFFERENT path (`pruned_mirror_path` keys
+    # on the string it is given) -- no directory exists under that key,
+    # because nothing was ever built or fetched against it.
+    assert not tasks.pruned_mirror_path(
+        sub.url_declared, sub.sha, cache).exists()
+
+
+def test_the_run_tree_persists_the_resolved_url(
+        tmp_path, upstream_submodule, local_urls):
+    up = _relative_url_fixture(upstream_submodule)
+    task = _sub_task(tmp_path, up)
+    dest = tmp_path / "run"
+    cache = tmp_path / "cache"
+
+    materialize(task, dest, cache)
+
+    (sub,) = tasks.derive_submodules(
+        task, tasks.ensure_mirror(str(up["path"]), up["base"], cache), cache)
+    persisted = _sh("git", "config", "--get", "submodule.vendor/libdep.url",
+                    cwd=dest)
+    assert persisted == sub.url_resolved
+    # N5's property: the tracked blob is never rewritten.
+    blob = _sh("git", "show", "HEAD:.gitmodules", cwd=dest)
+    assert "../libdep" in blob
+
+
+def test_the_submodule_is_at_its_gitlink_after_a_relative_url_materialization(
+        tmp_path, upstream_submodule, local_urls):
+    up = _relative_url_fixture(upstream_submodule)
+    task = _sub_task(tmp_path, up)
+    dest = tmp_path / "run"
+
+    materialize(task, dest, tmp_path / "cache")
+
+    head = _sh("git", "rev-parse", "HEAD", cwd=dest / "vendor" / "libdep")
+    assert head == up["pinned"]
+    # NOT `_sh`, which strips: the leading character is the whole assertion
+    # (M1b) -- a leading space means initialised, `-` uninitialised.
+    status = subprocess.run(["git", "submodule", "status"], cwd=dest,
+                            check=True, capture_output=True, text=True).stdout
+    assert status.startswith(" ")
+
+
+def test_start_sha_does_not_move_when_a_relative_url_is_resolved(
+        tmp_path, upstream_submodule, local_urls):
+    """D9: `_init_submodules` -- where the resolved url is built and
+    persisted -- runs AFTER `start_sha` is computed and pinned, so nothing
+    about resolving a relative url can feed back into it.
+
+    The comparison has to VARY `url_resolved` while holding everything else
+    identical, which rules out two shapes. A cross-FIXTURE comparison is
+    unsound: the relative-url fixture's `.gitmodules` blob differs from the
+    absolute one's, so their commits differ too and a correct implementation
+    fails it. Two materializations of the SAME task are merely a determinism
+    check -- both resolve `../libdep` to the same string, so a regression
+    that fed `url_resolved` into the setup commit yields two equal shas and
+    stays green. This uses the sound pattern
+    `test_declaring_an_unneeded_submodule_does_not_move_start_sha` already
+    carries: two manifests over ONE tree, hence one `.gitmodules` blob and
+    one `base_sha`, differing only in what `url_resolved` becomes -- the
+    resolved local path on one side and `None` on the other, because item
+    2's key means a declared-unneeded submodule is never resolved at all."""
+    up = _relative_url_fixture(upstream_submodule)
+    resolved = _sub_task(tmp_path / "a", up)
+    never = _sub_task(tmp_path / "b", up,
+                      extra_yaml='submodules_unneeded: ["vendor/libdep"]')
+
+    assert materialize(resolved, tmp_path / "ra", tmp_path / "ca") == \
+        materialize(never, tmp_path / "rb", tmp_path / "cb")
+
+
+def test_the_image_context_uses_the_resolved_url(
+        tmp_path, upstream_submodule, local_urls):
+    from bakeoff import images
+
+    up = _relative_url_fixture(upstream_submodule)
+    task = _sub_task(tmp_path, up)
+    repo_dir = tmp_path / "context" / "repo"
+    (repo_dir / "vendor" / "libdep").mkdir(parents=True)
+
+    images._extract_submodules(task, repo_dir, tmp_path / "cache")
+
+    assert (repo_dir / "vendor" / "libdep" / "libdep"
+            / "__init__.py").read_text() == SUB_LIB
+
+
+# --- tests.framework ----------------------------------------------------------
+
+
+def test_framework_defaults_to_pytest_so_every_existing_manifest_loads(
+    tmp_path, upstream
+):
+    task_dir = _write_task(tmp_path / "set", upstream)  # no framework: key
+
+    assert load_task(task_dir).tests.framework == "pytest"
+
+
+def test_the_allowlist_and_the_adapter_registry_cannot_disagree():
+    """`for_framework` raises KeyError on an unknown name rather than
+    defaulting, and this allowlist is the only thing that keeps that
+    unreachable. A default in either place would classify a jest run with
+    pytest's exit codes -- exit 1 for a config error, graded as the model's
+    failure."""
+    from bakeoff.runners import FRAMEWORKS
+    from bakeoff.tasks import _FRAMEWORKS
+
+    assert set(_FRAMEWORKS) == set(FRAMEWORKS)
+
+
+def test_an_unknown_framework_is_refused_with_the_allowlist_in_the_message(
+    tmp_path, upstream
+):
+    task_dir = _write_task(
+        tmp_path / "set", upstream, tests_extra="  framework: mocha\n"
+    )
+
+    with pytest.raises(TaskError) as excinfo:
+        load_task(task_dir)
+
+    assert "mocha" in str(excinfo.value)
+    assert "pytest" in str(excinfo.value)
+
+
+def test_a_node_framework_needs_a_node_shaped_runner(tmp_path, upstream):
+    """Not preflight's check -- this one costs no daemon. The two are not
+    redundant: this refuses a manifest, preflight refuses an IMAGE whose
+    runner is on PATH but wrong."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream,
+        tests_extra='  framework: vitest\n  runner: ["python", "-m", "pytest"]\n',
+    )
+
+    with pytest.raises(TaskError) as excinfo:
+        load_task(task_dir)
+
+    assert "vitest" in str(excinfo.value)
+
+
+# --- node id shapes -----------------------------------------------------------
+
+
+def test_a_node_f2p_id_must_carry_a_file_and_a_full_test_name(
+    tmp_path, upstream
+):
+    """`<file>::<fullName>`. The right half is what the reporter emits --
+    ancestorTitles joined by single spaces plus the title -- and what `-t`
+    matches, so no translation layer can be wrong about it."""
+    task_dir = _write_node_task(
+        tmp_path / "set", upstream, f2p=["tests/a.test.js"]
+    )
+
+    with pytest.raises(TaskError) as excinfo:
+        load_task(task_dir)
+
+    assert "::" in str(excinfo.value)
+
+
+def test_a_node_f2p_id_with_an_empty_half_is_refused(tmp_path, upstream):
+    for bad in ("::a name", "tests/a.test.js::"):
+        task_dir = _write_node_task(tmp_path / bad.replace("/", "_"), upstream,
+                                    f2p=[bad])
+        with pytest.raises(TaskError):
+            load_task(task_dir)
+
+
+def test_a_node_f2p_id_outside_tests_paths_is_refused(tmp_path, upstream):
+    """The scoped p2p run selects by path prefix, so an id whose file is
+    outside the declared scope can never be deselected from it -- and a
+    deselection that matches nothing is SILENT on node: measured, `-t` matching
+    nothing exits 0 with every test reported skipped."""
+    task_dir = _write_node_task(
+        tmp_path / "set", upstream, paths=["tests/"],
+        f2p=["other/a.test.js::does a thing"],
+    )
+
+    with pytest.raises(TaskError) as excinfo:
+        load_task(task_dir)
+
+    assert "tests/" in str(excinfo.value)
+
+
+def test_two_declared_ids_sharing_a_full_name_across_files_now_load(
+    tmp_path, upstream
+):
+    """This refusal is GONE, and its removal is the point of round 2 item 1.
+
+    It existed because `-t` matches `fullName` and knew nothing about which
+    file a test came from: the positionals and the name pattern were ANDed
+    across the whole run, so a quarantine of `a.test.js::works` also
+    deselected `b.test.js::works`. The file half is now carried into the argv
+    -- one invocation per file, each pattern holding only that file's titles
+    -- and measured 2026-09-02 one positional plus one `-t` runs the named
+    tests of that file only. So the manifest loads.
+
+    The SAME-file half is a different problem and is still open (`TASKS.md`):
+    two tests sharing a full name in one file collapse to the identical node
+    id string, which no check comparing `(fullName, path)` pairs can see."""
+    task_dir = _write_node_task(
+        tmp_path / "set", upstream,
+        f2p=["tests/a.test.js::works"], p2p=["tests/b.test.js::works"],
+    )
+
+    task = load_task(task_dir)
+
+    assert task.tests.f2p == ("tests/a.test.js::works",)
+    assert task.tests.p2p == ("tests/b.test.js::works",)
+
+
+def test_two_names_in_the_ONE_file_are_not_refused(tmp_path, upstream):
+    """The duplicate-name rule is about DIFFERENT files, and it must not fire
+    on the ordinary case of one test file declaring several tests.
+
+    The case the rule's own wording invites -- the same full name TWICE in the
+    same file -- is not constructible in a manifest and so is not tested here:
+    identical left and right halves are one identical string, which the f2p
+    duplicate check and the f2p/p2p overlap check already refuse, each with a
+    message about the thing that is actually wrong."""
+    task_dir = _write_node_task(
+        tmp_path / "set", upstream,
+        f2p=["tests/a.test.js::works"], p2p=["tests/a.test.js::other"],
+    )
+
+    assert load_task(task_dir).tests.framework == "vitest"
+
+
+def test_a_pytest_manifest_whose_runner_does_not_invoke_pytest_is_refused(
+    tmp_path, upstream
+):
+    """The framework and the runner are CROSS-CHECKED, never derived from each
+    other, and the check has teeth on the default framework too -- not only on
+    the node ones it was added for.
+
+    `["make", "test"]` is a legal command and an illegal declaration: nothing
+    in the argv says pytest, so the adapter reading its exit codes would be
+    reading whatever `make` returned. It is the same rule preflight applies at
+    gate time, made at LOAD time, where the message can carry the manifest
+    path and no image has been built yet."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream, runner=json.dumps(["make", "test"]),
+    )
+
+    with pytest.raises(TaskError, match="tests.runner contains 'pytest'"):
+        load_task(task_dir)
+
+
+def test_a_pytest_manifest_may_share_node_names_across_modules(
+    tmp_path, upstream
+):
+    """pytest selects by the WHOLE node id, path included, so `a.py::test_x`
+    and `b.py::test_x` are unambiguous there. Applying the node rule to pytest
+    would refuse a manifest that loads today, over a hazard pytest does not
+    have."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream,
+        tests_extra='  f2p: ["tests/a.py::test_x"]\n  p2p: ["tests/b.py::test_x"]\n',
+    )
+
+    assert load_task(task_dir).tests.framework == "pytest"
+
+
+def test_a_wellformed_node_manifest_loads(tmp_path, upstream):
+    task = load_task(_write_node_task(tmp_path / "set", upstream))
+
+    assert task.tests.framework == "vitest"
+    assert task.image.node == "22"
+
+
+def test_a_pytest_id_shape_is_not_newly_constrained(tmp_path, upstream):
+    """Backwards compatibility as a rule, not as a hope: adding a shape rule to
+    the pytest branch could refuse a manifest that loads today, and there is
+    exactly one."""
+    task = load_task(_write_task(tmp_path / "set", upstream))
+
+    assert task.tests.framework == "pytest"
+
+
+# --- the runtime is derived, never declared twice -----------------------------
+
+
+def test_image_node_on_a_pytest_task_is_a_load_error(tmp_path, upstream):
+    """Two keys that can each imply a runtime is two sources for one fact, and
+    the failure of a disagreement between them is a task gated in one
+    interpreter and run in another."""
+    task_dir = _write_task(
+        tmp_path / "set", upstream, extra_yaml='image:\n  node: "22"\n'
+    )
+
+    with pytest.raises(TaskError) as excinfo:
+        load_task(task_dir)
+
+    assert "framework" in str(excinfo.value)
+
+
+def test_image_python_on_a_node_task_is_a_load_error(tmp_path, upstream):
+    task_dir = _write_node_task(
+        tmp_path / "set", upstream, extra_yaml='  python: "3.12"\n'
+    )
+
+    with pytest.raises(TaskError):
+        load_task(task_dir)
+
+
+def test_task_runtime_names_the_base_a_task_needs(tmp_path, upstream):
+    from bakeoff.tasks import task_runtime
+
+    assert task_runtime(load_task(_write_task(tmp_path / "p", upstream))) == (
+        "python", "3.12")
+    assert task_runtime(load_task(_write_node_task(tmp_path / "n", upstream))) == (
+        "node", "22")
+
+
+def test_a_node_version_nobody_built_is_refused(tmp_path, upstream):
+    task_dir = _write_node_task(tmp_path / "set", upstream,
+                                extra_yaml='  node: "18"\n')
+
+    with pytest.raises(TaskError) as excinfo:
+        load_task(task_dir)
+
+    assert "22" in str(excinfo.value)
+
+
+def test_an_unquoted_node_version_is_refused_rather_than_coerced(
+    tmp_path, upstream
+):
+    """YAML parses a bare 22 as an int. `str(22)` happens to be right; the
+    refusal is here because the NEXT version is `22.1` and a bare 22.10 parses
+    as the float 22.1, which is the silent-wrong-value shape one key over.
+
+    `"quote it"`, not `"quote"`: every TaskError opens with the manifest PATH,
+    which under pytest's tmp_path is derived from this test's own name -- and
+    this test's name contains "unquoted". Measured before `image.node` existed
+    at all, the bare substring passed against `unknown image key(s) ['node']`,
+    so the assertion would have gone on passing whatever the loader said."""
+    task_dir = _write_node_task(tmp_path / "set", upstream,
+                                extra_yaml="  node: 22\n")
+
+    with pytest.raises(TaskError) as excinfo:
+        load_task(task_dir)
+
+    assert "quote it" in str(excinfo.value)
+
+
+def test_the_click_task_still_loads_and_its_start_sha_has_not_moved(tmp_path):
+    """None of these keys takes part in the setup commit, so `start_sha`
+    cannot move. Asserted anyway, because "cannot move" is the claim rather
+    than the evidence."""
+    task = load_task(
+        Path(__file__).resolve().parent.parent
+        / "taskset" / "click-3360-write-usage-empty-args"
+    )
+
+    assert task.tests.framework == "pytest"
+    assert task.declared_start_sha == (
+        "33575cc0b75608fa5cbcb1d3ae3347b81eac437f")
+    # `pallets/click` carries no gitlink at this base_sha, and the key it does
+    # not declare must load as the empty tuple rather than as anything a
+    # downstream `set()` could mistake for a declaration.
+    assert task.submodules_unneeded == ()
+
+
+def test_a_tasks_selection_loads_past_an_uncommitted_broken_sibling(
+    tmp_path, upstream
+):
+    """The item's headline test. Measured 2026-09-02 in a shared drafting
+    directory (`~/.cache/bakeoff-probe/taskset/`, not a git repository):
+    worker 6's `--tasks tomlkit-514-...` gate was blocked by a different
+    worker's in-progress `image.env` typo, and the error named only the
+    sibling. A `--tasks` selection must be able to load past an uncommitted
+    broken manifest it did not ask for."""
+    root = tmp_path / "set"
+    _write_task(root, upstream, name="t-001", task_id="t-001")
+    _write_broken_task(root, upstream)
+
+    tasks, refusals = load_task_set_with_refusals(root, only=["t-001"])
+
+    assert [t.task_id for t in tasks] == ["t-001"]
+    assert len(refusals) == 1
+    assert refusals[0].directory.name == "t-002"
+    assert refusals[0].committed is False
+    assert "is not an allowed image.env key" in refusals[0].error
+
+
+def test_a_broken_manifest_that_is_selected_still_refuses(tmp_path, upstream):
+    """A selection naming the broken sibling must refuse -- and for the right
+    reason. With the selection term dropped from `fatal`, `fatal` is empty,
+    the load falls through to the `missing` check, and it still raises a
+    TaskError whose message says "no such task(s)" instead -- a bare
+    `pytest.raises(TaskError)` would pass over that mutation, which is why
+    the message is asserted.
+
+    A second, unselected broken sibling (`t-003`, uncommitted like `t-002`
+    in this non-repo set) makes this the one test where a load produces both
+    a fatal refusal and a skippable one in the same collection --
+    `_refusal_report`'s `skippable` line is otherwise unreached in the suite,
+    since every other refusal test's load has exactly one refusal."""
+    root = tmp_path / "set"
+    _write_task(root, upstream, name="t-001", task_id="t-001")
+    _write_broken_task(root, upstream)
+    _write_broken_task(root, upstream, name="t-003")
+
+    with pytest.raises(TaskError) as excinfo:
+        load_task_set_with_refusals(root, only=["t-002"])
+
+    message = str(excinfo.value)
+    assert "SELECTED by --tasks as 't-002'" in message
+    assert "is not an allowed image.env key" in message
+    assert "further manifest(s)" in message
+
+
+def test_no_tasks_selection_refuses_on_any_invalid_manifest(tmp_path, upstream):
+    """The full-set path -- no `--tasks` at all -- is the path `grade.py` and
+    `judge.py` are on, and it must refuse on any invalid manifest regardless
+    of committed-ness. The second assertion pins that their unedited call
+    site, the `load_task_set` wrapper, inherits the same refusal."""
+    root = tmp_path / "set"
+    _write_task(root, upstream, name="t-001", task_id="t-001")
+    _write_broken_task(root, upstream)
+
+    with pytest.raises(TaskError) as excinfo:
+        load_task_set_with_refusals(root, only=None)
+    message = str(excinfo.value)
+    assert "no --tasks selection was given" in message
+    assert "task_set_commit" in message
+    assert "is not an allowed image.env key" in message
+
+    with pytest.raises(TaskError):
+        load_task_set(root)
+
+
+def test_the_refusal_text_names_the_sibling_and_the_selected_tasks(
+    tmp_path, upstream
+):
+    """"The error text names both." A shared drafting directory holding two
+    valid tasks and one broken sibling, exercised on both the warning path
+    (broken sibling unselected) and the refusal path (broken sibling
+    selected)."""
+    root = tmp_path / "set"
+    _write_task(root, upstream, name="t-001", task_id="t-001")
+    _write_task(root, upstream, name="t-003", task_id="t-003")
+    _write_broken_task(root, upstream)
+
+    tasks, refusals = load_task_set_with_refusals(
+        root, only=["t-001", "t-003"]
+    )
+    lines = refusal_warnings(refusals, root=root, selected={"t-001", "t-003"})
+    text = "\n".join(lines)
+    assert str(root / "t-002" / "task.yaml") in text
+    assert "None of them is a selected task (t-001, t-003)" in text
+    assert "A run without --tasks" in text
+
+    with pytest.raises(TaskError) as excinfo:
+        load_task_set_with_refusals(root, only=["t-002"])
+    message = str(excinfo.value)
+    assert str(root / "t-002" / "task.yaml") in message
+    assert "SELECTED by --tasks as 't-002'" in message
+
+
+def test_a_committed_broken_sibling_refuses_even_under_a_selection(
+    tmp_path, upstream
+):
+    """M4: a task set that is committed and carries a broken manifest is not
+    work in progress -- the set's own revision does not load whole, and
+    `grade.py`, which has no `--tasks`, would grade every record naming that
+    task TASK_NOT_FOUND at exit code 0. So a selection cannot skip it, and
+    the refusal names the selection -- the item's remedy (b) on the branch
+    this change creates."""
+    root = tmp_path / "set"
+    _write_task(root, upstream, name="t-001", task_id="t-001")
+    _write_broken_task(root, upstream)
+    _git_task_set(root)
+
+    with pytest.raises(TaskError) as excinfo:
+        load_task_set_with_refusals(root, only=["t-001"])
+
+    message = str(excinfo.value)
+    assert "committed, and NOT the task you selected (t-001)" in message
+    assert "is not an allowed image.env key" in message
+
+
+def test_an_untracked_broken_sibling_warns_inside_a_git_task_set(
+    tmp_path, upstream
+):
+    """The pair to the committed test, and the one that catches the pathspec
+    trap: `t-001` is committed first, and the broken `t-002` is added
+    afterward, uncommitted. Without a resolved pathspec `git status` would
+    match nothing against a relative path plus `cwd=root` and report the
+    untracked directory as committed."""
+    root = tmp_path / "set"
+    _write_task(root, upstream, name="t-001", task_id="t-001")
+    _git_task_set(root)
+    _write_broken_task(root, upstream)
+
+    tasks, refusals = load_task_set_with_refusals(root, only=["t-001"])
+
+    assert [t.task_id for t in tasks] == ["t-001"]
+    assert len(refusals) == 1
+    assert refusals[0].committed is False
+
+    text = "\n".join(refusal_warnings(refusals, root=root, selected={"t-001"}))
+    assert (
+        "this directory is in no repository, the manifest is untracked or "
+        "ignored there, or it is modified since the last commit"
+    ) in text
+
+
+def test_an_ignored_task_set_inside_a_repo_is_not_committed(tmp_path, upstream):
+    """Finding 2's measurement, and the anchor for the `ls-files` term. A
+    scratch task set living inside an OUTER repository, under a directory the
+    outer repository ignores. `task_set_commit` returns the enclosing repo's
+    HEAD, so the empty-commit guard does not fire; `git status --porcelain`
+    says nothing about an ignored path and would read as committed; only
+    `git ls-files --error-unmatch` reports the truth. With the `ls-files`
+    term removed, this test fails with a TaskError tagged `committed`."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    (outer / ".gitignore").write_text("scratch/\n")
+    _sh("git", "init", "-q", cwd=outer)
+    _sh("git", "config", "user.email", "t@t.test", cwd=outer)
+    _sh("git", "config", "user.name", "t", cwd=outer)
+    _sh("git", "add", "-A", cwd=outer)
+    _sh("git", "commit", "-q", "-m", "outer", cwd=outer)
+
+    root = outer / "scratch" / "taskset"
+    root.mkdir(parents=True)
+    _write_task(root, upstream, name="t-001", task_id="t-001")
+    _write_broken_task(root, upstream)
+
+    tasks, refusals = load_task_set_with_refusals(root, only=["t-001"])
+
+    assert [t.task_id for t in tasks] == ["t-001"]
+    assert len(refusals) == 1
+    assert refusals[0].committed is False
+
+    text = "\n".join(refusal_warnings(refusals, root=root, selected={"t-001"}))
+    assert (
+        "this directory is in no repository, the manifest is untracked or "
+        "ignored there, or it is modified since the last commit"
+    ) in text
+
+
+def test_a_modified_broken_manifest_in_a_committed_set_is_not_committed(
+    tmp_path, upstream
+):
+    """The branch `status --porcelain` decides on its own, and the ordinary
+    drafting loop: editing an existing tracked task rather than adding a new
+    one. Both tasks start valid and committed; `t-002/task.yaml` is then
+    rewritten to be broken, without a new commit. Without this test a
+    refactor that dropped the `status --porcelain` half entirely would keep
+    every other test in this plan green."""
+    root = tmp_path / "set"
+    _write_task(root, upstream, name="t-001", task_id="t-001")
+    _write_task(root, upstream, name="t-002", task_id="t-002")
+    _git_task_set(root)
+    (root / "t-002" / "task.yaml").write_text(
+        _manifest(task_id="t-002", url=str(upstream["path"]),
+                  base_sha=upstream["base"], extra_yaml=_BROKEN_IMAGE_ENV)
+    )
+
+    tasks, refusals = load_task_set_with_refusals(root, only=["t-001"])
+
+    assert [t.task_id for t in tasks] == ["t-001"]
+    assert len(refusals) == 1
+    assert refusals[0].committed is False
+
+    # This is the tracked-but-modified shape: `t-002` IS tracked in the set's
+    # revision, just edited since the commit. Finding 1 (round 2 item 4
+    # review): the old wording ("it has none, or the directory is not tracked
+    # there") is FALSE here on both alternatives, since the set has a
+    # revision and the directory is tracked in it. Guard against regressing
+    # to that claim, and pin the wording that is true on every shape.
+    text = "\n".join(refusal_warnings(refusals, root=root, selected={"t-001"}))
+    assert (
+        "this directory is in no repository, the manifest is untracked or "
+        "ignored there, or it is modified since the last commit"
+    ) in text
+    assert "it has none, or the directory is not tracked there" not in text
+
+
+def test_a_manifest_that_is_not_valid_yaml_is_a_refusal_not_a_traceback(
+    tmp_path, upstream
+):
+    """M3: `yaml.safe_load` raises `yaml.YAMLError`, not `TaskError`, so a
+    sibling with malformed YAML used to escape both drivers' `except
+    TaskError` as a bare traceback. The qualified name is asserted on
+    purpose -- `YAMLError` is a base class that is never the concrete type,
+    and asserting it would fail against the plan's own formatter."""
+    root = tmp_path / "set"
+    _write_task(root, upstream, name="t-001", task_id="t-001")
+    broken = root / "t-002"
+    broken.mkdir(parents=True)
+    (broken / "task.yaml").write_text("task_id: [\n")
+
+    tasks, refusals = load_task_set_with_refusals(root, only=["t-001"])
+    assert len(refusals) == 1
+    assert str(broken / "task.yaml") in refusals[0].error
+    assert "yaml.parser.ParserError" in refusals[0].error
+
+    # `only=None` raises TaskError -- not yaml.YAMLError -- which is what
+    # both drivers' `except TaskError` catches.
+    with pytest.raises(TaskError):
+        load_task_set_with_refusals(root, only=None)
+
+
+def test_a_selected_id_no_directory_supplies_names_the_refused_manifests(
+    tmp_path, upstream
+):
+    """D8: a refused directory is matched against `only` by directory name,
+    because a manifest that did not load has no readable `task_id`. A
+    selection naming an id no loaded task carries, with a refusal present,
+    must name every refused directory as one that could not be checked for
+    that id -- the residual hole D8 accepts, closed loudly rather than
+    papered over."""
+    root = tmp_path / "set"
+    _write_task(root, upstream, name="t-001", task_id="t-001")
+    _write_broken_task(root, upstream)
+
+    with pytest.raises(TaskError) as excinfo:
+        load_task_set_with_refusals(root, only=["t-999"])
+
+    message = str(excinfo.value)
+    assert "no such task(s)" in message
+    assert "t-999" in message
+    assert "DIRECTORY NAME only" in message
+    assert str(root / "t-002") in message
+
+
+# --- round 2, item 18: nested submodules --------------------------------------
+
+
+def test_local_path_is_relative_to_the_parent():
+    """Pure. `local_path` inverts a join this class performed, so a `path` that
+    is not under its `parent` RAISES rather than returning a plausible wrong
+    path -- which is what `path[len(parent) + 1:]` would do, and what
+    `submodule update --init --` would then be handed."""
+    flat = tasks.Submodule(name="n", path="vendor/lib", url_declared="u",
+                           url_resolved="u", sha="a" * 40)
+    nested = tasks.Submodule(name="n", path="vendor/lib/vendor/deep",
+                             url_declared="u", url_resolved="u", sha="b" * 40,
+                             depth=2, parent="vendor/lib")
+
+    assert flat.local_path == "vendor/lib"
+    assert flat.depth == 1 and flat.parent == ""
+    assert nested.local_path == "vendor/deep"
+
+    lying = tasks.Submodule(name="n", path="elsewhere/deep", url_declared="u",
+                            url_resolved="u", sha="c" * 40, depth=2,
+                            parent="vendor/lib")
+    with pytest.raises(ValueError):
+        lying.local_path
+
+
+def test_a_two_level_submodule_is_derived_with_full_paths_and_depths(
+        tmp_path, nested_submodule, local_urls):
+    """`path` is superproject-relative at BOTH levels, which is what keeps the
+    five path-shaped refusals comparing like with like at depth 2."""
+    up = nested_submodule()
+    task = _sub_task(tmp_path, up)
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
+
+    outer, inner = tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+    assert (outer.path, outer.depth, outer.parent, outer.local_path) == (
+        "vendor/lib", 1, "", "vendor/lib")
+    assert (inner.path, inner.depth, inner.parent, inner.local_path) == (
+        "vendor/lib/vendor/deep", 2, "vendor/lib", "vendor/deep")
+    assert outer.sha == up["inner_pinned"]
+    assert inner.sha == up["deep_pinned"]
+    assert inner.url_resolved == str(up["innermost"])
+
+
+def test_the_derived_order_is_parents_before_children(
+        tmp_path, nested_submodule, local_urls):
+    """PRE-ORDER, pinned rather than left as a property of the recursion's
+    shape: `_init_submodules` walks this flat tuple and runs each update with
+    `cwd` at the parent's working tree, which does not exist until the parent's
+    own update has run."""
+    up = nested_submodule()
+    task = _sub_task(tmp_path, up)
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
+
+    subs = tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+    assert [s.path for s in subs] == ["vendor/lib", "vendor/lib/vendor/deep"]
+
+
+def test_a_submodule_three_levels_deep_is_refused_by_the_depth_cap(
+        tmp_path, nested_submodule, local_urls):
+    """A four-repository chain. The cap is policy -- measured, git recurses to
+    any depth -- so the refusal names the cap rather than describing a limit of
+    git's."""
+    up = nested_submodule(levels=3)
+    task = _sub_task(tmp_path, up)
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
+
+    with pytest.raises(TaskError, match="at most 2"):
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+
+def test_the_depth_refusal_names_the_full_path_and_the_cap(
+        tmp_path, nested_submodule, local_urls):
+    """The message has to name a path the task author can find, and keep the
+    measured sentence: the level below the cap arrives empty and `git status
+    --porcelain` reports a tree in that state as CLEAN."""
+    up = nested_submodule(levels=3)
+    task = _sub_task(tmp_path, up)
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
+
+    with pytest.raises(TaskError) as excinfo:
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+    message = str(excinfo.value)
+    assert "vendor/lib/vendor/deep" in message
+    assert "most 2" in message
+    assert "3 levels below the superproject" in message
+    assert ("an empty submodule directory leaves `git status --porcelain` "
+            "clean") in message
+
+
+def test_an_orphan_gitmodules_stanza_at_the_cap_is_not_refused(
+        tmp_path, nested_submodule, local_urls):
+    """The predicate is a GITLINK scan, not `.gitmodules`' existence. A
+    submodule `git rm --cached`'d with its stanza left behind gives a readable
+    `.gitmodules` and zero `160000` entries -- the inert shape this module's
+    own comments say must be recorded rather than refused, and which the old
+    `_has_gitmodules` condition refused at the cap."""
+    up = nested_submodule(orphan_in_innermost=True)
+    task = _sub_task(tmp_path, up)
+    cache = tmp_path / "cache"
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], cache)
+
+    subs = tasks.derive_submodules(task, mirror, cache)
+
+    assert [s.path for s in subs] == ["vendor/lib", "vendor/lib/vendor/deep"]
+    innermost_mirror = tasks.ensure_pruned_mirror(
+        str(up["innermost"]), up["deep_pinned"], cache)
+    assert tasks._has_gitmodules(innermost_mirror, up["deep_pinned"]) is True
+    assert tasks._has_gitlinks(innermost_mirror, up["deep_pinned"]) is False
+    _materialize_sub(tmp_path, up, name="t-002")
+
+
+def test_a_nested_submodule_url_that_is_not_https_is_refused(
+        tmp_path, nested_submodule, monkeypatch):
+    """The url rule applies at EVERY level, and the message names the FULL
+    path.
+
+    `_SUBMODULE_URL_PREFIX` is set to the fixtures' own tmp_path rather than
+    emptied (`local_urls`) or left at production `https://`: emptied, no url
+    can be refused at all; at production, the level-1 local path is refused
+    first and the level-2 url is never read. Under this prefix the fixtures'
+    local paths pass and `ssh://` does not, which is the only arrangement in
+    which the assertion is about level 2.
+    """
+    monkeypatch.setattr(tasks, "_SUBMODULE_URL_PREFIX", str(tmp_path))
+    up = nested_submodule(deep_url="ssh://git@example.invalid/deep.git")
+    task = _sub_task(tmp_path, up)
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
+
+    with pytest.raises(TaskError) as excinfo:
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+    message = str(excinfo.value)
+    assert "vendor/lib/vendor/deep" in message
+    assert "ssh://git@example.invalid/deep.git" in message
+    assert "That tree is the submodule vendor/lib at depth 1" not in message
+
+
+def test_the_inner_url_is_refused_before_its_mirror_is_built(
+        tmp_path, nested_submodule, monkeypatch):
+    """Ordering, and it is why each level refuses BEFORE it clones: a url the
+    eval cannot fetch reaching `ensure_pruned_mirror` is git's own error, or a
+    credential prompt, instead of the loader's message naming the task.
+
+    Only the INNERMOST mirror is forbidden. A blanket patch would raise at
+    level 1, before any level-2 url exists to refuse -- the level-1 mirror is
+    the repository whose `.gitmodules` declares the inner url.
+    """
+    monkeypatch.setattr(tasks, "_SUBMODULE_URL_PREFIX", str(tmp_path))
+    up = nested_submodule(deep_url="ssh://git@example.invalid/deep.git")
+    task = _sub_task(tmp_path, up)
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
+    real = tasks.ensure_pruned_mirror
+
+    def only_the_innermost_is_forbidden(repo_url, sha, cache_root):
+        if repo_url in (str(up["innermost"]),
+                        "ssh://git@example.invalid/deep.git"):
+            raise AssertionError(
+                "the innermost mirror was built before its url was refused"
+            )
+        return real(repo_url, sha, cache_root)
+
+    monkeypatch.setattr(tasks, "ensure_pruned_mirror",
+                        only_the_innermost_is_forbidden)
+
+    with pytest.raises(TaskError, match="urls can be fetched by this"):
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+
+def test_a_gitlink_with_no_url_at_the_inner_level_is_refused(
+        tmp_path, nested_submodule, local_urls):
+    """The gitlink-with-no-url refusal at depth 2, and its message names both
+    the level-2 path and the parent submodule at its depth -- otherwise the
+    author is told a sha they cannot look up."""
+    up = nested_submodule(deep_stanza=False)
+    task = _sub_task(tmp_path, up)
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
+
+    with pytest.raises(TaskError) as excinfo:
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+    message = str(excinfo.value)
+    assert "vendor/lib/vendor/deep" in message
+    assert "That tree is the submodule vendor/lib at depth 1." in message
+
+
+def test_strip_paths_covering_a_nested_submodule_is_refused(
+        tmp_path, nested_submodule, local_urls):
+    """The full-path decision, from the consumer's side, and it takes BOTH
+    halves to state.
+
+    A strip covering the level-2 submodule necessarily covers the level-1 one
+    from below, and the loop refuses on the first submodule it matches -- so
+    the message names `vendor/lib`, which is accurate and is the strip that
+    would actually run. What the full path buys is the second half: the
+    LEVEL-LOCAL name `vendor/deep` matches no submodule in this tree, and a
+    level-local `sub.path` would have made it match one that is really at
+    `vendor/lib/vendor/deep`.
+    """
+    up = nested_submodule()
+    cache = tmp_path / "cache"
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], cache)
+
+    task = _sub_task(tmp_path, up,
+                     extra_yaml='strip_paths: ["vendor/lib/vendor/deep"]')
+    with pytest.raises(TaskError) as excinfo:
+        tasks.derive_submodules(task, mirror, cache)
+    assert "strip_paths names vendor/lib/vendor/deep" in str(excinfo.value)
+    assert "covers the submodule vendor/lib " in str(excinfo.value)
+
+    local_only = _sub_task(tmp_path, up, name="t-002",
+                           extra_yaml='strip_paths: ["vendor/deep"]')
+    assert [s.path for s in
+            tasks.derive_submodules(local_only, mirror, cache)] \
+        == ["vendor/lib", "vendor/lib/vendor/deep"]
+
+
+def test_a_reference_diff_touching_a_nested_submodule_is_refused(
+        tmp_path, nested_submodule, local_urls):
+    """`git add -A` stages nothing for content inside a submodule at any
+    depth, so a task whose fix lives two levels down is ungradable by
+    construction -- and the refusal only fires if `sub.path` is full."""
+    up = nested_submodule()
+    reference = up["reference"] + (
+        "diff --git a/vendor/lib/vendor/deep/deep.py"
+        " b/vendor/lib/vendor/deep/deep.py\n"
+        "--- a/vendor/lib/vendor/deep/deep.py\n"
+        "+++ b/vendor/lib/vendor/deep/deep.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+X = 1\n"
+    )
+    task = _sub_task(tmp_path, {**up, "reference": reference})
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
+
+    with pytest.raises(TaskError) as excinfo:
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+    assert "vendor/lib/vendor/deep" in str(excinfo.value)
+
+
+def test_a_level_two_submodule_cannot_be_declared_unneeded(
+        tmp_path, nested_submodule, local_urls):
+    """DEPTH 1 ONLY, and the reason is a RUN-TIME reader, not a gate one.
+
+    The gate can see an uninitialised submodule at any depth -- item 18 gave
+    preflight a per-level walk with an `ls -A` read at each. The capture cannot:
+    `container.submodule_states` enumerates gitlinks with `git ls-files -s -z`
+    at the superproject root, and measured 2026-09-03 (git 2.50.1) that does
+    not descend through a gitlink -- so a level-2 gitlink inside a POPULATED
+    level-1 submodule is never enumerated and never probed, while the level-1
+    path that IS enumerated carries a `.git` and is skipped by
+    `_uninitialised_with_content` by design. `--porcelain=v2` is silent for it
+    too. An agent's writes into that empty directory would therefore be
+    recorded nowhere while `submodules_dirty` came back `{}` -- the positive
+    claim "read, nothing dirty" -- `grader._submodule_edits` would collapse it
+    to `()` and the ladder would stamp EMPTY_PATCH: `resolved: False`, the
+    accusation item 17 exists to prevent, one level down and permanent. The
+    state is made unrepresentable at load instead.
+
+    The refusal fires at the level that FINDS the gitlink, which is what keeps
+    the two messages apart: a real level-2 path is told its depth and its
+    parent, and only a path no level explains is called a typo.
+    """
+    up = nested_submodule()
+    cache = tmp_path / "cache"
+    task = _sub_task(
+        tmp_path, up,
+        extra_yaml='submodules_unneeded: ["vendor/lib/vendor/deep"]')
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], cache)
+
+    with pytest.raises(TaskError) as excinfo:
+        tasks.derive_submodules(task, mirror, cache)
+
+    message = str(excinfo.value)
+    assert "submodules_unneeded names vendor/lib/vendor/deep" in message
+    assert "a gitlink at depth 2 inside the submodule vendor/lib" in message
+    assert "DEPTH 1 ONLY" in message
+    # The refusal runs in `_read_level`, before the level's mirrors are built,
+    # so nothing was fetched for the path it refused.
+    assert not tasks.pruned_mirror_path(
+        str(up["innermost"]), up["deep_pinned"], cache).exists()
+
+
+def test_a_level_two_typo_in_submodules_unneeded_is_refused_after_the_recursion(
+        tmp_path, nested_submodule, local_urls):
+    """A declared path under a level-1 gitlink is DEFERRED at item 2's own
+    position, because only the recursion can say whether it exists. When no
+    level explains it, the second check refuses it."""
+    up = nested_submodule()
+    task = _sub_task(
+        tmp_path, up,
+        extra_yaml='submodules_unneeded: ["vendor/lib/vendor/deeep"]')
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
+
+    with pytest.raises(TaskError) as excinfo:
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+    message = str(excinfo.value)
+    assert "vendor/lib/vendor/deeep" in message
+    assert "is not a gitlink at any level the derivation reached" in message
+
+
+def test_declaring_a_parent_and_its_child_is_refused(
+        tmp_path, nested_submodule, local_urls):
+    """DECLARING A PARENT IMPLICITLY DECLINES ITS CHILDREN, because the
+    recursion does not descend into a submodule it was told not to populate --
+    so the child is in no `sub.path` and the second typo check refuses the
+    pair. The message is accurate and does not say why; the why lives in the
+    key's documentation block, and this test is what forces that block to move
+    if the pair is ever made legal."""
+    up = nested_submodule()
+    task = _sub_task(
+        tmp_path, up,
+        extra_yaml=('submodules_unneeded: ["vendor/lib", '
+                    '"vendor/lib/vendor/deep"]'))
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
+
+    with pytest.raises(TaskError) as excinfo:
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+    message = str(excinfo.value)
+    assert "vendor/lib/vendor/deep" in message
+    assert "is not a gitlink at any level the derivation reached" in message
+
+
+def test_a_level_one_typo_still_beats_the_url_refusal(
+        tmp_path, nested_submodule, monkeypatch):
+    """Item 2's ordering, re-run ON THE NESTED FIXTURE, because that is where
+    the new `deferred` term could wrongly swallow it. `_under` is
+    component-wise, so `vendor/libdeps` is not under `vendor/lib` and is
+    refused as the typo it is rather than deferred to a level that will never
+    explain it."""
+    monkeypatch.setattr(tasks, "_SUBMODULE_URL_PREFIX", "https://")
+    up = nested_submodule()
+    task = _sub_task(tmp_path, up,
+                     extra_yaml='submodules_unneeded: ["vendor/libdeps"]')
+    mirror = tasks.ensure_mirror(str(up["path"]), up["base"], tmp_path / "cache")
+
+    with pytest.raises(TaskError) as excinfo:
+        tasks.derive_submodules(task, mirror, tmp_path / "cache")
+
+    message = str(excinfo.value)
+    assert "submodules_unneeded names vendor/libdeps" in message
+    assert "has no gitlink at" in message
+
+
+def test_a_nested_submodule_is_populated_at_its_gitlink(
+        tmp_path, nested_submodule, local_urls):
+    """M13 against M5. Both directories exist and are non-empty, both HEADs
+    equal their gitlinks, and both `git submodule status --recursive` markers
+    are a LEADING SPACE -- which is what the one-shot `--recursive` update does
+    NOT produce: it populates the deeper tree and leaves its marker at `-`,
+    because the inner `submodule init` skips a registration whose value is
+    already visible."""
+    up = nested_submodule()
+    _, run, _ = _materialize_sub(tmp_path, up)
+
+    outer = run / "vendor" / "lib"
+    inner = outer / "vendor" / "deep"
+    assert (outer / "libdep" / "__init__.py").read_text() == SUB_LIB
+    assert (inner / "deepdep" / "__init__.py").read_text() == SUB_DEEP
+    assert _sh("git", "rev-parse", "HEAD", cwd=outer) == up["inner_pinned"]
+    assert _sh("git", "rev-parse", "HEAD", cwd=inner) == up["deep_pinned"]
+
+    # RAW stdout, never `_sh`: that helper strips, and the whole assertion
+    # here is about the FIRST CHARACTER of the first line.
+    status = subprocess.run(
+        ["git", "submodule", "status", "--recursive"], cwd=run,
+        check=True, capture_output=True, text=True).stdout
+    lines = [line for line in status.splitlines() if line.strip()]
+    assert len(lines) == 2
+    assert all(line[0] == " " for line in lines), status
+    assert _sh("git", "status", "--porcelain", cwd=run) == ""
+
+
+def test_a_nested_submodule_cannot_reach_the_future(
+        tmp_path, nested_submodule, local_urls):
+    """Every level gets its own PRUNED mirror. Without one the run tree carries
+    submodule content newer than the gitlink -- the founding leak, one and two
+    levels down, and differential in the same way since only an arm that looks
+    inside `.git` collects it."""
+    up = nested_submodule()
+    _, run, _ = _materialize_sub(tmp_path, up)
+
+    outer = run / "vendor" / "lib"
+    inner = outer / "vendor" / "deep"
+    assert subprocess.run(["git", "cat-file", "-e", up["inner_future"]],
+                          cwd=outer, capture_output=True).returncode != 0
+    assert subprocess.run(["git", "cat-file", "-e", up["deep_future"]],
+                          cwd=inner, capture_output=True).returncode != 0
+
+
+def test_a_nested_submodule_does_not_move_start_sha(
+        tmp_path, nested_submodule, local_urls):
+    """`_init_submodules` runs AFTER `start_sha` is computed and compared, so
+    nothing the recursion does can reach the setup commit. Materialized twice
+    into two destinations, because a start sha that is a pure function of the
+    manifest is the property the pin rests on."""
+    up = nested_submodule()
+    task = _sub_task(tmp_path, up)
+    cache = tmp_path / "cache"
+    first = materialize(task, tmp_path / "run-a", cache)
+    second = materialize(task, tmp_path / "run-b", cache)
+
+    assert first == second
+    for run in (tmp_path / "run-a", tmp_path / "run-b"):
+        assert (run / "vendor" / "lib" / "vendor" / "deep"
+                / "deepdep" / "__init__.py").read_text() == SUB_DEEP
+        assert _sh("git", "status", "--porcelain", cwd=run) == ""

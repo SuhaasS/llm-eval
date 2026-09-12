@@ -50,6 +50,7 @@ a gate that stops being run.
 
 from __future__ import annotations
 
+import dataclasses
 import gzip
 import re
 import shutil
@@ -62,7 +63,7 @@ import pytest
 from bakeoff import oracle as oracle_module
 from bakeoff.grade_schema import GradeFailure, NotGradedReason
 from bakeoff.grader import GRADER_VERSION, grade_run
-from bakeoff.images import build_base_image, build_task_image, image_entrypoint
+from bakeoff.images import build_base_images, build_task_image, image_entrypoint
 from bakeoff.oracle import ensure_oracle
 from bakeoff.preflight import EXIT_TESTS_FAILED
 from bakeoff.schema import (
@@ -73,7 +74,7 @@ from bakeoff.schema import (
     TerminationReason,
     Versions,
 )
-from bakeoff.tasks import load_task, materialize
+from bakeoff.tasks import load_task, materialize, task_runtime
 
 # Both, module-wide. See the module docstring: `task_image` is what keeps the
 # section 6.6 logger gate offline, and a per-test decorator is a thing the next
@@ -144,7 +145,11 @@ def click_image(click_task, grader_cache) -> str:
     an inherited ENTRYPOINT makes `RunContainer`'s `sleep infinity` an argument
     to it and the container exits immediately.
     """
-    base = build_base_image(REPO_ROOT)
+    # Keyed by version exactly as the drivers do it: the base a task gets is
+    # the one its manifest names, never a default that happens to match.
+    base = build_base_images(REPO_ROOT, [task_runtime(click_task)])[
+        task_runtime(click_task)
+    ].image_id
     image = build_task_image(click_task, base, grader_cache / "build",
                              grader_cache)
     assert image.startswith("sha256:"), (
@@ -593,3 +598,59 @@ def test_a_planted_secret_is_found_by_a_scanner_that_saw_the_input(
     # copy every key an arm leaked out of the ephemeral scan dir and into a
     # directory that outlives the run.
     assert PLANTED_SECRET not in _output(grade, "secret_scan")
+
+
+def test_a_task_images_env_reaches_both_the_gates_exec_and_the_agents(
+    click_task, click_image, grader_cache, tmp_path
+):
+    """The real-image half, and the one that cannot be faked.
+
+    Everything offline proves is that we render the right Dockerfile line and
+    that container_env does not name the key. What no unit test can reach is
+    the merge itself -- that an image ENV survives into an exec that carries
+    the agent's OWN environment. If it did not, every determinism lever would
+    apply to preflight and the grader and not to the loop section 3.3
+    measures, and the only symptom would be a suite that sometimes passes.
+
+    Both execs, deliberately: `container.exec(argv)` is the shape preflight,
+    the oracle and the grader all make, and `exec(argv, env=container_env(...))`
+    is the shape `claude_runner.ContainerBackend` makes for the agent.
+    """
+    from bakeoff.claude_runner import ClaudeCodeConfig, container_env
+    from bakeoff.container import RunContainer
+    from bakeoff.images import build_task_image
+
+    declared = {"CI": "1", "HYPOTHESIS_STORAGE_DIRECTORY": "/tmp/bakeoff-hyp"}
+    task = dataclasses.replace(
+        click_task,
+        task_id=click_task.task_id + "-envprobe",
+        image=dataclasses.replace(click_task.image, env=declared),
+    )
+    base = build_base_images(REPO_ROOT, [task_runtime(task)])[task_runtime(task)].image_id
+    image = build_task_image(task, base, grader_cache / "build",
+                             grader_cache)
+
+    agent_env = container_env(ClaudeCodeConfig(
+        model="m", base_url="http://litellm:4000", auth_token="t",
+        settings_path="/eval/settings.json", config_dir="/eval/claude-config",
+        max_turns=1, wall_clock_timeout_s=1,
+        custom_headers="X-Bakeoff-Run-Id: r-envprobe",
+    ))
+
+    with RunContainer(image=image, repo_path=str(tmp_path),
+                      base_sha="") as container:
+        for key, value in declared.items():
+            gate = container.exec(["printenv", key])
+            agent = container.exec(["printenv", key], env=agent_env)
+
+            assert gate.exit_code == 0, key
+            assert gate.stdout.strip() == value
+            # The merge, which is the whole claim: a key the exec env does not
+            # name survives from the image.
+            assert agent.exit_code == 0, key
+            assert agent.stdout.strip() == value
+
+        # And the eval's own keys still win where they ARE named, so this is
+        # not passing because the exec env was ignored wholesale.
+        model = container.exec(["printenv", "ANTHROPIC_MODEL"], env=agent_env)
+        assert model.stdout.strip() == "m"

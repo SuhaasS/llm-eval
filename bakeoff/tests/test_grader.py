@@ -14,6 +14,7 @@ diffs in this file are genuine git diffs and a change that broke the parse
 would fail here rather than in the image.
 """
 
+import json
 import subprocess
 import tempfile
 from pathlib import Path
@@ -21,9 +22,11 @@ from types import SimpleNamespace
 
 import pytest
 
+import bakeoff.grader as grader
 from bakeoff.grade_schema import CHECK_ORDER, GradeFailure, NotGradedReason
 from bakeoff.grader import (
     GRADER_VERSION,
+    LadderResult,
     build_grade_record,
     grade_run,
     parse_deselected,
@@ -31,6 +34,7 @@ from bakeoff.grader import (
 )
 from bakeoff.oracle import Oracle
 from bakeoff.schema import (
+    SUBMODULE_UNINITIALISED_CONTENT,
     Artifacts,
     Checkpoint,
     DestructiveCategory,
@@ -43,6 +47,7 @@ from bakeoff.schema import (
     TerminationReason,
     Versions,
 )
+from bakeoff.tasks import TaskError
 
 # --------------------------------------------------------------------------
 # diffs -- real ones, because _chunk_path runs real git over them
@@ -202,6 +207,7 @@ def _task(
     build=(),
     typecheck=(),
     lint=(),
+    suite_timeout_s=600,
 ):
     return SimpleNamespace(
         task_id="calc-1",
@@ -216,8 +222,14 @@ def _task(
             f2p=f2p,
             p2p=p2p,
             allow_extra_paths=(),
+            framework="pytest",
         ),
         grading=SimpleNamespace(build=build, typecheck=typecheck, lint=lint),
+        budget=SimpleNamespace(
+            suite_timeout_s=suite_timeout_s,
+            wall_clock_timeout_s=900,
+            max_turns=40,
+        ),
     )
 
 
@@ -270,8 +282,39 @@ def _ladder(record=None, task=None, env=None, oracle=None):
     )
 
 
+def _grade_record_for(framework: str):
+    """A `GradeRecord` built straight from a `LadderResult` carrying
+    `framework`, bypassing `run_ladder` -- the threading `build_grade_record`
+    does (`framework=ladder.framework or ""`) does not depend on which
+    adapter actually classified anything, so this exercises the schema-level
+    join without needing a node-shaped `FakeEnv`."""
+    ladder = LadderResult(checks=(), resolved=True, framework=framework)
+    return build_grade_record(_record(), _task(), "sha256:image", None,
+                              ladder)
+
+
 def _check(result, name):
     return next(c for c in result.checks if c.name == name)
+
+
+def _run_f2p_with(*, exit_code, stdout="", stderr="", report=None,
+                  f2p=("tests/new.py::test_x",)):
+    """One ladder run whose f2p invocation answered with exactly this.
+
+    `report` is accepted and unused on pytest -- the adapter reads the exit
+    code and the `-q` summary lines and writes no machine-readable report
+    (`report_path()` is `None`, so `_Runner` never reads one). It is in the
+    signature because the thing under test is the SEAM: the same three shapes
+    below are what a node adapter answers from a report instead, and a helper
+    that could not express one would have to be rewritten to state the same
+    claim one framework over.
+
+    `f2p` defaults to a module the confinement predicate can contain, so the
+    accepted-shape branch and the fall-through branch are distinguished by
+    what the runner said rather than by which task the test happened to build.
+    """
+    env = FakeEnv(rules=[(is_f2p, (exit_code, stdout, stderr))])
+    return _ladder(task=_task(f2p=f2p), env=env)
 
 
 # --------------------------------------------------------------------------
@@ -442,6 +485,498 @@ def test_an_ungraded_record_does_not_claim_an_empty_quarantine(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# 1b. the gitlink refusals: the mode-line one before materialize, the rename
+#     one after -- and the edit refusal, which reads the record rather than
+#     the submission
+# --------------------------------------------------------------------------
+
+#: Shape 1: a DECLARED submodule whose gitlink the agent moved by committing
+#: inside it. Measured 2026-09-01 (git 2.50.1) on a synthetic superproject.
+_GITLINK_SUBMISSION = (
+    "diff --git a/vendor/libdep b/vendor/libdep\n"
+    "index 942c381..c464218 160000\n"
+    "--- a/vendor/libdep\n"
+    "+++ b/vendor/libdep\n"
+    "@@ -1 +1 @@\n"
+    "-Subproject commit 942c381d88cecca36be86b2e902f554ad145ec44\n"
+    "+Subproject commit c46421867cd1d0ac5a2038e156236a73a4cdeaac\n"
+)
+
+#: Shape 2: an AGENT-CREATED nested repository, on a task with NO submodules
+#: at all. Produced verbatim 2026-09-01 with git 2.50.1, by:
+#:
+#:     git init -b main .            # a plain repo, one tracked file src/calc.py
+#:     git add -A && git commit      # <base>
+#:     mkdir src/vendored && cd src/vendored
+#:     git init -b main . && touch helper.py && git add -A && git commit
+#:     cd - && git add -A            # "warning: adding embedded git repository"
+#:     git diff --cached <base>      # <- the text below
+#:
+#: and then, on a FRESH clone of the same base, `git apply --index` of it
+#: exits 0, writes `160000 4f5328fc... src/vendored` into the index, and
+#: leaves an EMPTY DIRECTORY at `src/vendored` in the working tree. The
+#: agent's `helper.py` is nowhere.
+_NESTED_REPO_SUBMISSION = (
+    "diff --git a/src/vendored b/src/vendored\n"
+    "new file mode 160000\n"
+    "index 0000000..4f5328f\n"
+    "--- /dev/null\n"
+    "+++ b/src/vendored\n"
+    "@@ -0,0 +1 @@\n"
+    "+Subproject commit 4f5328fcf96da17d142cfc082764652008343211\n"
+)
+
+#: Shape 3: a PURE RENAME of a gitlink, which carries no mode line at all.
+#: Produced verbatim 2026-09-02 with git 2.50.1, by `mv sub newsub` followed
+#: by `git add -A` in a superproject with a submodule at `sub` -- a plain
+#: `mv`, so there is no `.gitmodules` chunk beside it. `git diff --cached
+#: <base>` and `git diff --cached -M <base>` returned identical bytes, and
+#: `container.snapshot_diff` runs the former.
+_GITLINK_RENAME_SUBMISSION = (
+    "diff --git a/sub b/newsub\n"
+    "similarity index 100%\n"
+    "rename from sub\n"
+    "rename to newsub\n"
+)
+
+#: The control, and the reason the tree has to be asked: a 100%-similarity
+#: rename of an ORDINARY file is the same four lines with different paths.
+#: Produced the same way, by `git mv big.py moved_big.py`.
+_FILE_RENAME_SUBMISSION = (
+    "diff --git a/big.py b/moved_big.py\n"
+    "similarity index 100%\n"
+    "rename from big.py\n"
+    "rename to moved_big.py\n"
+)
+
+
+def _start_state_repo(root: Path) -> str:
+    """A real repository whose tree carries a `160000` gitlink at `sub` and a
+    blob at `big.py`, and the SHA of the commit holding both.
+
+    `git update-index --add --cacheinfo 160000,<sha>,<path>` writes a gitlink
+    entry directly -- no submodule, no clone, no `.gitmodules`, no network --
+    so `_start_state_gitlinks` runs against REAL git output rather than a
+    string somebody typed. Measured 2026-09-02 (git 2.50.1): the resulting
+    `git ls-tree -r -z <sha> -- sub big.py` reply is
+    `160000 commit <sha>\\tsub\\0100644 blob <sha>\\tbig.py\\0`.
+    """
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=root, check=True)
+    (root / "big.py").write_text("x = 1\n")
+    subprocess.run(["git", "add", "big.py"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "update-index", "--add", "--cacheinfo",
+         "160000,8d8cfe7b9864c69193d190b7e3c3df9bbddd911a,sub"],
+        cwd=root, check=True,
+    )
+    subprocess.run(
+        ["git", "-c", "user.email=test@example.com",
+         "-c", "user.name=test", "commit", "-q", "-m", "start"],
+        cwd=root, check=True,
+    )
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=root, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def test_a_gitlink_submission_is_not_graded_rather_than_failed(tmp_path):
+    """Measured 2026-09-01, git 2.50.1: `git apply --index` of this diff on a
+    freshly materialized tree exits 0 with only `warning: unable to rmdir`,
+    moves the INDEX gitlink to a commit that exists nowhere but the original
+    run tree's .git/modules, and leaves the submodule's working tree at the
+    original commit. The ladder would then run the suite against content the
+    agent never wrote and return `resolved: False` -- an accusation over a
+    limitation of the harness's own diff capture, since `git add -A` stages
+    NOTHING for an uncommitted edit inside a submodule.
+
+    NOTHING IS MONKEYPATCHED. The refusal reads the submission's own chunks,
+    so this reaches it through `grade_run` on the ordinary `_task()` fixture,
+    which declares no submodules -- which is the point: an earlier draft asked
+    the task for its declared submodule set, and that set is empty for every
+    task in today's corpus.
+
+    No container is started and no tree is materialized: the refusal sits
+    beside `not_graded_gate`, before either, which is why this test needs
+    neither Docker nor a mirror.
+    """
+    graded = grade_run(_record(diff=_GITLINK_SUBMISSION), _task(),
+                       "sha256:x", None, tmp_path / "cache",
+                       tmp_path / "artifacts")
+
+    assert graded.resolved is None
+    assert graded.not_graded_reason == \
+        NotGradedReason.SUBMODULE_GITLINK_UNGRADABLE.value
+    assert graded.grade_failure is None
+    assert "vendor/libdep" in graded.not_graded_detail
+
+
+def test_an_agent_created_nested_repo_is_not_graded_either(tmp_path):
+    """The shape the DECLARED-submodule authority was blind to.
+
+    `git init` or `git clone` inside a tracked subdirectory makes `git add -A`
+    emit exactly one `new file mode 160000` chunk, on a repository that has
+    never had a submodule. `_task()` declares none, `pallets/click` has none,
+    and under the first draft of this refusal that submission applied green
+    and graded a tree with an EMPTY DIRECTORY where the agent's work was --
+    `resolved: False` on any task in the corpus.
+    """
+    graded = grade_run(_record(diff=_NESTED_REPO_SUBMISSION), _task(),
+                       "sha256:x", None, tmp_path / "cache",
+                       tmp_path / "artifacts")
+
+    assert graded.resolved is None
+    assert graded.not_graded_reason == \
+        NotGradedReason.SUBMODULE_GITLINK_UNGRADABLE.value
+    assert graded.grade_failure is None
+    assert "src/vendored" in graded.not_graded_detail
+
+
+def test_both_gitlink_shapes_are_read_out_of_the_chunk(tmp_path):
+    """The two mode spellings git uses, and the paths from `_chunk_path`."""
+    assert grader._gitlinks_touched(_GITLINK_SUBMISSION) == ("vendor/libdep",)
+    assert grader._gitlinks_touched(_NESTED_REPO_SUBMISSION) == ("src/vendored",)
+
+
+def test_an_ordinary_submission_touches_no_gitlink():
+    """Backwards compatibility, and the reason the mode line is the authority
+    rather than the `Subproject commit` line the hunk body carries: a body
+    line is file content with one marker character in front of it, so a
+    submission that EDITS a file containing that text would match. This file
+    carries such lines, in the fixtures above.
+    """
+    assert grader._gitlinks_touched(TEXT_DIFF) == ()
+
+
+def test_a_text_chunk_whose_content_mentions_a_subproject_commit_is_graded():
+    """Constructed from the constant above: an ordinary Python file gaining
+    the exact bytes of a gitlink hunk body. Under a body-text authority this
+    is a false refusal -- `resolved: None` on a submission that fixes the bug.
+    """
+    forged = (
+        "diff --git a/src/calc.py b/src/calc.py\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/src/calc.py\n"
+        "+++ b/src/calc.py\n"
+        "@@ -1,0 +1,2 @@\n"
+        "+FIXTURE = \"\"\"\n"
+        "+Subproject commit 4f5328fcf96da17d142cfc082764652008343211\n"
+    )
+
+    assert grader._gitlinks_touched(forged) == ()
+
+
+def test_an_unparseable_submission_is_left_to_the_existing_refusal():
+    """A parse failure is `_apply_submission`'s to name, not this check's.
+    Two authorities for one shape is the mistake `not_graded_gate`'s docstring
+    already records, and this one runs FIRST -- so a raise here would take
+    `LOSSY_DIFF_UNAPPLIABLE` off every lossy row.
+    """
+    assert grader._gitlinks_touched("not a diff at all\n") == ()
+
+
+def test_a_pure_gitlink_rename_is_refused_though_it_carries_no_mode_line(
+    tmp_path
+):
+    """The blind spot `_chunk_is_gitlink` cannot close on its own: a
+    100%-similarity rename carries no `160000` mode line at all, so the
+    diff-only authority says "not a gitlink" -- stated as an assertion here so
+    the two authorities stay honestly separate -- and `_renamed_gitlinks`
+    closes the gap by asking `start_sha`'s tree for the rename source's mode.
+    """
+    sha = _start_state_repo(tmp_path)
+
+    assert grader._chunk_is_gitlink(_GITLINK_RENAME_SUBMISSION) is False
+    assert grader._renamed_gitlinks(
+        _GITLINK_RENAME_SUBMISSION, tmp_path, sha
+    ) == (("sub", "newsub"),)
+
+
+def test_a_pure_regular_file_rename_is_not_refused(tmp_path):
+    """The control: `_FILE_RENAME_SUBMISSION` is the same four lines as
+    `_GITLINK_RENAME_SUBMISSION` with different paths. A rule that refused on
+    the diff shape alone would take every honest file rename out of the
+    denominator; asking the tree is what tells the two apart.
+    """
+    sha = _start_state_repo(tmp_path)
+
+    assert grader._renamed_gitlinks(
+        _FILE_RENAME_SUBMISSION, tmp_path, sha
+    ) == ()
+
+
+def test_rename_pairs_come_from_git_rather_than_the_rename_header():
+    """`_rename_pairs` is `_chunk_path`'s forward/reverse `--numstat`, never a
+    match over `similarity index` / `rename from` / `rename to`."""
+    assert grader._rename_pairs(_GITLINK_RENAME_SUBMISSION) == \
+        (("sub", "newsub"),)
+    # A modification has `source == dest`, so it is not a rename.
+    assert grader._rename_pairs(TEXT_DIFF) == ()
+    assert grader._rename_pairs("not a diff at all\n") == ()
+
+
+def test_a_submission_with_no_rename_asks_the_start_state_nothing(monkeypatch):
+    """Pins the zero-cost common path: measured 2026-09-02, 115 of 115 stored
+    records carry no rename chunk, and none of them should pay a
+    `git ls-tree`."""
+    def _raiser(*a, **kw):
+        raise AssertionError(
+            "a submission with no rename must not ask git anything"
+        )
+
+    monkeypatch.setattr(grader, "_start_state_gitlinks", _raiser)
+
+    assert grader._renamed_gitlinks(
+        TEXT_DIFF, Path("/nonexistent"), START_SHA
+    ) == ()
+
+
+def test_the_renamed_source_mode_is_read_from_the_start_state(monkeypatch):
+    """Pins three things at once: the tree asked is `start_sha`'s and not
+    `base_sha`'s, only the SOURCE side of a rename is asked about, and the
+    pathspec is `:(literal)`-prefixed."""
+    calls = []
+
+    def _recorder(argv, cwd=None, capture_output=None):
+        calls.append((argv, cwd))
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(grader.subprocess, "run", _recorder)
+
+    repo = Path("/some/repo")
+    grader._start_state_gitlinks(repo, START_SHA, ("sub",))
+
+    assert len(calls) == 1
+    argv, cwd = calls[0]
+    assert argv == [
+        "git", "ls-tree", "-r", "-z", START_SHA, "--", ":(literal)sub",
+    ]
+    assert cwd == repo
+
+
+def test_a_gitlink_rename_is_not_graded_and_starts_no_container(
+    monkeypatch, tmp_path
+):
+    """Through `grade_run`, in the style of
+    `test_the_stat_cache_is_refreshed_before_the_ladder_applies`. `_record`'s
+    `diff` defaults to `TEXT_DIFF`, so naming `_GITLINK_RENAME_SUBMISSION`
+    explicitly is what makes the detail assertion hold."""
+    monkeypatch.setattr(grader, "materialize", lambda *a, **kw: START_SHA)
+    monkeypatch.setattr(
+        grader, "_start_state_gitlinks", lambda *a, **kw: ("sub",)
+    )
+
+    class _RefusingContainer:
+        def __init__(self, **kw):
+            raise AssertionError(
+                "a refused row must not start a container"
+            )
+
+    monkeypatch.setattr(grader, "RunContainer", _RefusingContainer)
+
+    graded = grade_run(_record(diff=_GITLINK_RENAME_SUBMISSION), _task(),
+                       "sha256:image", _oracle(),
+                       tmp_path / "cache", tmp_path / "art")
+
+    assert graded.resolved is None
+    assert graded.not_graded_reason == \
+        NotGradedReason.SUBMODULE_GITLINK_UNGRADABLE.value
+    assert graded.grade_failure is None
+    assert "sub -> newsub" in graded.not_graded_detail
+    assert graded.artifacts_dir is None
+
+
+def test_a_refused_rename_leaves_no_materialized_tree_behind(
+    monkeypatch, tmp_path
+):
+    """The order in `grade_run` matters: the refusal sits INSIDE the `try`
+    block so the existing `finally: shutil.rmtree(tree, ...)` removes the
+    tree on this path too -- above the `try`, a refused row would leave a
+    materialized tree holding somebody's submission on disk.
+
+    Do NOT assert the KEY-level `grade-tree/<run_id>` directory is gone.
+    Since round-2 item 3, `fresh_tree` allocates a `uuid4().hex` LEAF under
+    that key, the `finally` removes only the leaf, and the key-level
+    directory surviving as an empty husk is `fresh_tree`'s documented and
+    deliberate cost -- `_sweep_stale_trees` is explicitly documented as not
+    collecting it. Asserting the husk is gone would fail against correct,
+    unrelated code.
+    """
+    leaves: list[Path] = []
+
+    def _fake_materialize(task, dest, cache_root):
+        # `dest` is `<leaf>/repo`, so the leaf `fresh_tree` allocated is its
+        # parent. There is no other way to learn the name: it is a uuid4.
+        Path(dest).mkdir(parents=True)
+        leaves.append(Path(dest).parent)
+        return START_SHA
+
+    monkeypatch.setattr(grader, "materialize", _fake_materialize)
+    monkeypatch.setattr(
+        grader, "_start_state_gitlinks", lambda *a, **kw: ("sub",)
+    )
+
+    class _RefusingContainer:
+        def __init__(self, **kw):
+            raise AssertionError(
+                "a refused row must not start a container"
+            )
+
+    monkeypatch.setattr(grader, "RunContainer", _RefusingContainer)
+
+    grade_run(_record(diff=_GITLINK_RENAME_SUBMISSION), _task(),
+             "sha256:image", _oracle(),
+             tmp_path / "cache", tmp_path / "art")
+
+    assert leaves and not leaves[0].exists()
+
+
+def test_a_start_state_listing_that_fails_stops_the_grade(monkeypatch):
+    """A non-zero `git ls-tree` RAISES rather than being read as "no
+    gitlinks". The fallback for a silent failure here is grading a tree the
+    submission's content never reached, which is `resolved: False` in an
+    append-only file -- `scripts/grade.py` contains this per record into its
+    `errors` bucket, so the cost of being wrong is one named, re-runnable
+    row.
+
+    `grader.subprocess.run` is one process-global function, and
+    `_renamed_gitlinks` calls it twice on the way here: once, for real,
+    inside `_rename_pairs` (`_parse_submission` -> `_chunk_path` ->
+    `_numstat`, which must actually parse the fixture's real rename chunk to
+    produce a pair worth looking up), and once for the `git ls-tree` this
+    test is about. The fake therefore only intercepts the `ls-tree` argv and
+    delegates everything else -- including the real numstat call's `input=`
+    kwarg -- to the real `subprocess.run`, captured before the patch.
+    """
+    real_run = grader.subprocess.run
+
+    def _broken(argv, cwd=None, capture_output=None, **kw):
+        if argv[:2] == ["git", "ls-tree"]:
+            return SimpleNamespace(
+                returncode=128, stdout=b"",
+                stderr=b"fatal: not a tree object\n",
+            )
+        return real_run(argv, cwd=cwd, capture_output=capture_output, **kw)
+
+    monkeypatch.setattr(grader.subprocess, "run", _broken)
+
+    with pytest.raises(TaskError) as excinfo:
+        grader._renamed_gitlinks(
+            _GITLINK_RENAME_SUBMISSION, Path("/some/repo"), START_SHA
+        )
+    assert "not a tree object" in str(excinfo.value)
+
+
+# --- round 2 item 17: the states the submission diff cannot carry ---
+
+
+def test_a_dirty_submodule_at_exit_is_not_graded_rather_than_failed(tmp_path):
+    """Measured 2026-09-02 (git 2.50.1) through `container.snapshot_diff`'s
+    own command sequence: a tracked file edited inside an initialised
+    submodule and not committed stages ZERO BYTES, so the submission is empty
+    and the ladder stops at `EMPTY_PATCH` -- a `GradeFailure`, hence
+    `resolved: False`, an accusation that the model changed nothing, over a
+    limitation of the harness's own capture. `submodules_dirty_at_exit` is
+    what makes the row distinguishable from an honest empty run, and the
+    refusal takes it out of the denominator instead.
+
+    The submission here is an ORDINARY non-empty `TEXT_DIFF`, so nothing
+    about the diff is what triggers this.
+    """
+    graded = grade_run(
+        _record(submodules_dirty_at_exit={"vendor/libdep": "S.M."}),
+        _task(), "sha256:x", None, tmp_path / "cache", tmp_path / "artifacts",
+    )
+
+    assert graded.resolved is None
+    assert graded.not_graded_reason == \
+        NotGradedReason.SUBMODULE_EDIT_UNGRADABLE.value
+    assert graded.grade_failure is None
+    assert "vendor/libdep" in graded.not_graded_detail
+    assert not (tmp_path / "cache" / "grade-tree").exists()
+
+
+def test_an_untracked_file_inside_a_submodule_is_refused_too(tmp_path):
+    """The `U` bit, and it stages zero bytes exactly as the `M` bit does
+    (measured 2026-09-02). It is also the state `HARVESTING.md`'s "a suite
+    that writes inside the submodule is out" rule is about, whose consequence
+    is now grade-visible: such a task would refuse every collected run."""
+    graded = grade_run(
+        _record(submodules_dirty_at_exit={"vendor/libdep": "S..U"}),
+        _task(), "sha256:x", None, tmp_path / "cache", tmp_path / "artifacts",
+    )
+
+    assert graded.resolved is None
+    assert graded.not_graded_reason == \
+        NotGradedReason.SUBMODULE_EDIT_UNGRADABLE.value
+
+
+def test_the_states_the_diff_carries_are_left_to_the_gitlink_refusal():
+    """The two sub-states with neither `M` nor `U` set, and `git add -A`
+    stages a chunk for each: `SC..` is the gitlink moved by a commit inside,
+    245 bytes; `S...` is the directory removed, a `deleted file mode 160000`
+    at 199 bytes per path and identical seeded or unseeded. The diff carries
+    both, so `_gitlinks_touched` names them and this predicate must not --
+    two refusals for one shape is the mistake `not_graded_gate`'s docstring
+    already records."""
+    assert grader._submodule_edits(
+        _record(submodules_dirty_at_exit={"v": "SC.."})) == ()
+    assert grader._submodule_edits(
+        _record(submodules_dirty_at_exit={"v": "S..."})) == ()
+
+
+def test_a_record_that_never_measured_its_submodules_is_still_graded():
+    """`None` is "nobody looked" and `{}` is "read, nothing dirty", and the
+    VERDICT collapses them -- only here. Every stored record predates the
+    task-set lineage's schema 3.10.0 and `MIN_GRADABLE_SCHEMA` is `"3.0.0"`,
+    so a fail-closed reading
+    would refuse the whole corpus. The RECORD keeps the two apart
+    permanently."""
+    assert grader._submodule_edits(_record(submodules_dirty_at_exit=None)) == ()
+    assert grader._submodule_edits(_record(submodules_dirty_at_exit={})) == ()
+
+
+def test_the_gitlink_refusal_wins_when_a_submission_does_both(tmp_path):
+    """A commit inside a submodule with further edits left behind is `SCM.`
+    AND stages a 245-byte `index ...160000` chunk, so both refusals are true
+    of it. The gitlink reason is the more specific description -- it names
+    the commit that exists only in the run tree -- and it is the one already
+    in the stored vocabulary (GRADE_SCHEMA 1.2.0)."""
+    graded = grade_run(
+        _record(diff=_GITLINK_SUBMISSION,
+                submodules_dirty_at_exit={"vendor/libdep": "SCM."}),
+        _task(), "sha256:x", None, tmp_path / "cache", tmp_path / "artifacts",
+    )
+
+    assert graded.not_graded_reason == \
+        NotGradedReason.SUBMODULE_GITLINK_UNGRADABLE.value
+
+
+def test_content_in_an_uninitialised_submodule_is_refused_too(tmp_path):
+    """The second reader's marker, and refusing it is the same claim as
+    refusing `M`/`U`. With the scratch index seeded from `base_sha`, a file
+    an agent writes into an uninitialised submodule directory stages 0 bytes
+    and git emits no record for it -- and `grade_run` RE-MATERIALIZES the
+    tree, so that directory arrives empty and the content exists in neither
+    the diff nor the graded tree.
+
+    The marker is imported rather than typed: it is `schema`'s value space,
+    and a test that spelled it out would go on passing if the producer and
+    the consumer disagreed about it.
+    """
+    graded = grade_run(
+        _record(submodules_dirty_at_exit={
+            "vendor/libdep": SUBMODULE_UNINITIALISED_CONTENT}),
+        _task(), "sha256:x", None, tmp_path / "cache", tmp_path / "artifacts",
+    )
+
+    assert graded.resolved is None
+    assert graded.not_graded_reason == \
+        NotGradedReason.SUBMODULE_EDIT_UNGRADABLE.value
+    assert "vendor/libdep" in graded.not_graded_detail
+
+
+# --------------------------------------------------------------------------
 # 2-3. patch_non_empty and test_restore
 # --------------------------------------------------------------------------
 
@@ -595,6 +1130,118 @@ def test_a_checkout_failure_that_is_not_an_empty_prefix_is_an_error():
     assert result.environment_error_check == "test_restore"
 
 
+def test_a_submodule_under_the_test_prefix_is_excluded_from_rm_and_checkout():
+    """Measured 2026-09-02 against `tomlkit-514-inline-table-comment-
+    separator`: `tests/toml-test` is a submodule sitting under `tests.paths`.
+    `_gitlinks_touched` already refuses any submission that MOVES a gitlink,
+    so by the time this check runs the gitlink at every declared path still
+    equals the start state's -- the restore has nothing to put back there,
+    only a working tree for a blind `git rm -r` to destroy. `git ls-tree`
+    must run before either destructive command, and both the `rm` and the
+    `checkout` must carry the exclusion.
+    """
+    gitlink_sha = "c" * 40
+    blob_sha = "d" * 40
+    ls_tree_stdout = (
+        f"160000 commit {gitlink_sha}\ttests/toml-test\x00"
+        f"100644 blob {blob_sha}\ttests/test_items.py\x00"
+    )
+    env = FakeEnv(rules=[(["git", "ls-tree"], (0, ls_tree_stdout, ""))])
+    result = _ladder(env=env)
+
+    joined = [" ".join(argv) for argv in env.argvs]
+    ls_tree_at = next(
+        i for i, a in enumerate(joined) if a.startswith("git ls-tree")
+    )
+    rm_at = next(i for i, a in enumerate(joined) if a.startswith("git rm"))
+    checkout_at = next(
+        i for i, a in enumerate(joined) if a.startswith("git checkout")
+    )
+    assert ls_tree_at < rm_at < checkout_at
+
+    assert ":(exclude)tests/toml-test" in env.argvs[rm_at]
+    assert ":(exclude)tests/toml-test" in env.argvs[checkout_at]
+
+    restore = _check(result, "test_restore")
+    assert restore.status == "pass"
+    assert "left submodule tests/toml-test in place" in restore.detail
+
+
+def test_a_prefix_that_is_nothing_but_a_gitlink_skips_its_own_checkout():
+    """A declared prefix that IS the submodule (not a parent of it) has
+    nothing for `git checkout` to restore -- the exclusion above already
+    empties that pathspec, so the previous code issued a `git checkout` that
+    could only fail with the same message the "absent at the start state"
+    branch uses for a genuinely missing prefix, misattributing an excluded
+    gitlink as absent. The fix skips the per-prefix checkout for exactly this
+    case rather than filing a note that misnames the cause.
+    """
+    gitlink_sha = "c" * 40
+    ls_tree_stdout = f"160000 commit {gitlink_sha}\ttests/toml-test\x00"
+    env = FakeEnv(rules=[(["git", "ls-tree"], (0, ls_tree_stdout, ""))])
+    result = _ladder(env=env, task=_task(paths=("tests/toml-test",)))
+
+    assert not any(a[:2] == ["git", "checkout"] for a in env.argvs)
+
+    restore = _check(result, "test_restore")
+    assert restore.status == "pass"
+    assert "left submodule tests/toml-test in place" in restore.detail
+    assert "did not match any file" not in restore.detail
+
+
+def test_a_trailing_slash_on_the_declared_prefix_still_skips_its_checkout():
+    """`git ls-tree` never reports a trailing slash, but nothing upstream
+    strips one from a manifest's own `tests.paths` entry -- a declared prefix
+    of `tests/toml-test/` is the same gitlink as `tests/toml-test`, and an
+    exact string compare between the two would miss it: `prefix in
+    submodules` is False, the skip above never fires, and the per-prefix
+    `git checkout` runs against a pathspec `excludes` has already emptied,
+    landing in the "absent at the start state" branch and misattributing an
+    excluded gitlink as one that never existed. `.rstrip("/")` on the
+    manifest side is what keeps the two comparable.
+    """
+    gitlink_sha = "c" * 40
+    ls_tree_stdout = f"160000 commit {gitlink_sha}\ttests/toml-test\x00"
+    env = FakeEnv(rules=[(["git", "ls-tree"], (0, ls_tree_stdout, ""))])
+    result = _ladder(env=env, task=_task(paths=("tests/toml-test/",)))
+
+    assert not any(a[:2] == ["git", "checkout"] for a in env.argvs)
+
+    restore = _check(result, "test_restore")
+    assert restore.status == "pass"
+    assert "left submodule tests/toml-test in place" in restore.detail
+    assert "did not match any file" not in restore.detail
+
+
+def test_no_gitlink_leaves_the_rm_and_checkout_argv_byte_for_byte_unchanged():
+    """The fix must be invisible to every task in today's corpus: with no
+    `160000` entry under the declared prefixes, `excludes` is empty and the
+    `rm`/`checkout` pathspecs are exactly what they were before this change.
+    """
+    env = FakeEnv()
+    _ladder(env=env)
+    rm = next(a for a in env.argvs if a[:2] == ["git", "rm"])
+    checkout = next(a for a in env.argvs if a[:2] == ["git", "checkout"])
+    assert rm == [
+        "git", "rm", "-r", "-f", "--quiet", "--ignore-unmatch", "--", "tests/",
+    ]
+    assert checkout == ["git", "checkout", START_SHA, "--", "tests/"]
+
+
+def test_a_failed_gitlink_listing_is_an_environment_error_before_any_rm():
+    """The fallback for a silent `git ls-tree` failure is the same
+    accusation grading a broken restore already commits -- so it must never
+    fall through to the destructive `git rm`.
+    """
+    env = FakeEnv(
+        rules=[(["git", "ls-tree"], (128, "", "fatal: not a valid object name"))]
+    )
+    result = _ladder(env=env)
+    assert result.not_graded_reason == NotGradedReason.ENVIRONMENT_ERROR.value
+    assert result.environment_error_check == "test_restore"
+    assert not any(a[:2] == ["git", "rm"] for a in env.argvs)
+
+
 def test_agent_modified_tests_rides_the_ladder_result():
     touched = _ladder(_record(diff=TEST_TOUCHING_DIFF))
     assert touched.agent_modified_tests is True
@@ -701,12 +1348,101 @@ def test_a_grading_timeout_is_a_model_verdict():
     assert check.exit_code is None
 
 
+def test_every_graded_command_is_bounded_by_the_manifests_number():
+    """Checks 3, 4, 5, 6 and 7 all carry the `timeout` prefix, and all five
+    must carry the SAME number the gate used. A build that fits preflight's
+    bound and is killed under the grader's stamps `build_failed` -- a
+    GradeFailure, so `resolved: False` -- on every arm of the task,
+    permanently, in an append-only store, over an environment difference the
+    model never saw. That is the same shape as the `--index` stat-cache defect
+    one layer up."""
+    task = _task(
+        suite_timeout_s=1234,
+        build=("make", "build"),
+        typecheck=("mypy", "."),
+        lint=("ruff", "check", "."),
+    )
+    env = FakeEnv()
+    _ladder(task=task, env=env)
+
+    bounded = [argv for argv in env.argvs if argv[0] == "timeout"]
+    assert len(bounded) == 5, bounded
+    assert {argv[1] for argv in bounded} == {"1234"}
+
+
+def test_the_grade_records_the_bound_the_ladder_actually_used():
+    """`timed_out: True` alone stopped being readable the moment the bound
+    became per-task: a reader cannot tell a suite that blew 600 s from one
+    that blew 1800 s, and a re-grade under an edited manifest is a NEW line
+    whose disagreement with the old one is the finding. The bound has to be
+    on the line."""
+    task = _task(suite_timeout_s=1234)
+    ladder = _ladder(task=task)
+
+    assert ladder.suite_timeout_s == 1234
+    grade = build_grade_record(_record(), task, "sha256:image", None, ladder)
+    assert grade.suite_timeout_s == 1234
+
+
+def test_a_grade_where_no_bounded_command_ran_records_no_bound():
+    """`None`, not the manifest value. A record refused at the gate or at
+    check 1 ran nothing under any bound, and writing the configured number
+    there would be configuration reported as observation -- a claim about a
+    command that never happened."""
+    task = _task(suite_timeout_s=1234)
+    # `_record(diff="   \n")` is this file's empty-patch shape: the ladder
+    # stops at check 1 with EMPTY_PATCH, before anything is bounded.
+    ladder = _ladder(record=_record(diff="   \n"), task=task)
+
+    assert ladder.suite_timeout_s is None
+
+
+@pytest.mark.parametrize("check, matcher", [
+    ("typecheck", ["mypy"]),
+    ("f2p", is_f2p),
+    ("p2p", is_p2p),
+])
+def test_a_timeout_detail_names_the_bound_that_was_hit(check, matcher):
+    """The detail beside `timed_out: True` names the bound that killed the
+    command, and a stale module constant there is what this catches -- the
+    string said 600 while the argv carried 1234.
+
+    It does NOT distinguish argv-read from manifest-read: `cmd[1]` and
+    `runner.last_timeout_s` cannot differ from `task.budget.suite_timeout_s`
+    while `_Runner.run` is the only thing that builds the prefix, so that half
+    of the rule is a convention the code states and no test can falsify.
+    Said here rather than claimed, because a docstring that overclaims is the
+    reason the next reader trusts a check that is not making it."""
+    env = FakeEnv(rules=[(matcher, (124, "", ""))])
+    result = _ladder(
+        task=_task(suite_timeout_s=1234, typecheck=("mypy", ".")), env=env)
+
+    assert "hit the 1234s grading timeout" in _check(result, check).detail
+
+
+def test_the_gitleaks_bound_is_not_the_tasks_bound():
+    """The secret scan is a fixed-size scan of one diff, on the HOST, and
+    `_ContainerEnv.scan_secrets` has no task in scope. It keeps a constant --
+    renamed, because a constant called GRADE_TIMEOUT_S is precisely what
+    invites the next consumer to reach for it instead of the manifest."""
+    import bakeoff.grader as grader_module
+
+    assert not hasattr(grader_module, "GRADE_TIMEOUT_S")
+    assert grader_module.SCAN_TIMEOUT_S == 600
+
+
 # --------------------------------------------------------------------------
 # 5-6. f2p and p2p
 # --------------------------------------------------------------------------
 
 
 def test_f2p_environment_exit_is_never_stamped_on_the_model():
+    """The fixture reports no bare-module ERROR line (stdout is empty, stderr
+    is prose), so the confinement predicate finds nothing and refuses for
+    every code here -- including 2 and 4, which broadening 2 otherwise
+    accepts. This pins the FALLBACK path, not "exit 4 is never a model
+    verdict"; the accepted-shape branch is pinned separately, by the confined
+    fixtures below."""
     for code in (2, 3, 4, 5):
         env = FakeEnv(rules=[(is_f2p, (code, "", "collection error"))])
         result = _ladder(env=env)
@@ -729,6 +1465,243 @@ def test_f2p_failures_are_recorded_by_node_id():
     result = _ladder(env=env)
     assert result.grade_failure == GradeFailure.F2P_FAILED.value
     assert result.f2p_failed_node_ids == ("tests/test_calc.py::test_add",)
+
+
+@pytest.mark.parametrize("code,f2p_entry", [
+    # 4: a selected node id whose module will not import -- the shape f2p's
+    # own run makes when f2p declares a node id (row A, test_preflight.py's
+    # test_an_f2p_module_that_will_not_import_is_accepted_when_p2p_is_green).
+    (4, "tests/test_calc.py::test_add"),
+    # 2: a bare-module f2p entry collects the module path rather than a node
+    # id and gets the collection-interrupted exit a directory/module-path run
+    # gives (row B, same test). `f2p_modules` splits on "::" regardless, so
+    # containment holds identically either way -- EXIT_COLLECTION_FAILURES
+    # is (4, 2) and check 5 must treat both members alike.
+    (2, "tests/test_calc.py"),
+])
+def test_an_unfixed_collection_error_is_a_named_failure_not_an_ungradable_run(
+    code, f2p_entry
+):
+    """Otherwise a do-nothing arm outranks a half-working one.
+
+    On a task whose f2p module does not import at the start state, an arm that
+    changed nothing leaves it not importing: pytest exits 4 (or 2) and check 5
+    used to call that ENVIRONMENT_ERROR -- `resolved: None`, not graded. An
+    arm that half-fixed the import gets exit 1 and `resolved: False`. So in
+    any view that counts False, the arm that did NOTHING looks better than the
+    one that tried. A null standing in for a negative is the defect this
+    ladder is built around, and here it was pointing the wrong way.
+
+    Containment, not equality: a submission that fixed one of two f2p modules
+    errors on a subset and is still a model failure. Anything OUTSIDE the
+    declared modules stays an environment error -- see the next test."""
+    env = FakeEnv(rules=[
+        (is_f2p, (code,
+                  "ERROR: found no collectors for /repo/tests/test_calc.py::test_add\n"
+                  "ERROR tests/test_calc.py\n1 error in 0.01s\n",
+                  "")),
+    ])
+
+    result = _ladder(task=_task(f2p=(f2p_entry,)), env=env)
+
+    assert result.resolved is False
+    assert result.grade_failure == GradeFailure.F2P_FAILED.value
+    assert result.not_graded_reason is None
+    assert result.environment_error is None
+    # Observation, verbatim: pytest reported a MODULE, and a module is a node
+    # id -- the collector node. The absent `::` is what says so.
+    assert result.f2p_failed_node_ids == ("tests/test_calc.py",)
+
+
+def test_a_collection_error_outside_the_f2p_modules_stays_an_environment_error():
+    """A `False` is an accusation. A module erroring that no f2p id names is
+    indistinguishable from an image that lost a dependency, and stamping
+    f2p_failed on it would blame the model for the grader's environment. This
+    is also exactly what today's exit-2 route already does, so the branch above
+    is not allowed to widen it."""
+    env = FakeEnv(rules=[
+        (is_f2p, (4, "ERROR tests/test_unrelated.py\n1 error in 0.01s\n", "")),
+    ])
+
+    result = _ladder(env=env)
+
+    assert result.resolved is None
+    assert result.not_graded_reason == NotGradedReason.ENVIRONMENT_ERROR.value
+    assert result.environment_error_check == "f2p"
+    assert result.grade_failure is None
+
+
+def test_a_typoed_f2p_id_at_grade_time_is_still_an_environment_error():
+    """Same exit code, and the manifest is the thing that is wrong. `ERROR: not
+    found:` carries a colon, so nothing is reported, the predicate refuses, and
+    the grade does not accuse the model for the task author's typo."""
+    env = FakeEnv(rules=[
+        (is_f2p, (4, "ERROR: not found: /repo/tests/test_calc.py::test_add\n"
+                     "(no match in any of [<Module test_calc.py>])\n", "")),
+    ])
+
+    result = _ladder(env=env)
+
+    assert result.resolved is None
+    assert result.environment_error_check == "f2p"
+
+
+def test_check_6_still_reads_a_collection_error_as_an_environment_error():
+    """Check 6 is deliberately UNCHANGED. It is only reached when check 5
+    passed, which means every f2p module imported -- so a bare-module ERROR
+    there names something outside the task, and that is the environment. The
+    p2p argv is untouched too: no `--ignore`, no
+    `--continue-on-collection-errors`, so the graded command is still the one
+    preflight validated."""
+    env = FakeEnv(rules=[
+        (is_p2p, (2, "ERROR tests/test_other.py\n"
+                     "!!! Interrupted: 1 error during collection !!!\n", "")),
+    ])
+
+    result = _ladder(env=env)
+
+    assert result.resolved is None
+    assert result.environment_error_check == "p2p"
+    p2p_argv = next(argv for argv in env.argvs if is_p2p(argv))
+    assert not any(arg.startswith("--ignore") for arg in p2p_argv)
+    assert "--continue-on-collection-errors" not in p2p_argv
+
+
+def test_the_grader_version_moved_with_what_check_5_means():
+    """It gates resume -- a run already graded under the current grader is
+    skipped -- so a stored grade the gate skipped for agreeing with "the
+    current grader" would otherwise be one this grader disagrees with.
+
+    Pinned to a literal so a bump is a DELIBERATE edit rather than a side
+    effect: 2 -> 3 was check 5 reading a confined collection error as
+    `f2p_failed`; 3 -> 4 is checks 3-7 reading their `timeout` bound off
+    `task.budget.suite_timeout_s`, where a longer bound turns a `timed_out`
+    fail into a pass on the same stored input; 4 -> 5 is the gitlink refusal,
+    which takes a submission the ladder used to grade `False` out of the
+    denominator entirely; 5 -> 6 routes checks 5 and 6 through the runner
+    adapter and adds check 5's `did not run` environment branch, so what a
+    check MEANS changed even though no stored pytest verdict does; 6 -> 7 is
+    `_check_test_restore` excluding a `160000`-mode gitlink under a declared
+    test prefix from the `git rm`/`git checkout` restore, so a submodule
+    task's `not_graded_reason: environment_error` at `test_restore` is no
+    longer what a genuine fix reads as; 7 -> 8 is `pytest_adapter._FAILED_LINE`
+    learning `SUBFAILED` (fix 3, 2026-09-02), which changes the stored
+    `f2p_failed_node_ids`/`p2p_failed_node_ids` evidence on a `subTest`-only
+    failure and, through the oracle's quarantine, can change check 6's
+    verdict on a task whose p2p flake takes that shape.
+
+    `8 -> 9` is not a change to what any check asserts. It retires grades that
+    may carry an `APPLY_FAILED` produced by a stale bind mount rather than by
+    the submission (round 2 item 3, 2026-09-03): `grade-tree/<run_id>` was
+    reused across passes, the Docker VM served the cached empty directory, and
+    `scripts/grade.py`'s resume key is `(run_id, GRADER_VERSION)` alone, so
+    without the bump those lines are never revisited.
+
+    `9 -> 10` IS a change to what checks 5 and 6 run, on node tasks only
+    (round 2 item 1, 2026-09-03). The graded argv moved three ways: the
+    deselect branch became 1 + K commands whose deselections no longer cross
+    files; the jest per-file positional became mount-anchored and escaped,
+    where before it could match a second file; and jest stopped emitting
+    `--testPathIgnorePatterns`, which under 9 REPLACED the repository's own
+    ignore list on the one run that used it. A node grade produced under 9 was
+    made against a regression check with identically-titled tests silently
+    removed from it, so `p2p_failed_node_ids` and `resolved` can both
+    differ.
+
+    `10 -> 11` gives check 6 the `did not run` environment branch check 5 has
+    carried since 5 -> 6 (round 2 item 8, 2026-09-03), records the stale ids
+    in `GradeRecord.not_run_node_ids` from both checks, and subtracts the
+    quarantine from `_selected` at the source so a quarantined id is not
+    reported as one that did not run. Under 10, a node task with an explicit
+    `tests.p2p` whose declared ids had PARTLY stopped matching ran what still
+    matched, passed, and reached `state.passed("p2p")` at exit 0 -- a
+    `resolved: True` verdict over a regression check part of which never ran.
+    Two vocabulary changes ride with it: a wholly-stale explicit selection now
+    reads `environment_error` where it read `scope_collected_nothing`, and a
+    run where one declared id failed while another went stale now reads
+    `environment_error` where it read `p2p_regression` -- the second is the
+    only one that changes a `resolved` value (`False` -> `None`).
+
+    `11 -> 12` is `_renamed_gitlinks` (round 2 item 9, 2026-09-03). A pure
+    RENAME of a gitlink -- `mv sub newsub`, no new submodule commit -- carries
+    no `160000` mode line at all, so `_gitlinks_touched` never sees it, and a
+    pure rename of an ordinary file is byte-identical in shape. Under 11 such
+    a submission applied cleanly, moved only the index entry, and left the
+    submodule's files at the old path with an empty directory at the new one
+    -- so the ladder graded a tree the agent's move never reached and the
+    verdict was `resolved: False`, an accusation over content the harness's
+    own diff capture could not carry.
+
+    `12 -> 13` is `_submodule_edits` (round 2 item 17, 2026-09-03). A run
+    whose tree carried an uncommitted edit, an untracked file or an `rm` of
+    tracked content inside an INITIALISED submodule -- or content inside an
+    UNINITIALISED one -- is refused as `SUBMODULE_EDIT_UNGRADABLE` rather
+    than graded. `git add -A` stages ZERO BYTES for every one of those
+    (measured 2026-09-02, git 2.50.1), so under 12 the submission was empty
+    and the ladder stopped at `EMPTY_PATCH` -- a `GradeFailure`, hence
+    `resolved: False`. No verdict on today's corpus changes, because no
+    stored record carries `submodules_dirty_at_exit`; the bump lands with the
+    code that makes the divergence possible, on the `4 -> 5` argument, since
+    the resume gate keys on `(run_id, GRADER_VERSION)` alone."""
+    from bakeoff.grader import GRADER_VERSION
+
+    assert GRADER_VERSION == "13"
+
+
+def test_the_grade_says_which_runner_produced_its_numbers():
+    """`p2p_deselected`, `f2p_failed_node_ids` and `p2p_failed_node_ids` all
+    have framework-dependent shapes and units -- pytest's `p2p_deselected`
+    counts deselections it was asked to make; node's counts every test that
+    did not run, `it.skip` included. A reader summing across a mixed task set
+    adds those together and gets a number that is not a count of anything --
+    the defect `Versions.pricing_basis` exists to prevent one subsystem
+    over."""
+    record = _grade_record_for(framework="vitest")
+
+    assert record.framework == "vitest"
+    assert record.grade_schema_version.startswith("1.")
+
+
+def test_a_grade_written_before_the_field_existed_reads_as_unknown():
+    """`""`, not `"pytest"`. A default naming a real framework would be this
+    field claiming a fact about a record nobody measured."""
+    from bakeoff.grade_schema import GradeRecord
+
+    assert GradeRecord.__dataclass_fields__["framework"].default == ""
+
+
+def test_the_ladder_names_its_framework_off_the_manifest():
+    result = _ladder(task=_task())
+    assert result.framework == "pytest"
+    grade = build_grade_record(_record(), _task(), "sha256:image", None,
+                               result)
+    assert grade.framework == "pytest"
+
+
+def test_framework_survives_a_refusal_at_check_one():
+    """Set before the first check runs, so a record refused at EMPTY_PATCH
+    still names which adapter would have graded it -- unlike
+    `suite_timeout_s`, which stays `None` on this same path because no
+    bounded command ran."""
+    result = _ladder(record=_record(diff="   \n"))
+    assert result.grade_failure == GradeFailure.EMPTY_PATCH.value
+    assert result.framework == "pytest"
+
+
+def test_a_pre_container_gate_refusal_records_no_framework():
+    """`NO_TURNS` fires before `run_ladder` ever reads `task.tests.framework`
+    -- the ladder never got past the gate to learn which adapter it would
+    have used. `LadderResult.framework` stays `None`, and
+    `build_grade_record`'s `framework=ladder.framework or ""` is what turns
+    that `None` into the same `""` a pre-field grade reads as."""
+    result = _ladder(_record(turns_used=0))
+    assert result.not_graded_reason == NotGradedReason.NO_TURNS.value
+    assert result.framework is None
+
+    grade = build_grade_record(
+        _record(turns_used=0), _task(), "sha256:image", None, result
+    )
+    assert grade.framework == ""
 
 
 def test_p2p_rides_the_quarantine_and_the_scope():
@@ -1544,13 +2517,13 @@ def test_the_gitleaks_run_is_bounded_by_the_grading_timeout(monkeypatch,
     row instead of costing one named, re-runnable line.
     """
     import bakeoff.grader as grader
-    from bakeoff.grader import GRADE_TIMEOUT_S, _ContainerEnv
+    from bakeoff.grader import SCAN_TIMEOUT_S, _ContainerEnv
 
     seen = {}
 
     def fake_run(argv, **kw):
         seen.update(kw)
-        raise subprocess.TimeoutExpired(argv, GRADE_TIMEOUT_S)
+        raise subprocess.TimeoutExpired(argv, SCAN_TIMEOUT_S)
 
     monkeypatch.setattr(grader.subprocess, "run", fake_run)
 
@@ -1558,7 +2531,7 @@ def test_the_gitleaks_run_is_bounded_by_the_grading_timeout(monkeypatch,
                         scan_root=tmp_path / "grade-scan")
     result = env.scan_secrets({"src/calc.py": "x = 1"})
 
-    assert seen.get("timeout") == GRADE_TIMEOUT_S
+    assert seen.get("timeout") == SCAN_TIMEOUT_S
     # Exit 1 is gitleaks' "leaks OR error", which `--exit-code 42` exists to
     # make unreadable as a verdict -- so this lands in the environment branch
     # rather than being scored against the model.
@@ -1686,3 +2659,367 @@ def test_a_pass_that_captured_nothing_claims_no_artifacts_directory(
     assert second.artifacts_dir is None
     # And the refusal to claim one did not cost the earlier pass its evidence.
     assert (Path(first.artifacts_dir) / "f2p.out.gz").exists()
+
+
+# --- the runner adapter seam --------------------------------------------------
+
+
+def test_the_graders_runner_is_built_with_the_tasks_adapter():
+    """Both `_Runner` constructions in the grader take the adapter for the
+    task's declared framework. A pytest adapter on a jest task reads exit 1 --
+    which jest returns for a broken config -- as F2P_FAILED, and that is an
+    accusation against the model for the task author's error, permanently, in
+    an append-only store."""
+    import inspect
+
+    from bakeoff import grader
+
+    source = inspect.getsource(grader._check_f2p) + inspect.getsource(
+        grader._check_p2p)
+    assert source.count("_Runner(") == 2
+    assert "for_framework(" in source or "adapter=" in source
+
+
+def test_a_run_that_did_not_say_what_it_did_is_never_stamped_on_the_model():
+    """KIND_ENVIRONMENT reaches `state.environment`, never `state.fail`. This
+    is the Phase 0c failure stated over the new seam: a broken environment is
+    also a non-zero exit, and on vitest and jest it is the SAME non-zero exit
+    as a test failure."""
+    state = _run_f2p_with(exit_code=3, stdout="INTERNALERROR", report=None)
+
+    assert state.grade_failure is None
+    assert state.not_graded_reason == "environment_error"
+    assert state.environment_error_check == "f2p"
+
+
+def test_a_confined_load_error_is_still_an_f2p_failure():
+    """Broadening 2's rule, restated over the adapter. An arm that changed
+    nothing leaves the f2p module not importing; reading that as an environment
+    error made the do-nothing arm NOT GRADED while the arm that half-fixed it
+    graded False -- so in any view counting False the arm that did nothing
+    looked better than the one that tried."""
+    state = _run_f2p_with(exit_code=4, stdout="ERROR tests/new.py", report=None)
+
+    assert state.grade_failure == "f2p_failed"
+    assert state.f2p_failed_node_ids == ("tests/new.py",)
+
+
+def _node_task(f2p=("tests/a.test.js::does a thing",), p2p=()):
+    task = _task(f2p=f2p, p2p=p2p)
+    task.tests.framework = "vitest"
+    task.tests.runner = ("/node_modules/.bin/vitest", "run", "--no-cache")
+    return task
+
+
+def _run_node_f2p_with(*, report_shape,
+                       f2p=("tests/a.test.js::does a thing",)):
+    """One ladder run whose f2p invocation left this report behind.
+
+    The report is handed back the way the container hands it back -- the
+    runner writes the file, `_Runner` reads it with `cat <path>` -- because
+    that read is part of what is under test. `t_nomatch` is M1's shape
+    verbatim: a `-t` pattern matching no test exits **0** with every test
+    reported skipped, which is what a manifest naming a RENAMED test produces
+    and which no exit code anywhere would catch.
+    """
+    from bakeoff.runners.node_adapter import REPORT_PATH
+
+    shapes = {
+        "t_nomatch": [{"status": "skipped", "fullName": "does a thing"}],
+        "ran": [{"status": "failed", "fullName": "does a thing"}],
+    }
+    report = {
+        "testResults": [{
+            "name": "/repo/" + f2p[0].partition("::")[0],
+            "status": "passed" if report_shape == "t_nomatch" else "failed",
+            "assertionResults": shapes[report_shape],
+        }],
+    }
+    env = FakeEnv(rules=[
+        (lambda argv: argv[:1] == ["cat"] and argv[-1] == REPORT_PATH,
+         (0, json.dumps(report), "")),
+    ])
+    return _ladder(task=_node_task(f2p=f2p), env=env)
+
+
+def test_an_f2p_id_that_never_ran_is_the_graders_problem_not_the_models():
+    """Check 2 restores the test half, so the f2p names in the graded tree are
+    the MANIFEST's, not whatever the model wrote. An id that stopped matching
+    is therefore an environment fact, and stamping F2P_FAILED for it is an
+    accusation the model did not earn -- permanently, in an append-only store.
+
+    It has to be tested BEFORE the KIND_PASSED branch, and this shape is why:
+    the report the id never ran in is a report with nothing failing in it, at
+    exit 0, which a green-first ladder would absorb as a solved task."""
+    state = _run_node_f2p_with(report_shape="t_nomatch")
+
+    assert state.grade_failure is None
+    assert state.not_graded_reason == "environment_error"
+    assert "did not run" in state.environment_error
+
+
+def test_a_node_f2p_id_that_DID_run_and_failed_is_still_the_models_failure():
+    """The other half, so the branch above cannot be a blanket refusal of
+    every node run. A declared id that ran and failed is what the task exists
+    to measure."""
+    state = _run_node_f2p_with(report_shape="ran")
+
+    assert state.not_graded_reason is None
+    assert state.grade_failure == "f2p_failed"
+    assert state.f2p_failed_node_ids == ("tests/a.test.js::does a thing",)
+
+
+# --------------------------------------------------------------------------
+# 6b. the p2p `not_run` branch (round-2 item 8)
+# --------------------------------------------------------------------------
+
+# Both in one file, per `_run_node_p2p_with`'s docstring constraint.
+_P2P_A = "tests/b.test.js::keeps working"
+_P2P_B = "tests/b.test.js::renamed away"
+
+
+def _p2p_report(*entries):
+    """A one-file node report: `entries` is `(node_id, status)` pairs for
+    every id the run reached a terminal verdict for. An id declared but
+    absent from `entries` is exactly what a stale `-t` selection SKIPS --
+    which is what a rename or a quarantine both produce, and this builder
+    cannot and does not distinguish them; the caller's choice of `entries`
+    is what states which case a given test is about."""
+    file = entries[0][0].partition("::")[0]
+    return {
+        "testResults": [{
+            "name": "/repo/" + file,
+            "status": "passed",
+            "assertionResults": [
+                {"status": status, "fullName": node_id.partition("::")[2]}
+                for node_id, status in entries
+            ],
+        }],
+    }
+
+
+def _run_node_p2p_with(*, p2p, p2p_report, f2p_report=None, oracle=None,
+                       f2p=("tests/a.test.js::does a thing",)):
+    """One ladder run whose f2p AND p2p invocations left these reports
+    behind.
+
+    The `cat` rule is served a LIST, in order. The f2p and the p2p
+    invocations read the SAME `REPORT_PATH` -- `_Runner.run` writes a fixed
+    path so the gated argv equals the graded argv, and deletes the file
+    before each invocation. So the fake's `cat` rule takes a list of
+    results: the first read is check 5's, the second is check 6's. One
+    report for both would make check 5 read check 6's ids and refuse before
+    check 6 ever ran -- a fixture bug that looks exactly like the branch
+    under test firing.
+
+    Every declared id in these fixtures shares one file, so each check
+    issues one runner group and therefore one `cat`. That is a constraint,
+    not a coincidence: after round-2 item 1, `_Runner.run` reads one report
+    PER GROUP, and a multi-file id list would consume the ordered list above
+    in the wrong order.
+    """
+    from bakeoff.runners.node_adapter import REPORT_PATH
+
+    if f2p_report is None:
+        # Every declared f2p id present with "passed", so check 5 passes and
+        # control reaches check 6. Shape is `_run_node_f2p_with`'s verbatim.
+        f2p_report = _p2p_report(*((node_id, "passed") for node_id in f2p))
+    env = FakeEnv(rules=[
+        (lambda argv: argv[:1] == ["cat"] and argv[-1] == REPORT_PATH,
+         [(0, json.dumps(f2p_report), ""), (0, json.dumps(p2p_report), "")]),
+    ])
+    return _ladder(task=_node_task(f2p=f2p, p2p=p2p), env=env,
+                   oracle=oracle if oracle is not None else _oracle())
+
+
+def test_a_p2p_id_that_never_ran_is_the_graders_problem_not_the_models():
+    """The partial-staleness shape (`M1`, `verify_selected`'s docstring): a
+    `-t` pattern naming a test that no longer exists exits 0 with every test
+    reported skipped, so a renamed p2p id vanishes from the report rather
+    than producing any exit code a check could catch."""
+    state = _run_node_p2p_with(
+        p2p=(_P2P_A, _P2P_B), p2p_report=_p2p_report((_P2P_A, "passed")))
+
+    assert state.grade_failure is None
+    assert state.not_graded_reason == "environment_error"
+    assert state.environment_error_check == "p2p"
+    assert "did not run" in state.environment_error
+    assert _P2P_B in state.environment_error
+    assert state.not_run_node_ids == (_P2P_B,)
+
+
+def test_a_partly_stale_p2p_selection_is_not_absorbed_by_a_green_report():
+    """The ordering pin against `KIND_PASSED`. The ids that still match RUN,
+    PASS, and produce a report that is green at exit 0 -- so a ladder testing
+    `KIND_PASSED` first would return `resolved: True` over a regression check
+    part of which never ran."""
+    state = _run_node_p2p_with(
+        p2p=(_P2P_A, _P2P_B), p2p_report=_p2p_report((_P2P_A, "passed")))
+
+    assert state.resolved is None
+    assert _check(state, "p2p").status == "fail"
+
+
+def test_a_quarantined_p2p_id_is_not_reported_as_not_run():
+    """The blocking-finding pin (D1a / section 1.4 of the plan). `p2p_args`
+    folds the quarantine into the same `-t` as a negative lookahead, so a
+    quarantined test is SKIPPED, carries no terminal status, and is invisible
+    to `executed_names`. Without `pass_to_pass` subtracting `extra_deselect`
+    from `_selected`, every healthy node run of a task with one flake would
+    grade `not_graded` instead of `resolved: True`."""
+    state = _run_node_p2p_with(
+        p2p=(_P2P_A, _P2P_B), p2p_report=_p2p_report((_P2P_A, "passed")),
+        oracle=_oracle(quarantined=(_P2P_B,)))
+
+    assert state.not_graded_reason is None
+    assert state.resolved is True
+    assert state.not_run_node_ids is None
+
+
+def test_a_node_p2p_selection_that_wholly_missed_names_its_cause():
+    """D4 vs `KIND_NOTHING_RAN`. Both verdicts are `resolved: None`, so
+    nothing said about the model changes -- what changes is that the row
+    names the cause: the explicit branch has no SCOPE, so a wholly-empty
+    result is the *selection* matching nothing, a stale manifest, not a
+    declared scope that collected nothing."""
+    state = _run_node_p2p_with(
+        p2p=(_P2P_A, _P2P_B),
+        p2p_report={"testResults": [{
+            "name": "/repo/tests/b.test.js", "status": "passed",
+            "assertionResults": [],
+        }]})
+
+    assert state.not_graded_reason == "environment_error"
+    assert state.resolved is None
+    assert state.not_run_node_ids == (_P2P_A, _P2P_B)
+
+
+def test_a_node_p2p_id_that_DID_run_and_failed_is_still_the_models_failure():
+    """The other half, so the branch above cannot be a blanket refusal of
+    every node p2p run. Both declared ids present, one of them failing, is
+    exactly what the regression check exists to catch."""
+    state = _run_node_p2p_with(
+        p2p=(_P2P_A, _P2P_B),
+        p2p_report=_p2p_report((_P2P_A, "passed"), (_P2P_B, "failed")))
+
+    assert state.not_graded_reason is None
+    assert state.grade_failure == "p2p_regression"
+    assert state.p2p_failed_node_ids == (_P2P_B,)
+    assert state.not_run_node_ids is None
+
+
+def test_a_p2p_id_that_failed_beside_one_that_never_ran_is_still_not_graded():
+    """D4 vs `KIND_FAILED`. The failing id DID run -- that one piece of
+    evidence is unambiguous -- and the verdict is downgraded anyway, because
+    the check's claim is "the declared p2p set still passes" and a
+    partially-executed selection is not the run that claim describes."""
+    state = _run_node_p2p_with(
+        p2p=(_P2P_A, _P2P_B), p2p_report=_p2p_report((_P2P_A, "failed")))
+
+    assert state.not_graded_reason == "environment_error"
+    assert state.grade_failure is None
+    assert state.p2p_failed_node_ids is None
+    assert state.not_run_node_ids == (_P2P_B,)
+
+
+def test_the_deselect_branch_reports_no_p2p_ids_as_not_run():
+    """Today's default `_task()` (pytest, `p2p=()`), a clean `FakeEnv()`.
+    Pins that the branch cannot fire where no id list is declared -- the
+    leftover-`_selected` hazard `pass_to_pass`'s reset exists for."""
+    result = _ladder()
+
+    assert result.resolved is True
+    assert result.not_run_node_ids is None
+
+
+def test_a_pytest_p2p_run_never_reports_ids_as_not_run():
+    """The framework half of the test above. `test_grader.py`'s `is_p2p`
+    matcher is *pytest in argv AND `--deselect` in argv*, and on the explicit
+    branch with an EMPTY quarantine `pytest_adapter.p2p_args` emits
+    `list(selected)` and no `--deselect` -- so `is_p2p` would never fire and
+    an `is_f2p` rule would answer this check too. Deliberately no rule at
+    all: `FakeEnv`'s documented default (unmatched argv -> exit 0, empty
+    output) is what makes `resolved is True` reachable here. `not_run` is
+    structurally empty on pytest regardless -- `report_path()` is `None`, so
+    `_Runner.classify` never asks `verify_selected` -- and the exit code
+    (4, `ERROR: not found:`) carries this there instead."""
+    task = _task(p2p=("tests/test_calc.py::test_b",))
+    result = _ladder(task=task)
+
+    assert result.not_run_node_ids is None
+    assert result.resolved is True
+
+
+def test_the_ids_that_did_not_run_are_recorded_as_a_tuple_not_only_in_a_message():
+    """The anchor for the second mutation. A node `fullName` containing TWO
+    `", "` sequences makes the joined message not losslessly splittable back
+    into ids -- so the tuple is not redundant with the prose. (Deviation
+    from the plan's exact fullName text, which carried
+    only one comma and so split back cleanly; the id here is chosen to make
+    the plan's own stated assertion -- more than two parts -- literally
+    true.)"""
+    weird_id = "tests/b.test.js::formats a, b, and c"
+    state = _run_node_p2p_with(
+        p2p=(weird_id,),
+        p2p_report={"testResults": [{
+            "name": "/repo/tests/b.test.js", "status": "passed",
+            "assertionResults": [],
+        }]})
+
+    assert state.not_run_node_ids == (weird_id,)
+    assert len(state.not_run_node_ids) == 1
+    assert len(state.environment_error.split(", ")) > 2
+
+
+def test_only_one_check_can_write_the_ids_that_did_not_run():
+    """`_check_p2p` never runs at all once `_check_f2p` has raised `_Stop`
+    through `state.environment` -- so an f2p `not_run` is the only kind a
+    line can carry, and `environment_error_check` says which."""
+    result = _run_node_f2p_with(report_shape="t_nomatch")
+
+    assert result.environment_error_check == "f2p"
+    assert result.not_run_node_ids == ("tests/a.test.js::does a thing",)
+    assert _check(result, "p2p").status == "skipped"
+
+
+def test_two_grades_of_one_run_mount_different_host_paths(monkeypatch, tmp_path):
+    """A re-grade -- or a second event log carrying the same `run_id`, which
+    is 5 of the 7 stored ones -- used to mount `grade-tree/<run_id>` a second
+    time. The Docker VM serves that from its cache, EMPTY (measured
+    2026-09-02), and an empty tree makes `git apply` fail: APPLY_FAILED ->
+    `resolved: False`, against a submission the model really produced."""
+    import bakeoff.grader as grader
+
+    mounted: list[str] = []
+
+    class FakeContainer:
+        def __init__(self, **kw):
+            mounted.append(kw["repo_path"])
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def exec(self, argv, env=None):
+            return SimpleNamespace(exit_code=0, stdout="", stderr="")
+
+    monkeypatch.setattr(grader, "materialize", lambda *a, **kw: START_SHA)
+    monkeypatch.setattr(grader, "RunContainer", FakeContainer)
+    monkeypatch.setattr(grader, "run_ladder",
+                        lambda *a, **kw: _ladder_result())
+
+    record = _record()
+    cache = tmp_path / "cache"
+    for _ in range(2):
+        grade_run(record, _task(), "sha256:image", _oracle(),
+                  cache, tmp_path / "art")
+
+    assert len(mounted) == 2
+    assert mounted[0] != mounted[1]
+    assert all(p.endswith("/repo") for p in mounted)
+    # The stable key stays in the path, so a tree is still findable by run_id.
+    assert all(record.run_id in p for p in mounted)
+    # And the `finally` still fires: no leaf outlives its grade.
+    assert not list((cache / "grade-tree" / record.run_id).iterdir())

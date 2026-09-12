@@ -1073,3 +1073,36 @@ def test_re_grade_over_a_damaged_file_says_what_it_could_not_read(tmp_path):
 
     assert len(result["graded"]) == 1
     assert any("unreadable" in w for w in result["warnings"])
+
+
+def test_two_resolutions_of_one_task_mount_different_host_paths(
+    tmp_path, monkeypatch
+):
+    """Every second `grade.py` invocation re-mounted
+    `grade-preflight-tree/<task_id>`, and the VM served it empty."""
+    import scripts.grade as grade
+
+    mounted: list[str] = []
+
+    monkeypatch.setattr(grade, "build_task_image", lambda *a, **k: IMAGE)
+    monkeypatch.setattr(grade, "image_entrypoint", lambda image: [])
+    monkeypatch.setattr(grade, "materialize", lambda *a, **k: "a" * 40)
+    monkeypatch.setattr(grade, "ensure_oracle", lambda *a, **k: _oracle())
+
+    def fake_preflight(task, **kw):
+        mounted.append(str(kw["repo_path"]))
+        return PreflightResult(
+            task_id=task.task_id, task_version=task.task_version,
+            start_sha=kw["start_sha"], image=kw["image"],
+            manifest_digest=task.manifest_digest,
+            preflight_version=PREFLIGHT_VERSION,
+        )
+
+    monkeypatch.setattr(grade, "preflight", fake_preflight)
+
+    task = _task()
+    for _ in range(2):
+        grade.resolve_task(task, tmp_path, "sha256:base", force_preflight=True)
+
+    assert mounted[0] != mounted[1]
+    assert all(task.task_id in p for p in mounted)

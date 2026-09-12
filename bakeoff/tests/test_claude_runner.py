@@ -165,13 +165,68 @@ def test_container_env_does_not_forward_host_paths():
     directories that do not exist in the image, so `claude` would stop
     resolving -- and any path that did happen to exist would resolve to
     something the image never installed. HOME decides where the agent
-    writes state, with the same problem.
+    writes state, with the same problem. TZ is asserted absent for a
+    different reason: it is what makes an image-declared TZ safe to grant in
+    `_IMAGE_ENV_ALLOWED` -- unopposed here, it is unopposed on every process
+    that touches the image, the same as CI and HYPOTHESIS_STORAGE_DIRECTORY.
     """
     env = container_env(make_config())
     assert "PATH" not in env
     assert "HOME" not in env
+    assert "TZ" not in env
     assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:4000"
     assert env["CLAUDE_CONFIG_DIR"] == "/run/artifacts/r-001/claude-config"
+
+
+def test_pinned_env_keys_covers_the_key_that_is_only_set_when_non_empty():
+    """The sentinel in `pinned_env_keys` is the whole reason it is a function.
+
+    `_eval_env` emits ANTHROPIC_CUSTOM_HEADERS only when `custom_headers` is
+    truthy, and the dataclass default is "". Built from a default config, the
+    set would be missing exactly the key that carries the run id -- so a task
+    image could set it, the agent's exec would override it, and preflight and
+    the grader would read one value while the agent's calls carried another.
+    """
+    from bakeoff.claude_runner import pinned_env_keys
+
+    keys = pinned_env_keys()
+
+    assert "ANTHROPIC_CUSTOM_HEADERS" in keys
+    assert "ANTHROPIC_BASE_URL" in keys
+    assert "CLAUDE_CONFIG_DIR" in keys
+
+
+def test_pinned_env_keys_includes_the_host_allowlist_and_the_base_image_pin():
+    """PATH and HOME come from PASSTHROUGH_ENV; PYTHONDONTWRITEBYTECODE comes
+    from the base image and is the one member nothing in this process can
+    derive.
+
+    A task image overriding PATH would stop `claude` resolving; overriding
+    PYTHONDONTWRITEBYTECODE re-arms the stale-pyc defect that already made
+    verify_logger.py fail on 2 of 3 consecutive runs and shipped a `.pyc` as
+    the first hunk of a live submission diff.
+    """
+    from bakeoff.claude_runner import pinned_env_keys
+
+    keys = pinned_env_keys()
+
+    assert {"PATH", "HOME", "PYTHONDONTWRITEBYTECODE"} <= keys
+
+
+def test_pinned_env_keys_carves_out_tz_but_keeps_the_rest_of_the_passthrough():
+    """TZ is the one PASSTHROUGH_ENV member `tasks._IMAGE_ENV_ALLOWED` now
+    grants to a manifest, so it must NOT be pinned here or `_env_map` refuses
+    every declaration with "the harness sets itself" before the allowlist
+    check is ever reached -- measured, this was exactly what happened before
+    the carve-out. PATH and HOME stay pinned: `container_env` omits them the
+    same way it omits TZ, but a task-declared PATH would stop `claude`
+    resolving, which TZ cannot do."""
+    from bakeoff.claude_runner import pinned_env_keys
+
+    keys = pinned_env_keys()
+
+    assert "TZ" not in keys
+    assert {"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_FILE"} <= keys
 
 
 def test_config_digest_covers_environment_not_just_command():
@@ -231,6 +286,24 @@ def test_the_run_id_header_still_reaches_the_agent():
     # Absent, not empty, when unset: an empty header value is a header the
     # agent would still send.
     assert "ANTHROPIC_CUSTOM_HEADERS" not in container_env(make_config())
+
+
+def test_the_agents_env_names_no_key_a_task_image_may_set():
+    """The offline half of "the agent sees the same suite the gate does".
+
+    Docker merges an exec's environment into the image's with the EXEC's keys
+    winning (measured 2026-09-01, Docker 29.5.2), so the only way an image.env
+    value fails to reach the agent's `claude` process is `container_env`
+    naming the same key. This is that claim, over the whole allowed set rather
+    than over one example, and it is the assertion that turns a careless
+    future allowlist entry into a red suite instead of a task whose
+    determinism lever applies to the gate and not to the agent.
+    """
+    from bakeoff.tasks import _IMAGE_ENV_ALLOWED
+
+    env = container_env(make_config(custom_headers="X-Bakeoff-Run-Id: r-1"))
+
+    assert not (_IMAGE_ENV_ALLOWED & set(env))
 
 
 def test_config_digest_excludes_the_auth_token():

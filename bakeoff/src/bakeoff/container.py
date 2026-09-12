@@ -22,17 +22,27 @@ git is present.
 from __future__ import annotations
 
 import os
+import shutil
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from math import ceil
+from pathlib import Path
 from typing import Any, Callable
 
 import docker
 
-from bakeoff.schema import HostMetrics
+from bakeoff.schema import SUBMODULE_UNINITIALISED_CONTENT, HostMetrics
 
 REPO_MOUNT = "/repo"
+
+# How old a leaf under a `fresh_tree` parent has to be before the sweep may
+# take it. A graded record's tree lives minutes and an eval cell's is capped
+# by `wall_clock_timeout_s`, so a day is ~1000x the longest legitimate hold --
+# and the margin is what keeps the sweep from deleting a tree out from under
+# a concurrent `run_matrix` or `grade.py` running against the same cache.
+STALE_TREE_AGE_S = 86_400
 
 # How many times `git add -A` may lose the race against the agent's own
 # atomic writes before the failure is treated as real. Three, with a short
@@ -46,12 +56,212 @@ _ADD_RETRY_DELAY_S = 0.2
 # real index would stage the agent's in-progress work under it: a later
 # commit by the agent would sweep in files it never staged, and its
 # `git status` would disagree with reality. Nothing here writes to
-# .git/index at all.
+# .git/index at all -- the SUPERPROJECT's index, which is the one this rule
+# is about. A submodule's is a different file: measured 2026-09-03, the
+# `git add -A` below refreshes `.git/modules/<name>/index`'s stat cache
+# (content md5 unchanged), which `git --no-optional-locks add -A` would
+# suppress at byte-identical output. Filed in `TASKS.md`.
 SNAPSHOT_INDEX = "/tmp/bakeoff-snapshot-index"
 
 
 class ContainerError(RuntimeError):
     pass
+
+
+def fresh_tree(parent: Path) -> Path:
+    """A host directory under `parent` that NO container has ever mounted.
+
+    The Docker VM caches the directory it serves for a bind-mount source. A
+    host path that is `rmtree`d and re-created underneath that cache is served
+    from it and arrives EMPTY inside the container -- measured 2026-09-02,
+    four cycles on one path gave `[files], [], [files], []`. An empty mount
+    then RESOLVES: an empty `/repo` is `No test files found` at exit 1 under
+    vitest and jest, the same exit a red suite gives, and `git apply` fails,
+    which the grader reads as APPLY_FAILED -> `resolved: False`; an empty
+    CLAUDE_CONFIG_DIR is a run that parses to zero turns, zero tokens and zero
+    cost with the tokens already spent. So the failure is not flakiness, it is
+    a passing measurement of nothing, an accusation against a model, or a lost
+    cell. `RunContainer._assert_repo_mounted` is the post-condition for the
+    `/repo` case; this is the cause, for all of them.
+
+    THE RULE THIS FUNCTION EXISTS TO KEEP: a host path that has been
+    bind-mounted once is never bind-mounted again. Callers may `rmtree` a tree
+    this returned -- that is safe precisely because the allocator will not hand
+    the same name out a second time -- but they may never write into a path
+    they removed.
+
+    The stable key (`run_id`, `task_id`, the cell label, the artifacts root)
+    stays in the path as the PARENT, so an operator can still find a tree by
+    grepping the cache layout; only the leaf is unique. The key-level directory
+    survives cleanup as an empty husk -- see `_sweep_stale_trees` for what that
+    costs and what is and is not collected.
+
+    `uuid4`, not `tempfile.mkdtemp`: mkdtemp hard-codes mode 0o700, and the
+    container runs as uid 1000 while the host directory is owned by the
+    operator, so on a Linux host (no ownership remapping) the mount would be
+    unreadable to the agent. `materialize` creates its trees with the default
+    mode and this stays beside it.
+    """
+    parent = Path(parent)
+    parent.mkdir(parents=True, exist_ok=True)
+    _sweep_stale_trees(parent)
+    tree = parent / uuid.uuid4().hex
+    # `exist_ok=False`, deliberately: a collision here is a bug and has to be
+    # loud. Papering over it by reusing the directory is the defect itself.
+    tree.mkdir()
+    return tree
+
+
+def _sweep_stale_trees(parent: Path, max_age_s: float = STALE_TREE_AGE_S) -> None:
+    """Remove leaves under `parent` that no live process can still be using.
+
+    Husks are the price of `fresh_tree`'s rule: a leaf is removed by the
+    process that allocated it, so a process killed before that leaves one
+    behind, and nothing deletes it later -- deleting it later, BY NAME, is the
+    defect this whole mechanism removes.
+
+    AGE-BASED, never "every sibling". `run_matrix` and `grade.py` run against
+    one cache at the same time on purpose, and deleting a tree out from under
+    a live container is worse than leaking an inode. The leaf's own `st_mtime`
+    is effectively its ALLOCATION time -- everything a run writes goes into a
+    child of it and never touches the leaf's own mtime -- so a 24 h bound is
+    ~1000x the longest legitimate hold (a graded record's tree lives minutes,
+    an eval cell's is capped by `wall_clock_timeout_s`) rather than a bet on
+    what a long run does to its directory.
+
+    LEAF LEVEL ONLY, so this collects a husk only under a key that is
+    allocated under again -- true of `preflight-tree/<task_id>` and
+    `grade-preflight-tree/<task_id>` on every invocation, and not true of a
+    `grade-tree/<run_id>` or a per-cell tree. Sweeping the key level too would
+    collect those, and would `rmtree` a directory a concurrent allocator has
+    just created and is about to put a leaf under, whose `mkdir` then raises
+    `FileNotFoundError`.
+
+    Never raises. A sweep failure must not cost the run it is allocating for
+    -- the rule `HostSampler.start` and `checkpoints.maybe_capture` keep.
+    """
+    cutoff = time.time() - max_age_s
+    try:
+        entries = list(os.scandir(parent))
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            if entry.is_dir() and entry.stat().st_mtime < cutoff:
+                shutil.rmtree(entry.path, ignore_errors=True)
+        except OSError:
+            continue
+
+
+#: The submodule-state read, word for word. Every token is load-bearing and
+#: each was measured on 2026-09-02 (git 2.50.1); see `submodule_states`.
+_SUBMODULE_STATUS_ARGV = [
+    "git", "--no-optional-locks", "status",
+    "--porcelain=v2", "--ignore-submodules=none", "-z",
+]
+
+#: The gitlink path set, same rule and same reason as
+#: `preflight._gitlink_paths`: paths come from git, NUL-delimited, never from
+#: a display line. It is also the short-circuit -- no gitlinks, no probe.
+_GITLINK_ARGV = ["git", "ls-files", "-s", "-z"]
+
+#: Which declared gitlink directories hold content, for the paths passed as
+#: "$@". POSIX sh, no bashisms, every branch measured 2026-09-02 (M7).
+#:
+#: `[ -e "$p/.git" ]` is the INITIALISED test: a modern submodule has a `.git`
+#: FILE there and an older one a directory, so `-e` covers both. It also
+#: excludes an agent who ran `git init` in a de-initialised gitlink directory,
+#: and the reader that owns THAT shape is the first one, not the diff: measured
+#: 2026-09-03, the v2 stream reads `1 .M S..U ... vendor/libdep` while
+#: `snapshot_diff` stages 0 bytes and carries no `160000` line at all. The shape
+#: `grader._gitlinks_touched` owns is the other one -- a `git init` in a TRACKED,
+#: non-gitlink subdirectory, which stages `new file mode 160000`.
+#:
+#: `find -mindepth 1 -maxdepth 1 -print -quit` rather than `ls -A`: it stops at
+#: the first entry, and its output is empty-or-not rather than a list that has
+#: to be parsed. Command substitution strips trailing newlines, which is why
+#: the test is `-n` on ONE printed entry and never a count of lines. A missing
+#: directory writes to stderr, which is discarded, and prints nothing.
+#:
+#: `if`/`then` blocks and a closing `exit 0`, never `[ ... ] && continue`: the
+#: loop's last command decides the script's exit status, so a trailing false
+#: test makes `checked_exec` raise on a healthy tree.
+_UNINITIALISED_CONTENT_SH = '''
+for p in "$@"; do
+  if [ -e "$p/.git" ]; then
+    continue
+  fi
+  if [ -n "$(find "$p" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
+    printf '%s\\0' "$p"
+  fi
+done
+exit 0
+'''
+
+
+def _parse_status_v2(out: str) -> dict[str, str]:
+    """Submodule sub-states out of `git status --porcelain=v2 -z`.
+
+    Records are NUL-terminated, and the count of items per record is NOT
+    uniform: a `2` (rename/copy) record occupies TWO -- the new path, then the
+    original. Measured 2026-09-02 (git 2.50.1); the five shapes are in round 2
+    item 17's plan under M3.
+
+    ADVANCING BY TWO AFTER A `2` IS LOAD-BEARING, not hygiene. The second item
+    is a PATH, which is repository-authored text, and a path may be named so
+    that it reads as a record: a file named
+
+        `1 .M S.M. 160000 160000 160000 aaaaaaa bbbbbbb sneakysub`
+
+    renamed to `ordinary.py` puts exactly that string in the second slot, and a
+    parser that reads it as a record files a submodule state for `sneakysub` on
+    a repository that has no submodule at all. Same rule as `_GITLINK_MODE`'s:
+    content must never reach column zero of a record.
+
+    Fields are split by COUNT (`split(" ", 8)` / `split(" ", 9)`), so a path
+    containing spaces survives -- verified against `a dir/f.txt` and against
+    the forged name above. A record too short to index contributes nothing
+    rather than raising: this is called from the agent's stdout loop, and
+    `preflight._gitlink_paths`'s `partition` comment records what an
+    unadvertised `IndexError` costs there.
+    """
+    items = out.split("\0")
+    states: dict[str, str] = {}
+    index = 0
+    while index < len(items):
+        item = items[index]
+        if item.startswith("2 "):
+            index += 2
+            fields = item.split(" ", 9)
+            path_at = 9
+        elif item.startswith("1 "):
+            index += 1
+            fields = item.split(" ", 8)
+            path_at = 8
+        else:
+            # `u`, `?`, `!`, a `#` header this argv never asks for, and the
+            # trailing empty item after the final NUL. One item, no entry.
+            index += 1
+            continue
+        if len(fields) > path_at and fields[2].startswith("S"):
+            states[fields[path_at]] = fields[2]
+    return states
+
+
+def _gitlinks_from_ls_files(out: str) -> tuple[str, ...]:
+    """Every 160000 entry's path, from `git ls-files -s -z`.
+
+    `partition`, never `split("\\t", 1)[1]`: a record beginning `160000 ` with
+    no TAB makes the indexed form raise `IndexError`, and this is called from
+    the agent's stdout loop. A record that yields no path contributes none.
+    """
+    paths = []
+    for record in out.split("\0"):
+        if record.startswith("160000 "):
+            _meta, _tab, path = record.partition("\t")
+            if path:
+                paths.append(path)
+    return tuple(paths)
 
 
 @dataclass(frozen=True)
@@ -137,11 +347,99 @@ class RunContainer:
             labels={"bakeoff.eval_agent": "1"},
             **network_kwargs,
         )
+        self._assert_repo_mounted()
         if self.install_git:
             self.exec(["sh", "-c", "command -v git || apk add --no-cache git"])
         if self.base_sha:
             self.exec(["git", "config", "--global", "--add", "safe.directory", REPO_MOUNT])
         return self
+
+    def _assert_repo_mounted(self) -> None:
+        """Refuse a container whose bind mount did not land.
+
+        The trap is the Docker VM's mount cache, and it is NOT the macOS
+        `/var/folders` one (which the harness's `--basetemp` rule covers). A
+        host path the VM DOES share, removed and re-materialized underneath it
+        between containers, is served from a stale cache and comes up EMPTY:
+        measured 2026-09-02, four cycles of rmtree -> materialize -> new
+        container on one path gave `[files], [], [files], []`. Six production
+        call sites reused a path that way until 2026-09-03; each now allocates
+        through `fresh_tree`, so no container mounts a path an earlier one did.
+
+        THE CHECK STAYS, because the cause it caught is one of several. A path
+        the Docker VM does not share at all (`/var/folders`, the `--basetemp`
+        convention) is untouched by that fix; a new call site that builds a
+        path by hand instead of calling `fresh_tree` is not covered by it; and
+        a mount can fail to land for reasons that have nothing to do with the
+        path. This is the post-condition, `fresh_tree` is the cause.
+
+        It covers `REPO_MOUNT` and only `REPO_MOUNT`. The `CLAUDE_CONFIG_DIR`
+        mount is fresh by allocation and has NO mount post-condition of its
+        own: a freshly allocated config directory is supposed to be empty on
+        the host, so there is nothing here for a mount-time check to compare,
+        and `runner.py`'s own read-back answers for the allocator rather than
+        for the mount.
+
+        It is here because an empty `/repo` RESOLVES rather than failing. Both
+        node frameworks answer it with `No test files found` at exit **1**, the
+        same exit a failing test gives, so a gate passes while measuring
+        nothing; on the offline grader the same emptiness is `APPLY_FAILED`,
+        which stamps `resolved: False` -- an accusation that the model's patch
+        did not work -- over an environment difference the model never saw.
+        That is `_checked_exec`'s rule one layer up: an empty answer that is
+        byte-identical to a legitimate one is the failure this class refuses to
+        pass along quietly.
+
+        CONDITIONED ON THE HOST SIDE, because an empty answer is evidence only
+        when there was something to see: `oracle.py` and the grader both start
+        a container over a directory they are about to populate, and refusing
+        those would turn a defensive check into an outage.
+
+        THE REMOVAL IS HALF THE GUARANTEE. `__exit__` is not invoked when
+        `__enter__` raises, and this container carries `bakeoff.eval_agent` --
+        the label `HostSampler` counts peers by, and the one that makes a
+        leaked container findable -- so a refusal that left it running would
+        file `contention_flag: true` against every concurrent run for as long
+        as it survived.
+
+        The raise reaches `execute_run` inside its `try` (the `with
+        RunContainer` sits there), so a run refused here still produces a
+        CRASHED record naming this in `crash_error`, and never no record.
+
+        `-print -quit` rather than a bare listing: the question is whether
+        ANYTHING is there, and stopping at the first entry keeps the cost flat
+        on a large tree.
+        """
+        try:
+            host_empty = not any(os.scandir(self.repo_path))
+        except OSError:
+            # An unreadable host path is not this check's finding to make --
+            # whatever comes next will fail on it loudly and with the right
+            # message. Refusing here would rename that failure.
+            return
+        if host_empty:
+            return
+        seen = self.exec(
+            ["find", REPO_MOUNT, "-mindepth", "1", "-maxdepth", "1",
+             "-print", "-quit"]
+        )
+        if seen.stdout.strip():
+            return
+        try:
+            self._container.remove(force=True)
+        except Exception:  # noqa: BLE001 - the raise below is the real signal
+            pass
+        finally:
+            self._container = None
+        raise ContainerError(
+            f"{REPO_MOUNT} is empty inside the container but {self.repo_path} "
+            "is not: the bind mount did not land (the Docker VM serves a "
+            "reused host path from a stale cache -- measured, every other "
+            "container on one path). Nothing downstream can see this: an "
+            "empty /repo is byte-identical to a red suite on both node "
+            "frameworks (`No test files found`, exit 1) and to APPLY_FAILED "
+            "on the grader. Use a fresh path per container."
+        )
 
     def __exit__(self, *_exc: object) -> None:
         if self._container is not None:
@@ -271,8 +569,52 @@ class RunContainer:
         lost from the section 5.5 curve. The failure is preserved and raised
         if it survives every attempt: a stat error that is not a race is a
         broken container and must not be smoothed over.
+
+        THE SCRATCH INDEX IS SEEDED FROM `base_sha` FIRST, and it is not an
+        optimisation. `GIT_INDEX_FILE` starts EMPTY, and `git add -A` does not
+        descend into a gitlink path -- so for a submodule left uninitialised on
+        purpose (`submodules_unneeded`) the staged index has no entry and the
+        diff reports the gitlink as DELETED. Measured 2026-09-02, git 2.50.1:
+        199 bytes on a clean fixture tree and 239 on `tobymao/sqlglot` at
+        `05eed63b...`, `deleted file mode 160000`, with the agent having done
+        nothing. `grader._GITLINK_MODE` matches that line, so every such
+        submission would be refused as SUBMODULE_GITLINK_UNGRADABLE and every
+        checkpoint would carry a phantom the section 5.5 curve cannot tell
+        from a real deletion. `git read-tree <base_sha>` makes the index start
+        as the tree the diff is about to be taken against, so `add -A` UPDATES
+        it rather than rebuilding it from a scan that cannot see the gitlink.
+        The seed and the diff read the SAME parameter, so they can never
+        disagree -- and the parameter named `base_sha` holds `start_sha` at run
+        time (`matrix` -> `runner` -> `checkpoints`), which is why the
+        committed test half does not appear as additions: `add -A` reconciles
+        every worktree-visible path anyway, so the seed survives only where git
+        is blind, which is the gitlink and nothing else. Measured 0 bytes
+        seeding from either sha. Unconditional, because this class has no
+        manifest and must not gain one: measured, a repository with no
+        submodule diffs BYTE-IDENTICALLY either way (384 bytes,
+        `cmp`-identical, over a modification, an addition, a deletion and an
+        ignored untracked file). It also removes a second phantom that predates
+        any of this -- a file tracked at `base_sha` that also matches a
+        `.gitignore` pattern is skipped by `add -A` from an empty index and was
+        reported DELETED (460 bytes vs 135, measured).
+
+        `checked_exec`, so a failed seed RAISES rather than falling through:
+        the fallback for a silent failure here is the phantom deletion, which
+        is the accusation this paragraph exists to prevent. Containment
+        already lives one layer up in `checkpoints.maybe_capture`.
+
+        The seed is not free: `read-tree` discards the scratch index's stat
+        cache, so the `add -A` that follows re-hashes every tracked file
+        rather than trusting an unchanged mtime. Measured 2026-09-02 on a
+        358-file, 70 MB `sqlglot` worktree, three reps each: unseeded 0.01 s,
+        seeded 0.04 s -- a 4x multiplier, ~30 ms absolute. The cost scales
+        with the tracked bytes in the worktree, not with the size of the
+        change (`trucking-2`'s `base_sha` tracks 2,902 site-packages files on
+        top of its source tree); if that ever binds, the remedy is a narrower
+        base for the read-tree, never a conditional seed.
         """
         env = {"GIT_INDEX_FILE": SNAPSHOT_INDEX}
+        self.checked_exec(["git", "read-tree", base_sha], env=env)
         for attempt in range(_ADD_ATTEMPTS):
             result = self.exec(["git", "add", "-A"], env=env)
             if result.exit_code == 0:
@@ -287,6 +629,126 @@ class RunContainer:
         )
         files = [line for line in names.stdout.splitlines() if line.strip()]
         return diff.stdout, files
+
+    def submodule_states(self) -> dict[str, str]:
+        """What the submission diff cannot carry: per-gitlink dirt.
+
+        `snapshot_diff` normalizes over everything the agent did OUTSIDE a
+        gitlink boundary and nothing inside one. Measured 2026-09-02 (git
+        2.50.1) through this class's own command sequence -- scratch-index
+        `git add -A`, then `git diff --cached <base>`: an uncommitted edit to a
+        tracked file inside an INITIALISED submodule stages **0 bytes**, an
+        untracked file inside one stages 0 bytes, and an `rm` of tracked
+        content inside one stages 0 bytes. A commit inside one stages 245
+        bytes (an `index <old>..<new> 160000` chunk plus `Subproject commit`),
+        and a gitlink whose directory has been REMOVED stages a `deleted file
+        mode 160000` chunk, 199 bytes per path. So the two states the diff
+        carries are exactly the two `grader._gitlinks_touched` already refuses,
+        and the states it does not carry are recorded here instead. Without
+        this field a run that edited a submodule is byte-identical to one that
+        did nothing, and the offline grader stamps `EMPTY_PATCH` --
+        `resolved: False`, an accusation -- on it, permanently.
+
+        EVERY TOKEN OF THE ARGV IS LOAD-BEARING.
+
+        `--no-optional-locks`, because a plain `git status` REWRITES the index
+        -- and the submodule's index too. Both were stamped to `1577865600`
+        and the command re-run: after this argv both are still `1577865600`,
+        after a plain `status` both read the wall clock. `SNAPSHOT_INDEX`'s own
+        comment states the rule this protects -- *nothing here writes to
+        .git/index at all* -- and it is not hygiene: this runs from inside the
+        agent's stdout loop, concurrently with the agent's own git.
+
+        `--ignore-submodules=none`, because three config sites silence the
+        entry completely without it, measured each in isolation:
+        `submodule.<name>.ignore=all` in `.git/config`, `diff.ignoreSubmodules
+        =all` in `.git/config`, and `submodule.<name>.ignore=all` in
+        **`.gitmodules`** -- which is repository-authored and ships in the
+        upstream tree the task was cut from. Without the flag a file the task
+        author never wrote disarms the record.
+
+        `-z`, the same rule `preflight._gitlink_paths` and `tasks._numstat`
+        follow: the path field is C-quoted under `core.quotePath` and
+        space-delimited otherwise, so paths come from git's own delimiter and
+        never from a regex over a display line.
+
+        `git submodule status` is REJECTED, not merely unused: it reports a
+        **space** marker for all three states this method exists for, because
+        it compares the submodule's HEAD against the index gitlink and says
+        nothing about the submodule's working tree. Its `+` fires only on the
+        one state the diff already carries. It also costs ~91 ms against this
+        argv's ~14 ms (100 iterations, warm), so the cheaper read is also the
+        strictly more informative one.
+
+        A SECOND READER SITS BESIDE IT, because git sees only half of this.
+        With the scratch index seeded from `base_sha`, `git add -A` does not
+        descend through a gitlink boundary -- so content an agent writes into
+        an UNINITIALISED submodule directory is invisible to the diff, to
+        `git status` and to the v2 stream alike: recorded nowhere. So each
+        `160000` path from `git ls-files -s -z` whose directory carries no
+        `.git` is probed with `find -mindepth 1 -maxdepth 1 -print -quit`, and
+        one that prints anything is filed under
+        `schema.SUBMODULE_UNINITIALISED_CONTENT`.
+
+        The two readers are measured disjoint, and the rule is a DIRECTORY
+        test rather than a `.git` test: on a path with no `.git`, v2 fires only
+        when the directory is **absent** (it emits `1 .D S... ...` for a removed
+        gitlink) and the probe fires only when it is **non-empty**. Absent and
+        non-empty are mutually exclusive, so no path can be filed twice. The
+        `.git` test is what makes the probe CHEAP -- an initialised path is
+        never probed at all -- not what keeps the two apart.
+
+        The value space of the first reader is git's own `S<c><m><u>` grammar,
+        each slot its letter or `.`: eight values, of which seven are measured
+        (`S...`, `S.M.`, `S..U`, `SC..`, `SCM.`, `S.MU`, `SCMU`; `SC.U` follows
+        from the grammar and was not constructed). Recorded raw and
+        unenumerated, for the reason `_parse_submodule_status` keeps `marker`
+        beside `initialised`: the record is an observation and the verdict is
+        derived from it elsewhere. Here the marker also says WHICH READER
+        spoke -- git's is always four characters beginning `S`, the
+        filesystem's is one character.
+
+        `checked_exec`, never `exec`: an empty stdout from a failed
+        `git status` is byte-identical to a tree with no dirty submodule, and
+        reading that silence as "clean" is the fabricated measurement
+        `checked_exec` exists to prevent.
+
+        ONE METHOD, ONE CONTAINMENT, ONE RESULT. `{}` is a measurement --
+        "read, nothing dirty", which includes "no submodules" and an
+        uninitialised submodule whose directory is genuinely empty. This
+        method never returns `None`: it either returns a complete mapping or
+        raises, so a half-read can never present itself as a whole one. The
+        containment is `checkpoints._capture`'s, and `None` there means "not
+        read".
+        """
+        states = _parse_status_v2(
+            self.checked_exec(list(_SUBMODULE_STATUS_ARGV)).stdout
+        )
+        gitlinks = _gitlinks_from_ls_files(
+            self.checked_exec(list(_GITLINK_ARGV)).stdout
+        )
+        for path in self._uninitialised_with_content(gitlinks):
+            states[path] = SUBMODULE_UNINITIALISED_CONTENT
+        return states
+
+    def _uninitialised_with_content(
+        self, gitlinks: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        """The declared gitlink directories that hold content git will not
+        report. Empty tuple without an exec when the tree has no gitlink at
+        all, which is every task in today's corpus but one.
+
+        `sh -c <script> sh <paths...>` -- the paths go through `"$@"` and never
+        through string interpolation, so a gitlink path containing a space, a
+        quote or a `$` is passed verbatim (the space is measured). `"sh"` in
+        the `$0` slot is what makes `"$@"` start at the first real path.
+        """
+        if not gitlinks:
+            return ()
+        result = self.checked_exec(
+            ["sh", "-c", _UNINITIALISED_CONTENT_SH, "sh", *gitlinks]
+        )
+        return tuple(path for path in result.stdout.split("\0") if path)
 
     def restore_paths(self, base_sha: str, paths: list[str]) -> None:
         """Overwrite paths with their base_sha contents. Used to restore

@@ -85,6 +85,69 @@ def git_container(image_digest, tmp_path):
         yield container
 
 
+@pytest.fixture
+def git_container_factory(image_digest, tmp_path):
+    """`git_container`, but the caller builds the repository.
+
+    `git_container` yields one fixed tree -- `tests/test_a.py`, one commit, no
+    submodule, no `.gitignore` -- and three of the snapshot-seed tests need
+    three different ones: a gitlink over an empty directory, a tracked file
+    matching `.gitignore`, and a tree an agent `git init`s inside. A fixture
+    per shape would be three near-copies of the same twenty lines.
+
+    Yields `make(build) -> (RunContainer, start_sha)`; `build(repo: Path)`
+    writes files and may run git commands in `repo`, after which the factory
+    commits everything with a fixed identity and starts the container. The
+    container is closed at teardown through an `ExitStack`.
+
+    THE GITLINK IS FABRICATED, with no second repository and no file
+    transport. Measured 2026-09-02, git 2.50.1: `mkdir -p vendor/libdep` plus
+    `git update-index --add --cacheinfo 160000,<40 hex>,vendor/libdep` and a
+    commit gives a tree whose `git ls-files -s` carries the `160000` entry, an
+    empty directory at that path, and `git status --porcelain` empty --
+    exactly the declared-unneeded state, with no `git submodule add` and no
+    `protocol.file.allow=always`.
+
+    One caveat: the fabricated sha resolves to nothing, so `git submodule
+    status` in such a tree exits non-zero with "no submodule mapping found in
+    .gitmodules". Irrelevant here -- these tests call `snapshot_diff` and
+    nothing else -- but it means this fixture must NOT be reused for a
+    preflight test, which reads exactly that command.
+    """
+    import contextlib
+
+    from bakeoff.container import RunContainer
+
+    built = []
+    with contextlib.ExitStack() as stack:
+        def make(build):
+            repo = tmp_path / f"repo-{len(built)}"
+            built.append(repo)
+            repo.mkdir()
+
+            def run(*args):
+                return subprocess.run(args, cwd=repo, check=True,
+                                      capture_output=True)
+
+            run("git", "init", "-q")
+            run("git", "config", "user.email", "eval@pindrop.test")
+            run("git", "config", "user.name", "eval")
+            build(repo)
+            run("git", "add", "-A")
+            run("git", "commit", "-q", "-m", "base")
+            sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            container = stack.enter_context(RunContainer(
+                image=image_digest, repo_path=str(repo), base_sha=sha,
+                install_git=True,
+            ))
+            return container, sha
+
+        yield make
+
+
 # A stand-in for `claude` that speaks the same stream-json protocol on
 # stdout. It exists to prove the checkpoint progression is real: against
 # the post-hoc capture this replaces, every checkpoint held identical

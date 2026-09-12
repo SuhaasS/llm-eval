@@ -10,6 +10,15 @@ snapshotting after the run has finished yields the same end state for every
 turn number, which reads as a per-turn progression that never happened.
 The recorder cannot detect that -- it snapshots whenever it is called, so
 the caller owns interleaving capture with execution.
+
+A checkpoint carries what the diff CANNOT carry, beside it rather than
+instead of it. `git add -A` stages nothing for an uncommitted edit, an
+untracked file or an `rm` of tracked content inside an initialised submodule,
+and nothing for content inside an uninitialised one -- measured 2026-09-02
+(git 2.50.1) through `container.snapshot_diff`'s own command sequence, 0
+bytes in every case -- so a diff describes the tree completely only outside
+gitlink boundaries. `Checkpoint.submodules_dirty` records the per-gitlink
+state `container.submodule_states` reads; the diff is still the submission.
 """
 
 from __future__ import annotations
@@ -21,6 +30,7 @@ from bakeoff.schema import Checkpoint
 
 class SupportsSnapshot(Protocol):
     def snapshot_diff(self, base_sha: str) -> tuple[str, list[str]]: ...
+    def submodule_states(self) -> dict[str, str]: ...
 
 
 class CheckpointRecorder:
@@ -75,11 +85,28 @@ class CheckpointRecorder:
         interrupt -- and its diff is the submission (section 5.6). A caller
         that treated a missing final diff as ordinary would publish a record
         claiming the agent submitted nothing.
+
+        Its DIFF is what is allowed to raise. The submodule read never is: it
+        is contained inside `_capture`, so losing the submission to a
+        supplementary observation -- the exact inversion of the trade this
+        module rests on -- cannot happen on this path either.
         """
         return self._capture(turn, elapsed_ms)
 
     def _capture(self, turn: int, elapsed_ms: int) -> Checkpoint:
         diff, files = self.container.snapshot_diff(self.base_sha)
+        try:
+            # Contained HERE and not in `maybe_capture`, which is what makes
+            # `force_capture` safe too: see that method's docstring. `None` is
+            # "not read" and is distinct from the `{}` a clean tree gives --
+            # a partial mapping presented as a whole one would be the very
+            # defect this field exists to remove, one level down.
+            submodules: dict[str, str] | None = self.container.submodule_states()
+        except Exception as exc:  # noqa: BLE001 - see the docstrings above
+            submodules = None
+            self.errors.append(
+                f"turn {turn}: submodule state: {type(exc).__name__}: {exc}"
+            )
         checkpoint = Checkpoint(
             turn=turn,
             diff_vs_base=diff,
@@ -93,6 +120,7 @@ class CheckpointRecorder:
             # permanent None as a grader that did not run.
             tests_pass=None,
             per_test=[],
+            submodules_dirty=submodules,
         )
         self.captured.append(checkpoint)
         return checkpoint

@@ -76,6 +76,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO))
 
+from bakeoff.container import fresh_tree  # noqa: E402
 from bakeoff.eventlog import EventLog  # noqa: E402
 from bakeoff.grade_schema import (  # noqa: E402
     CHECK_ORDER,
@@ -103,7 +104,7 @@ from bakeoff.grader import (  # noqa: E402
     not_graded_gate,
 )
 from bakeoff.images import (  # noqa: E402
-    build_base_image,
+    build_base_images,
     build_task_image,
     image_entrypoint,
 )
@@ -118,7 +119,12 @@ from bakeoff.preflight import (  # noqa: E402
     preflight_cache_key,
 )
 from bakeoff.runner import harness_commit  # noqa: E402
-from bakeoff.tasks import TaskError, load_task_set, materialize  # noqa: E402
+from bakeoff.tasks import (  # noqa: E402
+    TaskError,
+    load_task_set,
+    materialize,
+    task_runtime,
+)
 
 # Under $HOME for the reason `run_matrix` documents: the Docker VM on macOS
 # mounts $HOME only, and a directory bind-mounted from elsewhere appears inside
@@ -286,8 +292,14 @@ def resolve_task(task, cache: Path, base_image: str,
             "and the container would exit immediately"
         )
 
-    work = Path(cache) / "grade-preflight-tree" / task.task_id
-    shutil.rmtree(work, ignore_errors=True)
+    # A path no container has mounted. One stable path per task, removed and
+    # re-materialized at the top of the NEXT invocation, is the stale bind
+    # mount: the Docker VM serves the directory it cached for that source, so
+    # every second `grade.py` invocation gated this task against an EMPTY
+    # `/repo` (measured 2026-09-02, `[files], [], [files], []` over four
+    # cycles) -- which on a vitest task is `No test files found` at exit 1,
+    # the exit a genuinely red suite gives.
+    work = fresh_tree(Path(cache) / "grade-preflight-tree" / task.task_id)
     try:
         start_sha = materialize(task, work / "repo", Path(cache))
 
@@ -320,18 +332,38 @@ def resolve_task(task, cache: Path, base_image: str,
 
 
 def task_resolver(cache: Path, force_preflight: bool = False) -> Callable:
-    """`resolve_env` for the real thing: the base image, built once.
+    """`resolve_env` for the real thing: one base image per `(runtime, version)`.
 
     A closure rather than a parameter, so `grade_event_log`'s seam is the
     one-argument `(task) -> TaskSetup` every test can fake, and so the base
-    image is not built at all by a batch whose records are all gated.
+    image is not built at all by a batch whose records are all gated. The
+    cache is keyed by `task_runtime(task)`: one build per distinct pair, and
+    still lazy, so that property survives the broadening.
+
+    `task_runtime`, never `task.image.python` -- every task carries a python
+    version, a vitest one included, so that key would silently grade a node
+    task inside the python base, where the runner does not exist.
+
+    This driver deliberately does NOT call `run_matrix.assert_one_agent`. It
+    is offline and per record, it reads the preflight cache `run_matrix`
+    already wrote, and the invocation that spent the money is where a
+    cross-task claim about the agent has to hold -- refusing here would refuse
+    to grade a collection that is already paid for. `resolve_task`'s own
+    `base_image` parameter is unchanged: it takes one image, and the caller
+    decides which.
+
+    `build_base_images` returns a `BaseImage` per key and this unwraps to the
+    id: the grader has no banner to print the reused/built decision on, and a
+    driver that runs after the money is spent has nothing to do with it.
     """
-    built: dict[str, str] = {}
+    built: dict[tuple[str, str], str] = {}
 
     def resolve(task) -> TaskSetup:
-        if "base" not in built:
-            built["base"] = build_base_image(REPO)
-        return resolve_task(task, cache, built["base"], force_preflight)
+        key = task_runtime(task)
+        if key not in built:
+            built.update({k: b.image_id for k, b
+                          in build_base_images(REPO, [key]).items()})
+        return resolve_task(task, cache, built[key], force_preflight)
 
     return resolve
 

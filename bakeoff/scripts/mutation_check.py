@@ -727,12 +727,34 @@ MUTATIONS = [
         # The Phase 0c failure in one operator: ModuleNotFoundError is also a
         # non-zero exit, so `!= 0` accepts a broken environment as "the bug is
         # present" and every arm is scored on a task that was never runnable.
+        # The verifying fixture's broken import is in `tests/conftest.py`, NOT
+        # in the f2p module: since PREFLIGHT_VERSION 4 a confined collection
+        # error is an accepted task shape and is handled by an EARLIER branch,
+        # so a fixture that is confined would leave this mutation inert.
+        # Stated over the adapter's OUTCOME since broadening 7: the number is
+        # still pytest's, but only the adapter is allowed to read it, and the
+        # branch has to keep working for a framework whose exit code carries
+        # nothing (vitest and jest both exit 1 for five different causes).
         "preflight: accept any non-zero exit as evidence the bug is present",
         "src/bakeoff/preflight.py",
-        "        elif red.exit_code != EXIT_TESTS_FAILED:",
+        "        elif red_outcome.kind != KIND_FAILED:",
         "        elif False:",
         "tests/test_preflight.py -k cannot_even_run",
         "integration",
+    ),
+    (
+        # The confinement equality is the whole of the acceptance. Without it
+        # `collected is not None` is true for any collection error at all, so a
+        # module no f2p id names -- a dependency the image lost -- reads as the
+        # task shape, and a DECLARED f2p module that never errored reads as
+        # checked when a collection error hid it. Both are GO under the
+        # mutation, with the rest of the gate green.
+        "preflight: accept any collection error, not one confined to the f2p modules",
+        "src/bakeoff/preflight.py",
+        "        confined = collected is not None and collected == f2p_modules(tests.f2p)",
+        "        confined = collected is not None",
+        "tests/test_preflight.py -k outside_the_declared_f2p_modules",
+        "not integration",
     ),
     (
         # Measured against litellm 1.95.0: _map_bedrock_exception matches auth
@@ -1335,6 +1357,69 @@ MUTATIONS = [
         "tests/test_tasks.py -k world_readable",
         "not integration",
     ),
+    # --- round 2 item 6: every budget: number goes through one validator ----
+    (
+        # Reverting this makes `max_turns: true` load as 1 and
+        # `max_turns: false` as 0, and the CLI refuses neither -- measured
+        # 2026-09-02, `--max-turns 0` starts a session and calls the API.
+        "budget: parse max_turns with a bare int again, accepting `true` as one turn",
+        "src/bakeoff/tasks.py",
+        "        max_turns=_positive_int(\n"
+        '            budget_raw.get("max_turns", _ABSENT),\n'
+        '            f"{where}:budget.max_turns",\n'
+        "            TaskBudget.max_turns,\n"
+        "        ),\n",
+        '        max_turns=int(budget_raw.get("max_turns", TaskBudget.max_turns)),\n',
+        "tests/test_tasks.py -k budget_key_refuses_a_boolean or max_turns",
+        "not integration",
+    ),
+    (
+        # This is the 2026-09-02 defect verbatim -- `wall_clock_timeout_s:
+        # true` becomes 1 and the `>` refusal below reports it as a
+        # `suite_timeout_s` the manifest never declared.
+        "budget: parse wall_clock_timeout_s with a bare int, blaming suite_timeout_s for a boolean",
+        "src/bakeoff/tasks.py",
+        "        wall_clock_timeout_s=_positive_int(\n"
+        '            budget_raw.get("wall_clock_timeout_s", _ABSENT),\n'
+        '            f"{where}:budget.wall_clock_timeout_s",\n'
+        "            TaskBudget.wall_clock_timeout_s,\n"
+        "        ),\n",
+        "        wall_clock_timeout_s=int(\n"
+        '            budget_raw.get("wall_clock_timeout_s", TaskBudget.wall_clock_timeout_s)\n'
+        "        ),\n",
+        "tests/test_tasks.py -k names_its_own_key",
+        "not integration",
+    ),
+    (
+        # `budget: []` then applies all three defaults to a manifest that
+        # visibly asked for something else. The selector is deliberately the
+        # long form: `-k not_a_mapping_is_refused` is a substring match that
+        # also collects the four `grading:` cases and
+        # `test_an_image_env_that_is_not_a_mapping_is_refused` (measured,
+        # 5/185), which still catches the mutation but re-runs four
+        # irrelevant tests.
+        "budget: read a written-but-empty budget section as an unwritten one",
+        "src/bakeoff/tasks.py",
+        '    budget_raw = data.get("budget")\n'
+        "    if budget_raw is None:\n"
+        "        budget_raw = {}\n",
+        '    budget_raw = data.get("budget") or {}\n',
+        "tests/test_tasks.py -k budget_section_that_is_not_a_mapping",
+        "not integration",
+    ),
+    (
+        # `image: []` then builds the default base with no `apt`, no `pip`
+        # and no `build` -- a non-editable install every arm fails
+        # identically on, and click's missing `less`.
+        "image: read a written-but-empty image section as an unwritten one",
+        "src/bakeoff/tasks.py",
+        '    image_raw = data.get("image")\n'
+        "    if image_raw is None:\n"
+        "        image_raw = {}\n",
+        '    image_raw = data.get("image") or {}\n',
+        "tests/test_tasks.py -k image_section_that_is_not_a_mapping",
+        "not integration",
+    ),
     (
         # Schema 3.8.0. Every one of the next six used to destroy the record
         # outright or, worse, publish something false in its place.
@@ -1525,8 +1610,8 @@ MUTATIONS = [
         # measures a suite that is not there.
         "grader: apply the submission to a state it was not diffed against",
         "src/bakeoff/grader.py",
-        '        restored = env.exec(["git", "checkout", start_sha, "--", prefix])',
-        '        restored = env.exec(["git", "checkout", task.base_sha, "--", prefix])',
+        '            ["git", "checkout", start_sha, "--", prefix, *excludes]',
+        '            ["git", "checkout", task.base_sha, "--", prefix, *excludes]',
         "tests/test_grader.py -k applied_where_it_was_diffed",
         "not integration",
     ),
@@ -1577,9 +1662,24 @@ MUTATIONS = [
         # behaviour scores `resolved`.
         "grader: let an agent-added test survive the restore",
         "src/bakeoff/grader.py",
-        "    paths = tuple(task.tests.paths)\n    if paths:\n        removed = env.exec(",
-        "    paths = tuple(task.tests.paths)\n    if False:\n        removed = env.exec(",
+        "    excludes: tuple[str, ...] = ()\n    if paths:\n        listed = env.exec(",
+        "    excludes: tuple[str, ...] = ()\n    if False:\n        listed = env.exec(",
         "tests/test_grader.py -k rm_then_checkout",
+        "not integration",
+    ),
+    (
+        # Fix 1's own exclusion had no anchor: both the `find` and the
+        # `replace` above carry `*excludes` verbatim, so neither mutation
+        # exercises it. Deleting `*excludes` from the `git rm` restores the
+        # exact tomlkit-514 defect this exclusion was written to close -- a
+        # submodule under a declared test prefix gets blindly `rm -r`'d.
+        "grader: rm a submodule the exclusion was supposed to spare",
+        "src/bakeoff/grader.py",
+        '            ["git", "rm", "-r", "-f", "--quiet", "--ignore-unmatch", "--",\n'
+        "             *paths, *excludes]",
+        '            ["git", "rm", "-r", "-f", "--quiet", "--ignore-unmatch", "--",\n'
+        "             *paths]",
+        "tests/test_grader.py -k excluded_from_rm_and_checkout",
         "not integration",
     ),
     (
@@ -1627,12 +1727,16 @@ MUTATIONS = [
         # The quarantine is derived and then has to RIDE. Dropping the flags
         # leaves a derivation that ran two full suites inside a container to
         # produce a list nothing subtracts -- and the record still reports
-        # `p2p_quarantine_requested`, so it reads as applied.
+        # `p2p_quarantine_requested`, so it reads as applied. The emission
+        # moved into the pytest adapter in broadening 7 Task 2; the selector
+        # did not, because `_Runner.pass_to_pass` is still what has to carry
+        # the flags through to the graded argv.
         "preflight: grade with the flake in the suite",
-        "src/bakeoff/preflight.py",
-        "        extra = [arg for node_id in extra_deselect\n"
-        '                 for arg in ("--deselect", node_id)]',
-        "        extra = []",
+        "src/bakeoff/runners/pytest_adapter.py",
+        "        for node_id in deselected:\n"
+        '            out += ["--deselect", node_id]',
+        "        for node_id in ():\n"
+        '            out += ["--deselect", node_id]',
         "tests/test_preflight.py -k quarantine_rides_as_deselect",
         "not integration",
     ),
@@ -1641,11 +1745,13 @@ MUTATIONS = [
         # ROOTDIR, which is whatever the agent left lying there -- measured,
         # eight scratch files in one stored record. Those become the
         # regression check, and a model that wrote a failing scratch test
-        # fails p2p on its own litter.
+        # fails p2p on its own litter. Emitted by the pytest adapter since
+        # broadening 7 Task 2; the selector is unchanged, because what must
+        # stay true is the argv `_Runner.pass_to_pass` hands the grader.
         "preflight: collect the agent's scratch files into p2p",
-        "src/bakeoff/preflight.py",
-        "        args: list[str] = [*scope]",
-        "        args: list[str] = []",
+        "src/bakeoff/runners/pytest_adapter.py",
+        "        out = list(selected) if selected else list(scope)",
+        "        out = list(selected) if selected else []",
         "tests/test_preflight.py -k scope_prefixes_lead",
         "not integration",
     ),
@@ -1656,11 +1762,30 @@ MUTATIONS = [
         # cache serves a verdict written by the OLD gate -- the pruned
         # mirror's "an older revision's output is served forever" defect, one
         # subsystem over. Two drivers now read this key.
+        #
+        # Round 2 item 7 (D10) extracted the join into `_key_parts`, shared by
+        # `preflight_cache_key` and `verdict_matches_key` so the two cannot
+        # drift -- the anchor moves to the ONE place the version is now
+        # dropped from, rather than staying on a call site that no longer
+        # spells the f-string itself.
         "preflight: serve a verdict from an older preflight forever",
         "src/bakeoff/preflight.py",
-        '    return f"{task.manifest_digest}|{image}|{start_sha}|{PREFLIGHT_VERSION}"',
-        '    return f"{task.manifest_digest}|{image}|{start_sha}"',
+        '    return f"{manifest_digest}|{image}|{start_sha}|{preflight_version}"',
+        '    return f"{manifest_digest}|{image}|{start_sha}"',
         "tests/test_run_matrix.py -k older_preflight_is_not_served",
+        "not integration",
+    ),
+    (
+        # Major.minor EQUALITY, not a prefix test. Measured:
+        # "Python 3.13.15".startswith("Python 3.1") is True, so a prefix
+        # comparison accepts 3.13 for a declared 3.1 -- a green gate over an
+        # interpreter the task was not cut for, which no later stage
+        # re-derives.
+        "preflight: accept a prefixing interpreter as the declared one",
+        "src/bakeoff/preflight.py",
+        "            if _parse_python_version(observed_python) != declared_python:",
+        '            if not observed_python.startswith(f"Python {declared_python}"):',
+        "tests/test_preflight.py -k prefixes_another_version_is_still_refused",
         "not integration",
     ),
     (
@@ -1773,6 +1898,1149 @@ MUTATIONS = [
         "    provider: str | None = None\n    native: str | None = None",
         "    provider: str | None = (((kwargs.get('litellm_params') or {}).get('extra_body') or {}).get('provider') or {}).get('order', [None])[0]\n    native: str | None = None",
         "tests/test_proxy_callback.py -k never_come_from_the_configured_order",
+        "not integration",
+    ),
+    (
+        # An image.env that did not reach the image is silent: the suite goes
+        # back to being nondeterministic (measured, 0 0 0 0 1 1 1 1 0 0 over
+        # ten fresh runs of unchanged code), the gate passes on a lucky draw,
+        # and every arm is scored against an oracle that answers differently
+        # per run. Reverting the refusal restores exactly that -- the evidence
+        # is still recorded, so the verdict flips from NO-GO to PASS with no
+        # other visible change.
+        "preflight: record the image.env mismatch and stop refusing it",
+        "src/bakeoff/preflight.py",
+        "        if mismatch:\n            problems.append(",
+        "        if False:\n            problems.append(",
+        "tests/test_preflight.py -k a_declared_env_that_did_not_reach",
+        "not integration",
+    ),
+    (
+        # The node half of the same defect. Reverting the refusal leaves every
+        # piece of EVIDENCE in place -- imported: true, pinned: false -- and
+        # flips the verdict from NO-GO to PASS with nothing else visible, which
+        # is exactly how a property suite gets certified on a lucky draw.
+        "preflight: record the unpinned node property suite and stop refusing it",
+        "src/bakeoff/preflight.py",
+        "                if imported and not pinned:\n                    problems.append(",
+        "                if False:\n                    problems.append(",
+        "tests/test_preflight.py -k fast_check_with_no_seed_pin",
+        "not integration",
+    ),
+    (
+        # Round 2 item 12's fix wave, blocking finding 1 (impl-12-review.md,
+        # 2026-09-03): with the report args LAST, a manifest-declared
+        # array-valued flag at the tail of `tests.runner` (jest's
+        # `--testPathIgnorePatterns`) swallows the next bare token -- the
+        # check's own file positional -- turning a SELECTION into another
+        # ignore PATTERN. Measured: the f2p SELECT check ran 23 suites with
+        # 3279 pending ("did not RUN") and the scoped p2p run left
+        # `tests.paths` outright. Reverting to `extra` first restores exactly
+        # that; every gated and every graded node argv moves with this line,
+        # since `grader.py` builds the same `_Runner`.
+        "preflight: swallow the check's own positional under a trailing "
+        "array-valued tests.runner flag",
+        "src/bakeoff/preflight.py",
+        "                extra = [*self.adapter.report_args(report_path), *extra]",
+        "                extra = [*extra, *self.adapter.report_args(report_path)]",
+        "tests/test_preflight.py -k swallow_the_checks_own_positional",
+        "not integration",
+    ),
+    (
+        # Fix 2's whole point: bidict-389's GATED runner passes by bypassing
+        # its own pyproject.toml addopts (--override-ini=addopts=) while the
+        # bare command an agent types exits 4 from turn one. Reverting this
+        # branch away makes the bare-runner probe measure the exit code and
+        # say nothing about it -- exactly the Phase 0c shape where the loop
+        # truncates after "edits" and every arm is scored on an unverified
+        # guess.
+        "preflight: measure the bare usage error and stop refusing it",
+        "src/bakeoff/preflight.py",
+        "            if bare.exit_code == EXIT_USAGE_ERROR:",
+        "            if False:",
+        "tests/test_preflight.py -k bare_usage_error_names_the_plugin",
+        "not integration",
+    ),
+    (
+        # The whole point of D3. Reverting to the FULL mirror leaves every
+        # unit test green -- the tree materializes, the suite collects, the
+        # gate passes -- while `git -C <path> log --all` in the run tree hands
+        # the agent submodule content newer than the gitlink, differentially,
+        # since only an arm that looks collects it.
+        "tasks: populate a submodule from the unpruned mirror",
+        "src/bakeoff/tasks.py",
+        "        sub.path: ensure_pruned_mirror(sub.url_resolved, sub.sha, cache_root)\n"
+        "        for sub in needed",
+        "        sub.path: ensure_mirror(sub.url_resolved, sub.sha, cache_root)\n"
+        "        for sub in needed",
+        "tests/test_tasks.py -k cannot_reach_the_future",
+        "not integration",
+    ),
+    (
+        # The post-condition, deleted. Every unit test that drives a HEALTHY
+        # materialization stays green -- the tree is clean, so the check never
+        # fires -- while a run tree whose guards silently missed goes to the
+        # agent carrying the operator's cache layout and a remote the container
+        # cannot resolve, with `git status --porcelain` clean.
+        "tasks: stop refusing a run tree that carries the host mirror path",
+        "src/bakeoff/tasks.py",
+        "            if hit:",
+        "            if False:",
+        "tests/test_tasks.py -k host_mirror_path_surviving",
+        "not integration",
+    ),
+    (
+        # Back to the literal "origin", KEEPING check=True -- so the mutant is
+        # louder than the pre-fix code, not identical to it, and the arm goes
+        # red on the raise rather than on a remote assertion. Measured
+        # 2026-09-02, git 2.50.1: an operator with `clone.defaultRemoteName`
+        # set gets a submodule whose only remote has another name, so `git
+        # remote remove origin` exits 2 -- which the pre-fix `check=False`
+        # swallowed while `.git/modules/<name>/config` kept the host cache
+        # path. Only the arm that sets that config sees either version.
+        "tasks: remove only a remote literally named origin",
+        "src/bakeoff/tasks.py",
+        "        for remote in _git(\"remote\", cwd=checked).stdout.splitlines():",
+        "        for remote in (\"origin\",):",
+        "tests/test_tasks.py -k did_not_name_origin",
+        "not integration",
+    ),
+    (
+        # The walk's error handler, dropped. Measured 2026-09-02: `Path.rglob`
+        # suppresses the PermissionError a mode-000 directory raises and
+        # returns the directory with nothing inside it, so the scan reports
+        # CLEAN over files it never opened -- the same silence the whole item
+        # removes, arriving through the walk instead of through a guard.
+        "tasks: let the leak scan skip a directory it cannot list",
+        "src/bakeoff/tasks.py",
+        "    for root, dirnames, filenames in os.walk(base, onerror=_refuse_walk_error):",
+        "    for root, dirnames, filenames in os.walk(base):",
+        "tests/test_tasks.py -k cannot_be_listed",
+        "not integration",
+    ),
+    (
+        # Without this the ladder applies a gitlink diff GREEN (measured:
+        # exit 0), grades a tree the agent's work is absent from, and stamps
+        # `resolved: False` -- an accusation -- on work the harness could not
+        # capture. It fires on ANY task, not only one with a declared
+        # submodule: `git init` in a tracked subdirectory produces the same
+        # chunk against a repository that has never had one.
+        "grader: grade a submission that only moves a gitlink",
+        "src/bakeoff/grader.py",
+        "    if gitlinks:",
+        "    if False:",
+        "tests/test_grader.py -k gitlink_submission_is_not_graded",
+        "not integration",
+    ),
+    (
+        # A 100%-similarity rename carries NO mode line, and a pure rename of
+        # an ordinary file is byte-identical to one of a gitlink -- so the
+        # mode can only come from `start_sha`'s tree. Skipping the lookup puts
+        # the submission back on the path measured 2026-09-02: `git apply
+        # --index` exits 0, the index entry moves, the submodule's files stay
+        # at the OLD path, and the ladder grades `resolved: False` -- an
+        # accusation over content the harness could not capture.
+        "grader: grade a submission that moved a gitlink and nothing else",
+        "src/bakeoff/grader.py",
+        "        renamed = _renamed_gitlinks(",
+        "        renamed = (lambda *a, **kw: ())(",
+        "tests/test_grader.py -k gitlink_rename_is_not_graded",
+        "not integration",
+    ),
+    (
+        # The residual ambiguity once the match is boundary-anchored:
+        # `vendor/lib` and `vendor/lib dep` both match ONE status line,
+        # because the separator the boundary rule looks for is itself part of
+        # the longer path. The shorter one renames the submodule in the
+        # evidence -- and every path in that evidence is a real index path, so
+        # nothing downstream can tell it is the wrong one.
+        "preflight: take the shortest matching gitlink path",
+        "src/bakeoff/preflight.py",
+        '            "path": max(match, key=len),',
+        '            "path": min(match, key=len),',
+        "tests/test_preflight.py -k longest_match",
+        "not integration",
+    ),
+    (
+        # Measured: a broken CONFIG exits 1 and writes NO report file, on both
+        # frameworks, and so does a runner that could not start. Reading that
+        # silence as anything but "the command did not say what it did" is the
+        # Phase 0c failure one runtime over -- and the report lives at a FIXED
+        # path, so a leftover file from the previous invocation is exactly what
+        # would stand in as this run's evidence.
+        #
+        # The anchor text also occurs in `parse_deselected` and in
+        # `_executed`; `run` replaces the FIRST occurrence, which is the
+        # classifier's, and both of those are defined below it for that reason.
+        "runners: read a report that was never written as a clean run",
+        "src/bakeoff/runners/node_adapter.py",
+        "        if report is None:",
+        "        if False:",
+        "tests/test_runners.py -k never_written",
+        "not integration",
+    ),
+    (
+        # Measured: one good file plus one unloadable file reports three
+        # PASSING tests and zero failing ones. Taking the failure branch first
+        # grades a task whose f2p file stopped importing as SOLVED.
+        "runners: let a passing file hide a file that did not load",
+        "src/bakeoff/runners/node_adapter.py",
+        "        if errored:",
+        "        if False:",
+        "tests/test_runners.py -k beats_a_passing_file",
+        "not integration",
+    ),
+    (
+        # M1's silent hole. A `-t` pattern matching no test exits **0** with
+        # every test reported skipped, so without this branch a manifest naming
+        # a renamed test -- and an oracle quarantine that swallowed the whole
+        # p2p list -- both read as a pass.
+        "runners: read a run that executed nothing as a pass",
+        "src/bakeoff/runners/node_adapter.py",
+        "        if ran == 0:",
+        "        if False:",
+        "tests/test_runners.py -k matched_nothing_is_nothing_ran",
+        "not integration",
+    ),
+    (
+        # The whole reason `p2p_argvs` owns the argv rather than composing it.
+        # Measured 2026-09-02: vitest REJECTS a second `-t` (exit 1, and no
+        # report file, so it classifies as an environment problem) and jest
+        # comma-joins the two into a pattern matching neither, running nothing
+        # at exit 0. Reverting the guard emits no `-t` at all instead.
+        "runners: emit selection and deselection as two -t flags",
+        "src/bakeoff/runners/node_adapter.py",
+        "        if not pattern:",
+        "        if True:",
+        # The selector moved with the test's name in round 2 item 1: the
+        # argv-literal assertion is what fails when `-t` stops being emitted
+        # at all, and the surviving `count("-t") <= 1` tests would not.
+        "tests/test_runners.py -k first_seen_order",
+        "not integration",
+    ),
+    (
+        # Both node frameworks answer a `-t` pattern that matches nothing with
+        # exit **0** and a report of every test skipped, so a manifest naming a
+        # renamed f2p test gates GREEN and then scores every arm as having
+        # solved it. pytest answers the same input with exit 4.
+        "preflight: accept an f2p id that never ran",
+        "src/bakeoff/preflight.py",
+        "        if not_run and red_outcome.kind != KIND_LOAD_ERROR:",
+        "        if False:",
+        "tests/test_preflight.py -k never_RAN",
+        "not integration",
+    ),
+    (
+        # Measured: `vitest run tests/` matched `/repo/jtests/fail.test.cjs` --
+        # the positional is a substring filter over the absolute path, not a
+        # path. The scoped p2p run exists to keep the agent's scratch files out
+        # of the regression check, and an over-matching filter restores exactly
+        # what it was added to remove.
+        "preflight: grade files the declared scope never named",
+        "src/bakeoff/preflight.py",
+        "                    if outside:",
+        "                    if False:",
+        "tests/test_preflight.py -k left_the_declared_paths",
+        "not integration",
+    ),
+    (
+        # Measured 2026-09-02: jest's positional is a JS RegExp tested against
+        # BOTH the repo-relative path and the absolute one, so only a
+        # mount-anchored, escaped, `$`-terminated pattern names one file --
+        # `tests/doc/a.test.js$` also matched `/repo/pkg/tests/doc/a.test.js`.
+        # The mutant is the vitest spelling on jest: the group's name pattern
+        # then reaches a second file, which is the defect the per-file
+        # grouping exists to close, one level down.
+        "runners: spell the jest file filter so it can match a second file",
+        "src/bakeoff/runners/node_adapter.py",
+        '            return "^" + _js_escape(_REPO_MOUNT + "/" + path) + "$"',
+        "            return path",
+        "tests/test_runners.py -k mount_anchored",
+        "not integration",
+    ),
+    (
+        # Group 0 of a deselect-branch run is the scope MINUS every file
+        # holding a deselection; each such file then gets its own group with
+        # only its own titles. Drop the files from `excluded` and group 0 runs
+        # them unfiltered beside their own group -- every deselected test runs
+        # after all, in a check whose whole purpose is to leave it out.
+        "runners: let a deselected file also run unfiltered in the scope group",
+        "src/bakeoff/runners/node_adapter.py",
+        "        excluded = [*ignored, *dfiles]",
+        "        excluded = [*ignored]",
+        "tests/test_runners.py -k own_group",
+        "not integration",
+    ),
+    (
+        # vitest's positional is a SUBSTRING filter no anchoring reaches, so
+        # one executed file's path contained in another's makes the per-file
+        # group select both -- and the group's negative `-t` then deselects
+        # the colliding file's same-named tests. Refused per task, because it
+        # cannot be closed in the argv.
+        "preflight: accept a file filter that selects a second executed file",
+        "src/bakeoff/preflight.py",
+        "    if ambiguous:",
+        "    if False:",
+        "tests/test_preflight.py -k selects_a_second_executed_file",
+        "not integration",
+    ),
+    (
+        # Fix 3, 2026-09-02: pytest 9's core-integrated subtests report a
+        # `unittest.subTest` failure as `SUBFAILED(label) <id> - <msg>`, never
+        # `FAILED <id>`, for a node whose only failures are subtest failures.
+        # Reverting to the two-alternative regex is the exact PREFLIGHT_VERSION
+        # 11 defect: `failed_node_ids` comes back empty on a run whose own exit
+        # code is 1, and preflight's before-check reads a declared f2p id that
+        # genuinely failed as never having failed -- measured against
+        # `sqlglot-6927-dremio-trycast`, whose `validate_all` helper wraps
+        # every assertion in `subTest`.
+        "runners: stop reading SUBFAILED, restoring the false NO-GO on subTest",
+        "src/bakeoff/runners/pytest_adapter.py",
+        r'    r"^(?:FAILED|ERROR|SUBFAILED(?:\([^)\n]*\)|\[[^\]\n]*\])?)\s+(\S+)",',
+        r'    r"^(?:FAILED|ERROR)\s+(\S+)",',
+        "tests/test_runners.py -k a_subfailed_line",
+        "not integration",
+    ),
+    (
+        # Round 2 item 3: the Docker VM serves a reused bind-mount source from
+        # a stale cache -- measured 2026-09-02, `[files], [], [files], []` over
+        # four cycles on one path. A fixed leaf name puts that back, and an
+        # empty mount does not fail: it is `No test files found` at exit 1 on
+        # both node frameworks and APPLY_FAILED on the grader. NOTE: under this
+        # mutation the SECOND fresh_tree call raises FileExistsError at
+        # `tree.mkdir()` before the assertion is reached -- `exist_ok=False` is
+        # deliberate, so the test is red with a traceback rather than an
+        # assertion diff.
+        "mount: hand back one shared host path per key, restoring the stale mount",
+        "src/bakeoff/container.py",
+        "    tree = parent / uuid.uuid4().hex",
+        '    tree = parent / "tree"',
+        "tests/test_container.py -k different_paths",
+        "not integration",
+    ),
+    (
+        # The site the probe measured: `--preflight-only` twice on one task
+        # gated the second invocation against an empty tree, and on a vitest
+        # task that PASSES while measuring nothing.
+        "preflight: reuse one host tree per task across invocations",
+        "scripts/run_matrix.py",
+        '        work = fresh_tree(cache / "preflight-tree" / task.task_id)',
+        '        work = cache / "preflight-tree" / task.task_id\n'
+        "        shutil.rmtree(work, ignore_errors=True)",
+        "tests/test_run_matrix.py -k different_host_paths",
+        "not integration",
+    ),
+    (
+        # The site GRADER_VERSION's bump rests on: `grade-tree/<run_id>` reused
+        # across passes, served empty, `git apply` failing, and APPLY_FAILED
+        # stamping `resolved: False` on a submission that was fine.
+        "grade: reuse one host tree per run_id across grading passes",
+        "src/bakeoff/grader.py",
+        '    tree = fresh_tree(Path(cache_root) / "grade-tree" / record.run_id)',
+        '    tree = Path(cache_root) / "grade-tree" / record.run_id\n'
+        "    shutil.rmtree(tree, ignore_errors=True)",
+        "tests/test_grader.py -k different_host_paths",
+        "not integration",
+    ),
+    (
+        # Site 6, the one with no mount post-condition: `_assert_repo_mounted`
+        # reads REPO_MOUNT only, and the host-side read-back in runner.py
+        # answers for the allocator, not for the mount. A stale
+        # CLAUDE_CONFIG_DIR is a run recorded with zero turns, zero tokens and
+        # zero cost after the tokens are spent. NOTE: `new` restores the reused
+        # path WITHOUT the `shutil.rmtree` line, because Task 4 deletes
+        # `import shutil` from this module -- a NameError would make the test
+        # red for a reason that is not the guarantee. Reuse alone is the
+        # guarantee: under this mutation both runs share one config directory,
+        # so the test sees an empty shared directory where it asserts two
+        # leaves.
+        "config dir: reuse one host path per artifacts root across runs",
+        "src/bakeoff/runner.py",
+        '    host_config_dir = fresh_tree(artifacts_root / "claude-config")',
+        '    host_config_dir = artifacts_root / "claude-config"\n'
+        "    host_config_dir.mkdir(parents=True, exist_ok=True)",
+        "tests/test_fault_injection.py -k different_config_dirs",
+        "not integration",
+    ),
+    # --- round 2 item 2: submodules_unneeded ---------------------------------
+    (
+        # Without the filter, `_init_submodules` populates a path the manifest
+        # declared unneeded -- which for the shape the key exists for means
+        # `ensure_pruned_mirror` against an ssh url, so the whole task is
+        # refused again and the key buys nothing.
+        "tasks: populate a submodule the manifest declared unneeded",
+        "src/bakeoff/tasks.py",
+        "    needed = tuple(sub for sub in subs if not sub.declared_unneeded)",
+        "    needed = tuple(subs)",
+        "tests/test_tasks.py -k leaves_a_declared_unneeded_submodule_empty",
+        "not integration",
+    ),
+    (
+        # The item itself. Without the guard the url refusal fires on a
+        # declared path and `tobymao/sqlglot` stays closed at every base_sha
+        # after 2026-02-27.
+        "tasks: refuse a declared-unneeded submodule for its url",
+        "src/bakeoff/tasks.py",
+        "        if not sub.declared_unneeded:",
+        "        if True:",
+        "tests/test_tasks.py -k not_refused_for_its_url",
+        "not integration",
+    ),
+    (
+        # The PLACEMENT of the first kept refusal, not the guard. This is the
+        # exact edit a later editor tidying the two kept refusals inside the
+        # guard would make, and it is valid Python -- the bracket balance
+        # survives the existing continuation line. A strip covering the path
+        # still removes the gitlink and still moves start_sha.
+        "tasks: move the strip refusal inside the unneeded guard",
+        "src/bakeoff/tasks.py",
+        "        stripped = [p for p in task.strip_paths",
+        "        stripped = [] if sub.declared_unneeded else "
+        "[p for p in task.strip_paths",
+        "tests/test_tasks.py -k strip_path_covering_a_declared_unneeded",
+        "not integration",
+    ),
+    (
+        # The PLACEMENT of the second kept refusal. `git add -A` stages
+        # nothing for a gitlink path in either state, so a task whose fix
+        # lives there is ungradable however the manifest declares it.
+        "tasks: move the reference-diff refusal inside the unneeded guard",
+        "src/bakeoff/tasks.py",
+        "        touched = [p for p in (*task.test_files, *task.solution_files,",
+        "        touched = [] if sub.declared_unneeded else "
+        "[p for p in (*task.test_files, *task.solution_files,",
+        "tests/test_tasks.py -k reference_diff_touching_a_declared_unneeded",
+        "not integration",
+    ),
+    (
+        # TWO LINES, and that is not stylistic: `mutation_check` applies
+        # `replace(find, replace, 1)` with no uniqueness check, and
+        # `    if unknown:` appears three times in tasks.py (the `image.*` and
+        # `grading.*` unknown-key refusals in `load_task`, both far above
+        # `derive_submodules`). A one-line anchor would mutate the image-key
+        # refusal, leave the typo refusal intact, let the selector pass, and
+        # report MISSED -- loud, but not a caught mutation.
+        "tasks: accept an unneeded declaration naming no gitlink",
+        "src/bakeoff/tasks.py",
+        "        unknown = sorted(set(task.submodules_unneeded) - set(gitlinks) - deferred)\n"
+        "        if unknown:",
+        "        unknown = sorted(set(task.submodules_unneeded) - set(gitlinks) - deferred)\n"
+        "        if False:",
+        "tests/test_tasks.py -k naming_no_gitlink_is_refused",
+        "not integration",
+    ),
+    (
+        # ONE line covering BOTH `.gitmodules` exemptions, which is why the
+        # design routes them through one derived set: a tree whose only
+        # gitlinks are declared is workable with no readable `.gitmodules` at
+        # all, and the unfetchable check reads the same set.
+        "tasks: refuse a declared-unneeded gitlink that has no url",
+        "src/bakeoff/tasks.py",
+        "    needed_gitlinks = set(gitlinks) - set(task.submodules_unneeded)",
+        "    needed_gitlinks = set(gitlinks)",
+        "tests/test_tasks.py -k survives_an_unreadable_gitmodules",
+        "not integration",
+    ),
+    (
+        # The original defect, at image-build time: without the `continue` the
+        # ssh url is cloned while building the task image, before preflight
+        # and before any container.
+        "images: clone a mirror for a submodule declared unneeded",
+        "src/bakeoff/images.py",
+        "        if sub.declared_unneeded:\n            continue",
+        "        if False:\n            continue",
+        "tests/test_images.py -k no_second_archive_is_taken",
+        "not integration",
+    ),
+    (
+        # The one line that turns the NO-GO into a GO. Written out verbatim
+        # with its continuation line because the `old` string does not exist
+        # until this item's preflight change has landed.
+        "preflight: keep a declared-unneeded submodule in the stale list",
+        "src/bakeoff/preflight.py",
+        '        stale = [entry["path"] for entry in submodules\n'
+        '                 if not entry["initialised"] '
+        'and not entry["declared_unneeded"]]',
+        '        stale = [entry["path"] for entry in submodules\n'
+        '                 if not entry["initialised"]]',
+        "tests/test_preflight.py -k unneeded_submodule_is_a_GO",
+        "not integration",
+    ),
+    (
+        # git is BLIND inside a gitlink path, so the filesystem read is the
+        # only enforcement HARVESTING's "a suite that writes inside the
+        # submodule is out" rule has left once the submodule is uninitialised.
+        "preflight: skip the start-state emptiness read",
+        "src/bakeoff/preflight.py",
+        '                entry["empty"] = _directory_is_empty(container, '
+        'entry["path"])',
+        '                entry["empty"] = True',
+        "tests/test_preflight.py -k declared_unneeded_submodule_with_content",
+        "not integration",
+    ),
+    (
+        # The post-suite half. `git status --porcelain` next door reports
+        # nothing for a file written inside an uninitialised submodule, so
+        # without this read "the suite ran with the directory empty" is an
+        # assumption rather than an observation.
+        "preflight: skip the post-suite emptiness read",
+        "src/bakeoff/preflight.py",
+        "        after = {path: _directory_is_empty(container, path)",
+        "        after = {path: True",
+        "tests/test_preflight.py -k writes_into_a_declared_unneeded_submodule",
+        "not integration",
+    ),
+    (
+        # Without the seed the scratch index is built by `git add -A` alone,
+        # which never descends into a gitlink path -- so an uninitialised
+        # submodule is a `deleted file mode 160000` chunk on a CLEAN tree
+        # (measured 239 bytes on tobymao/sqlglot, agent having done nothing)
+        # and every run of a declared-unneeded task grades
+        # SUBMODULE_GITLINK_UNGRADABLE. `new` is a DIFFERENT exec rather than
+        # a deletion so the mutated file still parses and the failure is the
+        # missing seed, not a syntax error. The selector is the unit
+        # argv-order test, because this gate runs under "not integration".
+        "container: stage the snapshot into an unseeded scratch index",
+        "src/bakeoff/container.py",
+        '        self.checked_exec(["git", "read-tree", base_sha], env=env)',
+        '        self.checked_exec(["git", "--version"], env=env)',
+        "tests/test_container.py -k seeded_from_base_before_staging",
+        "not integration",
+    ),
+    (
+        # `fatal` drives which refusals raise. Dropping the selection term
+        # lets a SELECTED broken manifest fall through to the "no such task"
+        # check instead of refusing on its own load error -- still a
+        # TaskError, so the test asserts the message rather than the type.
+        "task set: let a selected broken manifest through as a warning",
+        "src/bakeoff/tasks.py",
+        "    fatal = [r for r in refusals\n"
+        "             if wanted is None or r.committed or r.directory.name in wanted]",
+        "    fatal = [r for r in refusals\n"
+        "             if wanted is None or r.committed]",
+        "tests/test_tasks.py -k broken_manifest_that_is_selected",
+        "not integration",
+    ),
+    (
+        # Forces `committed` to False unconditionally, so a manifest tracked
+        # in the enclosing revision is treated as work in progress and a
+        # selection can skip it -- exactly the M4 hazard this item exists to
+        # close.
+        "task set: treat a committed broken sibling as work in progress",
+        "src/bakeoff/tasks.py",
+        "                committed=(bool(commit)\n"
+        "                           and _manifest_committed(root, task_dir)),",
+        "                committed=False,",
+        "tests/test_tasks.py -k committed_broken_sibling",
+        "not integration",
+    ),
+    (
+        # The full-set path (no --tasks) must refuse on ANY invalid manifest.
+        # This replacement keeps `fatal` total (no TypeError on `in None`)
+        # while removing the "no selection means the whole set is required"
+        # rule -- proving the guard, not just tripping an exception.
+        "task set: let the full-set path proceed past a manifest that did not load",
+        "src/bakeoff/tasks.py",
+        "    fatal = [r for r in refusals\n"
+        "             if wanted is None or r.committed or r.directory.name in wanted]",
+        "    fatal = [r for r in refusals\n"
+        "             if wanted is not None and (r.committed or r.directory.name in wanted)]",
+        "tests/test_tasks.py -k no_tasks_selection_refuses",
+        "not integration",
+    ),
+    (
+        # `pass` rather than deleting the branch, so the mutated code stays
+        # syntactically valid and falls through to `git status`, which says
+        # nothing about an ignored path and reads it as committed -- the
+        # "status alone" predicate finding 2 measured as wrong.
+        "task set: judge committed-ness from git status alone, refusing an ignored drafting directory",
+        "src/bakeoff/tasks.py",
+        "    if not tracked:\n"
+        "        return False",
+        "    if not tracked:\n"
+        "        pass",
+        "tests/test_tasks.py -k ignored_task_set_inside_a_repo",
+        "not integration",
+    ),
+    (
+        # The other half of the predicate: every TRACKED directory reads as
+        # committed regardless of modification, which is the branch
+        # `status --porcelain` decides on its own -- the ordinary drafting
+        # edit of an already-committed manifest.
+        "task set: call a tracked-but-modified manifest committed, refusing the ordinary drafting edit",
+        "src/bakeoff/tasks.py",
+        "    return not status",
+        "    return True",
+        "tests/test_tasks.py -k modified_broken_manifest",
+        "not integration",
+    ),
+    (
+        # A key written where it is measured is absent from every path that
+        # does not measure it, and absent renders identically to a verdict
+        # written by a gate too old to have the key. Twenty of preflight's
+        # forty-two keys were in that family. Under this mutation the seed is
+        # `{}`, so `__post_init__` raises out of `preflight` and the selected
+        # test fails as an ERROR rather than an assertion -- still red, which
+        # is what this harness requires.
+        "preflight: let an evidence key be absent on one path and present on another",
+        "src/bakeoff/preflight.py",
+        "    evidence: dict = _evidence_seed()",
+        "    evidence: dict = {}",
+        "tests/test_preflight.py -k every_evidence_key_is_present_on_every_route",
+        "not integration",
+    ),
+    (
+        # The enforcement, not the schema. A test covers the routes it
+        # enumerates; this covers the route somebody adds next -- which is the
+        # one that has already gone wrong twice inside this file
+        # (PREFLIGHT_VERSION 11's three keys, and bare_runner_skipped's "left
+        # out of this seed once").
+        "preflight: accept an evidence dict that is not the schema",
+        "src/bakeoff/preflight.py",
+        "        if set(self.evidence) != set(EVIDENCE_KEYS):",
+        "        if False:",
+        "tests/test_preflight.py -k not_the_schema_is_refused",
+        "not integration",
+    ),
+    ( # The clock, not a constant. `duration_ms` is on every ExecResult and the
+      # bug that matters is reading the wrong one -- or none -- while the key
+      # set still looks complete. A verdict full of zeroes reads as a suite
+      # that costs nothing, which is the number an author sizes a bound from.
+        "preflight: record a constant instead of the exec's own clock",
+        "src/bakeoff/preflight.py",
+        "    return result.duration_ms / 1000.0",
+        "    return 0.0",
+        "tests/test_preflight.py -k the_execs_own_clock",
+        "not integration",
+    ),
+    ( # The one null-aware maximum. `max(())` raises and `max([1.0, None])`
+      # raises, so the alternative to computing it here is every reader getting
+      # it wrong on exactly the two verdicts that matter.
+        "preflight: report the slowest bounded run as if nothing ran",
+        "src/bakeoff/preflight.py",
+        '    evidence["bounded_run_duration_max_s"] = max(measured) if measured else None',
+        '    evidence["bounded_run_duration_max_s"] = None',
+        "tests/test_preflight.py -k slowest_bounded_run",
+        "not integration",
+    ),
+    ( # The inner schema. Seeded `None`, the shape exists only on the paths
+      # that measure something -- which is the two-families defect item 5
+      # closed, one layer down inside the one key whose value is a key set.
+        "preflight: seed the bounded-run durations as a bare None",
+        "src/bakeoff/preflight.py",
+        '    seed["bounded_run_durations_s"] = dict.fromkeys(BOUNDED_RUN_KEYS)',
+        '    seed["bounded_run_durations_s"] = None',
+        "tests/test_preflight.py -k never_happened_records_no_duration",
+        "not integration",
+    ),
+    ( # <cache>/preflight/<task_id>.json is keyed on the task id and nothing
+      # else, and is written before the `ok` test while preflight.json is
+      # written only on PASS. Trusting it because the filename matched
+      # publishes a refusing gate's seconds under a passing run's line.
+        "run_matrix: trust a stored verdict because the filename matched",
+        "scripts/run_matrix.py",
+        "    return blob if verdict_matches_key(blob, key) else None",
+        "    return blob",
+        "tests/test_run_matrix.py -k from_another_gate_is_not_printed",
+        "not integration",
+    ),
+    (
+        # A `-t` pattern naming a test that no longer exists exits 0 with every
+        # test reported skipped (measured 2026-09-01, vitest and jest both). A
+        # PARTLY stale p2p selection therefore runs what still matches, passes,
+        # and arrives here as a green report -- so without this branch the
+        # record says `resolved: True` over a regression check part of which
+        # never ran.
+        "grader: absorb a partly-stale p2p selection into a green report",
+        "src/bakeoff/grader.py",
+        '    if outcome.not_run:\n'
+        '        state.not_run_node_ids = tuple(sorted(outcome.not_run))\n'
+        '        state.environment(\n            "p2p",',
+        '    if False:\n'
+        '        state.not_run_node_ids = tuple(sorted(outcome.not_run))\n'
+        '        state.environment(\n            "p2p",',
+        # BOTH ordering pins under one anchor: the `if False:` mutation makes
+        # 4.2(2) (vs KIND_PASSED) and 4.2(6) (vs KIND_FAILED) red alike, so one
+        # anchor proves both of D4's claims. This is the first selector in the
+        # file to use an `or`, and the mechanism handles it -- but THE QUOTES
+        # ARE REQUIRED: `run()` splits on " -k ", strips one layer of quoting
+        # off the remainder, and passes what is left as a SINGLE `-k`
+        # argument, so an unquoted expression would be split on the space and
+        # select nothing.
+        'tests/test_grader.py -k "partly_stale_p2p_selection or '
+        'failed_beside_one"',
+        "not integration",
+    ),
+    (
+        # A node `fullName` is free text and may contain ", ", so the joined
+        # message is not losslessly splittable back into ids. Without the
+        # tuple, a reader counting how often a task set's manifests went stale
+        # is grepping prose -- the well-formed-verdict-beside-a-lying-evidence-
+        # field shape GRADER_VERSION 7 -> 8 already moved for.
+        "grader: report the stale p2p ids only in a message",
+        "src/bakeoff/grader.py",
+        '        state.not_run_node_ids = tuple(sorted(outcome.not_run))\n'
+        '        state.environment(\n            "p2p",',
+        '        state.environment(\n            "p2p",',
+        "tests/test_grader.py -k recorded_as_a_tuple",
+        "not integration",
+    ),
+    (
+        # `p2p_args` folds the quarantine into the same `-t` as a negative
+        # lookahead, so a quarantined test is SKIPPED, carries no terminal
+        # status, and is invisible to `executed_names`. Without the
+        # subtraction it falls through `verify_selected` into `not_run`, and
+        # the grader's branch above then grades `not_graded` on every cell of
+        # every arm of any node task with one flake -- permanently, in an
+        # append-only file.
+        # The label names BOTH files on purpose: the mutated file is
+        # `preflight.py` while the defect it guards is the grader's verdict,
+        # so an operator scanning labels for preflight coverage has to be able
+        # to find it.
+        "preflight/grader: report a quarantined p2p id as one that did not run",
+        "src/bakeoff/preflight.py",
+        "            self._selected = tuple(\n"
+        "                node_id for node_id in tests.p2p\n"
+        "                if node_id not in extra_deselect\n"
+        "            )",
+        "            self._selected = tuple(tests.p2p)",
+        "tests/test_grader.py -k quarantined_p2p_id_is_not_reported",
+        "not integration",
+    ),
+    (
+        # M11.2/M11.3, measured 2026-09-02 (vitest 3.2.7, jest 30.5.0): an
+        # exact anchored `-t` against a file holding two identically titled
+        # tests runs BOTH, one passing and one failing in the same run, and
+        # the negated form skips BOTH with `numPendingTests: 2` for one
+        # requested id. So a node id is one name for two tests and nothing
+        # downstream counts the collision unless this branch does.
+        "runners: count two same-named tests in one file as one",
+        "src/bakeoff/runners/node_adapter.py",
+        "            if count > 1:",
+        "            if False:",
+        "tests/test_runners.py -k more_than_once_in_one_file",
+        "not integration",
+    ),
+    (
+        # The consequence of the branch above going uncaught: red-before is
+        # satisfied by whichever of the pair fails, green-after by both
+        # passing, and `F2P_FAILED`/`resolved: True` is stamped on a pair the
+        # record cannot name -- `failed_ids` collapses them to one id and
+        # `verify_selected` reports nothing missing.
+        "preflight: accept a declared id that names two tests",
+        "src/bakeoff/preflight.py",
+        "    if declared_dupes:",
+        "    if False:",
+        "tests/test_preflight.py -k names_more_than_one_test",
+        "not integration",
+    ),
+    (
+        # The measured defect, as a mutation. Accepting a tag whose labels say
+        # something else is what an unconditional cache-hit `docker build -t`
+        # did in reverse -- it repaired the mutation silently, seconds before
+        # preflight's read-back could see it (measured 2026-09-02). With the
+        # comparison never firing, a tag pointing anywhere is accepted as this
+        # base and nothing downstream re-derives it.
+        "images: accept a base tag whose labels say it is something else",
+        "src/bakeoff/images.py",
+        "        if labels.get(key) == want:",
+        "        if True:",
+        "tests/test_images.py -k mutated_to_another_version_is_rebuilt",
+        "not integration",
+    ),
+    (
+        # `null` from the daemon and a non-zero exit are different facts: an
+        # image that exists and declares no labels versus nobody to ask. Both
+        # rebuild, so the mutation is invisible in the DECISION -- it shows up
+        # in `preflight`'s evidence, where `{}` says the gate looked and found
+        # nothing and `None` says it could not look.
+        "images: collapse an unlabelled image into an absent one",
+        "src/bakeoff/images.py",
+        '    return json.loads(probe.stdout.strip() or "null") or {}',
+        '    return json.loads(probe.stdout.strip() or "null")',
+        "tests/test_images.py -k image_labels_answers_three_ways",
+        "not integration",
+    ),
+    (
+        # The reversed set is every file the test half added plus everything
+        # `export-ignore` kept out of `git archive` -- a long, plausible,
+        # entirely wrong list, printed by the gate as "what will vanish".
+        "images: report what the run tree has and the image does not",
+        "src/bakeoff/images.py",
+        "    return sorted(_repo_paths_in_image(image) - _tree_paths(Path(run_tree)))",
+        "    return sorted(_tree_paths(Path(run_tree)) - _repo_paths_in_image(image))",
+        "tests/test_images.py -k only_the_run_tree_has",
+        "not integration",
+    ),
+    (
+        # The run tree always has a `.git`; the image normally has none.
+        # Under the mutation the tree's metadata enters the subtrahend and
+        # cancels, by path name, the residue an `image.build` step that ran
+        # `git init` left in the image -- the one case where the image side
+        # carries `.git` paths at all, and the one this prune exists to keep
+        # visible.
+        "images: let the run tree's own git metadata cancel build residue",
+        "src/bakeoff/images.py",
+        '        dirnames[:] = [name for name in dirnames if name != ".git"]',
+        "        dirnames[:] = list(dirnames)",
+        "tests/test_images.py -k git_residue",
+        "not integration",
+    ),
+    (
+        # The mutation sends exit 1 to the catch-all, which renders it as
+        # "tests failed" -- the words `_PROCESS_EXIT_MEANING` has for a code
+        # that under `--co` cannot mean that, and the exact reading that let
+        # pytest-10210's broken agent-side command through.
+        "preflight: accept a bare pytest that cannot start as a failing suite",
+        "src/bakeoff/preflight.py",
+        "            elif bare.exit_code == EXIT_TESTS_FAILED:",
+        "            elif False:",
+        "tests/test_preflight.py -k cannot_start",
+        "not integration",
+    ),
+
+    # --- round 2 item 16: relative .gitmodules urls ---------------------------
+
+    (
+        # The resolver's own trigger, mutated to fire on everything: `if
+        # True:` makes it return `declared` unchanged no matter what --
+        # "no resolution happens", the truest statement of the mutation a
+        # SyntaxError-free edit can make here. (A first draft targeted the
+        # call site instead -- `url_resolved=None if path in unneeded else
+        # (` -- which heads a continuation line carrying keyword arguments
+        # inside a parenthesized display and does not parse at all.)
+        "tasks: a relative submodule url is resolved",
+        "src/bakeoff/tasks.py",
+        "    if not declared.startswith(_RELATIVE_URL_PREFIXES):",
+        "    if True:",
+        "tests/test_tasks.py -k both_urls_are_recorded",
+        "not integration",
+    ),
+    (
+        # The pre-pop guard, disabled. `segments.pop()` then runs on an
+        # empty list, so the named test's `pytest.raises(TaskError)` sees an
+        # `IndexError` and ERRORS rather than failing -- still red, just not
+        # by the assertion it was written for.
+        "tasks: the climb guard runs before the pop",
+        "src/bakeoff/tasks.py",
+        "            if not segments:",
+        "            if False:",
+        "tests/test_tasks.py -k climb_past_the_host",
+        "not integration",
+    ),
+    (
+        # `./` popping a segment it should only append to. Reproduces row
+        # C/Y's shape wrong -- the base's own last segment would be eaten
+        # rather than kept.
+        "tasks: a dot-slash url does not pop a segment",
+        "src/bakeoff/tasks.py",
+        "            remainder = remainder[2:]",
+        "            remainder = remainder[2:]; segments and segments.pop()",
+        "tests/test_tasks.py -k dot_slash_url_appends",
+        "not integration",
+    ),
+    (
+        # The mirror keyed on the RAW url instead of the resolved one --
+        # `--sub.git` for a relative declaration, the "loader refusing a
+        # manifest wearing the costume of a harness crash" shape the item's
+        # own design notes argue against.
+        "tasks: the mirror is keyed on the resolved url",
+        "src/bakeoff/tasks.py",
+        "        sub.path: ensure_pruned_mirror(sub.url_resolved, sub.sha, cache_root)\n"
+        "        for sub in needed",
+        "        sub.path: ensure_pruned_mirror(sub.url_declared, sub.sha, cache_root)\n"
+        "        for sub in needed",
+        "tests/test_tasks.py -k no_mirror_is_keyed_on_the_raw",
+        "not integration",
+    ),
+    (
+        # The persisted value reverted to the raw declaration -- exactly
+        # what N2 measures `git submodule sync` does on its own, made
+        # unconditional at materialization time instead.
+        "tasks: the run tree persists the resolved url",
+        "src/bakeoff/tasks.py",
+        "        _git(\"config\", key, sub.url_resolved, cwd=parent_tree)",
+        "        _git(\"config\", key, sub.url_declared, cwd=parent_tree)",
+        "tests/test_tasks.py -k run_tree_persists_the_resolved_url",
+        "not integration",
+    ),
+    (
+        # The SECOND, independent consumer: the image context's own mirror
+        # key. Anchored separately from the tasks.py entry above on purpose
+        # -- two independent consumers, so one regressing must not hide
+        # behind the other's anchor.
+        "images: the image context uses the resolved url",
+        "src/bakeoff/images.py",
+        "        mirror = ensure_pruned_mirror(sub.url_resolved, sub.sha, cache_root)",
+        "        mirror = ensure_pruned_mirror(sub.url_declared, sub.sha, cache_root)",
+        "tests/test_tasks.py -k image_context_uses_the_resolved_url",
+        "not integration",
+    ),
+    (
+        # The declared-unneeded guard, dropped -- the resolver now runs
+        # against a path nothing fetches, over a url that may not even
+        # exist behind the stanza.
+        "tasks: a declared-unneeded submodule is never resolved",
+        "src/bakeoff/tasks.py",
+        "            url_resolved=None if full_path in unneeded else _resolve_submodule_url(",
+        "            url_resolved=_resolve_submodule_url(",
+        "tests/test_tasks.py -k declared_unneeded_submodule_is_never_resolved",
+        "not integration",
+    ),
+    (
+        # The resolved/unresolved test inverted: the "never resolved"
+        # problem now fires exactly when the url WAS resolved, so the named
+        # test's positive assertion goes red on a clean failure rather than
+        # an exception.
+        "preflight: an unresolved relative url is a problem",
+        "src/bakeoff/preflight.py",
+        "                        and not entry[\"url_persisted\"].startswith(",
+        "                        and entry[\"url_persisted\"].startswith(",
+        "tests/test_preflight.py -k unresolved_relative_url",
+        "not integration",
+    ),
+    (
+        # Round 2 item 17. The measured defect: `git add -A` stages ZERO
+        # BYTES for an uncommitted edit inside an initialised submodule, so
+        # the submission is byte-identical to an agent that changed nothing
+        # and the grader's `EMPTY_PATCH` -- a GradeFailure -- stamps
+        # `resolved: False` on it, permanently. Dropping the state from the
+        # checkpoint restores exactly that: the diff still looks clean and
+        # nothing anywhere says why.
+        "checkpoints: record the diff and drop the submodule state",
+        "src/bakeoff/checkpoints.py",
+        "            submodules_dirty=submodules,",
+        "            submodules_dirty=None,",
+        "tests/test_checkpoints.py -k records_the_submodule_state",
+        "not integration",
+    ),
+    (
+        # Measured: a plain `git status` REWRITES `.git/index` AND the
+        # submodule's, both stamped to 1577865600 and both at the wall clock
+        # afterwards. This read runs from inside the agent's stdout loop,
+        # concurrently with the agent's own git, and `SNAPSHOT_INDEX`'s
+        # comment states the rule -- nothing here writes to .git/index at
+        # all.
+        "container: let the submodule read take the index lock",
+        "src/bakeoff/container.py",
+        '    "git", "--no-optional-locks", "status",',
+        '    "git", "status",',
+        "tests/test_container.py -k argv_is_pinned",
+        "not integration",
+    ),
+    (
+        # Three config sites silence the entry completely without the flag,
+        # and the third -- `submodule.<name>.ignore=all` in `.gitmodules` --
+        # is REPOSITORY-AUTHORED: it ships in the upstream tree the task was
+        # cut from, so the refusal would be disarmed by a file the task
+        # author never wrote.
+        "container: let a repository-authored ignore setting hide a dirty "
+        "submodule",
+        "src/bakeoff/container.py",
+        '    "--porcelain=v2", "--ignore-submodules=none", "-z",',
+        '    "--porcelain=v2", "-z",',
+        "tests/test_container.py -k argv_is_pinned",
+        "not integration",
+    ),
+    (
+        # A `2` record occupies TWO NUL items and the second is a PATH --
+        # repository-authored text. A tracked file NAMED `1 .M S.M. 160000
+        # ... sneakysub`, renamed away, puts that string in the second slot;
+        # advancing by one files a submodule state for a path with no
+        # submodule at all. Content reaching column zero of a record, the
+        # rule `_GITLINK_MODE` states one level down.
+        "container: read a rename's original path as a record of its own",
+        "src/bakeoff/container.py",
+        "            index += 2",
+        "            index += 1",
+        "tests/test_container.py -k nul_stream",
+        "not integration",
+    ),
+    (
+        # Without the branch the row lands as `EMPTY_PATCH` -- a
+        # GradeFailure, so `resolved: False`, an accusation that the model
+        # changed nothing -- over a limitation of the harness's own capture,
+        # in an append-only file.
+        "grader: grade a submission whose tree carried an uncommitted "
+        "submodule edit",
+        "src/bakeoff/grader.py",
+        "    if edits:",
+        "    if False:",
+        "tests/test_grader.py -k dirty_submodule_at_exit",
+        "not integration",
+    ),
+    (
+        # The two refusals must stay disjoint. `SC..` (a commit inside, 245
+        # bytes) and `S...` (the directory removed, a `deleted file mode
+        # 160000`) are both IN the submission diff, so `_gitlinks_touched`
+        # names them; refusing them here too would take the more specific
+        # reason -- the one already in the stored vocabulary -- off every
+        # such row.
+        "grader: refuse on the commit bit too, making the gitlink refusal "
+        "unreachable",
+        "src/bakeoff/grader.py",
+        '        or (len(state) == 4 and (state[2] == "M" or state[3] == "U"))',
+        '        or state != "S..."',
+        "tests/test_grader.py -k left_to_the_gitlink_refusal",
+        "not integration",
+    ),
+    (
+        # The second reader's CAPTURE half. With the scratch index seeded
+        # from base_sha, content an agent writes into an uninitialised
+        # submodule directory is invisible to the diff (0 bytes), to `git
+        # status` and to the v2 stream alike -- recorded nowhere without
+        # this probe.
+        "container: skip the second reader, so content in an uninitialised "
+        "submodule is recorded nowhere",
+        "src/bakeoff/container.py",
+        "        for path in self._uninitialised_with_content(gitlinks):",
+        "        for path in ():",
+        "tests/test_container.py -k recorded_as_a_distinct_marker",
+        "not integration",
+    ),
+    (
+        # The second reader's VERDICT half, and it must go red on its own:
+        # either half alone silently restores the gap. `grade_run`
+        # re-materializes the tree, so an uninitialised submodule directory
+        # arrives EMPTY and the content the agent put there is in neither
+        # the diff nor the graded tree.
+        "grader: read git's verdict only, letting the filesystem marker "
+        "through",
+        "src/bakeoff/grader.py",
+        "        if state == SUBMODULE_UNINITIALISED_CONTENT",
+        "        if False",
+        "tests/test_grader.py -k uninitialised_submodule_is_refused",
+        "not integration",
+    ),
+    # --- round 2 item 18: nested submodules ----------------------------------
+    (
+        # The cap raised by one, which makes a three-level chain LEGAL. The
+        # measured reason it is not: `submodule update --init` runs per level,
+        # so a level below the cap arrives empty, and an empty submodule
+        # directory leaves `git status --porcelain` clean -- the Phase 0c
+        # shape arriving through the dataset, one level further down.
+        "tasks: recurse one level past the depth cap",
+        "src/bakeoff/tasks.py",
+        "_MAX_SUBMODULE_DEPTH = 2",
+        "_MAX_SUBMODULE_DEPTH = 3",
+        "tests/test_tasks.py -k three_levels_deep",
+        "not integration",
+    ),
+    (
+        # The update must run at the PARENT's working tree. Measured
+        # 2026-09-02 (M13): from the superproject root, `submodule update
+        # --init -- vendor/deep` has no such submodule to update, so the inner
+        # directory stays empty -- and `git status --porcelain` reports that
+        # tree as clean. The find is the TWO-LINE call, because `cwd=
+        # parent_tree` appears three times in this loop and
+        # `mutation_check` replaces the first occurrence only.
+        "tasks: initialise a nested submodule from the superproject root",
+        "src/bakeoff/tasks.py",
+        '        _git("-c", "protocol.file.allow=always",\n'
+        '             "submodule", "update", "--init", "--", sub.local_path,\n'
+        "             cwd=parent_tree)",
+        '        _git("-c", "protocol.file.allow=always",\n'
+        '             "submodule", "update", "--init", "--", sub.local_path,\n'
+        "             cwd=Path(dest))",
+        "tests/test_tasks.py -k populated_at_its_gitlink",
+        "not integration",
+    ),
+    (
+        # `path` is the FULL superproject-relative path at every depth, and
+        # this join is what makes it one. Level-local, the five path-shaped
+        # consumers compare unlike things: a `strip_paths: ["vendor/deep"]`
+        # matches a submodule really at `vendor/lib/vendor/deep`, a reference
+        # diff touching `vendor/lib/vendor/deep/x.py` slips past the refusal
+        # built to catch it, and item 2's declared-unneeded join never
+        # matches at all.
+        "tasks: join a nested submodule path onto nothing",
+        "src/bakeoff/tasks.py",
+        "        full = str(PurePosixPath(parent.path) / local) if parent else local",
+        "        full = local",
+        "tests/test_tasks.py -k full_paths_and_depths",
+        "not integration",
+    ),
+    (
+        # The descent must SKIP a submodule the manifest declared unneeded:
+        # nothing is populated for it, so no mirror exists to descend through,
+        # its own `.gitmodules` is never read and its children never exist.
+        # Anchored on the `continue` rather than left to `mirrors.get(...)`
+        # returning None, which is a coincidence of the comprehension above
+        # and cannot be mutation-tested.
+        #
+        # The selector is a DEPTH-1 declaration, and it has to be since the
+        # final-review fix: a depth-2 declaration is refused at load, so the
+        # only shape that reaches this loop with `declared_unneeded` set is a
+        # submodule of the superproject, and `_no_pruned_mirror_is_built`
+        # drives exactly that through `materialize`.
+        "tasks: descend into a submodule item 2 declared unneeded",
+        "src/bakeoff/tasks.py",
+        "        if sub.declared_unneeded:",
+        "        if False:",
+        "tests/test_tasks.py -k no_pruned_mirror_is_built_for_a_declared_unneeded",
+        "not integration",
+    ),
+    (
+        # ITEM 2'S LEVER IS DEPTH-1 ONLY. `container.submodule_states` reads
+        # `git ls-files -s -z` at the SUPERPROJECT ROOT, which does not
+        # descend through a gitlink -- so a level-2 gitlink inside a populated
+        # level-1 submodule is never enumerated and never probed, and the
+        # level-1 path that is enumerated carries a `.git` and is skipped by
+        # design. Without this refusal an agent's writes into that empty
+        # directory are recorded nowhere, `submodules_dirty` reads `{}` (the
+        # positive claim "read, nothing dirty"), and the ladder stamps
+        # EMPTY_PATCH -- `resolved: False` on a submission that edited files.
+        #
+        # TWO LINES, for the reason the typo anchor above gives: `    if
+        # too_deep:` is unique today, but pinning the subtraction beside it is
+        # what keeps a future `if unknown:`-shaped neighbour from being the
+        # line that gets mutated.
+        "tasks: accept an unneeded declaration naming a depth-2 gitlink",
+        "src/bakeoff/tasks.py",
+        "        too_deep = sorted(set(task.submodules_unneeded) & set(gitlinks))\n"
+        "        if too_deep:",
+        "        too_deep = sorted(set(task.submodules_unneeded) & set(gitlinks))\n"
+        "        if False:",
+        "tests/test_tasks.py -k level_two_submodule_cannot_be_declared_unneeded",
+        "not integration",
+    ),
+    (
+        # `--recursive` is the ONLY reader that can see an empty nested
+        # submodule. Measured 2026-09-02 (M16) with level 1 populated and
+        # level 2 empty: the superproject's `git status --porcelain`, the
+        # inner's own, `git diff HEAD` and non-recursive `git submodule
+        # status` are all clean.
+        "preflight: read submodule status without --recursive",
+        "src/bakeoff/preflight.py",
+        '["git", "submodule", "status", "--recursive"]',
+        '["git", "submodule", "status"]',
+        "tests/test_preflight.py -k empty_inner_submodule",
+        "not integration",
+    ),
+    (
+        # THE DESCENT GUARD. Measured 2026-09-02 (M11): `git -C <empty
+        # submodule dir> ls-files -s -z` exits 0 and returns the PARENT's own
+        # gitlink as `./`, so an unguarded descent files `vendor/lib/.` -- a
+        # gitlink that does not exist, which is a fabricated observation and
+        # worse than the empty directory it was looking for.
+        "preflight: descend into a directory that is not its own repository",
+        "src/bakeoff/preflight.py",
+        '    return result.stdout.strip() == ""',
+        "    return True",
+        "tests/test_preflight.py -k uninitialised_parent_is_not_descended_into",
+        "not integration",
+    ),
+    (
+        # The third disagreement is only visible because the descent RECORDS
+        # the path it declined. Without the record `disagreed` is always
+        # empty and a status line claiming a directory is an initialised
+        # submodule, against a `--show-prefix` that says it is not a
+        # repository at all, passes the gate in silence.
+        "preflight: forget the paths the descent declined",
+        "src/bakeoff/preflight.py",
+        "                        not_own.append(path)",
+        "                        pass",
+        "tests/test_preflight.py -k not_a_repository",
         "not integration",
     ),
 ]

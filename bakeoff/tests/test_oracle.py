@@ -21,6 +21,7 @@ from bakeoff.oracle import (
     ensure_oracle,
     oracle_fingerprint,
 )
+from bakeoff.runners.pytest_adapter import ADAPTER
 
 
 class FakeRunner:
@@ -35,8 +36,59 @@ class FakeRunner:
         code, out = self._results.pop(0)
         return SimpleNamespace(exit_code=code, stdout=out, stderr="")
 
+    def classify(self, result):
+        """Delegated to the REAL pytest adapter rather than stubbed.
+
+        `_Runner.classify` does exactly this, and every pair queued above is a
+        pytest exit code with pytest `-q` output -- so a hand-written mapping
+        here would be a second opinion about what pytest's numbers mean,
+        sitting inside the fixtures that exist to pin what the oracle does
+        with them.
+        """
+        return ADAPTER.classify(
+            exit_code=result.exit_code, stdout=result.stdout,
+            stderr=result.stderr, report=None,
+        )
+
 
 TESTS = SimpleNamespace(f2p=("tests/test_x.py::test_a",), p2p=())
+
+
+def test_the_oracle_version_moved_with_what_derivation_means():
+    """It is in the fingerprint for the reason `PREFLIGHT_VERSION` is in
+    preflight's key: neither the manifest digest nor the image digest moves
+    when this file's rules change, so without the bump a warm cache serves a
+    quarantine derived by the old rules on exactly the tasks about to be
+    graded.
+
+    Pinned to a literal so a bump is a DELIBERATE edit rather than a side
+    effect: 1 -> 2 is the derivation's two reference runs reading their
+    `timeout` bound off `task.budget.suite_timeout_s` instead of a function
+    default, where a manifest that already declares the key loads fine under
+    the older loader (which ignores unknown `budget` sub-keys) and would
+    otherwise go on being derived at 600 against a bound it does not ask
+    for. 2 -> 3 is `_classify` reading an `Outcome` rather than an exit code:
+    a quarantine cached under 2 was derived by rules that could not classify a
+    node run at all, and whose "the quarantine swallowed the whole p2p list"
+    guard depended on pytest's exit 5 -- which vitest and jest answer with 0
+    and a report of every test reported skipped. 3 -> 4 is
+    `pytest_adapter._FAILED_LINE` learning `SUBFAILED` (fix 3, 2026-09-02): a
+    p2p node that flakes only through `unittest.subTest` was invisible to
+    `_classify`'s set on both reference runs under 3 and could never land in
+    the quarantine. 4 -> 5 is the node per-file selection (round 2 item 1,
+    2026-09-03): `_derive`'s two reference runs are now the per-file argv
+    sequence, so a quarantine cached under 4 for a NODE task was derived from
+    runs in which one file's deselection removed another file's
+    identically-titled test -- it can name an id that never needed
+    quarantining and miss one that did. 5 -> 6 is the same `_Runner`'s argv
+    once more (item 12's fix wave, `d75ceba`, 2026-09-03): `report_args` moved
+    to the front of every group, `ORACLE_VERSION` did not move with it, and a
+    node manifest whose `tests.runner` ends in an array-valued flag was
+    derived under an argv whose scope positional the flag had swallowed --
+    so the XOR was taken over a different file set than the same manifest
+    gives today. No pytest quarantine moves; `PytestAdapter.report_args` is
+    `[]`."""
+    assert ORACLE_VERSION == "6"
 
 
 def test_both_runs_green_yields_empty_quarantine():
@@ -149,13 +201,17 @@ class _Deriver:
         self.quarantined = quarantined
         self.calls = 0
 
-    def __call__(self, task, image, cache_root, timeout_s):
+    def __call__(self, task, image, cache_root):
         self.calls += 1
         return self.quarantined
 
 
 def _task(task_id="click-3360", digest="abc"):
-    return SimpleNamespace(task_id=task_id, manifest_digest=digest)
+    return SimpleNamespace(
+        task_id=task_id,
+        manifest_digest=digest,
+        budget=SimpleNamespace(suite_timeout_s=600, wall_clock_timeout_s=900),
+    )
 
 
 def test_a_cold_cache_derives_once_and_stores_the_verdict(tmp_path, monkeypatch):
@@ -323,9 +379,16 @@ def _stub_derive_environment(monkeypatch, tmp_path, existing, results):
         "bakeoff.oracle.RunContainer",
         lambda image, repo_path, base_sha: _FakeContainer(existing),
     )
-    monkeypatch.setattr(
-        "bakeoff.oracle._Runner", lambda container, argv, timeout_s: runner
-    )
+
+    def _make_runner(container, argv, timeout_s, adapter=None):
+        runner.timeout_s = timeout_s
+        # Recorded, not ignored: `_derive` must pass the task's adapter rather
+        # than leave `_Runner` on its pytest default, and a stub that swallowed
+        # the argument would hide the day it stopped.
+        runner.adapter = adapter
+        return runner
+
+    monkeypatch.setattr("bakeoff.oracle._Runner", _make_runner)
 
     def _fake_materialize(task, dest, cache_root):
         Path(dest).mkdir(parents=True)
@@ -344,7 +407,9 @@ def _derive_task(paths, p2p=()):
             p2p=p2p,
             paths=paths,
             runner=("python", "-m", "pytest", "-q"),
+            framework="pytest",
         ),
+        budget=SimpleNamespace(suite_timeout_s=600, wall_clock_timeout_s=900),
     )
 
 
@@ -356,7 +421,7 @@ def test_the_quarantine_is_derived_only_over_prefixes_that_exist(
     )
     task = _derive_task(paths=("tests/", "docs/"))
 
-    assert _derive(task, "sha256:img", tmp_path, 600) == ()
+    assert _derive(task, "sha256:img", tmp_path) == ()
     # "docs/" does not exist at the reference state. Passed raw it is a
     # positional argument pytest cannot collect -- exit 4, which `_classify`
     # refuses, so a task preflight passed on purpose becomes ungradable.
@@ -371,7 +436,7 @@ def test_an_explicit_p2p_list_derives_with_no_scope(tmp_path, monkeypatch):
     )
     task = _derive_task(paths=("tests/",), p2p=("tests/test_x.py::test_b",))
 
-    assert _derive(task, "sha256:img", tmp_path, 600) == ()
+    assert _derive(task, "sha256:img", tmp_path) == ()
     assert [c["scope"] for c in runner.calls] == [(), ()]
 
 
@@ -383,8 +448,11 @@ def test_the_derivation_tree_does_not_outlive_the_derivation(
     _stub_derive_environment(
         monkeypatch, tmp_path, existing={"tests/"}, results=[(0, ""), (0, "")]
     )
-    _derive(_derive_task(paths=("tests/",)), "sha256:img", tmp_path, 600)
-    assert not (tmp_path / "oracle-tree" / "click-3360").exists()
+    _derive(_derive_task(paths=("tests/",)), "sha256:img", tmp_path)
+    # The KEY directory survives as an empty husk by design (one inode per
+    # task, never per derivation); what must not survive is a tree holding the
+    # reference fix, which is the leaf.
+    assert not list((tmp_path / "oracle-tree" / "click-3360").iterdir())
 
 
 def test_the_tree_is_removed_even_when_the_derivation_refuses(
@@ -394,5 +462,132 @@ def test_the_tree_is_removed_even_when_the_derivation_refuses(
         monkeypatch, tmp_path, existing={"tests/"}, results=[(2, "")]
     )
     with pytest.raises(OracleError):
-        _derive(_derive_task(paths=("tests/",)), "sha256:img", tmp_path, 600)
-    assert not (tmp_path / "oracle-tree" / "click-3360").exists()
+        _derive(_derive_task(paths=("tests/",)), "sha256:img", tmp_path)
+    # The KEY directory survives as an empty husk by design (one inode per
+    # task, never per derivation); what must not survive is a tree holding the
+    # reference fix, which is the leaf.
+    assert not list((tmp_path / "oracle-tree" / "click-3360").iterdir())
+
+
+def test_the_derivation_bounds_its_two_reference_runs_by_the_manifest(
+    tmp_path, monkeypatch
+):
+    """The quarantine is derived from two full suite runs at the reference
+    state. Under a bound the manifest does not ask for, a slow-but-healthy
+    suite raises OracleError ("the p2p run exited 124") and the task becomes
+    ungradable -- for a number the task author already declared."""
+    runner = _stub_derive_environment(
+        monkeypatch, tmp_path, existing={"tests/"}, results=[(0, ""), (0, "")]
+    )
+    task = _derive_task(paths=("tests/",))
+    task.budget.suite_timeout_s = 4321  # SimpleNamespace, assigns directly
+
+    _derive(task, "sha256:" + "a" * 64, tmp_path)
+
+    assert runner.timeout_s == 4321
+
+
+def test_neither_oracle_entry_point_takes_a_timeout_parameter():
+    """Same reasoning as `preflight`: the parameter is deleted rather than
+    defaulted, so `grade.py`'s `ensure_oracle(task, image, Path(cache))` call
+    cannot be left on a bound the manifest does not ask for."""
+    import inspect
+
+    assert "timeout_s" not in inspect.signature(ensure_oracle).parameters
+    assert "timeout_s" not in inspect.signature(_derive).parameters
+
+
+def test_the_quarantine_still_refuses_a_run_that_could_not_collect():
+    """The oracle is deliberately UNCHANGED by broadening 2.
+
+    Both of its runs are at the POST-FIX state, where preflight has already
+    proved f2p exits 0 -- so no collection error can reach it. If one does, the
+    polarity is the worst in the codebase: a broken run reports no failed node
+    ids, so a classifier that softened here would read a suite that never
+    collected as a clean run and derive an empty quarantine from two of them.
+    """
+    from types import SimpleNamespace
+
+    from bakeoff.oracle import OracleError, _classify
+
+    result = SimpleNamespace(
+        exit_code=4, stdout="ERROR tests/a.py\n1 error in 0.01s\n", stderr="",
+    )
+    # The outcome comes from the real adapter, and the raw result is threaded
+    # through beside it for the output tail. `_classify` stopped reading the
+    # exit code directly when the judgement became per-framework (broadening
+    # 7); the claim this test makes is unchanged.
+    with pytest.raises(OracleError) as excinfo:
+        _classify(ADAPTER.classify(exit_code=result.exit_code,
+                                   stdout=result.stdout,
+                                   stderr=result.stderr, report=None), result)
+
+    assert "exited 4" in str(excinfo.value)
+
+
+def test_the_oracle_refuses_every_kind_that_is_not_passed_or_failed():
+    """A quarantine is derived from which tests failed, and a run that did not
+    happen reports none -- indistinguishable from a clean run, and it would
+    quarantine nothing. `load_error`, `nothing_ran` and `environment` all reach
+    the raise, and `nothing_ran` is the one that matters most on node: a
+    quarantine that swallows the whole p2p list exits 0 there (measured), so
+    the exit code cannot carry this any more."""
+    from bakeoff.oracle import OracleError, _classify
+    from bakeoff.runners import (
+        KIND_ENVIRONMENT, KIND_LOAD_ERROR, KIND_NOTHING_RAN, Outcome,
+    )
+
+    result = SimpleNamespace(stdout="the tail an operator needs", stderr="")
+    for kind, code in (
+        (KIND_LOAD_ERROR, 4), (KIND_NOTHING_RAN, 5), (KIND_ENVIRONMENT, 127),
+    ):
+        with pytest.raises(OracleError) as excinfo:
+            _classify(Outcome(kind=kind, exit_code=code, explain="x"), result)
+        # The tail is not decoration: every path through here is a broken
+        # oracle, and a refusal with no output is one an operator cannot act on.
+        assert "the tail an operator needs" in str(excinfo.value)
+
+
+def test_the_derivation_hands_the_runner_the_tasks_adapter(
+    tmp_path, monkeypatch
+):
+    """`_derive` builds its `_Runner` with the adapter for the task's declared
+    framework, never leaving it on the pytest default. Under jest, exit 1 is
+    what a config error, an import error and a failing assertion all return
+    alike -- so a default here would read a broken reference run as "these
+    tests failed" and quarantine them, shrinking the regression check on every
+    submission of that task, forever."""
+    from bakeoff.runners import for_framework
+
+    runner = _stub_derive_environment(
+        monkeypatch, tmp_path, existing={"tests/"}, results=[(0, ""), (0, "")]
+    )
+
+    _derive(_derive_task(paths=("tests/",)), "sha256:img", tmp_path)
+
+    assert runner.adapter is for_framework("pytest")
+
+
+def test_two_derivations_for_one_task_mount_different_host_paths(
+    tmp_path, monkeypatch
+):
+    """`oracle-tree/<task_id>` is one path per task, and a re-derivation
+    mounts it again -- the second container then sees the VM's cached, empty
+    copy and the reference fix "does not apply", which makes a sound task
+    ungradable."""
+    mounted: list[str] = []
+
+    def _recording(image, repo_path, base_sha):
+        mounted.append(str(repo_path))
+        return _FakeContainer({"tests/"})
+
+    for _ in range(2):
+        _stub_derive_environment(
+            monkeypatch, tmp_path, existing={"tests/"},
+            results=[(0, ""), (0, "")],
+        )
+        monkeypatch.setattr("bakeoff.oracle.RunContainer", _recording)
+        _derive(_derive_task(paths=("tests/",)), "sha256:img", tmp_path)
+
+    assert mounted[0] != mounted[1]
+    assert all("click-3360" in p for p in mounted)

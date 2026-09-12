@@ -125,6 +125,13 @@ Uncommitted changes record as `-dirty`, which is honest but not reproducible.
 
 **Commit the task set before every collection run.**
 
+That rule now has teeth in the loader: a manifest that does not load is fatal
+to every command over that directory once it is **tracked in the enclosing
+repository**, because that revision is what a record's `task_set_commit`
+names. Only work in progress can be skipped — a directory that is untracked,
+ignored, or in no repository at all — and only by a `--tasks` selection that
+does not name it.
+
 ### 1.6 Credentials — only for the live step
 
 Nothing until step 7 needs these. When you get there:
@@ -217,18 +224,35 @@ docker run --rm -it -v "$PWD":/w -w /w python:3.12-slim-bookworm bash -c '
   git clean -xfd && time python -m pytest -q -p no:cacheprovider ; git status --porcelain'
 ```
 
+`python:3.12-slim-bookworm` here matches the base image's default. If a
+repository's suite fails on it for a version reason — a `SyntaxError` on
+newer syntax, a removed stdlib module, a C extension with no wheel — re-run
+the screen against `python:3.11-slim-bookworm` or `python:3.13-slim-bookworm`
+and, if it passes there, declare `image.python: "3.11"` (quoted) in the
+manifest. Only those three are accepted; see `taskset/HARVESTING.md` for how
+the set grows. Measured 2026-09-02: re-screening the eight candidates whose
+exclusion or open diagnosis could plausibly be a version problem at 3.11 and
+3.13 reopened zero repositories — every blocker found there reproduces
+identically across all three versions
+(`~/.cache/bakeoff-probe/reports/r2-19-rescreen.md`). Treat this key's yield
+as unmeasured upside, not a measured gain, until a candidate is actually
+reopened by it.
+
 What you are looking for, and what each answer disqualifies:
 
 | observation | verdict |
 |---|---|
-| suite green, under ~40 s | usable. Preflight runs it four times per task and the agent re-runs it inside its own timeout |
-| suite green but slow (minutes) | expensive; every task from this repo pays it repeatedly |
+| suite green, under ~40 s | usable. Preflight runs it five times per task (four with an explicit `tests.p2p`) plus once per declared `grading.*` argv plus the bare pytest collection the gate makes on every pytest task, the oracle twice more, and the agent re-runs it inside its own timeout |
+| suite green but slow | usable only with `budget.suite_timeout_s` raised — and it must stay ≤ `budget.wall_clock_timeout_s`, or `load_task` refuses the manifest. Costs up to 9× the value per task at the gate (8× on a node task), before the proxy starts and inside the one-hour SSO window — and the gate records what it actually cost in `bounded_run_durations_s` |
 | collection errors | usually one missing test dependency. Fixable by declaring it in `image.pip` — note which |
 | `git status` dirty after the suite | the suite writes into the tree. Every submission diff then carries the droppings and diff size measures the interpreter rather than the agent. Fixable with `gitignore_extra` |
-| needs a git submodule | **excluded.** The build context is `git archive base_sha`, which drops submodules; the directory arrives empty |
-| `setuptools_scm` refuses to detect a version | needs a pretend-version in `build:`. `hatch-vcs` does not care |
-| hypothesis / property-based suite | **excluded.** A property suite can pass a wrong fix on a lucky draw and fail a right one on an unlucky seed |
-| `CLAUDE.md`, `AGENTS.md`, `.claude/` or `.cursorrules` present | either pick a `base_sha` predating them, or exclude the repo. A task-local agent file gives that task a context no other task has |
+| needs a git submodule | usable. The submodule is derived from `base_sha` and populated from its own pruned mirror; check three things before cutting: the `.gitmodules` url is `https://` (or is relative and resolves to one against `repo.url`), the submodule chain is at most two levels deep -- a submodule of a submodule is fine, a third level is refused at load -- and the suite does not write inside it (an untracked file there shows as ` M <path>` in the superproject and is a preflight NO-GO that `gitignore_extra` cannot fix). If the suite does **not** need the submodule, `submodules_unneeded: ["<path>"]` declines to populate it and none of the three checks applies to that path (nor to anything below it: declaring a parent declines its children). §6.4 confound to record in the manifest either way: the humans who wrote the PR had the submodule, so upstream's own suite was larger than any arm's |
+| `.gitmodules` names a non-`https://` url (`ssh://`, `git@…`) | excluded at that `base_sha` and at every descendant — **unless the suite guards on the submodule's presence**, in which case `submodules_unneeded: ["<path>"]` names it and the url is never read. Check the guard before declaring it: `git grep <submodule path> <base_sha> -- <tests.paths>` and confirm every reference sits behind an existence test (sqlglot's two are `if os.path.isdir(...)`). If the suite genuinely reads it, find the commit that added the url (`git log -p -- .gitmodules`) and cut strictly before it — `strip_paths` cannot lift this the way it lifts an agent-file floor, because a strip cannot touch a submodule path. A relative url is not in this row: it is resolved against `repo.url` and only the result is judged. §6.4 confound to record in the manifest: the humans who wrote the PR had the submodule, so upstream's own suite was strictly larger than any arm's |
+| `setuptools_scm` refuses to detect a version | needs a pretend-version in `build:`. `hatch-vcs` does not care. If the package is the repo under test itself (cutting a task from `pytest-dev/pytest`, say), the pin has to be **inlined into the `image.build` command** — the build context is `git archive base_sha` and never has `.git`, for any task, so `image.env` cannot supply it either (its `ENV` lines are emitted after the last `image.build` step, on purpose) — and note the pin fixes the **build only**: `setuptools_scm` writes a `_version.py` plus an `*.egg-info/` into the tree it built from, and the materialized run tree — bind-mounted over `/repo` at run time — never sees that write. See `HARVESTING.md`'s *"Nothing an `image.build` step writes into `/repo` reaches the run"* bullet, and the refusals row below for the shape this takes when the suite cannot import without it |
+| the suite exits 4 under the repo's own `addopts` in the image | usually a missing plugin the repo's `pyproject.toml`/`pytest.ini` names but `image.pip` does not install — `pytest-xdist` for `--numprocesses`, `pytest-cov` for `--cov`, `pytest-timeout` for `--timeout`, `hypothesis` for `--hypothesis-profile`. Add it to `image.pip`. Preflight refuses this itself now: the bare-runner probe (`PREFLIGHT_VERSION` 13) runs the repo's own `addopts` with none of `tests.runner`'s extra arguments, specifically so a gated runner that bypasses them (`--override-ini=addopts=`, most often) cannot hide a usage error the command an agent naturally types would hit from turn one |
+| hypothesis / property-based suite | usable with `image.env: {CI: "1", HYPOTHESIS_STORAGE_DIRECTORY: "<absolute path outside /repo>"}` — `CI=1` loads hypothesis's deterministic `ci` profile instead of a fresh draw each run. If the repo's own `addopts` names a competing `--hypothesis-profile`, bypass it with `--override-ini=addopts=` (never `-c /dev/null` — see `HARVESTING.md`'s Layer 2 bullet), and declare whatever plugin that bypass now hides from a bare invocation (`pytest-xdist` for `--numprocesses=auto` is the measured case) in `image.pip` too. See that same bullet for the determinism math and the §6.4 confound this still carries |
+| `CLAUDE.md`, `AGENTS.md`, `.claude/` or `.cursorrules` present | declare them in `strip_paths` and they are removed in the setup commit — or pick a `base_sha` predating them. List symlinks *and* their targets: if `CLAUDE.md` links to `AGENTS.md`, list both |
+| committed venv or vendored tree at `base_sha` | `strip_paths` can remove it, but judge by size — 2,902 `site-packages` files is a different repository from the one the PR was merged into, and a later `base_sha` is cheaper |
 
 Then filter for supply: merged PRs that close an issue and carry both a test and
 a fix. Repos with hundreds of those are worth the setup cost; repos with three
@@ -267,13 +291,23 @@ and rejects a whole class of candidate:
 
 A PR that *adds* a function and tests for it puts that symbol in the solution
 half, so the test module raises `ImportError` during collection and pytest
-exits **2** — which preflight reads as a broken environment, not as a present
-bug. There is no way to rescue such a task; the exit-1 requirement is exactly
-the check that stops a broken environment counting as evidence the bug is
-there. Measured on `trucking-doc-extraction` #3.
+exits **4** (a selected node id whose module will not import; a directory run
+gives 2). Since `PREFLIGHT_VERSION` 4 that is an **accepted** task shape, under
+a narrow condition you can check by eye before cutting anything: the reported
+`ERROR` lines must name **exactly** the modules holding your declared f2p ids,
+the rest of the suite must be green at the start state with those modules
+ignored, and f2p must go green after the reference fix — so an f2p set that spans a
+module the PR adds *and* a module that already
+imports cannot work, because a collection error stops the run before the second
+module's tests are ever attempted. Measured on `trucking-doc-extraction` #3.
 
-The heuristic that follows: **prefer a PR that changes the behaviour of an
-existing symbol over one that adds a symbol.**
+What you are choosing between is what the agent reads: an assertion message on
+an exit-1 task, `ImportError: cannot import name …` on this one. Both are what
+the human who filed the issue read, so neither is the "wrong" kind of task —
+but an exit-1 task gives per-test signal from the first run and this one gives
+none until the import works, so **prefer a PR that changes the behaviour of an
+existing symbol when you have the choice**, and reach for this shape when you
+do not.
 
 Also reject: tests that are flaky, tests that depend on wall-clock time or
 network, and PRs whose "fix" is a version bump or a pure refactor.
@@ -328,18 +362,74 @@ fail are your `f2p` list, verbatim node ids:
 ```bash
 git checkout --detach <base_sha>
 git apply <(git diff <base_sha> <merge_commit> -- tests/)
-python -m pytest -q -p no:cacheprovider tests/ 2>&1 | grep -E '^(FAILED|ERROR)'
+python -m pytest -q -p no:cacheprovider tests/ 2>&1 | grep -E '^(FAILED|ERROR|SUBFAILED)'
 ```
 
-Copy those ids exactly. Preflight asserts every declared id appears in pytest's
-FAILED/ERROR lines at the start state, so a typo is caught — but a *missing* id
-is not, and an f2p set narrower than the real one under-specifies the task.
+**A `SUBFAILED` line still names the id to declare, and the id is the part
+before the label.** pytest's core-integrated subtests (pytest >= 9; the base
+image pins 9.1.1) report a failing `unittest.subTest` as `SUBFAILED(label)
+<node id> - <msg>` or `SUBFAILED[label] <node id> - <msg>` — measured
+2026-09-02 against `sqlglot-6927-dremio-trycast`, whose `validate_all` helper
+wraps every assertion in `subTest` — never as `FAILED <node id>` for a node
+whose only failures are subtest failures. The label (`(i=0)`, `[0]`) is which
+iteration failed, not part of the id; declare the **node id** exactly as it
+appears after the label, the same id `--collect-only` would print for that
+test, and copy it once even if several `SUBFAILED` lines name the same node.
+The gate folds every `SUBFAILED` line for a node back onto that node's id, so
+a `subTest`-only failure gates red exactly like a plain `FAILED` line does —
+but only since preflight learned to parse it (fix 3); an f2p id measured this
+way against an older preflight reads as a false NO-GO.
+
+**If that command prints `ERROR <module>` with no `::` and nothing else, the
+test half does not import at the start state** — the PR adds a symbol its tests
+call. That is an accepted shape, and the ids still come from the **post-fix**
+run, never from the red one: the red run cannot name them, because a collection
+error stops pytest before anything is collected. Get them from the state the
+grader will grade:
+
+```bash
+git checkout --detach <merge_commit>
+python -m pytest -q -p no:cacheprovider tests/ | tail -3   # must be all green
+python -m pytest -q -p no:cacheprovider --collect-only -q <the new test module>
+```
+
+Every id `--collect-only` prints for the module(s) the PR adds is an f2p
+candidate. Then check the constraint the gate enforces: **every module holding
+a declared f2p id must be one of the modules that errored** in the red run. If
+the PR also changes a test in a module that already imports, that test's id
+cannot be in `f2p` for this task — a collection error hides it, so preflight
+would be accepting an id nobody checked, and it refuses instead.
+
+Copy those ids exactly. On an exit-1 task preflight asserts every declared id
+appears in pytest's FAILED/ERROR lines, so a typo is caught; on a
+collection-error task the equivalent check is the module-level equality above
+(a typo there surfaces as `ERROR: not found:`, which reports nothing and is
+refused). In neither case is a *missing* id caught, and an f2p set narrower
+than the real one under-specifies the task.
 
 `p2p` is normally left empty, meaning "everything else the runner collects".
 If you do declare it, **list leaf node ids only** (`path::test_name`, never a
 bare module or class). The grader's quarantine refusal compares declared ids
 against quarantined ids and is exact only while every entry names one item; a
 non-leaf entry makes that refusal fail open and the graded run exits 5.
+
+For a vitest task, the recipe is the same idea and a different reporter — run
+it inside the task image, at the start state:
+
+```bash
+# inside the task image, at the start state
+/node_modules/.bin/vitest run --no-cache --reporter=json \
+    --outputFile=/tmp/r.json tests/
+node -e 'const r=require("/tmp/r.json");
+  for (const s of r.testResults) for (const a of (s.assertionResults||[]))
+    if (a.status==="failed") console.log(s.name.replace("/repo/","")+"::"+a.fullName)'
+```
+
+**A `-t` pattern matching nothing exits 0 with every test skipped, so an id
+you typed from the source rather than read from a run is a silent no-op** —
+this is not optional. There is no pytest-style exit 4 to catch the typo; the
+run reports success and the id you invented never gets a verdict from any
+arm.
 
 ### 3.5 Write `task.yaml`
 
@@ -371,6 +461,7 @@ tests:
   allow_extra_paths: ["CHANGES.rst"]  # files in NEITHER half
 
 image:
+  # python: "3.12"                    # QUOTED. 3.11 | 3.12 (default) | 3.13
   apt: []                             # OS packages the suite needs
   pip: ["pytest==8.3.5"]              # PINNED versions only
   build: ["pip install -e ."]         # EDITABLE — see below
@@ -379,8 +470,17 @@ image:
 # saying why — see §4.
 
 budget:
+  # All three are POSITIVE INTEGERS, refused at load by name otherwise:
+  # a quoted "40", a floated 40.0, true/false, null, 0 and negatives are
+  # each a TaskError naming this file and the key. Unquoted and unfloated,
+  # or the manifest stops being a record of what the arms were asked to do.
   max_turns: 40
   wall_clock_timeout_s: 900
+  # suite_timeout_s: 600   # the timeout on every command preflight, the
+  #                        # oracle and the grader run in the container.
+  #                        # Must not exceed wall_clock_timeout_s. Size it
+  #                        # from bounded_run_durations_s in the cached
+  #                        # verdict, not from a hand-run `time docker run`.
 
 provenance:
   repo: <owner>/<repo>
@@ -393,8 +493,15 @@ provenance:
   original_model: null
 ```
 
-Three keys that bite:
+Four keys that bite:
 
+- **`image.python` is quoted, and from a closed set.** YAML reads an unquoted
+  `3.10` as the float `3.1`, so the version that reaches the build is not the
+  one you wrote — the loader refuses a non-string rather than coercing. The set
+  is `{"3.11", "3.12", "3.13"}` because those are the three the base image has
+  been built at; anything else is a floating tag or a registry error mid-build.
+  Every arm of a task runs the same base, so this is a per-task choice and not
+  a §5.4 divergence.
 - **`image.build` must install editable.** A plain `pip install .` resolves
   imports to site-packages, so nothing the agent writes to `/repo` takes
   effect — every arm fails identically and it reads as four weak models.
@@ -415,6 +522,63 @@ Three keys that bite:
 suite drops files into the tree; it is applied in the setup commit and is
 therefore visible in `start_sha`.
 
+`strip_paths` is a **top-level** key too. It lists paths removed from the start
+state — agent files, a small vendored tree — in the same setup commit, so it is
+visible in `start_sha`. Declaring one moves `start_sha`: re-pin it and bump
+`task_version`. Each entry must match a file **tracked at `base_sha`** (a typo
+that strips nothing is refused, and a file the PR *creates* cannot be
+stripped), and a path the reference diff also touches has to be in
+`tests.allow_extra_paths` as well, or the load is refused.
+
+`image.env` is a **map under `image:`**, and its keys are an allowlist: `CI`
+and `HYPOTHESIS_STORAGE_DIRECTORY`, nothing else. It is baked into the task
+image as `ENV` lines, so it reaches every process in the container — the
+gate's runner, the grader's, the agent's `claude`, and the commands the agent
+invents. Use it when the suite is property-based:
+
+```yaml
+image:
+  pip: ["hypothesis==6.167.1"]        # or whatever the repo's lockfile pins
+  build: ["pip install -e ."]
+  env:
+    CI: "1"
+    HYPOTHESIS_STORAGE_DIRECTORY: "/tmp/bakeoff-hypothesis"
+```
+
+`CI=1` loads Hypothesis's built-in `ci` profile — `derandomize=True`,
+`database=None`, `deadline=None` — which is the difference between a suite
+that answers `0 0 0 0 1 1 1 1 0 0` over ten runs and one that answers
+`1 1 1 1 1 1`. It does **not** move `start_sha` (it is not an input to the
+start state) but it does move the image id, so preflight re-runs. Read
+`HARVESTING.md`'s Layer 2 bullet before cutting a property-based task at all:
+determinism makes the oracle reproducible, not correct, and the draw is a
+function of the tree the agent is editing.
+
+A vitest task declares `tests.framework`, a node-shaped `runner`, node ids
+carrying the reporter's `fullName` after `::`, and `image.node` instead of
+`image.python`:
+
+```yaml
+tests:
+  paths: ["tests/"]
+  framework: vitest                     # pytest (default) | vitest | jest
+  runner: ["/node_modules/.bin/vitest", "run", "--no-cache"]
+  f2p: ["tests/formatting.test.ts::HelpFormatter writes usage with no args"]
+  p2p: []
+
+image:
+  node: "22"                            # QUOTED. {"22"} today
+  build: ["npm install --prefix / --omit=dev lodash@4.17.21"]
+```
+
+`framework` and `runner` are cross-checked, not derived from each other, so
+either one catches a typo in the other. `image.node` and `image.python` are
+mutually exclusive — the runtime comes from `tests.framework`, and declaring
+the key belonging to the other one is refused at load. See
+`HARVESTING.md`'s JavaScript screening subsection before cutting one of
+these: the `npm install`/`npm ci` and contained-test-path rules there are
+screening decisions, not manifest keys, and nothing downstream catches them.
+
 ### 3.6 Run the gate
 
 ```bash
@@ -422,8 +586,41 @@ cd bakeoff && .venv/bin/python scripts/run_matrix.py --preflight-only \
   --task-set ~/my-taskset --tasks <task_id>
 ```
 
-The first run builds the base image, mirrors the upstream repo, builds the task
-image and materializes the start state. It prints, among other things:
+The first run builds the base image, mirrors the upstream repo, builds the
+task image and materializes the start state. Later runs **reuse** a base the
+daemon already carries: each base stamps three labels on itself
+(`bakeoff.base.runtime`, `bakeoff.base.version`, `bakeoff.base.dockerfile_sha`,
+a hash of the base Dockerfile and its build arg), and the driver rebuilds only
+when the tag does not say it is exactly that base. The banner says which
+happened, and why when it rebuilt:
+
+```
+base py3.12  sha256:<12 hex>...  claude 2.1.220  (reused)
+base py3.13  sha256:<12 hex>...  claude 2.1.220  (built: the tag names no image)
+```
+
+Editing `docker/eval-agent.Dockerfile` or `docker/eval-agent-node.Dockerfile`
+moves the sha and is picked up on the next run without a flag. What the label
+**cannot** see is upstream drift — a republished `python:3.12-slim-bookworm`,
+a new `claude.ai/install.sh`, a moved apt or npm package — and neither could
+the unconditional rebuild it replaced, whose cache is keyed on the instruction
+string. To take those:
+
+```bash
+docker rmi bakeoff-eval-agent:base-python-3.12     # next run rebuilds
+# or, to re-pull the upstream base and re-run every step:
+cd bakeoff && docker build --pull --no-cache --build-arg BASE_PYTHON_VERSION=3.12 \
+  -f docker/eval-agent.Dockerfile -t bakeoff-eval-agent:base-python-3.12 .
+```
+
+Preflight's interpreter-mismatch refusal names the same two commands, because
+that is where an operator meets the problem.
+
+A base image built by hand without
+`--build-arg BAKEOFF_BASE_DOCKERFILE_SHA` carries an empty sha and will be
+rebuilt by the next driver run. That is intended: the drivers own these tags.
+
+It prints, among other things:
 
 ```
 start_sha <40 hex>  (base <12 hex> + test half)
@@ -445,6 +642,32 @@ version), so re-running is cheap; `--force-preflight` re-runs anyway.
 
 Drop `--tasks` to gate the whole set at once.
 
+**Drafting beside other tasks.** The loader validates every manifest under
+`--task-set`, not just the ones `--tasks` names — that is what makes the whole
+set loadable before a collection. With a `--tasks` selection, a sibling that
+does not load is downgraded to a `WARNING` naming the offending `task.yaml`,
+provided it is not itself selected and is not *tracked* in this directory's
+revision (untracked, ignored, or in a directory that is not a git repository
+at all). A manifest that **is** tracked and does not load refuses whatever you
+select, because the set's own revision is then broken and `grade.py` — which
+has no `--tasks` — will refuse to grade anything collected against it.
+Measured 2026-09-02: before this rule, one worker's in-progress `image.env`
+typo blocked every other worker's gate in a shared directory, and the error
+named only the sibling.
+
+**The warning is the only record of the skip.** Nothing in the run record says
+manifests were skipped: a scratch task set that is not a git repository
+records `task_set_commit` as `""` — the honest blank meaning this result is
+not re-derivable against a revision — and a warned run looks like any other
+run over such a directory. When the drafting directory instead sits *ignored*
+inside an enclosing repository, the blank is not what you get: `task_set_commit`
+returns that enclosing repository's clean HEAD — a sha that names a revision
+the task set is not even part of — so a warned run there is indistinguishable
+from a clean one by anything the record carries, and the driver's output is
+the only evidence that a manifest was skipped. Keep the driver's output if you
+need to reconstruct what a drafting run did, and gate the whole set before you
+commit it.
+
 ### 3.7 Reading a preflight refusal
 
 Every check maps to a defect that would otherwise be recorded as model
@@ -457,13 +680,21 @@ capability.
 | nothing under `tests.paths` | `tests.paths` does not match where this repo keeps its tests |
 | nothing left for the fix | every file landed in the test half or `allow_extra_paths` |
 | a rename crosses the test/solution boundary | the file would be both the agent's oracle and part of its submission. Pick a different PR |
-| f2p exits 2 / 4 / 5 at the start state | broken environment, not a present bug — missing dependency, collection error. Fix `image.pip` / `image.apt` |
+| f2p exits 4 with `ERROR: not found:` | a declared node id does not exist — a typo, or the id changed shape (parametrization) |
+| f2p exits 5 at the start state | nothing was collected — a `collect_ignore`, a `testpaths` mismatch, or an f2p selection that matched no tests |
+| f2p exits 2/4 and the reported `ERROR` modules are not exactly the declared f2p modules | a module errored that no f2p id names (broken environment: fix `image.pip`/`image.apt`), or a declared f2p module did not error (its ids are unobservable behind another module's collection error — narrow `f2p` to the modules that actually error, or pick a different PR) |
+| f2p could not be collected AND p2p is not green | the confinement parse cannot tell a missing symbol from a missing interpreter; p2p is the evidence that separates them, so fix the environment first |
 | f2p exits 0 at the start state | the test half did not actually land, or the bug is already fixed at `base_sha` |
 | a declared f2p id is not in FAILED/ERROR | typo, or the id changed shape (parametrization) |
 | p2p not green at the start state | a regression check against an already-red suite means nothing. Usually a missing dependency |
 | tree dirty after the suite | add `gitignore_extra` |
 | `CLAUDE.md` / `AGENTS.md` / `.claude` / `.cursorrules` in the start state | pick a `base_sha` predating them, or drop the repo |
+| `strip_paths` names X, which no tracked file is at or under | a typo, or a path the PR creates rather than one that exists at `base_sha`. The check exists because a strip that removes nothing is otherwise invisible |
+| `strip_paths` removes X, which the reference diff's test/solution half also changes | add X to `tests.allow_extra_paths`, or narrow the strip |
+| the start state still carries X, which `strip_paths` says it removed | the preflight tree is stale, or a build step re-created it, or X is a symlink whose target was stripped and the link was not. Re-run with `--force-preflight` |
 | image declares an `ENTRYPOINT` | the container's `sleep infinity` becomes an argument to it and the container exits immediately. Use a base without one |
+| the bare `python -m pytest --co -q` collection exits 1 | under `--co` this cannot mean a failing test (no test is executed) — it means `python -m pytest` could not even start in this image. Measured: the cause is a module the **image build** generated into `/repo` (`setuptools_scm`'s `_version.py`, most often) that the run tree's bind mount does not have; see `evidence.build_generated_paths`. Not fixable in the manifest — pick a different repo, or a PR whose suite tolerates the module's absence (`try/except ImportError`, as `sqlglot` does) |
+| preflight says the container runs a different Python than the manifest declares | a stale or mismatched base image. Rebuild: `run_matrix.py --preflight-only` builds the set the task set needs and re-tags each one |
 | the solution half does not apply | the reference was cut against the wrong base |
 | `tests.runner` does not contain `pytest` | the red/green distinction is built on pytest's exit codes and nothing else currently supplies it |
 
@@ -607,6 +838,13 @@ its own.
   hours apart, at temperature 1.0 and N=1 — between-run variance larger than the
   between-arm spread. At N=3 a discriminating task can present as a floor. That
   argues for more repeats in the pilot, not for a looser drop rule.
+- **The set must load whole before a collection, not just the tasks you are
+  running.** `--tasks` is a drafting affordance: it will skip an untracked
+  sibling that does not load, with a warning that exists only in the driver's
+  output. It will not skip a tracked one, and `grade.py` has no `--tasks` at
+  all — so a set with one broken committed manifest collects fine under
+  `--tasks` and then grades nothing, at exit code 0. Gate the whole set
+  (`--preflight-only`, no `--tasks`) before you commit it.
 
 ---
 
@@ -622,13 +860,23 @@ raise.
 | the agent cannot verify its own work | no test runner in the image, or the fixture is not importable. The eval measures a loop ending in "runs tests, sees failures, self-corrects"; without a runner it scores one unverified guess |
 | a fix is applied, the source is correct on disk, pytest is still red | stale `.pyc`. CPython invalidates on (mtime in whole seconds, size) and both halves are ordinary — an operator swap preserves byte count, and an agent edits and re-runs inside one second. The image sets `PYTHONDONTWRITEBYTECODE=1`; do not remove it |
 | a task passes preflight, then the dry run reports a huge `diff=` for an agent that edited nothing | a committed venv, build output or vendored tree tracked at `base_sha`. §5.6 stages everything, so it lands in every submission and diff size measures that tree. Preflight's tree-clean check only covers what the *suite* writes — screen with `git ls-tree -r --name-only <base_sha> \| wc -l` before cutting |
-| a candidate PR's f2p exits 2 at the start state with `error during collection` | the test half imports a symbol the fix introduces. Not repairable — pick a PR that changes an existing symbol instead (§3.1) |
+| a candidate PR's f2p exits **4** at the start state with `ERROR <module>` and no `::` | the test half imports a symbol the fix introduces. **Repairable — this is an accepted shape** if every reported `ERROR` names a declared f2p module, p2p is green there, and f2p goes green after the fix (§3.1, §3.4) |
+| a collection-error candidate is refused with "the rest of the suite is not green at the start state -- no tests were collected" | ignoring the erroring module left the sweep empty: this repo's test tree holds no regression baseline outside that module. Not repairable by configuration; pick a PR in a repo with a wider suite |
+| a collection-error candidate is refused and the printed argv shows an `--ignore` that did not take | the ignore paths come from pytest's **rootdir**-relative `ERROR` lines and `--ignore` resolves against the **working directory**. They coincide when rootdir is `/repo`; a `pyproject.toml` in a subdirectory or a `--rootdir` in `tests.runner` breaks it |
 | `smoke_bedrock.py` reports `MISSING BAKEOFF_MANTLE_TOKEN` / `SKIP` on four arms | the gate reads the env var and does not mint a token; `run_matrix.py` derives one itself. Re-run with `--derive-mantle-token` before concluding anything about credentials (§1.6) |
 | the driver says creds are good for 12 h and they die in under one | static keys in `.env` expose no `_expiry_time`, so the window falls back to the mantle token's nominal TTL. The abort streaks are the real backstop; size the invocation yourself or use `AWS_PROFILE` (§1.6) |
 | turns, tokens and cost all zero in an otherwise fine record | a model name the price book does not know. `model_name` in `litellm_config.yaml` doubles as the `PRICE_BOOK` key |
 | a run reads *"No deployments available"* at status `None` | expired credentials. litellm does not classify an expired AWS token as an auth error; it surfaces as 500, cools the deployment down, and the cooldown then hides the cause |
 | every arm's submission fails to apply during grading | index staleness across the host/container boundary. Fixed in `grader._refresh_index`; if you see it again, that is a regression, not a model result |
 | one arm's cells are all `turns=0` and permanent | the per-arm abort streak should have caught it. Records are written under mode `"x"` and `run_id` is deterministic, so those rows cannot be rewritten — start a new event log |
+| a property-based task's preflight passes, then a later run of the same task NO-GOes with no manifest change | `image.env` never applied. Preflight reads it back with `printenv` since `PREFLIGHT_VERSION` 5, so the refusal names the key — rebuild the task image. A task edited without a `task_version` bump moves `manifest_digest` and need not move the image id |
+| a hypothesis task grades `resolved` for one arm and not another on submissions that look equivalent | expected, and not a bug in the harness. Hypothesis mines literals out of the modules the suite **imports** and feeds them into the example pool, so two correct-looking fixes are judged by different examples — measured, changing one integer literal in an imported module flipped six consecutive verdicts in each direction. The same literal in a non-imported file changes nothing. Prefer suites with exhaustive `@example`s (§4) |
+| a node task's f2p run exits 0 and reports every test skipped | a `-t` pattern matching no test. vitest and jest have no pytest-style exit 4 for this — measured, both exit **0** with a summary that reads like success. An f2p id typed from the source rather than read from a run (§3.4) is a silent no-op the gate will not catch |
+| a node task's dependency is missing in every arm, and `image.build` reported success | `node_modules` was installed under `/repo`. It is erased by the bind mount at run time — measured — the same way an editable pytest install avoids and a node one has no equivalent escape from; install at the container root instead (`npm install --prefix / --omit=dev <deps>`, HARVESTING.md) |
+| a node task's runner is exit 127 on every arm after a build that reported success | `npm ci` ran at the `/` prefix and deleted the pinned vitest/jest. Its documented contract is to remove `node_modules` before installing, and whether it fires depends on which `package.json`/`package-lock.json` pair npm resolves for the prefix and cwd — a convention that is right only under an unstated cwd. Use `npm install`, never `npm ci`, in `image.build` |
+| a node quarantine removes a test you never named, and `p2p_deselected` agrees | on **vitest**, one executed file's repo-relative path is contained in another's. The per-file positional is a substring filter no anchoring reaches, so the group carries its name pattern into the second file. Preflight refuses it as `ambiguous_file_filters`; rename or move one of the files, narrow `tests.paths`, or cut the task on jest (HARVESTING.md's JavaScript screening subsection). A plain cross-file duplicate `fullName` is no longer this failure — since 2026-09-03 a node selection is one invocation per file — and is recorded rather than refused |
+| preflight says a declared id *names more than one test in its own file* | two tests in that file share a `fullName`. The id carries no positional index, so it names both — `-t` runs both and deselects both. Declare a different test, or cut the task from a PR whose tests are uniquely titled |
+| a base tag pointing at the wrong image | `docker tag` moves it and nothing in a record names the base. Before round 2 the driver repaired it silently via a cache-hit rebuild, which is how a probe of preflight's `python --version` read-back recorded PASS on a base it had deliberately broken (2026-09-02). The driver now names what it found — `(built: the tag said bakeoff.base.version='3.11', this base is '3.13')` — and preflight's read-back, which the label never substitutes for, remains the authority on what a python container actually runs. On node there is no interpreter read-back; the equivalent is the runner-pin re-assertion every task image build re-runs. What the check cannot see is a base tag mistagged onto a `bakeoff-task-*` image — docker propagates a base's labels into every image built `FROM` it, so such a tag claims to be the base and is reused; `docker rmi` the tag and let the next run rebuild it |
 
 ---
 

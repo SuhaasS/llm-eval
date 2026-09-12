@@ -43,6 +43,11 @@ Null semantics, in the order they are easiest to get wrong:
   defaults to `()` rather than `None` only because a `GradeRecord` is written by
   the ladder, which appends as it goes: an empty tuple is "the ladder ran no
   check", which on this path is a measurement.
+* `not_run_node_ids is None` means NOT MEASURED -- either the ladder never
+  reached a check that reads `Outcome.not_run`, or it did and the framework
+  reports no executed ids at all (pytest, where the exit code carries this
+  instead). A non-empty tuple is an observation. It never round-trips as `()`:
+  the branch that writes it only runs when the set is non-empty.
 
 `grader_version` is what gates resume (a run already graded under the current
 grader is skipped); `grader_commit` carries `runner.harness_commit()` including
@@ -62,7 +67,31 @@ from typing import Any
 # The grade file's own schema, independent of the run record's. A reader that
 # cannot tell grade schema versions apart reads an absent field as a positive
 # negative claim -- the same reason `SCHEMA_VERSION` moves for additive bumps.
-GRADE_SCHEMA_VERSION = "1.0.0"
+# 1.1.0 adds `suite_timeout_s`: with the bound per task, `timed_out` alone
+# does not say what was blown.
+# 1.2.0 adds `NotGradedReason.SUBMODULE_GITLINK_UNGRADABLE`. Additive in
+# fields and not in meaning: `not_graded_reason` can now carry a value no
+# earlier writer could produce, and a reader that cannot tell the versions
+# apart has no way to know whether its absence on a line is a measurement or
+# a vocabulary it did not have.
+# 1.3.0 adds `GradeRecord.framework`. `p2p_deselected`, `f2p_failed_node_ids`
+# and `p2p_failed_node_ids` have framework-dependent shapes and units (see the
+# field's own docstring), and a reader that cannot tell this version apart
+# from 1.2.0 has no way to know whether a line's numbers came from pytest or
+# a node adapter -- the same reason `SCHEMA_VERSION` moves for additive bumps.
+# 1.4.0 adds `GradeRecord.not_run_node_ids`: the declared f2p or p2p ids a run
+# did not execute. On a 1.3.0 line those ids exist only inside
+# `environment_error`'s prose, and a node `fullName` may itself contain ", ",
+# so the joined form cannot be split back -- the field's absence on such a
+# line is the writer's vocabulary, not a measurement, which is the same
+# reason `SCHEMA_VERSION` moves for additive bumps.
+# 1.5.0 adds `NotGradedReason.SUBMODULE_EDIT_UNGRADABLE`. Additive in fields
+# and not in meaning, exactly as 1.2.0 was: `not_graded_reason` can now carry
+# a value no earlier writer could produce, so its absence on an older line is
+# a gap in that writer's vocabulary and not a measurement. Every such run
+# graded under 1.4.0 or below landed as `EMPTY_PATCH` -- a `GradeFailure`,
+# hence `resolved: False`.
+GRADE_SCHEMA_VERSION = "1.5.0"
 
 # The oldest `RunRecord` schema whose fields mean what `from_dict` and the
 # ladder were written to assume. Below it the run is not graded and
@@ -115,10 +144,11 @@ def schema_at_least(version: str, floor: str) -> bool:
     """Is `version` at or above `floor`, compared as integer components?
 
     Not `version >= floor`. String comparison puts `"3.10.0"` BELOW `"3.9.0"`,
-    and `SCHEMA_VERSION` is at 3.8.0 -- two additive bumps from the wrap. The
-    defect would arrive with a schema bump rather than with a code change, and
-    it fails in the silent direction: every record written by the newer harness
-    is refused as "too old" and the whole collection reads as ungradable.
+    and `SCHEMA_VERSION` IS 3.11.0 -- the wrap has arrived, so this is no
+    longer insurance. Under `>=` every record this harness writes would be
+    refused as "too old" against a 3.9.0-or-below floor, and the failure
+    arrives with a schema bump rather than with a code change: it is silent
+    and it makes a whole collection read as ungradable.
 
     Components are compared as tuples, padded so `"3.8"` and `"3.8.0"` agree.
     A version that is not dotted integers raises `ValueError` rather than being
@@ -163,7 +193,17 @@ class NotGradedReason(str, Enum):
     out of the denominator rather than counted as a failure:
 
     * the run never produced a gradable submission (`EXCLUDED`, `NO_TURNS`,
-      `CRASHED`, `NO_FINAL_DIFF`, and the two unappliable-diff cases);
+      `CRASHED`, `NO_FINAL_DIFF`, the two unappliable-diff cases, and
+      `SUBMODULE_GITLINK_UNGRADABLE` -- where a submission exists and is
+      appliable, but what it carries is a GITLINK pointing at a commit that
+      lives only in the run tree that produced it, so the agent may well have
+      fixed the bug and the harness cannot see the content. Either a declared
+      submodule the agent committed inside, or a repository the agent created
+      itself with `git init`/`git clone` in a tracked subdirectory, which
+      produces the same chunk on a task with no submodules at all), and
+      `SUBMODULE_EDIT_UNGRADABLE` -- where a submission exists but the tree it
+      was taken from carried changes `git add -A` stages nothing for, so the
+      stored diff is not a description of what the agent produced;
     * the grading environment broke (`ENVIRONMENT_ERROR`,
       `SCOPE_COLLECTED_NOTHING`, `PREFLIGHT_FAILED`, `ORACLE_FAILED`,
       `TASK_SETUP_FAILED`);
@@ -180,6 +220,8 @@ class NotGradedReason(str, Enum):
     NO_FINAL_DIFF = "no_final_diff"
     BINARY_HUNK_UNAPPLIABLE = "binary_hunk_unappliable"
     LOSSY_DIFF_UNAPPLIABLE = "lossy_diff_unappliable"
+    SUBMODULE_GITLINK_UNGRADABLE = "submodule_gitlink_ungradable"
+    SUBMODULE_EDIT_UNGRADABLE = "submodule_edit_ungradable"
     ENVIRONMENT_ERROR = "environment_error"
     SCOPE_COLLECTED_NOTHING = "scope_collected_nothing"
     PREFLIGHT_FAILED = "preflight_failed"
@@ -259,6 +301,7 @@ _TUPLE_FIELDS: tuple[str, ...] = (
     "binary_chunks_dropped",
     "f2p_failed_node_ids",
     "p2p_failed_node_ids",
+    "not_run_node_ids",
 )
 
 
@@ -342,6 +385,24 @@ class GradeRecord:
     environment_error: str | None = None
     environment_error_check: str | None = None
 
+    #: Which runner adapter produced this record's numbers. `""` means the
+    #: grade predates the field, never "pytest" -- a default naming a real
+    #: framework would be this field claiming a fact nobody measured.
+    #:
+    #: It is VALIDATED CONFIGURATION, not a measurement: `run_ladder` sets it
+    #: to `for_framework(task.tests.framework).name`, an identity round-trip
+    #: through a registry keyed by that same manifest string (`grader.py`'s
+    #: own `_State.framework` docstring says so). It is still worth recording
+    #: rather than left for a reader to re-derive from the manifest, because
+    #: the closed allowlist behind `for_framework` is the single source of
+    #: truth for which adapter's semantics -- id shapes, `p2p_deselected`
+    #: units -- apply to `f2p_failed_node_ids`, `p2p_failed_node_ids` and
+    #: `p2p_deselected` on this line. An OBSERVATION would instead be the
+    #: adapter that actually classified each check's `Outcome`; no code path
+    #: diverges from the declared framework today, so the two coincide, but
+    #: this field records the latter's SOURCE (config), not the former.
+    framework: str = ""
+
     # Config (what was asked) beside observation (what pytest reported). See
     # the module docstring.
     f2p_declared: int | None = None
@@ -350,6 +411,56 @@ class GradeRecord:
     p2p_deselect_requested: int | None = None
     p2p_deselected: int | None = None
     p2p_failed_node_ids: tuple[str, ...] | None = None
+
+    #: Declared f2p or p2p node ids the run did not execute -- `Outcome.not_run`,
+    #: which is "requested, and no terminal status came back". `None` is NOT
+    #: MEASURED (the ladder never got here, or the framework reports no
+    #: executed ids -- pytest, where the exit code carries this instead); a
+    #: non-empty tuple is an observation. It never round-trips as `()`: the
+    #: branch that writes it only runs when the set is non-empty.
+    #:
+    #: On the p2p side the quarantine is already subtracted, upstream, by
+    #: `preflight._Runner.pass_to_pass` -- a quarantined id was asked NOT to
+    #: run, so reporting it here would be a defect, not evidence.
+    #:
+    #: `environment_error_check` says which check produced it, and ONE field is
+    #: enough because only one check can ever write it -- both branches go
+    #: through `state.environment`, which raises `_Stop`, so an f2p `not_run`
+    #: means `_check_p2p` never ran at all.
+    #:
+    #: Beside the message rather than instead of it, for the reason
+    #: `f2p_failed_node_ids` exists: a node `fullName` is free text and may
+    #: contain ", ", so `environment_error`'s joined form is not losslessly
+    #: splittable, and a reader counting how often a task set's manifests went
+    #: stale would be grepping prose. GRADER_VERSION 7 -> 8 moved for exactly
+    #: this shape -- a well-formed verdict beside a lying evidence field.
+    not_run_node_ids: tuple[str, ...] | None = None
+
+    #: The `timeout` bound every command in this ladder carried, from
+    #: `task.budget.suite_timeout_s`. `None` when no bounded command ran.
+    #:
+    #: `CheckResult.timed_out` alone stopped being readable the moment the
+    #: bound became per task: a reader cannot tell a suite that blew 600 s
+    #: from one that blew 1800 s, and a re-grade under an edited manifest is a
+    #: NEW line whose disagreement with the old one is the finding -- which it
+    #: cannot be if neither line says what it was measured against.
+    #:
+    #: It is the bound and NOT the headroom. A `timed_out` check is a
+    #: `GradeFailure` stamped on the model, and nothing on this record says
+    #: whether the grader's host was busier than the gate's: there is no host
+    #: or contention block here (`RunRecord.host` has one; a grade does not),
+    #: and `duration_s` at a timeout is just this number again. The figure
+    #: it is the margin against -- preflight's OBSERVED suite duration in the
+    #: same image -- is recorded since `PREFLIGHT_VERSION` 18, in
+    #: `<cache>/preflight/<task_id>.json` under `bounded_run_durations_s`;
+    #: join on `task_id` and date the gate with `graded_under_preflight_version`.
+    #: It is not copied onto this record, and deliberately: it is a property
+    #: of the task, it would go stale the moment the task is re-preflighted,
+    #: and a stale copy of a measurement is configuration reported as
+    #: observation.
+    #: So read a `timed_out` grade as "this bound was hit", never as "this
+    #: suite needs more than this bound".
+    suite_timeout_s: int | None = None
 
     # Where this grade's captured output lives. `None` when nothing was kept.
     artifacts_dir: str | None = None
