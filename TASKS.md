@@ -845,8 +845,43 @@ one ends a multi-day run outright.
   upstream's `completion_tokens` (75). Closed with no subtraction. What it
   opened instead is the under-billing item below.
 
-- [ ] **A $0-credit OpenRouter account cannot run a live cell, and the first
-  one was excluded correctly.** Measured 2026-09-11: the free tier caps prompt
+- [ ] **On OpenRouter the record's `tokens` and `cost_usd` are litellm's
+  arithmetic, wrong in both directions; add a record-level `upstream_tokens`
+  block (schema bump).** Measured 2026-09-11 on the first two live cells
+  (`click-3360`, both graded `resolved: true`): K2.6 transcript `input
+  178,744 / output 1,340 / cache_read 0 / reasoning 0` against OpenRouter's
+  own `prompt 296,774 (169,184 cached) / completion 10,190 (9,468
+  reasoning)`, book $0.121 vs billed $0.143; K3 transcript `input 188,237 /
+  cache_read 0` against `prompt 567,672 (538,206 cached) / completion 4,409
+  (416 reasoning)`, book $0.618 vs billed $0.316. litellm's Anthropic adapter
+  drops `prompt_tokens_details.cached_tokens` and `reasoning_tokens` for these
+  model ids and re-counts `input_tokens` itself. `metadata.upstream_usage` on
+  every wire entry (captured off the raw final chunk) and `cost_usd_provider`
+  are correct; the fix is a `runner` helper summing `upstream_usage` over
+  returning entries into `RunRecord.upstream_tokens: {prompt, cached,
+  completion, reasoning} | None` at schema 3.10.0, pinned in
+  `test_usage_accounting.py`, so a reader does not have to open the wire log
+  to price an OpenRouter run. Until then, never compare `cost_usd` across
+  `provider_route` values.
+
+- [ ] **Consider re-pinning K2.6 to `crusoe` (bf16).** Measured 2026-09-11:
+  on the probe's isolated-prefix check Crusoe hit 5/5 (5.9–6.0k cached per
+  hit, 47% cheaper) where CoreWeave hit 0/15 that day and 3/10 the day before;
+  Crusoe is $0.70/$3.50 with cache read $0.35 against CoreWeave's
+  $0.65/$3.41/$0.15, and bf16 removes the fp4 quantization confound §5.4
+  names. A real loop on CoreWeave still cached 57% of prompt tokens, so this
+  is a cost-variance and fidelity call, not a correctness one; changing the
+  pin is `order`, `quantizations`, the `PRICE_BOOK` row and its comment, and
+  a fresh probe run before any matrix. Fireworks returned 429/503 for K2.6 on
+  every probe call that day and is not a candidate.
+
+- [x] **A $0-credit OpenRouter account cannot run a live cell, and the first
+  one was excluded correctly.** Closed 2026-09-11 once credits were added: the
+  full probe passed (K2.6 cache check aside, see the lottery note in
+  CLAUDE.md) and one live cell per arm ran a real Claude Code loop through
+  the proxy — K2.6 12 turns / 12 tools / $0.14 billed, K3 24 turns / 26 tools
+  / $0.32 billed — and both graded `resolved: true` under `grade.py`. The
+  original finding is kept below for the record. Measured 2026-09-11: the free tier caps prompt
   tokens per request (`402 Prompt tokens limit exceeded: 2768 > 2665 ... upgrade
   to a paid account`, the ceiling moving with the remaining allowance) and
   refuses requests that "would exceed your available credits given your
