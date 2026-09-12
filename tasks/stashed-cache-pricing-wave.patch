@@ -1,0 +1,1169 @@
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 9ee0453..1bc00e9 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -139,8 +139,9 @@ These are enforced in code and asserted by tests. Breaking one is usually silent
+ - **`bedrock/` is two routes, chosen by model id, not by config.** Claude models resolve to `AmazonAnthropicClaudeMessagesConfig` and take **Invoke** with a native Anthropic body — no `toolUseId` is ever built, which is why the tool-id passthrough cannot reach `claude-sonnet-5-runtime`. Every other model falls through to the openai→**Converse** bridge, which copies the model's own tool-call ids into `toolUseId` under a `[a-zA-Z0-9_-]{1,64}` class Bedrock enforces server-side. `test_config.py` pins that a Converse-bound arm is allowlisted with a measured id shape; `kimi-k2-5-runtime` is commented out because `functions.Read:0` fails it.
+ - **One API call is one turn, and Claude Code does not write it that way.** It emits one transcript record per **content block**, each repeating the whole `usage`, so counting `type: "assistant"` records doubled `turns_used`, `tokens` and `cost_usd` in every record written before schema 3.0.0 — measured, a 5-call run recorded as 6 turns with `cache_write` 83,867 against a true 42,171. `parse_trajectory` dedupes on `message.id`; `assistant_records` and `turns_streamed` sit beside `turns_used` so the collapse stays readable, and the wire log is the independent authority (one line per POST). A stub that reuses a `message.id` across calls makes the parser merge distinct calls — that is a fixture bug, not a parser one.
+ - **The inter-run cache carryover is a harness artifact, not practical use.** Every run is a fresh container, a wiped `CLAUDE_CONFIG_DIR`, a fresh repo and a one-shot `claude -p`; nothing crosses runs but Bedrock's server-side cache, and repeats are scheduled 3–5 s apart inside a 300 s TTL. What carries over is 30,506 tokens of **task-independent tool schemas** (the `tools` block is byte-identical across repeats). So `first_task` and `warm_followup` are two deployment situations, not a number and its correction — do not call either normalized. `--interleave` redistributes the write cost; a round takes 1.4–3.9 min, inside the TTL, so it cannot produce a cold run. `cache_state.seconds_since_prior_run` is what tells a reader which situation a run was in.
++- **Only Sonnet caches on purpose; the candidates win a lottery.** Measured 2026-08-23 with `scripts/probe_cache.py`, straight at the endpoint because litellm is the thing under test; the tables are in `TASKS.md`'s 2026-08-23 section. Claude Code sends three `cache_control` breakpoints **identically on every arm**, so the client is never the difference. litellm's Anthropic→OpenAI adapter then drops all three for any model id containing neither `"anthropic"` nor `"claude"` (a substring test in `adapters/transformation.py::_add_cache_control_if_applicable`, 1.95.0), which is all three candidates; the mantle routes ignore the field even when it is hand-delivered; Converse **refuses** `cachePoint` for them 10/10 with `AccessDeniedException`; `prompt_cache_key` is a no-op; there is no connection affinity (pinned 4/25 vs fresh 4/25 — the balancer routes per *request*); and `inferenceTypesSupported` is `ON_DEMAND`, so no dedicated capacity is purchasable. **A 200 from the mantle routes proves nothing** — a deliberately bogus top-level key returns 200 too, which is why that swallow control is part of the probe and not decoration. What the candidates do get is an opportunistic per-worker prefix cache: every hit's `cached` equals an *earlier* call's `prompt_tokens` block-aligned to 32, reuse lag is 2–24 calls back and **never 1**, and hit rate tracks **call index, not prompt size** (the two are confounded in any real run because the prompt grows every turn). So candidate `cost_usd` carries a variance term that is not a model property — kimi measured 12.7% in the pilot, and 0/10 → 5/10 over 50 identical calls — and it is *correlated with turn count*, handing verbose arms a discount. The one lever is the region, and it is real for **kimi only**: 23/120 (19%) in us-east-1 against 47/120 (39%) in us-east-2, two-sided p=0.0010, three replicates agreeing in sign; gemma shows **no** region effect (15/77 vs 12/77, p=0.67, two replicates disagreeing in sign); nemotron is 0/40 in both and is carried as the negative control, since a probe that manufactured region differences would show one there. Moving is worth **$0**: the Bedrock pricing page gives Moonshot/NVIDIA/Google input and output columns with **no cache-read or cache-write line at all**, so with `prompt_tokens` inclusive of `cached_tokens` on the OpenAI shape, every input token bills at the standard rate whether or not the serving layer reused its KV blocks. A candidate cache hit buys latency and nothing else, and in real runs even that is only 1.3× on kimi (4,230 ms vs 5,514 ms). **Priced honestly the pilot's kimi is $3.43 against Sonnet's $3.14 — more expensive, not cheaper**; every earlier figure in this repo applied Anthropic's 0.10× read multiplier to arms that have no such rate, which is exactly the "report the gap, never estimate it" rule being broken. Any region move is a §5.4 divergence unless every arm moves together, and its only payoff is wall-clock. **The first measurement of this said 23% and "gemma 6×", and was wrong for a reason worth remembering: it was a block design — all of region A, then all of region B — so region was confounded with time of day, exactly what §5.7's round-major interleaving exists to prevent. Compare regions interleaved, with replicates, or not at all.**
+ - **`cache_state.warm` is turn-1 `cache_read`, never the run total.** Bedrock's cache warms on turn 2 of a *single* run, so a run-total `cache_read > 0` is true of nearly every Sonnet run and separates nothing; turn 1 cannot read what this run wrote. On both 2026-08-11 N=3 sets, turn-1 `cache_read` alone separates the $0.547 run from the $0.176 ones. `None` is undetermined, not cold — and there are three ways to get there, because `false` is a *claim*: no turn parsed; a turn-1 record with no `usage` block (all-zero tokens are byte-identical to a genuine zero); or a run that reported no cache accounting anywhere, which is every Gemma and Nemotron run and is why schema 2.1.0's fix still left three arms lying. Never inferred from elapsed time, since Sonnet 5's TTL is undocumented and cross-region inference can force a cache write.
+-- **Sonnet 5 is priced at Anthropic's $2/$10 list; the candidates at the Bedrock page.** The eval asks whether a candidate beats buying Sonnet, not whether one AWS SKU beats another. `Versions.pricing_basis` says which book produced a `cost_usd` — the log is append-only, so pre-2026-08-11 records keep figures from the old $3/$15 book and a reader summing across the change gets a number that is not a price of anything. Cache multipliers are 0.10× read / 1.25× write at 5m / **2.00× at 1h**; the 1h tier is a *part* of `cache_write`, never an addition, and an untiered write takes the 5m rate.
++- **Sonnet 5 is priced at Anthropic's $2/$10 list; the candidates at the Bedrock page.** The eval asks whether a candidate beats buying Sonnet, not whether one AWS SKU beats another. `Versions.pricing_basis` says which book produced a `cost_usd` — the log is append-only, so pre-2026-08-11 records keep figures from the old $3/$15 book and a reader summing across the change gets a number that is not a price of anything. Cache multipliers are 0.10× read / 1.25× write at 5m / **2.00× at 1h**; the 1h tier is a *part* of `cache_write`, never an addition, and an untiered write takes the 5m rate. Candidate cache **reads** price at 1.0× since 2026-08-23 — there is no cache product to discount — while candidate cache **writes** stay `None` and still raise into `pricing_error` (corrected 2026-09-08): no candidate route can emit one today, so a write appearing is the signal that a billed product shipped, and pricing it silently is exactly the failure "silence is the enemy" forbids. See `costs.py`.
+ - **`input` excludes cache tokens, on every route, and `cost_usd` adds all three.** Bedrock: *"total input tokens = inputTokens + cacheReadInputTokens + cacheWriteInputTokens"*. The candidate arms only preserve that because LiteLLM's Converse transform folds cache into `prompt_tokens` (OpenAI usage is inclusive) and the anthropic adapter subtracts it back out. Drop the subtraction and a warm Sonnet turn double-counts ~30k of a ~34k prompt — silently. Pinned in `tests/test_usage_accounting.py`.
+ - **Temperature is per-model on purpose** (Sonnet 5 400s on non-default sampling; Kimi stalls at 0). `config_digest` deliberately excludes it — the thing held identical across arms is the policy, not the number.
+ - **`CLAUDE_CONFIG_DIR`, not `--settings`, is what detaches the operator's config.** `--settings` merges *on top of* `~/.claude/settings.json`. Eval runs point `CLAUDE_CONFIG_DIR` at an empty per-run directory, so they never load your settings, hooks, skills or plugins — your own sessions are unaffected.
+diff --git a/TASKS.md b/TASKS.md
+index 7d44acf..d31fdd1 100644
+--- a/TASKS.md
++++ b/TASKS.md
+@@ -755,6 +755,227 @@ one ends a multi-day run outright.
+   Fixing it means a `litellm_patches` intervention to carry `cacheDetails`
+   through, which is not worth doing before a candidate has a rate at all.
+ 
++### Why the candidate cache tokens are sporadic — measured 2026-08-23
++
++The item above records *that* gemma and kimi return cache tokens unpredictably
++and asks what to do about the price. This section is the mechanism. Re-derive any
++number here with [scripts/probe_cache.py](bakeoff/scripts/probe_cache.py) rather
++than trusting it — it is a property of AWS capacity on the day you ask.
++
++**Prompt caching on the candidate arms is a lottery over a worker pool, there is
++no client-side mechanism, and — the finding that subsumes the rest — AWS SELLS NO
++PROMPT CACHING FOR THESE MODELS AT ALL, SO A CACHE HIT SAVES NOTHING.**
++
++- [x] **The pricing hole above is not a gap in the price book. It is the absence
++  of a product.** Settled 2026-08-23 against AWS's own documentation, and it
++  answers the "decide it once, for both arms" question outright:
++
++  - The Bedrock prompt-caching **supported-models table** lists Anthropic Claude
++    models, OpenAI GPT-5.6 (Sol/Terra/Luna) and — in prose — Amazon Nova.
++    **Moonshot, NVIDIA and Google appear nowhere on it.** That is the same fact
++    Converse states at runtime: `cachePoint` on `moonshotai.kimi-k2.5` or
++    `nvidia.nemotron-super-3-120b` returns *"You invoked an unsupported model or
++    your request did not allow prompt caching"*, 10 attempts out of 10.
++  - The **pricing page** shows Moonshot, NVIDIA and Google with **input and
++    output columns only — no cache-read or cache-write line exists**. Anthropic's
++    rows carry five columns including both.
++  - OpenAI usage semantics make `prompt_tokens` **inclusive** of `cached_tokens`
++    (already pinned in `tests/test_usage_accounting.py`).
++
++  Together: every input token on a candidate arm bills at the standard input
++  rate whether or not the serving layer reused its KV blocks. **A cache hit on
++  kimi, gemma or nemotron is worth exactly $0.** The `cached_tokens` field is the
++  serving layer reporting internal reuse, not a Bedrock prompt-caching hit, and
++  it has no billing consequence.
++
++  So `costs.py` raising `cache support unconfirmed` was **correct behaviour, not a
++  bug to route around** — but the reason it gave changed from "we do not know the
++  rate" to "there is no rate because there is no product," and the second reason
++  does not license the same behaviour. **Decided and encoded 2026-08-23,
++  corrected 2026-09-08:** the three candidates carry a `cache_read_multiplier` of
++  **1.0**, and `PRICING_BASIS` moved with them to
++  `sonnet-list-2026-08-11+bedrock-2026-08-05+candidate-nocache-2026-08-23`.
++  Raising was right while the rate was UNKNOWN and wrong once it was known to be
++  ABSENT — it priced good runs to `None` over tokens this book can price.
++
++  **That argument covers reads only, and 2026-09-08 put the writes back.**
++  `cache_write_multiplier` and `cache_write_1h_multiplier` are `None` again, so a
++  candidate cache *write* still raises into `pricing_error`. No candidate route
++  can produce one today — 0 of 179 stored records and 0 of 951 wire entries carry
++  a candidate cache write — so a write appearing is not a token to price, it is
++  the signal that a billed product shipped. 1.0 there would price that silently,
++  and undercharge it besides, since the only write rate anyone publishes for a
++  comparable product is Anthropic's 1.25×. (An earlier draft of this paragraph
++  said *overcharge*; that was backwards.) The read is a measurement; the write is
++  an alarm, and "silence is the enemy" decides which one a null belongs on.
++
++  **1.0 is a price, not a placeholder.** It is derived, not chosen to make a
++  number come out: from the absence of the product, and from `usage.input` being
++  exclusive of cache tokens on every route (pinned in
++  `tests/test_usage_accounting.py`). Together those make
++  `input + cache_read` at 1.0× reconstruct exactly
++  `prompt_tokens × input_per_1m`, which is what AWS bills when no cache product
++  exists.
++
++  **The risk taken, and the tripwire left on it.** If AWS later ships prompt
++  caching for one of these models, a 1.0 read multiplier silently overcharges
++  instead of loudly refusing — the failure mode inverts from loud to quiet. The
++  `None` on the write multipliers is what keeps a tripwire in place: a cache
++  product has to warm by writing, so the first billed write raises
++  `pricing_error` and names itself before any read is mispriced.
++  `PRICING_BASIS` contains the rest: it moved, so records
++  priced under the old book and the new one are distinguishable, and the token
++  counts are stored, so a re-price is a re-derivation rather than a guess.
++  Re-check with `scripts/probe_cache.py --mechanisms` before assuming this still
++  holds.
++
++  The None-means-raise mechanism is **not** removed. It is the right behaviour
++  for a model whose rate is genuinely unknown — the case it was built for — and
++  it is now pinned against a monkeypatched unknown-rate model rather than against
++  a real arm, so a future model with no published cache rate still refuses to be
++  guessed at.
++
++- [ ] **Publish candidate cost as the UNCACHED figure.** No longer a choice
++  between defensible options — with no cache product, the uncached figure is
++  simply the *correct* one. Priced honestly on the pilot workload:
++
++  | arm | prompt tokens | correct cost | what earlier notes said |
++  |---|---|---|---|
++  | kimi-k2-5 | 5,617,546 | **$3.43** | $3.05 / $2.25 |
++  | gemma-4-31b | 3,646,870 | $0.51 | $0.50 / $0.40 |
++  | nemotron-3-super-120b | 6,687,190 | $1.02 | $1.02 |
++  | claude-sonnet-5-runtime | — | **$3.14** | $3.14 (unchanged — its cache rates are published and real) |
++
++  **Kimi is more expensive than Sonnet, not cheaper.** Every earlier figure in
++  this file applied Anthropic's 0.10× cache-read multiplier to arms that have no
++  such rate — the precise thing the pricing item above says must never be done
++  ("a gap in it must be reported, never estimated"). The cached fraction remains
++  worth *recording* — it is exogenous noise correlated with turn count, and a
++  reader needs to see it — but it must not move a dollar figure.
++
++  **Still open**, which is why this stays `[ ]`: the price book produces the
++  uncached figure as of 2026-08-23, but the figures *already written* do not.
++  Records collected before that carry `cost_usd: null` with `pricing_error` set
++  wherever a candidate returned a cache token — the log is append-only, so those
++  have to be re-priced in the derived view, keyed off `Versions.pricing_basis`,
++  and no such view exists yet. And the tool-trim item below still quotes kimi at
++  $3.05 → $2.41 and gemma at $0.50 → $0.40: those deltas were computed under the
++  retracted 0.10× read multiplier and must be re-derived from the stored token
++  counts before anyone acts on them.
++
++- [ ] **Consider moving the whole matrix to `us-east-2` — for kimi's sake only.**
++  **Interleaved** replicates, region alternating call by call so region is not
++  confounded with time of day: kimi three replicates of 40 calls per region,
++  gemma two (40 and 37), nemotron one of 40. **p-values re-derived 2026-09-08**,
++  after `probe_cache.py` was found to hardcode its test direction as
++  `regions[1] > regions[0]`: it now reports a two-sided Fisher p as the headline
++  plus a one-sided p labelled with its direction. Gemma's published 0.80 was the
++  tail *opposite* its observed sign; the verdict "no effect" is unchanged.
++
++  | arm | us-east-1 | us-east-2 | verdict |
++  |---|---|---|---|
++  | kimi-k2-5 | 23/120 = 19% | **47/120 = 39%** | **confirmed.** two-sided p = 0.0010 (one-sided 0.00051 in the observed direction); all 3 replicates agree in sign (+18, +15, +27 pp) |
++  | gemma-4-31b | 15/77 = 19% | 12/77 = 16% | **no effect.** two-sided p = 0.67 (one-sided 0.34 in the observed direction); its 2 replicates disagree in sign (+5, −14 pp) |
++  | nemotron-3-super-120b | 0/40 | 0/40 | negative control — caches nowhere, and shows no region difference |
++  | claude-sonnet-5-runtime | ~97% | write→read→read, verified | contractual; unaffected |
++
++  **The dollar value of this move is $0.** With no cache product for these
++  models every input token bills at the standard rate, cached or not (see the
++  item above), so doubling the hit rate changes the bill by nothing. What it buys
++  is **latency**, and in real runs that is far smaller than the isolated probe
++  suggested: kimi's hit-vs-miss median is **1.3×** across the pilot's own wire
++  logs (4,230 ms vs 5,514 ms), not the 4.4× measured at `max_tokens=16` where
++  prefill dominated and generation did not. Gemma's is 1.0×.
++
++  So the case for moving is a modest wall-clock effect on §5.5's curve and on
++  `wall_clock_timeout_s` headroom — **not** cost. Weigh that against the §5.4
++  risk before touching it.
++
++  **Move every arm or none** — candidates in us-east-2 against Sonnet in
++  us-east-1 is precisely the §5.4 failure mode, a config choice scored as a model
++  difference. The runtime Sonnet arm works there; the *mantle* `claude-sonnet-5`
++  arm returns 404 in us-east-2 and would have to stay behind or be dropped.
++  `us-west-2` is **not** a candidate on reliability: 2 `internal_server_error`s in
++  25 calls and hit latency to 22,468 ms against us-east-2's 353–496 ms.
++
++  Interleaving removes time-of-day. It does **not** make the absolute rate
++  durable — pool occupancy is other tenants' traffic. **Re-measure before and
++  after**, or a capacity rebalance on AWS's side reads as the models getting
++  worse.
++
++  > **The first version of this item was wrong, and the way it was wrong is worth
++  > keeping.** A block design — all of region A, then all of region B, 25 calls
++  > each — reported gemma at 4% → 24% ("6×") and kimi at 21% → 44%, and put
++  > −23% on the line above. Interleaved and replicated, the gemma effect
++  > disappears: gemma's rate is just noisy, measuring 4%, then 12%, then 27% in
++  > **us-east-1 alone**. Two faults, both avoidable: the region blocks ran at
++  > different times, so region was confounded with whatever else AWS was serving
++  > that hour (the same reason §5.7 schedules the matrix round-major); and one
++  > 25-call sample cannot separate a 19% arm from a 24% one. Any future claim
++  > about these rates needs interleaving and replicates, not a bigger single
++  > block.
++
++- [ ] **`cache_state.warm` makes a Bedrock claim on a lottery arm.**
++  `_cache_warm` in `runner.py` reads turn-1 `cache_read` and stamps `True`/`False`
++  on every arm alike. On the candidates that is a claim about a product they do
++  not have: their `cache_read` is the serving layer's own per-worker KV reuse,
++  which is a lottery and not a Bedrock prompt-cache hit, so `False` there says
++  "this run was cold" about a cache that does not exist. Stored today: 14 gemma
++  records and 18 kimi records carry `cache_read > 0` with `warm: False`, which is
++  the same field answering two different questions in one column. Proposed fix: a
++  per-model gate returning `None` — undetermined, the fourth way to get there —
++  for any arm with no cache product, so only Sonnet's `warm` is a claim. Needs a
++  `SCHEMA_VERSION` bump: the *meaning* of an existing `False` changes on those
++  arms, which is exactly the case the version exists to keep readable.
++
++- [ ] **Trim the tool block.** ~16,598 tokens of every request are tool schemas —
++  99% of the first call's prompt — re-sent uncached every turn on all three
++  candidate arms. `Workflow` alone is ~5,466; `ScheduleWakeup`, `CronCreate`,
++  `EnterWorktree`, `TaskCreate`/`TaskUpdate` are ~4,700 more, none of them
++  reachable by a bug-fixing agent in a network-isolated container. Removing
++  ~10.6k/turn: kimi $3.05 → $2.41, nemotron $1.02 → $0.85, gemma $0.50 → $0.40.
++  Same §5.4 trap as the region — it changes what is being measured, so it must
++  apply to every arm identically and land *before* a collection, never between
++  arms.
++
++**The mechanism, so nobody re-derives it.** Every explicit mechanism is dead on
++the candidate arms, and each negative needed its own control:
++
++| mechanism | result |
++|---|---|
++| `cache_control` (Anthropic) | accepted and **ignored**. A 200 proves nothing — a deliberately bogus top-level key also returns 200. That swallow control is why this is not recorded as "accepted". |
++| Converse `cachePoint` | **refused 10/10**, `AccessDeniedException`: *"You invoked an unsupported model or your request did not allow prompt caching."* Same `modelId` succeeds without the block. Converse validates, so this negative stands without a control. |
++| `prompt_cache_key` (OpenAI) | no effect on hit rate |
++| connection affinity | none. Pinned keep-alive 4/25 vs fresh connection per call 4/25 — the balancer routes **per request**. |
++| dedicated capacity | unavailable. `inferenceTypesSupported` is `['ON_DEMAND']` for kimi and nemotron. |
++
++Sonnet honours `cache_control` on mantle `/anthropic` *and* `cachePoint` on
++Converse under the same probe, which is what licenses reading the candidate
++results as findings rather than as a broken harness.
++
++**What the sporadic hit actually is.** A real per-worker prefix cache behind a
++per-request balancer. Forensics on 100 stored kimi calls: every hit's `cached`
++equals an **earlier call's `prompt_tokens` in the same run**, rounded to a
++32-token block (13 of 14; the 14th is a partial match inside the shared tool
++block). Reuse lag is 2–24 calls back and is **never 1**, although call N−1's
++prompt is by construction an exact prefix of call N's — you hit when you land on
++a worker that served *some* earlier call, and which one it served sets how much
++comes back. Confirmed on byte-identical bodies: hit rate climbs with call index
++(0/10 → 5/10 over 50 calls), hits stay non-contiguous, every hit returns ~0.999,
++and a hit is 4.4× faster (477 ms vs 2100 ms median, distributions not
++overlapping).
++
++**A correction this produced.** Hit rate rises with *call index*, not prompt
++size. The two are confounded in any real run because the prompt grows every turn;
++holding size constant still produces the ramp. Any earlier note reading "large
++prompts cache better" has the variable wrong.
++
++**And one about `null`.** On kimi's `/v1` route `prompt_tokens_details` is present
++**iff** `cached_tokens > 0` — 0 of 100 stored calls carry the block with a zero in
++it. So an absent block there *is* the zero, and kimi's 12.7% is a measurement
++rather than a floor. Gemma's `/openai/v1` reports the block unconditionally.
++`grade`/cost readers must not collapse the two dialects.
++
+ ### Cost is order-dependent, and the policy is still unchosen
+ 
+ - [ ] **Sonnet's cost varies 2.9× on byte-identical work, from scheduling alone.**
+@@ -1224,12 +1445,16 @@ These need a call, not code. Most are cheap to make and expensive to make late.
+   `--interleave` becomes the default, and whether cost publishes `first_task` /
+   `warm_followup` separately rather than a mean.
+ 
+-- [ ] **The cost headline compares non-comparable subsets.** Sonnet is on
++- [x] **The cost headline compares non-comparable subsets.** Sonnet is on
+   Anthropic list pricing, the candidates on the Bedrock page — defensible, and
+-  documented. Less defensible: candidate cache multipliers are `None`, so any
+-  candidate run returning cache tokens gets `cost_usd = None` and drops out of
+-  the means entirely. Sonnet's warm runs price at 0.1×; the candidates' warm runs
+-  are unpriced. Either measure the multipliers or state the subset on the figure.
++  documented. Less defensible *was*: candidate cache multipliers were `None`, so
++  any candidate run returning cache tokens got `cost_usd = None` and dropped out
++  of the means entirely. **Closed 2026-08-23** — candidate cache *reads* price at
++  1.0×, which is the derived rate for a route with no cache product; see the
++  2026-08-23 section above for the derivation and the pricing basis. Candidate
++  cache *writes* deliberately still drop out: those multipliers remain `None` so
++  a write raises, because no candidate route can emit one and its appearance is
++  an alarm rather than a token to price.
+ 
+ - [ ] **Per-turn snapshotting runs inside the synchronous stdout loop.**
+   `every_k_turns=1` by default and never overridden; each turn boundary fires
+diff --git a/bakeoff/config/litellm_config.yaml b/bakeoff/config/litellm_config.yaml
+index 3620e15..fd41cfa 100644
+--- a/bakeoff/config/litellm_config.yaml
++++ b/bakeoff/config/litellm_config.yaml
+@@ -73,6 +73,52 @@
+ # litellm_params as defaults and a temperature in Claude Code's own request
+ # body may win. Only the wire log shows what was sent -- Phase 0c (Task 12)
+ # reads it back from wire.jsonl rather than trusting this file.
++#
++# PROMPT CACHING IS NOT SYMMETRIC ACROSS THESE ARMS. It is sold for the
++# reference arm and not for the other three, which makes every candidate cost
++# figure an UNCACHED one. Measured 2026-08-23 (scripts/probe_cache.py):
++#
++#   claude-sonnet-5*  explicit caching honoured. Claude Code's three
++#                     cache_control breakpoints survive on the native-Anthropic
++#                     paths, and the reference arm runs ~97% cache-read.
++#   the three candidates
++#                     NO explicit caching on any route. litellm's
++#                     Anthropic->OpenAI adapter strips cache_control for any
++#                     model id containing neither "anthropic" nor "claude" (a
++#                     substring test, litellm 1.95.0), the mantle routes ignore
++#                     the field anyway, Converse REFUSES cachePoint for them,
++#                     and prompt_cache_key is a no-op. What hits instead is an
++#                     opportunistic per-worker prefix cache behind a per-request
++#                     balancer -- a lottery whose odds are (warm workers)/(pool
++#                     size), not anything a client controls.
++#
++# So candidate cost carries a variance term that is NOT a model property, and
++# for KIMI the region sets its size. Measured interleaved, region alternating
++# call by call: kimi three replicates of 40 calls per region, gemma two (40 and
++# 37), nemotron one of 40 as the negative control. Two conclusions, tables and
++# derivation in the 2026-08-23 section of TASKS.md:
++#
++#   kimi   REAL. 23/120 (19%) us-east-1 vs 47/120 (39%) us-east-2, two-sided
++#          p = 0.0010, all three replicates agreeing in sign.
++#   gemma  NO effect. 15/77 (19%) vs 12/77 (16%), two-sided p = 0.67, its two
++#          replicates disagreeing in sign. (An earlier 0.80 here was the tail
++#          opposite the observed sign -- probe_cache.py hardcoded its direction
++#          until 2026-09-08. The verdict is unchanged.)
++#
++# Changing `us-east-1` here is worth $0. AWS sells no prompt caching for these
++# three models -- they are absent from the Bedrock prompt-caching supported-model
++# table, and the pricing page gives them input and output columns with NO
++# cache-read or cache-write line -- and `prompt_tokens` is inclusive of
++# `cached_tokens` on the OpenAI shape, so every input token bills at the standard
++# rate whether the serving layer reused its KV blocks or not. The region buys
++# LATENCY only, and in real runs just 1.3x on kimi (4,230 ms hit vs 5,514 ms
++# miss); the 4.4x figure came from an isolated probe at max_tokens=16 where
++# prefill dominated. Two earlier notes here claimed 23% and then 14% of candidate
++# spend; both applied Anthropic's 0.10x cache-read multiplier to arms that have
++# no such rate. It remains a section 5.4 divergence unless EVERY arm moves
++# together, and the mantle claude-sonnet-5 arm 404s in us-east-2 while the
++# runtime one works. See the 2026-08-23 section in TASKS.md, and re-measure with
++# scripts/probe_cache.py --regions before touching this line.
+ 
+ model_list:
+   # ---- bedrock-mantle (primary) ----
+@@ -179,6 +225,17 @@ model_list:
+   # to Converse. Leaving it live left it one `--models kimi-k2-5-runtime` away
+   # from a paid run, which is the only reason it was reachable.
+   #
++  # A SECOND, INDEPENDENT REASON, measured 2026-08-23. Restoring this arm would
++  # not buy prompt caching either. Converse REFUSES a cachePoint block for this
++  # model, 10 attempts out of 10:
++  #   AccessDeniedException: You invoked an unsupported model or your request
++  #   did not allow prompt caching.
++  # The same modelId succeeds on the same call without the block, so it is the
++  # block and not the model access. Converse validates its input -- unlike the
++  # mantle routes, which return 200 for a deliberately bogus top-level key -- so
++  # this negative needs no swallow control. Same result for
++  # bedrock/nvidia.nemotron-super-3-120b. See scripts/probe_cache.py.
++  #
+   # TO RESTORE: uncomment, then add bedrock/moonshotai.kimi-k2.5 to
+   # CONVERSE_SAFE_TOOL_ID_MODELS in tests/test_config.py with the id shape it
+   # actually returns as the evidence -- the allowlist entry is the measurement,
+diff --git a/bakeoff/scripts/mutation_check.py b/bakeoff/scripts/mutation_check.py
+index 8310f39..8130541 100644
+--- a/bakeoff/scripts/mutation_check.py
++++ b/bakeoff/scripts/mutation_check.py
+@@ -137,11 +137,12 @@ MUTATIONS = [
+         "not integration",
+     ),
+     (
+-        # 2.1.0 fixed `warm` for the one arm that has a cache. Gemma and
+-        # Nemotron report no cache accounting at all, so turn-1 cache_read is 0
+-        # for them on every run and `false` asserted a cold cache on models
+-        # whose cache support is unconfirmed -- 3 of the 4 arms still lying
+-        # after the fix that was supposed to end it.
++        # 2.1.0 fixed `warm` for the one arm that has a cache. Nemotron reports
++        # no cache accounting at all and the other two report none on most
++        # runs, so turn-1 cache_read is 0 and `false` asserted a cold Bedrock
++        # cache on arms that have no Bedrock cache to be cold on -- confirmed
++        # 2026-08-23, AWS sells no prompt-cache product for the three. That was
++        # 3 of the 4 arms still lying after the fix meant to end it.
+         "cache: call an arm that reports no cache accounting cold",
+         "src/bakeoff/runner.py",
+         "    if total.cache_read == 0 and total.cache_write == 0:\n        return None",
+diff --git a/bakeoff/scripts/smoke_test.py b/bakeoff/scripts/smoke_test.py
+index edf8247..390f8b5 100644
+--- a/bakeoff/scripts/smoke_test.py
++++ b/bakeoff/scripts/smoke_test.py
+@@ -134,12 +134,15 @@ def run_problems(
+     if record.trajectory_parse_error:
+         problems.append(f"trajectory did not parse: {record.trajectory_parse_error}")
+ 
+-    # An unpriced run is NOT a failure. The three candidates raise on any
+-    # observed cache token (their Bedrock cache pricing is unconfirmed), and
+-    # the loop, the tool calls and the diff are all still evidence -- only the
+-    # price is missing. This used to arrive as trajectory_parse_error, which
+-    # zeroed the record; now the tokens survive and the run is repriceable
+-    # offline, so it is reported rather than gated.
++    # An unpriced run is NOT a failure. `cost_usd` raises for a model the price
++    # book does not know, and for one whose multipliers are genuinely None --
++    # which since 2026-08-23 is no arm's cache READS, candidate ones included
++    # at 1.0x rather than raising, while a candidate cache WRITE has no
++    # multiplier and still raises. The loop, the tool calls and the diff are
++    # all still evidence; only the price is missing. This used to
++    # arrive as trajectory_parse_error, which zeroed the record; now the tokens
++    # survive and the run is repriceable offline, so it is reported rather than
++    # gated.
+     #
+     # It becomes a real problem only when the tokens are ALSO empty, because
+     # then nothing can reprice it and the cost is lost permanently.
+@@ -489,12 +492,26 @@ def print_rates(rows: list[dict], repeats: int) -> None:
+ def print_cache_tokens(rows: list[dict]) -> None:
+     """Whether an arm returns cache tokens at all, stated rather than assumed.
+ 
+-    costs.py prices cache tokens for Sonnet and raises for the three
+-    candidates, whose Bedrock cache pricing is unconfirmed. That trip used to
+-    zero the whole record; parse_trajectory now keeps the turns and tokens and
+-    records the cost as unknown, so the remaining job of this line is to say
+-    which arms are affected -- and therefore which arms need a rate before any
+-    cost figure is published.
++    CACHE TOKENS NO LONGER DECIDE WHETHER A RUN HAS A PRICE, and this line
++    used to assume they did. Through 2026-08-23 `cost_usd` raised on any cache
++    token from the three candidates, so pricedness could be read off the arm
++    NAME -- which is what stood here, `arm.startswith("claude-sonnet-5")`.
++    `costs.PRICE_BOOK` now prices candidate cache READS at 1.0x the input
++    rate: AWS sells no prompt cache for them, and `prompt_tokens` is inclusive
++    of `cached_tokens` while `usage.input` is exclusive, so a reused token
++    bills exactly like a fresh one. A candidate cache WRITE stays unpriced and
++    still raises, but no candidate route emits one. An arm name therefore
++    predicts nothing about pricedness. The note below reads `row["cost"]` per run instead --
++    the same field print_cost keys off, so the two blocks cannot disagree
++    about which runs have a price.
++
++    The two arms' cache tokens are not the same thing, which is why this line
++    prints them rather than summing them into one column. Sonnet's are a
++    Bedrock product, billed at 0.10x read and 1.25x/2.00x write. The
++    candidates' are an opportunistic per-worker KV cache the serving layer
++    keeps (measured 2026-08-23 with scripts/probe_cache.py): a lottery a
++    minority of runs win, with no product behind it and no billing
++    consequence.
+ 
+     Measured on 2026-08-07: the cache warms on turn 2 of a single run (not at
+     N=10, as TASKS.md assumed), and Kimi does return cache tokens once it runs
+@@ -506,17 +523,19 @@ def print_cache_tokens(rows: list[dict]) -> None:
+     repeat paid the cache write, and on the 2026-08-11 N=3 runs that column
+     alone separated the $0.547 run from the $0.176 one.
+     """
+-    print("\ncache tokens (costs.py has no confirmed rate for any candidate)")
++    print("\ncache tokens (a Bedrock product on Sonnet; a KV lottery on the rest)")
+     for arm in dict.fromkeys(row["arm"] for row in rows):
+         arm_rows = [row for row in rows if row["arm"] == arm]
+         reads = sum(row["cache_read"] for row in arm_rows)
+         writes = sum(row["cache_write"] for row in arm_rows)
+-        priced = arm.startswith("claude-sonnet-5")
++        # Per ROW, never per arm. A None cost is a property of the run that
++        # produced it, and no arm is unpriceable by name any more.
++        unpriced = sum(1 for row in arm_rows if row["cost"] is None)
+         if reads or writes:
+             note = (
+-                "priced"
+-                if priced
+-                else "UNPRICED -- cost recorded as null, tokens intact"
++                f"UNPRICED on {unpriced}/{len(arm_rows)} -- cost null, tokens intact"
++                if unpriced
++                else "priced"
+             )
+         else:
+             note = "none returned"
+@@ -627,11 +646,18 @@ def print_cost(rows: list[dict], repeats: int) -> None:
+     and what carries over is 30,506 tokens of task-independent tool schemas, not
+     any part of the work. Averaging the two would price a scenario nobody is in.
+ 
+-    Runs whose cost is None are excluded and counted, because a mean over "the
+-    runs that happened to miss the cache" is not a price of anything -- and for
+-    the candidate arms that is not a coincidence: `warm is True` requires cache
+-    tokens, cache tokens raise on a model with no confirmed rate, so their
+-    warm_followup column is unreachable by construction rather than unobserved.
++    Runs whose cost is None are excluded and counted, because a mean over the
++    runs that happened to be priceable is not a price of anything.
++
++    Through 2026-08-23 that exclusion emptied the candidates' warm_followup
++    column BY CONSTRUCTION rather than by observation: `warm is True` requires
++    cache tokens, and cache tokens raised on a candidate, so the two conditions
++    could not both hold and an empty column there said nothing about any
++    deployment situation. It no longer does. Candidate cache reads price at
++    1.0x the input rate -- and `warm` keys on a read, never on a write, which
++    is the half that stayed unpriced -- so a candidate that wins the KV lottery
++    now carries a cost, and an empty warm_followup column is once again a
++    measurement.
+     """
+     if repeats <= 1:
+         return
+@@ -662,11 +688,16 @@ def print_cost(rows: list[dict], repeats: int) -> None:
+         cold = mean([row for row in priced if row["cache_warm"] is False])
+         warm = mean([row for row in priced if row["cache_warm"] is True])
+         unpriced = len(arm_rows) - len(priced)
++        # The old note here named the cause as "no cache rate" and singled out
++        # the warm runs. Both halves are dead: every arm's cache reads are
++        # priced since 2026-08-23 -- only a candidate cache write is still
++        # unpriced, and no candidate route emits one -- so a None means the
++        # price book did not know the model, or a multiplier it needed is still
++        # None -- neither of which has anything to do with which scenario the
++        # run was in.
+         note = ""
+-        if unpriced and any(row["cache_warm"] is True for row in arm_rows):
+-            note = f"  [{unpriced} unpriced, incl. every warm run -- no cache rate]"
+-        elif unpriced:
+-            note = f"  [{unpriced} unpriced]"
++        if unpriced:
++            note = f"  [{unpriced} unpriced -- model or rate absent from PRICE_BOOK]"
+         print(f"  {arm:26} first_task={cold}   warm_followup={warm}{note}")
+ 
+ 
+@@ -693,7 +724,7 @@ def print_sampling(rows: list[dict]) -> None:
+         shown = "absent" if temperature is None else repr(temperature)
+         expected = "none by API constraint" if row["arm"].startswith(
+             "claude-sonnet-5"
+-        ) else "1.0 configured"
++        ) else "temperature 1.0 configured"
+         print(
+             f"  {row['arm']:26} temperature={shown:<8} "
+             f"max_output_tokens={sampling.get('max_output_tokens')}   "
+diff --git a/bakeoff/src/bakeoff/costs.py b/bakeoff/src/bakeoff/costs.py
+index 367afa9..1d6cc92 100644
+--- a/bakeoff/src/bakeoff/costs.py
++++ b/bakeoff/src/bakeoff/costs.py
+@@ -23,13 +23,26 @@ at the 5m rate, which is what Claude Code asks Bedrock for today -- its TTL is
+ hardcoded to 5m, claude-code#32671 -- and is recorded as untiered rather than
+ rewritten to 5m so the assumption stays visible in the log.
+ 
+-Candidate cache multipliers are None on purpose: spec section 8 records
+-that Bedrock prompt-cache support for the three candidates is unconfirmed,
+-and AWS publishes no cache pricing for any of them. Guessing here would
+-silently corrupt the headline cost metric, so any cache tokens observed on
+-those models raise instead.
+-
+-CALLER CONTRACT. Raising is right, but only the price may be lost by it.
++THE CANDIDATE CACHE MULTIPLIERS ARE ASYMMETRIC: read is 1.0, write stays None.
++The read is a derived price (measured 2026-08-23) -- AWS sells these three no
++cache product, so a reused input token bills exactly like a fresh one, and a
++candidate cache hit is worth $0. The write is deliberately left unpriced
++(2026-09-08), because no candidate route can emit one: a nonzero candidate
++`cache_write` is not a token count to price, it is evidence that a billed cache
++product shipped, and that belongs in `pricing_error` where a reader will see it,
++never in a plausible dollar figure. Sonnet keeps its real multipliers (0.10x
++read, 1.25x / 2.00x write) because its caching is a product AWS sells and bills.
++The derivation, the measurements behind it and what to re-check live beside the
++numbers, in the PRICE_BOOK comment below.
++
++The one thing that must never happen here is a multiplier chosen to make a
++number look right. It has happened: working notes priced candidate cache reads
++at Anthropic's 0.10x and reported Kimi as cheaper than Sonnet when, priced
++correctly, it is more expensive.
++
++CALLER CONTRACT. Raising is right -- for a model this book does not know at all,
++for a cache write on a candidate arm, and for any multiplier that is genuinely
++None -- but only the price may be lost by it.
+ `trajectory.parse_trajectory` catches per turn and records the reason on
+ `ParsedTrajectory.pricing_error`, so the turn count, the tokens and the tool
+ calls all survive and the run stays repriceable offline the moment AWS
+@@ -55,7 +68,7 @@ class UnknownModelError(KeyError):
+ 
+ # Bumped whenever a rate in PRICE_BOOK moves. Stamped into every record's
+ # Versions so a stored cost says which book produced it.
+-PRICING_BASIS = "sonnet-list-2026-08-11+bedrock-2026-08-05"
++PRICING_BASIS = "sonnet-list-2026-08-11+bedrock-2026-08-05+candidate-nocache-2026-08-23"
+ 
+ 
+ @dataclass(frozen=True)
+@@ -76,9 +89,63 @@ PRICE_BOOK: dict[str, ModelPricing] = {
+         cache_write_multiplier=1.25,
+         cache_write_1h_multiplier=2.00,
+     ),
+-    "gemma-4-31b": ModelPricing(input_per_1m=0.14, output_per_1m=0.40),
+-    "nemotron-3-super-120b": ModelPricing(input_per_1m=0.15, output_per_1m=0.65),
+-    "kimi-k2-5": ModelPricing(input_per_1m=0.60, output_per_1m=3.00),
++    # The three candidates, and their cache multipliers are ASYMMETRIC on
++    # purpose: read is 1.0, write is None. The two halves rest on different
++    # evidence and fail in opposite directions, so they are decided separately.
++    #
++    # READ IS 1.0, AND 1.0 IS A PRICE HERE, NOT A PLACEHOLDER. Spec section 8
++    # recorded Bedrock prompt-cache support for these three as *unconfirmed*,
++    # and both multipliers were None so that any cache token raised. Measured
++    # 2026-08-23 (scripts/probe_cache.py) it is confirmed ABSENT: none of them
++    # appears on Bedrock's prompt-caching supported-model table (Anthropic
++    # Claude, OpenAI GPT-5.6 and Amazon Nova are on it), the pricing page gives
++    # them input and output columns with no cache-read or cache-write line at
++    # all, and Converse answers a `cachePoint` block with AccessDeniedException,
++    # 10 attempts of 10. So the `cached_tokens` these routes report is the
++    # serving layer's own opportunistic KV reuse, not a Bedrock prompt-caching
++    # hit, and it carries NO billing consequence. Absent is a stronger claim
++    # than unknown, and unlike unknown it is priceable: OpenAI usage makes
++    # `prompt_tokens` inclusive of `cached_tokens` while `usage.input` is
++    # exclusive of them on every route (pinned by tests/test_usage_accounting.py),
++    # so `input + cache_read` at 1.0x reconstructs exactly
++    # `prompt_tokens x input_per_1m` -- which is what AWS bills. None here was
++    # right while the rate was unknown and wrong once it was known: it priced
++    # good runs to None over tokens this book can price, and reads are not rare
++    # (32 of the 179 stored candidate records carry one).
++    #
++    # WRITE STAYS NONE, AND THAT IS NOT AN OVERSIGHT (2026-09-08). The read
++    # derivation does not carry over, because no candidate route can produce a
++    # write at all: litellm fills `cache_creation_input_tokens` only from
++    # Anthropic-native usage fields, which none of these routes emit, and
++    # Converse refuses `cachePoint` for them outright. Measured: 0 writes in 179
++    # stored candidate records and 0 in 951 wire entries. A nonzero candidate
++    # `cache_write` is therefore not a quantity to price -- it is direct
++    # evidence that a billed cache product shipped for that model, which is
++    # exactly the event that invalidates the 1.0 above. Priced at 1.0 that
++    # signal becomes a plausible-looking dollar figure and is lost, and it is
++    # wrong in the UNDERCHARGING direction: every published write rate is above
++    # 1.0 (Anthropic's is 1.25x at 5m, 2.00x at 1h). Left None it raises,
++    # `parse_trajectory` records the reason on `pricing_error`, the tokens
++    # survive, and the run reprices offline the moment the rate is published.
++    # Prefer a loud failure over a plausible-looking zero.
++    #
++    # Re-check the read side with scripts/probe_cache.py --mechanisms before
++    # assuming it still holds, and move PRICING_BASIS with any rate that moves.
++    "gemma-4-31b": ModelPricing(
++        input_per_1m=0.14, output_per_1m=0.40,
++        cache_read_multiplier=1.0, cache_write_multiplier=None,
++        cache_write_1h_multiplier=None,
++    ),
++    "nemotron-3-super-120b": ModelPricing(
++        input_per_1m=0.15, output_per_1m=0.65,
++        cache_read_multiplier=1.0, cache_write_multiplier=None,
++        cache_write_1h_multiplier=None,
++    ),
++    "kimi-k2-5": ModelPricing(
++        input_per_1m=0.60, output_per_1m=3.00,
++        cache_read_multiplier=1.0, cache_write_multiplier=None,
++        cache_write_1h_multiplier=None,
++    ),
+ }
+ 
+ # The proxy exposes the bedrock-runtime route under a "-runtime" suffix so the
+diff --git a/bakeoff/src/bakeoff/runner.py b/bakeoff/src/bakeoff/runner.py
+index 2fae862..28617c6 100644
+--- a/bakeoff/src/bakeoff/runner.py
++++ b/bakeoff/src/bakeoff/runner.py
+@@ -463,9 +463,26 @@ def _cache_warm(parsed: ParsedTrajectory) -> bool | None:
+       tokens, byte-identical to a genuine zero, so the projection alone cannot
+       be read; an API-error or replayed assistant record lands here.
+     - The run reported no cache accounting ANYWHERE, read or write, on any
+-      turn. Gemma and Nemotron do this on every run -- 9 for 9 -- and `false`
+-      would assert a cold cache on models whose cache support is unconfirmed
+-      (`costs.PRICE_BOOK` carries None multipliers for exactly that reason).
++      turn. Nemotron does this on every run, 0 for all; Gemma and Kimi do it on
++      most runs but not all -- across the stored logs 14 Gemma and 18 Kimi
++      records carry `cache_read > 0`. `false` on a run with no accounting would
++      assert a cold Bedrock cache on an arm that has no Bedrock cache to be
++      cold on (confirmed 2026-08-23: `costs.PRICE_BOOK` prices candidate cache
++      reads at 1.0x because AWS sells them no cache product, and leaves their
++      cache writes unpriced so one still raises), so the guard says nothing
++      instead.
++
++    WHAT THIS GUARD DOES NOT COVER, and it is the interesting half. It catches
++    only the arms that report NOTHING. When a candidate does report
++    `cached_tokens` -- an opportunistic per-worker KV hit, won by lottery, with
++    no product behind it -- this function falls through and stamps a real
++    `True`/`False`. The bool it stamps means "turn-1 `cache_read`", and the
++    field it lands in claims a Bedrock cache that an earlier run warmed. On a
++    candidate that claim has no referent: the two arms' `cache_read` columns
++    are byte-identical and mean different things, so a reader filtering
++    `warm is False` across arms is mixing a measured cold Bedrock cache with a
++    KV lottery nobody entered. That mismatch is pre-existing, is not fixed
++    here, and is tracked in TASKS.md.
+ 
+     Checked against the measured Sonnet runs in tasks/todo.md: the cold run's
+     turn 1 is (0, 41695), so the run-total guard sees writes and leaves it
+diff --git a/bakeoff/src/bakeoff/schema.py b/bakeoff/src/bakeoff/schema.py
+index dc6fd24..f32b644 100644
+--- a/bakeoff/src/bakeoff/schema.py
++++ b/bakeoff/src/bakeoff/schema.py
+@@ -518,10 +518,14 @@ class CacheState:
+     - turn 1 carried no `usage` block, which projects to all-zero tokens and is
+       indistinguishable from a genuine zero once projected;
+     - the run reported NO cache accounting anywhere -- no read and no write on
+-      any turn. Gemma and Nemotron do this on every run, and `false` there would
+-      assert a cold cache on a model whose cache support is unconfirmed
+-      (`costs.PRICE_BOOK` carries None multipliers for exactly that reason).
+-      Through 2.1.0 they all said `false`.
++      any turn. Nemotron does this on every run; Gemma and Kimi do it on most,
++      reporting `cached_tokens` on a minority. `false` there would assert a
++      cold Bedrock cache on an arm that has no Bedrock cache to be cold on --
++      resolved 2026-08-23: AWS sells no prompt-cache product for the three
++      candidates, and `costs.PRICE_BOOK` prices their cache READS at 1.0x the
++      input rate for exactly that reason -- their cache WRITES keep no
++      multiplier and still raise, since no candidate route can emit one and a
++      write appearing is the alarm. Through 2.1.0 they all said `false`.
+ 
+     So `false` now means: the provider accounted for cache somewhere in this
+     run, and reported no read on the first call. A reader filtering for cold
+diff --git a/bakeoff/src/bakeoff/trajectory.py b/bakeoff/src/bakeoff/trajectory.py
+index 8edda7a..8a20148 100644
+--- a/bakeoff/src/bakeoff/trajectory.py
++++ b/bakeoff/src/bakeoff/trajectory.py
+@@ -218,9 +218,15 @@ def parse_trajectory(path: Path, model: str) -> ParsedTrajectory:
+                     result.bash_commands.append((turn_no, command))
+ 
+         # Pricing is not parsing, and conflating them destroyed data. cost_usd
+-        # raises for the three candidates on any cache token (their Bedrock
+-        # cache pricing is unconfirmed) and for a model absent from the price
+-        # book. Letting that escape aborts the loop, and assemble_record then
++        # raises for a model absent from the price book, and for one whose
++        # multipliers are None. The three candidates were the second case until
++        # 2026-08-23, when their cache READS moved from None to 1.0x -- their
++        # cache WRITES stayed None and still raise, so on a candidate arm the
++        # trip that produced the defect below is now reachable only on a write
++        # no candidate route can emit, and this guard is otherwise holding a
++        # door the next unpriced model walks through. It stays because the cost
++        # of removing it is the whole record. Letting that escape aborts the
++        # loop, and assemble_record then
+         # replaces the whole ParsedTrajectory with an empty one -- so a run
+         # whose transcript parsed perfectly is recorded with turns, tokens and
+         # tool calls all zero. Observed live on 2026-08-07: a kimi-k2-5 run
+@@ -230,7 +236,8 @@ def parse_trajectory(path: Path, model: str) -> ParsedTrajectory:
+         # UnknownModelError subclasses KeyError, not ValueError, so both are
+         # named. Both mean the same thing -- the tokens are known and the
+         # price is not -- and the tokens are what make the run repriceable
+-        # offline once rates are published.
++        # offline once a rate is published. 2026-08-23 is that repricing having
++        # happened once already, offline, over stored tokens.
+         if seen is not None:
+             # A later block of a call already counted. Its tool calls are on
+             # the turn above; its usage is a repeat, and its `stop_reason` is
+diff --git a/bakeoff/tests/conftest.py b/bakeoff/tests/conftest.py
+index 56e604f..67417f5 100644
+--- a/bakeoff/tests/conftest.py
++++ b/bakeoff/tests/conftest.py
+@@ -1,4 +1,7 @@
+-"""Fixtures for container integration tests.
++"""Shared test fixtures.
++
++`unpriceable_model` is a price-book stand-in the unit suite reaches for;
++everything after it belongs to the container integration tests.
+ 
+ The image ships git rather than installing it at runtime. RunContainer
+ creates containers with network_mode="none" (spec section 5.1), so
+@@ -23,6 +26,38 @@ from pathlib import Path
+ 
+ import pytest
+ 
++
++@pytest.fixture
++def unpriceable_model(monkeypatch):
++    """A model in `PRICE_BOOK` with no cache multipliers, so any cache token
++    makes `cost_usd` raise. Yields the name to pass as `model=`.
++
++    Shared because three modules need it and none of them may name a real arm
++    for it any more. Until 2026-08-23 the three candidates carried None
++    multipliers and were used here directly; they now carry 1.0 on READS,
++    because Bedrock sells them no cache product at all and a reused token
++    therefore bills at the standard input rate, and None on both WRITE
++    multipliers, where a raise is still the right answer. The fake model below
++    carries None on all three -- a shape no real arm has any more, which is the
++    point of it. Naming a candidate would have gone on testing an
++    arm rather than the mechanism -- and the mechanism is what the trajectory
++    and record guarantees rest on: `cost_usd` raising must cost the price and
++    nothing else. It is still live in `costs.py`, now guarding the case it was
++    built for, a model whose rate is genuinely unknown.
++
++    An arbitrary name is safe downstream. `parse_trajectory` and
++    `assemble_record` carry `model` as an opaque string; `cost_usd` is the only
++    caller that looks it up, which is what makes the monkeypatch sufficient.
++    """
++    from bakeoff.costs import PRICE_BOOK, ModelPricing
++
++    name = "rate-not-yet-published"
++    monkeypatch.setitem(
++        PRICE_BOOK, name, ModelPricing(input_per_1m=1.0, output_per_1m=1.0)
++    )
++    return name
++
++
+ # Alpine-based and ships git, so `command -v git` short-circuits install_git
+ # and busybox wget is available for the network-isolation test.
+ FIXTURE_IMAGE = "alpine/git:latest"
+diff --git a/bakeoff/tests/test_costs.py b/bakeoff/tests/test_costs.py
+index 68422ed..08d2662 100644
+--- a/bakeoff/tests/test_costs.py
++++ b/bakeoff/tests/test_costs.py
+@@ -1,6 +1,6 @@
+ import pytest
+ 
+-from bakeoff.costs import PRICE_BOOK, UnknownModelError, cost_usd
++from bakeoff.costs import ModelPricing, PRICE_BOOK, UnknownModelError, cost_usd
+ from bakeoff.schema import TokenUsage
+ 
+ 
+@@ -69,12 +69,23 @@ def test_a_tier_larger_than_the_total_raises_rather_than_clamping():
+         cost_usd("claude-sonnet-5", usage)
+ 
+ 
+-def test_a_one_hour_write_on_a_model_without_a_one_hour_rate_raises():
+-    """Sonnet is the only arm with any cache rate at all, and 1h is a separate
+-    confirmation from 5m -- a model card listing 5m only says nothing about
+-    what 1h costs. Guessing 1.25x there understates by 60%."""
+-    for model in ("gemma-4-31b", "nemotron-3-super-120b", "kimi-k2-5"):
+-        assert PRICE_BOOK[model].cache_write_1h_multiplier is None
++def test_a_one_hour_write_on_a_model_without_a_one_hour_rate_raises(monkeypatch):
++    """1h is a separate confirmation from 5m -- a model card listing 5m only
++    says nothing about what 1h costs, and guessing 1.25x there understates by
++    60%.
++
++    Monkeypatched rather than read off a real arm: since 2026-08-23 every model
++    in the book has all three multipliers, so the shape this guards no longer
++    occurs naturally. The guard still has to work for the next model that
++    arrives with a 5m rate and no 1h one.
++    """
++    monkeypatch.setitem(
++        PRICE_BOOK, "five-minute-only",
++        ModelPricing(input_per_1m=1.0, output_per_1m=1.0,
++                     cache_read_multiplier=0.1, cache_write_multiplier=1.25),
++    )
++    with pytest.raises(ValueError, match="1h cache write rate unconfirmed"):
++        cost_usd("five-minute-only", TokenUsage(cache_write=100, cache_write_1h=100))
+ 
+ 
+ def test_reasoning_tokens_billed_as_output():
+@@ -89,16 +100,78 @@ def test_candidate_pricing_matches_spec():
+     assert cost_usd("kimi-k2-5", usage) == pytest.approx(3.60)
+ 
+ 
+-def test_candidates_have_cache_support_unconfirmed():
+-    """Spec section 8: candidate Bedrock cache support is unconfirmed, so
+-    their cache multipliers must be explicitly None until measured."""
++def test_candidates_price_cache_reads_at_the_standard_input_rate():
++    """The asymmetry, pinned: read is 1.0, both write multipliers are None.
++
++    AWS sells no prompt caching for these three -- absent from the Bedrock
++    supported-model table, no cache line on the pricing page, and Converse
++    refuses a cachePoint block 10 times out of 10 (2026-08-23). With no product
++    there is no discount, so a reused token bills exactly like a fresh one, and
++    1.0 is the price rather than a placeholder.
++
++    The write side does not follow, because no candidate route can emit a write
++    at all. A nonzero candidate cache_write is not a quantity to price -- it is
++    the signal that a billed cache product shipped, which is the very fact the
++    1.0 rests on. None keeps that loud; 1.0 would spend it on a wrong number.
++    """
+     for model in ("gemma-4-31b", "nemotron-3-super-120b", "kimi-k2-5"):
+-        assert PRICE_BOOK[model].cache_read_multiplier is None
++        assert PRICE_BOOK[model].cache_read_multiplier == 1.0
++        assert PRICE_BOOK[model].cache_write_multiplier is None
++        assert PRICE_BOOK[model].cache_write_1h_multiplier is None
++
++
++@pytest.mark.parametrize("model", ["gemma-4-31b", "nemotron-3-super-120b", "kimi-k2-5"])
++def test_a_candidate_cache_write_raises_because_no_route_can_produce_one(model):
++    """No candidate route can emit a cache write: litellm fills
++    cache_creation_input_tokens only from Anthropic-native usage fields, which
++    none of these routes send, and Converse refuses cachePoint for them. 0
++    writes in 179 stored candidate records, 0 in 951 wire entries.
++
++    So a write arriving here is the product-launch signal, not a token count --
++    it says AWS shipped a billed cache product, which is exactly what would
++    invalidate the 1.0 on the read side. Pinned loud: it must reach
++    `pricing_error`, never a dollar figure. A read alone still prices cleanly;
++    the two halves must not be gated together.
++    """
++    with pytest.raises(ValueError, match="cache support unconfirmed"):
++        cost_usd(model, TokenUsage(cache_write=100))
++
++    assert cost_usd(model, TokenUsage(cache_read=100)) == pytest.approx(
++        PRICE_BOOK[model].input_per_1m * 100 / 1_000_000
++    )
++
++
++@pytest.mark.parametrize("model", ["gemma-4-31b", "nemotron-3-super-120b", "kimi-k2-5"])
++def test_a_candidate_cache_read_costs_exactly_what_an_input_token_costs(model):
++    """The arithmetic the 1.0 exists to produce. `usage.input` is exclusive of
++    cache tokens on every route, so input + cache_read at 1.0x reconstructs
++    `prompt_tokens x input_per_1m` -- what AWS actually bills.
++
++    Sonnet is the contrast and must NOT move: its caching is a product.
++    """
++    assert cost_usd(model, TokenUsage(cache_read=100)) == cost_usd(
++        model, TokenUsage(input=100)
++    )
++    assert cost_usd("claude-sonnet-5", TokenUsage(cache_read=100)) == pytest.approx(
++        0.10 * cost_usd("claude-sonnet-5", TokenUsage(input=100))
++    )
++
+ 
++def test_cache_tokens_on_a_model_whose_rate_is_unknown_still_raises(
++    unpriceable_model,
++):
++    """The None-means-raise mechanism outlives the arms that used to trigger it
++    on the READ side.
+ 
+-def test_cache_tokens_on_model_without_cache_support_raises():
++    It was built for a rate that is UNKNOWN. The candidates left that state for
++    reads on 2026-08-23 -- absence is priceable -- but the next model to arrive
++    mid-eval starts exactly where they were, and pricing it at a guessed
++    multiplier is the failure this guards. Takes the shared fixture from
++    conftest, which is where the stand-in model is defined for the three modules
++    that need it; re-declaring it here let two copies drift.
++    """
+     with pytest.raises(ValueError, match="cache support unconfirmed"):
+-        cost_usd("gemma-4-31b", TokenUsage(cache_read=100))
++        cost_usd(unpriceable_model, TokenUsage(cache_read=100))
+ 
+ 
+ def test_unknown_model_raises():
+diff --git a/bakeoff/tests/test_fault_injection.py b/bakeoff/tests/test_fault_injection.py
+index 59bff1d..335ec6e 100644
+--- a/bakeoff/tests/test_fault_injection.py
++++ b/bakeoff/tests/test_fault_injection.py
+@@ -446,15 +446,25 @@ def test_destructive_command_survives_parse_scan_and_record(task, tmp_path):
+     assert event.reverted_by_agent is False
+ 
+ 
+-def test_a_destructive_command_survives_an_unpriceable_model(task, tmp_path):
++def test_a_destructive_command_survives_an_unpriceable_model(
++    task, tmp_path, unpriceable_model
++):
+     """Section 7's safety record must not depend on the price book.
+ 
+     execute_run scans destructive commands off the parsed trajectory and
+     empties the list on any parse exception. A cache-token pricing failure
+     used to be such an exception, so an unpriceable arm reported NO
+     destructive commands -- which reads as a positive safety claim rather
+-    than as missing data. The scan runs on gemma-4-31b usage carrying
+-    cache_read, which is exactly what used to raise.
++    than as missing data. The scan runs on usage carrying cache_read for a
++    model whose cache rate is unknown, which is exactly what raises.
++
++    The model is monkeypatched rather than named. gemma-4-31b stood here until
++    2026-08-23, when the three candidates' cache READS moved from None to 1.0 --
++    Bedrock sells them no cache product, so a read prices at the standard input
++    rate, and the usage below carries a read. (Their cache writes stayed None
++    and still raise.) Naming one would leave this asserting that a
++    priced run keeps its destructive events, which is a different and much
++    weaker claim.
+     """
+     path = _write(
+         tmp_path,
+@@ -467,7 +477,7 @@ def test_a_destructive_command_survives_an_unpriceable_model(task, tmp_path):
+             ),
+         ],
+     )
+-    parsed = parse_trajectory(path, model="gemma-4-31b")
++    parsed = parse_trajectory(path, model=unpriceable_model)
+ 
+     # The pricing failed and the parse did not.
+     assert parsed.total_cost_usd is None
+@@ -477,7 +487,7 @@ def test_a_destructive_command_survives_an_unpriceable_model(task, tmp_path):
+     assert events and events[0].turn == 2
+ 
+     record = assemble_record(
+-        task=task, model="gemma-4-31b", sample_index=0,
++        task=task, model=unpriceable_model, sample_index=0,
+         started_at="2026-08-04T00:00:00Z", finished_at="2026-08-04T00:05:00Z",
+         trajectory_path=path, runner_result=None, checkpoints=[],
+         destructive_events=events, artifacts_root=tmp_path,
+@@ -490,14 +500,18 @@ def test_a_destructive_command_survives_an_unpriceable_model(task, tmp_path):
+ 
+ 
+ def test_per_turn_costs_carry_their_price_basis_when_the_run_total_cannot(
+-    task, tmp_path
++    task, tmp_path, unpriceable_model
+ ):
+     """A partial pricing failure leaves real dollars in `per_turn` while
+     `cost_usd` goes None. Keying the basis on the run total blanked it there,
+     so those figures sat in the record with no book attached -- and they are
+     exactly what an offline repricer sums.
+ 
+-    Turn 1 carries no cache token and prices; turn 2 carries one and raises.
++    Turn 1 carries no cache token and prices; turn 2 carries one and raises --
++    on a monkeypatched model whose cache rate is unknown, since the candidates
++    that used to produce this split price their cache reads as of 2026-08-23
++    -- only a write still raises there -- and would now make both turns
++    succeed.
+     """
+     path = _write(
+         tmp_path,
+@@ -507,7 +521,7 @@ def test_per_turn_costs_carry_their_price_basis_when_the_run_total_cannot(
+         ],
+     )
+     record = assemble_record(
+-        task=task, model="gemma-4-31b", sample_index=0,
++        task=task, model=unpriceable_model, sample_index=0,
+         started_at="2026-08-04T00:00:00Z", finished_at="2026-08-04T00:05:00Z",
+         trajectory_path=path, runner_result=None, checkpoints=[],
+         destructive_events=[], artifacts_root=tmp_path,
+diff --git a/bakeoff/tests/test_runner.py b/bakeoff/tests/test_runner.py
+index 58daf7c..e387b6e 100644
+--- a/bakeoff/tests/test_runner.py
++++ b/bakeoff/tests/test_runner.py
+@@ -286,8 +286,11 @@ def test_warm_is_undetermined_when_the_model_reported_no_cache_at_all(task, tmp_
+     Gemma and Nemotron returned no cache fields in 9 runs. `_usage_from`
+     defaults every cache field to 0, so turn-1 `cache_read > 0` was False and
+     every one of their records claimed it had started against a COLD cache --
+-    an assertion about a cache whose existence is unconfirmed, which is why
+-    costs.PRICE_BOOK carries None multipliers for them.
++    an assertion about a Bedrock cache these arms do not have. Confirmed
++    2026-08-23: AWS sells no prompt-cache product for the three candidates,
++    which is why costs.PRICE_BOOK prices their cache reads at 1.0x the input
++    rate rather than at a cache rate, and leaves their cache writes unpriced
++    so one still raises.
+ 
+     No read and no write anywhere in the run means nothing was accounted for.
+     """
+diff --git a/bakeoff/tests/test_smoke_test.py b/bakeoff/tests/test_smoke_test.py
+index a5ab322..62644cd 100644
+--- a/bakeoff/tests/test_smoke_test.py
++++ b/bakeoff/tests/test_smoke_test.py
+@@ -361,12 +361,17 @@ def test_an_unpriced_run_is_reported_but_does_not_fail_the_gate():
+     moment AWS publishes rates, and gating on it would discard good data.
+ 
+     This is the case that used to arrive as trajectory_parse_error with the
+-    whole trajectory zeroed."""
++    whole trajectory zeroed. The shape is live on a real arm again: candidate
++    cache *writes* stay unpriced, because no candidate route can emit one and a
++    write appearing is the signal that a billed cache product shipped."""
+     assert (
+         _live_problems(
+             _Record(
+                 cost_usd=None,
+-                pricing_error="ValueError: kimi-k2-5: cache support unconfirmed",
++                pricing_error=(
++                    "ValueError: kimi-k2-5: "
++                    "cache support unconfirmed, saw cache_write"
++                ),
+                 cache_read=15168,
+             )
+         )
+diff --git a/bakeoff/tests/test_trajectory.py b/bakeoff/tests/test_trajectory.py
+index 6412973..dc6b35e 100644
+--- a/bakeoff/tests/test_trajectory.py
++++ b/bakeoff/tests/test_trajectory.py
+@@ -223,14 +223,22 @@ def test_per_turn_cost_is_populated(parsed):
+ 
+ # --- pricing is not parsing --------------------------------------------------
+ #
+-# The same fixture, read as a model whose cache pricing is unconfirmed. It
+-# carries cache_read=1000, so cost_usd raises on every turn. That used to
+-# abort the parse and cost the whole trajectory.
++# The same fixture, read as a model whose cache rate is unknown -- PRICE_BOOK
++# holds it with no multipliers. The fixture carries cache_read=1000, so cost_usd
++# raises on every turn. That used to abort the parse and cost the whole
++# trajectory.
++#
++# The model is monkeypatched in (`unpriceable_model`, tests/conftest.py) rather
++# than named. kimi-k2-5 stood here until 2026-08-23, when the three candidates
++# were confirmed to have no Bedrock cache product at all and moved their cache
++# READ multiplier from None to 1.0 (the write multipliers stayed None and still
++# raise) -- the fixture's cache_read prices now, so naming one would have left
++# this file asserting nothing while still reading as though it did.
+ 
+ 
+ @pytest.fixture
+-def unpriced():
+-    return parse_trajectory(FIXTURE, model="kimi-k2-5")
++def unpriced(unpriceable_model):
++    return parse_trajectory(FIXTURE, model=unpriceable_model)
+ 
+ 
+ def test_an_unpriceable_model_keeps_every_turn(unpriced):
+@@ -265,17 +273,25 @@ def test_an_unpriceable_model_reports_cost_unknown_not_zero(unpriced):
+     assert all(t.cost_usd is None for t in unpriced.turns)
+ 
+ 
+-def test_the_reason_names_the_model_and_the_cause(unpriced):
+-    assert "kimi-k2-5" in unpriced.pricing_error
++def test_the_reason_names_the_model_and_the_cause(unpriced, unpriceable_model):
++    assert unpriceable_model in unpriced.pricing_error
+     assert "cache support unconfirmed" in unpriced.pricing_error
+ 
+ 
+-@pytest.mark.parametrize("model", ["claude-sonnet-5", "kimi-k2-5", "not-in-price-book"])
+-def test_cost_is_none_exactly_when_a_pricing_error_is_recorded(model):
++@pytest.mark.parametrize("model", ["claude-sonnet-5", "", "not-in-price-book"])
++def test_cost_is_none_exactly_when_a_pricing_error_is_recorded(
++    model, unpriceable_model
++):
+     """The invariant. A None cost with no stated reason is the silent absence
+     the event log exists to prevent, and a reason with a number beside it
+-    would make the number a lie."""
+-    result = parse_trajectory(FIXTURE, model=model)
++    would make the number a lie.
++
++    Three arms: priced, rate unknown, model unknown. The middle one is the
++    empty string because the model it stands for exists only inside the
++    fixture's monkeypatch -- it used to be kimi-k2-5, which since 2026-08-23
++    prices like the first arm and so tested the invariant only once.
++    """
++    result = parse_trajectory(FIXTURE, model=model or unpriceable_model)
+     assert (result.total_cost_usd is None) == bool(result.pricing_error)
+ 
+ 
+diff --git a/docs/superpowers/specs/2026-08-03-llm-bakeoff-eval-design.md b/docs/superpowers/specs/2026-08-03-llm-bakeoff-eval-design.md
+index 2ecb3d1..bd126e4 100644
+--- a/docs/superpowers/specs/2026-08-03-llm-bakeoff-eval-design.md
++++ b/docs/superpowers/specs/2026-08-03-llm-bakeoff-eval-design.md
+@@ -396,6 +396,8 @@ Ten samples of the same task executed back-to-back will warm Bedrock's prompt ca
+ 
+ This is **asymmetric**. Sonnet 5 has prompt caching; the candidates' Bedrock cache support is unconfirmed (§8). Batched repeats would therefore make Sonnet 5 look artificially cheap, biasing cost-per-completed-workflow *against* the candidates the eval exists to evaluate.
+ 
++> **Resolved 2026-08-23 (see the §8 note below): "unconfirmed" is now "absent".** The asymmetry above is real and is *larger* than written, not smaller. Sonnet reads at 0.1× list; the candidates have no cache product at all, so every input token they send bills at the standard rate however much of it a serving layer happened to reuse. The control below is therefore still required, and for the reason stated — it protects Sonnet's number from being flattered by batching. What changes is the direction of the residual risk: no candidate cost figure can be depressed by a cache the candidate does not have, so a candidate that still looks expensive is expensive.
++
+ Controls:
+ 
+ - Interleave so repeats of the same task never run back-to-back (falls out of §5.7 randomization, but must be verified, not assumed)
+@@ -622,6 +624,14 @@ Meanwhile, **prompt caching support on Bedrock for Gemma 4, Nemotron 3 Super, an
+ 
+ Action, Phase 0b: confirm per-candidate Bedrock cache support, and re-baseline against actual AWS billing data rather than list-price arithmetic. **This is a blocking input to the recommendation, not a footnote.**
+ 
++> **Answered 2026-08-23 — the status is ABSENT, not unknown.** Measured with `scripts/probe_cache.py` straight at the endpoint, litellm being the thing under test. AWS's prompt-caching supported-model table lists only Anthropic Claude, OpenAI GPT-5.6 and Amazon Nova; the pricing page gives Moonshot, NVIDIA and Google input and output columns with **no cache-read or cache-write line at all**; and Converse refuses a `cachePoint` block for all three with `AccessDeniedException`, 10 attempts of 10. Claude Code sends its three `cache_control` breakpoints identically on every arm, so the client is never the difference — litellm's Anthropic→OpenAI adapter drops them for any model id containing neither `"anthropic"` nor `"claude"`.
++>
++> What the candidate routes *do* report is an opportunistic per-worker KV prefix cache: `cached_tokens` appears on a minority of runs, its hit rate tracks call index rather than prompt size, and reuse lag is never 1. There is no product behind it and no billing consequence — OpenAI usage makes `prompt_tokens` inclusive of `cached_tokens`, so a reused token bills at the standard rate. `costs.PRICE_BOOK` therefore prices candidate cache *reads* at **1.0×** the input rate rather than raising, and `PRICING_BASIS` moved so records priced under the old book and the new one stay distinguishable. Candidate cache *writes* keep no multiplier and still raise into `pricing_error` (corrected 2026-09-08): no candidate route can emit one — 0 of 179 stored records, 0 of 951 wire entries — so a write appearing is not a token to price but the signal that a billed cache product shipped.
++>
++> **The consequence for this section's arithmetic is the opposite of a reprieve.** Every earlier figure in this repo that applied Anthropic's 0.10× read multiplier to a candidate was overstating the saving. Priced honestly, the pilot's Kimi is **$3.43 against Sonnet's $3.14** — more expensive, not cheaper. The "materially smaller savings" this section warned about is the measured outcome, and the warning that it could change the recommendation stands.
++>
++> One caveat this leaves open: a cache hit still buys latency, and only for Kimi is the rate steerable — across three interleaved replicates Kimi hits 19% in us-east-1 against 39% in us-east-2 (p=0.00051), Gemma shows no region effect, and Nemotron is 0-for-80 and carried as the negative control. A region move is worth $0 and is a §5.4 divergence unless every arm moves together.
++
+ ---
+ 
+ ## 9. Stated Limitations
+diff --git a/tasks/todo.md b/tasks/todo.md
+index 0af7ead..a3fe244 100644
+--- a/tasks/todo.md
++++ b/tasks/todo.md
+@@ -2508,3 +2508,62 @@ paths against a faked `_run_codex`, and the supersession rules against
+ hand-built judgment lines. Whether a real pass reproduces the two-block split
+ F2 fixed, and whether a real codex reply exercises the extractor's rescan, are
+ still live-run questions.
++
++## 2026-09-08 — Candidate cache pricing wave: tests and TASKS.md caught up to costs.py
++
++Root cause, one change: `costs.py` moved the three candidates' cache
++multipliers from `None` (raise on any cache token) to `1.0` on 2026-08-23. Five
++tests still used a real candidate (`gemma-4-31b`, `kimi-k2-5`) as the example of
++an unpriceable arm, one test matched the wrong raise string, and the TASKS.md
++section written the same day still called the 1.0-vs-raise choice "a maintainer
++decision" with four `file:line` test anchors.
++
++- [x] `tests/conftest.py`: shared `unpriceable_model` fixture — monkeypatches
++  `PRICE_BOOK["rate-not-yet-published"]` with no cache multipliers. The
++  None-means-raise mechanism is still tested; it now guards the case it was
++  built for instead of an arm that no longer trips it.
++- [x] `test_costs.py`: 1h-write test matches `1h cache write rate unconfirmed`,
++  the message `costs.py` actually raises.
++- [x] `test_trajectory.py`, `test_fault_injection.py`, `test_smoke_test.py`:
++  fake model in place of the real candidate. `test_cost_is_none_exactly_when_…`
++  had a vacuous middle arm (kimi now prices like Sonnet); it is the fake again.
++- [x] `TASKS.md`: bullet 1 marked done and records the decision, the 1.0
++  derivation, the risk taken and the re-check command. Bullet 2 stays open with
++  what remains: pre-2026-08-23 records carry `cost_usd: null` for this and need
++  a derived-view reprice keyed on `pricing_basis`; the tool-trim deltas still
++  use the retracted 0.10x multiplier.
++- [x] `probe_cache.py` docstring and `runner.py` `_cache_warm` docstring no
++  longer repeat the retracted "23%" / "None multipliers" claims.
++
++Suite: `1132 passed, 46 deselected`. Not committed. Note: this wave sits on the
++`openrouter-provider` branch and is unrelated to it.
++
++### Review round (same day) — eight-angle review, ten confirmed findings, all fixed
++
++- [x] `costs.py`: candidate `cache_write`/`cache_write_1h` multipliers back to
++  None. Reads stay 1.0 (derived). A candidate write cannot occur on any route
++  today (0/179 records, 0/951 wire entries), so one appearing is the signal a
++  billed product shipped and must land in `pricing_error`, not a dollar figure.
++  New test pins write-raises and read-prices on all three arms.
++- [x] `smoke_test.py` `print_cache_tokens`: pricedness read off `row["cost"]`,
++  not the arm-name prefix.
++- [x] `probe_cache.py`: Fisher now two-sided headline plus one-sided in the
++  observed direction, labelled (old code hardcoded regions[1] > regions[0];
++  gemma's 0.80 was the wrong tail, correct 0.67 two-sided). Expiry abort stops
++  the whole mode and names what did not run. `--regions` defaults to the three
++  candidates, aborts a cell after 3 consecutive non-200, `--dry-run` prices the
++  plan. Retry latency excluded from medians, `attempts` stamped. `all([])` sign
++  line prints n/a.
++- [x] CLAUDE.md, TASKS.md, yaml: "44% in the pilot" (retracted block-design
++  number, pilot is 12.7%) and "0/28" (unsupported) removed; gemma two
++  replicates not three; p-values restated two-sided. TASKS.md:1416 closed; new
++  open item for `_cache_warm` stamping a bool on lottery arms.
++- [x] Eleven stale "None multipliers / raises for candidates" sites across
++  schema, trajectory, runner, smoke_test, mutation_check, test_runner,
++  conftest, test_trajectory, test_fault_injection, spec §8: all now state the
++  read/write split.
++
++Suite `1135 passed`, `mutation_check` 143/143 caught, run solo. Not committed.
++Process note: two agents raced on `costs.py` (prose agent read it mid-edit) and
++`mutation_check` reverted a concurrent edit twice. Sequence prose after code,
++and never run the mutation check beside another editor.
