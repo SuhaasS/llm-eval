@@ -22,9 +22,21 @@
 # accept every parameter sent, rather than dropping the parameter. The
 # response's `provider` field is captured per call so the pin is verified,
 # never assumed. Measured 2026-09-08 from /api/v1/models/<id>/endpoints:
-#   kimi-k2.6  coreweave/fp4  $0.65/$3.41  cache read $0.15   tools: yes
+#   kimi-k2.6  crusoe/bf16    $0.70/$3.50  cache read $0.35   tools: yes
+#   kimi-k2.6  coreweave/fp4  $0.65/$3.41  cache read $0.15   tools: yes  (the pin until 2026-09-11)
 #   kimi-k3    fireworks      $3.00/$15.00 cache read $0.30   tools: yes
 #   kimi-k3    fireworks/fast                                 tools: NO -- never let the router pick it
+#
+# WHY K2.6 MOVED FROM COREWEAVE TO CRUSOE, 2026-09-11. Measured by
+# scripts/probe_openrouter.py check 3 (repeated 4k prefix, 3 s apart):
+# CoreWeave hit 3 of 10 replicates one day and 0 of 15 the next -- a
+# per-worker prefix cache behind a per-request balancer, the bedrock-mantle
+# lottery again -- while Crusoe hit 5 of 5 at a 47% cost drop on every repeat.
+# Crusoe also serves bf16, which removes the fp4 quantization confound spec
+# section 5.4 names. Fireworks answered 429/503 for K2.6 on every call that
+# day and is not a candidate. The list price is $0.05/M higher on input; the
+# expected price under a Claude Code loop (most of the prompt is a repeated
+# prefix) is lower, and it is a price, not a lottery.
 #
 # reasoning_effort IS DROPPED HERE, NOT PINNED. litellm derives one from
 # Claude Code's thinking:{"type":"adaptive"} on every arm. K2.6's endpoints
@@ -50,10 +62,10 @@ model_list:
       top_p: 0.95
       extra_body:
         provider:
-          order: ["coreweave"]
+          order: ["crusoe"]
           allow_fallbacks: false
           require_parameters: true
-          quantizations: ["fp4"]
+          quantizations: ["bf16"]
         usage: {include: true}
         reasoning: {enabled: true}
 

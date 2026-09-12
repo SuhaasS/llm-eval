@@ -456,11 +456,13 @@ def test_every_openrouter_arm_asks_for_provider_cost_and_drops_the_derived_effor
 
 
 def test_the_openrouter_config_pins_quantization_where_the_endpoint_declares_one():
-    """CoreWeave declares fp4 for K2.6; Fireworks declares none for K3, so
-    pinning there would match nothing."""
+    """Crusoe declares bf16 for K2.6 (re-pinned from CoreWeave's fp4 on
+    2026-09-11: CoreWeave's cache hit 3/10 then 0/15 probe replicates,
+    Crusoe's 5/5); Fireworks declares none for K3, so pinning there would
+    match nothing."""
     by_name = {e["model_name"]: e["litellm_params"]["extra_body"]["provider"] for e in _openrouter_arms()}
-    assert by_name["kimi-k2-6"]["order"] == ["coreweave"]
-    assert by_name["kimi-k2-6"]["quantizations"] == ["fp4"]
+    assert by_name["kimi-k2-6"]["order"] == ["crusoe"]
+    assert by_name["kimi-k2-6"]["quantizations"] == ["bf16"]
     assert by_name["kimi-k3"]["order"][0].startswith("fireworks")
     assert "quantizations" not in by_name["kimi-k3"]
 

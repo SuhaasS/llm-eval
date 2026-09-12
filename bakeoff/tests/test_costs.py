@@ -110,13 +110,15 @@ def test_zero_usage_is_zero_cost():
     assert cost_usd("claude-sonnet-5", TokenUsage()) == 0.0
 
 
-def test_kimi_k2_6_prices_at_coreweave_rates_with_a_real_cache_read_discount():
-    """Spec §5. $0.65 / $3.41 per 1M, cache read $0.15 -> 0.2308x. Unlike the
-    bedrock candidates, this route publishes a cache-read rate, so the
-    multiplier is a price and a cache hit is worth money, not only latency."""
-    assert cost_usd("kimi-k2-6", TokenUsage(input=1_000_000)) == pytest.approx(0.65)
-    assert cost_usd("kimi-k2-6", TokenUsage(output=1_000_000)) == pytest.approx(3.41)
-    assert cost_usd("kimi-k2-6", TokenUsage(cache_read=1_000_000)) == pytest.approx(0.15, rel=1e-3)
+def test_kimi_k2_6_prices_at_crusoe_rates_with_a_real_cache_read_discount():
+    """Spec §5. Crusoe bf16: $0.70 / $3.50 per 1M, cache read $0.35 -> 0.5x.
+    Re-pinned from CoreWeave ($0.65 / $3.41 / $0.15) on 2026-09-11 because
+    CoreWeave's cache was a per-request lottery and Crusoe's fired on every
+    repeat. Unlike the bedrock candidates, this route publishes a cache-read
+    rate, so the multiplier is a price and a cache hit is worth money."""
+    assert cost_usd("kimi-k2-6", TokenUsage(input=1_000_000)) == pytest.approx(0.70)
+    assert cost_usd("kimi-k2-6", TokenUsage(output=1_000_000)) == pytest.approx(3.50)
+    assert cost_usd("kimi-k2-6", TokenUsage(cache_read=1_000_000)) == pytest.approx(0.35, rel=1e-3)
 
 
 def test_kimi_k3_prices_at_fireworks_rates():
@@ -130,7 +132,7 @@ def test_an_openrouter_cache_write_bills_as_plain_input():
     prefix costs what an unwritten one costs. The 1h tier does not exist on
     this route and takes the same rate so the total stays
     prompt_tokens x input_per_1m when no read occurred."""
-    for name, rate in (("kimi-k2-6", 0.65), ("kimi-k3", 3.00)):
+    for name, rate in (("kimi-k2-6", 0.70), ("kimi-k3", 3.00)):
         assert cost_usd(name, TokenUsage(cache_write=1_000_000)) == pytest.approx(rate)
         assert cost_usd(name, TokenUsage(cache_write=1_000_000, cache_write_1h=1_000_000)) == pytest.approx(rate)
 
@@ -149,4 +151,7 @@ def test_the_openrouter_arms_have_no_runtime_alias():
 
 def test_the_pricing_basis_names_the_openrouter_book():
     from bakeoff.costs import PRICING_BASIS
-    assert PRICING_BASIS.endswith("+openrouter-2026-09-08")
+    # Two segments, because two live records were written under the first
+    # (K2.6 at CoreWeave's rates) before the re-pin moved the row.
+    assert "+openrouter-2026-09-08" in PRICING_BASIS
+    assert PRICING_BASIS.endswith("+k26-crusoe-2026-09-11")

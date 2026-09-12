@@ -55,7 +55,7 @@ class UnknownModelError(KeyError):
 
 # Bumped whenever a rate in PRICE_BOOK moves. Stamped into every record's
 # Versions so a stored cost says which book produced it.
-PRICING_BASIS = "sonnet-list-2026-08-11+bedrock-2026-08-05+openrouter-2026-09-08"
+PRICING_BASIS = "sonnet-list-2026-08-11+bedrock-2026-08-05+openrouter-2026-09-08+k26-crusoe-2026-09-11"
 
 
 @dataclass(frozen=True)
@@ -117,10 +117,15 @@ PRICE_BOOK.update(
 # second transport, and an alias would price a deployment that cannot exist.
 PRICE_BOOK.update(
     {
-        # coreweave/fp4: $0.65 in, $3.41 out, $0.15 cache read per 1M.
+        # crusoe/bf16: $0.70 in, $3.50 out, $0.35 cache read per 1M. Re-pinned
+        # from coreweave/fp4 ($0.65 / $3.41 / $0.15) on 2026-09-11 because
+        # CoreWeave's cache is a per-request lottery (3/10 then 0/15 probe
+        # hits) and Crusoe's fired 5/5; see the config header. The two live
+        # records written before the re-pin carry the earlier PRICING_BASIS
+        # and CoreWeave's rates, which is what the basis segment below is for.
         "kimi-k2-6": ModelPricing(
-            input_per_1m=0.65, output_per_1m=3.41,
-            cache_read_multiplier=0.15 / 0.65, cache_write_multiplier=1.0,
+            input_per_1m=0.70, output_per_1m=3.50,
+            cache_read_multiplier=0.35 / 0.70, cache_write_multiplier=1.0,
             cache_write_1h_multiplier=1.0,
         ),
         # fireworks: $3.00 in, $15.00 out, $0.30 cache read per 1M. If
