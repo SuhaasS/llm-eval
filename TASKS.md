@@ -864,7 +864,13 @@ one ends a multi-day run outright.
   to price an OpenRouter run. Until then, never compare `cost_usd` across
   `provider_route` values.
 
-- [ ] **Consider re-pinning K2.6 to `crusoe` (bf16).** Measured 2026-09-11:
+- [x] **Re-pinned K2.6 to `crusoe` (bf16), 2026-09-11.** Confirmed on a
+  15-replicate probe afterwards: 15/15 hits on Crusoe (47% cost drop each)
+  and 15/15 on Fireworks for K3 (85–89%), zero billing anomalies, every call
+  answered by the pinned upstream. `PRICE_BOOK["kimi-k2-6"]` is now
+  $0.70 / $3.50 / $0.35 and `PRICING_BASIS` gained `+k26-crusoe-2026-09-11`;
+  the two live records from earlier that day stay priced under the CoreWeave
+  row. The original evidence: measured 2026-09-11:
   on the probe's isolated-prefix check Crusoe hit 5/5 (5.9–6.0k cached per
   hit, 47% cheaper) where CoreWeave hit 0/15 that day and 3/10 the day before;
   Crusoe is $0.70/$3.50 with cache read $0.35 against CoreWeave's
